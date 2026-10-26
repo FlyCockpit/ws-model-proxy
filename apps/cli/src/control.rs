@@ -87,6 +87,13 @@ pub struct ControlServer {
     /// Removes the socket file if a forced shutdown skips `Drop`.
     _exit_cleanup: crate::shutdown::ExitCleanup,
 }
+
+/// The daemon locks this process took (`ControlServer::bind_in`): never released before the
+/// process exits, so no other daemon starts while anything of this one (a runtime step worker
+/// above all, which may still launch) can still run.
+#[cfg(unix)]
+static DAEMON_LOCKS: std::sync::Mutex<Vec<nix::fcntl::Flock<fs::File>>> =
+    std::sync::Mutex::new(Vec::new());
 #[cfg(unix)]
 pub struct PendingRequest {
     pub request: ControlRequest,
@@ -98,10 +105,50 @@ pub struct PendingRequest {
 #[cfg(unix)]
 impl ControlServer {
     pub fn bind() -> Result<Self> {
-        let path = crate::paths::state_dir()?.join("relay-control.sock");
-        let state_dir = crate::paths::state_dir()?;
-        fs::create_dir_all(&state_dir)?;
-        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))?;
+        Self::bind_in(&crate::paths::state_dir()?)
+    }
+
+    /// One daemon per state directory: its lock (`relay-daemon.lock`, an exclusive `flock`
+    /// kept until the process exits, `DAEMON_LOCKS`) is taken before the control socket is
+    /// looked at, so two starting daemons never both get past here (the socket check alone is
+    /// not atomic: both could see a stale socket and each bind its own), and a new one starts
+    /// only once every thread of the old one ended, and once every runtime command the old one
+    /// started ended too (`launch_guard::settle`). Everything the daemon owns (its runtime step
+    /// runner above all, whose idle answers prove stops) has one owner per node.
+    fn bind_in(state_dir: &std::path::Path) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = state_dir.join("relay-control.sock");
+        fs::create_dir_all(state_dir)?;
+        fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
+        let lock_path = state_dir.join("relay-daemon.lock");
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .with_context(|| format!("opening daemon lock `{}`", lock_path.display()))?;
+        let daemon_lock =
+            match nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => lock,
+                Err((_, nix::errno::Errno::EWOULDBLOCK)) => anyhow::bail!(
+                    "a relay daemon already runs (it holds `{}`)",
+                    lock_path.display()
+                ),
+                Err((_, error)) => {
+                    return Err(error)
+                        .with_context(|| format!("locking daemon lock `{}`", lock_path.display()));
+                }
+            };
+        DAEMON_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(daemon_lock);
+        // An earlier daemon ended by SIGKILL can leave a runtime command its guard is still
+        // ending; nothing here answers (an idle rank above all) until it has.
+        crate::launch_guard::settle(state_dir, crate::launch_guard::SETTLE_WAIT)?;
         if path.exists() {
             match UnixStream::connect(&path) {
                 Ok(_) => anyhow::bail!(
@@ -388,6 +435,27 @@ impl ControlServer {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_second_daemon_never_binds_while_one_runs() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let first = super::ControlServer::bind_in(dir.path()).expect("the first daemon binds");
+        let refused = super::ControlServer::bind_in(dir.path())
+            .err()
+            .expect("a second daemon is refused");
+        assert!(
+            format!("{refused:#}").contains("already runs"),
+            "{refused:#}"
+        );
+        // Even with the first one's socket gone (what a racing start would unlink): refused.
+        std::fs::remove_file(dir.path().join("relay-control.sock")).expect("socket");
+        assert!(super::ControlServer::bind_in(dir.path()).is_err());
+        // Its control server gone (a fatal return), its process (and any step worker it may
+        // still run) is not: still refused until the process exits.
+        drop(first);
+        assert!(super::ControlServer::bind_in(dir.path()).is_err());
+    }
+
     use super::*;
 
     #[test]

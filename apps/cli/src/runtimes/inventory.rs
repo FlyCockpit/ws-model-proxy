@@ -3,6 +3,7 @@
 //! Built off the relay loop: probes take time.
 
 use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use rand::distr::SampleString;
 
@@ -13,28 +14,112 @@ use crate::protocol::frames::{
 use crate::relay_bus::FromWorker;
 use crate::runtime_store::Store;
 
-/// Probe every always-on runtime, then send the snapshot through `tx`.
-pub(crate) fn spawn(tx: SyncSender<FromWorker>, store: Store, instances: Vec<InstanceRecord>) {
-    let spawned = std::thread::Builder::new()
-        .name("wsmp-inventory".into())
-        .spawn(move || {
-            let always_on = probe_always_on(&store);
-            for frame in frames(always_on, instances) {
-                match crate::protocol::encode_control(&frame) {
-                    Ok(text) => {
-                        if tx.send(FromWorker::Telemetry(text)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => tracing::warn!(
-                        error = %format!("{error:#}"),
-                        "encoding the runtime inventory failed"
-                    ),
-                }
-            }
+/// The daemon's one inventory worker, across reconnects. The server applies snapshots in the
+/// order they arrive, so they must arrive in the order they were captured, and an older one
+/// never after a newer one. One worker probes and sends them all, one at a time, so they leave
+/// in capture order. A capture replaces the one the worker has not started on, but every
+/// snapshot it has probed is sent: captures that keep coming while probes are slow still let
+/// one snapshot out per probe. Capturing never needs a new thread.
+pub(crate) struct Inventories {
+    shared: Arc<Shared>,
+}
+
+#[derive(Default)]
+struct Shared {
+    next: Mutex<Next>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct Next {
+    capture: Option<Capture>,
+    closed: bool,
+}
+
+struct Capture {
+    tx: SyncSender<FromWorker>,
+    store: Store,
+    instances: Vec<InstanceRecord>,
+}
+
+type Probe = dyn Fn(&Store) -> Vec<AlwaysOnInventory> + Send;
+
+impl Inventories {
+    /// Start the worker. Failing to start it is the daemon's failure to start: without it the
+    /// server never learns what this node holds.
+    pub(crate) fn start() -> std::io::Result<Self> {
+        Self::start_with(Box::new(probe_always_on))
+    }
+
+    fn start_with(probe: Box<Probe>) -> std::io::Result<Self> {
+        let shared = Arc::new(Shared::default());
+        let worker = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("wsmp-inventory".into())
+            .spawn(move || work(&worker, &*probe))?;
+        Ok(Self { shared })
+    }
+
+    /// Probe every always-on runtime off the relay loop, then send the snapshot through `tx`.
+    pub(crate) fn capture(
+        &self,
+        tx: SyncSender<FromWorker>,
+        store: Store,
+        instances: Vec<InstanceRecord>,
+    ) {
+        let mut next = lock(&self.shared);
+        next.capture = Some(Capture {
+            tx,
+            store,
+            instances,
         });
-    if let Err(error) = spawned {
-        tracing::warn!(error = %error, "starting the inventory worker failed");
+        self.shared.wake.notify_one();
+    }
+}
+
+impl Drop for Inventories {
+    fn drop(&mut self) {
+        lock(&self.shared).closed = true;
+        self.shared.wake.notify_one();
+    }
+}
+
+fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Next> {
+    shared.next.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn work(shared: &Shared, probe: &Probe) {
+    loop {
+        let capture = {
+            let mut next = lock(shared);
+            loop {
+                if next.closed {
+                    return;
+                }
+                if let Some(capture) = next.capture.take() {
+                    break capture;
+                }
+                next = shared
+                    .wake
+                    .wait(next)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        };
+        let always_on = probe(&capture.store);
+        // Not sent under the lock: the relay loop captures while it drains `tx`.
+        for frame in frames(always_on, capture.instances) {
+            match crate::protocol::encode_control(&frame) {
+                Ok(text) => {
+                    if capture.tx.send(FromWorker::Telemetry(text)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "encoding the runtime inventory failed"
+                ),
+            }
+        }
     }
 }
 
@@ -149,6 +234,59 @@ pub fn frames(always_on: Vec<AlwaysOnInventory>, instances: Vec<InstanceRecord>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn captures_while_probing_send_the_probed_snapshot_then_the_newest() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        // The first probe waits until the test lets it go; later ones return at once.
+        let (probing_tx, probing_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let inventories = super::Inventories::start_with(Box::new(move |_| {
+            if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                probing_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            Vec::new()
+        }))
+        .unwrap();
+        let (tx, rx) = mpsc::sync_channel(16);
+        let record = |id: &str| InstanceRecord {
+            instance_id: id.into(),
+            launch_version_id: "vr1".into(),
+            launch_hash: "a".repeat(64),
+            rank: 0,
+            intent_hash: "b".repeat(64),
+            step_id: None,
+            phase: InstancePhase::Ready,
+            unit_name: "wsmp-i-abcdefabcdef-r0".into(),
+            port: 30000,
+            handle: "i-abcdefabcdef".into(),
+            models: vec!["m".into()],
+            engine_facts: None,
+            rank_idle: None,
+        };
+        let sent = || {
+            let FromWorker::Telemetry(text) = rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            else {
+                panic!("not a frame");
+            };
+            text
+        };
+        inventories.capture(tx.clone(), Store::default(), vec![record("first")]);
+        probing_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        inventories.capture(tx.clone(), Store::default(), vec![record("second")]);
+        inventories.capture(tx, Store::default(), vec![record("third")]);
+        release_tx.send(()).unwrap();
+        // The probed one is sent although newer ones came, then only the newest of those.
+        let text = sent();
+        assert!(text.contains("first"), "{text}");
+        let text = sent();
+        assert!(text.contains("third") && !text.contains("second"), "{text}");
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
     use super::*;
     use crate::protocol::frames::{InstancePhase, InventoryModel, RuntimeOrigin};
     use crate::protocol::runtime_spec::ModelCapability;
@@ -206,6 +344,7 @@ mod tests {
                 handle: "i-abcdefabcdef".into(),
                 models: vec!["m".into()],
                 engine_facts: None,
+                rank_idle: None,
             })
             .collect();
         let frames = frames(on, instances);

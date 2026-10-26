@@ -24,15 +24,35 @@
  * `./always-on.ts`; the engine facts of managed instances are recorded here.
  */
 import { randomBytes } from "node:crypto";
-import {
-  clearInstanceReleaseRequests,
-  releaseClaim,
-  retakenClaim,
-  sweepReleaseRequests,
-} from "@ws-model-proxy/api/lib/claim-release";
+import { canonicalJson } from "@ws-model-proxy/api/lib/canonical-json";
+import { releaseClaim, sweepReleaseRequests } from "@ws-model-proxy/api/lib/claim-release";
 import { sameStoredInstanceFacts, storedInstanceFacts } from "@ws-model-proxy/api/lib/engine-facts";
 import { graphWrite, instanceCapacityFences } from "@ws-model-proxy/api/lib/graph-write";
+import {
+  fresh,
+  isLeadingStop,
+  mayHaveRunAfterRequeue,
+  owned,
+  peekRun,
+  physicalLaunch,
+  recordStoppedThrough,
+  resolveRun,
+  startsUnresolved,
+} from "@ws-model-proxy/api/lib/instance-run";
+import {
+  CURRENT_RESERVATION_WHERE,
+  dropSupersededHolds,
+  HOLDING_RESERVATION_WHERE,
+  retakeInstanceClaims,
+} from "@ws-model-proxy/api/lib/reservations";
+import { planRetake } from "@ws-model-proxy/api/lib/retake-plan";
 import { type RuntimeLaunch, runtimeLaunchSchema } from "@ws-model-proxy/api/lib/runtime-spec";
+import {
+  claimGpuIds,
+  type StepReservation,
+  stepJobReservations,
+} from "@ws-model-proxy/api/lib/step-intent";
+import { effectiveTrust } from "@ws-model-proxy/api/nodes/trust";
 import { healthFailureDetail } from "@ws-model-proxy/config/health-reasons";
 import { RUNTIME_ADVANCED } from "@ws-model-proxy/config/runtime-defaults";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
@@ -41,7 +61,6 @@ import {
   type InstanceRecord,
   type NodeToServerControlFrame,
   type NodeTrustWire,
-  RUNTIME_JOB_PRE_ADMISSION_ERRORS,
   type ServerToNodeControlFrame,
   STOP_PROOF_FAILURES,
 } from "../relay/frames.js";
@@ -49,6 +68,7 @@ import { nodeOwnerMatches } from "../relay/node-owner.js";
 import type {
   NodeFrameHandlers,
   NodeSessionRef,
+  OperatorCloseAnswer,
   RuntimeInventorySnapshot,
   SendGuard,
 } from "../relay/session-manager.js";
@@ -61,6 +81,7 @@ import {
   type InstanceInput,
   jobFrame,
   type NewStep,
+  type Physical,
   type RankInput,
   START_PHASES,
   STATUS_SEQUENCE_BASE,
@@ -70,6 +91,7 @@ import {
   stepIntentSchema,
   stopStep,
 } from "./steps.js";
+import { byKey, SweepCursor } from "./sweep.js";
 
 type Tx = Prisma.TransactionClient;
 type JobResult = Extract<NodeToServerControlFrame, { type: "runtime.job.result" }>;
@@ -78,6 +100,7 @@ const TICK_MS = 1_000;
 const BATCH = 64;
 const LIVE_STEP_STATES = ["PENDING", "RUNNING", "AWAITING_OPERATOR"] as const;
 const LIVE_PHASES = ["STARTING", "READY", "UNHEALTHY", "UNAVAILABLE"] as const;
+const ALL_STEP_PHASES: readonly StepPhase[] = [...START_PHASES, "STOP", "STATUS"];
 const STOP_ATTEMPTS = 3;
 /** A STOPPING rank whose node has been offline this long needs a person (Mark as stopped). */
 export const MARK_STOPPED_AFTER_OFFLINE_MS = 10 * 60_000;
@@ -136,17 +159,27 @@ function activeOwner(now: Date): Prisma.UserWhereInput {
   };
 }
 
+/**
+ * A runtime job for a node whose CLI cannot prove what it runs (from before `features.rankIdle`:
+ * one runner across connections, and stop answers that say whether the rank is idle), or a start
+ * whose run has reservations on one that cannot read them (before `features.jobReservations`):
+ * refused before it is sent. A start FAILS its instance until the CLI is upgraded
+ * (`TERMINAL_START_ERRORS`); a stop or probe cannot be proven there (`UNPROVABLE_STOP`).
+ */
+export const CLI_UPGRADE_REQUIRED = "cli_upgrade_required";
+
 /** Codes that prove a stop cannot be proven by the node: a person decides (Mark as stopped). */
 const UNPROVABLE_STOP = new Set([
   // A person gave up on an interactive stop: they decide (Mark as stopped), nothing is retried.
   OPERATOR_CANCELLED,
+  // The node's CLI cannot prove a stop (no `rankIdle`): a person decides, or upgrades it.
+  CLI_UPGRADE_REQUIRED,
   "definition_missing",
   "definition_frozen",
   "instance_unknown",
   "owned_launch_unconfirmed",
   "launch_unconfirmed",
 ]);
-const PRE_ADMISSION: ReadonlySet<string> = new Set(RUNTIME_JOB_PRE_ADMISSION_ERRORS);
 
 export type LifecycleRelay = {
   sendToNode(nodeId: string, frame: ServerToNodeControlFrame, guard?: SendGuard): boolean;
@@ -157,9 +190,19 @@ export type LifecycleRelay = {
     trust: NodeTrustWire;
     /** The node can hold operator terminals (feature and terminal key). */
     operatorTerminals?: boolean;
+    /** The node's CLI reads a job's `reservations` (hello `features.jobReservations`). */
+    jobReservations?: boolean;
+    /** The node's CLI proves what it runs (hello `features.rankIdle`): runtime jobs need it. */
+    rankIdle?: boolean;
   } | null;
   /** Nodes with a live session here (dispatch looks at their steps only). */
   onlineNodeIds?(): string[];
+  /**
+   * From now on, no start-phase job of the rank's runs through `throughRun` is delivered to the
+   * node's live session (as a sent stop's `stopsStartsThrough`): before a proof that sent nothing
+   * (an inventory record) may release the claim.
+   */
+  fenceRunStarts?(nodeId: string, instanceId: string, rank: number, throughRun: number): void;
   /** The node's session can track one more operator terminal (absent: always). */
   operatorRoom?(nodeId: string): boolean;
   /**
@@ -169,7 +212,7 @@ export type LifecycleRelay = {
   closeOperatorStep?(
     stepId: string,
     options?: { keepRunning?: boolean; actor?: "USER" | "SYSTEM" },
-  ): "closed" | "running" | "absent";
+  ): OperatorCloseAnswer;
   /** Close an operator terminal no step owns any more (a stale dispatch's), by its id. */
   closeOperatorTerminal?(nodeId: string, terminalId: string): void;
 };
@@ -207,18 +250,26 @@ function interactiveIntent(intent: Prisma.JsonValue): boolean {
 
 /**
  * The attempts of an interactive step whose live dispatch the server ends (stop, cancel,
- * reissue). The dispatch gives its attempt back only while its confirm screen never came up:
- * nobody can attach before `awaiting_operator`, so nothing ran. Once the screen was up, a person
- * may have pressed Enter just before the close reached the node, so the attempt counts (the
- * rank then needs a stop, which the node proves from status when nothing ran).
+ * reissue, drain), from what closing its terminal found (`answer`). The dispatch gives its
+ * attempt back only when the close proves its confirm screen never came up: the tracker that
+ * holds the session closed it while it was still coming up (`unopened`: nobody can attach before
+ * `awaiting_operator`, so nothing ran), and the step's columns agree. Anything else counts the
+ * attempt: the screen was up (a person may have pressed Enter just before the close reached the
+ * node), or nothing here tracks the terminal (`absent`: another process holds the session, or a
+ * progress write was lost), so this process cannot know. The rank then needs a stop, which the
+ * node proves from status when nothing ran: a release always has proof.
  */
-function attemptsAfterServerClose(step: {
-  attempts: number;
-  operatorTerminalId: string | null;
-  operatorSince: Date | null;
-  operatorAcceptedAt: Date | null;
-}): number {
-  return step.operatorTerminalId !== null &&
+function attemptsAfterServerClose(
+  step: {
+    attempts: number;
+    operatorTerminalId: string | null;
+    operatorSince: Date | null;
+    operatorAcceptedAt: Date | null;
+  },
+  answer: OperatorCloseAnswer | undefined,
+): number {
+  return answer === "unopened" &&
+    step.operatorTerminalId !== null &&
     step.operatorSince === null &&
     step.operatorAcceptedAt === null
     ? Math.max(0, step.attempts - 1)
@@ -229,9 +280,22 @@ function commandAuthor(editor: "USER" | "AGENT" | "SYSTEM"): "user" | "agent" | 
   return editor === "USER" ? "user" : editor === "AGENT" ? "agent" : "unknown";
 }
 
+/**
+ * A person's accepted interactive run past its timeout, of any run: it is never cut off, its
+ * person is asked to look at it (`needsOperator` STEP, needsYou), and the deadline sweep skips
+ * it once that need is raised.
+ */
+function overdueAcceptedRun(now: Date): Prisma.InstanceStepWhereInput {
+  return { state: "RUNNING", operatorAcceptedAt: { not: null }, deadline: { lte: now } };
+}
+
 /** A step as `afterStep` needs it. */
 type FinishedStep = {
+  /** A stop proof names its step: `releaseClaim` checks it belongs to the claim's run. */
+  id: string;
   instanceId: string;
+  /** The node that ran it (whose answer it is). */
+  nodeId: string;
   phase: StepPhase;
   rank: number;
   generation: number;
@@ -253,6 +317,8 @@ const TERMINAL_START_ERRORS: ReadonlySet<string> = new Set([
   "operator_terminals_disabled",
   // A `process` start that hands its server off does so every time: it needs a `service` spec.
   "process_detached",
+  // The node's CLI cannot read the job's reservations until it is upgraded.
+  CLI_UPGRADE_REQUIRED,
 ]);
 
 export type LifecycleOptions = {
@@ -264,14 +330,72 @@ export type LifecycleOptions = {
 type InstanceRow = Prisma.RuntimeInstanceGetPayload<{
   include: {
     Ranks: true;
+    Reservations: {
+      where: { supersededGeneration: null };
+      select: {
+        index: true;
+        nodeId: true;
+        resources: true;
+        Node: { select: { id: true; slug: true; trust: true; trustLowerRequestedAt: true } };
+      };
+    };
     LaunchVersion: { select: { spec: true; launchHash: true; advanced: true; editor: true } };
   };
 }>;
 
+/**
+ * `Reservations` (`launch.reservations`, the current plan's) are read only for their nodes: an
+ * offline or deleted reservation node makes the instance UNAVAILABLE like a rank's, a queued
+ * start waits for what blockers hold there, and an automatic restart places them again. Nothing
+ * is ever dispatched to them, and their claim is the ranks' (`lib/reservations.ts`), so no
+ * release path here writes them. Rows a restart superseded go once a START of a later
+ * generation is claimed (`dropSupersededHolds`).
+ */
 const INSTANCE_INCLUDE = {
   Ranks: true,
+  Reservations: {
+    where: CURRENT_RESERVATION_WHERE,
+    // Their node's slug goes into the run's steps (`stepReservations`); its trust is checked
+    // before an agent's start (`claimStep`).
+    select: {
+      index: true,
+      nodeId: true,
+      // The worker GPUs placement recorded (`resources.gpus`) go to the launcher too.
+      resources: true,
+      Node: { select: { id: true, slug: true, trust: true, trustLowerRequestedAt: true } },
+    },
+  },
   LaunchVersion: { select: { spec: true, launchHash: true, advanced: true, editor: true } },
 } as const;
+
+/** Rows read without the include (older callers' fixtures) have none. */
+function reservationsOf(instance: InstanceRow): InstanceRow["Reservations"] {
+  return instance.Reservations ?? [];
+}
+
+/**
+ * The run's reservation nodes (and the worker GPUs each was given) as its steps carry them
+ * (single-node instances only; a row whose node was deleted is left out: the instance is stopping or waits to be placed again).
+ */
+function stepReservations(instance: InstanceRow): StepReservation[] {
+  if (instance.Ranks.length !== 1) return [];
+  return reservationsOf(instance).flatMap((row) => {
+    if (!row.nodeId || !row.Node) return [];
+    // The GPUs placement accounted to it on the worker (absent: none recorded).
+    const gpuIds = claimGpuIds(row.resources);
+    return [
+      { index: row.index, nodeId: row.nodeId, node: row.Node.slug, ...(gpuIds ? { gpuIds } : {}) },
+    ];
+  });
+}
+
+/**
+ * An automatic restart's reason while it waits for the planner (STOPPED, retried every
+ * RETAKE_RETRY_MS): `waiting_` and the refusal's reason (contracts/refusals.ts).
+ */
+function waitingReason(reason: string): string {
+  return `waiting_${reason}`;
+}
 
 function launchOf(instance: InstanceRow): RuntimeLaunch | null {
   const spec = instance.LaunchVersion.spec;
@@ -312,26 +436,40 @@ function rankInput(rank: InstanceRow["Ranks"][number]): RankInput {
 
 /**
  * A status probe (stop proof) is for a claim marked stopped, or a held claim of an instance that is
- * stopping (its stops could not prove the stop), sent for the run that holds it: a probe of an
- * earlier run carries that run's port and commands, so it proves nothing about a later one.
- * Anything else is the run that holds the claim now: a probe never goes out for it, and an
- * answer releases nothing.
+ * stopping (its stops could not prove the stop). Anything else is a run in progress: a probe never
+ * goes out for it. (A probe of an earlier run never goes out at all: `claimStep`'s run gate.)
  */
-function statusProbeWanted(
-  instance: { phase: string },
-  claim: string | undefined,
-  probeGeneration: number,
-  currentGeneration: number,
-): boolean {
-  if (claim === "HELD_UNKNOWN") return true;
-  return (
-    claim === "HELD" &&
-    instance.phase === "STOPPING" &&
-    probeGeneration === Math.max(currentGeneration, 1)
-  );
+function statusProbeWanted(instance: { phase: string }, claim: string | undefined): boolean {
+  return claim === "HELD_UNKNOWN" || (claim === "HELD" && instance.phase === "STOPPING");
 }
 
 const STOP_PROOF_FAILURE_CODES: ReadonlySet<string> = new Set(STOP_PROOF_FAILURES);
+
+/**
+ * A stop or status probe the node answered stopped, but not idle (`rankIdle`: another step that
+ * may launch was still in flight for the rank there): no proof. Its step's `errorCode` (the stop
+ * evidence's reason).
+ */
+export const STATUS_LAUNCH_PENDING = "launch_pending";
+
+/**
+ * The runs a sent job ends at the socket (`SendGuard.stopsStartsThrough`): nothing of them starts
+ * after it (a start claimed earlier but delayed past it is not delivered), because the node's
+ * answer to it may prove them stopped, and the node can only say what it was sent. A gang stop
+ * ends its own run; a leading stop the runs before it (its own run's starts follow it); a status
+ * probe its run (it goes out only for a run that is stopping or marked stopped). Others: none.
+ */
+export function startsEndedBy(
+  job: { phase: string; generation: number },
+  leadingStop: boolean,
+): number | undefined {
+  if (job.phase === "status") return job.generation;
+  if (job.phase !== "stop") return undefined;
+  return leadingStop ? job.generation - 1 : job.generation;
+}
+
+/** How soon a leading stop whose node was not idle is sent again. */
+const RANK_BUSY_RETRY_MS = 30_000;
 
 /** Why a status probe answered not stopped (its `detail`), when the node said (newer nodes). */
 function stopProofFailure(phase: string, detail: string | undefined): string | null {
@@ -377,6 +515,16 @@ export class RuntimeLifecycle {
   private stopped = false;
   private readonly now: () => Date;
   private readonly startedAt = Date.now();
+  /** Each batched sweep's page cursor (`./sweep.ts`): every matching row is reached. */
+  private readonly sweeps = {
+    prepare: new SweepCursor(BATCH * 4),
+    watch: new SweepCursor(BATCH * 4),
+    expire: new SweepCursor(BATCH),
+    dispatch: new SweepCursor(BATCH * 4),
+    drain: new SweepCursor(BATCH),
+    restart: new SweepCursor(BATCH),
+    prune: new SweepCursor(BATCH * 4),
+  };
 
   constructor(
     private readonly relay: LifecycleRelay,
@@ -460,73 +608,98 @@ export class RuntimeLifecycle {
 
   // ── Starts ──
 
-  /** STARTING instances whose operation has no steps yet get a new generation. */
+  /**
+   * STARTING instances whose run has no start steps yet get them (generation = the run). A
+   * restart began its run when it was committed (`beginRun`), so this only publishes the steps:
+   * nothing here decides which run is current.
+   */
   private async prepareStarts() {
-    const rows = await prisma.runtimeInstance.findMany({
-      where: { desiredState: "RUNNING", phase: "STARTING" },
-      select: { id: true, userId: true, operationId: true },
-      orderBy: { phaseChangedAt: "asc" },
-      take: BATCH * 4,
-    });
-    for (const row of rows) {
-      // A start operation's generation names it; the engine's own restarts write their
-      // generation in the same transaction as the restart, so they are never "unprepared".
-      const prepared = await prisma.instanceStep.count({
-        where: {
-          instanceId: row.id,
-          phase: { in: [...START_PHASES] },
-          ...(row.operationId
-            ? { intent: { path: ["operationId"], equals: row.operationId } }
-            : {}),
-        },
-      });
-      if (prepared > 0) continue;
+    // Prepared runs waiting for their person stay STARTING: the cursor reaches the rest.
+    const page = await this.sweeps.prepare.next((page) =>
+      prisma.runtimeInstance.findMany({
+        where: { ...page.where, desiredState: "RUNNING", phase: "STARTING" },
+        select: { id: true, userId: true, phaseChangedAt: true },
+        orderBy: page.orderBy,
+        take: page.take,
+      }),
+    );
+    for (const row of byKey(page, (row) => row.phaseChangedAt.getTime())) {
+      // Plain read first (a legacy row's run computed without writing it).
+      if (await this.runPrepared(prisma, row.id, await peekRun(prisma, row.id))) continue;
       await this.write(row.userId, row.id, async (tx) => {
         const instance = await tx.runtimeInstance.findUnique({
           where: { id: row.id },
           include: INSTANCE_INCLUDE,
         });
         if (instance?.phase !== "STARTING" || instance.desiredState !== "RUNNING") return;
-        if (instance.operationId !== row.operationId) return;
         // Again under the fence: another replica may have prepared it meanwhile.
-        const already = await tx.instanceStep.count({
-          where: {
-            instanceId: row.id,
-            phase: { in: [...START_PHASES] },
-            ...(row.operationId
-              ? { intent: { path: ["operationId"], equals: row.operationId } }
-              : {}),
-          },
-        });
-        if (already > 0) return;
-        await this.createGeneration(tx, instance, instance.operationId);
+        const run = await resolveRun(tx, row.id);
+        if (await this.runPrepared(tx, row.id, run)) return;
+        await this.createGeneration(tx, instance, run, instance.operationId);
       }).catch((error: unknown) =>
         console.error("[lifecycle] preparing a start failed", errorName(error)),
       );
     }
   }
 
-  private async createGeneration(tx: Tx, instance: InstanceRow, operationId: string | null) {
+  private async runPrepared(db: Tx, instanceId: string, run: number): Promise<boolean> {
+    const prepared = await db.instanceStep.count({
+      where: { instanceId, generation: run, phase: { in: [...START_PHASES] } },
+    });
+    return prepared > 0;
+  }
+
+  /** The steps of run `run` (the instance's current run, under this write's fence). */
+  private async createGeneration(
+    tx: Tx,
+    instance: InstanceRow,
+    run: number,
+    operationId: string | null,
+  ) {
     const launch = launchOf(instance);
     if (!launch) {
       // The launched version cannot be read (should not happen: versions are validated).
       await this.gangStop(tx, instance, "definition_invalid");
       return;
     }
-    const latest = await tx.instanceStep.aggregate({
-      where: { instanceId: instance.id, phase: { not: "HEALTH" } },
-      _max: { generation: true },
-    });
-    const generation = (latest._max.generation ?? 0) + 1;
-    const ranks = instance.Ranks.filter((rank) => rank.nodeId !== null).map(rankInput);
+    const ranks = instance.Ranks.filter((rank) => rank.nodeId !== null);
+    // The leading stop of a restart names what each rank runs now (an earlier version's
+    // process, port and unit), so the node stops that process.
+    const physical = new Map<number, Physical>();
+    // Ranks with a proven stop (`stoppedThroughRun`, recorded when a restart retook a claim
+    // released with proof, or a leading stop succeeded), nothing launched since (no physical launch: runs since then, if
+    // any, never launched) and no earlier start still out: their leading stop has nothing to
+    // stop and is satisfied here. Sent, it would name this run's launch to a node that may keep
+    // the proven launch's stopped record, which refuses it. Without a proven stop it is sent
+    // (the node proves absence from its missing record; rows from before runs existed too).
+    const ended = new Set<number>();
+    if (run > 1)
+      for (const rank of ranks) {
+        const stored = await physicalLaunch(tx, instance.id, rank.rank);
+        if (stored) {
+          // An unreadable record names the instance's own launch (as before).
+          const found = await this.physicalOf(tx, instance, stored);
+          if (found) physical.set(rank.rank, found);
+        } else if (
+          rank.stoppedThroughRun > 0 &&
+          // No STOP is sent: nothing may still launch (`unresolvedStartsWhere`).
+          !(await startsUnresolved(tx, instance.id, rank.rank, run))
+        )
+          ended.add(rank.rank);
+      }
     const steps = generationSteps({
       instance: instanceInput(instance),
-      ranks,
+      ranks: ranks.map(rankInput),
       launch,
-      generation,
+      generation: run,
       operationId,
+      physical,
+      reservations: stepReservations(instance),
+      ended,
     });
-    await this.insertSteps(tx, instance, steps);
+    await this.insertSteps(tx, instance, run, steps);
+    // A satisfied leading stop proves what a sent one would (nothing of an earlier run runs).
+    for (const rank of ended) await recordStoppedThrough(tx, instance.id, rank, run - 1);
     // Earlier probes belong to the previous run.
     await tx.instanceStep.updateMany({
       where: { instanceId: instance.id, phase: "HEALTH", state: "PENDING", attempts: 0 },
@@ -539,37 +712,84 @@ export class RuntimeLifecycle {
         healthSuccesses: 0,
         unhealthySince: null,
         healthDetail: null,
-        cacheGeneration: `${instance.id}:${generation}`,
+        cacheGeneration: `${instance.id}:${run}`,
       },
     });
   }
 
-  private async insertSteps(tx: Tx, instance: InstanceRow, steps: readonly NewStep[]) {
-    const nodeByRank = new Map(instance.Ranks.map((rank) => [rank.rank, rank.nodeId]));
+  /**
+   * What physically runs on a rank: the stored intent of its latest launch (any run) and that
+   * version's launch. Undefined when nothing was ever launched there (the instance's own launch
+   * then: the node proves absence from its missing record).
+   */
+  private async physical(
+    tx: Tx,
+    instance: InstanceRow,
+    rank: number,
+  ): Promise<Physical | undefined> {
+    const stored = await physicalLaunch(tx, instance.id, rank);
+    return stored ? this.physicalOf(tx, instance, stored) : undefined;
+  }
+
+  /** The node's answer to this stop or probe said its rank was idle (`InstanceStep.rankIdle`). */
+  private async answeredIdle(tx: Tx, stepId: string): Promise<boolean> {
+    const row = await tx.instanceStep.findUnique({
+      where: { id: stepId },
+      select: { rankIdle: true },
+    });
+    return row?.rankIdle === true;
+  }
+
+  /** `physical` from the stored launch (`physicalLaunch`); undefined when it is unreadable. */
+  private async physicalOf(
+    tx: Tx,
+    instance: InstanceRow,
+    stored: { intent: Prisma.JsonValue; headAddr: string | null },
+  ): Promise<Physical | undefined> {
+    const intent = stepIntentSchema.safeParse(stored.intent);
+    if (!intent.success) return undefined;
+    let launch = launchOf(instance);
+    if (intent.data.launchVersionId !== instance.launchVersionId) {
+      // Owner-scoped, like the command author's lookup (`stepCommandAuthor`).
+      const version = await tx.runtimeVersion.findFirst({
+        where: { id: intent.data.launchVersionId, Runtime: { userId: instance.userId } },
+        select: { spec: true },
+      });
+      const spec = version?.spec;
+      const parsed = runtimeLaunchSchema.safeParse(
+        spec && typeof spec === "object" && "launch" in spec ? Reflect.get(spec, "launch") : null,
+      );
+      if (parsed.success) launch = parsed.data;
+    }
+    return launch ? { intent: intent.data, launch, headAddr: stored.headAddr } : undefined;
+  }
+
+  /**
+   * Every step is created here, in the instance's current run `run` (read under this write's
+   * fence; the SQL trigger `instance_run_order` refuses any other generation too).
+   */
+  private async insertSteps(tx: Tx, instance: InstanceRow, run: number, steps: readonly NewStep[]) {
+    const rankByNumber = new Map(instance.Ranks.map((rank) => [rank.rank, rank]));
     for (const step of steps) {
-      const nodeId = nodeByRank.get(step.rank);
-      if (!nodeId) continue;
+      if (step.generation !== run || run < 1)
+        throw new Error("A new step belongs to its instance's current run.");
+      const rank = rankByNumber.get(step.rank);
+      if (!rank?.nodeId) continue;
       await tx.instanceStep.create({
         data: {
           instanceId: instance.id,
-          nodeId,
+          nodeId: rank.nodeId,
           rank: step.rank,
           phase: step.phase,
           sequence: step.sequence,
           generation: step.generation,
           intent: step.intent,
           intentHash: step.intentHash,
+          headAddr: step.headAddr ?? null,
+          ...(step.state ? { state: step.state } : {}),
         },
       });
     }
-  }
-
-  private async currentGeneration(tx: Tx, instanceId: string): Promise<number> {
-    const latest = await tx.instanceStep.aggregate({
-      where: { instanceId, phase: { not: "HEALTH" } },
-      _max: { generation: true },
-    });
-    return latest._max.generation ?? 0;
   }
 
   // ── Stops ──
@@ -601,6 +821,7 @@ export class RuntimeLifecycle {
    * still goes to the back of the line, and one another server process took first is skipped.
    */
   private async reconcileStopping() {
+    // sweep: stamp rotation (lastStopReconcileAt, ./sweep.ts)
     const rows = await prisma.runtimeInstance.findMany({
       where: { phase: "STOPPING", desiredState: { not: null } },
       select: { id: true, userId: true, lastStopReconcileAt: true },
@@ -650,7 +871,8 @@ export class RuntimeLifecycle {
    */
   private async settleStopping(tx: Tx, instance: InstanceRow) {
     const now = this.now();
-    const generation = await this.currentGeneration(tx, instance.id);
+    // The run that owns the claims: its gang stops and probes are created at it.
+    const run = await resolveRun(tx, instance.id);
     // Pending start-phase and health steps never run now. Never-sent ones are CANCELLED (proof
     // they never ran); a re-queued one (attempts > 0) may have run and is FAILED. A hold's
     // reason does not outlive the hold.
@@ -685,49 +907,26 @@ export class RuntimeLifecycle {
     // answer; the instance's stops wait behind it (dispatch).
     await this.settleOperatorSteps(tx, instance.id, START_PHASES, "stopped");
     const launch = launchOf(instance);
-    const steps = await tx.instanceStep.findMany({
-      where: { instanceId: instance.id, generation, phase: { not: "HEALTH" } },
-      select: {
-        rank: true,
-        phase: true,
-        state: true,
-        sequence: true,
-        attempts: true,
-        errorCode: true,
+    // This run's gang stops (not its leading stop, not status probes).
+    const stopSteps = await tx.instanceStep.findMany({
+      where: {
+        instanceId: instance.id,
+        generation: run,
+        phase: "STOP",
+        sequence: { gte: run * GENERATION_STRIDE + STOP_ORDER_BASE },
       },
+      select: { rank: true, state: true, errorCode: true },
     });
     let needsMarkStopped = false;
     // Claims as they are now (a caller's copy may predate a release in this transaction).
     const current = await tx.instanceRank.findMany({ where: { instanceId: instance.id } });
     for (const rank of current) {
+      if (rank.claim !== "HELD" && rank.claim !== "HELD_UNKNOWN") continue;
+      // Provably never ran since the last proven stop (evaluated by the release itself), marked
+      // stopped or not: nothing to probe or stop.
+      if (await releaseClaim(tx, rank.id, now, { neverRan: true })) continue;
       if (rank.claim !== "HELD") continue;
-      const mine = steps.filter((step) => step.rank === rank.rank);
-      const starts = mine.filter((step) => step.phase !== "STOP" && step.phase !== "STATUS");
-      const leadingStop = mine.find(
-        (step) => step.phase === "STOP" && step.sequence === generation * GENERATION_STRIDE,
-      );
-      // Attempts count only dispatches that may have run something (a declined operator
-      // terminal, or one ended before its screen came up, gives its attempt back), so a FAILED
-      // step without one never ran.
-      const neverRan = starts.every(
-        (step) =>
-          step.state === "CANCELLED" ||
-          (step.state === "PENDING" && step.attempts === 0) ||
-          (step.state === "FAILED" &&
-            (step.attempts === 0 || PRE_ADMISSION.has(step.errorCode ?? ""))),
-      );
-      const priorProven = generation <= 1 || leadingStop?.state === "SUCCEEDED";
-      if (neverRan && priorProven) {
-        await this.release(tx, rank.id, now);
-        continue;
-      }
-      // This run's gang stops of the rank (not its leading stop, not status probes).
-      const stops = mine.filter(
-        (step) =>
-          step.phase === "STOP" &&
-          step.sequence >= generation * GENERATION_STRIDE + STOP_ORDER_BASE &&
-          step.sequence < (generation + 1) * GENERATION_STRIDE,
-      );
+      const stops = stopSteps.filter((step) => step.rank === rank.rank);
       // Offline too long: the stop cannot be proven until the node returns (a person may
       // mark it stopped), whether or not a stop is still queued for it.
       if (
@@ -751,27 +950,22 @@ export class RuntimeLifecycle {
         // mark it stopped only once a probe could not prove it (or none can be sent); the probe keeps
         // being repeated, so a later proof still completes the stop with no person.
         // A person who gave up on an interactive stop decides at once (the probe still runs).
-        const probeUnproven = await this.probeStoppingRank(
-          tx,
-          instance,
-          rank,
-          launch,
-          generation,
-          now,
-        );
+        const probeUnproven = await this.probeStoppingRank(tx, instance, rank, launch, run, now);
         if (probeUnproven || failed.some((step) => step.errorCode === OPERATOR_CANCELLED))
           needsMarkStopped = true;
         continue;
       }
-      await this.insertSteps(tx, instance, [
+      // A gang stop of this run, naming what physically runs on the rank.
+      await this.insertSteps(tx, instance, run, [
         stopStep({
           instance: instanceInput(instance),
           rank: rankInput(rank),
           nnodes: instance.Ranks.length,
           launch,
-          generation: Math.max(generation, 1),
+          generation: run,
           attempt: stops.length,
           operationId: instance.operationId,
+          physical: await this.physical(tx, instance, rank.rank),
         }),
       ]);
     }
@@ -806,7 +1000,7 @@ export class RuntimeLifecycle {
     instance: InstanceRow,
     rank: InstanceRow["Ranks"][number],
     launch: RuntimeLaunch,
-    generation: number,
+    run: number,
     now: Date,
   ): Promise<boolean> {
     if (rank.nodeId === null) return true;
@@ -814,14 +1008,8 @@ export class RuntimeLifecycle {
     // away for MARK_STOPPED_AFTER_OFFLINE_MS (a node connected to another server process is online).
     if (await this.offlineSince(tx, rank.nodeId, 0))
       return this.offlineSince(tx, rank.nodeId, MARK_STOPPED_AFTER_OFFLINE_MS);
-    const probeGeneration = Math.max(generation, 1);
     const probes = await tx.instanceStep.findMany({
-      where: {
-        instanceId: instance.id,
-        rank: rank.rank,
-        generation: probeGeneration,
-        phase: "STATUS",
-      },
+      where: { instanceId: instance.id, rank: rank.rank, generation: run, phase: "STATUS" },
       select: { state: true, updatedAt: true },
     });
     const finished = probes.filter(
@@ -831,16 +1019,17 @@ export class RuntimeLifecycle {
     if (probes.length > finished.length) return finished.length > 0;
     const latest = Math.max(0, ...finished.map((probe) => probe.updatedAt.getTime()));
     if (finished.length === 0 || latest <= now.getTime() - HELD_UNKNOWN_PROBE_MS)
-      await this.insertSteps(tx, instance, [
+      await this.insertSteps(tx, instance, run, [
         stopStep({
           instance: instanceInput(instance),
           rank: rankInput(rank),
           nnodes: instance.Ranks.length,
           launch,
-          generation: probeGeneration,
+          generation: run,
           attempt: await this.nextStatusAttempt(tx, instance.id, rank.rank),
           operationId: null,
           phase: "STATUS",
+          physical: await this.physical(tx, instance, rank.rank),
         }),
       ]);
     return finished.length > 0;
@@ -867,11 +1056,6 @@ export class RuntimeLifecycle {
     });
     const since = node ? offlineSinceOf(node, this.now()) : null;
     return since !== null && since.getTime() <= this.now().getTime() - ms;
-  }
-
-  /** A proven stop releases the claim (the same release a person's unproven release uses). */
-  private async release(tx: Tx, rankId: string, now: Date) {
-    await releaseClaim(tx, rankId, now);
   }
 
   /** Every claim is released or marked stopped: STOPPED, then the restart rule for RUNNING. */
@@ -983,17 +1167,21 @@ export class RuntimeLifecycle {
 
   /** (RUNNING, STOPPED) past `nextRestartAt`: retake the claims and start a new generation. */
   private async restartDue() {
-    const rows = await prisma.runtimeInstance.findMany({
-      where: {
-        desiredState: "RUNNING",
-        phase: "STOPPED",
-        nextRestartAt: { lte: this.now() },
-        // An inactive owner's instance never starts (it restarts once the owner is active).
-        Runtime: { User: activeOwner(this.now()) },
-      },
-      select: { id: true, userId: true },
-      take: BATCH,
-    });
+    const rows = await this.sweeps.restart.next((page) =>
+      prisma.runtimeInstance.findMany({
+        where: {
+          ...page.where,
+          desiredState: "RUNNING",
+          phase: "STOPPED",
+          nextRestartAt: { lte: this.now() },
+          // An inactive owner's instance never starts (it restarts once the owner is active).
+          Runtime: { User: activeOwner(this.now()) },
+        },
+        select: { id: true, userId: true },
+        orderBy: page.orderBy,
+        take: page.take,
+      }),
+    );
     for (const row of rows) {
       await this.write(row.userId, row.id, async (tx) => {
         const instance = await tx.runtimeInstance.findUnique({
@@ -1034,8 +1222,11 @@ export class RuntimeLifecycle {
 
   private async retake(tx: Tx, instance: InstanceRow) {
     const now = this.now();
-    if (instance.Ranks.some((rank) => rank.nodeId === null)) {
-      // A rank's node was deleted: nothing to restart on.
+    if (
+      instance.Ranks.some((rank) => rank.nodeId === null) ||
+      reservationsOf(instance).some((reservation) => reservation.nodeId === null)
+    ) {
+      // A rank's (or reservation's) node was deleted: nothing to restart on.
       await tx.runtimeInstance.update({
         where: { id: instance.id },
         data: {
@@ -1047,12 +1238,90 @@ export class RuntimeLifecycle {
       });
       return;
     }
-    await tx.instanceRank.updateMany({
-      where: { instanceId: instance.id },
-      data: { ...retakenClaim(now), blockedBy: [] },
+    // Its claims were released while it backed off: another start may have taken the room.
+    // The planner checks it like a start's (the same budgets, under this owner fence): ranks on
+    // their own nodes and ports, reservations by their labels. No room: it stays STOPPED and
+    // tries again later, without spending its restart budget. (An unreadable launch is failed
+    // by createGeneration below.)
+    const launch = launchOf(instance);
+    const plan = launch
+      ? await planRetake(
+          tx,
+          {
+            id: instance.id,
+            userId: instance.userId,
+            runtimeId: instance.runtimeId,
+            launchVersionId: instance.launchVersionId,
+            startedBy: instance.startedBy,
+            ranks: instance.Ranks.flatMap((rank) =>
+              rank.nodeId
+                ? [
+                    {
+                      rank: rank.rank,
+                      nodeId: rank.nodeId,
+                      port: rank.port,
+                      distPort: rank.distPort,
+                    },
+                  ]
+                : [],
+            ),
+            reservations: reservationsOf(instance),
+          },
+          launch,
+          now,
+        )
+      : null;
+    if (plan && !plan.ok) {
+      await tx.runtimeInstance.update({
+        where: { id: instance.id },
+        data: {
+          // Why, for the runtime page and agents: `waiting_<refusal reason>` (not enough
+          // memory, a port in use, a node offline or on hold, ...).
+          phaseReason: waitingReason(plan.refusal.reason),
+          nextRestartAt: new Date(now.getTime() + RETAKE_RETRY_MS),
+        },
+      });
+      return;
+    }
+    // Always through the one retake, which begins the new run: a run proven stopped leaves no
+    // reservation row (a superseded one included) that the retaken claim would hold again.
+    const run = await retakeInstanceClaims(tx, {
+      instanceId: instance.id,
+      now,
+      // An unreadable launch (failed by createGeneration below) plans none: the old run's
+      // rows go (it stopped) or stay superseded while it may still run.
+      reservations: plan ? plan.start.reservations : [],
+      writeRanks: async (claim) => {
+        await tx.instanceRank.updateMany({
+          where: { instanceId: instance.id },
+          // The stopping instances whose room on these nodes the plan counted on: START waits.
+          data: { ...claim, blockedBy: plan ? plan.start.blockedBy : [] },
+        });
+        if (!plan) return;
+        // What the planner admitted is what the ranks hold, as a start's (`writePlannedStarts`):
+        // the GPUs it picked, and the ports it kept or moved (one outside the node's range now,
+        // or taken meanwhile, moved).
+        const ranks = [...instance.Ranks].sort((a, b) => a.rank - b.rank);
+        for (const placement of plan.start.placements) {
+          const rank = ranks[placement.nodeNumber - 1];
+          if (
+            !rank ||
+            (canonicalJson(rank.resources) === canonicalJson(placement.resources) &&
+              rank.port === placement.port &&
+              rank.distPort === plan.start.distPort)
+          )
+            continue;
+          await tx.instanceRank.update({
+            where: { id: rank.id },
+            data: {
+              port: placement.port,
+              distPort: plan.start.distPort,
+              resources: placement.resources as Prisma.InputJsonObject,
+            },
+          });
+        }
+      },
     });
-    // The claims are held by the new run: a request to release the old one has nothing left.
-    await clearInstanceReleaseRequests(tx, instance.id, now);
     await tx.runtimeInstance.update({
       where: { id: instance.id },
       data: {
@@ -1061,30 +1330,40 @@ export class RuntimeLifecycle {
         phaseChangedAt: now,
         nextRestartAt: null,
         restartsInWindow: { increment: 1 },
+        // The fabric the plan chose (a multi-node instance; `settleStopped` cleared the old
+        // one), as a start's (`writePlannedStarts`): its steps resolve the head address on it.
+        // No fabric fits: the planner refused above and the restart waits.
+        fabricId: plan?.start.fabric?.fabricId ?? null,
       },
     });
     const fresh = await tx.runtimeInstance.findUniqueOrThrow({
       where: { id: instance.id },
       include: INSTANCE_INCLUDE,
     });
-    await this.createGeneration(tx, fresh, fresh.operationId);
+    await this.createGeneration(tx, fresh, run, fresh.operationId);
   }
 
   // ── Live instances: readiness, health, unavailability ──
 
   private async watchLive() {
-    const rows = await prisma.runtimeInstance.findMany({
-      where: { desiredState: "RUNNING", phase: { in: [...LIVE_PHASES] } },
-      select: { id: true, userId: true },
-      take: BATCH * 4,
-    });
+    const rows = await this.sweeps.watch.next((page) =>
+      prisma.runtimeInstance.findMany({
+        where: { ...page.where, desiredState: "RUNNING", phase: { in: [...LIVE_PHASES] } },
+        select: { id: true, userId: true },
+        orderBy: page.orderBy,
+        take: page.take,
+      }),
+    );
     for (const row of rows) {
       await this.write(row.userId, row.id, async (tx) => {
         const instance = await tx.runtimeInstance.findUnique({
           where: { id: row.id },
           include: INSTANCE_INCLUDE,
         });
+        // Again under the fence: the row was read before it, and a crash or stop meanwhile may
+        // have ended the run (a FAILED instance must not come back as UNAVAILABLE or STARTING).
         if (instance?.desiredState !== "RUNNING") return;
+        if (!(LIVE_PHASES as readonly string[]).includes(instance.phase)) return;
         await this.watchInstance(tx, instance);
       }).catch((error: unknown) =>
         console.error("[lifecycle] watching an instance failed", errorName(error)),
@@ -1095,19 +1374,32 @@ export class RuntimeLifecycle {
 
   private async watchInstance(tx: Tx, instance: InstanceRow) {
     const now = this.now();
+    // The run is persisted before anything here changes the phase: a legacy row's committed,
+    // unprepared restart is read from its phase and operation (`resolveRun`), and nothing below
+    // may lose it.
+    const run = await resolveRun(tx, instance.id);
     const nodeIds = instance.Ranks.flatMap((rank) => (rank.nodeId ? [rank.nodeId] : []));
+    // A reservation's node (`launch.reservations`) is watched like a rank's: the instance's
+    // launcher uses it, so its loss makes the instance UNAVAILABLE and stops it like a group's.
+    const reservations = reservationsOf(instance);
+    const reservationNodeIds = reservations.flatMap((reservation) =>
+      reservation.nodeId ? [reservation.nodeId] : [],
+    );
+    const watched = [...new Set([...nodeIds, ...reservationNodeIds])];
+    const deleted =
+      nodeIds.length !== instance.Ranks.length || reservationNodeIds.length !== reservations.length;
     // The durable connection state (any replica's sessions), not this process's map. Right
     // after this process started, nodes are still reconnecting: nothing is marked yet.
     const rows = await tx.node.findMany({
-      where: { id: { in: nodeIds } },
+      where: { id: { in: watched } },
       select: { id: true, connection: true, lastDisconnectedAt: true, lastHeartbeatAt: true },
     });
     const onlineIds = new Set(
       rows.filter((node) => offlineSinceOf(node, now) === null).map((node) => node.id),
     );
-    const offline = nodeIds.filter((nodeId) => !onlineIds.has(nodeId));
+    const offline = watched.filter((nodeId) => !onlineIds.has(nodeId));
     if (offline.length > 0 && now.getTime() - this.startedAt < STARTUP_GRACE_MS) return;
-    if (offline.length > 0 || nodeIds.length !== instance.Ranks.length) {
+    if (offline.length > 0 || deleted) {
       if (instance.phase !== "UNAVAILABLE") {
         await tx.runtimeInstance.update({
           where: { id: instance.id },
@@ -1121,22 +1413,22 @@ export class RuntimeLifecycle {
         return;
       }
       const since = instance.unavailableSince ?? instance.phaseChangedAt;
-      // A rank whose node was deleted never comes back: stop now. Otherwise the online ranks
-      // of a multi-node instance stop after unavailableStopMs (their GPUs are freed).
-      if (nodeIds.length !== instance.Ranks.length)
-        await this.gangStop(tx, instance, "node_deleted");
+      // A rank's or reservation's node that was deleted never comes back: stop now. Otherwise
+      // the online ranks of a multi-node instance, or of one with reservations, stop after
+      // unavailableStopMs (their GPUs and reserved memory are freed).
+      if (deleted) await this.gangStop(tx, instance, "node_deleted");
       else if (
-        instance.Ranks.length > 1 &&
+        instance.Ranks.length + reservations.length > 1 &&
         now.getTime() - since.getTime() >= advancedInt(instance, "unavailableStopMs")
       )
         await this.gangStop(tx, instance, "node_offline");
       return;
     }
     if (instance.phase === "UNAVAILABLE") {
-      // Back: READY if this run had reached readiness (health probes confirm), else STARTING.
-      const generation = await this.currentGeneration(tx, instance.id);
+      // Back: READY if this run had reached readiness (health probes confirm), else STARTING
+      // (a restart committed meanwhile has no readiness of its own: an earlier run's says nothing).
       const ready = await tx.instanceStep.count({
-        where: { instanceId: instance.id, generation, phase: "READINESS", state: "SUCCEEDED" },
+        where: { instanceId: instance.id, generation: run, phase: "READINESS", state: "SUCCEEDED" },
       });
       await tx.runtimeInstance.update({
         where: { id: instance.id },
@@ -1179,30 +1471,36 @@ export class RuntimeLifecycle {
       where: { instanceId: instance.id, phase: "HEALTH" },
       _max: { sequence: true },
     });
-    await this.insertSteps(tx, instance, [
+    const run = await resolveRun(tx, instance.id);
+    await this.insertSteps(tx, instance, run, [
       healthStep({
         instance: instanceInput(instance),
         head: rankInput(head),
         nnodes: instance.Ranks.length,
         launch,
-        generation: await this.currentGeneration(tx, instance.id),
+        generation: run,
         sequence: (latest._max.sequence ?? HEALTH_SEQUENCE_BASE - 1) + 1,
+        reservations: stepReservations(instance),
       }),
     ]);
   }
 
   private async pruneHealth() {
     // Finished probes only (bounded: a WHERE on phase, state and age).
-    await prisma.instanceStep
-      .findMany({
-        where: {
-          phase: "HEALTH",
-          state: { in: ["SUCCEEDED", "FAILED", "CANCELLED"] },
-          updatedAt: { lt: new Date(this.now().getTime() - HEALTH_HISTORY_MS) },
-        },
-        select: { id: true, Instance: { select: { userId: true, id: true } } },
-        take: BATCH * 4,
-      })
+    await this.sweeps.prune
+      .next((page) =>
+        prisma.instanceStep.findMany({
+          where: {
+            ...page.where,
+            phase: "HEALTH",
+            state: { in: ["SUCCEEDED", "FAILED", "CANCELLED"] },
+            updatedAt: { lt: new Date(this.now().getTime() - HEALTH_HISTORY_MS) },
+          },
+          select: { id: true, Instance: { select: { userId: true, id: true } } },
+          orderBy: page.orderBy,
+          take: page.take,
+        }),
+      )
       .then(async (rows) => {
         const byOwner = new Map<string, string[]>();
         for (const row of rows) {
@@ -1210,9 +1508,12 @@ export class RuntimeLifecycle {
           list.push(row.id);
           byOwner.set(row.Instance.userId, list);
         }
+        // One owner's failing write does not hold the others' back.
         for (const [userId, ids] of byOwner)
           await graphWrite([userId], (tx) =>
             tx.instanceStep.deleteMany({ where: { id: { in: ids }, phase: "HEALTH" } }),
+          ).catch((error: unknown) =>
+            console.error("[lifecycle] pruning probes failed", errorName(error)),
           );
       })
       .catch((error: unknown) =>
@@ -1224,21 +1525,30 @@ export class RuntimeLifecycle {
 
   private async expireSteps() {
     const now = this.now();
-    const rows = await prisma.instanceStep.findMany({
-      where: {
-        state: "RUNNING",
-        deadline: { lte: now },
-        OR: [
-          // A person's run is never expired; only its need is raised (once, below).
-          { operatorAcceptedAt: null },
-          { Instance: { needsOperator: null } },
-        ],
-      },
-      select: { id: true, instanceId: true, Instance: { select: { userId: true } } },
-      orderBy: { deadline: "asc" },
-      take: BATCH,
-    });
-    for (const row of rows) {
+    const page = await this.sweeps.expire.next((page) =>
+      prisma.instanceStep.findMany({
+        where: {
+          ...page.where,
+          state: "RUNNING",
+          deadline: { lte: now },
+          OR: [
+            // A person's run (of any run) is never expired; only its need is raised (once,
+            // below), which takes it out of this sweep.
+            { operatorAcceptedAt: null },
+            { Instance: { needsOperator: null } },
+          ],
+        },
+        select: {
+          id: true,
+          instanceId: true,
+          deadline: true,
+          Instance: { select: { userId: true } },
+        },
+        orderBy: page.orderBy,
+        take: page.take,
+      }),
+    );
+    for (const row of byKey(page, (row) => row.deadline?.getTime() ?? 0)) {
       await this.write(row.Instance.userId, row.instanceId, async (tx) => {
         const step = await tx.instanceStep.findUnique({ where: { id: row.id } });
         if (step?.state !== "RUNNING" || !step.deadline || step.deadline > this.now()) return;
@@ -1270,27 +1580,42 @@ export class RuntimeLifecycle {
   private async dispatchSteps() {
     const online = this.relay.onlineNodeIds?.();
     if (online && online.length === 0) return;
-    const rows = await prisma.instanceStep.findMany({
-      where: {
-        state: "PENDING",
-        AND: [
-          { OR: [{ notBefore: null }, { notBefore: { lte: this.now() } }] },
-          // Stops and status probes go out for every owner; nothing else for an inactive one
-          // (claimStep checks again under the fence).
-          {
-            OR: [
-              { phase: { in: ["STOP", "STATUS"] } },
-              { Instance: { Runtime: { User: activeOwner(this.now()) } } },
-            ],
-          },
-        ],
-        // Steps that can go now: on a connected node.
-        ...(online ? { nodeId: { in: online } } : {}),
-      },
-      select: { id: true, nodeId: true, instanceId: true, Instance: { select: { userId: true } } },
-      orderBy: [{ sequence: "asc" }, { createdAt: "asc" }],
-      take: BATCH * 4,
-    });
+    const page = await this.sweeps.dispatch.next((page) =>
+      prisma.instanceStep.findMany({
+        where: {
+          ...page.where,
+          state: "PENDING",
+          AND: [
+            { OR: [{ notBefore: null }, { notBefore: { lte: this.now() } }] },
+            // Stops and status probes go out for every owner; nothing else for an inactive one
+            // (claimStep checks again under the fence).
+            {
+              OR: [
+                { phase: { in: ["STOP", "STATUS"] } },
+                { Instance: { Runtime: { User: activeOwner(this.now()) } } },
+              ],
+            },
+          ],
+          // Steps that can go now: on a connected node.
+          ...(online ? { nodeId: { in: online } } : {}),
+        },
+        select: {
+          id: true,
+          nodeId: true,
+          instanceId: true,
+          sequence: true,
+          createdAt: true,
+          Instance: { select: { userId: true } },
+        },
+        orderBy: page.orderBy,
+        take: page.take,
+      }),
+    );
+    // Steps that wait (their turn, a blocker, a person's run) stay PENDING: the cursor reaches
+    // the rest. A page goes out in sequence order, then creation order.
+    const rows = [...page].sort(
+      (a, b) => a.sequence - b.sequence || a.createdAt.getTime() - b.createdAt.getTime(),
+    );
     for (const row of rows) {
       const session = this.relay.nodeSession(row.nodeId);
       // Defence in depth: a step goes only to a node of its instance's owner (claimStep checks
@@ -1309,6 +1634,10 @@ export class RuntimeLifecycle {
         connectionGeneration: session.connectionGeneration,
         userId: row.Instance.userId,
         ownerCheck: "runtime_step",
+        stopsStartsThrough: startsEndedBy(
+          job,
+          isLeadingStop({ phase: "STOP", sequence: row.sequence, generation: job.generation }),
+        ),
       });
       if (!sent) await this.undeliver(row.Instance.userId, row.instanceId, row.id, job.ownerEpoch);
     }
@@ -1318,7 +1647,13 @@ export class RuntimeLifecycle {
   private async claimStep(
     tx: Tx,
     stepId: string,
-    session: { connectionGeneration: number; trust: NodeTrustWire; operatorTerminals?: boolean },
+    session: {
+      connectionGeneration: number;
+      trust: NodeTrustWire;
+      operatorTerminals?: boolean;
+      jobReservations?: boolean;
+      rankIdle?: boolean;
+    },
   ) {
     const now = this.now();
     const step = await tx.instanceStep.findUnique({
@@ -1334,23 +1669,30 @@ export class RuntimeLifecycle {
       await this.afterStep(tx, step, false, "bad_job");
       return null;
     }
-    // A gang stop for a claim released meanwhile has nothing to stop (a leading stop of a new
-    // run always has its claim HELD).
+    // One gate for every phase: a step of an earlier run (prepared before a restart was
+    // committed, or re-queued after a lost session) never goes out. Its run no longer owns the
+    // claims; the current run's own steps (its leading stop first) take over.
+    const run = await resolveRun(tx, instance.id);
+    if (!owned(step, run)) {
+      await tx.instanceStep.updateMany({
+        where: { id: step.id, state: "PENDING" },
+        data:
+          step.attempts === 0
+            ? { state: "CANCELLED", operatorHold: null }
+            : { state: "FAILED", errorCode: "superseded", operatorHold: null },
+      });
+      if (step.operatorHold !== null) await this.syncNeedsOperator(tx, instance.id);
+      return null;
+    }
+    // A stop for a claim released meanwhile has nothing to stop (a leading stop of a new run
+    // always has its claim HELD), and a probe of a claim that is no longer marked stopped would act
+    // on the run in progress: neither goes out.
     if (step.phase === "STOP" || step.phase === "STATUS") {
       const claim = instance.Ranks.find((rank) => rank.rank === step.rank)?.claim;
-      // A stop of an earlier run, or a probe of a claim that is no longer marked stopped, would act
-      // on the run that holds the claim now: it never goes out.
-      const superseded =
-        (step.phase === "STOP" &&
-          step.generation < (await this.currentGeneration(tx, instance.id))) ||
-        (step.phase === "STATUS" &&
-          !statusProbeWanted(
-            instance,
-            claim,
-            step.generation,
-            await this.currentGeneration(tx, instance.id),
-          ));
-      if (claim === "RELEASED" || superseded) {
+      if (
+        claim === "RELEASED" ||
+        (step.phase === "STATUS" && !statusProbeWanted(instance, claim))
+      ) {
         await tx.instanceStep.updateMany({
           where: { id: step.id, state: "PENDING" },
           data:
@@ -1364,18 +1706,6 @@ export class RuntimeLifecycle {
     }
     const startPhase = isStartPhase(step.phase);
     if (startPhase || step.phase === "HEALTH") {
-      // A step of an earlier run (re-queued after a lost session) never runs in a later one.
-      if (step.generation < (await this.currentGeneration(tx, instance.id))) {
-        await tx.instanceStep.updateMany({
-          where: { id: step.id, state: "PENDING" },
-          data:
-            step.attempts === 0
-              ? { state: "CANCELLED", operatorHold: null }
-              : { state: "FAILED", errorCode: "superseded", operatorHold: null },
-        });
-        if (step.operatorHold !== null) await this.syncNeedsOperator(tx, instance.id);
-        return null;
-      }
       if (instance.desiredState !== "RUNNING") return null;
       if (startPhase && instance.phase !== "STARTING") return null;
       if (step.phase === "HEALTH" && instance.phase !== "READY" && instance.phase !== "UNHEALTHY")
@@ -1383,6 +1713,18 @@ export class RuntimeLifecycle {
       // A banned or deleting owner's instance never starts (or runs anything but stops and
       // status probes); the step waits, and is cancelled if a person would have to answer it.
       if (!(await this.ownerActive(tx, instance.userId))) return null;
+    }
+    if (step.phase !== "HEALTH") {
+      // Confirm screens of earlier runs that nobody accepted are closed: nobody answers them
+      // now, and they would hold this run's stops back. A person's run already accepted keeps
+      // running and is waited for below.
+      await this.settleOperatorSteps(tx, instance.id, ALL_STEP_PHASES, "superseded", {
+        before: run,
+      });
+      if (isLeadingStop(step) && (await startsUnresolved(tx, instance.id, step.rank, run)))
+        // This run's leading stop proves every earlier launch of the rank ended: it waits until
+        // each one sent earlier answered (its result, its deadline, or its session's loss).
+        return null;
     }
     const node = await tx.node.findUnique({
       where: { id: step.nodeId },
@@ -1397,10 +1739,33 @@ export class RuntimeLifecycle {
     if (node.connectionGeneration !== session.connectionGeneration) return null;
     const fullControl =
       node.trust === "FULL" && node.trustLowerRequestedAt === null && session.trust === "full";
-    // Agents cannot start anything on a Relay-only node, on any path (owner decision).
-    if (startPhase && !fullControl && instance.startedBy === "AGENT") {
+    // Agents cannot start anything on a Relay-only node, on any path (owner decision): nor
+    // reserve memory on one (a reservation node lowered after placement; a deleted one counts
+    // as not Full, as for ranks).
+    if (
+      startPhase &&
+      instance.startedBy === "AGENT" &&
+      (!fullControl ||
+        reservationsOf(instance).some(
+          (row) => row.Node === null || effectiveTrust(row.Node) !== "FULL",
+        ))
+    ) {
       await this.failStep(tx, step.id, "trust_relay");
       await this.afterStep(tx, step, false, "trust_relay");
+      return null;
+    }
+    // Runtime jobs go only to a CLI that proves what it runs (`features.rankIdle`): an older one
+    // cannot say whether a start it admitted may still launch, so none of its stops could be
+    // trusted. Refused here, saying to upgrade.
+    // A run with reservations tells its commands which nodes they got (the job's
+    // `reservations`). A CLI from before them refuses such a job outright, so the start fails
+    // here, saying to upgrade too.
+    if (
+      session.rankIdle !== true ||
+      (startPhase && stepJobReservations(intent.data) && session.jobReservations !== true)
+    ) {
+      await this.failStep(tx, step.id, CLI_UPGRADE_REQUIRED);
+      await this.afterStep(tx, step, false, CLI_UPGRADE_REQUIRED);
       return null;
     }
     if (startPhase) {
@@ -1415,15 +1780,37 @@ export class RuntimeLifecycle {
         },
       });
       if (lower > 0) return null;
+      // This run's leading stop (generation > 1) succeeded: the runs whose claims a restart
+      // kept (superseded reservations, the ranks' previous claims) have stopped, so those stop
+      // holding now.
+      await dropSupersededHolds(tx, instance.id, step.generation);
       // Queued behind instances this operation stops: wait until they released.
       const blockers = [...new Set(instance.Ranks.flatMap((rank) => rank.blockedBy))];
       if (blockers.length > 0) {
         // Only the blockers' claims on the nodes this start uses: a blocker rank stuck on
         // another (offline) node frees nothing here and must not hold the start forever.
-        const startNodes = instance.Ranks.flatMap((rank) => (rank.nodeId ? [rank.nodeId] : []));
-        const holding = await tx.instanceRank.count({
-          where: { instanceId: { in: blockers }, claim: "HELD", nodeId: { in: startNodes } },
-        });
+        // Reservation nodes count too: what a blocker holds there is used once this runs.
+        // Held means not RELEASED, as placement counts it: a claim marked stopped
+        // (HELD_UNKNOWN) may still be running and keeps its memory until a proof or a person
+        // releases it, and a reservation holds while one of its instance's ranks does.
+        const startNodes = [...instance.Ranks, ...reservationsOf(instance)].flatMap((row) =>
+          row.nodeId ? [row.nodeId] : [],
+        );
+        const holding =
+          (await tx.instanceRank.count({
+            where: {
+              instanceId: { in: blockers },
+              claim: { not: "RELEASED" },
+              nodeId: { in: startNodes },
+            },
+          })) +
+          (await tx.instanceReservation.count({
+            where: {
+              instanceId: { in: blockers },
+              nodeId: { in: startNodes },
+              ...HOLDING_RESERVATION_WHERE,
+            },
+          }));
         if (holding > 0) return null;
         // Released: a later start of a blocker must not hold this instance back again.
         await tx.instanceRank.updateMany({
@@ -1457,8 +1844,14 @@ export class RuntimeLifecycle {
         return null;
       }
     }
-    let headAddr: string | null = null;
-    if (intent.data.nnodes > 1) {
+    // A stop or status probe names the head address its launch was dispatched with (recorded on
+    // the step), so it still reaches a surviving rank after the head's node was deleted; every
+    // other step (and one recorded before steps kept it) resolves the head's fabric address now.
+    let headAddr: string | null =
+      intent.data.nnodes > 1 && (step.phase === "STOP" || step.phase === "STATUS")
+        ? (step.headAddr ?? null)
+        : null;
+    if (intent.data.nnodes > 1 && !headAddr) {
       const head = instance.Ranks.find((rank) => rank.rank === 0);
       if (intent.data.fabricId && head?.nodeId) {
         const member = await tx.fabricMember.findFirst({
@@ -1474,11 +1867,13 @@ export class RuntimeLifecycle {
       }
     }
     const ownerEpoch = this.ownerEpoch(session.connectionGeneration);
-    // A fresh terminal per dispatch (ids are never reused), with who wrote the command.
+    // A fresh terminal per dispatch (ids are never reused), with who wrote the command: the
+    // author of the version the job names (a stop of a restart's earlier launch names that
+    // launch's version, never the successor's).
     const operator = interactive
       ? {
           terminalId: randomBytes(16).toString("base64url"),
-          commandAuthor: commandAuthor(instance.LaunchVersion.editor),
+          commandAuthor: await this.stepCommandAuthor(tx, instance, intent.data.launchVersionId),
         }
       : undefined;
     // An interactive job's deadline here bounds only its terminal coming up; the person's run
@@ -1495,10 +1890,17 @@ export class RuntimeLifecycle {
         state: "RUNNING",
         ownerEpoch,
         attempts: { increment: 1 },
+        // Sent again after a counted dispatch: that one may have run (it is never forgotten,
+        // whatever this attempt answers).
+        mayHaveRun: mayHaveRunAfterRequeue(step.attempts),
+        // This dispatch is not answered yet.
+        rankIdle: null,
         deadline,
         leaseExpiresAt: deadline,
         notBefore: null,
         operatorHold: null,
+        // What it is sent with: a later stop of this launch names the same head.
+        ...(headAddr ? { headAddr } : {}),
         ...(operator ? { operatorTerminalId: operator.terminalId } : {}),
         ...(step.errorCode && OPERATOR_HOLD_CODES.has(step.errorCode) ? { errorCode: null } : {}),
       },
@@ -1516,6 +1918,7 @@ export class RuntimeLifecycle {
       ownerEpoch,
       headAddr,
       ...(operator ? { operator } : {}),
+      jobReservations: session.jobReservations === true,
     });
   }
 
@@ -1555,17 +1958,27 @@ export class RuntimeLifecycle {
   // ── Operator terminals (interactive steps) ──
 
   /**
-   * Whether a step of the instance waits for its person: an interactive step AWAITING_OPERATOR
-   * (terminal open or closed), a held one, or a person's run past its timeout.
+   * Whether a step waits for its person: of the instance's current run, an interactive step
+   * AWAITING_OPERATOR (terminal open or closed), a held one, or a person's run past its
+   * timeout; of any run, a person's accepted run past its timeout (`overdueAcceptedRun`).
+   * An earlier run's screens never raise (or keep) the need: whatever answers them, the
+   * successor's need is computed from its own steps. An earlier run's accepted command still
+   * runs on the node and the successor's stops wait behind it, so once it is past its timeout
+   * its person is asked to look at it (the need is attention only: it authorizes nothing, and
+   * the step's answer still changes nothing about the successor). The need also takes the step
+   * out of the deadline sweep, which never cuts a person's run off.
    */
   private async operatorStepWaiting(tx: Tx, instanceId: string): Promise<boolean> {
+    const run = await resolveRun(tx, instanceId);
     const waiting = await tx.instanceStep.count({
       where: {
         instanceId,
         OR: [
-          { state: "AWAITING_OPERATOR" },
-          { state: "PENDING", operatorHold: { not: null } },
-          { state: "RUNNING", operatorAcceptedAt: { not: null }, deadline: { lte: this.now() } },
+          {
+            generation: run,
+            OR: [{ state: "AWAITING_OPERATOR" }, { state: "PENDING", operatorHold: { not: null } }],
+          },
+          overdueAcceptedRun(this.now()),
         ],
       },
     });
@@ -1671,6 +2084,58 @@ export class RuntimeLifecycle {
   }
 
   /**
+   * Closes a step's operator terminal unless its person's run is in progress (`closeOperatorStep`
+   * with `keepRunning`), and reconciles that run: the relay saw `operator_running` (the person
+   * pressed Enter) while this database has no acceptance (its write failed, R5-B-1). The
+   * acceptance is recorded now, as `operatorProgress` would have (RUNNING, accepted, the step's
+   * deadline counted from when its screen came up), so its stops keep waiting for it and, past its timeout, its
+   * person is asked whatever run it belongs to (`overdueAcceptedRun`). Only the step's own
+   * physical bookkeeping changes: no run, claim or successor state.
+   */
+  private async closeOperatorKeepingRun(
+    tx: Tx,
+    step: StepRow,
+    actor?: "USER",
+  ): Promise<OperatorCloseAnswer | undefined> {
+    const answer = this.relay.closeOperatorStep?.(step.id, {
+      keepRunning: true,
+      ...(actor ? { actor } : {}),
+    });
+    if (
+      answer !== "running" ||
+      step.operatorAcceptedAt !== null ||
+      (step.state !== "AWAITING_OPERATOR" && step.state !== "RUNNING") ||
+      !interactiveIntent(step.intent)
+    )
+      return answer;
+    const intent = stepIntentSchema.parse(step.intent);
+    const now = this.now();
+    // When the person pressed Enter is not known: no earlier than its screen came up. The
+    // deadline counts from then (attention may come early, never late; it authorizes nothing).
+    const since = step.operatorSince ?? now;
+    const deadline = new Date(since.getTime() + intent.timeoutMs);
+    const changed = await tx.instanceStep.updateMany({
+      where: {
+        id: step.id,
+        state: step.state,
+        ownerEpoch: step.ownerEpoch,
+        operatorAcceptedAt: null,
+      },
+      // Acceptance implies the screen came up (CHECK `instance_step_operator_shape`): a lost
+      // `awaiting_operator` write left `operatorSince` null, so it is recorded now too.
+      data: {
+        state: "RUNNING",
+        deadline,
+        leaseExpiresAt: deadline,
+        operatorSince: since,
+        operatorAcceptedAt: now,
+      },
+    });
+    if (changed.count > 0) await this.syncNeedsOperator(tx, step.instanceId);
+    return answer;
+  }
+
+  /**
    * End the interactive steps of these phases that wait for their person (AWAITING_OPERATOR, or
    * RUNNING with a terminal that has not come up yet) and close their terminals. A person's run
    * in progress is left to answer. A dispatch whose screen never came up gives its attempt back
@@ -1682,11 +2147,14 @@ export class RuntimeLifecycle {
     instanceId: string,
     phases: readonly StepPhase[],
     code: string,
+    options: { before?: number } = {},
   ): Promise<number> {
     const steps = await tx.instanceStep.findMany({
       where: {
         instanceId,
         phase: { in: [...phases] },
+        // Only steps of runs before this one (`before`: the current run).
+        ...(options.before !== undefined ? { generation: { lt: options.before } } : {}),
         OR: [
           { state: "AWAITING_OPERATOR" },
           { state: "RUNNING", operatorTerminalId: { not: null }, operatorAcceptedAt: null },
@@ -1696,8 +2164,9 @@ export class RuntimeLifecycle {
     let settled = 0;
     for (const step of steps) {
       if (!interactiveIntent(step.intent)) continue;
-      if (this.relay.closeOperatorStep?.(step.id, { keepRunning: true }) === "running") continue;
-      const attempts = attemptsAfterServerClose(step);
+      const closed = await this.closeOperatorKeepingRun(tx, step);
+      if (closed === "running") continue;
+      const attempts = attemptsAfterServerClose(step, closed);
       const changed = await tx.instanceStep.updateMany({
         where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
         data: {
@@ -1722,7 +2191,9 @@ export class RuntimeLifecycle {
    * runs. Only a dispatch whose screen never came up gives its attempt back.
    */
   private async reissueOperatorStep(tx: Tx, step: StepRow): Promise<boolean> {
-    if (this.relay.closeOperatorStep?.(step.id, { keepRunning: true }) === "running") return false;
+    const closed = await this.closeOperatorKeepingRun(tx, step);
+    if (closed === "running") return false;
+    const attempts = attemptsAfterServerClose(step, closed);
     const changed = await tx.instanceStep.updateMany({
       where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
       data: {
@@ -1731,12 +2202,45 @@ export class RuntimeLifecycle {
         deadline: null,
         leaseExpiresAt: null,
         ...NO_OPERATOR,
-        attempts: attemptsAfterServerClose(step),
+        attempts,
+        // A dispatch that keeps its attempt (its screen was up) may have run.
+        mayHaveRun: attempts === step.attempts ? mayHaveRunAfterRequeue(attempts) : undefined,
       },
     });
     if (changed.count === 0) return false;
     await this.syncNeedsOperator(tx, step.instanceId);
     return true;
+  }
+
+  /**
+   * An earlier run's interactive step reported its screen up or closed: its terminal closes (a
+   * person's run in progress is left alone) and it ends FAILED `superseded`, or CANCELLED when
+   * nothing ran (a decline gives its attempt back, as `operatorClosed`).
+   */
+  private async settleSupersededOperator(tx: Tx, step: StepRow, result: JobResult) {
+    if (
+      result.status === "awaiting_operator" &&
+      (await this.closeOperatorKeepingRun(tx, step)) === "running"
+    )
+      return;
+    const attempts =
+      result.status === "operator_closed" &&
+      result.exitCode === undefined &&
+      step.operatorAcceptedAt === null
+        ? Math.max(0, step.attempts - 1)
+        : step.attempts;
+    const changed = await tx.instanceStep.updateMany({
+      where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
+      data: {
+        state: attempts === 0 ? "CANCELLED" : "FAILED",
+        errorCode: attempts === 0 ? null : "superseded",
+        attempts,
+        deadline: null,
+        leaseExpiresAt: null,
+        operatorTerminalId: null,
+      },
+    });
+    if (changed.count > 0) await this.syncNeedsOperator(tx, step.instanceId);
   }
 
   /**
@@ -1774,13 +2278,27 @@ export class RuntimeLifecycle {
       if (changed.count > 0) await this.syncNeedsOperator(tx, step.instanceId);
       return;
     }
-    // operator_running: a repeat, or a run reported before its screen, changes nothing.
-    if (step.state !== "AWAITING_OPERATOR") return;
+    // operator_running: a repeat changes nothing. One socket delivers a dispatch's progress in
+    // order, so a RUNNING dispatch with its terminal and no acceptance that reports a run lost
+    // its `awaiting_operator` write (the screen was up): the acceptance is recorded all the
+    // same, with the screen's time (CHECK `instance_step_operator_shape`).
+    const lostScreen =
+      step.state === "RUNNING" &&
+      step.operatorAcceptedAt === null &&
+      step.operatorTerminalId !== null &&
+      interactiveIntent(step.intent);
+    if (step.state !== "AWAITING_OPERATOR" && !lostScreen) return;
     const intent = stepIntentSchema.parse(step.intent);
     const deadline = new Date(now.getTime() + intent.timeoutMs);
     const changed = await tx.instanceStep.updateMany({
-      where,
-      data: { state: "RUNNING", deadline, leaseExpiresAt: deadline, operatorAcceptedAt: now },
+      where: { ...where, operatorAcceptedAt: null },
+      data: {
+        state: "RUNNING",
+        deadline,
+        leaseExpiresAt: deadline,
+        operatorSince: step.operatorSince ?? now,
+        operatorAcceptedAt: now,
+      },
     });
     if (changed.count > 0) await this.syncNeedsOperator(tx, step.instanceId);
   }
@@ -1825,8 +2343,10 @@ export class RuntimeLifecycle {
    * and not yet answered). Its stops wait behind it: never sent over it, never failed for it.
    */
   private async operatorRunInProgress(tx: Tx, step: StepRow): Promise<boolean> {
-    // Also a terminal still open on the node: its run may have begun before its report (the
-    // node holds a stop behind it too, on the rank's lock).
+    // Also a terminal of this run still open on the node: its run may have begun before its
+    // report (the node holds a stop behind it too, on the rank's lock). A person's accepted run
+    // counts whatever run it belongs to (it still runs); an earlier run's open screen nobody
+    // accepted was closed before this stop (claimStep).
     const running = await tx.instanceStep.count({
       where: {
         instanceId: step.instanceId,
@@ -1834,7 +2354,11 @@ export class RuntimeLifecycle {
         id: { not: step.id },
         OR: [
           { state: "RUNNING", operatorAcceptedAt: { not: null } },
-          { state: "AWAITING_OPERATOR", operatorTerminalId: { not: null } },
+          {
+            state: "AWAITING_OPERATOR",
+            operatorTerminalId: { not: null },
+            generation: step.generation,
+          },
         ],
       },
     });
@@ -1870,11 +2394,12 @@ export class RuntimeLifecycle {
       if (step.state !== "AWAITING_OPERATOR" || step.operatorTerminalId !== null)
         throw new OperatorStepError("not_waiting");
       const instance = step.Instance;
+      // A step of an earlier run (any phase) is never run again: its run no longer owns the
+      // claims.
+      if (!owned(step, await resolveRun(tx, instance.id)))
+        throw new OperatorStepError("superseded");
       if (isStartPhase(step.phase)) {
-        const current =
-          step.generation === (await this.currentGeneration(tx, instance.id)) &&
-          instance.desiredState === "RUNNING" &&
-          instance.phase === "STARTING";
+        const current = instance.desiredState === "RUNNING" && instance.phase === "STARTING";
         if (!current) throw new OperatorStepError("superseded");
         // An agent's start never runs interactively on a Relay-only node: say so now.
         if (instance.startedBy === "AGENT" && !(await this.nodeFullControl(tx, step.nodeId)))
@@ -1888,6 +2413,8 @@ export class RuntimeLifecycle {
           deadline: null,
           leaseExpiresAt: null,
           notBefore: null,
+          // Reopened after a counted dispatch (its screen was up): that one may have run.
+          mayHaveRun: mayHaveRunAfterRequeue(step.attempts),
           ...NO_OPERATOR,
           ...(step.errorCode === "operator_terminals_disabled" ? { errorCode: null } : {}),
         },
@@ -1921,11 +2448,9 @@ export class RuntimeLifecycle {
       if (step.state === "RUNNING" && step.operatorAcceptedAt !== null)
         throw new OperatorStepError("running");
       if (!waiting) throw new OperatorStepError("not_waiting");
-      if (
-        this.relay.closeOperatorStep?.(step.id, { keepRunning: true, actor: "USER" }) === "running"
-      )
-        throw new OperatorStepError("running");
-      const attempts = attemptsAfterServerClose(step);
+      const closed = await this.closeOperatorKeepingRun(tx, step, "USER");
+      if (closed === "running") throw new OperatorStepError("running");
+      const attempts = attemptsAfterServerClose(step, closed);
       const changed = await tx.instanceStep.updateMany({
         where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
         data: {
@@ -1945,6 +2470,25 @@ export class RuntimeLifecycle {
     this.wake();
   }
 
+  /**
+   * Who wrote the command of the version a job names: the instance's launch version, or (a stop
+   * or status probe of an earlier launch) that version, read under the instance's owner. A
+   * version not found is "unknown": never the successor's author.
+   */
+  private async stepCommandAuthor(
+    tx: Tx,
+    instance: InstanceRow,
+    launchVersionId: string,
+  ): Promise<"user" | "agent" | "unknown"> {
+    if (launchVersionId === instance.launchVersionId)
+      return commandAuthor(instance.LaunchVersion.editor);
+    const version = await tx.runtimeVersion.findFirst({
+      where: { id: launchVersionId, Runtime: { userId: instance.userId } },
+      select: { editor: true },
+    });
+    return version ? commandAuthor(version.editor) : "unknown";
+  }
+
   // ── Inactive (banned or deleting) owners ──
 
   private async ownerActive(tx: Tx, userId: string): Promise<boolean> {
@@ -1954,9 +2498,6 @@ export class RuntimeLifecycle {
     });
     return !!owner && !userCredentialAccessBlocked(owner, this.now());
   }
-
-  /** Where the next drain pass continues (instances by id; null: from the start). */
-  private drainCursor: string | null = null;
 
   /**
    * Banned or deletion-pending owners (§3.5 S): nobody may answer their interactive steps, so
@@ -1970,36 +2511,41 @@ export class RuntimeLifecycle {
   private async drainInactiveOwners() {
     const now = this.now();
     const interactive = { path: ["interactive"], equals: true };
-    const rows = await prisma.runtimeInstance.findMany({
-      where: {
-        ...(this.drainCursor ? { id: { gt: this.drainCursor } } : {}),
-        Runtime: { User: inactiveOwner(now) },
-        OR: [
-          {
-            Steps: {
-              some: {
-                intent: interactive,
-                OR: [
-                  { state: { in: ["PENDING", "AWAITING_OPERATOR"] } },
-                  { state: "RUNNING", operatorAcceptedAt: null },
-                ],
+    const rows = await this.sweeps.drain.next((page) =>
+      prisma.runtimeInstance.findMany({
+        where: {
+          ...page.where,
+          Runtime: { User: inactiveOwner(now) },
+          OR: [
+            {
+              Steps: {
+                some: {
+                  intent: interactive,
+                  OR: [
+                    { state: { in: ["PENDING", "AWAITING_OPERATOR"] } },
+                    { state: "RUNNING", operatorAcceptedAt: null },
+                  ],
+                },
               },
             },
-          },
-          {
-            phase: { in: ["STOPPING", "STARTING"] },
-            Ranks: { some: { claim: "HELD" } },
-            Steps: {
-              some: { phase: "STOP", state: { in: ["FAILED", "CANCELLED"] }, intent: interactive },
+            {
+              phase: { in: ["STOPPING", "STARTING"] },
+              Ranks: { some: { claim: "HELD" } },
+              Steps: {
+                some: {
+                  phase: "STOP",
+                  state: { in: ["FAILED", "CANCELLED"] },
+                  intent: interactive,
+                },
+              },
             },
-          },
-        ],
-      },
-      select: { id: true, userId: true },
-      orderBy: { id: "asc" },
-      take: BATCH,
-    });
-    this.drainCursor = rows.length === BATCH ? (rows.at(-1)?.id ?? null) : null;
+          ],
+        },
+        select: { id: true, userId: true },
+        orderBy: page.orderBy,
+        take: page.take,
+      }),
+    );
     for (const row of rows) {
       if (this.stopped) return;
       // Plain reads first: an instance matched only by history (an older run's failed stop, a
@@ -2067,8 +2613,8 @@ export class RuntimeLifecycle {
       select: { id: true, phase: true, Ranks: { select: { id: true, rank: true, claim: true } } },
     });
     if (!instance) return false;
-    const generation = await this.currentGeneration(db, instanceId);
-    return (await this.unanswerableStopRanks(db, instance, generation)).size > 0;
+    const run = await peekRun(db, instanceId);
+    return (await this.unanswerableStopRanks(db, instance, run)).size > 0;
   }
 
   private async drainInstance(tx: Tx, instanceId: string, userId: string) {
@@ -2080,26 +2626,21 @@ export class RuntimeLifecycle {
     });
     if (!instance) return;
     const now = this.now();
-    const generation = await this.currentGeneration(tx, instanceId);
+    const generation = await resolveRun(tx, instanceId);
     let startCancelled = false;
     let stopCancelled = false;
     for (const step of await this.waitingInteractiveSteps(tx, instanceId)) {
       // Closed by step id on whichever session holds it; a person's run is left alone.
-      const closed =
-        step.state === "PENDING"
-          ? null
-          : this.relay.closeOperatorStep?.(step.id, { keepRunning: true });
+      const closed = step.state === "PENDING" ? null : await this.closeOperatorKeepingRun(tx, step);
       if (closed === "running") continue;
       // A dispatch whose screen never came up gives its attempt back, but only when this close
-      // ended it: a terminal the ban fence already cancelled (or another process tracks)
-      // answers "absent" and may have run, so its attempt counts. A step that never ran is
-      // CANCELLED (proof for the claim's auto-release), else FAILED.
+      // proves it (`attemptsAfterServerClose`): a terminal the ban fence already cancelled (or
+      // another process tracks) answers "absent" and may have run, so its attempt counts. A
+      // step that never ran is CANCELLED (proof for the claim's auto-release), else FAILED.
       const attempts =
         step.state === "PENDING"
           ? step.attempts
-          : closed === "closed"
-            ? attemptsAfterServerClose(step)
-            : step.attempts;
+          : attemptsAfterServerClose(step, closed ?? undefined);
       const changed = await tx.instanceStep.updateMany({
         where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
         data: {
@@ -2228,6 +2769,16 @@ export class RuntimeLifecycle {
         return;
       }
       if (progress) {
+        // A confirm screen of an earlier run (up, or closed without success): nobody answers it
+        // now, so it is closed and the step ends; it changes nothing about the successor. A
+        // person who already accepted it keeps running (recorded: its stops wait for it).
+        if (
+          result.status !== "operator_running" &&
+          !owned(step, await resolveRun(tx, step.instanceId))
+        ) {
+          await this.settleSupersededOperator(tx, step, result);
+          return;
+        }
         await this.operatorProgress(tx, step, result);
         return;
       }
@@ -2288,6 +2839,8 @@ export class RuntimeLifecycle {
         data: {
           state: succeeded ? "SUCCEEDED" : "FAILED",
           errorCode: code,
+          // A stop's or probe's word on whether the rank was idle (`proofHolds`).
+          rankIdle: result.rankIdle ?? null,
           deadline: null,
           leaseExpiresAt: null,
           operatorTerminalId: null,
@@ -2322,43 +2875,55 @@ export class RuntimeLifecycle {
     code: string | null,
     healthDetail: string | null = null,
   ) {
-    const { instanceId, phase, rank, generation } = step;
+    const { instanceId, phase, rank } = step;
     const instance = await tx.runtimeInstance.findUnique({
       where: { id: instanceId },
       include: INSTANCE_INCLUDE,
     });
     if (!instance) return;
     const now = this.now();
-    // Start and health results of an earlier run say nothing about this one.
-    if (
-      (isStartPhase(phase) || phase === "HEALTH") &&
-      generation !== (await this.currentGeneration(tx, instanceId))
-    )
-      return;
+    // A step of an earlier run changes nothing about this one: no readiness, no failure, no
+    // health, no release (its row keeps what physically happened).
+    const mine = owned(step, await resolveRun(tx, instanceId));
     if (phase === "STOP" || phase === "STATUS") {
       const claim = instance.Ranks.find((row) => row.rank === rank);
-      // This step is the leading stop of the run now starting (proof the previous run ended).
-      const leading =
-        phase === "STOP" &&
-        step.sequence === generation * GENERATION_STRIDE &&
-        generation === (await this.currentGeneration(tx, instanceId)) &&
-        instance.phase === "STARTING";
-      const current = generation === (await this.currentGeneration(tx, instanceId));
+      // A leading stop that succeeded proves every launch of the runs before its own ended
+      // (it waited for each earlier start to answer): recorded on the rank, so what those runs
+      // launched is no longer named by later stops, required as a definition, or a node an
+      // agent's action must be trusted on (`launchesEnded`).
+      const idle = succeeded ? await this.answeredIdle(tx, step.id) : false;
+      if (succeeded && isLeadingStop(step)) {
+        if (idle) await recordStoppedThrough(tx, instanceId, rank, step.generation - 1);
+        else {
+          // Stopped, but the node had another step that may launch in flight for the rank: no
+          // proof, the leading stop is not satisfied. It goes again shortly, and this run's
+          // starts (and the release of what the earlier run holds) wait for it, as for any
+          // leading stop not yet answered.
+          await tx.instanceStep.updateMany({
+            where: { id: step.id, state: "SUCCEEDED" },
+            data: {
+              state: "PENDING",
+              errorCode: STATUS_LAUNCH_PENDING,
+              notBefore: new Date(now.getTime() + RANK_BUSY_RETRY_MS),
+              rankIdle: null,
+            },
+          });
+        }
+      }
       if (succeeded && claim) {
-        // The leading stop of a restart proves the previous run ended; the claim stays (the
-        // new run uses it). Any other verified stop of this run releases it, and a probe
-        // releases a claim marked stopped. A late answer of an earlier run releases nothing.
-        const proves =
-          phase === "STATUS"
-            ? statusProbeWanted(
-                instance,
-                claim.claim,
-                generation,
-                await this.currentGeneration(tx, instanceId),
-              )
-            : current && (!leading || claim.claim === "HELD_UNKNOWN");
-        if (proves) await this.release(tx, claim.id, now);
-      } else if (!succeeded && leading) {
+        // The node proved this rank stopped. `releaseClaim` decides whether that releases the
+        // claim: a proof of this run, after its launches (the leading stop of a restart proves
+        // only that the previous run ended: the claim stays, the new run uses it); a probe
+        // releases a claim marked stopped, or a stopping run's.
+        const released = await releaseClaim(tx, claim.id, now, { result: { stepId: step.id } });
+        // A status probe that answered stopped but not idle proves nothing: the step says so
+        // (`STATUS_LAUNCH_PENDING`), so the stop evidence never shows it as confirmed.
+        if (!released && phase === "STATUS" && !idle)
+          await tx.instanceStep.updateMany({
+            where: { id: step.id, state: "SUCCEEDED" },
+            data: { errorCode: STATUS_LAUNCH_PENDING },
+          });
+      } else if (!succeeded && mine && isLeadingStop(step) && instance.phase === "STARTING") {
         // The previous run could not be proven stopped: the new run must not start over it.
         await this.gangStop(tx, instance, "startup_failed");
         return;
@@ -2366,6 +2931,7 @@ export class RuntimeLifecycle {
       if (instance.phase === "STOPPING") await this.settleStopping(tx, instance);
       return;
     }
+    if (!mine) return;
     if (phase === "HEALTH") {
       await this.recordHealth(tx, instance, succeeded, healthDetail);
       return;
@@ -2388,11 +2954,10 @@ export class RuntimeLifecycle {
       return;
     }
     if (phase !== "READINESS") return;
-    const gen = generation;
     const unfinished = await tx.instanceStep.count({
       where: {
         instanceId,
-        generation: gen,
+        generation: step.generation,
         phase: { in: [...START_PHASES] },
         state: { not: "SUCCEEDED" },
       },
@@ -2476,6 +3041,7 @@ export class RuntimeLifecycle {
         { lastStopCheckAt: { lte: new Date(this.now().getTime() - HELD_UNKNOWN_PROBE_MS) } },
       ],
     });
+    // sweep: stamp rotation (lastStopCheckAt, ./sweep.ts)
     const ranks = await prisma.instanceRank.findMany({
       where: { ...due(), nodeId: online ? { in: online } : { not: null } },
       select: {
@@ -2522,11 +3088,24 @@ export class RuntimeLifecycle {
     rank: { id: string; rank: number; instanceId: string },
   ): Promise<Date> {
     const now = this.now();
+    // Read again under the fence: the rank was picked before it, and a restart may have taken
+    // the claim again since (HELD, a new run's): that claim is not this probe's to release.
+    const current = await tx.instanceRank.findUnique({
+      where: { id: rank.id },
+      select: { claim: true },
+    });
+    if (current?.claim !== "HELD_UNKNOWN") return now;
+    // Nothing launched since the last proven stop: released without asking the node (a probe
+    // would name this run, which the node never ran, and never prove it).
+    if (await releaseClaim(tx, rank.id, now, { neverRan: true })) return now;
+    // This run's probes (an earlier run's never goes out, and says nothing about this one).
+    const run = await resolveRun(tx, rank.instanceId);
     const recent = await tx.instanceStep.findMany({
       where: {
         instanceId: rank.instanceId,
         rank: rank.rank,
         phase: "STATUS",
+        generation: run,
         OR: [
           { state: { in: [...LIVE_STEP_STATES] } },
           { updatedAt: { gt: new Date(now.getTime() - HELD_UNKNOWN_PROBE_MS) } },
@@ -2546,18 +3125,18 @@ export class RuntimeLifecycle {
     const launch = instance ? launchOf(instance) : null;
     const row = instance?.Ranks.find((candidate) => candidate.id === rank.id);
     if (!instance || !launch || !row) return now;
-    const generation = Math.max(await this.currentGeneration(tx, instance.id), 1);
     const attempts = await this.nextStatusAttempt(tx, instance.id, row.rank);
-    await this.insertSteps(tx, instance, [
+    await this.insertSteps(tx, instance, run, [
       stopStep({
         instance: instanceInput(instance),
         rank: rankInput(row),
         nnodes: instance.Ranks.length,
         launch,
-        generation,
+        generation: run,
         attempt: attempts,
         operationId: null,
         phase: "STATUS",
+        physical: await this.physical(tx, instance, row.rank),
       }),
     ]);
     return now;
@@ -2614,21 +3193,38 @@ export class RuntimeLifecycle {
         if (step.state !== "RUNNING") return;
         await tx.instanceStep.updateMany({
           where: { id: step.id, state: "RUNNING", ownerEpoch: step.ownerEpoch },
-          data: { state: "PENDING", ownerEpoch: null, deadline: null, leaseExpiresAt: null },
+          data: {
+            state: "PENDING",
+            ownerEpoch: null,
+            deadline: null,
+            leaseExpiresAt: null,
+            // The lost dispatch may have reached the node: a later attempt's refusal does not
+            // prove it never ran.
+            mayHaveRun: mayHaveRunAfterRequeue(step.attempts),
+          },
         });
       }).catch((error: unknown) => console.error(`[lifecycle] ${what} failed`, errorName(error)));
     this.wake();
   }
 
   /**
-   * A complete inventory: ranks the node reports `stopped` are proven stopped (claims released
-   * while STOPPING); a live run's rank the node reports stopped or unknown has crashed (gang
-   * stop, then the restart rule). Always-on instances follow their runtime's status.
+   * A complete inventory. Each record of a held rank names the last step the node ran for the
+   * unit (`stepId`); only a record naming a step of the run that owns the claim, observed after
+   * that run's launches (`owned` and `fresh`), is evidence:
+   * - stopped, while STOPPING or marked stopped: proves the stop (`releaseClaim` observation);
+   * - stopped or unknown in a live run (READY/UNHEALTHY): the run crashed (gang stop, then the
+   *   restart rule);
+   * - otherwise its engine facts are recorded.
+   * A record naming an earlier run's step, or one before this run's launch, or an unknown step,
+   * changes nothing and is reported back as stale (the relay keeps what it served for that
+   * handle). A missing record, or one without a step id (nodes before 0.4.0), cannot be dated:
+   * in a live run it makes a health probe due now, and the health thresholds decide.
+   * Always-on instances follow their runtime's status.
    */
   async runtimeInventory(
     ref: NodeSessionRef,
     snapshot: RuntimeInventorySnapshot,
-  ): Promise<{ ok: true } | { ok: false; message: string }> {
+  ): Promise<{ ok: true; stale: string[] } | { ok: false; message: string }> {
     const ranks = await prisma.instanceRank.findMany({
       where: {
         nodeId: ref.nodeId,
@@ -2640,6 +3236,11 @@ export class RuntimeLifecycle {
     const reported = new Map(
       snapshot.instances.map((record) => [`${record.instanceId}:${record.rank}`, record]),
     );
+    const stale = new Set<string>();
+    // A record that could not be classified (its write failed) is neither evidence nor stale:
+    // the snapshot is refused (`runtime.inventory.error`), so the relay keeps everything it
+    // served, and the node's next inventory is classified again.
+    let unclassified = false;
     for (const rank of ranks) {
       const record = reported.get(`${rank.instanceId}:${rank.rank}`);
       await this.write(ref.userId, rank.instanceId, async (tx) => {
@@ -2649,49 +3250,89 @@ export class RuntimeLifecycle {
         });
         const claim = instance?.Ranks.find((row) => row.id === rank.id);
         if (!instance || !claim || claim.nodeId !== ref.nodeId) return;
-        // A start of this rank in flight may have crossed the snapshot: no proof then.
-        const inFlight = await tx.instanceStep.count({
-          where: {
-            instanceId: instance.id,
-            rank: claim.rank,
-            generation: await this.currentGeneration(tx, instance.id),
-            phase: { in: [...START_PHASES] },
-            attempts: { gt: 0 },
-            OR: [
-              { state: { in: ["RUNNING", "PENDING", "AWAITING_OPERATOR"] } },
-              { errorCode: "stopped" },
-            ],
-          },
-        });
-        if (record?.phase === "stopped" && inFlight === 0) {
+        const evidence = record?.stepId
+          ? await this.inventoryEvidence(tx, instance.id, claim.rank, ref.nodeId, record.stepId)
+          : "undated";
+        if (evidence === "stale") {
+          if (record && record.rank === 0) stale.add(record.handle);
+          return;
+        }
+        const live =
+          (instance.phase === "READY" || instance.phase === "UNHEALTHY") &&
+          instance.desiredState === "RUNNING";
+        const lost = !record || record.phase === "stopped" || record.phase === "unknown";
+        if (evidence === "undated") {
+          // Nothing orders this against the run's launch: a health probe answers instead.
+          if (live && lost && claim.claim === "HELD" && instance.lastHealthAt !== null)
+            await tx.runtimeInstance.update({
+              where: { id: instance.id },
+              data: { lastHealthAt: null },
+            });
+          return;
+        }
+        if (record?.phase === "stopped") {
           if (instance.phase === "STOPPING" || claim.claim === "HELD_UNKNOWN") {
-            await this.release(tx, claim.id, this.now());
+            // The node can only say what it was sent: nothing of this run starts on it after
+            // this record may release the claim (a start claimed earlier, not sent yet, is not
+            // delivered: `SendGuard.stopsStartsThrough`).
+            this.relay.fenceRunStarts?.(
+              ref.nodeId,
+              instance.id,
+              claim.rank,
+              await resolveRun(tx, instance.id),
+            );
+            await releaseClaim(tx, claim.id, this.now(), {
+              observation: { stepId: evidence.stepId, rankIdle: record.rankIdle === true },
+            });
             if (instance.phase === "STOPPING") await this.settleStopping(tx, instance);
             return;
           }
         }
         // A ready run whose rank the node no longer runs has crashed: gang stop, then the
-        // restart rule. A record of another launch version is an older run (ignored).
-        const live =
-          (instance.phase === "READY" || instance.phase === "UNHEALTHY") &&
-          instance.desiredState === "RUNNING";
-        const sameRun = !record || record.launchVersionId === instance.launchVersionId;
-        const lost = !record || record.phase === "stopped" || record.phase === "unknown";
-        if (live && sameRun && lost && claim.claim === "HELD") {
+        // restart rule.
+        if (live && lost && claim.claim === "HELD") {
           await this.gangStop(tx, instance, "crashed");
           return;
         }
         if (record && claim.claim === "HELD" && instance.desiredState === "RUNNING")
           await this.recordInstanceFacts(tx, instance, record);
-      }).catch((error: unknown) =>
-        console.error("[lifecycle] applying inventory failed", errorName(error)),
-      );
+      }).catch((error: unknown) => {
+        unclassified = true;
+        console.error("[lifecycle] applying inventory failed", errorName(error));
+      });
     }
     await applyAlwaysOnInventory(ref, snapshot.alwaysOn, this.now()).catch((error: unknown) =>
       console.error("[lifecycle] applying always-on inventory failed", errorName(error)),
     );
     this.wake();
-    return { ok: true };
+    if (unclassified)
+      return {
+        ok: false,
+        message: "The server could not apply the inventory; it is kept as it was.",
+      };
+    return { ok: true, stale: [...stale] };
+  }
+
+  /**
+   * What an inventory record naming step `stepId` proves about this rank: evidence of the run
+   * that owns the claim, after its launches (`owned` and `fresh`), or stale (an earlier run's
+   * step, one observed before this run's launch, or a step that is not this rank's).
+   */
+  private async inventoryEvidence(
+    tx: Tx,
+    instanceId: string,
+    rank: number,
+    nodeId: string,
+    stepId: string,
+  ): Promise<{ stepId: string } | "stale"> {
+    const step = await tx.instanceStep.findFirst({
+      where: { id: stepId, instanceId, rank, nodeId },
+      select: { phase: true, sequence: true, generation: true },
+    });
+    if (!step) return "stale";
+    const run = await resolveRun(tx, instanceId);
+    if (!owned(step, run) || !(await fresh(tx, { ...step, instanceId, rank }, run))) return "stale";
+    return { stepId };
   }
 
   /** The head rank's engine facts of the run the node reports (admission reads them). */

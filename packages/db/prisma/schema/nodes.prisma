@@ -114,17 +114,18 @@ model Node {
   /// policy: agents may not change it). Null: kept. 1 min .. 30 days (BigInt: > 2^31 ms).
   removeAfterOfflineMs    BigInt?
 
-  User           User                 @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  HoldProfile    Profile?             @relation("NodeHoldProfile", fields: [holdProfileId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  User           User                  @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  HoldProfile    Profile?              @relation("NodeHoldProfile", fields: [holdProfileId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   Credentials    NodeCredential[]
   Runtimes       Runtime[]
   Ranks          InstanceRank[]
+  Reservations   InstanceReservation[]
   QueuedCommands QueuedNodeCommand[]
   ProfileNodes   ProfileNode[]
   EnrolledBy     NodeEnrollmentUse[]
   Commands       NodeCommand[]
   FabricMembers  FabricMember[]
-  ReplacedBy     NodeEnrollmentCode[] @relation("EnrollmentReplaces")
+  ReplacedBy     NodeEnrollmentCode[]  @relation("EnrollmentReplaces")
 
   @@unique([userId, slug])
   @@unique([id, userId])

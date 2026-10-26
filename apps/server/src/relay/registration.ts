@@ -6,12 +6,18 @@
  *
  * These are status columns of `node` (connection, heartbeat, versions, trust as reported,
  * features, held state), which the graph-write fence leaves unfenced (§2.14): each write is
- * one statement on one row. The disconnect (connection OFFLINE plus the node's targets'
+ * one statement on one row. Except a trust change: it takes the owner's fence first
+ * (`trustChangeFence`), like a person's lowering. The disconnect (connection OFFLINE plus the node's targets'
  * circuit) is `disconnectNodeAtGeneration` in `@ws-model-proxy/api/lib/pool-routing`. Runtime inventory → runtimes/models/instances/targets is lane A2
  * and arrives through the session manager's node frame handlers.
  */
 import type { NodeFeatures } from "@ws-model-proxy/api/lib/runtime-spec";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import {
+  acquireFences,
+  fences,
+  runCapacityOrderedTransaction,
+} from "@ws-model-proxy/db/capacity-lock-order";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { HeldDefinition, NodeTrustWire } from "./frames.js";
 import type { NodeIdentity } from "./node-credential-auth.js";
@@ -35,6 +41,36 @@ export function normalizeReportedHostname(value: string | undefined): string | n
   const clean = value.replace(INVISIBLE_CHARACTERS, "").trim();
   if (clean.length === 0) return null;
   return Array.from(clean).slice(0, HOSTNAME_MAX_LENGTH).join("");
+}
+
+type Tx = Prisma.TransactionClient;
+type NodeTrustColumn = "FULL" | "RELAY" | null;
+
+/**
+ * A trust change the node reports waits for the owner's fence: admission and every agent
+ * authorization read trust under it (placement, an agent's stop, restart, release), so none of
+ * them commits on a trust that changed after it read it. Then the node's trust columns are read
+ * again: a person's lowering may have committed meanwhile. Unchanged trust takes no fence (a
+ * hello or `node.state` of a busy owner never waits for it).
+ */
+async function trustChangeFence(
+  tx: Tx,
+  userId: string,
+  nodeId: string,
+): Promise<{ trust: NodeTrustColumn; trustLowerRequestedAt: Date | null } | null> {
+  await acquireFences(tx, [fences.owner(userId)]);
+  return tx.node.findUnique({
+    where: { id: nodeId },
+    select: { trust: true, trustLowerRequestedAt: true },
+  });
+}
+
+/** The node's trust columns are still as read (`trustChangeFence` otherwise). */
+function trustUnchangedWhere(read: {
+  trust: NodeTrustColumn;
+  trustLowerRequestedAt: Date | null;
+}): Prisma.NodeWhereInput {
+  return { trust: read.trust, trustLowerRequestedAt: read.trustLowerRequestedAt };
 }
 
 export function trustToDb(value: NodeTrustWire): "FULL" | "RELAY" {
@@ -95,7 +131,7 @@ export async function registerNodeHello(input: {
 }): Promise<NodeRegistration> {
   const { identity, hello } = input;
   const now = input.now ?? new Date();
-  return prisma.$transaction(async (tx) => {
+  return runCapacityOrderedTransaction(prisma, async (tx) => {
     const credential = await tx.nodeCredential.findUnique({
       where: { id: identity.credentialId },
       select: {
@@ -119,7 +155,7 @@ export async function registerNodeHello(input: {
     if (userCredentialAccessBlocked(credential.User, now)) {
       throw new RelayRegistrationError("The node's owner is not active.", "access_denied");
     }
-    const node = credential.Node;
+    let node = credential.Node;
     if (node.id !== identity.nodeId || node.userId !== identity.userId) {
       throw new RelayRegistrationError("The node credential was rebound.", "access_denied");
     }
@@ -136,8 +172,10 @@ export async function registerNodeHello(input: {
       );
     }
     const reportedTrust = trustToDb(hello.trust);
-    const lowerPending = node.trustLowerRequestedAt !== null;
-    const data: Prisma.NodeUpdateInput = {
+    const dataFor = (trust: {
+      trust: NodeTrustColumn;
+      trustLowerRequestedAt: Date | null;
+    }): Prisma.NodeUpdateManyMutationInput => ({
       connection: "ONLINE",
       connectionGeneration: { increment: 1 },
       lastConnectedAt: now,
@@ -150,17 +188,33 @@ export async function registerNodeHello(input: {
       rejectedCliVersion: null,
       rejectedAt: null,
       trust: reportedTrust,
-      ...(node.trust !== reportedTrust ? { trustChangedAt: now } : {}),
-      ...trustLowerColumns(node.trust, reportedTrust, lowerPending),
+      ...(trust.trust !== reportedTrust ? { trustChangedAt: now } : {}),
+      ...trustLowerColumns(trust.trust, reportedTrust, trust.trustLowerRequestedAt !== null),
       features: hello.features as Prisma.InputJsonValue,
       featuresAt: now,
       heldDefinitions: hello.definitions as Prisma.InputJsonValue,
       heldMetricCommandsHash: hello.heldMetricCommandsHash,
       heldFabricsHash: hello.heldFabricsHash,
-    };
+    });
+    // Trust as read is unchanged: the row is locked only while it still is
+    // (`trustUnchangedWhere`), so a change that committed since is never overwritten without the
+    // owner's fence (and none commits before this write: it waits on the row).
+    const unchanged =
+      node.trust === reportedTrust &&
+      (
+        await tx.node.updateMany({
+          where: { id: node.id, ...trustUnchangedWhere(node) },
+          data: { trust: reportedTrust },
+        })
+      ).count === 1;
+    if (!unchanged) {
+      const fenced = await trustChangeFence(tx, node.userId, node.id);
+      if (fenced) node = { ...node, ...fenced };
+    }
+    const lowerPending = node.trustLowerRequestedAt !== null;
     const updated = await tx.node.update({
       where: { id: node.id },
-      data,
+      data: dataFor(node),
       select: { connectionGeneration: true },
     });
     await tx.nodeCredential.update({
@@ -211,24 +265,62 @@ export async function writeNodeState(input: {
 }): Promise<{ trustLowerPending: boolean } | null> {
   const fence = generationFence(input.generation);
   if (fence === null) return null;
-  const node = await prisma.node.findUnique({
+  const read = await prisma.node.findUnique({
     where: { id: input.nodeId },
+    select: { userId: true, trust: true, trustLowerRequestedAt: true, connectionGeneration: true },
+  });
+  if (!read || read.connectionGeneration !== fence) return null;
+  const reportedTrust = trustToDb(input.trust);
+  // `unchanged`: written only while the trust columns are still as read (no fence taken).
+  const write = async (
+    tx: Tx,
+    node: { trust: NodeTrustColumn; trustLowerRequestedAt: Date | null },
+    unchanged: boolean,
+  ) => {
+    const lowerPending = node.trustLowerRequestedAt !== null;
+    const written = await tx.node.updateMany({
+      where: {
+        id: input.nodeId,
+        connectionGeneration: fence,
+        connection: "ONLINE",
+        ...(unchanged ? trustUnchangedWhere(node) : {}),
+      },
+      data: {
+        trust: reportedTrust,
+        ...(node.trust !== reportedTrust ? { trustChangedAt: input.now } : {}),
+        ...trustLowerColumns(node.trust, reportedTrust, lowerPending),
+        features: input.features as Prisma.InputJsonValue,
+        featuresAt: input.now,
+      },
+    });
+    return written.count === 0 && unchanged
+      ? null
+      : { trustLowerPending: lowerPending && reportedTrust === "FULL" };
+  };
+  // Unchanged as read and still so when written: no fence. Otherwise (it changed, or a change
+  // committed since the read) under the owner's fence, from the columns read again there.
+  const fast = read.trust === reportedTrust ? await write(prisma, read, true) : null;
+  if (fast) return fast;
+  return runCapacityOrderedTransaction(prisma, async (tx) => {
+    const node = await trustChangeFence(tx, read.userId, input.nodeId);
+    return node ? write(tx, node, false) : null;
+  });
+}
+
+/**
+ * The node's trust as stored (what it last reported, and a person's pending lowering) for the
+ * connection generation that wrote it: what a session's trust is set from (`syncTrust` in the
+ * session manager). Null when the node is gone.
+ */
+export async function readNodeTrust(nodeId: string): Promise<{
+  trust: NodeTrustColumn;
+  trustLowerRequestedAt: Date | null;
+  connectionGeneration: number;
+} | null> {
+  return prisma.node.findUnique({
+    where: { id: nodeId },
     select: { trust: true, trustLowerRequestedAt: true, connectionGeneration: true },
   });
-  if (!node || node.connectionGeneration !== fence) return null;
-  const reportedTrust = trustToDb(input.trust);
-  const lowerPending = node.trustLowerRequestedAt !== null;
-  await prisma.node.updateMany({
-    where: { id: input.nodeId, connectionGeneration: fence, connection: "ONLINE" },
-    data: {
-      trust: reportedTrust,
-      ...(node.trust !== reportedTrust ? { trustChangedAt: input.now } : {}),
-      ...trustLowerColumns(node.trust, reportedTrust, lowerPending),
-      features: input.features as Prisma.InputJsonValue,
-      featuresAt: input.now,
-    },
-  });
-  return { trustLowerPending: lowerPending && reportedTrust === "FULL" };
 }
 
 /** Remembers an identity-key refusal on the credential (the node page shows it). */

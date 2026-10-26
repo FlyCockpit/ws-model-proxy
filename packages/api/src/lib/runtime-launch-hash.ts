@@ -1,18 +1,25 @@
 import { createHash } from "node:crypto";
 import { canonicalJson } from "./canonical-json";
-import type { NodeFabricSets, NodeMetricCommand, RuntimeSpec } from "./runtime-spec";
+import {
+  type NodeFabricSets,
+  type NodeMetricCommand,
+  nodeRuntimeSpec,
+  type RuntimeSpec,
+} from "./runtime-spec";
 
 function sha256Hex(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
 /**
- * THE node-side identity of a runtime version (B2): sha256 of the canonical JSON of `spec`.
- * Sent in `runtime.define` envelopes, held/frozen records and every `runtime.job`. Equal
- * launch hashes mean running instances adopt a new version live and nothing is re-pushed.
+ * THE node-side identity of a runtime version (B2): sha256 of the canonical JSON of the spec as
+ * the node holds it (`nodeRuntimeSpec`: without the server-only `launch.reservations`). Sent in
+ * `runtime.define` envelopes, held/frozen records and every `runtime.job`. Equal launch hashes
+ * mean nothing is re-pushed; a version update also compares reservations before it lets a
+ * running instance adopt it live (`routers/runtimes.ts`).
  */
 export function runtimeLaunchHash(spec: RuntimeSpec): string {
-  return sha256Hex(canonicalJson(spec));
+  return sha256Hex(canonicalJson(nodeRuntimeSpec(spec)));
 }
 
 /**

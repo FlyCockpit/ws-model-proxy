@@ -4,6 +4,7 @@ import { hasProvedEmail } from "@ws-model-proxy/auth/proved-email";
 import prisma from "@ws-model-proxy/db";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { agentRulesApply } from "../contracts/auth-context";
+import type { RefusalReason } from "../contracts/refusals";
 import { runtimesContract as c, runtimeSlugSchema } from "../contracts/runtimes";
 import { callerActor } from "../lib/caller-actor";
 import { canonicalJson } from "../lib/canonical-json";
@@ -13,7 +14,14 @@ import {
   instanceCapacityFences,
   runtimeCapacityFences,
 } from "../lib/graph-write";
+import {
+  agentBlockedNodeWithCleanup,
+  currentReservations,
+  OCCUPANCY_SELECT,
+} from "../lib/instance-occupancy";
 import { readLiveLoad } from "../lib/live-load";
+import { PlacementPlanner } from "../lib/placement";
+import { loadPlacementContext } from "../lib/placement-load";
 import {
   isForeignKeyViolation,
   isUniqueViolation,
@@ -23,6 +31,7 @@ import {
 } from "../lib/refuse";
 import { jsonObject } from "../lib/registry-view";
 import { type RequestCompat, storedRequestCompat } from "../lib/request-compat";
+import { launchIdentity, reservationsKey } from "../lib/reservations";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
 import {
   authoredRuntimeSpecSchema,
@@ -36,16 +45,19 @@ import {
   applyLimitsPatch,
   createVersion,
   derivedColumns,
-  effectiveTrust,
   type LimitColumns,
   ownedNode,
+  type PlannedStartWrite,
   specIsInteractive,
   syncRuntimeModels,
+  type Tx,
   versionHashes,
+  writePlannedStarts,
 } from "../lib/runtime-store";
 import {
   INSTANCE_INCLUDE,
   instanceView,
+  loadStepRefs,
   previousLaunchHashes,
   RUNTIME_SUMMARY_INCLUDE,
   type RuntimeSummaryRow,
@@ -58,6 +70,7 @@ import {
 } from "../lib/runtime-views";
 import { deliverInvite, writeInvite } from "../lib/share-invite-write";
 import { latestStopChecks, stopCheckKey } from "../lib/stop-evidence";
+import { effectiveTrust } from "../nodes/trust";
 import { normalizeBaseUrl, parseDetectedServers } from "../nodes/views";
 import { runtimeStart, runtimeStop } from "./runtime-lifecycle";
 import { runtimeReleaseRequests, runtimeReleaseUnproven } from "./runtime-release";
@@ -67,7 +80,7 @@ function userIdOf(context: SignedInContext): string {
   return context.session.user.id;
 }
 
-/** Previous launch hashes of each runtime's current version (for `launchChanged`). */
+/** The previous version's `launchIdentity` of each runtime's current version (`launchChanged`). */
 async function previousHashesOf(rows: RuntimeSummaryRow[]): Promise<Map<string, string | null>> {
   const wanted = rows.flatMap((row) =>
     row.CurrentVersion && row.CurrentVersion.version > 1
@@ -78,9 +91,9 @@ async function previousHashesOf(rows: RuntimeSummaryRow[]): Promise<Map<string, 
   if (wanted.length === 0) return result;
   const previous = await prisma.runtimeVersion.findMany({
     where: { OR: wanted },
-    select: { runtimeId: true, launchHash: true },
+    select: { runtimeId: true, launchHash: true, spec: true },
   });
-  for (const row of previous) result.set(row.runtimeId, row.launchHash);
+  for (const row of previous) result.set(row.runtimeId, launchIdentity(row));
   return result;
 }
 
@@ -144,10 +157,12 @@ async function createRuntime(context: SignedInContext, input: CreateInput) {
     throw new ORPCError("BAD_REQUEST", {
       message: "An always-on runtime names its node; a startable one does not.",
     });
-  if (input.nodeId) assertAgentMayUseNode(context, await ownedNode(userId, input.nodeId));
   let created: { runtimeId: string };
   try {
     created = await graphWrite([userId], async (tx) => {
+      // Under the owner fence: a trust change (a person's lowering, the node's report) waits
+      // for it, so the node is not lowered between this check and the write.
+      if (input.nodeId) assertAgentMayUseNode(context, await ownedNode(userId, input.nodeId, tx));
       const runtime = await tx.runtime.create({
         data: {
           userId,
@@ -283,9 +298,9 @@ async function previousLaunchHashOf(runtimeId: string, version: number): Promise
   if (version <= 1) return null;
   const previous = await prisma.runtimeVersion.findFirst({
     where: { runtimeId, version: version - 1 },
-    select: { launchHash: true },
+    select: { launchHash: true, spec: true },
   });
-  return previous?.launchHash ?? null;
+  return previous ? launchIdentity(previous) : null;
 }
 
 const ACTIVE_INSTANCE = {
@@ -403,6 +418,7 @@ export const runtimesRouter = {
       }),
     ]);
     const stopChecks = await latestStopChecks(prisma, instances);
+    const stepRefs = await loadStepRefs(prisma, userId, instances);
     const liveLoad = readLiveLoad(
       context.services?.liveLoad,
       instances.map((row) => row.id),
@@ -427,7 +443,7 @@ export const runtimesRouter = {
       current: versionDetail(current, previous, factsFrom),
       requestProfile: profile ? requestProfileView(profile) : null,
       servedModels: models.map(runtimeModelView),
-      instanceList: instances.map((row) => instanceView(row, stopChecks, liveLoad)),
+      instanceList: instances.map((row) => instanceView(row, stopChecks, liveLoad, stepRefs)),
       shares: shares.map((share) => ({ id: share.id, email: share.Grantee.email })),
       contributions: models.flatMap((model) =>
         model.Members.filter((member) => member.shareId !== null).map((member) => ({
@@ -571,7 +587,11 @@ export const runtimesRouter = {
       };
     }
 
-    const launchChanged = hashes.launchHash !== current.launchHash;
+    // Reservations are server-only (not in the launch hash): another set needs a restart too.
+    const nextReservations = reservationsKey(spec);
+    const launchChanged =
+      hashes.launchHash !== current.launchHash ||
+      nextReservations !== reservationsKey(current.spec);
     // A node-origin runtime's definition lives in the node's runtimes.json and comes back with
     // every inventory; the server never pushes it, so only the node can change it.
     if (launchChanged && runtime.origin === "NODE")
@@ -580,12 +600,20 @@ export const runtimesRouter = {
         runtime.id,
         "This runtime is defined on its node: edit its definition there. Limits and advanced settings can be changed here.",
       );
-    if (launchChanged && runtime.Node && effectiveTrust(runtime.Node) !== "FULL")
-      throw refuseAbout(
-        "launch_change_on_relay_only",
-        runtime.Node.id,
-        "This node is Relay only, so its always-on definition is frozen. Change it on the node, or raise trust with `wsmp trust full`.",
-      );
+    // Refused at Relay only: checked under the owner fence below (a trust change waits for it).
+    const assertDefinitionUnfrozen = async (tx: Tx) => {
+      if (!launchChanged || !runtime.Node) return;
+      const node = await tx.node.findUnique({
+        where: { id: runtime.Node.id },
+        select: { trust: true, trustLowerRequestedAt: true },
+      });
+      if (!node || effectiveTrust(node) !== "FULL")
+        throw refuseAbout(
+          "launch_change_on_relay_only",
+          runtime.Node.id,
+          "This node is Relay only, so its always-on definition is frozen. Change it on the node, or raise trust with `wsmp trust full`.",
+        );
+    };
     // A served model that moves to another type would break the pools it is in.
     const nextType = derivedColumns(spec).modelType;
     if (nextType !== current.modelType) {
@@ -606,13 +634,11 @@ export const runtimesRouter = {
     const agent = agentRulesApply(context.auth);
     const adoptedLive: string[] = [];
     const restarted: string[] = [];
-    const needsRestart: Array<{
-      instanceId: string;
-      reason: "launch_changed" | "trust_relay" | "interactive_needs_person";
-    }> = [];
+    const needsRestart: Array<{ instanceId: string; reason: RefusalReason }> = [];
     const { version, operationId } = await graphWrite(
       [userId],
       async (tx) => {
+        await assertDefinitionUnfrozen(tx);
         // Read and classify under the owner fence (a trust change waits for it).
         adoptedLive.length = 0;
         restarted.length = 0;
@@ -622,38 +648,40 @@ export const runtimesRouter = {
           select: {
             id: true,
             desiredState: true,
-            LaunchVersion: { select: { launchHash: true } },
+            LaunchVersion: { select: { launchHash: true, spec: true } },
+            // Every node the instance occupies (`OCCUPANCY_SELECT`, for agents), with the ranks'
+            // ports (a restart keeps its nodes and ports, as `runtime_start` with its id).
             Ranks: {
-              select: {
-                claim: true,
-                Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
-              },
+              ...OCCUPANCY_SELECT.Ranks,
+              select: { ...OCCUPANCY_SELECT.Ranks.select, port: true, distPort: true },
             },
+            Reservations: OCCUPANCY_SELECT.Reservations,
           },
         });
+        // Restarted as `runtime_start` with the instance id restarts it (without stopping
+        // others): placed again on its nodes by the planner, its capacity, definition slots and
+        // labels included, so it may take other resources, ports or reservations.
+        const candidates: typeof instances = [];
         for (const instance of instances) {
           // Always-on: the address is the launch; nothing to restart. A started instance adopts
           // live only when what it launched has the new launch hash (an earlier launch change it
           // was never restarted for still needs a restart).
+          const sameReservations =
+            reservationsKey(instance.LaunchVersion.spec) === nextReservations;
           if (
             instance.desiredState === null ||
-            instance.LaunchVersion.launchHash === hashes.launchHash
+            (instance.LaunchVersion.launchHash === hashes.launchHash && sameReservations)
           )
             adoptedLive.push(instance.id);
-          else if (
-            !input.restartRunning ||
-            // Released claims (failed, stopped ranks) are re-placed by a start, not here.
-            instance.Ranks.some((rank) => rank.claim !== "HELD")
-          )
+          else if (!input.restartRunning || !spec.launch)
             needsRestart.push({ instanceId: instance.id, reason: "launch_changed" });
-          else if (
-            agent &&
-            instance.Ranks.some((rank) => !rank.Node || effectiveTrust(rank.Node) !== "FULL")
-          )
+          // Every node the restart reaches: the ranks' and the reservations' (a worker lowered
+          // to Relay only after placement, a replaced run's worker still holding).
+          else if (agent && (await agentBlockedNodeWithCleanup(tx, userId, instance)))
             needsRestart.push({ instanceId: instance.id, reason: "trust_relay" });
           else if (agent && specIsInteractive(spec))
             needsRestart.push({ instanceId: instance.id, reason: "interactive_needs_person" });
-          else restarted.push(instance.id);
+          else candidates.push(instance);
         }
 
         const created = await createVersion(tx, {
@@ -690,8 +718,50 @@ export const runtimesRouter = {
               data: { versionId: created.id, launchVersionId: created.id },
             });
         }
+        const starts: PlannedStartWrite[] = [];
+        const blockedBy: string[][] = [];
+        if (candidates.length > 0 && spec.launch) {
+          const planner = new PlacementPlanner(await loadPlacementContext(tx, { userId, agent }));
+          for (const instance of candidates) {
+            const reservationNodeIds: Array<string | null> = [];
+            for (const reservation of currentReservations(instance.Reservations))
+              reservationNodeIds[reservation.index] = reservation.nodeId;
+            const ranks = [...instance.Ranks].sort((a, b) => a.rank - b.rank);
+            const result = planner.place({
+              runtimeId: runtime.id,
+              versionId: created.id,
+              launch: spec.launch,
+              nodeIds: ranks.map((rank) => rank.nodeId ?? ""),
+              restart: {
+                instanceId: instance.id,
+                ports: ranks.map((rank) => rank.port),
+                distPort: ranks[0]?.distPort ?? null,
+                reservationNodeIds,
+              },
+              checkFrozen: false,
+              nodeOrigin: runtime.origin === "NODE",
+              // Nothing confirmed a preview: no other instance is stopped for it.
+              preempt: false,
+            });
+            if (!result.ok) {
+              needsRestart.push({ instanceId: instance.id, reason: result.refusal.reason });
+              continue;
+            }
+            restarted.push(instance.id);
+            starts.push({
+              runtimeId: runtime.id,
+              versionId: created.id,
+              instanceId: instance.id,
+              placements: result.start.placements,
+              reservations: result.start.reservations,
+              fabric: result.start.fabric,
+              distPort: result.start.distPort,
+            });
+            blockedBy.push(result.start.blockedBy);
+          }
+        }
         let restartOperationId: string | null = null;
-        if (restarted.length > 0) {
+        if (starts.length > 0) {
           const operation = await tx.runtimeOperation.create({
             data: {
               userId,
@@ -706,22 +776,15 @@ export const runtimesRouter = {
             select: { id: true },
           });
           restartOperationId = operation.id;
-          await tx.runtimeInstance.updateMany({
-            where: { id: { in: restarted } },
-            data: {
-              versionId: created.id,
-              launchVersionId: created.id,
-              operationId: operation.id,
-              desiredState: "RUNNING",
-              phase: "STARTING",
-              phaseChangedAt: new Date(),
-              phaseReason: "definition_changed",
-              needsOperator: null,
-              needsOperatorSince: null,
-              restartsInWindow: 0,
-              restartWindowStartedAt: null,
-              nextRestartAt: null,
-            },
+          // The same write as `runtime_start`'s restart: each begins a new run in this commit
+          // (`instance-run.ts`), and its claims are the plan's.
+          await writePlannedStarts(tx, {
+            userId,
+            operationId: operation.id,
+            startedBy: actor.actor,
+            starts,
+            blockedBy,
+            phaseReason: "definition_changed",
           });
         }
         const row = await tx.runtimeVersion.findUniqueOrThrow({
@@ -737,7 +800,7 @@ export const runtimesRouter = {
     const define =
       (await context.services?.pushRuntimeDefinitions?.({ userId, runtimeId: runtime.id })) ?? [];
     return {
-      version: versionSummary(version, current.launchHash),
+      version: versionSummary(version, launchIdentity(current)),
       adoptedLive,
       needsRestart,
       restarted,
@@ -754,34 +817,38 @@ export const runtimesRouter = {
       select: { id: true },
     });
     if (!runtime) throw notFound("That runtime does not exist.");
-    const busy = await prisma.runtimeInstance.count({
-      where: {
-        runtimeId: runtime.id,
-        OR: [
-          { desiredState: "RUNNING" },
-          { Ranks: { some: { claim: { in: ["HELD", "HELD_UNKNOWN"] } } } },
-        ],
-      },
-    });
-    if (busy > 0)
-      throw refuse("instances_running", "Stop this runtime's instances before deleting it.");
-    const pinned = await prisma.profileItem.count({ where: { runtimeId: runtime.id } });
-    if (pinned > 0)
-      throw refuse(
-        "pinned_by_profile",
-        "A profile pins this runtime. Remove it from the profile first.",
-      );
-    const members = await prisma.poolMember.findMany({
-      where: { RuntimeModel: { runtimeId: runtime.id } },
-      select: { id: true },
-    });
+    let members: Array<{ id: string }> = [];
     try {
-      await graphDelete({ userId, runtimeIds: [runtime.id] }, async (tx) => {
+      members = await graphDelete({ userId, runtimeIds: [runtime.id] }, async (tx) => {
+        // Decided under the fences (the owner's, and every instance's capacity fence): a start
+        // committed before them is seen here, and none commits until this delete does.
+        const busy = await tx.runtimeInstance.count({
+          where: {
+            runtimeId: runtime.id,
+            OR: [
+              { desiredState: "RUNNING" },
+              { Ranks: { some: { claim: { in: ["HELD", "HELD_UNKNOWN"] } } } },
+            ],
+          },
+        });
+        if (busy > 0)
+          throw refuse("instances_running", "Stop this runtime's instances before deleting it.");
+        const pinned = await tx.profileItem.count({ where: { runtimeId: runtime.id } });
+        if (pinned > 0)
+          throw refuse(
+            "pinned_by_profile",
+            "A profile pins this runtime. Remove it from the profile first.",
+          );
+        const removed = await tx.poolMember.findMany({
+          where: { RuntimeModel: { runtimeId: runtime.id } },
+          select: { id: true },
+        });
         // Its invites go with it (the cascade would too): no link opens a deleted runtime.
         await tx.shareInvite.deleteMany({ where: { runtimeId: runtime.id, ownerUserId: userId } });
         await tx.runtimeInstance.deleteMany({ where: { runtimeId: runtime.id } });
         await tx.runtime.update({ where: { id: runtime.id }, data: { currentVersionId: null } });
         await tx.runtime.delete({ where: { id: runtime.id } });
+        return removed;
       });
     } catch (error) {
       if (isForeignKeyViolation(error))
@@ -830,14 +897,9 @@ export const runtimesRouter = {
               phase: true,
               phaseChangedAt: true,
               Ranks: {
-                select: {
-                  id: true,
-                  rank: true,
-                  claim: true,
-                  markedStoppedAt: true,
-                  Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
-                },
+                select: { ...OCCUPANCY_SELECT.Ranks.select, id: true, markedStoppedAt: true },
               },
+              Reservations: OCCUPANCY_SELECT.Reservations,
             },
           });
           if (!instance) throw notFound("That instance does not exist.");
@@ -850,15 +912,18 @@ export const runtimesRouter = {
             throw new ORPCError("CONFLICT", {
               message: await markStoppedConflict(tx, instance, input.nodeNumber),
             });
-          // Agents mark stopped only on Full-control nodes (a node that left counts as not Full).
-          if (agent)
-            for (const rank of ranks)
-              if (!rank.Node || effectiveTrust(rank.Node) !== "FULL")
-                throw refuseAbout(
-                  "trust_relay",
-                  rank.Node?.id ?? instance.id,
-                  "Agents may only mark instances stopped on nodes at Full control. A person can do this in the browser.",
-                );
+          // Agents mark stopped only on Full-control nodes (a node that left counts as not Full):
+          // the marked ranks' and the reservations' they hold memory on.
+          // Their status probes name what may still run there: the nodes it names count too.
+          const blocked = agent
+            ? await agentBlockedNodeWithCleanup(tx, userId, { ...instance, Ranks: ranks })
+            : null;
+          if (blocked)
+            throw refuseAbout(
+              "trust_relay",
+              blocked.nodeId ?? instance.id,
+              "Agents may only mark instances stopped on nodes at Full control. A person can do this in the browser.",
+            );
           const marked = ranks.map((rank) => rank.rank);
           const operation = await tx.runtimeOperation.create({
             data: {
@@ -930,6 +995,7 @@ export const runtimesRouter = {
         row,
         await latestStopChecks(prisma, [row]),
         readLiveLoad(context.services?.liveLoad, [row.id]),
+        await loadStepRefs(prisma, userId, [row]),
       );
     }),
     releaseUnproven: runtimeReleaseUnproven,

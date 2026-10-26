@@ -85,4 +85,8 @@ pub enum Command {
 
     /// List or apply crash-safe file recovery from abandoned `.wsmp-recover-*` directories.
     Recover(crate::commands::recover::Args),
+
+    /// Internal: run a runtime command so it cannot outlive the relay that started it.
+    #[command(name = "__launch-guard", hide = true)]
+    LaunchGuard(crate::commands::launch_guard::Args),
 }

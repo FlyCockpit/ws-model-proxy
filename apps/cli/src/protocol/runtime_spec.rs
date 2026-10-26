@@ -604,8 +604,22 @@ pub struct NodeFeatures {
     pub runtime_hosts: Vec<String>,
     pub media_expand: bool,
     pub live_stt: bool,
+    /// The node reads `runtime.job` `reservations` and exports them to the
+    /// commands. Absent means an older CLI that ignores them.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub job_reservations: bool,
+    /// One runtime step runner outlives the node's relay connections, and
+    /// stop and status results and inventory records say whether the rank
+    /// had another step that may launch in flight (`rank_idle`). The server
+    /// sends runtime jobs only to a node with it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rank_idle: bool,
     /// The node's secrets: names and when they were last set (never values).
     pub secrets: Vec<SecretEntry>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

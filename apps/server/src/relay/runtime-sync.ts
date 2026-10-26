@@ -6,7 +6,10 @@
  * and `Node.heldDefinitions` / held hashes are replaced from that answer.
  *
  * Which versions a node holds (cap `RUNTIME_DEFINITIONS_MAX`, in this priority):
- *   1. the launch version of every instance with a live claim on the node (never dropped);
+ *   1. every version a process or step on the node may still name (never dropped): the launch
+ *      version of every instance with a live claim on the node, what each live-claimed rank
+ *      physically runs (a restart's earlier version, until its stop is proven), and the version
+ *      of every unfinished step on the node;
  *   2. the current version of each server-origin ALWAYS_ON runtime on the node;
  *   3. versions pinned by profiles that own the node;
  *   4. the current version of every server-origin STARTABLE runtime of the owner (newest first).
@@ -15,6 +18,8 @@
  * One operation per node is in flight; a sync asked for meanwhile runs after its final answer.
  */
 import { randomBytes } from "node:crypto";
+import { graphWrite } from "@ws-model-proxy/api/lib/graph-write";
+import { requiredDefinitionsByNode } from "@ws-model-proxy/api/lib/node-definitions";
 import {
   nodeFabricsHash,
   nodeMetricCommandsHash,
@@ -22,11 +27,12 @@ import {
 import {
   type NodeMetricCommand,
   nodeMetricCommandsSchema,
+  nodeRuntimeSpec,
   RUNTIME_DEFINITIONS_MAX,
   runtimeSpecSchema,
 } from "@ws-model-proxy/api/lib/runtime-spec";
 import { nodeFabricSets } from "@ws-model-proxy/api/nodes/fabrics";
-import prisma from "@ws-model-proxy/db";
+import prisma, { type Prisma } from "@ws-model-proxy/db";
 import {
   CHUNK_BUDGET_BYTES,
   DEFINE_CHUNK_MAX_VERSIONS,
@@ -53,8 +59,6 @@ export const DEFINE_ANSWER_WAIT_MS = 5_000;
 export const DEFINE_TIMEOUT_RETRIES = 3;
 export const DEFINE_RETRY_BASE_MS = 5_000;
 
-const LIVE_CLAIMS = ["HELD", "HELD_UNKNOWN"] as const;
-
 // ── What the node should hold (pure) ──
 
 export type DesiredVersion = {
@@ -65,13 +69,27 @@ export type DesiredVersion = {
   createdAt: Date;
 };
 
-/** Orders and caps the desired versions; launch versions of live instances always stay. */
-export function capDesired(versions: readonly DesiredVersion[]): DefinitionEnvelope[] {
+/**
+ * Orders and caps the desired versions; the required ones (priority 1) always come first.
+ * Admission keeps them within the cap (`definition_slots_full`); more than the cap of them is a
+ * bug, logged, and the released CLI's limit still applies (the cap is never raised here).
+ */
+export function capDesired(
+  versions: readonly DesiredVersion[],
+  nodeId: string | null = null,
+): DefinitionEnvelope[] {
   const byId = new Map<string, DesiredVersion>();
   for (const version of versions) {
     const seen = byId.get(version.envelope.versionId);
     if (!seen || version.priority < seen.priority) byId.set(version.envelope.versionId, version);
   }
+  const required = [...byId.values()].filter((version) => version.priority === 1).length;
+  if (required > RUNTIME_DEFINITIONS_MAX)
+    console.error(
+      "[runtime-sync] a node requires more definitions than it can hold; some are not sent",
+      nodeId ?? "",
+      required,
+    );
   return (
     [...byId.values()]
       .sort(
@@ -80,7 +98,7 @@ export function capDesired(versions: readonly DesiredVersion[]): DefinitionEnvel
           b.createdAt.getTime() - a.createdAt.getTime() ||
           (a.envelope.versionId < b.envelope.versionId ? -1 : 1),
       )
-      // Live instances' launch versions sort first, so the cap drops only optional versions.
+      // Required versions sort first, so the cap drops only optional versions.
       .slice(0, RUNTIME_DEFINITIONS_MAX)
       .map((version) => version.envelope)
   );
@@ -176,7 +194,8 @@ function envelopeOf(row: {
     launchHash: row.launchHash,
     kind: row.Runtime.kind === "ALWAYS_ON" ? "always_on" : "startable",
     slug: row.Runtime.slug,
-    spec: spec.data,
+    // The node's copy: without the server-only `launch.reservations` (the launch hash too).
+    spec: nodeRuntimeSpec(spec.data),
   };
 }
 
@@ -188,8 +207,11 @@ const VERSION_SELECT = {
   Runtime: { select: { id: true, slug: true, kind: true } },
 } as const;
 
-export async function loadNodeDefinitionState(nodeId: string): Promise<NodeDefinitionState | null> {
-  const node = await prisma.node.findUnique({
+export async function loadNodeDefinitionState(
+  nodeId: string,
+  db: Prisma.TransactionClient = prisma,
+): Promise<NodeDefinitionState | null> {
+  const node = await db.node.findUnique({
     where: { id: nodeId },
     select: {
       userId: true,
@@ -234,21 +256,20 @@ export async function loadNodeDefinitionState(nodeId: string): Promise<NodeDefin
   };
 
   const userId = node.userId;
-  const [running, alwaysOn, pinned, startable] = await Promise.all([
-    prisma.runtimeVersion.findMany({
-      where: {
-        LaunchInstances: {
-          some: { userId, Ranks: { some: { nodeId, claim: { in: [...LIVE_CLAIMS] } } } },
-        },
-        Runtime: { origin: "SERVER" },
-      },
+  // Every version a process or step on the node may still name (`node-definitions.ts`).
+  const required =
+    (await requiredDefinitionsByNode(db, { userId, nodeIds: [nodeId] })).get(nodeId) ??
+    new Set<string>();
+  const [needed, alwaysOn, pinned, startable] = await Promise.all([
+    db.runtimeVersion.findMany({
+      where: { id: { in: [...required] }, Runtime: { userId, origin: "SERVER" } },
       select: VERSION_SELECT,
     }),
-    prisma.runtimeVersion.findMany({
+    db.runtimeVersion.findMany({
       where: { CurrentOf: { userId, nodeId, kind: "ALWAYS_ON", origin: "SERVER" } },
       select: VERSION_SELECT,
     }),
-    prisma.runtimeVersion.findMany({
+    db.runtimeVersion.findMany({
       where: {
         // An item pinned to other nodes does not use this node's cap.
         ProfileItems: {
@@ -261,7 +282,7 @@ export async function loadNodeDefinitionState(nodeId: string): Promise<NodeDefin
       },
       select: VERSION_SELECT,
     }),
-    prisma.runtimeVersion.findMany({
+    db.runtimeVersion.findMany({
       where: { CurrentOf: { userId, kind: "STARTABLE", origin: "SERVER" } },
       select: VERSION_SELECT,
       orderBy: { createdAt: "desc" },
@@ -269,17 +290,17 @@ export async function loadNodeDefinitionState(nodeId: string): Promise<NodeDefin
     }),
   ]);
   const desired: DesiredVersion[] = [];
-  const add = (rows: typeof running, priority: DesiredVersion["priority"]) => {
+  const add = (rows: typeof needed, priority: DesiredVersion["priority"]) => {
     for (const row of rows) {
       const envelope = envelopeOf(row);
       if (envelope) desired.push({ envelope, priority, createdAt: row.createdAt });
     }
   };
-  add(running, 1);
+  add(needed, 1);
   add(alwaysOn, 2);
   add(pinned, 3);
   add(startable, 4);
-  state.desired = capDesired(desired);
+  state.desired = capDesired(desired, nodeId);
   return state;
 }
 
@@ -398,34 +419,52 @@ export function createRuntimeSync(
     inFlight.set(nodeId, op);
     const answer = new Promise<DefineOutcome | null>((resolve) => op.waiters.push(resolve));
     try {
-      const state = await loadNodeDefinitionState(nodeId);
-      // Replaced meanwhile (a new session took the slot): this operation is over.
-      if (inFlight.get(nodeId) !== op) return answer;
-      // The definitions are read under the node's owner (`loadNodeDefinitionState`); the live
-      // session must be that owner's node too (defence in depth).
-      if (!state?.fullControl || !nodeOwnerMatches(session, state.userId, "definition_sync")) {
+      const owner = await prisma.node.findUnique({
+        where: { id: nodeId },
+        select: { userId: true },
+      });
+      if (!owner) {
         finish(nodeId, op, null);
         return answer;
       }
-      const frames = buildCompleteOperation({
-        opId: op.opId,
-        desired: state.desired,
-        held: state.held,
-        node: state.node,
-      });
-      for (const frame of frames) {
-        // Pinned to the planned session and re-checked against its live trust.
-        const sent = relay.sendToNode(nodeId, frame, {
-          connectionGeneration: op.connectionGeneration,
-          requireFullTrust: true,
-          userId: state.userId,
-          ownerCheck: "definition_sync",
-        });
-        if (!sent) {
+      // Read and sent under the owner's fence, which every claim and step writer and every
+      // admission takes: what the node requires is one coherent state, and an admission waits
+      // until this operation's frames are on the socket (so nothing admitted after the read is
+      // removed before the sync it triggers, which queues behind this one).
+      await graphWrite([owner.userId], async (tx) => {
+        const state = await loadNodeDefinitionState(nodeId, tx);
+        // Replaced meanwhile (a new session took the slot): this operation is over.
+        if (inFlight.get(nodeId) !== op) return;
+        // The definitions are read under the node's owner (`loadNodeDefinitionState`); the live
+        // session must be that owner's node too (defence in depth).
+        if (
+          !state?.fullControl ||
+          state.userId !== owner.userId ||
+          !nodeOwnerMatches(session, state.userId, "definition_sync")
+        ) {
           finish(nodeId, op, null);
-          break;
+          return;
         }
-      }
+        const frames = buildCompleteOperation({
+          opId: op.opId,
+          desired: state.desired,
+          held: state.held,
+          node: state.node,
+        });
+        for (const frame of frames) {
+          // Pinned to the planned session and re-checked against its live trust.
+          const sent = relay.sendToNode(nodeId, frame, {
+            connectionGeneration: op.connectionGeneration,
+            requireFullTrust: true,
+            userId: state.userId,
+            ownerCheck: "definition_sync",
+          });
+          if (!sent) {
+            finish(nodeId, op, null);
+            break;
+          }
+        }
+      });
     } catch (error) {
       console.error("[runtime-sync] building the definition sync failed", errorName(error));
       finish(nodeId, op, null);

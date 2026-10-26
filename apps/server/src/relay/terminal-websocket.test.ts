@@ -103,6 +103,57 @@ const db = prisma as unknown as {
 const now = new Date("2026-01-01T00:00:00.000Z");
 /** Connection generations only grow (the manager remembers the highest per node). */
 let generation = 0;
+/**
+ * The stored node rows the trust path reads and writes (a hello's update, `node.state`'s
+ * conditional update, the trust read): enough of the database for the session's trust to follow
+ * what is stored.
+ */
+function storedNodes(userId: string) {
+  const rows = new Map<string, Record<string, unknown>>();
+  const row = (id: string) => {
+    const found = rows.get(id) ?? {
+      id,
+      userId,
+      trust: null,
+      trustLowerRequestedAt: null,
+      connectionGeneration: 0,
+    };
+    rows.set(id, found);
+    return found;
+  };
+  const apply = (target: Record<string, unknown>, data: Record<string, unknown>) => {
+    for (const [key, value] of Object.entries(data)) {
+      if (value && typeof value === "object" && "increment" in value)
+        target[key] = Number(target[key] ?? 0) + Number((value as { increment: number }).increment);
+      else target[key] = value;
+    }
+  };
+  const matches = (target: Record<string, unknown>, where: Record<string, unknown>) =>
+    Object.entries(where).every(([key, value]) =>
+      value !== null && typeof value === "object" && !(value instanceof Date)
+        ? true
+        : value instanceof Date
+          ? target[key] instanceof Date && (target[key] as Date).getTime() === value.getTime()
+          : target[key] === value,
+    );
+  return {
+    rows,
+    update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
+      const target = row(args.where.id);
+      apply(target, args.data);
+      return { ...target };
+    },
+    updateMany: async (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+      const id = String(args.where.id ?? "");
+      const target = row(id);
+      if (!matches(target, args.where)) return { count: 0 };
+      apply(target, args.data);
+      return { count: 1 };
+    },
+    findUnique: async (args: { where: { id: string } }) => ({ ...row(args.where.id) }),
+  };
+}
+
 const testIdentity = generateTestHelloIdentity();
 
 /** The node credential a node named `slug` authenticated with (one node per slug). */
@@ -445,11 +496,19 @@ describe("terminal browser hub", () => {
       };
     });
     db.nodeCredential.update.mockResolvedValue({});
-    db.node.update.mockImplementation(async () => {
-      generation += 1;
-      return { connectionGeneration: generation };
-    });
-    db.node.updateMany.mockResolvedValue({ count: 1 });
+    const stored = storedNodes("user-id");
+    db.node.update.mockImplementation(
+      async (args: { where: { id: string }; data: Record<string, unknown> }) => {
+        // One generation counter across nodes, as before.
+        generation += 1;
+        return stored.update({
+          ...args,
+          data: { ...args.data, connectionGeneration: generation },
+        });
+      },
+    );
+    db.node.updateMany.mockImplementation(stored.updateMany);
+    db.node.findUnique.mockImplementation(stored.findUnique);
     db.user.findUnique.mockResolvedValue({ slug: "owner" });
     db.node.findFirst.mockImplementation(
       async (args: { where: { id?: string; userId?: string } }) => {

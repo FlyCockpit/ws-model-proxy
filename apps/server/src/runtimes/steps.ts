@@ -11,27 +11,37 @@
  *   30 AFTER_JOIN  ranks whose commands have `afterJoin` (after every rank started)
  *   40 READINESS   rank 0 (the head) only
  * Gang stops add STOP steps with `sequence = generation * 100 + 50 + n`; health probes use
- * `HEALTH_SEQUENCE_BASE` and up.
+ * `HEALTH_SEQUENCE_BASE` and up. The generation is the instance's run (`instance-run.ts`), and
+ * order inside a run is the phase slot (`slotOf`), not the raw sequence.
+ *
+ * Stops and status probes (the leading stop included) name what physically runs on the rank:
+ * the intent of its latest launch (`Physical`), which may be of an earlier launch version, port
+ * or unit than the run's own. The node matches its record by that identity and uses the
+ * record's own stop command, so a restart onto a new version still stops the old process.
  */
 import { createHash } from "node:crypto";
 import { canonicalJson } from "@ws-model-proxy/api/lib/canonical-json";
+import { GENERATION_STRIDE } from "@ws-model-proxy/api/lib/instance-run";
 import {
   RUNTIME_TIMEOUTS_SEC,
   type RuntimeCommands,
   type RuntimeLaunch,
 } from "@ws-model-proxy/api/lib/runtime-spec";
 import {
+  claimGpuIds,
   type StepIntent,
+  type StepReservation,
   stepIntentSchema,
   stepJobFabricId,
   stepJobPlaceholders,
+  stepJobReservations,
 } from "@ws-model-proxy/api/lib/step-intent";
 import { type JobPlaceholders, type RuntimeJobFrame, runtimeUnitName } from "../relay/frames.js";
 
 export const HEALTH_SEQUENCE_BASE = 1_000_000;
 /** Status probes of ranks marked stopped (held-unknown): unbounded, like health probes. */
 export const STATUS_SEQUENCE_BASE = 2_000_000;
-export const GENERATION_STRIDE = 100;
+export { GENERATION_STRIDE };
 export const STOP_ORDER_BASE = 50;
 /** Health probes and status checks of the CLI are short. */
 export const HEALTH_TIMEOUT_MS = 60_000;
@@ -67,7 +77,7 @@ const WIRE_PHASE = {
 } as const satisfies Record<StepPhase, RuntimeJobFrame["phase"]>;
 
 /** What a step carries (stored as `InstanceStep.intent`, hashed into `intentHash`). */
-export { type StepIntent, stepIntentSchema };
+export { type StepIntent, type StepReservation, stepIntentSchema };
 
 export function intentHash(intent: StepIntent): string {
   return createHash("sha256").update(canonicalJson(intent), "utf8").digest("hex");
@@ -96,6 +106,16 @@ export type NewStep = {
   generation: number;
   intent: StepIntent;
   intentHash: string;
+  /**
+   * A stop or status probe of a recorded launch (`Physical`): the head address it was
+   * dispatched with (`InstanceStep.headAddr`). Absent: resolved at dispatch.
+   */
+  headAddr?: string | null;
+  /**
+   * A leading STOP with nothing left to stop (every earlier launch of the rank is proven
+   * stopped): created SUCCEEDED, never sent. Absent: PENDING.
+   */
+  state?: "SUCCEEDED";
 };
 
 function commandsFor(launch: RuntimeLaunch, rank: number): RuntimeCommands {
@@ -148,13 +168,8 @@ export function canonicalDecimal(value: number): string | null {
 export function rankPlaceholders(resources: unknown): Record<string, string> {
   const out: Record<string, string> = {};
   if (!resources || typeof resources !== "object") return out;
-  const gpus = Reflect.get(resources, "gpus");
-  if (Array.isArray(gpus)) {
-    const ids = gpus
-      .map((key) => (typeof key === "string" ? /^[a-z]+:([0-9]{1,3})$/.exec(key)?.[1] : undefined))
-      .filter((id): id is string => id !== undefined);
-    if (ids.length > 0 && ids.length === gpus.length) out.gpu_ids = ids.join(",");
-  }
+  const gpuIds = claimGpuIds(resources);
+  if (gpuIds) out.gpu_ids = gpuIds;
   const kind = Reflect.get(resources, "kind");
   const number = (key: string) => {
     const value = Reflect.get(resources, key);
@@ -182,6 +197,8 @@ function intentFor(input: {
   phase: StepPhase;
   launch: RuntimeLaunch;
   operationId: string | null;
+  /** The run's reservation nodes (single-node instances only). */
+  reservations?: readonly StepReservation[];
 }): StepIntent {
   const commands = commandsFor(input.launch, input.rank.rank);
   const placeholders: Record<string, string | number> = {
@@ -205,6 +222,26 @@ function intentFor(input: {
     placeholders,
     timeoutMs: timeoutFor(input.phase, input.launch, commands),
     interactive: interactiveFor(input.phase, commands),
+    ...(input.nnodes === 1 && input.reservations && input.reservations.length > 0
+      ? { reservations: [...input.reservations].sort((a, b) => a.index - b.index) }
+      : {}),
+  };
+}
+
+/**
+ * What runs on a rank: the stored intent of its latest launch, the launch (spec) of that
+ * intent's version (the stop's timeout and interactivity come from it), and the head address the
+ * launch was dispatched with (multi-node; null when not recorded).
+ */
+export type Physical = { intent: StepIntent; launch: RuntimeLaunch; headAddr: string | null };
+
+function physicalIntent(input: Parameters<typeof intentFor>[0], physical: Physical): StepIntent {
+  const commands = commandsFor(physical.launch, input.rank.rank);
+  return {
+    ...physical.intent,
+    operationId: input.operationId,
+    timeoutMs: timeoutFor(input.phase, physical.launch, commands),
+    interactive: interactiveFor(input.phase, commands),
   };
 }
 
@@ -212,8 +249,9 @@ function step(
   input: Parameters<typeof intentFor>[0],
   sequence: number,
   generation: number,
+  physical?: Physical,
 ): NewStep {
-  const intent = intentFor(input);
+  const intent = physical ? physicalIntent(input, physical) : intentFor(input);
   return {
     rank: input.rank.rank,
     phase: input.phase,
@@ -221,16 +259,27 @@ function step(
     generation,
     intent,
     intentHash: intentHash(intent),
+    ...(physical?.headAddr ? { headAddr: physical.headAddr } : {}),
   };
 }
 
-/** Every step of start generation `generation` (≥ 1). */
+/**
+ * Every step of start generation `generation` (≥ 1). `physical`: per rank, what runs there now
+ * (its leading stop names it). `ended`: ranks whose every earlier launch is proven stopped: their
+ * leading stop is satisfied already (SUCCEEDED, never sent). A node may keep a stopped record of
+ * an earlier version, which refuses a stop naming another one, while it takes the new version's
+ * start (nothing of the old one runs).
+ */
 export function generationSteps(input: {
   instance: InstanceInput;
   ranks: readonly RankInput[];
   launch: RuntimeLaunch;
   generation: number;
   operationId: string | null;
+  physical?: ReadonlyMap<number, Physical>;
+  /** The run's reservation nodes (single-node instances only). */
+  reservations?: readonly StepReservation[];
+  ended?: ReadonlySet<number>;
 }): NewStep[] {
   const ranks = [...input.ranks].sort((a, b) => a.rank - b.rank);
   const nnodes = ranks.length;
@@ -241,11 +290,19 @@ export function generationSteps(input: {
     nnodes,
     launch: input.launch,
     operationId: input.operationId,
+    ...(input.reservations ? { reservations: input.reservations } : {}),
   };
   for (const rank of ranks) {
     const commands = commandsFor(input.launch, rank.rank);
-    if (input.generation > 1)
-      steps.push(step({ ...common, rank, phase: "STOP" }, base + ORDER.STOP, input.generation));
+    if (input.generation > 1) {
+      const leading = step(
+        { ...common, rank, phase: "STOP" },
+        base + ORDER.STOP,
+        input.generation,
+        input.physical?.get(rank.rank),
+      );
+      steps.push(input.ended?.has(rank.rank) ? { ...leading, state: "SUCCEEDED" } : leading);
+    }
     if (commands.prepare)
       steps.push(
         step({ ...common, rank, phase: "PREPARE" }, base + ORDER.PREPARE, input.generation),
@@ -274,6 +331,10 @@ export function stopStep(input: {
   attempt: number;
   operationId: string | null;
   phase?: "STOP" | "STATUS";
+  /** What runs on the rank (absent: the instance's own launch). */
+  physical?: Physical;
+  /** The run's reservation nodes, without `physical` (with it, the launch's own). */
+  reservations?: readonly StepReservation[];
 }): NewStep {
   return step(
     {
@@ -283,11 +344,13 @@ export function stopStep(input: {
       phase: input.phase ?? "STOP",
       launch: input.launch,
       operationId: input.operationId,
+      ...(input.reservations ? { reservations: input.reservations } : {}),
     },
     input.phase === "STATUS"
       ? STATUS_SEQUENCE_BASE + input.attempt
       : input.generation * GENERATION_STRIDE + STOP_ORDER_BASE + Math.min(input.attempt, 49),
     input.generation,
+    input.physical,
   );
 }
 
@@ -299,6 +362,7 @@ export function healthStep(input: {
   launch: RuntimeLaunch;
   generation: number;
   sequence: number;
+  reservations?: readonly StepReservation[];
 }): NewStep {
   return step(
     {
@@ -308,6 +372,7 @@ export function healthStep(input: {
       phase: "HEALTH",
       launch: input.launch,
       operationId: null,
+      ...(input.reservations ? { reservations: input.reservations } : {}),
     },
     Math.max(HEALTH_SEQUENCE_BASE, input.sequence),
     input.generation,
@@ -325,8 +390,15 @@ export function jobFrame(input: {
   ownerEpoch: string;
   headAddr: string | null;
   operator?: RuntimeJobFrame["operator"];
+  /**
+   * The node's CLI reads `reservations` (hello `features.jobReservations`). A released CLI
+   * refuses a job with unknown fields: without it they are left out (a start that needs them
+   * is refused before it is sent, `cli_upgrade_required`).
+   */
+  jobReservations?: boolean;
 }): RuntimeJobFrame {
   const { intent } = input;
+  const reservations = input.jobReservations ? stepJobReservations(intent) : null;
   // The same values the step views render the shown command from (`step-intent.ts`).
   const placeholders: JobPlaceholders = stepJobPlaceholders(intent, input.headAddr);
   const fabricId = stepJobFabricId(intent);
@@ -349,5 +421,6 @@ export function jobFrame(input: {
     ownerEpoch: input.ownerEpoch,
     intentHash: input.intentHash,
     ...(input.operator ? { operator: input.operator } : {}),
+    ...(reservations ? { reservations } : {}),
   };
 }

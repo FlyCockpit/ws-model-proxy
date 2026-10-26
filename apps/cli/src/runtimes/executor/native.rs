@@ -31,8 +31,8 @@ fn manager_until(
     manager_output_until(program, args, deadline, cancel, false, env)
 }
 
-/// A user-manager call with `XDG_RUNTIME_DIR` set. With `any_status`,
-/// stdout is returned whatever the exit status.
+/// A user-manager call with `XDG_RUNTIME_DIR` set, under the launch guard
+/// ([`crate::launch_guard`]). With `any_status`, stdout is returned whatever the exit status.
 #[cfg(target_os = "linux")]
 fn manager_output_until(
     program: &str,
@@ -51,16 +51,24 @@ fn manager_output_until(
         program.to_owned(),
     ];
     invocation.extend_from_slice(args);
+    let (guard, invocation) = crate::launch_guard::command("env", &invocation)?;
     let bytes = if any_status {
         crate::bounded_run::run_until_any_status(
-            "env",
+            &guard,
             &invocation,
             deadline.instant(),
             8192,
             cancel,
         )
     } else {
-        crate::bounded_run::run_until_env("env", &invocation, deadline.instant(), 8192, cancel, env)
+        crate::bounded_run::run_until_env(
+            &guard,
+            &invocation,
+            deadline.instant(),
+            8192,
+            cancel,
+            env,
+        )
     }
     .map_err(|_| anyhow::anyhow!("the systemd user manager did not answer"))?;
     String::from_utf8(bytes).context("the systemd user manager answered invalid text")
@@ -154,17 +162,23 @@ fn description(owner: &str, unit: &str) -> String {
     format!("wsmp-runtime:{owner}:{base}")
 }
 
-/// From `systemctl show --property=LoadState,ActiveState,TasksCurrent,ControlGroup`: a
-/// unit or slice that is gone, or whose control group is empty, runs nothing. `populated`
-/// reads the control group's `cgroup.events` (cgroup v2): it counts every process of the
-/// group and of every group below it (a slice's scopes and services). Without it, a unit whose
-/// task count is not known counts as alive.
+/// From `systemctl show --property=LoadState,ActiveState,Job,TasksCurrent,ControlGroup`: a
+/// unit with a job queued or running (a start `systemd-run --no-block` queued that has not
+/// forked yet) or that is activating may run something, whatever its control group holds now.
+/// Otherwise a unit or slice that is gone, or whose control group is empty, runs nothing.
+/// `populated` reads the control group's `cgroup.events` (cgroup v2): it counts every process
+/// of the group and of every group below it (a slice's scopes and services). Without it, a
+/// unit whose task count is not known counts as alive.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn unit_tasks_alive(output: &str, populated: impl FnOnce(&str) -> Option<bool>) -> bool {
     let fields = output
         .lines()
         .filter_map(|line| line.split_once('='))
         .collect::<std::collections::BTreeMap<_, _>>();
+    let job = fields.get("Job").copied().unwrap_or("");
+    if !job.is_empty() && job != "0" || fields.get("ActiveState") == Some(&"activating") {
+        return true;
+    }
     let group = fields.get("ControlGroup").copied().unwrap_or("");
     if fields.get("LoadState") == Some(&"not-found") || group.is_empty() {
         return false;
@@ -238,7 +252,9 @@ fn cgroup_populated(group: &str) -> Option<bool> {
 
 /// `/bin/sh -c script` with the rank's environment, inside a transient scope of the rank's
 /// slice (Linux), so whatever it leaves behind (a fork, a `setsid` daemon) stays where the stop
-/// proof looks. The exit status is the script's (`systemd-run --scope` runs it in place).
+/// proof looks. The exit status is the script's (`systemd-run --scope` runs it in place). Like
+/// every runtime command it runs under the launch guard ([`crate::launch_guard`]), so it never
+/// outlives the daemon.
 fn run_in_rank_slice(
     job: &Job,
     script: String,
@@ -267,20 +283,15 @@ fn run_in_rank_slice(
             "-c".into(),
             script,
         ];
-        crate::bounded_run::run_until_env("env", &args, deadline.instant(), limit, cancel, &env)
+        let (guard, args) = crate::launch_guard::command("env", &args)?;
+        crate::bounded_run::run_until_env(&guard, &args, deadline.instant(), limit, cancel, &env)
             .map_err(|_| anyhow::anyhow!("the command did not succeed"))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        crate::bounded_run::run_until_env(
-            "/bin/sh",
-            &["-c".into(), script],
-            deadline.instant(),
-            limit,
-            cancel,
-            &env,
-        )
-        .map_err(|_| anyhow::anyhow!("the command did not succeed"))
+        let (guard, args) = crate::launch_guard::command("/bin/sh", &["-c".into(), script])?;
+        crate::bounded_run::run_until_env(&guard, &args, deadline.instant(), limit, cancel, &env)
+            .map_err(|_| anyhow::anyhow!("the command did not succeed"))
     }
 }
 
@@ -474,7 +485,7 @@ impl Runtime for NativeRuntime {
                     "--user".into(),
                     "show".into(),
                     unit.into(),
-                    "--property=LoadState,ActiveState,Description,InvocationID,TasksCurrent,ControlGroup".into(),
+                    "--property=LoadState,ActiveState,Job,Description,InvocationID,TasksCurrent,ControlGroup".into(),
                 ],
                 deadline,
                 self.cancel_flag(),
@@ -484,10 +495,15 @@ impl Runtime for NativeRuntime {
                 .lines()
                 .filter_map(|line| line.split_once('='))
                 .collect::<BTreeMap<_, _>>();
+            // A unit with a job queued (a start not forked yet) is there, whatever its state.
+            let queued = fields
+                .get("Job")
+                .is_some_and(|job| !job.is_empty() && *job != "0");
             if fields.get("LoadState") == Some(&"not-found")
-                || (fields
-                    .get("ActiveState")
-                    .is_some_and(|s| matches!(*s, "inactive" | "failed"))
+                || (!queued
+                    && fields
+                        .get("ActiveState")
+                        .is_some_and(|s| matches!(*s, "inactive" | "failed"))
                     && (fields.get("TasksCurrent") == Some(&"0")
                         || fields.get("ControlGroup") == Some(&"")))
             {
@@ -655,7 +671,7 @@ impl Runtime for NativeRuntime {
                     "--user".into(),
                     "show".into(),
                     unit.into(),
-                    "--property=LoadState,ActiveState,TasksCurrent,ControlGroup".into(),
+                    "--property=LoadState,ActiveState,Job,TasksCurrent,ControlGroup".into(),
                 ],
                 deadline,
                 self.cancel_flag(),
@@ -885,6 +901,17 @@ mod tests {
         assert!(unit_tasks_alive(
             "LoadState=loaded\nActiveState=failed\nTasksCurrent=[not set]\nControlGroup=/x\n"
         ));
+        // A start queued (`systemd-run --no-block`) that has not forked yet: nothing in the
+        // control group, but it may run.
+        assert!(unit_tasks_alive(
+            "LoadState=loaded\nActiveState=inactive\nJob=42\nTasksCurrent=[not set]\nControlGroup=\n"
+        ));
+        assert!(unit_tasks_alive(
+            "LoadState=loaded\nActiveState=activating\nJob=\nTasksCurrent=0\nControlGroup=/x\n"
+        ));
+        assert!(!unit_tasks_alive(
+            "LoadState=loaded\nActiveState=inactive\nJob=\nTasksCurrent=[not set]\nControlGroup=\n"
+        ));
     }
 
     #[test]
@@ -998,6 +1025,7 @@ mod tests {
             gpu_ids: None,
             dist_port: None,
             host: "127.0.0.1".into(),
+            reservations: Vec::new(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "other", "modelType": "llm",
                 "models": [{ "id": "m" }],
@@ -1079,6 +1107,7 @@ mod tests {
             gpu_ids: None,
             dist_port: None,
             host: "127.0.0.1".into(),
+            reservations: Vec::new(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "other", "modelType": "llm",
                 "models": [{ "id": "m" }],
@@ -1160,6 +1189,7 @@ mod tests {
             dist_port: Some(dist),
             gpu_ids: None,
             host: "127.0.0.1".into(),
+            reservations: Vec::new(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "other", "modelType": "llm",
                 "models": [{ "id": "m" }],

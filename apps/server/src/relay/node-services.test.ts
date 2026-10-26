@@ -4,10 +4,14 @@ const updateMany = vi.fn(async () => ({ count: 1 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: { node: { updateMany } } }));
 
 const { createNodeRelayServices, SecretWriteError } = await import("./node-services.js");
-const { composeNodeFrameHandlers } = await import("./node-frame-handlers.js");
+const { composeNodeFrameHandlers, NodeFrameHandlersFailed } = await import(
+  "./node-frame-handlers.js"
+);
 
-import type { ServerToNodeControlFrame } from "./frames.js";
+import type { NodeToServerControlFrame, ServerToNodeControlFrame } from "./frames.js";
 import type { NodeSessionRef, SendGuard } from "./session-manager.js";
+
+type ExecStatusFrame = Extract<NodeToServerControlFrame, { type: "exec.status" }>;
 
 const ref = (nodeId = "node-1"): NodeSessionRef => ({
   nodeId,
@@ -40,7 +44,7 @@ function relay(deliver = true) {
         return deliver;
       }),
       nodeSession: vi.fn(() => ({ ...session })),
-      requestTrustLower: vi.fn(() => true),
+      requestTrustLower: vi.fn(async () => undefined),
       closeSessionsForNodes: vi.fn(async () => undefined),
     },
   };
@@ -241,7 +245,7 @@ describe("node relay services", () => {
     await services.rescan?.("node-1");
     expect(r.sent[0]).toMatchObject({ type: "runtime.detect" });
     await services.lowerTrust?.("node-1");
-    expect(r.port.requestTrustLower).toHaveBeenCalledWith("node-1", expect.any(Date));
+    expect(r.port.requestTrustLower).toHaveBeenCalledWith("node-1");
     await services.disconnect?.("node-1", "node_deleted");
     expect(r.port.closeSessionsForNodes).toHaveBeenCalledWith(["node-1"]);
   });
@@ -286,6 +290,57 @@ describe("composeNodeFrameHandlers", () => {
     expect(error).toHaveBeenCalledWith("[relay] node frame handler failed", "nodeReady", "Error");
     error.mockRestore();
   });
+
+  it("reports a node frame a part failed, after every part ran", async () => {
+    const calls: string[] = [];
+    const handlers = composeNodeFrameHandlers(
+      {
+        "exec.status": async () => {
+          calls.push("a");
+          throw new Error("boom");
+        },
+      },
+      { "exec.status": () => void calls.push("b") },
+    );
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const frame = {} as ExecStatusFrame;
+    await expect(handlers["exec.status"]?.(ref(), frame)).rejects.toBeInstanceOf(
+      NodeFrameHandlersFailed,
+    );
+    expect(calls).toEqual(["a", "b"]);
+    expect(error).toHaveBeenCalledWith("[relay] node frame handler failed", "exec.status", "Error");
+    error.mockRestore();
+  });
+
+  it("resolves a node frame every part handled", async () => {
+    const handlers = composeNodeFrameHandlers(
+      { "exec.status": async () => undefined },
+      { "exec.status": () => undefined },
+    );
+    const frame = {} as ExecStatusFrame;
+    await expect(handlers["exec.status"]?.(ref(), frame)).resolves.toBeUndefined();
+  });
+
+  it.each(["nodeReady", "trustRaised", "nodeDisconnected"] as const)(
+    "only logs a failed %s hook (nothing redelivers it)",
+    async (hook) => {
+      const calls: string[] = [];
+      const handlers = composeNodeFrameHandlers(
+        {
+          [hook]: () => {
+            calls.push("a");
+            throw new Error("boom");
+          },
+        },
+        { [hook]: () => void calls.push("b") },
+      );
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await expect(Promise.resolve(handlers[hook]?.(ref()))).resolves.toBeUndefined();
+      expect(calls).toEqual(["a", "b"]);
+      expect(error).toHaveBeenCalledWith("[relay] node frame handler failed", hook, "Error");
+      error.mockRestore();
+    },
+  );
 
   it("refuses two parts answering the same node question", () => {
     const sync = async () => "none" as const;

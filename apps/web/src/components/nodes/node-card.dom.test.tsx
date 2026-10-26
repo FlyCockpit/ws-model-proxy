@@ -42,6 +42,8 @@ function node(overrides: Partial<NodeSummary> = {}): NodeSummary {
     labels: ["gpu"],
     hardwareKind: "discrete",
     liveFreeMemoryGb: 12.5,
+    usableMemoryGb: 64,
+    reservedNowMemoryGb: 0,
     runningInstances: 1,
     alwaysOnRuntimes: 0,
     needsYou: 0,

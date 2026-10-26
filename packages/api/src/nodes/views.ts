@@ -13,13 +13,19 @@ import type {
   nodeSummarySchema,
   queuedCommandViewSchema,
 } from "../contracts/nodes";
+import {
+  CURRENT_RESERVATION_WHERE,
+  HOLDING_RESERVATION_WHERE,
+  RESERVATION_CLAIM_SELECT,
+  reservationClaim,
+} from "../lib/reservations";
 import { nodeFabricsHash, nodeMetricCommandsHash } from "../lib/runtime-launch-hash";
 import {
   declaredHardwareSchema,
   nodeFeaturesSchema,
   nodeMetricCommandsSchema,
 } from "../lib/runtime-spec";
-import { effectiveHardware, fabricSuggestions, liveMetrics } from "./hardware";
+import { effectiveHardware, fabricSuggestions, type HeldClaimGroup, liveMetrics } from "./hardware";
 import { nodeTrustView } from "./trust";
 
 type NodeSummary = z.infer<typeof nodeSummarySchema>;
@@ -56,8 +62,16 @@ export const nodeSummarySelect = {
     where: { claim: { in: [...HELD_CLAIMS] } },
     select: {
       resources: true,
+      // A replaced run's claim that still holds (it overlaps the current one).
+      prevResources: true,
+      prevPort: true,
       Instance: { select: { id: true, phase: true, needsOperator: true } },
     },
+  },
+  // Memory instances hold here without running (`launch.reservations`), while they hold.
+  Reservations: {
+    where: HOLDING_RESERVATION_WHERE,
+    select: { instanceId: true, resources: true, supersededGeneration: true },
   },
   _count: {
     select: {
@@ -70,6 +84,34 @@ export const nodeSummarySelect = {
 export type NodeSummaryRow = Prisma.NodeGetPayload<{ select: typeof nodeSummarySelect }>;
 
 const NOT_RUNNING_PHASES = new Set(["STOPPED", "FAILED"]);
+
+/**
+ * `resources` of every claim that holds on the node (its ranks' and reservations'), one group
+ * per instance: a replaced run's claims that still hold (a rank's `prev*`, superseded
+ * reservations) overlap the current ones (`effectiveHardware`).
+ */
+function heldClaimsOf(row: Pick<NodeSummaryRow, "Ranks" | "Reservations">): HeldClaimGroup[] {
+  const groups = new Map<string, { current: unknown[]; previous: unknown[] }>();
+  const groupOf = (instanceId: string) => {
+    const group = groups.get(instanceId) ?? { current: [], previous: [] };
+    groups.set(instanceId, group);
+    return group;
+  };
+  for (const rank of row.Ranks) {
+    const group = groupOf(rank.Instance.id);
+    group.current.push(rank.resources);
+    // Rows read without the select (older callers' fixtures) have none.
+    if (rank.prevPort !== null && rank.prevPort !== undefined)
+      group.previous.push(rank.prevResources);
+  }
+  for (const reservation of row.Reservations ?? []) {
+    const group = groupOf(reservation.instanceId);
+    if (reservation.supersededGeneration === null || reservation.supersededGeneration === undefined)
+      group.current.push(reservation.resources);
+    else group.previous.push(reservation.resources);
+  }
+  return [...groups.values()];
+}
 
 export function toNodeSummary(row: NodeSummaryRow, now: Date): NodeSummary {
   const running = new Set<string>();
@@ -84,7 +126,7 @@ export function toNodeSummary(row: NodeSummaryRow, now: Date): NodeSummary {
     nodeInfo: row.nodeInfo,
     nodeMetrics: row.nodeMetrics,
     nodeMetricsAt: row.nodeMetricsAt,
-    heldClaims: [],
+    heldClaims: heldClaimsOf(row),
     now,
   });
   return {
@@ -99,6 +141,8 @@ export function toNodeSummary(row: NodeSummaryRow, now: Date): NodeSummary {
     labels: row.labels,
     hardwareKind: hardware.kind.value,
     liveFreeMemoryGb: liveMetrics(row.nodeMetrics, row.nodeMetricsAt, now).freeMemoryGb,
+    usableMemoryGb: hardware.usableMemoryGb,
+    reservedNowMemoryGb: hardware.reservedNowMemoryGb,
     runningInstances: running.size,
     alwaysOnRuntimes: row._count.Runtimes,
     needsYou: needsYou.size + row._count.QueuedCommands,
@@ -129,7 +173,7 @@ export function toNodeListRow(row: NodeListSelected, now: Date): NodeListRow {
     nodeInfo: row.nodeInfo,
     nodeMetrics: row.nodeMetrics,
     nodeMetricsAt: row.nodeMetricsAt,
-    heldClaims: [],
+    heldClaims: heldClaimsOf(row),
     now,
   });
   const features = nodeFeaturesSchema.safeParse(row.features);
@@ -169,6 +213,8 @@ export const nodeDetailSelect = {
       rank: true,
       claim: true,
       resources: true,
+      prevResources: true,
+      prevPort: true,
       Instance: {
         select: {
           id: true,
@@ -177,6 +223,30 @@ export const nodeDetailSelect = {
           needsOperator: true,
           Runtime: { select: { slug: true } },
           _count: { select: { Ranks: true } },
+        },
+      },
+    },
+  },
+  // Every reservation here that holds or whose instance has not stopped (shown as "reserved by").
+  Reservations: {
+    where: {
+      OR: [HOLDING_RESERVATION_WHERE, { Instance: { phase: { not: "STOPPED" } } }],
+    },
+    orderBy: { index: "asc" },
+    select: {
+      index: true,
+      instanceId: true,
+      resources: true,
+      supersededGeneration: true,
+      Instance: {
+        select: {
+          id: true,
+          runtimeId: true,
+          phase: true,
+          needsOperator: true,
+          Runtime: { select: { slug: true } },
+          ...RESERVATION_CLAIM_SELECT.Instance.select,
+          _count: { select: { Reservations: { where: CURRENT_RESERVATION_WHERE } } },
         },
       },
     },
@@ -318,13 +388,25 @@ export function toNodeDetail(
   now: Date,
 ): NodeDetail {
   const heldRanks = row.Ranks.filter((rank) => rank.claim !== "RELEASED");
-  const summary = toNodeSummary(
-    {
-      ...row,
-      Ranks: heldRanks.map((rank) => ({ resources: rank.resources, Instance: rank.Instance })),
-    },
-    now,
-  );
+  const reservations = (row.Reservations ?? []).map((reservation) => ({
+    ...reservation,
+    claim: reservationClaim(reservation.Instance.Ranks),
+  }));
+  const heldReservations = reservations.filter((reservation) => reservation.claim !== "RELEASED");
+  const held = {
+    Ranks: heldRanks.map((rank) => ({
+      resources: rank.resources,
+      prevResources: rank.prevResources,
+      prevPort: rank.prevPort,
+      Instance: rank.Instance,
+    })),
+    Reservations: heldReservations.map((reservation) => ({
+      instanceId: reservation.instanceId,
+      resources: reservation.resources,
+      supersededGeneration: reservation.supersededGeneration,
+    })),
+  };
+  const summary = toNodeSummary({ ...row, ...held }, now);
   const features = nodeFeaturesSchema.safeParse(row.features);
   const declared = declaredHardwareSchema.safeParse(row.declaredResources);
   const metricCommands = nodeMetricCommandsSchema.safeParse(row.metricCommands);
@@ -349,7 +431,30 @@ export function toNodeDetail(
     phase: rank.Instance.phase,
     reserved: rank.claim,
     needsOperator: rank.Instance.needsOperator,
+    role: "rank" as const,
   }));
+  // Memory held here by an instance that runs elsewhere (`launch.reservations`): one entry per
+  // instance, its current reservation's when it has one here. A restart's superseded row (the
+  // old run's, still counted in `hardware` above) beside the new one is the same instance's hold,
+  // not another entry.
+  const reservationEntries = new Map<string, (typeof reservations)[number]>();
+  for (const reservation of reservations) {
+    const seen = reservationEntries.get(reservation.Instance.id);
+    if (!seen || (seen.supersededGeneration !== null && reservation.supersededGeneration === null))
+      reservationEntries.set(reservation.Instance.id, reservation);
+  }
+  for (const reservation of reservationEntries.values())
+    instances.push({
+      instanceId: reservation.Instance.id,
+      runtimeId: reservation.Instance.runtimeId,
+      runtimeSlug: reservation.Instance.Runtime.slug,
+      nodeNumber: reservation.index + 1,
+      nodeCount: Math.max(1, reservation.Instance._count.Reservations),
+      phase: reservation.Instance.phase,
+      reserved: reservation.claim,
+      needsOperator: reservation.Instance.needsOperator,
+      role: "reservation",
+    });
 
   return {
     ...summary,
@@ -361,7 +466,7 @@ export function toNodeDetail(
       nodeInfo: row.nodeInfo,
       nodeMetrics: row.nodeMetrics,
       nodeMetricsAt: row.nodeMetricsAt,
-      heldClaims: heldRanks.map((rank) => rank.resources),
+      heldClaims: heldClaimsOf(held),
       now,
     }),
     declaredHardware: declared.success ? declared.data : null,

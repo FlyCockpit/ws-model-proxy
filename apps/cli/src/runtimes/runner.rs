@@ -70,6 +70,7 @@ pub fn result_frame_for(job: &Job, outcome: &Outcome, terminal_id: Option<&str>)
         detail: outcome.detail.clone(),
         terminal_id: terminal_id.map(str::to_string),
         exit_code: None,
+        rank_idle: None,
     }
 }
 
@@ -86,9 +87,117 @@ fn key_name(job: &Job) -> Option<String> {
     ok.then(|| format!("{}-r{}", job.instance_id, job.rank))
 }
 
-/// One step in flight on a rank: its cancel flag and its dispatch (step id
-/// and operator terminal id).
-type InFlight = (Arc<AtomicBool>, String);
+/// One step in flight on a rank: its cancel flag, its dispatch (step id and
+/// operator terminal id), and whether it may launch (a start phase).
+type InFlight = (Arc<AtomicBool>, String, bool);
+
+/// The phases that may launch a process (the server's `RUN_START_PHASES`).
+fn may_launch(phase: crate::protocol::frames::JobPhase) -> bool {
+    use crate::protocol::frames::JobPhase;
+    matches!(
+        phase,
+        JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin | JobPhase::Readiness
+    )
+}
+
+/// Takes a step off its rank's in-flight list (its cancel flag names it).
+fn forget_step(
+    running: &Mutex<BTreeMap<String, Vec<InFlight>>>,
+    key: &str,
+    cancel: &Arc<AtomicBool>,
+) {
+    let mut running = running.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(flags) = running.get_mut(key) {
+        flags.retain(|(flag, _, _)| !Arc::ptr_eq(flag, cancel));
+        if flags.is_empty() {
+            running.remove(key);
+        }
+    }
+}
+
+/// Whether no step that may launch is in flight on rank `key` and not
+/// cancelled (a cancelled one checks its flag before it runs anything), and no
+/// launch guard of this node is still ending its session unwatched
+/// ([`crate::launch_guard::lingering`]): a step forgotten while its cleanup
+/// lingers could still launch, and that cleanup names no rank.
+fn rank_idle(running: &Mutex<BTreeMap<String, Vec<InFlight>>>, key: &str) -> bool {
+    rank_idle_given(running, key, crate::launch_guard::lingering())
+}
+
+fn rank_idle_given(
+    running: &Mutex<BTreeMap<String, Vec<InFlight>>>,
+    key: &str,
+    lingering: bool,
+) -> bool {
+    if lingering {
+        return false;
+    }
+    let running = running.lock().unwrap_or_else(PoisonError::into_inner);
+    running.get(key).is_none_or(|flags| {
+        flags
+            .iter()
+            .all(|(flag, _, launches)| !*launches || flag.load(Ordering::SeqCst))
+    })
+}
+
+/// Runs `step` holding the rank (`held`), then takes the in-flight check
+/// (`rank_idle`) before letting the rank go: a step that may launch runs only
+/// holding the rank, so none ran between `step` and the check, and any
+/// admitted after it was delivered after `step`'s dispatch (frames are
+/// admitted in order). What `step` observed stopped is proven stopped only
+/// when the check says idle.
+fn holding_rank<T>(
+    held: MutexGuard<'_, ()>,
+    running: &Mutex<BTreeMap<String, Vec<InFlight>>>,
+    key: &str,
+    step: impl FnOnce() -> T,
+) -> (T, bool) {
+    let out = step();
+    let idle = rank_idle(running, key);
+    drop(held);
+    (out, idle)
+}
+
+/// The rank's in-process lock (every step on the rank runs holding it).
+fn rank_lock(keys: &Mutex<BTreeMap<String, Arc<Mutex<()>>>>, key: &str) -> Arc<Mutex<()>> {
+    let mut keys = keys.lock().unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(keys.entry(key.to_string()).or_default())
+}
+
+/// Every instance record on disk, verified (expired stopped records go),
+/// each marked with whether its rank was idle (`InstanceRecord::rank_idle`).
+/// Each rank is observed holding its lock, and the in-flight check is taken
+/// in the same hold: a step that may launch runs only holding it, so nothing
+/// launched between the check and the observation. A rank a step holds is
+/// not idle.
+fn observe_all_idle(
+    dir: &Path,
+    keys: &Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    running: &Mutex<BTreeMap<String, Vec<InFlight>>>,
+) -> Vec<(Job, InstanceRecord)> {
+    let runtime = NativeRuntime { cancel: None };
+    let mut out = Vec::new();
+    for path in instance_paths(dir) {
+        let Some(key) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let lock = rank_lock(keys, key);
+        let held = match lock.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        let (mut observed, idle) = match held {
+            Some(held) => holding_rank(held, running, key, || observe_path(dir, &path, &runtime)),
+            None => (observe_path(dir, &path, &runtime), false),
+        };
+        for (job, record) in &mut observed {
+            record.rank_idle = key_name(job).map(|name| idle && name == key);
+        }
+        out.extend(observed);
+    }
+    out
+}
 
 pub struct Runner {
     tx: SyncSender<Update>,
@@ -124,11 +233,13 @@ impl Runner {
         let tx = self.tx.clone();
         let dir = self.dir.clone();
         let generation = Arc::clone(&self.generation);
+        let running = Arc::clone(&self.running);
+        let keys = Arc::clone(&self.keys);
         let _ = std::thread::Builder::new()
             .name("wsmp-instances".into())
             .spawn(move || {
                 let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
-                let instances = observe_all(&dir);
+                let instances = observe_all_idle(&dir, &keys, &running);
                 let _ = tx.send(Update {
                     generation,
                     result: None,
@@ -175,18 +286,13 @@ impl Runner {
                     .map_or("", |ticket| ticket.ids.terminal_id.as_str())
             );
             let stop = job.action == crate::protocol::frames::JobPhase::Stop;
-            if !admit_step(flags, dispatch, stop, &cancel) {
+            if !admit_step(flags, dispatch, stop, may_launch(job.action), &cancel) {
                 tracing::info!(step_id = job.step_id, "a runtime step is already in flight");
                 return Ok(());
             }
         }
-        let key_lock = {
-            let mut keys = self
-                .keys
-                .lock()
-                .map_err(|_| anyhow::anyhow!("runner state poisoned"))?;
-            Arc::clone(keys.entry(key.clone()).or_default())
-        };
+        let key_lock = rank_lock(&self.keys, &key);
+        let keys = Arc::clone(&self.keys);
         let deadline = Deadline::new(Duration::from_millis(job.timeout_ms));
         let tx = self.tx.clone();
         let dir = self.dir.clone();
@@ -194,6 +300,8 @@ impl Runner {
         let active = Arc::clone(&self.active);
         let generation = Arc::clone(&self.generation);
         active.fetch_add(1, Ordering::SeqCst);
+        // What a failed spawn rolls back (the thread takes the originals).
+        let (admitted_key, admitted) = (key.clone(), Arc::clone(&cancel));
         let spawned = std::thread::Builder::new()
             .name("wsmp-runtime-step".into())
             .spawn(move || {
@@ -204,29 +312,32 @@ impl Runner {
                 // on a person must not park every probe for it.
                 let waits =
                     ticket.is_some() || job.action == crate::protocol::frames::JobPhase::Stop;
-                let outcome = match lock_rank(&key_lock, (!waits).then_some(deadline)) {
-                    None => Some(Outcome::failed(JobError::JobDeadline)),
-                    Some(_held) => match ticket {
+                let (outcome, idle) = match lock_rank(&key_lock, (!waits).then_some(deadline)) {
+                    None => (Some(Outcome::failed(JobError::JobDeadline)), false),
+                    Some(held) => holding_rank(held, &running, &key, || match ticket {
                         Some(ticket) => {
                             run_operator_step(&dir, &key, job.clone(), &ticket, &cancel, &tx)
                         }
                         None => Some(run_step(&dir, &key, job.clone(), &cancel, deadline)),
-                    },
+                    }),
                 };
-                if let Ok(mut running) = running.lock()
-                    && let Some(flags) = running.get_mut(&key)
-                {
-                    flags.retain(|(flag, _)| !Arc::ptr_eq(flag, &cancel));
-                    if flags.is_empty() {
-                        running.remove(&key);
-                    }
-                }
+                forget_step(&running, &key, &cancel);
                 let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
-                let instances = observe_all(&dir);
+                let instances = observe_all_idle(&dir, &keys, &running);
                 let _ = tx.send(Update {
                     generation,
-                    result: outcome
-                        .map(|outcome| result_frame_for(&job, &outcome, terminal_id.as_deref())),
+                    result: outcome.map(|outcome| {
+                        let mut frame = result_frame_for(&job, &outcome, terminal_id.as_deref());
+                        if matches!(
+                            job.action,
+                            crate::protocol::frames::JobPhase::Stop
+                                | crate::protocol::frames::JobPhase::Status
+                        ) && let NodeFrame::RuntimeJobResult { rank_idle, .. } = &mut frame
+                        {
+                            *rank_idle = Some(idle);
+                        }
+                        frame
+                    }),
                     instances,
                     operator: None,
                 });
@@ -234,6 +345,9 @@ impl Runner {
             });
         if let Err(error) = spawned {
             self.active.fetch_sub(1, Ordering::SeqCst);
+            // Never admitted after all: off the rank's list, so a re-delivery runs and the rank
+            // is idle again (`rank_idle`).
+            forget_step(&self.running, &admitted_key, &admitted);
             return Err(error).context("starting a runtime step");
         }
         Ok(())
@@ -250,17 +364,18 @@ fn admit_step(
     flags: &mut Vec<InFlight>,
     dispatch: String,
     stop: bool,
+    launches: bool,
     cancel: &Arc<AtomicBool>,
 ) -> bool {
-    if flags.iter().any(|(_, other)| *other == dispatch) {
+    if flags.iter().any(|(_, other, _)| *other == dispatch) {
         return false;
     }
     if stop {
-        for (flag, _) in flags.iter() {
+        for (flag, _, _) in flags.iter() {
             flag.store(true, Ordering::SeqCst);
         }
     }
-    flags.push((Arc::clone(cancel), dispatch));
+    flags.push((Arc::clone(cancel), dispatch, launches));
     true
 }
 
@@ -492,31 +607,30 @@ fn lock_with(
         .map_err(|(_, error)| anyhow::anyhow!("locking instance state: {error}"))
 }
 
-/// Every instance record on disk, verified; expired stopped records go.
-pub fn observe_all(dir: &Path) -> Vec<(Job, InstanceRecord)> {
+/// The instance record files, in name order.
+fn instance_paths(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let runtime = NativeRuntime { cancel: None };
-    let mut out = Vec::new();
     let mut paths: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .collect();
     paths.sort();
-    for path in paths {
-        let Ok(executor) = Executor::load(path.clone()) else {
-            continue;
-        };
-        let deadline = Deadline::new(Duration::from_secs(20));
-        if executor.expired() {
-            remove_expired(dir, &path);
-            continue;
-        }
-        out.extend(executor.observations(&runtime, deadline));
+    paths
+}
+
+/// One record file's observations, verified; an expired stopped record goes.
+fn observe_path(dir: &Path, path: &Path, runtime: &NativeRuntime) -> Vec<(Job, InstanceRecord)> {
+    let Ok(executor) = Executor::load(path.to_path_buf()) else {
+        return Vec::new();
+    };
+    if executor.expired() {
+        remove_expired(dir, path);
+        return Vec::new();
     }
-    out
+    executor.observations(runtime, Deadline::new(Duration::from_secs(20)))
 }
 
 #[cfg(test)]
@@ -539,22 +653,122 @@ mod tests {
     }
 
     #[test]
+    fn a_rank_is_idle_only_without_a_step_that_may_launch_and_is_not_cancelled() {
+        let _serial = crate::launch_guard::lingering_serial();
+        let running = Mutex::new(BTreeMap::new());
+        assert!(rank_idle(&running, "i-r0"), "nothing in flight");
+        let start = Arc::new(AtomicBool::new(false));
+        {
+            let mut map = running.lock().expect("runner state");
+            let flags: &mut Vec<InFlight> = map.entry("i-r0".to_string()).or_default();
+            assert!(admit_step(flags, "s1:".into(), false, true, &start));
+            // A status probe (it launches nothing) changes nothing.
+            let probe = Arc::new(AtomicBool::new(false));
+            assert!(admit_step(flags, "p1:".into(), false, false, &probe));
+        }
+        assert!(!rank_idle(&running, "i-r0"), "a start waits for the rank");
+        assert!(rank_idle(&running, "i-r1"), "another rank");
+        {
+            let mut map = running.lock().expect("runner state");
+            let flags = map.get_mut("i-r0").expect("in flight");
+            let stop = Arc::new(AtomicBool::new(false));
+            assert!(admit_step(flags, "s2:".into(), true, false, &stop));
+        }
+        assert!(rank_idle(&running, "i-r0"), "the stop cancelled the start");
+    }
+
+    #[test]
+    fn no_rank_is_idle_while_a_launch_guard_lingers() {
+        // A closed operator terminal whose guard still ends its session: its step is forgotten,
+        // but what the guard has not ended yet may still launch.
+        let running = Mutex::new(BTreeMap::new());
+        assert!(rank_idle_given(&running, "i-r0", false));
+        assert!(!rank_idle_given(&running, "i-r0", true));
+        assert!(!rank_idle_given(&running, "other-r3", true));
+    }
+
+    #[test]
+    fn a_proof_is_idle_only_if_no_start_waited_for_the_rank_during_it() {
+        let _serial = crate::launch_guard::lingering_serial();
+        // A start is admitted and waits for the rank while a status probe
+        // holds it. Once the probe lets the rank go, the start runs (it may
+        // launch) and leaves the list: the probe's answer must still say
+        // not idle, whatever runs first afterwards.
+        let running = Arc::new(Mutex::new(BTreeMap::new()));
+        let rank = Arc::new(Mutex::new(()));
+        let start = Arc::new(AtomicBool::new(false));
+        {
+            let mut map = running.lock().expect("runner state");
+            let flags: &mut Vec<InFlight> = map.entry("i-r0".to_string()).or_default();
+            assert!(admit_step(flags, "s1:".into(), false, true, &start));
+        }
+        let held = rank.lock().expect("the probe holds the rank");
+        let starter = {
+            let (running, rank, start) = (Arc::clone(&running), Arc::clone(&rank), start);
+            std::thread::spawn(move || {
+                let _running_start = rank.lock().expect("the start runs");
+                forget_step(&running, "i-r0", &start);
+            })
+        };
+        let ((), idle) = holding_rank(held, &running, "i-r0", || {
+            // The probe's proof: the start has not run (it waits for the rank).
+        });
+        starter.join().expect("the start ran");
+        assert!(!idle, "a start waited for the rank during the proof");
+        let ((), idle) = holding_rank(rank.lock().expect("rank"), &running, "i-r0", || {});
+        assert!(idle, "nothing in flight any more");
+    }
+
+    #[test]
+    fn a_step_never_spawned_leaves_no_ghost_on_its_rank() {
+        let _serial = crate::launch_guard::lingering_serial();
+        let running = Mutex::new(BTreeMap::new());
+        let start = Arc::new(AtomicBool::new(false));
+        {
+            let mut map = running.lock().expect("runner state");
+            let flags: &mut Vec<InFlight> = map.entry("i-r0".to_string()).or_default();
+            assert!(admit_step(flags, "s1:".into(), false, true, &start));
+        }
+        assert!(!rank_idle(&running, "i-r0"));
+        // Its worker could not be started: rolled back.
+        forget_step(&running, "i-r0", &start);
+        assert!(rank_idle(&running, "i-r0"));
+        // A re-delivery of the same dispatch is admitted again.
+        let again = Arc::new(AtomicBool::new(false));
+        let mut map = running.lock().expect("runner state");
+        let flags: &mut Vec<InFlight> = map.entry("i-r0".to_string()).or_default();
+        assert!(admit_step(flags, "s1:".into(), false, true, &again));
+    }
+
+    #[test]
     fn a_re_delivered_dispatch_in_flight_is_not_run_again() {
         let mut flags = Vec::new();
         let start = Arc::new(AtomicBool::new(false));
-        assert!(admit_step(&mut flags, "s1:term-a".into(), false, &start));
+        assert!(admit_step(
+            &mut flags,
+            "s1:term-a".into(),
+            false,
+            true,
+            &start
+        ));
         let stop = Arc::new(AtomicBool::new(false));
-        assert!(admit_step(&mut flags, "s2:".into(), true, &stop));
+        assert!(admit_step(&mut flags, "s2:".into(), true, false, &stop));
         assert!(
             start.load(Ordering::SeqCst),
             "the stop cancels the rank's step"
         );
         // The same stop again (parked behind a person's run): no second thread.
         let again = Arc::new(AtomicBool::new(false));
-        assert!(!admit_step(&mut flags, "s2:".into(), true, &again));
+        assert!(!admit_step(&mut flags, "s2:".into(), true, false, &again));
         assert_eq!(flags.len(), 2);
         // A newer dispatch of a step (another terminal id) is its own.
-        assert!(admit_step(&mut flags, "s1:term-b".into(), false, &again));
+        assert!(admit_step(
+            &mut flags,
+            "s1:term-b".into(),
+            false,
+            true,
+            &again
+        ));
         assert_eq!(flags.len(), 3);
     }
 }

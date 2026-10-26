@@ -1,6 +1,7 @@
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import type { TFunction } from "i18next";
 
+import { refusalReservationOf, withReservation } from "@/lib/refusal-text";
 import { friendly } from "@/utils/friendly-error";
 
 /** The machine reason an API refusal carries (`data.reason`), or null. Reads codes only. */
@@ -24,7 +25,8 @@ export function refusalKeys(reason: string): string[] {
 export function refusalMessage(t: TFunction, error: unknown, fallbackKey?: string): string {
   const reason = refusalReasonOf(error);
   const specific = reason ? t(refusalKeys(reason), { defaultValue: "" }) : "";
-  if (specific) return specific;
+  // A reservation that cannot be placed: say which (labels, node).
+  if (specific) return withReservation(t, refusalReservationOf(error), specific);
   return friendly(error, fallbackKey ? t(fallbackKey) : undefined);
 }
 

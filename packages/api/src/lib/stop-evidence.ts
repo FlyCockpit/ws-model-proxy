@@ -46,7 +46,8 @@ type StepReader = { instanceStep: { findFirst: Prisma.InstanceStepDelegate["find
  * every rank of a STOPPING instance, from this stop only (created since the instance began
  * stopping: a check of an earlier run says nothing about this one), and a rank still held after
  * it was marked stopped (HELD_UNKNOWN, also on a STOPPED or FAILED instance), from its mark on.
- * Its `errorCode` says why the node could not prove the stop (`port_in_use`, ...). One indexed
+ * Its `errorCode` says why the node could not prove the stop (`port_in_use`, ...), or why its
+ * stopped answer proves nothing yet (`launch_pending`: a start may still launch). One indexed
  * lookup per rank.
  */
 export async function latestStopChecks(
@@ -89,7 +90,9 @@ export async function latestStopChecks(
     if (probe)
       checks.set(stopCheckKey(probe.instanceId, probe.rank), {
         at: probe.updatedAt.toISOString(),
-        proven: probe.state === "SUCCEEDED",
+        // A stopped answer the server refused as a proof (a start may still launch there) records
+        // why (`launch_pending`): it is not a confirmed stop.
+        proven: probe.state === "SUCCEEDED" && probe.errorCode === null,
         errorCode: probe.errorCode,
       });
   return checks;

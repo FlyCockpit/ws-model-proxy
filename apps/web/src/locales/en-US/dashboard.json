@@ -216,6 +216,8 @@
     "card": {
       "hardware": "Hardware",
       "freeMemory": "Free memory",
+      "reserved": "Held by runtimes",
+      "reservedValue": "{{held}} of {{usable}}",
       "running": "Running",
       "runningValue": "{{instances}} started, {{alwaysOn}} always on",
       "lastSeen": "Last seen",
@@ -475,6 +477,7 @@
       "empty": "Nothing started here.",
       "part_one": "part {{number}} of {{count}}",
       "part_other": "part {{number}} of {{count}}",
+      "reservation": "holds memory here, runs on another node",
       "needsYou": "Needs you",
       "held": "Definitions on the node",
       "heldEmpty": "None.",
@@ -597,7 +600,8 @@
         "preempted": "makes room",
         "profile_owned_node": "not in this profile"
       },
-      "startVersion": "version {{version}}"
+      "startVersion": "version {{version}}",
+      "reservation": "{{node}} (memory held, nothing runs there)"
     },
     "editor": {
       "back": "All profiles",
@@ -669,6 +673,9 @@
     "name_aliased": "One of your model-name aliases already uses that callable ID. Remove the alias or pick another name.",
     "always_on_runtime": "An always-on runtime runs on its own; there is nothing to start.",
     "fabric_port_ranges_disjoint": "These nodes' port ranges share no port; make them overlap.",
+    "placement_too_complex": "Placing this took too much work. Pin the nodes, or start fewer at once.",
+    "restart_overlap_no_room": "The running instance keeps its memory until its stop is confirmed, and there isn't room for the restart beside it. Stop it first, then start it.",
+    "definition_slots_full": "This node already needs the most definitions it can hold (128). Stop something there first.",
     "identity_mismatch": "The node presented a different identity key."
   },
   "models": {
@@ -1419,6 +1426,7 @@
       "status_not_running": "the status command did not say running"
     },
     "processDetached": "The start command handed its server off (for example `docker compose up -d`), so the node cannot watch or stop it. Use management \"service\" with stop and status commands, and stop what is still running by hand.",
+    "cliUpgradeRequired": "wsmp on this runtime's node is too old to run it. Upgrade wsmp on the node and restart it, then start the runtime again.",
     "needsOperator": {
       "STEP": "A step waits for you",
       "RESTART": "Restart needed",
@@ -1427,7 +1435,7 @@
     "markStopped": {
       "action": "Mark as stopped…",
       "title": "Mark as stopped?",
-      "description": "wsmp couldn't confirm that this process stopped. Marking it stopped tells wsmp to stop waiting for it; nothing is run on the node to do it. Its port, memory and GPUs stay reserved until wsmp confirms the process is gone or the instance starts again (wsmp restarts an instance that should keep running). Do this only if you've checked on the node that the process is gone.",
+      "description": "wsmp couldn't confirm that this process stopped. Marking it stopped tells wsmp to stop waiting for it; nothing is run on the node to do it. Its port, memory and GPUs stay reserved (starts waiting for that room keep waiting) until wsmp confirms the process is gone or the instance starts again (wsmp restarts an instance that should keep running). Do this only if you've checked on the node that the process is gone.",
       "confirm": "Mark as stopped",
       "pending": "Marking…",
       "done": "Marked as stopped.",
@@ -1457,8 +1465,13 @@
           "port_in_use": "The port is still in use",
           "port_held_outside_runtime": "The port is still in use, though nothing is left in the service's units: usually something it started (a container or a daemon) runs outside them",
           "unowned_service": "The service runs outside the node's control and has no status command",
-          "not_stopped": "The node couldn't confirm it (update the node if this keeps happening)"
-        }
+          "not_stopped": "The node couldn't confirm it (update the node if this keeps happening)",
+          "launch_pending": "The node said it stopped, but a start sent to it earlier was still waiting there. wsmp checks again.",
+          "cli_upgrade_required": "This node's wsmp is too old to prove a stop. Upgrade wsmp on the node."
+        },
+        "alsoHeld": "Also held until the stop is confirmed or you release it",
+        "holds": "Holds",
+        "port": "Port {{port}}"
       },
       "held": {
         "pill": "Resources held until the stop is confirmed",
@@ -1477,6 +1490,14 @@
     "previewFirst": "Preview to see the placement.",
     "confirmStart": "Confirm",
     "placement": "Node {{number}}: {{node}}, port {{port}}",
+    "reservationPlacement": "Holds {{memory}} on {{node}} (reservation {{number}}, nothing runs there)",
+    "reservationHeld": "Holds {{memory}} on {{node}}",
+    "reservationUnconfirmed": "Holds {{memory}} on {{node}} until the stop is confirmed",
+    "reservationIdle": "Reserves {{memory}} on {{node}} while it runs (not held now)",
+    "reservationRefusal": "Reservation {{number}} (labels {{labels}}): {{reason}}",
+    "reservationRefusalNode": "Reservation {{number}} (labels {{labels}}), {{node}}: {{reason}}",
+    "waitingToRestart": "Waiting to restart: {{reason}} It tries again every 30 seconds.",
+    "waitingToRestartNeutral": "Waiting to restart until it can be placed again. It tries again every 30 seconds.",
     "startRequested": "Start requested.",
     "warnings": {
       "low_free_memory": "Little free memory on the node.",
@@ -1534,6 +1555,9 @@
       "invite_needs_link": "This invite needs its link to be accepted.",
       "always_on_runtime": "Always-on runtimes run on their own; there is nothing to start.",
       "fabric_port_ranges_disjoint": "The nodes' port ranges share no port for the dist port.",
+      "placement_too_complex": "Placing this start took too much work (many nodes, reservations or stops to try). Pin the nodes, or start fewer at once.",
+      "restart_overlap_no_room": "The running instance keeps its memory, GPUs and ports until its stop is confirmed, and the node has no room for the restart beside them. Stop it first and start it once the stop is confirmed, free room on the node, or restart with resources that fit.",
+      "definition_slots_full": "The node already needs 128 runtime definitions for what runs or is stopping there. Stop an instance on it, or wait for restarts to finish.",
       "cap_currency_has_spend": "The cap's currency must be the one this share has spent in this month.",
       "already_shared": "This pool is already shared with this person. Change the existing share.",
       "invite_pending": "This e-mail already has a pending invite. Resend it instead.",
@@ -1777,7 +1801,7 @@
       "view": "Definition view",
       "formTab": "Form",
       "jsonTab": "JSON",
-      "fixJsonFirst": "Fix the JSON before switching back to the form.",
+      "fixJsonFirst": "Fix the JSON before switching back to the form. The form shows only a complete definition it can keep exactly as written (no unknown fields).",
       "servesLabel": "What it runs",
       "serves": "Serves models",
       "service": "Service (no models)",
@@ -1831,6 +1855,12 @@
       "fabricHint": "Optional: the network every node of an instance must share.",
       "resources": "Resources",
       "resourcesHint": "What each part reserves on its node while it runs.",
+      "reservations": "Reservations on other nodes",
+      "reservationsHint": "Single-node runtimes only. Memory this runtime holds on other nodes while it runs, when its launcher starts work there itself (for example over SSH). Each reservation goes to its own node with all of its labels; nothing is started there by wsmp.",
+      "reservation": "Reservation {{number}}",
+      "reservationLabelsHint": "The node it holds memory on has all of these labels.",
+      "addReservation": "Add a reservation",
+      "removeReservation": "Remove reservation {{number}}",
       "resourceKind": "Kind",
       "resourceKinds": {
         "discrete": "GPUs",
@@ -2037,7 +2067,15 @@
         "untrustedNamed": "Written by the agent {{agent}}. wsmp did not check any of it.",
         "command": "Command it ran",
         "loadFailed": "Couldn't load the agent's request. It may have been withdrawn or have expired."
-      }
+      },
+      "alsoFreed": "Releasing also frees"
+    },
+    "heldFootprint": {
+      "previousClaim": "Port {{port}} and {{memory}} on {{node}}, kept for the run a restart replaced",
+      "reservation": "{{memory}} on {{node}}",
+      "supersededReservation": "{{memory}} on {{node}}, kept for the run a restart replaced",
+      "distPort": "dist port {{port}}",
+      "gpus": "GPUs {{gpus}}"
     }
   },
   "overview": {

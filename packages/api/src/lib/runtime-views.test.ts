@@ -1,6 +1,8 @@
+import type { Prisma } from "@ws-model-proxy/db";
 import { describe, expect, it } from "vitest";
+import { mockDeep } from "vitest-mock-extended";
 import { runtimeSpecSchema } from "./runtime-spec";
-import { type StepRow, type StepViewContext, stepView } from "./runtime-views";
+import { loadStepRefs, type StepRow, type StepViewContext, stepView } from "./runtime-views";
 import type { StepIntent } from "./step-intent";
 
 const HASH = "b".repeat(64);
@@ -62,14 +64,18 @@ function step(value: unknown, rank = 0): StepRow {
     intent: value as StepRow["intent"],
     operatorTerminalId: null,
     updatedAt: new Date("2026-10-06T12:00:00Z"),
+    headAddr: null,
   };
 }
 
 function context(overrides: Partial<StepViewContext> = {}): StepViewContext {
   return {
+    launchVersionId: "ver1",
     spec: spec(1, "sudo serve --port {{port}}"),
     launchHash: HASH,
     author: "USER",
+    versions: new Map(),
+    fabricNames: new Map(),
     fabric: null,
     headNodeId: "node-a",
     ...overrides,
@@ -119,11 +125,12 @@ describe("stepView rendered command", () => {
   });
 
   it("shows no command when the step names another spec, or its intent is unreadable", () => {
-    // Another version id with the same launch hash is the same spec: the node renders it alike.
-    expect(stepView(step(intent({ launchVersionId: "ver0" })), context()).rendered).toEqual({
-      state: "ready",
-      text: "sudo serve --port 30001",
-      nodeFills: [],
+    // A version that is not known here (gone, or not loaded): nothing is shown, never the
+    // instance's own version's text or author.
+    expect(stepView(step(intent({ launchVersionId: "ver0" })), context())).toMatchObject({
+      command: null,
+      commandAuthor: null,
+      rendered: { state: "unavailable", reason: "version" },
     });
     expect(stepView(step(intent({ launchHash: "c".repeat(64) })), context())).toMatchObject({
       interactive: true,
@@ -153,5 +160,170 @@ describe("stepView rendered command", () => {
     expect(view).toMatchObject({ interactive: false, rendered: null, headAddr: null });
     const unreadable = stepView(step({}), context({ spec: spec(1, "serve {{port}}", false) }));
     expect(unreadable).toMatchObject({ interactive: false, rendered: null });
+  });
+});
+
+describe("stepView of a step that names another version (a restart's earlier launch)", () => {
+  const OLD_HASH = "c".repeat(64);
+  const old = {
+    spec: spec(1, "sudo old-serve --port {{port}}"),
+    launchHash: OLD_HASH,
+    author: "AGENT" as const,
+  };
+  const stop = (value: StepIntent, overrides: Partial<StepRow> = {}): StepRow => ({
+    ...step(value),
+    phase: "STOP",
+    ...overrides,
+  });
+
+  it("shows the named version's command and author, never the successor's", () => {
+    const named = stepView(
+      stop(intent({ launchVersionId: "ver0", launchHash: OLD_HASH })),
+      context({ versions: new Map([["ver0", old]]) }),
+    );
+    expect(named).toMatchObject({ command: "pkill -f {{port}}", commandAuthor: "agent" });
+    // Same launch, another author: the author is the named version's.
+    const sameLaunch = stepView(
+      stop(intent({ launchVersionId: "ver0" })),
+      context({ versions: new Map([["ver0", { ...old, launchHash: HASH }]]) }),
+    );
+    expect(sameLaunch).toMatchObject({ commandAuthor: "agent" });
+    // An interactive start of that version renders from its spec.
+    expect(
+      stepView(
+        step(intent({ launchVersionId: "ver0", launchHash: OLD_HASH })),
+        context({ versions: new Map([["ver0", old]]) }),
+      ).rendered,
+    ).toEqual({ state: "ready", text: "sudo old-serve --port 30001", nodeFills: [] });
+  });
+
+  it("previews a stop with the head address its launch was dispatched with", () => {
+    const multiSpec = spec(2, "serve --head {{head_addr}}");
+    const interactiveStop = runtimeSpecSchema.parse({
+      ...multiSpec,
+      launch: {
+        ...multiSpec.launch,
+        commands: [
+          {
+            start: "serve --head {{head_addr}}",
+            stop: "stop --head {{head_addr}}",
+            status: "true",
+            interactive: { stop: true },
+          },
+        ],
+      },
+    });
+    // The head's node left the fabric since: dispatch sends the stored address, and so does the
+    // preview.
+    const view = stepView(
+      stop(intent({ rank: 1, nnodes: 2, fabricId: "fab1" }), { rank: 1, headAddr: "10.0.0.9" }),
+      context({ spec: interactiveStop, fabric: { id: "fab1", name: "qsfp", Members: [] } }),
+    );
+    expect(view.headAddr).toBe("10.0.0.9");
+    expect(view.rendered).toMatchObject({ state: "ready", text: "stop --head 10.0.0.9" });
+
+    // The gang restarted onto another fabric: the old stop renders with its own fabric's name
+    // (the node checks the job's fabric), never the successor's.
+    const moved = context({
+      spec: interactiveStop,
+      fabric: { id: "fab2", name: "roce", Members: [] },
+      fabricNames: new Map([["fab1", "qsfp"]]),
+    });
+    const stopView = (refs: StepViewContext) =>
+      stepView(
+        stop(intent({ rank: 1, nnodes: 2, fabricId: "fab1" }), { rank: 1, headAddr: "10.0.0.9" }),
+        refs,
+      ).rendered;
+    expect(stopView(moved)).toMatchObject({ state: "ready", text: "stop --head 10.0.0.9" });
+    // Its fabric renamed or deleted since: the node runs the recorded stop without checking
+    // the fabric again, and the preview shows it.
+    expect(stopView({ ...moved, fabricNames: new Map() })).toMatchObject({
+      state: "ready",
+      text: "stop --head 10.0.0.9",
+    });
+    expect(stopView({ ...moved, fabricNames: new Map([["fab1", "renamed"]]) })).toMatchObject({
+      state: "ready",
+    });
+    // A start is rendered by the node against its fabric: the fabric's name now counts.
+    const interactiveStart = runtimeSpecSchema.parse({
+      ...interactiveStop,
+      launch: {
+        ...interactiveStop.launch,
+        commands: [
+          {
+            start: "serve --head {{head_addr}}",
+            stop: "stop",
+            status: "true",
+            interactive: { start: true },
+          },
+        ],
+      },
+    });
+    const startOn = (names: Map<string, string>) =>
+      stepView(step(intent({ rank: 1, nnodes: 2, fabricId: "fab1" }), 1), {
+        ...moved,
+        spec: interactiveStart,
+        fabric: {
+          id: "fab1",
+          name: names.get("fab1") ?? "",
+          Members: [{ nodeId: "node-a", ip: "10.0.0.5" }],
+        },
+      }).rendered;
+    expect(startOn(new Map([["fab1", "qsfp"]]))).toMatchObject({ state: "ready" });
+    expect(startOn(new Map([["fab1", "renamed"]]))).toEqual({
+      state: "refused",
+      field: "fabricId",
+    });
+  });
+});
+
+describe("loadStepRefs", () => {
+  it("reads the other versions and fabrics steps name in owner-scoped queries, none when there are none", async () => {
+    const db = mockDeep<Prisma.TransactionClient>();
+    db.runtimeVersion.findMany.mockResolvedValue([
+      { id: "ver0", spec: spec(1, "old"), launchHash: "c".repeat(64), editor: "AGENT" },
+    ] as never);
+    db.fabric.findMany.mockResolvedValue([{ id: "fab1", name: "qsfp" }] as never);
+    const rows = [
+      {
+        launchVersionId: "ver1",
+        Fabric: null,
+        Steps: [{ intent: intent() }, { intent: intent({ launchVersionId: "ver0" }) }],
+      },
+      {
+        launchVersionId: "ver2",
+        Fabric: { id: "fab2" },
+        Steps: [
+          { intent: intent({ launchVersionId: "ver0", nnodes: 2, fabricId: "fab1" }) },
+          { intent: intent({ launchVersionId: "ver2", nnodes: 2, fabricId: "fab2" }) },
+        ],
+      },
+    ];
+    const refs = await loadStepRefs(db, "u-1", rows);
+    expect(refs.versions.get("ver0")).toMatchObject({
+      launchHash: "c".repeat(64),
+      author: "AGENT",
+    });
+    expect(refs.fabricNames.get("fab1")).toBe("qsfp");
+    expect(db.runtimeVersion.findMany).toHaveBeenCalledTimes(1);
+    expect(db.runtimeVersion.findMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { id: { in: ["ver0"] }, Runtime: { userId: "u-1" } },
+    });
+    // Only fabrics other than the instance's own.
+    expect(db.fabric.findMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { id: { in: ["fab1"] }, userId: "u-1" },
+    });
+    db.runtimeVersion.findMany.mockClear();
+    db.fabric.findMany.mockClear();
+    const none = await loadStepRefs(db, "u-1", [
+      {
+        launchVersionId: "ver1",
+        Fabric: { id: "fab2" },
+        Steps: [{ intent: intent() }, { intent: intent({ nnodes: 2, fabricId: "fab2" }) }],
+      },
+    ]);
+    expect(none.versions.size + none.fabricNames.size).toBe(0);
+    expect(db.runtimeVersion.findMany).not.toHaveBeenCalled();
+    expect(db.fabric.findMany).not.toHaveBeenCalled();
   });
 });

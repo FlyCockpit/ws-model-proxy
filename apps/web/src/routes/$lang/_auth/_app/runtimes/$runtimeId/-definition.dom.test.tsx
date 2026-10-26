@@ -23,6 +23,8 @@ const SPEC = {
 
 const state = vi.hoisted(() => ({
   origin: "SERVER" as "NODE" | "SERVER",
+  /** The definition's current spec when a test opens one other than the v-2 fixture. */
+  current: null as unknown,
   update: vi.fn(async (_input: unknown) => ({
     version: { version: 3 },
     adoptedLive: [],
@@ -84,7 +86,7 @@ vi.mock("@/utils/orpc", async () => {
               kind: "STARTABLE",
               origin: state.origin,
               currentVersion: { id: "v-2" },
-              current: { spec: v2.spec },
+              current: { spec: state.current ?? v2.spec },
             }),
           }),
         },
@@ -146,6 +148,7 @@ function byId<T extends HTMLElement>(id: string): T {
 afterEach(() => {
   cleanup();
   state.update.mockClear();
+  state.current = null;
 });
 
 // Form-heavy renders: slow under a full parallel run.
@@ -219,6 +222,238 @@ describe("runtime definition page", { timeout: 20_000 }, () => {
     fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.saveVersion" }));
     await waitFor(() => expect(screen.getByText("Command must not be blank.")).toBeTruthy());
     expect(state.update).not.toHaveBeenCalled();
+  });
+
+  it("keeps valid JSON of a shape the form cannot read on the JSON tab, with the same error", async () => {
+    mount();
+    await waitFor(() => byId("definition-model-0"));
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.jsonTab" }));
+    // Reservations the form cannot show (an object, a null entry, labels as text) and `models`
+    // as an object: the JSON stays as written, with the fix-first error, and nothing is saved.
+    const launch = (SPEC as { launch?: Record<string, unknown> }).launch ?? {};
+    for (const text of [
+      ...[
+        { labels: ["worker"], resources: { kind: "unified", memoryGb: 100 } },
+        [null],
+        [{ labels: "worker", resources: {} }],
+        // A label the comma-separated field would split into two (F10).
+        [{ labels: ["worker,other"], resources: { kind: "unified", memoryGb: 100 } }],
+      ].map((reservations) => JSON.stringify({ ...SPEC, launch: { ...launch, reservations } })),
+      JSON.stringify({ ...SPEC, launch: { ...launch, labels: ["gpu box"] } }),
+      JSON.stringify({ ...SPEC, models: {} }),
+    ]) {
+      fireEvent.change(byId("definition-json"), { target: { value: text } });
+      fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.formTab" }));
+      expect(screen.getByText("dashboard:runtime.specForm.fixJsonFirst")).toBeTruthy();
+      expect(byId<HTMLTextAreaElement>("definition-json").value).toBe(text);
+    }
+    expect(state.update).not.toHaveBeenCalled();
+  });
+
+  it("saves an object-shaped reservation from the JSON tab only with a validation error", async () => {
+    mount();
+    await waitFor(() => byId("definition-model-0"));
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.jsonTab" }));
+    const launch = (SPEC as { launch?: Record<string, unknown> }).launch ?? {};
+    const text = JSON.stringify({
+      ...SPEC,
+      launch: {
+        ...launch,
+        reservations: { labels: ["worker"], resources: { kind: "unified", memoryGb: 100 } },
+      },
+    });
+    fireEvent.change(byId("definition-json"), { target: { value: text } });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.formTab" }));
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.saveVersion" }));
+    // The JSON tab validates the spec as written: the reservation is not dropped and saved.
+    await waitFor(() => expect(byId<HTMLTextAreaElement>("definition-json").value).toBe(text));
+    expect(state.update).not.toHaveBeenCalled();
+  });
+
+  it("never saves a reservation label split by the form (F10)", async () => {
+    mount();
+    await waitFor(() => byId("definition-model-0"));
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.jsonTab" }));
+    const launch = (SPEC as { launch?: Record<string, unknown> }).launch ?? {};
+    const text = JSON.stringify({
+      ...SPEC,
+      launch: {
+        ...launch,
+        reservations: [{ labels: ["worker,other"], resources: { kind: "unified", memoryGb: 100 } }],
+      },
+    });
+    fireEvent.change(byId("definition-json"), { target: { value: text } });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.formTab" }));
+    expect(screen.getByText("dashboard:runtime.specForm.fixJsonFirst")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.saveVersion" }));
+    // Saved as written from the JSON tab: the schema refuses the label, nothing is sent.
+    await waitFor(() => expect(byId<HTMLTextAreaElement>("definition-json").value).toBe(text));
+    expect(state.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a reservation's memory written as text", "reservation", { kind: "unified", memoryGb: "100" }],
+    ["a field its kind does not have", "reservation", { kind: "none", memoryGb: 100 }],
+    ["a launch.resources memory written as text", "launch", { kind: "unified", memoryGb: "16" }],
+    ["a launch.resources unknown field", "launch", { kind: "cpu", ramGb: 8, cores: 4 }],
+  ])(
+    "never rewrites and saves a resource the form cannot hold (F10: %s)",
+    async (_name, where, resources) => {
+      mount();
+      await waitFor(() => byId("definition-model-0"));
+      fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.jsonTab" }));
+      const launch = (SPEC as { launch?: Record<string, unknown> }).launch ?? {};
+      const raw = {
+        ...SPEC,
+        launch:
+          where === "launch"
+            ? { ...launch, resources: [resources] }
+            : { ...launch, reservations: [{ labels: ["worker"], resources }] },
+      };
+      const text = JSON.stringify(raw);
+      fireEvent.change(byId("definition-json"), { target: { value: text } });
+      fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.formTab" }));
+      // The JSON tab stays, with its text and a request to fix it.
+      expect(screen.getByText("dashboard:runtime.specForm.fixJsonFirst")).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.saveVersion" }));
+      // Saved as written from the JSON tab: the schema refuses it, nothing is sent.
+      await waitFor(() => expect(byId<HTMLTextAreaElement>("definition-json").value).toBe(text));
+      expect(state.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    // B5-F10: an unknown key in a reservation entry (the schema refuses it).
+    [
+      "a reservation entry's unknown key",
+      (launch: Record<string, unknown>) => ({
+        launch: {
+          ...launch,
+          reservations: [{ labels: ["worker"], resources: { kind: "none" }, memoryGb: 100 }],
+        },
+      }),
+    ],
+    [
+      "launch's unknown key",
+      (launch: Record<string, unknown>) => ({
+        launch: { ...launch, replicas: 2 },
+      }),
+    ],
+    ["a top-level unknown key", () => ({ note: "kept" })],
+    [
+      "readiness's unknown key",
+      (launch: Record<string, unknown>) => ({
+        launch: {
+          ...launch,
+          readiness: { path: "/v1/models", expectedStatus: 200, timeoutMs: 900000, retries: 3 },
+        },
+      }),
+    ],
+    // A part the form would fill in (health is required; the form writes its defaults).
+    [
+      "a missing launch.health",
+      (launch: Record<string, unknown>) => {
+        const { health: _health, ...rest } = launch;
+        return { launch: rest };
+      },
+    ],
+  ])(
+    "F10 class: never converts to the form (or saves) what the form would drop or change (%s)",
+    async (_name, change) => {
+      mount();
+      await waitFor(() => byId("definition-model-0"));
+      fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.jsonTab" }));
+      const launch = (SPEC as { launch?: Record<string, unknown> }).launch ?? {};
+      const text = JSON.stringify({ ...SPEC, ...change(launch) });
+      fireEvent.change(byId("definition-json"), { target: { value: text } });
+      fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.formTab" }));
+      expect(screen.getByText("dashboard:runtime.specForm.fixJsonFirst")).toBeTruthy();
+      expect(byId<HTMLTextAreaElement>("definition-json").value).toBe(text);
+      fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.saveVersion" }));
+      // Saved as written from the JSON tab: the schema refuses it, nothing is sent.
+      await waitFor(() => expect(byId<HTMLTextAreaElement>("definition-json").value).toBe(text));
+      expect(state.update).not.toHaveBeenCalled();
+    },
+  );
+
+  const malformed: Array<[string, (launch: Record<string, unknown>) => unknown, RegExp]> = [
+    [
+      "a numeric stop command",
+      (launch) => ({ ...SPEC, launch: { ...launch, commands: [{ start: "run", stop: 7 }] } }),
+      /^launch\.commands\.0\.stop: /,
+    ],
+    [
+      "a numeric prepare command",
+      (launch) => ({ ...SPEC, launch: { ...launch, commands: [{ start: "run", prepare: 7 }] } }),
+      /^launch\.commands\.0\.prepare: /,
+    ],
+    [
+      "a numeric multi-node fabric",
+      (launch) => ({
+        ...SPEC,
+        launch: {
+          ...launch,
+          groupSize: 2,
+          resources: [...(launch.resources as unknown[]), ...(launch.resources as unknown[])],
+          fabric: 7,
+        },
+      }),
+      /^launch\.fabric: /,
+    ],
+  ];
+
+  it.each(malformed)(
+    "R6-B-1: keeps JSON with %s on the JSON tab, with feedback and no event error",
+    async (_name, build, issue) => {
+      const errors: unknown[] = [];
+      const onError = (event: ErrorEvent) => {
+        errors.push(event.error);
+        event.preventDefault();
+      };
+      window.addEventListener("error", onError);
+      try {
+        mount();
+        await waitFor(() => byId("definition-model-0"));
+        fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.jsonTab" }));
+        const launch = (SPEC as { launch?: Record<string, unknown> }).launch ?? {};
+        const text = JSON.stringify(build(launch));
+        fireEvent.change(byId("definition-json"), { target: { value: text } });
+        fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.specForm.formTab" }));
+        expect(screen.getByText("dashboard:runtime.specForm.fixJsonFirst")).toBeTruthy();
+        expect(byId<HTMLTextAreaElement>("definition-json").value).toBe(text);
+        fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.saveVersion" }));
+        // The save is validated (the schema names the value) and nothing is sent.
+        expect(await screen.findByText(issue)).toBeTruthy();
+        expect(state.update).not.toHaveBeenCalled();
+        expect(byId<HTMLTextAreaElement>("definition-json").value).toBe(text);
+        expect(errors).toEqual([]);
+      } finally {
+        window.removeEventListener("error", onError);
+      }
+    },
+  );
+
+  it("R6-B-1: opens a saved definition with a numeric stop on the JSON tab", async () => {
+    const errors: unknown[] = [];
+    const onError = (event: ErrorEvent) => {
+      errors.push(event.error);
+      event.preventDefault();
+    };
+    window.addEventListener("error", onError);
+    try {
+      state.current = {
+        ...SPEC,
+        launch: { ...SPEC.launch, commands: [{ start: "run", stop: 7 }] },
+      };
+      mount();
+      const json = await waitFor(() => byId<HTMLTextAreaElement>("definition-json"));
+      expect(JSON.parse(json.value)).toEqual(state.current);
+      expect(document.getElementById("definition-model-0")).toBeNull();
+      expect(errors).toEqual([]);
+      expect(state.update).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("error", onError);
+    }
   });
 
   it("marks agent-written versions and diffs a version against the one before", async () => {

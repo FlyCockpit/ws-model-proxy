@@ -13,7 +13,12 @@ type RefusalCode =
   | "PRECONDITION_FAILED"
   | "TOO_MANY_REQUESTS";
 
-type RefusalError = ORPCError<RefusalCode, { reason: RefusalReason; subjectId: string | null }>;
+type RefusalReservation = { index: number; labels: string[]; nodeSlug: string | null };
+
+type RefusalError = ORPCError<
+  RefusalCode,
+  { reason: RefusalReason; subjectId: string | null; reservation?: RefusalReservation }
+>;
 
 /**
  * The message of every "nothing was written, retry" CONFLICT: a capacity-ordered or serializable
@@ -58,6 +63,26 @@ export function refuseAbout(
   return new ORPCError(code ?? REFUSAL_STATUS[reason] ?? "CONFLICT", {
     message,
     data: { reason, subjectId },
+  });
+}
+
+/**
+ * A planner's refusal (a start or profile preview's first refusal) as the error: its reason,
+ * subject and, for a reservation, which one (`data.reservation`), so clients can say which.
+ */
+export function refusalOf(refusal: {
+  reason: RefusalReason;
+  subjectId: string | null;
+  message: string;
+  reservation?: RefusalReservation;
+}): RefusalError {
+  return new ORPCError(REFUSAL_STATUS[refusal.reason] ?? "CONFLICT", {
+    message: refusal.message,
+    data: {
+      reason: refusal.reason,
+      subjectId: refusal.subjectId,
+      ...(refusal.reservation ? { reservation: refusal.reservation } : {}),
+    },
   });
 }
 
