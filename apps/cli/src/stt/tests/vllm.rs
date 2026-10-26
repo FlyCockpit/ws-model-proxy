@@ -1,4 +1,4 @@
-﻿//! The `vllm` adapter against a fake vLLM realtime engine on loopback. The
+//! The `vllm` adapter against a fake vLLM realtime engine on loopback. The
 //! fake follows `vllm/entrypoints/speech_to_text/realtime/connection.py`:
 //! silent `session.update`, `unknown_event` errors, one generation per
 //! start commit, deltas while audio arrives, `done` after the final commit
@@ -740,7 +740,10 @@ fn engine_reads_poll_on_the_socket_they_go_through() {
         panic!("a plain loopback connection");
     };
     // Linux keeps the timeout in clock ticks, so it reads back rounded to one.
-    let timeout = tcp.read_timeout().expect("read timeout").expect("a timeout");
+    let timeout = tcp
+        .read_timeout()
+        .expect("read timeout")
+        .expect("a timeout");
     assert!(
         timeout.abs_diff(crate::stt::vllm::READ_POLL) < Duration::from_millis(15),
         "{timeout:?}"
