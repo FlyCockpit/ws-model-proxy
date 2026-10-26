@@ -1006,7 +1006,7 @@ fn shutdown_guard_pty(
     };
     if exited.is_none() {
         // Unreaped, so the pid is still the guard's.
-        crate::launch_guard::terminate(guard);
+        crate::launch_guard::terminate_unreaped(guard);
     }
     let status = exited.unwrap_or_else(|| reap_after_signal(Some(pid)));
     drop(runtime.master);

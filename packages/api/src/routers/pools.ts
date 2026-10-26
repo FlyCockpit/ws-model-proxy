@@ -467,6 +467,15 @@ async function replaceCloudMembers(
 }
 
 /** Human-only setters (the contract binding refuses everyone else) share this. */
+/**
+ * The checks before a write's fence only refuse early: a pool deleted meanwhile (the delete takes
+ * the owner fence too) is not found under it, before anything is written beneath it.
+ */
+async function assertPoolLive(tx: Tx, userId: string, poolId: string) {
+  if ((await tx.pool.count({ where: { id: poolId, userId } })) === 0)
+    throw notFound("That pool does not exist.");
+}
+
 async function humanSetter(
   context: SignedInContext,
   poolId: string,
@@ -481,6 +490,7 @@ async function humanSetter(
   await graphWrite(
     [userId],
     async (tx) => {
+      await assertPoolLive(tx, userId, poolId);
       await write(tx);
       await audit(tx, { ownerId: userId, actor, poolId, action, after });
     },
@@ -515,6 +525,7 @@ async function setOwnKeyEquivalent(context: SignedInContext, poolId: string, mod
   await graphWrite(
     owners,
     async (tx) => {
+      await assertPoolLive(tx, userId, poolId);
       // Under the pool owner's fence no choice is made (setOwnKey takes it): the set is final.
       const missing = (await granteesOf(tx)).filter((grantee) => !owners.includes(grantee));
       if (missing.length > 0) {
@@ -753,8 +764,7 @@ export const poolsRouter = {
         // Whether the pool is still there, and whether the slug changes, is decided under the
         // fences (a delete or a rename may have landed since).
         async (tx) => {
-          if ((await tx.pool.count({ where: { id: pool.id, userId } })) === 0)
-            throw notFound("That pool does not exist.");
+          await assertPoolLive(tx, userId, pool.id);
           const current =
             input.slug === undefined
               ? null
@@ -803,6 +813,9 @@ export const poolsRouter = {
           if (input.advanced) await applyAdvanced(tx, pool.id, advancedPatch);
           if (rules) await replaceRules(tx, pool.id, rules);
           await applySidecars(tx, pool, input.sidecars ?? [], owners);
+          // The accepted request, as asked: an update whose fields already held these values (a
+          // member another request removed, the slug it has) is audited too. A delete of one
+          // named row that is already gone is not (see `delete`, `rules.delete`).
           const { poolId: _poolId, ...after } = input;
           await audit(tx, {
             ownerId: userId,
@@ -844,15 +857,20 @@ export const poolsRouter = {
     if (!pool) throw notFound("That pool does not exist.");
     // Shares, contributed members, key entries and other owners' sidecars go with it.
     await graphDelete({ userId, poolIds: [pool.id] }, async (tx) => {
-      const deleted = await tx.pool.deleteMany({ where: { id: pool.id, userId } });
-      // Deleted by another request meanwhile: that one audited it.
-      if (deleted.count === 0) return;
+      // Read under the fences: deleted by another request meanwhile (that one audited it), or
+      // renamed (the audit names the slug it had when it went).
+      const live = await tx.pool.findFirst({
+        where: { id: pool.id, userId },
+        select: { slug: true },
+      });
+      if (!live) return;
+      await tx.pool.deleteMany({ where: { id: pool.id, userId } });
       await audit(tx, {
         ownerId: userId,
         actor,
         poolId: pool.id,
         action: "pool.delete",
-        after: { slug: pool.slug },
+        after: { slug: live.slug },
       });
     });
     return { ok: true as const };
@@ -1030,7 +1048,9 @@ export const poolsRouter = {
         await graphDelete(
           { userId: member.Pool.userId, poolMemberIds: [member.id] },
           async (tx) => {
-            await tx.poolMember.delete({ where: { id: member.id } });
+            // Withdrawn or removed by another request meanwhile: that one audited it.
+            const withdrawn = await tx.poolMember.deleteMany({ where: { id: member.id } });
+            if (withdrawn.count === 0) return;
             await audit(tx, {
               ownerId: member.Pool.userId,
               actor,
@@ -1057,7 +1077,9 @@ export const poolsRouter = {
       if (!rule) throw notFound("That rule does not exist.");
       const actor = callerActor(context.auth, userId);
       await graphWrite([userId], async (tx) => {
-        await tx.poolRoutingRule.delete({ where: { id: rule.id } });
+        // Deleted by another request meanwhile: that one audited it.
+        const deleted = await tx.poolRoutingRule.deleteMany({ where: { id: rule.id } });
+        if (deleted.count === 0) return;
         await audit(tx, {
           ownerId: userId,
           actor,

@@ -67,6 +67,16 @@ impl Process {
         }
         nix::sys::signal::kill(self.pid, signal)
     }
+
+    /// `signal` to this process without reading its start time: only for the caller's own
+    /// child that is not reaped yet, whose pid cannot name another process. A start time that
+    /// cannot be read now (a `ps` that timed out) must not cost such a child its signal.
+    pub(crate) fn signal_unreaped_child(&self, signal: Signal) -> nix::Result<()> {
+        if !signallable(self.pid) {
+            return Err(Errno::ESRCH);
+        }
+        nix::sys::signal::kill(self.pid, signal)
+    }
 }
 
 /// Not 0 or below (a process group, or every process) and not init.
@@ -191,32 +201,60 @@ fn ps(args: &[&str]) -> std::io::Result<std::process::Output> {
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("`ps` has no output"))?;
-    let reader = std::thread::spawn(move || {
+    // A thread that cannot start (resource pressure) is an error like any failed listing.
+    let reader = match std::thread::Builder::new().spawn(move || {
         let mut out = Vec::new();
         stdout.read_to_end(&mut out).map(|_| out)
-    });
+    }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            give_up(child);
+            return Err(error);
+        }
+    };
     let until = std::time::Instant::now() + PS_TIMEOUT;
     loop {
-        if let Some(status) = child.try_wait()? {
-            let stdout = reader
-                .join()
-                .map_err(|_| std::io::Error::other("reading `ps` failed"))??;
-            return Ok(std::process::Output {
-                status,
-                stdout,
-                stderr: Vec::new(),
-            });
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = reader
+                    .join()
+                    .map_err(|_| std::io::Error::other("reading `ps` failed"))??;
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr: Vec::new(),
+                });
+            }
+            Ok(None) if std::time::Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(None) => {
+                give_up(child);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "`ps` did not answer in time",
+                ));
+            }
+            Err(error) => {
+                give_up(child);
+                return Err(error);
+            }
         }
-        if std::time::Instant::now() >= until {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "`ps` did not answer in time",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// Kill a `ps` this listing no longer waits for, and reap it off this thread: one stuck in the
+/// kernel may not die at once, and the caller may hold a registry lock. With no thread to spare
+/// it is left unreaped (a zombie until the CLI exits).
+#[cfg(not(target_os = "linux"))]
+fn give_up(mut child: std::process::Child) {
+    let _ = child.kill();
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
+    }
+    let _ = std::thread::Builder::new().spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 #[cfg(not(target_os = "linux"))]

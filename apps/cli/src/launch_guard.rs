@@ -114,6 +114,13 @@ pub(crate) fn terminate(guard: crate::process_list::Process) {
     let _ = guard.signal(nix::sys::signal::Signal::SIGTERM);
 }
 
+/// [`terminate`] for the caller's own guard child that is not reaped yet: its pid is still the
+/// guard's, so nothing is checked (and nothing can fail to be checked) first.
+#[cfg(unix)]
+pub(crate) fn terminate_unreaped(guard: crate::process_list::Process) {
+    let _ = guard.signal_unreaped_child(nix::sys::signal::Signal::SIGTERM);
+}
+
 pub fn lock_path(state_dir: &Path) -> PathBuf {
     state_dir.join("relay-launchers.lock")
 }

@@ -588,7 +588,7 @@ describe("contributed members", () => {
       shareId: { not: null },
       OR: [{ Share: { granteeUserId: OWNER } }, { Pool: { userId: OWNER } }],
     });
-    expect(db.poolMember.delete).not.toHaveBeenCalled();
+    expect(db.poolMember.deleteMany).not.toHaveBeenCalled();
   });
 });
 
@@ -823,24 +823,58 @@ describe("graph-write fences and review follow-ups", () => {
   });
 
   it("deleting a pool goes through the parent-delete fences", async () => {
-    db.pool.findFirst.mockResolvedValue({ id: "pool-1", slug: "chat" } as never);
+    // Renamed meanwhile: the audit names the slug read under the fences.
+    db.pool.findFirst
+      .mockResolvedValueOnce({ id: "pool-1", slug: "chat" } as never)
+      .mockResolvedValueOnce({ slug: "talk" } as never);
     db.pool.deleteMany.mockResolvedValue({ count: 1 });
     await client().delete({ poolId: "pool-1" });
     expect(fenceLog.deletes).toEqual([{ userId: OWNER, poolIds: ["pool-1"] }]);
     expect(db.pool.deleteMany).toHaveBeenCalledWith({ where: { id: "pool-1", userId: OWNER } });
-    expect(db.auditEvent.create.mock.calls[0]?.[0]?.data).toMatchObject({ action: "pool.delete" });
+    expect(db.auditEvent.create.mock.calls[0]?.[0]?.data).toMatchObject({
+      action: "pool.delete",
+      after: { slug: "talk" },
+    });
   });
 
-  it("a pool deleted meanwhile is neither updated nor audited twice", async () => {
+  it("a pool deleted meanwhile is neither updated nor set nor audited twice", async () => {
+    // Found before the fences, gone under them.
     db.pool.findFirst.mockResolvedValueOnce({ id: "pool-1", slug: "chat" } as never);
-    db.pool.deleteMany.mockResolvedValue({ count: 0 });
+    db.pool.findFirst.mockResolvedValueOnce(null);
     await client().delete({ poolId: "pool-1" });
-    db.pool.findFirst.mockResolvedValueOnce(owned as never);
+    expect(db.pool.deleteMany).not.toHaveBeenCalled();
+    db.pool.findFirst.mockResolvedValue(owned as never);
+    db.share.findMany.mockResolvedValue([]);
     db.pool.count.mockResolvedValue(0);
     expect(await reasonOf(client().update({ poolId: "pool-1", name: "Renamed" }))).toBe(
       "NOT_FOUND",
     );
+    expect(await reasonOf(client().cloud.setMode({ poolId: "pool-1", mode: "OWNER" }))).toBe(
+      "NOT_FOUND",
+    );
+    expect(
+      await reasonOf(
+        client().cloud.setOwnKeyEquivalent({ poolId: "pool-1", model: "openai/gpt-x" }),
+      ),
+    ).toBe("NOT_FOUND");
     expect(db.pool.update).not.toHaveBeenCalled();
+    expect(db.poolFallback.upsert).not.toHaveBeenCalled();
+    expect(db.auditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("a rule or contributed member deleted meanwhile is not audited twice", async () => {
+    db.poolRoutingRule.findFirst.mockResolvedValue({ id: "rule-1", poolId: "pool-1" } as never);
+    db.poolRoutingRule.deleteMany.mockResolvedValue({ count: 0 });
+    await client().rules.delete({ ruleId: "rule-1" });
+    db.poolMember.findFirst.mockResolvedValue({
+      id: "mem-c",
+      poolId: "pool-1",
+      Pool: { userId: OWNER },
+    } as never);
+    db.poolMember.deleteMany.mockResolvedValue({ count: 0 });
+    await client().members.removeContributed({ memberId: "mem-c" });
+    expect(db.poolRoutingRule.deleteMany).toHaveBeenCalledWith({ where: { id: "rule-1" } });
+    expect(db.poolMember.deleteMany).toHaveBeenCalledWith({ where: { id: "mem-c" } });
     expect(db.auditEvent.create).not.toHaveBeenCalled();
   });
 

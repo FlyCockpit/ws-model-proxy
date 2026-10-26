@@ -751,9 +751,10 @@ fn finish_until(
     let exited = wait_for_exit(&mut child, until, cancelled);
     let pid = child.id();
     if let Some(guard) = guard {
-        // A launch guard ends its session itself, holding its launcher lock until it has.
+        // A launch guard ends its session itself, holding its launcher lock until it has. Not
+        // exited, so not reaped: the pid is still the guard's.
         if !exited {
-            crate::launch_guard::terminate(guard);
+            crate::launch_guard::terminate_unreaped(guard);
         }
     } else {
         kill_group_or_child(&mut child);
