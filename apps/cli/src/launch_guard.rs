@@ -39,7 +39,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -211,6 +211,7 @@ fn open_lock(path: &Path) -> Result<std::fs::File> {
 #[cfg(unix)]
 pub fn settle(state_dir: &Path, wait: Duration) -> Result<()> {
     use nix::fcntl::{Flock, FlockArg};
+    use std::time::Instant;
     let path = absolute_lock(state_dir)?;
     let mut file = open_lock(&path)?;
     let until = Instant::now() + wait;
@@ -379,6 +380,7 @@ pub fn guard(_parent: u32, _lock: &Path, _program: &OsString, _args: &[OsString]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn wrap_puts_the_command_after_the_guard_arguments() {

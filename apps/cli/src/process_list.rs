@@ -170,7 +170,7 @@ mod tests {
         assert!(stat_is_zombie(b"42 (sleep) Z 1 42 42"));
         assert!(!stat_is_zombie(b"42 (sleep) S 1 42 42"));
         // A name cut inside a multibyte character, and one holding `) Z `.
-        assert!(stat_is_zombie(b"42 (caf\xc3) Z 1 42 42"));
+        assert!(stat_is_zombie(b"42 (\xe2\x82) Z 1 42 42"));
         assert!(!stat_is_zombie(b"42 (a) Z (b) R 1 42 42"));
         assert!(!stat_is_zombie(b"garbage"));
     }
@@ -183,20 +183,25 @@ mod tests {
         // The kernel keeps the first 15 bytes of the file name: the name is cut inside `é`.
         let name = std::ffi::OsStr::from_bytes(b"wsmp-scantest-\xc3\xa9");
         let program = dir.path().join(name);
-        std::fs::copy("/bin/sleep", &program).unwrap();
+        // A shell, not `sleep`: a multicall coreutils (uutils) picks its tool by file name, and
+        // a renamed copy exits at once. It waits for input until the test drops stdin.
+        std::fs::copy("/bin/sh", &program).unwrap();
         let mut child = std::process::Command::new(&program)
-            .arg("5")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
         let comm = std::fs::read(format!("/proc/{pid}/comm")).unwrap();
         let listed = super::live();
+        let running = child.try_wait().unwrap().is_none();
         let _ = child.kill();
         let _ = child.wait();
         assert!(
             std::str::from_utf8(&comm).is_err(),
             "the test needs a name that is not UTF-8: {comm:?}"
         );
+        assert!(running, "the test process exited before the scan");
         assert!(listed.unwrap().contains(&pid));
     }
 }
