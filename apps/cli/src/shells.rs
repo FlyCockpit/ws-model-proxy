@@ -55,10 +55,47 @@ fn found() -> Vec<Shell> {
 
 #[cfg(windows)]
 fn found() -> Vec<Shell> {
-    let mut shells = Vec::new();
-    let system32 = std::env::var_os("SystemRoot")
+    let mut shells = command_shells();
+    if let Some(wsl) = system32()
+        .map(|dir| dir.join("wsl.exe"))
+        .filter(|path| path.is_file())
+    {
+        for name in wsl_distributions(&wsl) {
+            shells.push(Shell {
+                id: format!("wsl:{name}"),
+                program: wsl.clone(),
+                args: vec![
+                    "--distribution".to_string(),
+                    name,
+                    "--cd".to_string(),
+                    "~".to_string(),
+                ],
+            });
+        }
+    }
+    shells
+}
+
+#[cfg(windows)]
+fn system32() -> Option<PathBuf> {
+    std::env::var_os("SystemRoot")
         .map(|root| PathBuf::from(root).join("System32"))
-        .filter(|dir| dir.is_dir());
+        .filter(|dir| dir.is_dir())
+}
+
+/// The Windows shells that can run commands (pwsh, powershell and cmd, in that order), without
+/// asking WSL for its distributions. Empty elsewhere.
+#[cfg(not(windows))]
+pub fn command_shells() -> Vec<Shell> {
+    Vec::new()
+}
+
+/// The Windows shells that can run commands (pwsh, powershell and cmd, in that order), without
+/// asking WSL for its distributions. Empty elsewhere.
+#[cfg(windows)]
+pub fn command_shells() -> Vec<Shell> {
+    let mut shells = Vec::new();
+    let system32 = system32();
     let pwsh = on_path("pwsh.exe").or_else(|| {
         std::env::var_os("ProgramFiles")
             .map(|dir| PathBuf::from(dir).join(r"PowerShell\7\pwsh.exe"))
@@ -96,24 +133,6 @@ fn found() -> Vec<Shell> {
             program,
             args: Vec::new(),
         });
-    }
-    if let Some(wsl) = system32
-        .as_ref()
-        .map(|dir| dir.join("wsl.exe"))
-        .filter(|path| path.is_file())
-    {
-        for name in wsl_distributions(&wsl) {
-            shells.push(Shell {
-                id: format!("wsl:{name}"),
-                program: wsl.clone(),
-                args: vec![
-                    "--distribution".to_string(),
-                    name,
-                    "--cd".to_string(),
-                    "~".to_string(),
-                ],
-            });
-        }
     }
     shells
 }

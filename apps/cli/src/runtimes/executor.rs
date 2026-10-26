@@ -22,8 +22,16 @@ use crate::protocol::frames::{
     InstancePhase, InstanceRecord, JobError, JobPhase, JobReservation, JobStatus,
 };
 use crate::protocol::runtime_spec::{
-    Management, Readiness, RuntimeSpec, status_can_report_stopped,
+    CommandShell, Management, Readiness, RuntimeSpec, status_can_report_stopped,
 };
+
+fn sh() -> CommandShell {
+    CommandShell::Sh
+}
+
+fn is_sh(shell: &CommandShell) -> bool {
+    *shell == CommandShell::Sh
+}
 
 const STATE_LIMIT: usize = 2 * 1024 * 1024;
 const INSTANCES_DIR: &str = "runtime-instances";
@@ -52,6 +60,10 @@ pub struct Job {
     pub stop_command: String,
     pub status_command: Option<String>,
     pub health_command: Option<String>,
+    /// The shell every command above runs in (argv commands were rendered for it). Records
+    /// written before it existed ran `sh`.
+    #[serde(default = "sh", skip_serializing_if = "is_sh")]
+    pub shell: CommandShell,
     /// Node secret names exported to every command (values never stored).
     pub secrets: Vec<String>,
     pub timeout_ms: u64,

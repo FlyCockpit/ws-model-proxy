@@ -8,10 +8,10 @@ use std::net::IpAddr;
 
 use crate::protocol::frames::{FabricSet, is_fabric_ip, is_secret_name};
 use crate::protocol::runtime_spec::{
-    Address, Commands, FABRIC_MEMBERS_MAX, Launch, Management, MetricsReader, ModelType,
-    NODE_FABRICS_MAX, NODE_METRIC_COMMANDS_MAX, NodeMetricCommand, RUNTIME_COMMAND_MAX_BYTES,
-    RUNTIME_PLACEHOLDERS, ReaderMapEntry, Resource, RuntimeApi, RuntimeSpec, SpecModel,
-    TranscriptionProfile, status_can_report_stopped,
+    Address, CommandLine, CommandShell, Commands, FABRIC_MEMBERS_MAX, Launch, Management,
+    MetricsReader, ModelType, NODE_FABRICS_MAX, NODE_METRIC_COMMANDS_MAX, NodeMetricCommand,
+    RUNTIME_ARGV_MAX, RUNTIME_COMMAND_MAX_BYTES, RUNTIME_PLACEHOLDERS, ReaderMapEntry, Resource,
+    RuntimeApi, RuntimeSpec, SpecModel, TranscriptionProfile, status_can_report_stopped,
 };
 
 /// Why a put was refused: the reason and the JSON path.
@@ -109,6 +109,27 @@ pub fn command_ok(command: &str) -> bool {
     text_ok(command, RUNTIME_COMMAND_MAX_BYTES)
         && !command.trim().is_empty()
         && placeholders(command).all(|name| RUNTIME_PLACEHOLDERS.contains(&name))
+}
+
+/// A runtime command: text as [`command_ok`]; an argv of 1 to [`RUNTIME_ARGV_MAX`] arguments
+/// whose program is not blank, each argument valid text with known placeholders, and no longer
+/// than a text command when joined with spaces. Twin of the server's `runtimeCommandLineSchema`.
+pub fn command_line_ok(command: &CommandLine) -> bool {
+    match command {
+        CommandLine::Text(text) => command_ok(text),
+        CommandLine::Argv(argv) => {
+            let joined = argv.iter().map(String::len).sum::<usize>() + argv.len().saturating_sub(1);
+            (1..=RUNTIME_ARGV_MAX).contains(&argv.len())
+                && argv
+                    .first()
+                    .is_some_and(|program| !program.trim().is_empty())
+                && joined <= RUNTIME_COMMAND_MAX_BYTES
+                && argv.iter().all(|arg| {
+                    text_ok(arg, RUNTIME_COMMAND_MAX_BYTES)
+                        && placeholders(arg).all(|name| RUNTIME_PLACEHOLDERS.contains(&name))
+                })
+        }
+    }
 }
 
 /// An origin-relative route: one leading slash, no `//`, `..`, `#`, `?`,
@@ -497,26 +518,28 @@ fn validate_launch(launch: &Launch, serves: bool) -> Check {
     for (index, commands) in launch.commands.iter().enumerate() {
         validate_commands(commands, launch.management, index)?;
     }
+    // `cmd` cannot quote an argument safely, so its launches have text commands only.
+    if launch.shell == Some(CommandShell::Cmd) {
+        let argv = launch
+            .commands
+            .iter()
+            .flat_map(Commands::all)
+            .any(|(_, command)| matches!(command, CommandLine::Argv(_)));
+        ensure(!argv, || "launch.shell".into())?;
+    }
     Ok(())
 }
 
 fn validate_commands(commands: &Commands, management: Management, index: usize) -> Check {
     let path = |field: &str| format!("launch.commands[{index}].{field}");
-    for (field, command) in [
-        ("start", Some(&commands.start)),
-        ("stop", commands.stop.as_ref()),
-        ("prepare", commands.prepare.as_ref()),
-        ("afterJoin", commands.after_join.as_ref()),
-        ("status", commands.status.as_ref()),
-        ("health", commands.health.as_ref()),
-    ] {
-        if let Some(command) = command {
-            ensure(command_ok(command), || path(field))?;
-        }
+    for (field, command) in commands.all() {
+        ensure(command_line_ok(command), || path(field))?;
     }
     // A status command that can never say stopped (exit 3) would hold a stop forever.
     if let Some(status) = &commands.status {
-        ensure(status_can_report_stopped(status), || path("status"))?;
+        ensure(status_can_report_stopped(&status.joined()), || {
+            path("status")
+        })?;
     }
     if management == Management::Service {
         ensure(commands.stop.is_some(), || path("stop"))?;
@@ -534,6 +557,23 @@ fn validate_commands(commands: &Commands, management: Management, index: usize) 
         })?;
         if flags.contains(&Some(true)) {
             ensure(commands.status.is_some(), || path("status"))?;
+        }
+        // A person runs an interactive step in an operator terminal's shell: it is text.
+        for (field, flag, command) in [
+            ("start", interactive.start, Some(&commands.start)),
+            ("stop", interactive.stop, commands.stop.as_ref()),
+            ("prepare", interactive.prepare, commands.prepare.as_ref()),
+            (
+                "afterJoin",
+                interactive.after_join,
+                commands.after_join.as_ref(),
+            ),
+        ] {
+            if flag == Some(true) {
+                ensure(!matches!(command, Some(CommandLine::Argv(_))), || {
+                    path(field)
+                })?;
+            }
         }
         if interactive.start.is_some() || interactive.after_join.is_some() {
             ensure(management == Management::Service, || {

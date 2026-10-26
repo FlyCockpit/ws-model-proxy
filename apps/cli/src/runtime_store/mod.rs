@@ -471,19 +471,7 @@ pub fn binds_all_interfaces(spec: &RuntimeSpec) -> bool {
         texts.push(&address.base_url);
     }
     for commands in spec.launch.iter().flat_map(|launch| &launch.commands) {
-        texts.push(&commands.start);
-        texts.extend(
-            [
-                &commands.stop,
-                &commands.prepare,
-                &commands.after_join,
-                &commands.status,
-                &commands.health,
-            ]
-            .into_iter()
-            .flatten()
-            .map(String::as_str),
-        );
+        texts.extend(commands.all().flat_map(|(_, command)| command.parts()));
     }
     texts.iter().any(|text| has_all_interfaces(text))
 }
