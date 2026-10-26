@@ -13,6 +13,7 @@ pub mod config;
 #[cfg(windows)]
 pub mod conpty_host;
 pub mod hardware;
+pub mod launch_guard;
 pub mod login;
 pub mod logout;
 pub mod recover;

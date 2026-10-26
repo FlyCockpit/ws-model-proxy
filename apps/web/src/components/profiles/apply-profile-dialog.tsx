@@ -17,6 +17,7 @@ import { InlineRetry } from "@/components/inline-retry";
 import { StatusPill } from "@/components/nodes/node-badges";
 import type { NodeSummary, ProfileView, StartPreview } from "@/components/nodes/node-types";
 import { refusalKeys, refusalMessage, refusalReasonOf } from "@/components/nodes/refusal";
+import { refusalReservationOf, withReservation } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
 /**
@@ -161,8 +162,14 @@ function PreviewSummary({
           <ul className="list-disc space-y-0.5 pl-5">
             {preview.refusals.map((refusal) => (
               <li key={`${refusal.reason}-${refusal.subjectId}`}>
-                {t([...refusalKeys(refusal.reason), "dashboard:runtime.refusals.other"])}
-                {refusal.subjectId && nodeById.has(refusal.subjectId)
+                {withReservation(
+                  t,
+                  refusalReservationOf(refusal),
+                  t([...refusalKeys(refusal.reason), "dashboard:runtime.refusals.other"]),
+                )}
+                {refusal.subjectId &&
+                nodeById.has(refusal.subjectId) &&
+                !refusalReservationOf(refusal)?.nodeSlug
                   ? ` (${slug(refusal.subjectId)})`
                   : null}
               </li>
@@ -188,9 +195,15 @@ function PreviewSummary({
                 ) : null}
                 <span className="text-muted-foreground">
                   →{" "}
-                  {start.placements
-                    .map((placement) => `${placement.nodeSlug}:${placement.port}`)
-                    .join(", ")}
+                  {[
+                    ...start.placements.map(
+                      (placement) => `${placement.nodeSlug}:${placement.port}`,
+                    ),
+                    // Reservations: memory held there, nothing runs.
+                    ...start.reservations.map((reservation) =>
+                      t("dashboard:profiles.apply.reservation", { node: reservation.nodeSlug }),
+                    ),
+                  ].join(", ")}
                 </span>
               </li>
             ))}

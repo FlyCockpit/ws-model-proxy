@@ -34,6 +34,8 @@
     "runtimeHosts": ["10.0.0.5:8000"],
     "mediaExpand": true,
     "liveStt": true,
+    "jobReservations": true,
+    "rankIdle": true,
     "secrets": [
       {
         "name": "WSMP_SECRET_LLAMA_KEY",

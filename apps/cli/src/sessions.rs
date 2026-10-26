@@ -89,10 +89,6 @@ const INPUT_QUEUE_LIMIT: usize = 256 * 1024;
 /// Room past [`INPUT_QUEUE_LIMIT`] for Windows resize frames.
 #[cfg(windows)]
 const CONTROL_SLACK: usize = 4 * 1024;
-/// Kill rounds on terminal close. Session members can fork while they are
-/// being killed, so the session is re-scanned until it is empty.
-#[cfg(unix)]
-const SESSION_KILL_ROUNDS: usize = 20;
 /// After the child exits, keep the exec slot until both pipes report EOF, or
 /// this long, whichever comes first. A grandchild that holds a pipe must not
 /// stall the slot; the leftover bytes are then dropped.
@@ -681,110 +677,6 @@ fn status_parts(status: std::process::ExitStatus) -> (Option<i32>, Option<i32>) 
     }
 }
 
-/// Every live process whose session id is confirmed to be `sid`, via
-/// `/proc` on Linux. Zombies are skipped: they are already dead and only wait
-/// for their parent to reap them.
-#[cfg(target_os = "linux")]
-fn session_members(sid: nix::unistd::Pid) -> Vec<nix::unistd::Pid> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
-        .filter(|raw| *raw > 1)
-        .filter(|raw| {
-            // Field 3 of `stat` (after the parenthesised command) is the state.
-            std::fs::read_to_string(format!("/proc/{raw}/stat"))
-                .ok()
-                .and_then(|stat| {
-                    let rest = &stat[stat.rfind(')')? + 1..];
-                    rest.split_whitespace().next().map(|state| state != "Z")
-                })
-                .unwrap_or(false)
-        })
-        .map(nix::unistd::Pid::from_raw)
-        .filter(|pid| nix::unistd::getsid(Some(*pid)) == Ok(sid))
-        .collect()
-}
-
-/// Every live process whose session id is confirmed to be `sid`. macOS and
-/// the BSDs have no `/proc` and listing pids needs FFI (`unsafe` is forbidden
-/// here), so `/bin/ps` lists candidates and `getsid` confirms each one.
-#[cfg(all(unix, not(target_os = "linux")))]
-fn session_members(sid: nix::unistd::Pid) -> Vec<nix::unistd::Pid> {
-    let Ok(output) = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,stat="])
-        .env_clear()
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-    else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let raw = fields.next()?.parse::<i32>().ok()?;
-            let zombie = fields.next().is_some_and(|state| state.starts_with('Z'));
-            (raw > 1 && !zombie).then(|| nix::unistd::Pid::from_raw(raw))
-        })
-        .filter(|pid| nix::unistd::getsid(Some(*pid)) == Ok(sid))
-        .collect()
-}
-
-/// SIGKILL every process in the session led by `leader` (a PTY shell spawned
-/// with `setsid`, so its pid is the session id). This reaches background jobs
-/// in their own process groups and `nohup`/disowned jobs, which a process
-/// group kill misses. Rounds repeat because members can fork while the kill
-/// is in progress.
-///
-/// Only pids whose `getsid` matches are signalled, and never session 1 or
-/// the CLI's own session. A process that calls `setsid()` itself starts a new
-/// session and escapes this kill; that is a documented limit.
-#[cfg(unix)]
-fn kill_session(leader: u32) {
-    let Ok(raw) = i32::try_from(leader) else {
-        return;
-    };
-    if raw <= 1 {
-        return;
-    }
-    // The shell was spawned with `setsid`, so its session id is its pid.
-    // Either it is our unreaped child, or it was reaped just now and the
-    // kernel does not hand out a pid that is still some session's id while
-    // members remain; either way the pid cannot name an unrelated session. A
-    // zombie or reaped leader can fail `getsid`; its session members are
-    // still confirmed one by one below.
-    let sid = nix::unistd::Pid::from_raw(raw);
-    if nix::unistd::getsid(Some(sid)).is_ok_and(|actual| actual != sid) {
-        return;
-    }
-    if nix::unistd::getsid(None).is_ok_and(|own| own == sid) {
-        return;
-    }
-    let own_pid = nix::unistd::getpid();
-    for round in 0..SESSION_KILL_ROUNDS {
-        let members = session_members(sid);
-        if members.is_empty() {
-            return;
-        }
-        for pid in members {
-            if pid != own_pid {
-                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-            }
-        }
-        // SIGKILL is asynchronous. Back off a little so a killed process can
-        // become a zombie before the next scan.
-        if round > 0 {
-            std::thread::sleep(Duration::from_millis(5));
-        } else {
-            std::thread::yield_now();
-        }
-    }
-}
-
 /// A child the relay thread owns, recorded so a forced shutdown can kill it
 /// from another thread without the registries.
 #[cfg_attr(unix, derive(Clone, Copy, Debug, PartialEq, Eq))]
@@ -799,6 +691,10 @@ enum LiveChild {
     /// A PTY shell: the leader of its own session.
     #[cfg(unix)]
     PtySession(u32),
+    /// An operator terminal's launch guard, the leader of its PTY's session. Ended by SIGTERM
+    /// only ([`crate::launch_guard::terminate`]).
+    #[cfg(unix)]
+    GuardSession(u32),
 }
 
 static LIVE_CHILDREN: Mutex<BTreeMap<u64, LiveChild>> = Mutex::new(BTreeMap::new());
@@ -850,9 +746,13 @@ fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
             LiveChild::ExecGroup(pid) => kill_process_group(pid, false),
             #[cfg(unix)]
             LiveChild::PtySession(pid) => {
-                kill_session(pid);
-                kill_process_group(pid, false);
+                // An unproven session keeps its leader.
+                if crate::process_list::kill_session(pid) {
+                    kill_process_group(pid, false);
+                }
             }
+            #[cfg(unix)]
+            LiveChild::GuardSession(pid) => crate::launch_guard::terminate(pid),
         }
     }
 }
@@ -1059,6 +959,9 @@ struct PtyRuntime {
     reader: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     pid: Option<u32>,
+    /// It runs a launch guard (an operator command): close sends it SIGTERM and never kills its
+    /// session, so its lock outlasts what the command started.
+    guarded: bool,
     /// Exit status and the instant `poll` reaped the shell. The terminal
     /// closes on PTY EOF or [`TERMINAL_OUTPUT_DRAIN`] later.
     exited: Option<(Option<i32>, Option<i32>, Instant)>,
@@ -1071,11 +974,16 @@ fn shutdown_pty(mut runtime: PtyRuntime) -> (Option<i32>, Option<i32>) {
     runtime.stop.store(true, Ordering::SeqCst);
     runtime.input.close();
     let exited = runtime.exited.map(|(code, signal, _)| (code, signal));
+    if runtime.guarded {
+        return shutdown_guard_pty(runtime, exited);
+    }
     if let Some(pid) = runtime.pid {
-        kill_session(pid);
         // A shell that `poll` already reaped is not signalled by pid again;
-        // `killpg` still reaches jobs left in its process group.
-        kill_process_group(pid, exited.is_none());
+        // `killpg` still reaches jobs left in its process group. An unproven
+        // session keeps its leader.
+        if crate::process_list::kill_session(pid) {
+            kill_process_group(pid, exited.is_none());
+        }
     }
     // The reader and writer notice `stop` within their poll timeout. Joining
     // either would block: the reader while a background job still holds the
@@ -1194,6 +1102,83 @@ fn pump_input(
             }
         }
     })
+}
+
+/// [`shutdown_pty`] of an operator command's launch guard. A guard still running gets SIGTERM
+/// and ends its session itself, holding its lock until it has: a scan of its session can be
+/// stale by the time a kill lands (the guard may have started its command since), so its
+/// session is never killed while it lives. One someone else killed left its session to this.
+/// What has not ended by the time the terminal closes [`crate::launch_guard::linger`]s, so no
+/// rank is proven idle before it has.
+#[cfg(unix)]
+fn shutdown_guard_pty(
+    mut runtime: PtyRuntime,
+    exited: Option<(Option<i32>, Option<i32>)>,
+) -> (Option<i32>, Option<i32>) {
+    drop(runtime.writer.take());
+    drop(runtime.reader.take());
+    let Some(pid) = runtime.pid else {
+        drop(runtime.child);
+        drop(runtime.master);
+        return exited.unwrap_or((None, None));
+    };
+    if exited.is_none() {
+        // Unreaped, so the pid is still the guard's.
+        crate::launch_guard::terminate(pid);
+    }
+    let status = exited.unwrap_or_else(|| reap_after_signal(Some(pid)));
+    drop(runtime.master);
+    match status {
+        (None, None) => {
+            // Still ending its session. The child stays owned (the subreaper leaves it alone)
+            // until it is reaped here.
+            let child = runtime.child;
+            let mut reaped = false;
+            crate::launch_guard::linger(move || {
+                let _owned = &child;
+                if !reaped {
+                    match reap_guard(pid) {
+                        GuardReap::Running => return false,
+                        GuardReap::Exited | GuardReap::Gone => return true,
+                        GuardReap::Killed => reaped = true,
+                    }
+                }
+                crate::process_list::kill_session(pid)
+            });
+        }
+        (_, Some(_)) => {
+            drop(runtime.child);
+            crate::launch_guard::end_killed_session(pid);
+        }
+        (Some(_), None) => drop(runtime.child),
+    }
+    status
+}
+
+/// What a non-blocking reap of a guard found.
+#[cfg(unix)]
+enum GuardReap {
+    Running,
+    /// It exited, so it ended its session itself.
+    Exited,
+    /// Someone else's signal killed it: its session is left to the caller.
+    Killed,
+    /// Not our child any more (reaped elsewhere).
+    Gone,
+}
+
+#[cfg(unix)]
+fn reap_guard(pid: u32) -> GuardReap {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    let Ok(raw) = i32::try_from(pid) else {
+        return GuardReap::Gone;
+    };
+    match waitpid(nix::unistd::Pid::from_raw(raw), Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::Exited(..)) => GuardReap::Exited,
+        Ok(WaitStatus::Signaled(..)) => GuardReap::Killed,
+        Err(nix::errno::Errno::ECHILD) => GuardReap::Gone,
+        _ => GuardReap::Running,
+    }
 }
 
 /// Best-effort wipe of key material. No `unsafe` and no extra crates, so this
@@ -2708,7 +2693,16 @@ fn spawn_pty(
         |child| child.process_id(),
     )?;
     let pid = child.process_id();
-    let tracked = pid.map(|pid| LiveChildGuard::track(LiveChild::PtySession(pid)));
+    let guarded = args
+        .first()
+        .is_some_and(|arg| arg == crate::launch_guard::SUBCOMMAND);
+    let tracked = pid.map(|pid| {
+        LiveChildGuard::track(if guarded {
+            LiveChild::GuardSession(pid)
+        } else {
+            LiveChild::PtySession(pid)
+        })
+    });
     let stop = Arc::new(AtomicBool::new(false));
     let input = Arc::new(InputQueue::new());
     let writer_thread = pump_input(
@@ -2740,6 +2734,7 @@ fn spawn_pty(
         reader: Some(thread),
         stop,
         pid,
+        guarded,
         exited: None,
         _tracked: tracked,
     })
@@ -5656,6 +5651,97 @@ mod tests {
                 rest.split_whitespace().next().map(|state| state != "Z")
             })
             .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closing_a_launch_guards_terminal_terminates_the_guard_and_lingers_until_it_ends() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = crate::launch_guard::lingering_serial();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = |name: &str| dir.path().join(name);
+        // Stands in for the guard (its first argument is the guard subcommand): it leaves a
+        // helper in another group of its session, and on SIGTERM takes a while to end.
+        let script = marker("guard");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntrap '' HUP INT QUIT\ntrap 'echo > \"{term}\"; sleep 0.5; exit 143' TERM\nset -m\n(trap '' HUP; exec sleep 120) &\necho $! > \"{helper}\"\nwhile :; do sleep 0.02; done\n",
+                term = marker("term").display(),
+                helper = marker("helper.pid").display(),
+            ),
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let (tx, rx) = channel();
+        let mut terminals = TerminalRegistry::with_shell(
+            tx,
+            Duration::from_secs(60),
+            script.to_str().expect("path"),
+            &[crate::launch_guard::SUBCOMMAND],
+        );
+        let startup = enabled_startup(false);
+        let browser = CliTerminalKey::generate().expect("browser");
+        let nonce = terminal_crypto::encode_b64url(&[9_u8; 16]);
+        terminals.open(
+            &startup,
+            None,
+            TermHandshake {
+                terminal_id: "guard",
+                viewer_id: Some("viewer-a"),
+                cols: 80,
+                rows: 24,
+                browser_public_key: browser.public_b64url(),
+                browser_nonce: &nonce,
+                identity: None,
+                shell: None,
+            },
+        );
+        assert!(
+            terminals
+                .sessions
+                .get("guard")
+                .and_then(|session| session.pty.as_ref())
+                .is_some_and(|pty| pty.guarded)
+        );
+        let wait_for = |path: &Path| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} was not written",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_for(&marker("helper.pid"));
+        std::thread::sleep(Duration::from_millis(50));
+        let helper = std::fs::read_to_string(marker("helper.pid"))
+            .expect("helper pid")
+            .trim()
+            .parse::<u32>()
+            .expect("helper pid");
+        assert!(!crate::launch_guard::lingering());
+        let _ = terminals.close("guard");
+        assert!(
+            crate::launch_guard::lingering(),
+            "the guard still ends its session"
+        );
+        wait_for(&marker("term"));
+        // The session is the guard's to end: close killed nothing in it.
+        assert!(process_running(helper), "close killed the guard's session");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::launch_guard::lingering() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!crate::launch_guard::lingering(), "the guard exited");
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(helper).expect("pid")),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        drop(terminals);
+        drop(rx);
     }
 
     #[cfg(target_os = "linux")]

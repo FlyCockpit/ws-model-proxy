@@ -48,8 +48,21 @@ const CSRF_LESS: CallerAuth = {
 const client = (auth: CallerAuth = PERSON, services?: Parameters<typeof contextFor>[1]) =>
   createRouterClient(profilesRouter, { context: contextFor(auth, services) });
 
+const fullNode = (id: string, trust: "RELAY" | "FULL" = "FULL") => ({
+  id,
+  slug: id,
+  trust,
+  trustLowerRequestedAt: null,
+});
+
 function planState(
-  options: { trust?: "RELAY" | "FULL"; personHold?: boolean; running?: boolean } = {},
+  options: {
+    trust?: "RELAY" | "FULL";
+    personHold?: boolean;
+    running?: boolean;
+    /** The running instance's head runs outside the profile, on a node of this trust, and reserves "a". */
+    reservingFrom?: "RELAY" | "FULL";
+  } = {},
 ) {
   db.profileNode.findMany.mockResolvedValueOnce([{ nodeId: "a", hold: false, holdNote: null }]);
   db.profile.findFirst.mockResolvedValueOnce({
@@ -87,7 +100,19 @@ function planState(
             launchVersionId: "v-1",
             desiredState: "RUNNING",
             phase: "READY",
-            Ranks: [{ nodeId: "a", claim: "HELD" }],
+            Ranks: options.reservingFrom
+              ? [
+                  {
+                    rank: 0,
+                    nodeId: "outside",
+                    claim: "HELD",
+                    Node: fullNode("outside", options.reservingFrom),
+                  },
+                ]
+              : [{ rank: 0, nodeId: "a", claim: "HELD", Node: fullNode("a") }],
+            Reservations: options.reservingFrom
+              ? [{ index: 0, nodeId: "a", supersededGeneration: null, Node: fullNode("a") }]
+              : [],
           },
         ] as never)
       : [],
@@ -102,6 +127,9 @@ beforeEach(() => {
   // The apply transaction re-reads the owned nodes' holds; by default nobody holds them.
   db.node.findMany.mockResolvedValue([]);
   db.node.updateMany.mockResolvedValue({ count: 1 });
+  // The definitions nodes require (`requiredDefinitionsByNode`): none unless a test says so.
+  db.instanceRank.findMany.mockResolvedValue([]);
+  db.instanceStep.findMany.mockResolvedValue([]);
 });
 
 describe("profiles.apply", () => {
@@ -186,6 +214,26 @@ describe("profiles.apply", () => {
     });
     // The instance it stops is fenced too (its capacity view changes).
     expect(fenceLog.held.some((fence) => fence.includes("i-1"))).toBe(true);
+  });
+
+  it("stops an instance whose head is outside the profile but reserves an owned node; refuses an agent when that head is Relay only", async () => {
+    planState({ running: true, reservingFrom: "FULL" });
+    const preview = await client(PERSON).apply({ profileId: "p-1", preview: true });
+    // Loaded by its reservation (not only by a rank on an owned node).
+    expect(db.runtimeInstance.findMany.mock.calls[0]?.[0]?.where).toMatchObject({
+      OR: expect.arrayContaining([
+        expect.objectContaining({ Reservations: { some: { nodeId: { in: ["a"] } } } }),
+      ]),
+    });
+    expect(preview).toMatchObject({
+      mode: "preview",
+      preview: { stops: [{ instanceId: "i-1", reason: "profile_owned_node" }], refusals: [] },
+    });
+    planState({ running: true, reservingFrom: "RELAY" });
+    await expect(client(FULL_AGENT).apply({ profileId: "p-1" })).rejects.toMatchObject({
+      data: { reason: "trust_relay", subjectId: "outside" },
+    });
+    expect(db.runtimeInstance.updateMany).not.toHaveBeenCalled();
   });
 
   it("refuses as stale when an instance it stops changed meanwhile", async () => {

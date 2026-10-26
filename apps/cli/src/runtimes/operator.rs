@@ -6,7 +6,8 @@
 //! The terminal starts in a confirm stage with no process: the daemon itself
 //! draws the confirm screen (the exact rendered command and who wrote it)
 //! and reads the writer's keys. Enter spawns a fresh PTY that runs exactly
-//! `/bin/sh -c WRAPPER wsmp-operator <command>`: [`WRAPPER`] runs `sudo -k`
+//! `/bin/sh -c WRAPPER wsmp-operator <command>` (under the launch guard,
+//! [`crate::launch_guard`], so it never outlives the daemon): [`WRAPPER`] runs `sudo -k`
 //! (when `sudo` exists) before and after the command and nothing else, so
 //! no shell prompt is ever offered and no sudo credential outlives the step.
 //! Viewer input reaches the PTY only while that command runs. When it exits
@@ -101,6 +102,7 @@ impl OperatorIds {
             error: None,
             detail: None,
             terminal_id: Some(self.terminal_id.clone()),
+            rank_idle: None,
             exit_code: if status == JobStatus::OperatorClosed {
                 exit_code
             } else {

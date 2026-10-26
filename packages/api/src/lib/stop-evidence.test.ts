@@ -40,6 +40,37 @@ describe("nodeConnectionView", () => {
 describe("latestStopChecks", () => {
   const held = (rank: number) => ({ rank, claim: "HELD", markedStoppedAt: null });
 
+  it("never shows a stopped answer the server refused as a proof as confirmed", async () => {
+    const answer = (errorCode: string | null) =>
+      latestStopChecks(
+        {
+          instanceStep: {
+            findFirst: vi.fn(async () => ({
+              instanceId: "held",
+              rank: 0,
+              state: "SUCCEEDED",
+              errorCode,
+              updatedAt: at("2026-10-07T11:55:00.000Z"),
+            })),
+          },
+        } as never,
+        [
+          {
+            id: "held",
+            phase: "STOPPED",
+            phaseChangedAt: at("2026-10-07T11:00:00.000Z"),
+            Ranks: [{ rank: 0, claim: "HELD_UNKNOWN", markedStoppedAt: NOW }],
+          },
+        ],
+      );
+    // A start may still launch on the node: refused, and recorded why.
+    expect((await answer("launch_pending")).get(stopCheckKey("held", 0))).toMatchObject({
+      proven: false,
+      errorCode: "launch_pending",
+    });
+    expect((await answer(null)).get(stopCheckKey("held", 0))?.proven).toBe(true);
+  });
+
   it("reads each stopping rank's last finished check of this stop only", async () => {
     const findFirst = vi.fn(async ({ where }: { where: { instanceId: string; rank: number } }) =>
       where.rank === 0

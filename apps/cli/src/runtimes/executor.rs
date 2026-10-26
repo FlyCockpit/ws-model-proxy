@@ -18,7 +18,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::protocol::frames::{InstancePhase, InstanceRecord, JobError, JobPhase, JobStatus};
+use crate::protocol::frames::{
+    InstancePhase, InstanceRecord, JobError, JobPhase, JobReservation, JobStatus,
+};
 use crate::protocol::runtime_spec::{
     Management, Readiness, RuntimeSpec, status_can_report_stopped,
 };
@@ -68,6 +70,11 @@ pub struct Job {
     /// Where the engine listens (`127.0.0.1`, or the fabric address).
     pub host: String,
     pub spec: Value,
+    /// The worker nodes a single-node instance's reservations were assigned to (the job's
+    /// `reservations`): every command sees them as `WSMP_RESERVATION_*`. A stop or status job
+    /// that names none uses the launch's (the record's).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reservations: Vec<JobReservation>,
 }
 
 impl Job {
@@ -1392,6 +1399,8 @@ impl Executor {
                         handle: job.handle.clone(),
                         models: job.models(),
                         engine_facts: None,
+                        // The runner sets it (`observe_all_idle`).
+                        rank_idle: None,
                     },
                 )
             })
@@ -1671,9 +1680,13 @@ fn owned_units(job: &Job) -> [String; 3] {
 pub const GPU_VISIBILITY_ENV: [&str; 2] = ["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"];
 
 /// The environment every runtime command gets on top of the scrubbed
-/// parent environment: the definition's node secrets and, on a placed rank,
-/// its GPUs. CUDA numbers devices fastest-first by default; `PCI_BUS_ID`
-/// makes its N the `nvidia-smi` index N that `nvidia:N` names.
+/// parent environment: the definition's node secrets, on a placed rank its
+/// GPUs, and the job's reservations (`WSMP_RESERVATION_COUNT`, then per entry
+/// `WSMP_RESERVATION_<index>_NODE`, `WSMP_RESERVATION_<index>_NODE_ID` and, when
+/// placement gave it worker GPUs, `WSMP_RESERVATION_<index>_GPUS` in the
+/// rank's `CUDA_VISIBLE_DEVICES` format, e.g. `0,3`).
+/// CUDA numbers devices fastest-first by default; `PCI_BUS_ID` makes its N
+/// the `nvidia-smi` index N that `nvidia:N` names.
 /// Errors name a missing secret, never a value.
 pub fn command_env(job: &Job) -> Result<Vec<(String, String)>> {
     let (mut found, missing) = crate::secrets::values(&job.secrets);
@@ -1686,6 +1699,20 @@ pub fn command_env(job: &Job) -> Result<Vec<(String, String)>> {
         found.push(("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()));
         for name in GPU_VISIBILITY_ENV {
             found.push((name.to_string(), ids.clone()));
+        }
+    }
+    if !job.reservations.is_empty() {
+        found.push((
+            "WSMP_RESERVATION_COUNT".to_string(),
+            job.reservations.len().to_string(),
+        ));
+        for reservation in &job.reservations {
+            let prefix = format!("WSMP_RESERVATION_{}", reservation.index);
+            found.push((format!("{prefix}_NODE"), reservation.node.clone()));
+            found.push((format!("{prefix}_NODE_ID"), reservation.node_id.clone()));
+            if let Some(ids) = &reservation.gpu_ids {
+                found.push((format!("{prefix}_GPUS"), ids.clone()));
+            }
         }
     }
     Ok(found)

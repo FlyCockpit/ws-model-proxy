@@ -35,6 +35,8 @@ function node(overrides: Partial<NodeSummary> = {}): NodeSummary {
     labels: [],
     hardwareKind: "discrete",
     liveFreeMemoryGb: null,
+    usableMemoryGb: 16,
+    reservedNowMemoryGb: 0,
     runningInstances: 0,
     alwaysOnRuntimes: 0,
     needsYou: 0,

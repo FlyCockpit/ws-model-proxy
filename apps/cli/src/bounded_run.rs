@@ -29,7 +29,11 @@
 //! or a cancel) for the direct child to exit without reaping it where the
 //! platform allows, `SIGKILL` its whole process group and the direct child
 //! itself (a child that left its group is still ours to kill), then reap it
-//! for at most [`REAP_GRACE`]. A child that survives even that (blocked in
+//! for at most [`REAP_GRACE`]. A launch guard ([`crate::launch_guard`]) leads a
+//! session instead of a group, and is sent SIGTERM instead of being killed: it
+//! ends its session itself, holding its launcher lock until it has (a guard
+//! still ending goes to the reaper). Only a guard someone else killed has its
+//! session killed here. A child that survives even that (blocked in
 //! uninterruptible sleep) is handed to a detached reaper thread; the call
 //! still returns within about `timeout + REAP_GRACE`.
 //!
@@ -59,14 +63,12 @@
 //! a command that was running. A panic in a release build (which aborts)
 //! ends the runs in flight first ([`kill_all_active_for_panic`], installed by
 //! `main`). On Unix, `SIGKILL` of the daemon itself cannot be caught and can
-//! leave a command running until it exits by itself.
+//! leave a command running until it exits by itself, except a runtime
+//! command: those run under [`crate::launch_guard`], which ends them.
 
 #[cfg(windows)]
 use crate::job_tree::{Child, JobTree};
-#[cfg(windows)]
 use std::collections::BTreeMap;
-#[cfg(not(windows))]
-use std::collections::BTreeSet;
 /// Registered with the subreaper, so its scan never reaps the run's child.
 #[cfg(not(windows))]
 type Child = crate::subreaper::Owned<std::process::Child>;
@@ -149,8 +151,9 @@ impl Drop for Permit {
 
 #[cfg(windows)]
 type Groups = BTreeMap<u64, JobTree>;
+/// Each run's pid, and whether it is a launch guard leading its session.
 #[cfg(not(windows))]
-type Groups = BTreeSet<u32>;
+type Groups = BTreeMap<u32, bool>;
 
 #[derive(Default)]
 struct Registry {
@@ -204,20 +207,20 @@ fn spawn_failed() {
 /// [`begin_spawn`]: the group is killed here (under the lock on Unix, so
 /// `kill_all_active` never returns before it), and the caller gives up.
 #[cfg(unix)]
-fn register(pid: u32) -> bool {
-    register_in(&ACTIVE, pid)
+fn register(pid: u32, session: bool) -> bool {
+    register_in(&ACTIVE, pid, session)
 }
 
 #[cfg(unix)]
-fn register_in(shared: &'static Mutex<Registry>, pid: u32) -> bool {
+fn register_in(shared: &'static Mutex<Registry>, pid: u32, session: bool) -> bool {
     let mut registry = lock_registry(shared);
     registry.spawning = registry.spawning.saturating_sub(1);
     if registry.closed {
         #[cfg(unix)]
-        kill_run(pid);
+        kill_run(pid, session);
         return false;
     }
-    registry.groups.insert(pid);
+    registry.groups.insert(pid, session);
     true
 }
 
@@ -342,8 +345,8 @@ fn kill_all_for_panic_in(shared: &'static Mutex<Registry>) {
     registry.closed = true;
     let groups = std::mem::take(&mut registry.groups);
     #[cfg(unix)]
-    for pid in groups {
-        kill_run(pid);
+    for (pid, session) in groups {
+        kill_run(pid, session);
     }
 }
 
@@ -357,8 +360,8 @@ fn kill_all_in(shared: &'static Mutex<Registry>) {
         // (under this lock) before it reaps, so no signalled id can have been
         // reaped and recycled.
         #[cfg(unix)]
-        for pid in groups {
-            kill_run(pid);
+        for (pid, session) in groups {
+            kill_run(pid, session);
         }
     }
     // A run past its shutdown check but not yet registered is killed by its
@@ -490,8 +493,14 @@ fn run_inner(
         .stdout(Stdio::piped())
         // Never read, never uploaded.
         .stderr(Stdio::null());
+    // A launch guard starts a session of its own (a group leader cannot), and its session is
+    // what is killed when it did not end on its own.
     #[cfg(unix)]
-    {
+    let session = args
+        .first()
+        .is_some_and(|arg| arg == crate::launch_guard::SUBCOMMAND);
+    #[cfg(unix)]
+    if !session {
         use std::os::unix::process::CommandExt;
         // Its own group, so the deadline kills everything it started.
         command.process_group(0);
@@ -523,7 +532,7 @@ fn run_inner(
     #[cfg(not(windows))]
     let pid = child.id();
     #[cfg(not(windows))]
-    let registered = register(pid);
+    let registered = register(pid, session);
     #[cfg(windows)]
     let registration = register_job_in(&ACTIVE, child.job());
     #[cfg(windows)]
@@ -534,7 +543,7 @@ fn run_inner(
     };
     #[cfg(not(windows))]
     let finish = |child, until, permit, cancelled: &dyn Fn() -> bool| {
-        finish_until(child, until, permit, cancelled, settlement)
+        finish_until(child, until, permit, cancelled, settlement, session)
     };
     if !registered {
         finish(child, Instant::now(), permit, &|| true);
@@ -730,10 +739,19 @@ fn finish_until(
     permit: Permit,
     cancelled: &dyn Fn() -> bool,
     settlement: Option<Instant>,
+    session: bool,
 ) -> Finished {
     let exited = wait_for_exit(&mut child, until, cancelled);
     let pid = child.id();
-    kill_group_or_child(&mut child);
+    if session {
+        // A launch guard ends its session itself, holding its launcher lock until it has.
+        // Still unreaped while it runs, so the pid is its own.
+        if !exited {
+            crate::launch_guard::terminate(pid);
+        }
+    } else {
+        kill_group_or_child(&mut child);
+    }
     // Off the registry before the reap: the registry never names a pid that
     // has been reaped (and could be reused).
     unregister(pid);
@@ -743,8 +761,15 @@ fn finish_until(
         &mut child,
         settlement.unwrap_or_else(|| Instant::now() + REAP_GRACE),
     );
+    // A launch guard that exited (on its own or on SIGTERM) ended its session itself; one that
+    // someone else killed left it to this. A reaped leader's id is not reused while its session
+    // has members. One that is still ending (a kill it keeps retrying) keeps its lock and goes
+    // to the reaper, lingering until it has ended.
+    if session && status.is_some_and(|status| status.code().is_none()) {
+        crate::launch_guard::end_killed_session(pid);
+    }
     if status.is_none() {
-        hand_off_to_reaper(child, permit);
+        hand_off_to_reaper(child, permit, session);
     }
     Finished { exited, status }
 }
@@ -810,14 +835,36 @@ fn reap_within(child: &mut Child, until: Instant) -> Option<ExitStatus> {
 /// detached thread so it does not stay a zombie. The thread ends when the
 /// child finally dies; until then the run's permit stays held and the child
 /// counts as stuck.
+///
+/// A launch guard (`session`) still ending its session is [`crate::launch_guard::lingering`]
+/// until it is reaped, and its session after that when someone else killed it.
 #[cfg(not(windows))]
-fn hand_off_to_reaper(mut child: Child, permit: Permit) {
+fn hand_off_to_reaper(mut child: Child, permit: Permit, session: bool) {
     lock(permit.0).stuck += 1;
     let shared = permit.0;
+    let (ended_tx, ended_rx) = std::sync::mpsc::channel::<bool>();
+    if session {
+        let pid = child.id();
+        let mut reaped = false;
+        crate::launch_guard::linger(move || {
+            if !reaped {
+                match ended_rx.try_recv() {
+                    // Killed by someone else: its session is this cleanup's to end.
+                    Ok(true) => reaped = true,
+                    Ok(false) => return true,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                    // No reaper thread: nothing proves the guard ended.
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+                }
+            }
+            crate::process_list::kill_session(pid)
+        });
+    }
     let spawned = thread::Builder::new()
         .name("wsmp-reaper".to_string())
         .spawn(move || {
-            let _ = child.wait();
+            let killed = child.wait().is_ok_and(|status| status.code().is_none());
+            let _ = ended_tx.send(killed);
             {
                 let mut budget = lock(shared);
                 budget.stuck = budget.stuck.saturating_sub(1);
@@ -878,8 +925,15 @@ fn kill_group(pid: u32) {
 /// pid cannot have been recycled. Other Unix targets reap first, so this
 /// widens the accepted G1-2 window (a recycled pid, in the microseconds
 /// between the reap and `unregister`) from the group kill to this one.
+/// A launch guard (`session`) is sent SIGTERM: it ends its session itself before its launcher
+/// lock goes, and the signal is all that happens here (shutdown calls this under the registry
+/// lock).
 #[cfg(unix)]
-fn kill_run(pid: u32) {
+fn kill_run(pid: u32, session: bool) {
+    if session {
+        crate::launch_guard::terminate(pid);
+        return;
+    }
     kill_group(pid);
     let Ok(raw) = i32::try_from(pid) else {
         return;
@@ -1418,7 +1472,7 @@ mod tests {
     fn fresh_registry() -> &'static Mutex<Registry> {
         Box::leak(Box::new(Mutex::new(Registry {
             closed: false,
-            groups: BTreeSet::new(),
+            groups: BTreeMap::new(),
             spawning: 0,
         })))
     }
@@ -1453,7 +1507,7 @@ mod tests {
         thread::sleep(Duration::from_millis(300));
         assert!(child.try_wait().expect("try_wait").is_none());
         assert!(
-            !register_in(shared, pid),
+            !register_in(shared, pid, false),
             "registration after the exit began must be refused"
         );
         let waited = exiting.join().expect("shutdown thread");
@@ -1480,7 +1534,7 @@ mod tests {
         assert!(begin_spawn_in(shared));
         // No `process_group(0)`: the child shares this test's group.
         let mut child = Command::new("sleep").arg("30").spawn().expect("sleep");
-        assert!(register_in(shared, child.id()));
+        assert!(register_in(shared, child.id(), false));
         kill_all_in(shared);
         let deadline = Instant::now() + Duration::from_secs(3);
         while child.try_wait().expect("try_wait").is_none() {
@@ -1497,7 +1551,7 @@ mod tests {
         let shared = fresh_registry();
         assert!(begin_spawn_in(shared));
         let mut child = own_group_sleeper();
-        assert!(register_in(shared, child.id()));
+        assert!(register_in(shared, child.id(), false));
         kill_all_for_panic_in(shared);
         let deadline = Instant::now() + Duration::from_secs(3);
         while child.try_wait().expect("try_wait").is_none() {

@@ -17,7 +17,7 @@
  *   runtime.detected / runtime.job.result / secret.result / exec.* to their owners (A1/A2/A4/D3;
  *   the defaults log at debug and do nothing, an inventory is acknowledged);
  *   `sendToNode(nodeId, frame)` sends any server→node control frame to the live session;
- *   `requestTrustLower(nodeId, requestedAt)`; `setRelayAttemptStarter(start)` (recovery probes);
+ *   `requestTrustLower(nodeId)`; `setRelayAttemptStarter(start)` (recovery probes);
  *   `onPoolRoutingRulesChanged(poolId)`.
  * - Terminals (./terminal-websocket.ts): `registerTerminalBridge`, `startTerminal`,
  *   `attachTerminal`, `detachTerminalViewer`, `closeTerminalFromBrowser`,
@@ -115,6 +115,7 @@ import {
 } from "./protocol.js";
 import {
   RelayRegistrationError,
+  readNodeTrust,
   recordNodeIdentityRefusal,
   recordRejectedNodeHello,
   registerNodeHello,
@@ -248,6 +249,9 @@ export type OperatorTerminalInfo = {
  * until its final result, `operator_closed`, a replacement or the session's end. It outlives
  * the terminal record: the node ends the terminal (`term.exit`) before its final result.
  */
+/** What closing a step's operator terminal found (`closeOperatorStep`). */
+export type OperatorCloseAnswer = "unopened" | "closed" | "running" | "absent";
+
 type OperatorStepTracker = {
   stepId: string;
   instanceId: string;
@@ -270,6 +274,21 @@ type OperatorStepTracker = {
  * terminals of non-stop steps per node (stops are exempt); the node caps 8.
  */
 export const OPERATOR_STEPS_PER_SESSION = 16;
+
+/** A failed `operator_running` write is delivered again this many times (`retryOperatorAcceptance`). */
+export const OPERATOR_ACCEPT_RETRIES = 6;
+/** The first retry's delay; each next one doubles (1 s ... 32 s). */
+export const OPERATOR_ACCEPT_RETRY_MS = 1_000;
+
+/**
+ * A pending redelivery of one step's failed `operator_running`. `timer` is null while a
+ * redelivery is in flight; the chain owns the map entry until it ends or is cancelled.
+ */
+type OperatorAcceptanceRetry = {
+  terminalId: string;
+  attempt: number;
+  timer: ReturnType<typeof setTimeout> | null;
+};
 
 export type TerminalWriterLabel = "you" | "other" | "none";
 
@@ -459,11 +478,15 @@ export type NodeFrameHandlers = {
   nodeDisconnected?(node: NodeSessionRef): void;
   /** The node reported Full control again (`wsmp trust full`): its definitions unfreeze. */
   trustRaised?(node: NodeSessionRef): void | Promise<void>;
-  /** A complete inventory snapshot (A2). Its answer is the `runtime.inventory.ok/error` ack. */
+  /**
+   * A complete inventory snapshot (A2). Its answer is the `runtime.inventory.ok/error` ack.
+   * `stale`: handles whose record the lifecycle found to be about an earlier run (or from before
+   * the current run's launch); what the session served for them is kept.
+   */
   runtimeInventory?(
     node: NodeSessionRef,
     snapshot: RuntimeInventorySnapshot,
-  ): Promise<{ ok: true } | { ok: false; message: string }>;
+  ): Promise<{ ok: true; stale?: readonly string[] } | { ok: false; message: string }>;
 } & {
   [K in RoutedNodeFrameType]?: (node: NodeSessionRef, frame: NodeFrame<K>) => void | Promise<void>;
 };
@@ -479,7 +502,67 @@ export type SendGuard = {
   userId?: string;
   /** The log class of an owner refusal (default `frame`). */
   ownerCheck?: NodeOwnerCheck;
+  /**
+   * A runtime stop that ends runs through this one: once sent, no start-phase job of a run at or
+   * before it is delivered for the rank (`staleRunJob`). A gang STOP ends its own run; a run's
+   * leading stop ends the runs before it (its own starts still follow it).
+   */
+  stopsStartsThrough?: number;
 };
+
+const RUN_START_JOB_PHASES: ReadonlySet<string> = new Set([
+  "prepare",
+  "start",
+  "after_join",
+  "readiness",
+]);
+
+/** What this session sent of each rank's runs, by `instanceId:rank` (`staleRunJob`). */
+type RunDeliveries = {
+  /** The highest run (generation) whose start-phase job was sent. */
+  started: Map<string, number>;
+  /** The highest run a sent stop ended (`SendGuard.stopsStartsThrough`). */
+  ended: Map<string, number>;
+};
+
+/**
+ * A job the rank's runs already sent here make stale: the lifecycle claims a job before sending
+ * it, outside its write, so this is the last check, at the socket. Refused (not sent), the
+ * lifecycle returns the step to PENDING and its run gate ends it.
+ * - A stop, status or health job of a run older than one whose start-phase job was sent: the
+ *   later run owns the rank (its leading stop proved the old launch ended).
+ * - A start-phase job of a run older than one whose start-phase job was sent (the same reason),
+ *   or of a run a sent stop ended (a gang stop of that run or later, or a later run's leading
+ *   stop): that stop may already have been proven and released the claim, and nothing may start
+ *   after it.
+ */
+function staleRunJob(
+  runs: RunDeliveries,
+  frame: { instanceId: string; rank: number; generation: number; phase: string },
+): boolean {
+  const key = `${frame.instanceId}:${frame.rank}`;
+  const started = runs.started.get(key);
+  if (!RUN_START_JOB_PHASES.has(frame.phase))
+    return started !== undefined && frame.generation < started;
+  const ended = runs.ended.get(key);
+  return (
+    (started !== undefined && frame.generation < started) ||
+    (ended !== undefined && frame.generation <= ended)
+  );
+}
+
+function recordRunDelivery(
+  runs: RunDeliveries,
+  frame: { instanceId: string; rank: number; generation: number; phase: string },
+  stopsStartsThrough: number | undefined,
+): void {
+  const key = `${frame.instanceId}:${frame.rank}`;
+  const raise = (map: Map<string, number>, run: number) => {
+    if ((map.get(key) ?? -1) < run) map.set(key, run);
+  };
+  if (RUN_START_JOB_PHASES.has(frame.phase)) raise(runs.started, frame.generation);
+  else if (stopsStartsThrough !== undefined) raise(runs.ended, stopsStartsThrough);
+}
 
 /** How recovery probes reach a node (injected: model-api's relay attempt). */
 export type RelayAttemptStarter = (input: {
@@ -508,6 +591,12 @@ type InventoryAssembly = {
 type SessionState = {
   socket: RelaySocket;
   identity: NodeIdentity;
+  /**
+   * `node.state` frames are handled one after another, in the order the node sent them: an
+   * older report never commits after a newer one.
+   */
+  nodeStateQueue: Promise<void>;
+
   connectedAt: Date;
   lastHeartbeatAt: Date;
   nodeId: string | null;
@@ -522,15 +611,34 @@ type SessionState = {
   helloAcked: boolean;
   protocolVersion: string | null;
   nodeVersion: string | null;
+  /** Effective trust: only `syncTrust` raises it; anything may lower it (fail closed). */
   trust: NodeTrustWire;
+  /** What the node itself last reported (hello, `node.state`): Full needs it Full too. */
+  reportedTrust: NodeTrustWire;
+  /** The pending lowering a `trust.lower` was sent for (its request time), not to repeat it. */
+  trustLowerSentFor: string | null;
   features: NodeFeatures | null;
   terminalPublicKey: string | null;
   terminalIdentity: TerminalIdentity | null;
   servedHandles: Set<string>;
   inventory: InventoryAssembly | null;
+  /** Inventory snapshots completed on this session (each one's publication order). */
+  inventoryCompleted: number;
+  /** The newest completed snapshot whose answer was applied (published or refused). */
+  inventoryPublished: number;
   terminalsById: Map<string, TerminalRecord>;
   /** Interactive steps sent with an operator terminal, by step id. */
   operatorSteps: Map<string, OperatorStepTracker>;
+  /**
+   * Per `instanceId:rank`, the highest runs whose start-phase job and run-ending stop this
+   * session sent: a job they make stale is not delivered (`staleRunJob`).
+   */
+  runDeliveries: RunDeliveries;
+  /**
+   * The one retry chain of a failed `operator_running` write, by step id
+   * (`retryOperatorAcceptance`). Cancelled with the session's interactive work and by `dispose`.
+   */
+  acceptanceRetries: Map<string, OperatorAcceptanceRetry>;
   /** In-flight node file ops by op id (answers route only to the session that got the op). */
   filesById: Map<string, TrackedFileOp>;
   unauthenticatedTimer: ReturnType<typeof setTimeout>;
@@ -713,6 +821,8 @@ export class RelaySessionManager {
   private affinityResetTimer: ReturnType<typeof setInterval> | undefined;
   private affinityResetRecoveryRunning = false;
   private affinityResetClosed = false;
+  /** `dispose` ran: no acceptance retry is scheduled any more. */
+  private acceptanceRetriesClosed = false;
   private affinityResetWrites = new Set<Promise<void>>();
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByNodeId = new Map<string, SessionState>();
@@ -732,6 +842,16 @@ export class RelaySessionManager {
    * generation exists so the older one is not installed over it. Bounded (oldest evicted).
    */
   private latestGenerationByNodeId = new Map<string, number>();
+  /**
+   * Per node, a person's lowerings of its trust in this process (`requestTrustLower`), counted
+   * whether or not a session is installed: a `syncTrust` whose read a lowering overtook never
+   * raises the session's trust from that read.
+   */
+  private trustLowerings = new Map<string, number>();
+  /** Per node, the inventory snapshot being applied: they apply one after another. */
+  private inventoryTurns = new Map<string, Promise<void>>();
+  /** Per node, the `syncTrust` in progress: they run one after another. */
+  private trustSyncs = new Map<string, Promise<void>>();
   private activeRelayRequests = new Map<string, ActiveRelayRequest>();
   private frameHandlers: NodeFrameHandlers = {};
   private relayAttemptStarter: RelayAttemptStarter | null = null;
@@ -803,6 +923,7 @@ export class RelaySessionManager {
       )
     )
       return false;
+    if (frame.type === "runtime.job" && staleRunJob(session.runDeliveries, frame)) return false;
     let encoded: string;
     try {
       encoded = encodeRelayServerControlMessage(frame);
@@ -810,14 +931,19 @@ export class RelaySessionManager {
       console.error("[relay] refused to send a frame", frame.type, errorName(error));
       return false;
     }
-    if (frame.type === "runtime.job" && frame.operator)
-      return this.sendOperatorJob(session, frame, encoded);
+    if (frame.type === "runtime.job" && frame.operator) {
+      const sent = this.sendOperatorJob(session, frame, encoded);
+      if (sent) recordRunDelivery(session.runDeliveries, frame, guard.stopsStartsThrough);
+      return sent;
+    }
     try {
       session.socket.send(encoded);
-      return true;
     } catch {
       return false;
     }
+    if (frame.type === "runtime.job")
+      recordRunDelivery(session.runDeliveries, frame, guard.stopsStartsThrough);
+    return true;
   }
 
   /**
@@ -830,6 +956,8 @@ export class RelaySessionManager {
     trust: NodeTrustWire;
     operatorTerminals: boolean;
     terminalShells: readonly string[];
+    jobReservations: boolean;
+    rankIdle: boolean;
   } | null {
     const session = this.sessionsByNodeId.get(nodeId);
     if (!session?.registered || !session.helloAcked || session.connectionGeneration === null)
@@ -840,6 +968,8 @@ export class RelaySessionManager {
       trust: session.trust,
       operatorTerminals: this.operatorTerminalsAllowed(session),
       terminalShells: session.features?.terminals.shells ?? [],
+      jobReservations: session.features?.jobReservations === true,
+      rankIdle: session.features?.rankIdle === true,
     };
   }
 
@@ -904,7 +1034,7 @@ export class RelaySessionManager {
       return false;
     }
     if (repeat) return true;
-    if (evict !== null) session.operatorSteps.delete(evict.stepId);
+    if (evict !== null) this.forgetOperatorStep(session, evict);
     if (previous !== undefined) this.replaceOperatorStep(session, previous);
     session.operatorSteps.set(job.stepId, {
       stepId: job.stepId,
@@ -971,12 +1101,22 @@ export class RelaySessionManager {
   }
 
   /**
+   * The one way a step's tracker leaves the session (final, close, replacement, eviction): it
+   * also ends that terminal's acceptance retry, so finished work never keeps a timer or a map
+   * entry, and a redelivery still in flight finds its chain gone and stops.
+   */
+  private forgetOperatorStep(session: SessionState, tracker: OperatorStepTracker) {
+    if (session.operatorSteps.get(tracker.stepId) === tracker)
+      session.operatorSteps.delete(tracker.stepId);
+    this.cancelOperatorAcceptanceRetry(session, tracker.stepId, tracker.terminalId);
+  }
+
+  /**
    * A new terminal replaced this step's terminal: forget the old one, end its record and close
    * it on the node (a person's run in it, if any, is left alone there).
    */
   private replaceOperatorStep(session: SessionState, tracker: OperatorStepTracker) {
-    if (session.operatorSteps.get(tracker.stepId) === tracker)
-      session.operatorSteps.delete(tracker.stepId);
+    this.forgetOperatorStep(session, tracker);
     if (tracker.state !== "spawning" && !tracker.cancelled) this.auditOperator(tracker, "closed");
     const terminal = session.terminalsById.get(tracker.terminalId);
     if (terminal?.operator) this.closeTerminal(session, terminal, true);
@@ -1029,7 +1169,7 @@ export class RelaySessionManager {
       }
       if (result.status === "operator_running") return false;
       if (result.status === "running") return true;
-      session.operatorSteps.delete(tracker.stepId);
+      this.forgetOperatorStep(session, tracker);
       return true;
     }
     switch (result.status) {
@@ -1054,7 +1194,7 @@ export class RelaySessionManager {
         return true;
       }
       case "operator_closed": {
-        session.operatorSteps.delete(tracker.stepId);
+        this.forgetOperatorStep(session, tracker);
         if (tracker.state !== "spawning") {
           if (result.exitCode !== undefined || tracker.accepted)
             this.auditOperator(tracker, "closed", {
@@ -1068,7 +1208,7 @@ export class RelaySessionManager {
       case "running":
         return true;
       default: {
-        session.operatorSteps.delete(tracker.stepId);
+        this.forgetOperatorStep(session, tracker);
         const outcome: NodeAuditOutcome =
           result.status === "succeeded"
             ? tracker.accepted
@@ -1089,17 +1229,22 @@ export class RelaySessionManager {
    * Close the operator terminal of a step by step id, on whichever session holds it.
    * `keepRunning` leaves a terminal whose command already runs alone (answer `running`): a
    * person's run is never cut off. The node's `operator_closed` still reaches the engine.
+   * `unopened`: closed while its confirm screen was not up yet (nobody can attach before
+   * `awaiting_operator` reaches this tracker, so nothing ran); `closed`: closed after it came
+   * up (a person may have pressed Enter just before the close); `absent`: no tracker here
+   * (another process holds the session, or it is gone): nothing known.
    */
   closeOperatorStep(
     stepId: string,
     options: { keepRunning?: boolean; actor?: "USER" | "SYSTEM" } = {},
-  ): "closed" | "running" | "absent" {
+  ): OperatorCloseAnswer {
     for (const session of this.sessionsByNodeId.values()) {
       const tracker = session.operatorSteps.get(stepId);
       if (tracker === undefined || tracker.cancelled) continue;
       if (options.keepRunning === true && tracker.state === "running") return "running";
+      const unopened = tracker.state === "spawning";
       this.cancelOperatorStep(session, tracker, options.actor ?? "SYSTEM");
-      return "closed";
+      return unopened ? "unopened" : "closed";
     }
     return "absent";
   }
@@ -1139,6 +1284,8 @@ export class RelaySessionManager {
   ) {
     if (tracker.state !== "spawning") this.auditOperator(tracker, "cancelled", { actor });
     tracker.cancelled = true;
+    // A cancelled run no longer has an acceptance to deliver.
+    this.cancelOperatorAcceptanceRetry(session, tracker.stepId, tracker.terminalId);
     const terminal = session.terminalsById.get(tracker.terminalId);
     if (terminal?.operator) this.closeTerminal(session, terminal, true);
     else this.sendControl(session, { type: "term.close", terminalId: tracker.terminalId });
@@ -1173,16 +1320,106 @@ export class RelaySessionManager {
     return null;
   }
 
-  /** A person lowered the node's trust: tell its live session (the node answers `node.state`). */
-  requestTrustLower(nodeId: string, requestedAt: Date): boolean {
-    const session = this.sessionsByNodeId.get(nodeId);
-    if (session) session.trust = "relay";
-    if (session) this.reconcileTrust(session);
-    return this.sendToNode(nodeId, {
-      type: "trust.lower",
-      id: `trust-${randomBytes(8).toString("hex")}`,
-      requestedAt: requestedAt.toISOString(),
+  /**
+   * The one place a session's trust is raised, and where it follows what was decided: the node's
+   * stored trust (what it last reported, every change written under the owner's fence) and a
+   * person's pending lowering, read afresh, applied to the node's installed session of the
+   * generation that wrote them. Every trust event (a hello, `node.state`, a lowering) ends in
+   * one; they run one after another per node, so the last one applies the newest decision.
+   * Full needs the stored trust and the node's own last report Full, no lowering pending, and
+   * no lowering arrived while this one read (it then leaves Full to the next one). A pending
+   * lowering is sent to a node that still reports Full once its hello was acknowledged.
+   */
+  private syncTrust(nodeId: string, options: { raised?: boolean } = {}): Promise<void> {
+    const run = (this.trustSyncs.get(nodeId) ?? Promise.resolve())
+      .then(() => this.applyTrust(nodeId, options.raised !== false))
+      .catch((error: unknown) => console.error("[relay] trust sync failed", errorName(error)));
+    this.trustSyncs.set(nodeId, run);
+    void run.then(() => {
+      if (this.trustSyncs.get(nodeId) === run) this.trustSyncs.delete(nodeId);
     });
+    return run;
+  }
+
+  private async applyTrust(nodeId: string, notifyRaised: boolean): Promise<void> {
+    const lowerings = this.trustLowerings.get(nodeId) ?? 0;
+    const row = await readNodeTrust(nodeId);
+    const session = this.sessionsByNodeId.get(nodeId);
+    if (!session || !row || !this.isCurrent(session)) return;
+    if (session.connectionGeneration !== row.connectionGeneration) return;
+    const lowerPending = row.trustLowerRequestedAt !== null;
+    const loweredMeanwhile = (this.trustLowerings.get(nodeId) ?? 0) !== lowerings;
+    const next: NodeTrustWire =
+      row.trust === "FULL" && session.reportedTrust === "full" && !lowerPending && !loweredMeanwhile
+        ? "full"
+        : "relay";
+    const before = session.trust;
+    session.trust = next;
+    if (before !== next) {
+      this.reconcileTrust(session);
+      this.notifyTerminalListChanged(session.identity.userId);
+    }
+    const requestedAt = row.trustLowerRequestedAt?.toISOString() ?? null;
+    if (
+      requestedAt !== null &&
+      session.reportedTrust === "full" &&
+      session.helloAcked &&
+      session.trustLowerSentFor !== requestedAt
+    ) {
+      // Recorded only once written: an unsent lowering is sent again by the next sync (a
+      // heartbeat's).
+      if (
+        this.sendControl(session, {
+          type: "trust.lower",
+          id: `trust-${randomBytes(8).toString("hex")}`,
+          requestedAt,
+        })
+      )
+        session.trustLowerSentFor = requestedAt;
+    }
+    const ref = this.sessionRef(session);
+    if (notifyRaised && before !== "full" && next === "full" && ref) {
+      try {
+        await this.frameHandlers.trustRaised?.(ref);
+      } catch (error) {
+        console.error("[relay] trust raised handler failed", errorName(error));
+      }
+    }
+  }
+
+  /**
+   * No start-phase job of the rank's runs through `throughRun` is delivered to the node's live
+   * session from now on (`staleRunJob`), as after a sent stop that ends them: before a proof that
+   * sends nothing (an inventory record) may release the claim.
+   */
+  fenceRunStarts(nodeId: string, instanceId: string, rank: number, throughRun: number): void {
+    const session = this.sessionsByNodeId.get(nodeId);
+    if (!session) return;
+    recordRunDelivery(
+      session.runDeliveries,
+      { instanceId, rank, generation: throughRun, phase: "stop" },
+      throughRun,
+    );
+  }
+
+  /** The session's effective trust now (`syncTrust` sets it across awaits). */
+  private sessionTrust(session: SessionState): NodeTrustWire {
+    return session.trust;
+  }
+
+  /**
+   * A person lowered the node's trust (stored first): its live session fails closed now, and
+   * `syncTrust` sends the stored lowering to the node (once per request).
+   */
+  requestTrustLower(nodeId: string): Promise<void> {
+    // A sync that read before this lowering never raises trust after it.
+    this.trustLowerings.set(nodeId, (this.trustLowerings.get(nodeId) ?? 0) + 1);
+    const session = this.sessionsByNodeId.get(nodeId);
+    if (session) {
+      session.trust = "relay";
+      this.reconcileTrust(session);
+    }
+    return this.syncTrust(nodeId);
   }
 
   /**
@@ -1228,13 +1465,20 @@ export class RelaySessionManager {
       protocolVersion: null,
       nodeVersion: null,
       trust: "relay",
+      reportedTrust: "relay",
+      trustLowerSentFor: null,
       features: null,
       terminalPublicKey: null,
       terminalIdentity: null,
       servedHandles: new Set(),
       inventory: null,
+      inventoryCompleted: 0,
+      inventoryPublished: 0,
       terminalsById: new Map(),
       operatorSteps: new Map(),
+      runDeliveries: { started: new Map(), ended: new Map() },
+      nodeStateQueue: Promise.resolve(),
+      acceptanceRetries: new Map(),
       filesById: new Map(),
       unauthenticatedTimer,
       helloNonce,
@@ -1364,11 +1608,19 @@ export class RelaySessionManager {
           id: message.id,
           receivedAt: now.toISOString(),
         });
+        // Reconcile with what is stored: a lowering another server process committed reaches
+        // this session within a heartbeat.
+        if (session.helloAcked) void this.syncTrust(session.nodeId);
         return;
       }
-      case "node.state":
-        await this.handleNodeState(session, message, now);
+      case "node.state": {
+        const handled = session.nodeStateQueue.then(() =>
+          this.handleNodeState(session, message, now),
+        );
+        session.nodeStateQueue = handled.catch(() => undefined);
+        await handled;
         return;
+      }
       case "runtime.inventory":
         await this.handleInventoryChunk(session, message);
         return;
@@ -1429,7 +1681,15 @@ export class RelaySessionManager {
         return;
       case "runtime.job.result":
         if (!this.isCurrent(session) || !this.observeOperatorResult(session, message)) return;
-        await this.routeToHandler(session, message);
+        // A person's run the engine could not record (its write failed) is retried: the node's
+        // run goes on whatever the database says, so the acceptance must reach it.
+        if (message.status !== "operator_running") {
+          await this.routeToHandler(session, message);
+          return;
+        }
+        if (await this.routeToHandler(session, message))
+          this.cancelOperatorAcceptanceRetry(session, message.stepId, message.terminalId);
+        else this.retryOperatorAcceptance(session, message);
         return;
       case "runtime.define.result":
       case "runtime.detected":
@@ -1450,41 +1710,160 @@ export class RelaySessionManager {
   private async routeToHandler(
     session: SessionState,
     message: NodeFrame<RoutedNodeFrameType>,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const ref = this.sessionRef(session);
-    if (!ref || !this.isCurrent(session)) return;
+    if (!ref || !this.isCurrent(session)) return true;
     const handlers = this.frameHandlers;
     try {
       switch (message.type) {
         case "runtime.define.result":
-          if (handlers["runtime.define.result"])
-            return await handlers["runtime.define.result"](ref, message);
+          if (handlers["runtime.define.result"]) {
+            await handlers["runtime.define.result"](ref, message);
+            return true;
+          }
           break;
         case "runtime.detected":
-          if (handlers["runtime.detected"]) return await handlers["runtime.detected"](ref, message);
+          if (handlers["runtime.detected"]) {
+            await handlers["runtime.detected"](ref, message);
+            return true;
+          }
           break;
         case "runtime.job.result":
-          if (handlers["runtime.job.result"])
-            return await handlers["runtime.job.result"](ref, message);
+          if (handlers["runtime.job.result"]) {
+            await handlers["runtime.job.result"](ref, message);
+            return true;
+          }
           break;
         case "secret.result":
-          if (handlers["secret.result"]) return await handlers["secret.result"](ref, message);
+          if (handlers["secret.result"]) {
+            await handlers["secret.result"](ref, message);
+            return true;
+          }
           break;
         case "exec.started":
-          if (handlers["exec.started"]) return await handlers["exec.started"](ref, message);
+          if (handlers["exec.started"]) {
+            await handlers["exec.started"](ref, message);
+            return true;
+          }
           break;
         case "exec.status":
-          if (handlers["exec.status"]) return await handlers["exec.status"](ref, message);
+          if (handlers["exec.status"]) {
+            await handlers["exec.status"](ref, message);
+            return true;
+          }
           break;
         case "exec.rejected":
-          if (handlers["exec.rejected"]) return await handlers["exec.rejected"](ref, message);
+          if (handlers["exec.rejected"]) {
+            await handlers["exec.rejected"](ref, message);
+            return true;
+          }
           break;
       }
     } catch (error) {
       console.error("[relay] node frame handler failed", message.type, errorName(error));
-      return;
+      return false;
     }
     console.debug("[relay] node frame without a handler", message.type);
+    return true;
+  }
+
+  /**
+   * Delivers a failed `operator_running` again (after 1, 2, 4 ... s, `OPERATOR_ACCEPT_RETRIES`
+   * times) while this session still tracks that run: the engine records the acceptance (its
+   * deadline, its person's attention), and a repeat changes nothing. Past the retries, the
+   * engine records it the next time it asks about the step (`closeOperatorStep` answers
+   * `running`). Nothing is ever cut off or replayed on the node.
+   *
+   * One chain per step: a repeated failed `operator_running` for a step that already has one
+   * joins it (no new timer); one for another terminal of that step replaces it. A delivered
+   * repeat ends it, and so does the end of its run here: a final, a close, a replacement or a
+   * cancel (`forgetOperatorStep`, `cancelOperatorStep`). Teardown of the session's interactive
+   * work and `dispose` cancel every chain.
+   */
+  private retryOperatorAcceptance(
+    session: SessionState,
+    message: NodeFrame<"runtime.job.result">,
+  ): void {
+    const terminalId = message.terminalId;
+    if (terminalId === undefined || this.acceptanceRetriesClosed || !this.isCurrent(session))
+      return;
+    // An initial delivery that failed after its run ended (final, close, replacement) starts
+    // nothing: only a run this session still tracks has an acceptance to retry.
+    if (!this.operatorRunTracked(session, message.stepId, terminalId)) return;
+    const existing = session.acceptanceRetries.get(message.stepId);
+    if (existing !== undefined) {
+      if (existing.terminalId === terminalId) return;
+      this.cancelOperatorAcceptanceRetry(session, message.stepId);
+    }
+    const chain: OperatorAcceptanceRetry = { terminalId, attempt: 0, timer: null };
+    session.acceptanceRetries.set(message.stepId, chain);
+    this.scheduleOperatorAcceptance(session, message, chain);
+  }
+
+  private scheduleOperatorAcceptance(
+    session: SessionState,
+    message: NodeFrame<"runtime.job.result">,
+    chain: OperatorAcceptanceRetry,
+  ): void {
+    const owned = () =>
+      !this.acceptanceRetriesClosed &&
+      session.acceptanceRetries.get(message.stepId) === chain &&
+      this.isCurrent(session);
+    if (!owned()) return;
+    if (chain.attempt >= OPERATOR_ACCEPT_RETRIES) {
+      session.acceptanceRetries.delete(message.stepId);
+      console.error("[relay] operator acceptance not recorded after retries");
+      return;
+    }
+    chain.timer = setTimeout(
+      () => {
+        chain.timer = null;
+        if (!owned()) return;
+        if (!this.operatorRunTracked(session, message.stepId, chain.terminalId)) {
+          session.acceptanceRetries.delete(message.stepId);
+          return;
+        }
+        void this.routeToHandler(session, message).then((delivered) => {
+          if (!owned()) return;
+          if (delivered) {
+            session.acceptanceRetries.delete(message.stepId);
+            return;
+          }
+          chain.attempt += 1;
+          this.scheduleOperatorAcceptance(session, message, chain);
+        });
+      },
+      OPERATOR_ACCEPT_RETRY_MS * 2 ** chain.attempt,
+    );
+    chain.timer.unref?.();
+  }
+
+  /** Whether this session still tracks a live, accepted run of that step in that terminal. */
+  private operatorRunTracked(session: SessionState, stepId: string, terminalId: string): boolean {
+    const tracker = session.operatorSteps.get(stepId);
+    return (
+      tracker !== undefined &&
+      !tracker.cancelled &&
+      tracker.state === "running" &&
+      tracker.terminalId === terminalId
+    );
+  }
+
+  /** Ends a step's acceptance retry chain (all of the session's chains without a step id). */
+  private cancelOperatorAcceptanceRetry(
+    session: SessionState,
+    stepId?: string,
+    terminalId?: string,
+  ): void {
+    const ids = stepId === undefined ? [...session.acceptanceRetries.keys()] : [stepId];
+    for (const id of ids) {
+      const chain = session.acceptanceRetries.get(id);
+      if (chain === undefined || (terminalId !== undefined && chain.terminalId !== terminalId))
+        continue;
+      if (chain.timer !== null) clearTimeout(chain.timer);
+      chain.timer = null;
+      session.acceptanceRetries.delete(id);
+    }
   }
 
   private async handleHello(session: SessionState, message: NodeFrame<"hello">, now: Date) {
@@ -1575,7 +1954,10 @@ export class RelaySessionManager {
     session.registered = true;
     session.protocolVersion = message.protocolVersion;
     session.nodeVersion = message.node.version ?? null;
-    session.trust = registration.effectiveTrust;
+    // Relay until `syncTrust` reads what is stored (the registration's snapshot may be stale by
+    // then: a person may have lowered trust meanwhile).
+    session.trust = "relay";
+    session.reportedTrust = message.trust.value;
     session.features = message.features;
     session.terminalPublicKey = message.node.terminalPublicKey;
     session.terminalIdentity = message.node.terminalIdentity ?? null;
@@ -1594,11 +1976,13 @@ export class RelaySessionManager {
     );
     this.targetRecovery.wake();
     this.startAffinityObserverMaintenance();
+    // The node's trust as decided (its ready handlers run below, not the raised one).
+    await this.syncTrust(registration.nodeId, { raised: false });
 
     const ref = this.sessionRef(session);
     if (!ref || !this.isCurrent(session)) return;
     let definitionSync: "expect" | "none" = "none";
-    if (session.trust === "full" && this.frameHandlers.definitionSync) {
+    if (this.sessionTrust(session) === "full" && this.frameHandlers.definitionSync) {
       try {
         definitionSync = await this.frameHandlers.definitionSync(ref);
       } catch (error) {
@@ -1614,13 +1998,9 @@ export class RelaySessionManager {
       definitionSync,
     });
     session.helloAcked = true;
-    if (registration.trustLowerPending) {
-      this.sendControl(session, {
-        type: "trust.lower",
-        id: `trust-${randomBytes(8).toString("hex")}`,
-        requestedAt: (registration.trustLowerRequestedAt ?? now).toISOString(),
-      });
-    }
+    // Again now it is acknowledged: a lowering pending (or one that came during the awaits
+    // above, when nothing but hello could be sent) goes to the node.
+    await this.syncTrust(registration.nodeId, { raised: false });
     await this.seedCounterEpochs(registration.nodeId, session.identity.userId);
     if (!this.isCurrent(session)) return;
     try {
@@ -1638,33 +2018,28 @@ export class RelaySessionManager {
   ) {
     const nodeId = session.nodeId;
     if (!nodeId) return;
-    let result: { trustLowerPending: boolean } | null = null;
+    let written = false;
     try {
-      result = await writeNodeState({
+      written = !!(await writeNodeState({
         nodeId,
         generation: session.connectionGeneration,
         trust: message.trust.value,
         features: message.features,
         now,
-      });
+      }));
     } catch (error) {
       console.error("[relay] node state write failed", errorName(error));
     }
     if (!this.isCurrent(session)) return;
     session.features = message.features;
-    const before = session.trust;
-    // Fail closed: an unconfirmed lowering (or an unknown stored state) keeps the node Relay.
-    session.trust = result && !result.trustLowerPending ? message.trust.value : "relay";
-    this.reconcileTrust(session);
-    this.notifyTerminalListChanged(session.identity.userId);
-    const ref = this.sessionRef(session);
-    if (before !== "full" && session.trust === "full" && ref) {
-      try {
-        await this.frameHandlers.trustRaised?.(ref);
-      } catch (error) {
-        console.error("[relay] trust raised handler failed", errorName(error));
-      }
+    // Fail closed: what was not written (or not for this connection) raises nothing.
+    session.reportedTrust = written ? message.trust.value : "relay";
+    if (!written && session.trust !== "relay") {
+      session.trust = "relay";
+      this.reconcileTrust(session);
+      this.notifyTerminalListChanged(session.identity.userId);
     }
+    await this.syncTrust(nodeId);
   }
 
   /** Ends whatever the node's current trust and features no longer allow. */
@@ -1751,7 +2126,36 @@ export class RelaySessionManager {
     };
     const ref = this.sessionRef(session);
     if (!ref) return;
-    let answer: { ok: true } | { ok: false; message: string } = { ok: true };
+    // One snapshot at a time per node, in the order they completed, across reconnects too:
+    // what the newest report says is decided last, so an older one never acts after it (it
+    // could remove a runtime the newer one restored). One whose session was replaced while it
+    // waited is dropped: the new session's snapshots decide.
+    const sequence = ++session.inventoryCompleted;
+    const nodeId = ref.nodeId;
+    const before = this.inventoryTurns.get(nodeId) ?? Promise.resolve();
+    let done = () => {};
+    const turn = before.then(() => new Promise<void>((resolve) => (done = resolve)));
+    this.inventoryTurns.set(nodeId, turn);
+    try {
+      await before;
+      if (!this.isCurrent(session)) return;
+      await this.applyInventorySnapshot(session, ref, snapshot, sequence);
+    } finally {
+      done();
+      if (this.inventoryTurns.get(nodeId) === turn) this.inventoryTurns.delete(nodeId);
+    }
+  }
+
+  /** One complete inventory snapshot, its turn come (`inventoryTurns`). */
+  private async applyInventorySnapshot(
+    session: SessionState,
+    ref: NodeSessionRef,
+    snapshot: RuntimeInventorySnapshot,
+    sequence: number,
+  ): Promise<void> {
+    let answer: { ok: true; stale?: readonly string[] } | { ok: false; message: string } = {
+      ok: true,
+    };
     if (this.frameHandlers.runtimeInventory) {
       try {
         answer = await this.frameHandlers.runtimeInventory(ref, snapshot);
@@ -1762,6 +2166,8 @@ export class RelaySessionManager {
     }
     if (!this.isCurrent(session)) return;
     if (!answer.ok) {
+      // Refused: what the session serves stays, and no older snapshot replaces it either.
+      session.inventoryPublished = Math.max(session.inventoryPublished, sequence);
       this.sendControl(session, {
         type: "runtime.inventory.error",
         snapshotId: snapshot.snapshotId,
@@ -1769,8 +2175,23 @@ export class RelaySessionManager {
       });
       return;
     }
+    if (sequence <= session.inventoryPublished) {
+      // A newer snapshot was published meanwhile: this one is stored, and changes nothing here.
+      this.sendControl(session, { type: "runtime.inventory.ok", snapshotId: snapshot.snapshotId });
+      return;
+    }
+    session.inventoryPublished = sequence;
     const nodeId = ref.nodeId;
-    session.servedHandles = servedHandlesOf(snapshot);
+    // A stale record (an earlier run's, or one from before the current launch) changes nothing:
+    // its handle stays served exactly as before.
+    const stale = new Set(answer.stale ?? []);
+    const previous = session.servedHandles;
+    const served = servedHandlesOf(snapshot);
+    for (const handle of stale) {
+      if (previous.has(handle)) served.add(handle);
+      else served.delete(handle);
+    }
+    session.servedHandles = served;
     this.forgetInstancesOfNode(nodeId);
     this.pruneCounterEpochs(nodeId, session.servedHandles);
     for (const key of [...session.runtimeLoad.keys()]) {
@@ -1827,7 +2248,9 @@ export class RelaySessionManager {
   dispose() {
     this.stopAffinityResetRecovery();
     this.targetRecovery.stop();
+    this.acceptanceRetriesClosed = true;
     for (const session of this.sessionsBySocket.values()) {
+      this.cancelOperatorAcceptanceRetry(session);
       if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
       if (session.inventory) clearTimeout(session.inventory.timer);
       clearTimeout(session.unauthenticatedTimer);
@@ -3309,16 +3732,20 @@ export class RelaySessionManager {
     );
   }
 
-  private sendControl(session: SessionState, message: ServerToNodeControlFrame) {
-    if (session.socket.readyState !== WS_READY_STATE_OPEN) return;
+  /** Sends a control frame; whether it was written to an open socket. */
+  private sendControl(session: SessionState, message: ServerToNodeControlFrame): boolean {
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
     try {
       session.socket.send(encodeRelayServerControlMessage(message));
+      return true;
     } catch (error) {
       console.error("[relay] control frame not sent", message.type, errorName(error));
+      return false;
     }
   }
 
   private teardownInteractiveWork(session: SessionState) {
+    this.cancelOperatorAcceptanceRetry(session);
     this.closeAllTerminals(session, true);
     for (const op of [...session.filesById.values()]) {
       this.sendControl(session, { type: "file.cancel", opId: op.opId });

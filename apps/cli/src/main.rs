@@ -83,6 +83,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Completions(args) => commands::completions::run(args),
         Command::Terminal(args) => commands::terminal::run(args),
         Command::Recover(args) => commands::recover::run(args),
+        Command::LaunchGuard(args) => commands::launch_guard::run(args),
         #[cfg(windows)]
         Command::ConptyHost(args) => commands::conpty_host::run(args),
     }

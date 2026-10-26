@@ -66,6 +66,7 @@
         "prisma/schema-hardening.sql",
         "../../scripts/docker-entrypoint.sh",
         "../../scripts/test-docker-entrypoint-schema.sh",
+        "scripts/test-entrypoint-schema.mjs",
         "scripts/verify-schema-hardening.mjs",
         "prisma.config.ts"
       ]

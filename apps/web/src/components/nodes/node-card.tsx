@@ -41,6 +41,13 @@ export function NodeCard({ node, lang }: { node: NodeSummary; lang: string }) {
           </dd>
           <dt className="text-muted-foreground">{t("dashboard:nodes.card.freeMemory")}</dt>
           <dd>{free ?? t("dashboard:nodes.card.unknown")}</dd>
+          <dt className="text-muted-foreground">{t("dashboard:nodes.card.reserved")}</dt>
+          <dd>
+            {t("dashboard:nodes.card.reservedValue", {
+              held: formatGb(node.reservedNowMemoryGb, lang),
+              usable: formatGb(node.usableMemoryGb, lang),
+            })}
+          </dd>
           <dt className="text-muted-foreground">{t("dashboard:nodes.card.running")}</dt>
           <dd>
             {t("dashboard:nodes.card.runningValue", {

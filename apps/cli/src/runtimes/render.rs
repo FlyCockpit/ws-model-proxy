@@ -76,21 +76,6 @@ fn fraction(value: &str) -> bool {
                 .is_some_and(|f| f.bytes().all(|b| b == b'0')))
 }
 
-/// A comma list of GPU indices (0–255), unique, at most 64.
-fn gpu_ids(value: &str) -> bool {
-    let parts: Vec<&str> = value.split(',').collect();
-    let mut seen = std::collections::BTreeSet::new();
-    !value.is_empty()
-        && parts.len() <= 64
-        && parts.iter().all(|part| {
-            (part == &"0" || (!part.starts_with('0') && !part.is_empty()))
-                && part.len() <= 3
-                && part.bytes().all(|b| b.is_ascii_digit())
-                && part.parse::<u16>().is_ok_and(|n| n <= 255)
-                && seen.insert(*part)
-        })
-}
-
 fn phase_command(commands: &Commands, phase: JobPhase) -> Option<&str> {
     match phase {
         JobPhase::Prepare => commands.prepare.as_deref(),
@@ -237,6 +222,7 @@ pub fn render(
         gpu_ids: job.placeholders.gpu_ids.clone(),
         host,
         spec: held.spec.clone(),
+        reservations: job.reservations.clone(),
     })
 }
 
@@ -316,7 +302,7 @@ fn typed_values(
         values.insert("dist_port", dist.to_string());
     }
     if let Some(ids) = &p.gpu_ids {
-        if !gpu_ids(ids) {
+        if !crate::protocol::frames::is_gpu_ids(ids) {
             return Err(refuse(JobError::BadJob, "placeholders.gpu_ids"));
         }
         values.insert("gpu_ids", ids.clone());

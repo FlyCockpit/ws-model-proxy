@@ -107,10 +107,15 @@ const REQUIRED_OBJECTS = [
   "claim_release_request_shape",
   "claim_release_request_transition",
   "instance_rank_node_owner",
+  "instance_reservation_node_owner",
+  "instance_reservation_current_index",
   "instance_step_node_owner",
+  "instance_run_order",
+  "instance_step_run_order",
   "instance_step_shape",
   "instance_step_operator_shape",
   "instance_step_operator_hold",
+  "instance_step_may_have_run",
   "execution_target_kind_source_xor_check",
   "execution_target_identity_immutable",
   // profiles
@@ -373,9 +378,9 @@ try {
       ('inst-a', 'owner-a', 'rt-a', 'v-a1', 'v-a1', 'llama', 'USER', 'READY');
     -- a two-node startable instance: head on node-a2, worker on node-a3
     INSERT INTO runtime_instance (id, "userId", "runtimeId", "versionId", "launchVersionId", handle,
-      "startedBy", "desiredState", phase) VALUES
-      ('inst-m', 'owner-a', 'rt-s', 'v-s2', 'v-s1', 'i-aaaaaaaaaaaa', 'USER', 'RUNNING', 'READY'),
-      ('inst-w', 'owner-a', 'rt-s', 'v-s1', 'v-s1', 'i-bbbbbbbbbbbb', 'USER', 'RUNNING', 'READY');
+      "startedBy", "desiredState", phase, "runGeneration") VALUES
+      ('inst-m', 'owner-a', 'rt-s', 'v-s2', 'v-s1', 'i-aaaaaaaaaaaa', 'USER', 'RUNNING', 'READY', 1),
+      ('inst-w', 'owner-a', 'rt-s', 'v-s1', 'v-s1', 'i-bbbbbbbbbbbb', 'USER', 'RUNNING', 'READY', 1);
     INSERT INTO instance_rank (id, "instanceId", "nodeId", "unitName", rank, resources, port) VALUES
       ('rank-m0', 'inst-m', 'node-a2', 'wsmp-i-aaaaaaaaaaaa-r0', 0, '{}', 30001),
       ('rank-m1', 'inst-m', 'node-a3', 'wsmp-i-aaaaaaaaaaaa-r1', 1, '{}', 30001),
@@ -434,6 +439,27 @@ try {
     `UPDATE instance_step SET "nodeId" = 'node-b1' WHERE id = 'step-m1'`,
     "23514",
     /an instance runs only on nodes of its owner/,
+  );
+  // Runs: a new step belongs to its instance's current run; a run never goes back; a step keeps
+  // its generation.
+  await expectFailure(
+    "instance_step_run_order insert",
+    `INSERT INTO instance_step (id, "instanceId", "nodeId", rank, phase, sequence, generation, intent,
+      "intentHash") VALUES ('step-r', 'inst-m', 'node-a2', 0, 'START', 220, 2, '{}', ${HEX("d")})`,
+    "23514",
+    /a new step belongs to its instance's current run/,
+  );
+  await expectFailure(
+    "instance_run_order decrease",
+    `UPDATE runtime_instance SET "runGeneration" = 0 WHERE id = 'inst-m'`,
+    "23514",
+    /an instance run never goes back/,
+  );
+  await expectFailure(
+    "instance_step_run_order generation",
+    `UPDATE instance_step SET generation = 2 WHERE id = 'step-m1'`,
+    "23514",
+    /a step keeps its generation/,
   );
   await client.query(`
     INSERT INTO runtime_operation (id, "userId", kind, actor, "actorUserId", summary, fingerprint)
@@ -877,6 +903,44 @@ try {
     "instance_rank_claim_shape",
     `UPDATE instance_rank SET claim = 'HELD_UNKNOWN' WHERE id = 'rank-w0'`,
     "23514",
+  );
+  await expectFailure(
+    "instance_rank_bounds a replaced run's claim without all of its parts",
+    `UPDATE instance_rank SET "prevPort" = 30005 WHERE id = 'rank-w0'`,
+    "23514",
+  );
+  await expectFailure(
+    "instance_rank_bounds a replaced run's port out of range",
+    `UPDATE instance_rank SET "prevResources" = '{}', "prevPort" = 80, "prevGeneration" = 0
+      WHERE id = 'rank-w0'`,
+    "23514",
+  );
+  await expectFailure(
+    "instance_rank_bounds a negative stopped-through run",
+    `UPDATE instance_rank SET "stoppedThroughRun" = -1 WHERE id = 'rank-w0'`,
+    "23514",
+  );
+  await expectFailure(
+    "instance_step_shape head address",
+    `UPDATE instance_step SET "headAddr" = '' WHERE id = 'step-m1'`,
+    "23514",
+  );
+  await expectFailure(
+    "instance_step_shape may have run without an attempt",
+    `UPDATE instance_step SET "mayHaveRun" = true WHERE id = 'step-m1'`,
+    "23514",
+  );
+  // A counted dispatch may have run; then it stays so.
+  await client.query(`
+    INSERT INTO instance_step (id, "instanceId", "nodeId", rank, phase, sequence, generation, intent,
+      "intentHash", state, attempts, "mayHaveRun", "errorCode") VALUES
+      ('step-w0', 'inst-w', 'node-a3', 0, 'START', 120, 1, '{}', ${HEX("c")}, 'FAILED', 2, true,
+       'bad_job')`);
+  await expectFailure(
+    "instance_step_may_have_run cleared",
+    `UPDATE instance_step SET "mayHaveRun" = false WHERE id = 'step-w0'`,
+    "55000",
+    /a step that may have run stays so/,
   );
   await expectFailure(
     "instance_rank_claim_shape released without proof on a held claim",

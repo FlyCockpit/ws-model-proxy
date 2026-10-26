@@ -60,12 +60,15 @@ const rank = (nodeNumber: number, overrides: Record<string, unknown> = {}) => ({
   nodeId: `node-${nodeNumber}`,
   nodeSlug: nodeNumber === 1 ? "box" : "spark",
   port: 30000 + nodeNumber,
+  distPort: null,
+  gpus: [],
   reserved: "HELD_UNKNOWN",
   unitName: "u",
   nodeConnection: { state: "ONLINE", since: "2026-10-07T08:00:00.000Z" },
   lastStopCheck: { at: "2026-10-07T10:05:00.000Z", proven: false, errorCode: "status_running" },
   releasedUnproven: null,
   releaseRequestId: null,
+  previousClaim: null,
   ...overrides,
 });
 
@@ -83,6 +86,33 @@ const RUNTIME = {
           releaseRequestId: "req-1",
         }),
       ],
+      reservations: [],
+      supersededReservations: [],
+    },
+    {
+      // A single-node instance a restart moved: its old worker and old port still hold.
+      id: "inst-2",
+      phase: "STOPPED",
+      needsOperator: null,
+      ranks: [
+        rank(1, {
+          gpus: ["nvidia:1"],
+          previousClaim: { port: 30009, distPort: 31009, memoryGb: 64, gpus: ["nvidia:0"] },
+        }),
+      ],
+      reservations: [
+        { index: 0, nodeId: "w-new", nodeSlug: "w-new", labels: [], memoryGb: 20, gpus: [] },
+      ].map((row) => ({ ...row, reserved: "HELD_UNKNOWN", nodeConnection: null })),
+      supersededReservations: [
+        {
+          index: 0,
+          nodeId: "w-old",
+          nodeSlug: "w-old",
+          labels: [],
+          memoryGb: 100,
+          gpus: ["amd:0"],
+        },
+      ].map((row) => ({ ...row, reserved: "HELD_UNKNOWN", nodeConnection: null })),
     },
   ],
 };
@@ -211,6 +241,34 @@ describe("ReleaseUnprovenAction", () => {
         ["activity", "needsYou"],
       ]),
     );
+  });
+
+  it("lists everything the release frees: the replaced run's port and workers too", async () => {
+    mount(<ReleaseUnprovenAction runtimeId="rt-1" instanceId="inst-2" nodeNumber={1} />);
+    fireEvent.click(screen.getByRole("button", { name: ACTION }));
+    const dialog = screen.getByRole("dialog", { name: "dashboard:runtime.releaseUnproven.title" });
+    expect(
+      await within(dialog).findByText("dashboard:runtime.releaseUnproven.alsoFreed"),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText("dashboard:runtime.heldFootprint.previousClaim:30009|64 GB|box"),
+    ).toBeTruthy();
+    // The dist port and GPUs too: the replaced run's, the current claim's and the old worker's.
+    expect(
+      within(dialog).getByText(
+        "dashboard:runtime.heldFootprint.distPort:31009 · dashboard:runtime.heldFootprint.gpus:nvidia:0",
+      ),
+    ).toBeTruthy();
+    expect(within(dialog).getByText("dashboard:runtime.heldFootprint.gpus:nvidia:1")).toBeTruthy();
+    expect(within(dialog).getByText("dashboard:runtime.heldFootprint.gpus:amd:0")).toBeTruthy();
+    expect(
+      within(dialog).getByText("dashboard:runtime.heldFootprint.reservation:20 GB|w-new"),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        "dashboard:runtime.heldFootprint.supersededReservation:100 GB|w-old",
+      ),
+    ).toBeTruthy();
   });
 
   it("names an offline node as the reason", async () => {

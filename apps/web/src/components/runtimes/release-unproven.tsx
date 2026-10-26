@@ -8,6 +8,7 @@ import { useTranslation } from "react-i18next";
 
 import { ConfirmAction } from "@/components/access/confirm-action";
 import { InlineRetry } from "@/components/inline-retry";
+import { ClaimDetails, HeldFootprint } from "@/components/runtimes/held-footprint";
 import { StatusPill } from "@/components/status-pill";
 import { TimeAgo } from "@/components/time-ago";
 import { refusalText } from "@/lib/refusal-text";
@@ -169,10 +170,9 @@ function ReleaseEvidence({
         <Skeleton className="h-4 w-2/3" />
       </div>
     );
-  const rank = runtime.data?.instanceList
-    .find((row) => row.id === instanceId)
-    ?.ranks.find((row) => row.nodeNumber === nodeNumber);
-  if (!rank)
+  const instance = runtime.data?.instanceList.find((row) => row.id === instanceId);
+  const rank = instance?.ranks.find((row) => row.nodeNumber === nodeNumber);
+  if (!instance || !rank)
     return (
       <InlineRetry
         message={t("dashboard:runtime.markStopped.evidence.loadFailed")}
@@ -180,6 +180,10 @@ function ReleaseEvidence({
       />
     );
   const reason = stopUnprovenReason(rank);
+  // Reservations hold while any part of the instance holds its claim.
+  const otherPartHolds = instance.ranks.some(
+    (row) => row.nodeNumber !== nodeNumber && row.reserved !== "RELEASED",
+  );
   return (
     <section className="flex min-w-0 flex-col gap-2 rounded-lg border p-3 text-sm">
       <h3 className="font-medium">{t("dashboard:runtime.markStopped.evidence.title")}</h3>
@@ -190,6 +194,7 @@ function ReleaseEvidence({
             node: rank.nodeSlug ?? t("dashboard:runtime.nodeGone"),
             port: rank.port,
           })}
+          <ClaimDetails distPort={rank.distPort} gpus={rank.gpus} />
         </dd>
         <dt className="text-muted-foreground">
           {t("dashboard:runtime.releaseUnproven.reasonLabel")}
@@ -207,6 +212,14 @@ function ReleaseEvidence({
           ) : null}
         </dd>
       </dl>
+      {/* What the release frees with this part's claim: its replaced run's claim, and the
+          instance's reservations (current and a replaced run's) once no other part holds. */}
+      <HeldFootprint
+        instance={instance}
+        nodeNumber={nodeNumber}
+        heading={t("dashboard:runtime.releaseUnproven.alsoFreed")}
+        withReservations={!otherPartHolds}
+      />
     </section>
   );
 }

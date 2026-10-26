@@ -216,6 +216,8 @@
     "card": {
       "hardware": "Hardware",
       "freeMemory": "Memoria libre",
+      "reserved": "Ocupada por runtimes",
+      "reservedValue": "{{held}} de {{usable}}",
       "running": "En ejecución",
       "runningValue": "{{instances}} iniciados, {{alwaysOn}} siempre activos",
       "lastSeen": "Visto por última vez",
@@ -475,6 +477,7 @@
       "empty": "Nada iniciado aquí.",
       "part_one": "parte {{number}} de {{count}}",
       "part_other": "parte {{number}} de {{count}}",
+      "reservation": "ocupa memoria aquí, se ejecuta en otro nodo",
       "needsYou": "Te necesita",
       "held": "Definiciones en el nodo",
       "heldEmpty": "Ninguna.",
@@ -597,7 +600,8 @@
         "preempted": "libera espacio",
         "profile_owned_node": "no está en este perfil"
       },
-      "startVersion": "versión {{version}}"
+      "startVersion": "versión {{version}}",
+      "reservation": "{{node}} (memoria ocupada, ahí no se ejecuta nada)"
     },
     "editor": {
       "back": "Todos los perfiles",
@@ -669,6 +673,9 @@
     "name_aliased": "Uno de tus alias de nombre de modelo ya usa ese ID invocable. Elimina el alias o elige otro nombre.",
     "always_on_runtime": "Un runtime siempre activo se ejecuta por su cuenta; no hay nada que iniciar.",
     "fabric_port_ranges_disjoint": "Los rangos de puertos de estos nodos no comparten ningún puerto; haz que se superpongan.",
+    "placement_too_complex": "Ubicar esto requirió demasiado trabajo. Fija los nodos o inicia menos a la vez.",
+    "restart_overlap_no_room": "La instancia en ejecución conserva su memoria hasta que se confirme que se detuvo, y no hay espacio para el reinicio junto a ella. Detenla primero y luego iníciala.",
+    "definition_slots_full": "Este nodo ya necesita el máximo de definiciones que puede tener (128). Detén algo ahí primero.",
     "identity_mismatch": "El nodo presentó una clave de identidad distinta."
   },
   "models": {
@@ -1419,6 +1426,7 @@
       "status_not_running": "el comando de estado no dijo que corre"
     },
     "processDetached": "El comando de inicio entregó su servidor a otro proceso (por ejemplo `docker compose up -d`), así que el nodo no puede vigilarlo ni detenerlo. Usa management \"service\" con comandos de stop y status, y detén a mano lo que siga corriendo.",
+    "cliUpgradeRequired": "El wsmp del nodo de este runtime es demasiado antiguo para ejecutarlo. Actualiza wsmp en el nodo y reinícialo; luego vuelve a iniciar el runtime.",
     "needsOperator": {
       "STEP": "Un paso te espera",
       "RESTART": "Requiere reinicio",
@@ -1427,7 +1435,7 @@
     "markStopped": {
       "action": "Marcar como detenida…",
       "title": "¿Marcar como detenida?",
-      "description": "wsmp no pudo confirmar que este proceso se detuvo. Al marcar la instancia como detenida, wsmp deja de esperarla; no se ejecuta nada en el nodo para hacerlo. Su puerto, su memoria y sus GPU siguen reservados hasta que wsmp confirme que el proceso ya no existe o la instancia vuelva a iniciar (wsmp reinicia una instancia que debe seguir en ejecución). Hazlo solo si verificaste en el nodo que el proceso terminó.",
+      "description": "wsmp no pudo confirmar que este proceso se detuvo. Al marcar la instancia como detenida, wsmp deja de esperarla; no se ejecuta nada en el nodo para hacerlo. Su puerto, su memoria y sus GPU siguen reservados (los inicios que esperan ese espacio siguen esperando) hasta que wsmp confirme que el proceso ya no existe o la instancia vuelva a iniciar (wsmp reinicia una instancia que debe seguir en ejecución). Hazlo solo si verificaste en el nodo que el proceso terminó.",
       "confirm": "Marcar como detenida",
       "pending": "Marcando…",
       "done": "Marcada como detenida.",
@@ -1457,8 +1465,13 @@
           "port_in_use": "El puerto sigue en uso",
           "port_held_outside_runtime": "El puerto sigue en uso, aunque ya no queda nada en las unidades del servicio: por lo general, algo que inició (un contenedor o un daemon) se ejecuta fuera de ellas",
           "unowned_service": "El servicio se ejecuta fuera del control del nodo y no tiene comando de estado",
-          "not_stopped": "El nodo no pudo confirmarlo (actualiza el nodo si esto continúa)"
-        }
+          "not_stopped": "El nodo no pudo confirmarlo (actualiza el nodo si esto continúa)",
+          "launch_pending": "El nodo indicó que se detuvo, pero un inicio que se le envió antes seguía esperando allí. wsmp vuelve a revisar.",
+          "cli_upgrade_required": "El wsmp de este nodo es demasiado antiguo para comprobar una detención. Actualiza wsmp en el nodo."
+        },
+        "alsoHeld": "También reservado hasta que se confirme la detención o lo liberes",
+        "holds": "Reserva",
+        "port": "Puerto {{port}}"
       },
       "held": {
         "pill": "Recursos reservados hasta confirmar la detención",
@@ -1477,6 +1490,14 @@
     "previewFirst": "Genera la vista previa para ver la ubicación.",
     "confirmStart": "Confirmar",
     "placement": "Nodo {{number}}: {{node}}, puerto {{port}}",
+    "reservationPlacement": "Ocupa {{memory}} en {{node}} (reserva {{number}}, ahí no se ejecuta nada)",
+    "reservationHeld": "Ocupa {{memory}} en {{node}}",
+    "reservationUnconfirmed": "Ocupa {{memory}} en {{node}} hasta que se confirme que se detuvo",
+    "reservationIdle": "Reserva {{memory}} en {{node}} mientras se ejecuta (ahora no ocupa nada)",
+    "reservationRefusal": "Reserva {{number}} (etiquetas {{labels}}): {{reason}}",
+    "reservationRefusalNode": "Reserva {{number}} (etiquetas {{labels}}), {{node}}: {{reason}}",
+    "waitingToRestart": "Esperando para reiniciarse: {{reason}} Lo vuelve a intentar cada 30 segundos.",
+    "waitingToRestartNeutral": "Esperando para reiniciarse hasta que se pueda ubicar de nuevo. Lo vuelve a intentar cada 30 segundos.",
     "startRequested": "Inicio solicitado.",
     "warnings": {
       "low_free_memory": "Poca memoria libre en el nodo.",
@@ -1535,6 +1556,9 @@
       "invite_needs_link": "Esta invitación necesita su enlace para aceptarse.",
       "always_on_runtime": "Los runtimes siempre activos se ejecutan por su cuenta; no hay nada que iniciar.",
       "fabric_port_ranges_disjoint": "Los rangos de puertos de los nodos no comparten ningún puerto para el puerto dist.",
+      "placement_too_complex": "Ubicar este inicio requirió demasiado trabajo (muchos nodos, reservas o detenciones por probar). Fija los nodos o inicia menos a la vez.",
+      "restart_overlap_no_room": "La instancia en ejecución conserva su memoria, GPU y puertos hasta que se confirme que se detuvo, y el nodo no tiene espacio para el reinicio junto a ellos. Detenla primero e iníciala cuando se confirme la detención, libera espacio en el nodo o reinicia con recursos que quepan.",
+      "definition_slots_full": "El nodo ya necesita 128 definiciones para lo que corre o se está deteniendo ahí. Detén una instancia en él o espera a que terminen los reinicios.",
       "cap_currency_has_spend": "La moneda del tope debe ser la que este compartido ya gastó este mes.",
       "already_shared": "Este pool ya está compartido con esta persona. Cambia el compartido existente.",
       "invite_pending": "Este correo ya tiene una invitación pendiente. Reenvíala en su lugar.",
@@ -1778,7 +1802,7 @@
       "view": "Vista de la definición",
       "formTab": "Formulario",
       "jsonTab": "JSON",
-      "fixJsonFirst": "Corrige el JSON antes de volver al formulario.",
+      "fixJsonFirst": "Corrige el JSON antes de volver al formulario. El formulario solo muestra una definición completa que puede conservar tal como está escrita (sin campos desconocidos).",
       "servesLabel": "Qué ejecuta",
       "serves": "Sirve modelos",
       "service": "Servicio (sin modelos)",
@@ -1832,6 +1856,12 @@
       "fabricHint": "Opcional: la red que deben compartir todos los nodos de una instancia.",
       "resources": "Recursos",
       "resourcesHint": "Lo que cada parte reserva en su nodo mientras se ejecuta.",
+      "reservations": "Reservas en otros nodos",
+      "reservationsHint": "Solo runtimes de un nodo. Memoria que este runtime ocupa en otros nodos mientras se ejecuta, cuando su lanzador inicia trabajo ahí por su cuenta (por ejemplo por SSH). Cada reserva va a su propio nodo con todas sus etiquetas; wsmp no inicia nada ahí.",
+      "reservation": "Reserva {{number}}",
+      "reservationLabelsHint": "El nodo donde ocupa memoria tiene todas estas etiquetas.",
+      "addReservation": "Agregar una reserva",
+      "removeReservation": "Quitar la reserva {{number}}",
       "resourceKind": "Tipo",
       "resourceKinds": {
         "discrete": "GPU",
@@ -2038,7 +2068,15 @@
         "untrustedNamed": "Escrito por el agente {{agent}}. wsmp no verificó nada de esto.",
         "command": "Comando que ejecutó",
         "loadFailed": "No se pudo cargar la solicitud del agente. Quizá se retiró o expiró."
-      }
+      },
+      "alsoFreed": "Liberar también libera"
+    },
+    "heldFootprint": {
+      "previousClaim": "Puerto {{port}} y {{memory}} en {{node}}, reservados para la ejecución que reemplazó un reinicio",
+      "reservation": "{{memory}} en {{node}}",
+      "supersededReservation": "{{memory}} en {{node}}, reservados para la ejecución que reemplazó un reinicio",
+      "distPort": "puerto dist {{port}}",
+      "gpus": "GPU {{gpus}}"
     }
   },
   "overview": {

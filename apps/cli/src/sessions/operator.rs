@@ -433,13 +433,18 @@ impl TerminalRegistry {
         };
         let (cols, rows) = session.pty_size;
         let (program, args) = op::wrapper_argv(&state.screen.command);
-        let spawned = super::user_home()
-            .ok()
-            .and_then(|home| crate::child_env::resolve_cwd(None, &home).ok())
-            .ok_or_else(|| anyhow::anyhow!("no home directory"))
-            .and_then(|cwd| {
+        // Under the launch guard like every runtime command: it never outlives the daemon.
+        let spawned = crate::launch_guard::command(&program, &args)
+            .and_then(|guarded| {
+                super::user_home()
+                    .ok()
+                    .and_then(|home| crate::child_env::resolve_cwd(None, &home).ok())
+                    .ok_or_else(|| anyhow::anyhow!("no home directory"))
+                    .map(|cwd| (guarded, cwd))
+            })
+            .and_then(|((program, args), cwd)| {
                 super::spawn_pty(
-                    &program,
+                    std::ffi::OsStr::new(&program),
                     &args,
                     &cwd,
                     &state.env,

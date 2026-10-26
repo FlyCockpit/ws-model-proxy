@@ -32,6 +32,8 @@ export const runtimeLifecycle = new RuntimeLifecycle(
     closeOperatorStep: (stepId, options) => relaySessionManager.closeOperatorStep(stepId, options),
     closeOperatorTerminal: (nodeId, terminalId) =>
       relaySessionManager.closeOperatorTerminal(nodeId, terminalId),
+    fenceRunStarts: (nodeId, instanceId, rank, throughRun) =>
+      relaySessionManager.fenceRunStarts(nodeId, instanceId, rank, throughRun),
   },
   {
     // A start that found its definition missing: push the node's definitions again.
@@ -60,7 +62,7 @@ export const nodeOperatorServices = nodeOperator.services;
 const nodeRelay = createNodeRelayServices(
   {
     ...relay,
-    requestTrustLower: (nodeId, at) => relaySessionManager.requestTrustLower(nodeId, at),
+    requestTrustLower: (nodeId) => relaySessionManager.requestTrustLower(nodeId),
     closeSessionsForNodes: (nodeIds) => relaySessionManager.closeSessionsForNodes(nodeIds),
   },
   {

@@ -215,11 +215,34 @@ describe("nodes.list / get", () => {
 });
 
 describe("nodes.deleteOffline (MCP node_delete)", () => {
-  function setupDelete(connection: "ONLINE" | "OFFLINE", deleted = 1) {
+  const fullNode = (id: string) => ({ id, slug: id, trust: "FULL", trustLowerRequestedAt: null });
+  /** The instance the deletion stops: its head here, its worker reservation elsewhere. */
+  function occupant(worker: Record<string, unknown> | null, supersededGeneration: number | null) {
+    return {
+      id: "inst-1",
+      Ranks: [{ rank: 0, nodeId: "node-1", claim: "HELD", Node: fullNode("node-1") }],
+      Reservations: [
+        {
+          index: 0,
+          nodeId: worker ? worker.id : null,
+          supersededGeneration,
+          Node: worker,
+        },
+      ],
+    };
+  }
+
+  function setupDelete(
+    connection: "ONLINE" | "OFFLINE",
+    deleted = 1,
+    affected: unknown[] = [occupant(fullNode("worker"), null)],
+  ) {
     db.node.deleteMany.mockResolvedValueOnce({ count: deleted });
     db.node.findFirst.mockResolvedValueOnce({ id: "node-1", slug: "box", connection } as never);
     db.profileItem.findFirst.mockResolvedValueOnce(null);
+    db.runtimeInstance.findMany.mockResolvedValueOnce(affected as never);
     db.instanceRank.findMany.mockResolvedValueOnce([{ instanceId: "inst-1" }] as never);
+    db.instanceReservation.findMany.mockResolvedValueOnce([] as never);
     db.fabricMember.findMany.mockResolvedValue([] as never);
   }
 
@@ -266,6 +289,56 @@ describe("nodes.deleteOffline (MCP node_delete)", () => {
       after: { stoppedInstances: ["inst-1"], note: "old box" },
     });
     expect(JSON.stringify(audit)).not.toMatch(/credential|secret|wsmp_node_/i);
+  });
+
+  it.each([
+    ["a Relay-only worker", occupant({ ...fullNode("worker"), trust: "RELAY" }, null), "worker"],
+    [
+      "a worker being lowered",
+      occupant({ ...fullNode("worker"), trustLowerRequestedAt: new Date() }, null),
+      "worker",
+    ],
+    [
+      "a replaced run's Relay-only worker",
+      occupant({ ...fullNode("worker"), trust: "RELAY" }, 2),
+      "worker",
+    ],
+    ["a deleted worker", occupant(null, null), "inst-1"],
+  ] as const)(
+    "refuses an agent's deletion that stops an instance holding %s (trust_relay)",
+    async (_name, affected, subject) => {
+      setupDelete("OFFLINE", 1, [affected]);
+      await expect(
+        client(FULL_AGENT).deleteOffline({ nodeId: "node-1", confirm: "DELETE" }),
+      ).rejects.toMatchObject({ data: { reason: "trust_relay", subjectId: subject } });
+      expect(db.node.deleteMany).not.toHaveBeenCalled();
+      // Every instance the trigger stops or releases here, through the shared occupancy read.
+      expect(db.runtimeInstance.findMany.mock.calls[0]?.[0]).toMatchObject({
+        where: { userId: "owner-1", desiredState: { not: null } },
+      });
+    },
+  );
+
+  it("refuses an agent's deletion of a worker whose instance's head is Relay-only", async () => {
+    setupDelete("OFFLINE", 1, [
+      {
+        id: "inst-1",
+        Ranks: [
+          {
+            rank: 0,
+            nodeId: "relay-head",
+            claim: "HELD",
+            Node: { ...fullNode("relay-head"), trust: "RELAY" },
+          },
+        ],
+        Reservations: [
+          { index: 0, nodeId: "node-1", supersededGeneration: null, Node: fullNode("node-1") },
+        ],
+      },
+    ]);
+    await expect(
+      client(FULL_AGENT).deleteOffline({ nodeId: "node-1", confirm: "DELETE" }),
+    ).rejects.toMatchObject({ data: { reason: "trust_relay", subjectId: "relay-head" } });
   });
 
   it("is refused for a read-only agent before reading the node", async () => {
@@ -490,9 +563,11 @@ describe("delete", () => {
       { instanceId: "i-1" },
       { instanceId: "i-2" },
     ] as never);
+    // An instance holding a reservation here (launch.reservations) stops too.
+    db.instanceReservation.findMany.mockResolvedValueOnce([{ instanceId: "i-3" }] as never);
     db.fabricMember.findMany.mockResolvedValueOnce([] as never);
     const out = await client(PERSON, { disconnect }).delete({ nodeId: "node-1" });
-    expect(out).toEqual({ deleted: true, stoppedInstances: ["i-1", "i-2"] });
+    expect(out).toEqual({ deleted: true, stoppedInstances: ["i-1", "i-2", "i-3"] });
     expect(db.node.delete).toHaveBeenCalledWith({ where: { id: "node-1" } });
     expect(disconnect).toHaveBeenCalledWith("node-1", "node_deleted");
     // A parent delete: the node's whole fence set (fenceParentDelete) before any row.

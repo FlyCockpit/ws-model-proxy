@@ -25,6 +25,7 @@ pub mod hardware;
 pub mod hostname;
 #[cfg(windows)]
 mod job_tree;
+pub mod launch_guard;
 pub mod logging;
 pub mod media;
 pub mod metric_sources;
@@ -32,6 +33,8 @@ pub mod output;
 pub mod output_mask;
 pub mod paths;
 pub mod probe;
+#[cfg(unix)]
+mod process_list;
 pub mod protocol;
 pub mod relay_bus;
 pub mod runtime_store;
