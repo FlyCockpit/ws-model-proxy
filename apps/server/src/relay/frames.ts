@@ -17,7 +17,10 @@
 
 import { gpuIds } from "@ws-model-proxy/api/lib/command-render";
 import { embeddingContractSchema } from "@ws-model-proxy/api/lib/embedding-contract";
-import { RUNTIME_JOB_PRE_ADMISSION_ERRORS } from "@ws-model-proxy/api/lib/instance-run";
+import {
+  RUNTIME_JOB_ADMITTED_ERRORS,
+  RUNTIME_JOB_PRE_ADMISSION_ERRORS,
+} from "@ws-model-proxy/api/lib/instance-run";
 import {
   ENGINES,
   fabricIpSchema,
@@ -281,6 +284,12 @@ export const instanceRecordSchema = z
      */
     models: z.array(z.string().min(1).max(256)).max(64),
     engineFacts: engineFactsSchema.optional(),
+    /**
+     * As the record was observed, no step that may launch was admitted for the rank in the
+     * node's runner and not cancelled (`features.rankIdle`): a `stopped` record proves the stop
+     * only with it.
+     */
+    rankIdle: z.boolean().optional(),
   })
   .strict();
 export type InstanceRecord = z.infer<typeof instanceRecordSchema>;
@@ -780,18 +789,7 @@ export type RuntimeJobFrame = z.infer<typeof runtimeJobFrameSchema>;
 export { RUNTIME_JOB_PRE_ADMISSION_ERRORS };
 export const RUNTIME_JOB_ERRORS = [
   ...RUNTIME_JOB_PRE_ADMISSION_ERRORS,
-  "instance_unknown",
-  "owned_launch_unconfirmed",
-  "launch_unconfirmed",
-  "command_failed",
-  "readiness_failed",
-  "health_failed",
-  "job_deadline",
-  /**
-   * A `process` start handed its server off out of the node's units (its start unit has no task
-   * left while the port answers): it needs `management: "service"` with stop and status.
-   */
-  "process_detached",
+  ...RUNTIME_JOB_ADMITTED_ERRORS,
 ] as const;
 /**
  * Why a status probe (stop proof) answered not stopped, in its `detail`: a process of the
@@ -837,6 +835,12 @@ export const runtimeJobResultFrameSchema = z
       .optional(),
     terminalId: base64Url16Schema.optional(),
     exitCode: z.number().int().min(0).max(255).optional(),
+    /**
+     * A stop or status probe: as it answered, no other step that may launch was admitted for the
+     * rank in the node's runner and not cancelled, under any connection (`features.rankIdle`; a
+     * stop cancels the others first). A stopped answer proves the stop only with it.
+     */
+    rankIdle: z.boolean().optional(),
   })
   .strict()
   .refine((result) => (result.status === "failed") === (result.error !== undefined), {

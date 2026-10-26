@@ -264,11 +264,12 @@ integration("upgrade from the released schema (PostgreSQL, PG1)", () => {
           `wsmp-i-${B.slice(0, 12)}-r0`,
         ],
       );
+      // Written by the released server, two days before the upgrade.
       for (const { id, instanceId, step, state, attempts } of rows)
         query(
           `INSERT INTO instance_step (id, "instanceId", "nodeId", rank, phase, sequence, generation,
              intent, "intentHash", state, attempts, "updatedAt")
-           VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, now())`,
+           VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, now() - interval '2 days')`,
           [
             id,
             instanceId,
@@ -301,7 +302,8 @@ integration("upgrade from the released schema (PostgreSQL, PG1)", () => {
     await prisma?.$disconnect();
     process.env.DATABASE_URL = previousUrl;
     if (tmp) rmSync(tmp, { recursive: true, force: true });
-    runSql(databaseUrl ?? "", `DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`);
+    // Drops only the throwaway database this suite created in beforeAll.
+    runSql(databaseUrl ?? "", `DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`); // policy: bounded-delete
   });
 
   const ref = () => ({
@@ -319,7 +321,7 @@ integration("upgrade from the released schema (PostgreSQL, PG1)", () => {
         return true;
       },
       nodeSession: (id) =>
-        id === nodeId ? { userId, connectionGeneration: 1, trust: "full" } : null,
+        id === nodeId ? { userId, connectionGeneration: 1, trust: "full", rankIdle: true } : null,
     });
   const instance = (id: string) =>
     prisma.runtimeInstance.findUniqueOrThrow({ where: { id }, include: { Ranks: true } });
@@ -392,6 +394,7 @@ integration("upgrade from the released schema (PostgreSQL, PG1)", () => {
       rank: 0,
       intentHash: probe.intentHash,
       ownerEpoch: probe.ownerEpoch,
+      ...(probe.phase === "stop" || probe.phase === "status" ? { rankIdle: true } : {}),
       status: "succeeded",
       stopped: true,
     });

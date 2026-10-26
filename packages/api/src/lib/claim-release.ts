@@ -19,15 +19,7 @@
  */
 import type { Prisma } from "@ws-model-proxy/db";
 import { DbNull } from "@ws-model-proxy/db/json-null";
-import {
-  fresh,
-  isLeadingStop,
-  isRunStartPhase,
-  owned,
-  RUN_START_PHASES,
-  refusedBeforeAdmission,
-  resolveRun,
-} from "./instance-run";
+import { fresh, isLeadingStop, launchedAfterWhere, owned, resolveRun } from "./instance-run";
 
 type Tx = Prisma.TransactionClient;
 
@@ -42,7 +34,7 @@ export type UnprovenRelease = { by: string; reason: string };
  * - `result`: a STOP or STATUS step of this rank whose stopped answer was recorded (SUCCEEDED) in
  *   this transaction;
  * - `observation`: an inventory record naming the last step the node ran for this rank's unit,
- *   which the node reports stopped;
+ *   which the node reports stopped, with its `rankIdle` as the node observed it;
  * - `neverRan`: the instance's own steps show this rank never ran since the last proven stop
  *   (evaluated here: a refusal before admission proves only the attempt it answers never ran,
  *   `refusedBeforeAdmission` in `instance-run.ts`);
@@ -50,7 +42,7 @@ export type UnprovenRelease = { by: string; reason: string };
  */
 export type ClaimRelease =
   | { result: { stepId: string } }
-  | { observation: { stepId: string } }
+  | { observation: { stepId: string; rankIdle: boolean } }
   | { neverRan: true }
   | { unproven: UnprovenRelease };
 
@@ -60,6 +52,7 @@ type RankRow = {
   nodeId: string | null;
   rank: number;
   claim: string;
+  stoppedThroughRun: number;
 };
 
 /** The node's proof (a result or an observation) proves this run's rank stopped. */
@@ -68,6 +61,8 @@ async function proofHolds(
   rank: RankRow,
   stepId: string,
   modality: "result" | "observation",
+  /** An observation's `rankIdle`, as the node reported it. */
+  observedIdle: boolean | null,
 ): Promise<boolean> {
   const step = await tx.instanceStep.findUnique({
     where: { id: stepId },
@@ -79,6 +74,7 @@ async function proofHolds(
       state: true,
       sequence: true,
       generation: true,
+      rankIdle: true,
     },
   });
   // Bound to the claim: the same instance, rank and node.
@@ -103,68 +99,30 @@ async function proofHolds(
       });
       if (instance?.phase !== "STOPPING") return false;
     }
-  } else {
-    // The node says stopped only once nothing of this rank can still start: no start step of
-    // any run on its way or unanswered (a snapshot is taken between jobs, so one dispatched
-    // earlier may still launch after it).
-    const unresolved = await tx.instanceStep.count({
-      where: {
-        instanceId: rank.instanceId,
-        rank: rank.rank,
-        phase: { in: [...RUN_START_PHASES] },
-        OR: [
-          { state: { in: ["RUNNING", "AWAITING_OPERATOR"] } },
-          { state: "PENDING", attempts: { gt: 0 } },
-        ],
-      },
-    });
-    if (unresolved > 0) return false;
   }
+  // The node's stopped answer proves the stop only when the node also said that no other step
+  // that may launch was in flight for the rank in its runner (`rankIdle`: a stop cancels them
+  // first, a probe or an inventory record cancels nothing). The node knows what it admitted; the
+  // server's own step states cannot (one sent under a lost connection may still wait there).
+  if ((modality === "observation" ? observedIdle : step.rankIdle) !== true) return false;
   const run = await resolveRun(tx, rank.instanceId);
   return owned(step, run) && (await fresh(tx, step, run));
 }
 
 /**
- * The rank never ran since the last proven stop: every start-phase step of the latest
- * generation that has any never ran (never sent, cancelled, or refused before admission with no
- * earlier dispatch that may have run: `refusedBeforeAdmission`), and that generation is the first
- * or its leading stop succeeded. (A run begun later without steps launched nothing.)
+ * The rank never ran since the last proven stop: no start-phase step after the run through which
+ * its launches are proven stopped (`stoppedThroughRun`: recorded when a run's leading stop
+ * succeeded, or a restart retook a claim released with proof) could have started a process
+ * (`launchedAfterWhere`, the rule `physicalLaunch` reads: dispatched, and not refused before
+ * admission with no earlier dispatch that may have run, `refusedBeforeAdmission`). Runs begun
+ * since without launching anything (a restart stopped before its steps were prepared, or before
+ * they were sent) launched nothing.
  */
 async function neverRan(tx: Tx, rank: RankRow): Promise<boolean> {
-  const latest =
-    (
-      await tx.instanceStep.aggregate({
-        where: { instanceId: rank.instanceId, phase: { in: [...RUN_START_PHASES] } },
-        _max: { generation: true },
-      })
-    )._max.generation ?? 0;
-  const steps = await tx.instanceStep.findMany({
-    where: { instanceId: rank.instanceId, rank: rank.rank, generation: latest },
-    select: {
-      phase: true,
-      state: true,
-      sequence: true,
-      generation: true,
-      attempts: true,
-      errorCode: true,
-      mayHaveRun: true,
-    },
+  const launched = await tx.instanceStep.count({
+    where: launchedAfterWhere(rank.instanceId, rank.rank, rank.stoppedThroughRun),
   });
-  // Attempts count only dispatches that may have run something (a declined operator terminal,
-  // or one ended before its screen came up, gives its attempt back), so a FAILED step without
-  // one never ran.
-  const allNever = steps
-    .filter((step) => isRunStartPhase(step.phase))
-    .every(
-      (step) =>
-        step.state === "CANCELLED" ||
-        (step.state === "PENDING" && step.attempts === 0) ||
-        (step.state === "FAILED" &&
-          !step.mayHaveRun &&
-          (step.attempts === 0 || refusedBeforeAdmission(step))),
-    );
-  const leading = steps.find((step) => isLeadingStop(step));
-  return allNever && (latest <= 1 || leading?.state === "SUCCEEDED");
+  return launched === 0;
 }
 
 /**
@@ -184,14 +142,27 @@ export async function releaseClaim(
   if (!unproven) {
     const rank = await tx.instanceRank.findUnique({
       where: { id: rankId },
-      select: { id: true, instanceId: true, nodeId: true, rank: true, claim: true },
+      select: {
+        id: true,
+        instanceId: true,
+        nodeId: true,
+        rank: true,
+        claim: true,
+        stoppedThroughRun: true,
+      },
     });
     if (!rank || (rank.claim !== "HELD" && rank.claim !== "HELD_UNKNOWN")) return false;
     const proven =
       "result" in release
-        ? await proofHolds(tx, rank, release.result.stepId, "result")
+        ? await proofHolds(tx, rank, release.result.stepId, "result", null)
         : "observation" in release
-          ? await proofHolds(tx, rank, release.observation.stepId, "observation")
+          ? await proofHolds(
+              tx,
+              rank,
+              release.observation.stepId,
+              "observation",
+              release.observation.rankIdle,
+            )
           : "neverRan" in release
             ? await neverRan(tx, rank)
             : false;

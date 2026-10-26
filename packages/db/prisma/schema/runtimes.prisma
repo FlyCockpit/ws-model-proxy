@@ -422,6 +422,12 @@ model InstanceRank {
   prevPort               Int?
   prevDistPort           Int?
   prevGeneration         Int?
+  /// Every launch of this rank in a run up to this one is proven stopped: a restart retook a
+  /// claim released with proof (`retakeInstanceClaims`; while RELEASED, the claim itself says so,
+  /// `launchesEnded`). Stops and status probes no longer name those launches, and their versions
+  /// are no longer required on the node. A release without proof leaves it, so a launch that may
+  /// still run keeps its version and the next run's leading STOP reaches it.
+  stoppedThroughRun      Int        @default(0)
 
   Instance        RuntimeInstance       @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Node            Node?                 @relation(fields: [nodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)
@@ -579,6 +585,11 @@ model InstanceStep {
   /// admission proves only that attempt never ran, so the rank still needs a stop
   /// (`lib/instance-run.ts` `MAY_HAVE_RUN`).
   mayHaveRun         Boolean   @default(false)
+  /// A stop or status probe the node answered: whether, as it answered, no other step that may
+  /// launch was admitted for the rank in the node's runner and not cancelled (the result's
+  /// `rankIdle`). A stopped answer proves the stop only with true (`lib/claim-release.ts`). Null
+  /// until answered, cleared when the step is sent again.
+  rankIdle           Boolean?
 
   Instance RuntimeInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 

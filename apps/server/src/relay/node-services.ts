@@ -41,7 +41,7 @@ type RelayPort = {
   nodeSession(
     nodeId: string,
   ): { userId: string; connectionGeneration: number; trust: NodeTrustWire } | null;
-  requestTrustLower(nodeId: string, requestedAt: Date): boolean;
+  requestTrustLower(nodeId: string): Promise<void>;
   closeSessionsForNodes(nodeIds: readonly string[]): Promise<void>;
 };
 
@@ -152,7 +152,7 @@ export function createNodeRelayServices(
       });
     },
     lowerTrust: async (nodeId) => {
-      relay.requestTrustLower(nodeId, new Date());
+      await relay.requestTrustLower(nodeId);
     },
     disconnect: async (nodeId) => {
       await relay.closeSessionsForNodes([nodeId]);

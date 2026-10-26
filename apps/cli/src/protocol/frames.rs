@@ -252,6 +252,11 @@ pub struct InstanceRecord {
     pub models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_facts: Option<EngineFacts>,
+    /// Whether, as this record was observed, no step that may launch was
+    /// admitted for the rank in the node's runner and not cancelled (as a
+    /// result's `rank_idle`). A `stopped` record proves the stop only with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_idle: Option<bool>,
 }
 
 // ── node.info / node.metrics ──
@@ -1237,6 +1242,12 @@ pub enum NodeFrame {
         terminal_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<u8>,
+        /// A stop or status probe: whether, as it answered, no other step that
+        /// may launch (prepare, start, after_join, readiness) was admitted for
+        /// the rank in the node's runner and not cancelled, under any
+        /// connection (`features.rankIdle`). A stop cancels the others first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rank_idle: Option<bool>,
     },
     #[serde(rename = "runtime.define.result")]
     /// Answers one define chunk; the final answer also carries the held state.
@@ -2325,7 +2336,7 @@ mod tests {
         };
         let entry = |index: u8| JobReservation {
             index,
-            node_id: format!("nd{index}"),
+            node_id: format!("wk{index}"),
             node: format!("worker-{index}"),
             gpu_ids: None,
         };
@@ -2336,7 +2347,7 @@ mod tests {
         ));
         assert!(broken(&|job| job.reservations[0].node_id = String::new()));
         assert!(broken(&|job| job.reservations[0].node_id = "a".repeat(65)));
-        assert!(broken(&|job| job.reservations[0].node_id = "nd 1".into()));
+        assert!(broken(&|job| job.reservations[0].node_id = "wk 1".into()));
         assert!(broken(&|job| job.reservations[0].node = "Worker-a".into()));
         assert!(broken(&|job| job.reservations[0].node = "worker--a".into()));
         assert!(broken(&|job| job.reservations[0].node = "-worker".into()));

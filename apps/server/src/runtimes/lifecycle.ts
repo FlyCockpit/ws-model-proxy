@@ -35,7 +35,9 @@ import {
   owned,
   peekRun,
   physicalLaunch,
+  recordStoppedThrough,
   resolveRun,
+  startsUnresolved,
 } from "@ws-model-proxy/api/lib/instance-run";
 import {
   CURRENT_RESERVATION_WHERE,
@@ -66,6 +68,7 @@ import { nodeOwnerMatches } from "../relay/node-owner.js";
 import type {
   NodeFrameHandlers,
   NodeSessionRef,
+  OperatorCloseAnswer,
   RuntimeInventorySnapshot,
   SendGuard,
 } from "../relay/session-manager.js";
@@ -157,9 +160,11 @@ function activeOwner(now: Date): Prisma.UserWhereInput {
 }
 
 /**
- * A start whose run has reservations, on a node whose CLI cannot read them (from before
- * `features.jobReservations`): refused before it is sent, the instance FAILS until the CLI is
- * upgraded (`TERMINAL_START_ERRORS`).
+ * A runtime job for a node whose CLI cannot prove what it runs (from before `features.rankIdle`:
+ * one runner across connections, and stop answers that say whether the rank is idle), or a start
+ * whose run has reservations on one that cannot read them (before `features.jobReservations`):
+ * refused before it is sent. A start FAILS its instance until the CLI is upgraded
+ * (`TERMINAL_START_ERRORS`); a stop or probe cannot be proven there (`UNPROVABLE_STOP`).
  */
 export const CLI_UPGRADE_REQUIRED = "cli_upgrade_required";
 
@@ -167,6 +172,8 @@ export const CLI_UPGRADE_REQUIRED = "cli_upgrade_required";
 const UNPROVABLE_STOP = new Set([
   // A person gave up on an interactive stop: they decide (Mark as stopped), nothing is retried.
   OPERATOR_CANCELLED,
+  // The node's CLI cannot prove a stop (no `rankIdle`): a person decides, or upgrades it.
+  CLI_UPGRADE_REQUIRED,
   "definition_missing",
   "definition_frozen",
   "instance_unknown",
@@ -185,9 +192,17 @@ export type LifecycleRelay = {
     operatorTerminals?: boolean;
     /** The node's CLI reads a job's `reservations` (hello `features.jobReservations`). */
     jobReservations?: boolean;
+    /** The node's CLI proves what it runs (hello `features.rankIdle`): runtime jobs need it. */
+    rankIdle?: boolean;
   } | null;
   /** Nodes with a live session here (dispatch looks at their steps only). */
   onlineNodeIds?(): string[];
+  /**
+   * From now on, no start-phase job of the rank's runs through `throughRun` is delivered to the
+   * node's live session (as a sent stop's `stopsStartsThrough`): before a proof that sent nothing
+   * (an inventory record) may release the claim.
+   */
+  fenceRunStarts?(nodeId: string, instanceId: string, rank: number, throughRun: number): void;
   /** The node's session can track one more operator terminal (absent: always). */
   operatorRoom?(nodeId: string): boolean;
   /**
@@ -197,7 +212,7 @@ export type LifecycleRelay = {
   closeOperatorStep?(
     stepId: string,
     options?: { keepRunning?: boolean; actor?: "USER" | "SYSTEM" },
-  ): "closed" | "running" | "absent";
+  ): OperatorCloseAnswer;
   /** Close an operator terminal no step owns any more (a stale dispatch's), by its id. */
   closeOperatorTerminal?(nodeId: string, terminalId: string): void;
 };
@@ -235,18 +250,26 @@ function interactiveIntent(intent: Prisma.JsonValue): boolean {
 
 /**
  * The attempts of an interactive step whose live dispatch the server ends (stop, cancel,
- * reissue). The dispatch gives its attempt back only while its confirm screen never came up:
- * nobody can attach before `awaiting_operator`, so nothing ran. Once the screen was up, a person
- * may have pressed Enter just before the close reached the node, so the attempt counts (the
- * rank then needs a stop, which the node proves from status when nothing ran).
+ * reissue, drain), from what closing its terminal found (`answer`). The dispatch gives its
+ * attempt back only when the close proves its confirm screen never came up: the tracker that
+ * holds the session closed it while it was still coming up (`unopened`: nobody can attach before
+ * `awaiting_operator`, so nothing ran), and the step's columns agree. Anything else counts the
+ * attempt: the screen was up (a person may have pressed Enter just before the close reached the
+ * node), or nothing here tracks the terminal (`absent`: another process holds the session, or a
+ * progress write was lost), so this process cannot know. The rank then needs a stop, which the
+ * node proves from status when nothing ran: a release always has proof.
  */
-function attemptsAfterServerClose(step: {
-  attempts: number;
-  operatorTerminalId: string | null;
-  operatorSince: Date | null;
-  operatorAcceptedAt: Date | null;
-}): number {
-  return step.operatorTerminalId !== null &&
+function attemptsAfterServerClose(
+  step: {
+    attempts: number;
+    operatorTerminalId: string | null;
+    operatorSince: Date | null;
+    operatorAcceptedAt: Date | null;
+  },
+  answer: OperatorCloseAnswer | undefined,
+): number {
+  return answer === "unopened" &&
+    step.operatorTerminalId !== null &&
     step.operatorSince === null &&
     step.operatorAcceptedAt === null
     ? Math.max(0, step.attempts - 1)
@@ -271,6 +294,8 @@ type FinishedStep = {
   /** A stop proof names its step: `releaseClaim` checks it belongs to the claim's run. */
   id: string;
   instanceId: string;
+  /** The node that ran it (whose answer it is). */
+  nodeId: string;
   phase: StepPhase;
   rank: number;
   generation: number;
@@ -419,6 +444,32 @@ function statusProbeWanted(instance: { phase: string }, claim: string | undefine
 }
 
 const STOP_PROOF_FAILURE_CODES: ReadonlySet<string> = new Set(STOP_PROOF_FAILURES);
+
+/**
+ * A stop or status probe the node answered stopped, but not idle (`rankIdle`: another step that
+ * may launch was still in flight for the rank there): no proof. Its step's `errorCode` (the stop
+ * evidence's reason).
+ */
+export const STATUS_LAUNCH_PENDING = "launch_pending";
+
+/**
+ * The runs a sent job ends at the socket (`SendGuard.stopsStartsThrough`): nothing of them starts
+ * after it (a start claimed earlier but delayed past it is not delivered), because the node's
+ * answer to it may prove them stopped, and the node can only say what it was sent. A gang stop
+ * ends its own run; a leading stop the runs before it (its own run's starts follow it); a status
+ * probe its run (it goes out only for a run that is stopping or marked stopped). Others: none.
+ */
+export function startsEndedBy(
+  job: { phase: string; generation: number },
+  leadingStop: boolean,
+): number | undefined {
+  if (job.phase === "status") return job.generation;
+  if (job.phase !== "stop") return undefined;
+  return leadingStop ? job.generation - 1 : job.generation;
+}
+
+/** How soon a leading stop whose node was not idle is sent again. */
+const RANK_BUSY_RETRY_MS = 30_000;
 
 /** Why a status probe answered not stopped (its `detail`), when the node said (newer nodes). */
 function stopProofFailure(phase: string, detail: string | undefined): string | null {
@@ -615,10 +666,26 @@ export class RuntimeLifecycle {
     // The leading stop of a restart names what each rank runs now (an earlier version's
     // process, port and unit), so the node stops that process.
     const physical = new Map<number, Physical>();
+    // Ranks with a proven stop (`stoppedThroughRun`, recorded when a restart retook a claim
+    // released with proof, or a leading stop succeeded), nothing launched since (no physical launch: runs since then, if
+    // any, never launched) and no earlier start still out: their leading stop has nothing to
+    // stop and is satisfied here. Sent, it would name this run's launch to a node that may keep
+    // the proven launch's stopped record, which refuses it. Without a proven stop it is sent
+    // (the node proves absence from its missing record; rows from before runs existed too).
+    const ended = new Set<number>();
     if (run > 1)
       for (const rank of ranks) {
-        const found = await this.physical(tx, instance, rank.rank);
-        if (found) physical.set(rank.rank, found);
+        const stored = await physicalLaunch(tx, instance.id, rank.rank);
+        if (stored) {
+          // An unreadable record names the instance's own launch (as before).
+          const found = await this.physicalOf(tx, instance, stored);
+          if (found) physical.set(rank.rank, found);
+        } else if (
+          rank.stoppedThroughRun > 0 &&
+          // No STOP is sent: nothing may still launch (`unresolvedStartsWhere`).
+          !(await startsUnresolved(tx, instance.id, rank.rank, run))
+        )
+          ended.add(rank.rank);
       }
     const steps = generationSteps({
       instance: instanceInput(instance),
@@ -628,8 +695,11 @@ export class RuntimeLifecycle {
       operationId,
       physical,
       reservations: stepReservations(instance),
+      ended,
     });
     await this.insertSteps(tx, instance, run, steps);
+    // A satisfied leading stop proves what a sent one would (nothing of an earlier run runs).
+    for (const rank of ended) await recordStoppedThrough(tx, instance.id, rank, run - 1);
     // Earlier probes belong to the previous run.
     await tx.instanceStep.updateMany({
       where: { instanceId: instance.id, phase: "HEALTH", state: "PENDING", attempts: 0 },
@@ -658,7 +728,25 @@ export class RuntimeLifecycle {
     rank: number,
   ): Promise<Physical | undefined> {
     const stored = await physicalLaunch(tx, instance.id, rank);
-    const intent = stepIntentSchema.safeParse(stored?.intent ?? null);
+    return stored ? this.physicalOf(tx, instance, stored) : undefined;
+  }
+
+  /** The node's answer to this stop or probe said its rank was idle (`InstanceStep.rankIdle`). */
+  private async answeredIdle(tx: Tx, stepId: string): Promise<boolean> {
+    const row = await tx.instanceStep.findUnique({
+      where: { id: stepId },
+      select: { rankIdle: true },
+    });
+    return row?.rankIdle === true;
+  }
+
+  /** `physical` from the stored launch (`physicalLaunch`); undefined when it is unreadable. */
+  private async physicalOf(
+    tx: Tx,
+    instance: InstanceRow,
+    stored: { intent: Prisma.JsonValue; headAddr: string | null },
+  ): Promise<Physical | undefined> {
+    const intent = stepIntentSchema.safeParse(stored.intent);
     if (!intent.success) return undefined;
     let launch = launchOf(instance);
     if (intent.data.launchVersionId !== instance.launchVersionId) {
@@ -673,7 +761,7 @@ export class RuntimeLifecycle {
       );
       if (parsed.success) launch = parsed.data;
     }
-    return launch ? { intent: intent.data, launch, headAddr: stored?.headAddr ?? null } : undefined;
+    return launch ? { intent: intent.data, launch, headAddr: stored.headAddr } : undefined;
   }
 
   /**
@@ -698,6 +786,7 @@ export class RuntimeLifecycle {
           intent: step.intent,
           intentHash: step.intentHash,
           headAddr: step.headAddr ?? null,
+          ...(step.state ? { state: step.state } : {}),
         },
       });
     }
@@ -832,9 +921,11 @@ export class RuntimeLifecycle {
     // Claims as they are now (a caller's copy may predate a release in this transaction).
     const current = await tx.instanceRank.findMany({ where: { instanceId: instance.id } });
     for (const rank of current) {
-      if (rank.claim !== "HELD") continue;
-      // Provably never ran since the last proven stop (evaluated by the release itself).
+      if (rank.claim !== "HELD" && rank.claim !== "HELD_UNKNOWN") continue;
+      // Provably never ran since the last proven stop (evaluated by the release itself), marked
+      // stopped or not: nothing to probe or stop.
       if (await releaseClaim(tx, rank.id, now, { neverRan: true })) continue;
+      if (rank.claim !== "HELD") continue;
       const stops = stopSteps.filter((step) => step.rank === rank.rank);
       // Offline too long: the stop cannot be proven until the node returns (a person may
       // mark it stopped), whether or not a stop is still queued for it.
@@ -1207,15 +1298,26 @@ export class RuntimeLifecycle {
           data: { ...claim, blockedBy: plan ? plan.start.blockedBy : [] },
         });
         if (!plan) return;
-        // The GPUs the planner picked are recorded with the claims (as a start's are).
+        // What the planner admitted is what the ranks hold, as a start's (`writePlannedStarts`):
+        // the GPUs it picked, and the ports it kept or moved (one outside the node's range now,
+        // or taken meanwhile, moved).
         const ranks = [...instance.Ranks].sort((a, b) => a.rank - b.rank);
         for (const placement of plan.start.placements) {
           const rank = ranks[placement.nodeNumber - 1];
-          if (!rank || canonicalJson(rank.resources) === canonicalJson(placement.resources))
+          if (
+            !rank ||
+            (canonicalJson(rank.resources) === canonicalJson(placement.resources) &&
+              rank.port === placement.port &&
+              rank.distPort === plan.start.distPort)
+          )
             continue;
           await tx.instanceRank.update({
             where: { id: rank.id },
-            data: { resources: placement.resources as Prisma.InputJsonObject },
+            data: {
+              port: placement.port,
+              distPort: plan.start.distPort,
+              resources: placement.resources as Prisma.InputJsonObject,
+            },
           });
         }
       },
@@ -1532,6 +1634,10 @@ export class RuntimeLifecycle {
         connectionGeneration: session.connectionGeneration,
         userId: row.Instance.userId,
         ownerCheck: "runtime_step",
+        stopsStartsThrough: startsEndedBy(
+          job,
+          isLeadingStop({ phase: "STOP", sequence: row.sequence, generation: job.generation }),
+        ),
       });
       if (!sent) await this.undeliver(row.Instance.userId, row.instanceId, row.id, job.ownerEpoch);
     }
@@ -1546,6 +1652,7 @@ export class RuntimeLifecycle {
       trust: NodeTrustWire;
       operatorTerminals?: boolean;
       jobReservations?: boolean;
+      rankIdle?: boolean;
     },
   ) {
     const now = this.now();
@@ -1614,18 +1721,7 @@ export class RuntimeLifecycle {
       await this.settleOperatorSteps(tx, instance.id, ALL_STEP_PHASES, "superseded", {
         before: run,
       });
-      if (
-        isLeadingStop(step) &&
-        (await tx.instanceStep.count({
-          where: {
-            instanceId: instance.id,
-            rank: step.rank,
-            generation: { lt: run },
-            phase: { in: [...START_PHASES] },
-            state: { in: ["RUNNING", "AWAITING_OPERATOR"] },
-          },
-        })) > 0
-      )
+      if (isLeadingStop(step) && (await startsUnresolved(tx, instance.id, step.rank, run)))
         // This run's leading stop proves every earlier launch of the rank ended: it waits until
         // each one sent earlier answered (its result, its deadline, or its session's loss).
         return null;
@@ -1658,10 +1754,16 @@ export class RuntimeLifecycle {
       await this.afterStep(tx, step, false, "trust_relay");
       return null;
     }
+    // Runtime jobs go only to a CLI that proves what it runs (`features.rankIdle`): an older one
+    // cannot say whether a start it admitted may still launch, so none of its stops could be
+    // trusted. Refused here, saying to upgrade.
     // A run with reservations tells its commands which nodes they got (the job's
     // `reservations`). A CLI from before them refuses such a job outright, so the start fails
-    // here, saying to upgrade; its stops and probes go without them.
-    if (startPhase && stepJobReservations(intent.data) && session.jobReservations !== true) {
+    // here, saying to upgrade too.
+    if (
+      session.rankIdle !== true ||
+      (startPhase && stepJobReservations(intent.data) && session.jobReservations !== true)
+    ) {
       await this.failStep(tx, step.id, CLI_UPGRADE_REQUIRED);
       await this.afterStep(tx, step, false, CLI_UPGRADE_REQUIRED);
       return null;
@@ -1791,6 +1893,8 @@ export class RuntimeLifecycle {
         // Sent again after a counted dispatch: that one may have run (it is never forgotten,
         // whatever this attempt answers).
         mayHaveRun: mayHaveRunAfterRequeue(step.attempts),
+        // This dispatch is not answered yet.
+        rankIdle: null,
         deadline,
         leaseExpiresAt: deadline,
         notBefore: null,
@@ -1992,7 +2096,7 @@ export class RuntimeLifecycle {
     tx: Tx,
     step: StepRow,
     actor?: "USER",
-  ): Promise<"closed" | "running" | "absent" | undefined> {
+  ): Promise<OperatorCloseAnswer | undefined> {
     const answer = this.relay.closeOperatorStep?.(step.id, {
       keepRunning: true,
       ...(actor ? { actor } : {}),
@@ -2060,8 +2164,9 @@ export class RuntimeLifecycle {
     let settled = 0;
     for (const step of steps) {
       if (!interactiveIntent(step.intent)) continue;
-      if ((await this.closeOperatorKeepingRun(tx, step)) === "running") continue;
-      const attempts = attemptsAfterServerClose(step);
+      const closed = await this.closeOperatorKeepingRun(tx, step);
+      if (closed === "running") continue;
+      const attempts = attemptsAfterServerClose(step, closed);
       const changed = await tx.instanceStep.updateMany({
         where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
         data: {
@@ -2086,8 +2191,9 @@ export class RuntimeLifecycle {
    * runs. Only a dispatch whose screen never came up gives its attempt back.
    */
   private async reissueOperatorStep(tx: Tx, step: StepRow): Promise<boolean> {
-    if ((await this.closeOperatorKeepingRun(tx, step)) === "running") return false;
-    const attempts = attemptsAfterServerClose(step);
+    const closed = await this.closeOperatorKeepingRun(tx, step);
+    if (closed === "running") return false;
+    const attempts = attemptsAfterServerClose(step, closed);
     const changed = await tx.instanceStep.updateMany({
       where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
       data: {
@@ -2342,9 +2448,9 @@ export class RuntimeLifecycle {
       if (step.state === "RUNNING" && step.operatorAcceptedAt !== null)
         throw new OperatorStepError("running");
       if (!waiting) throw new OperatorStepError("not_waiting");
-      if ((await this.closeOperatorKeepingRun(tx, step, "USER")) === "running")
-        throw new OperatorStepError("running");
-      const attempts = attemptsAfterServerClose(step);
+      const closed = await this.closeOperatorKeepingRun(tx, step, "USER");
+      if (closed === "running") throw new OperatorStepError("running");
+      const attempts = attemptsAfterServerClose(step, closed);
       const changed = await tx.instanceStep.updateMany({
         where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
         data: {
@@ -2528,15 +2634,13 @@ export class RuntimeLifecycle {
       const closed = step.state === "PENDING" ? null : await this.closeOperatorKeepingRun(tx, step);
       if (closed === "running") continue;
       // A dispatch whose screen never came up gives its attempt back, but only when this close
-      // ended it: a terminal the ban fence already cancelled (or another process tracks)
-      // answers "absent" and may have run, so its attempt counts. A step that never ran is
-      // CANCELLED (proof for the claim's auto-release), else FAILED.
+      // proves it (`attemptsAfterServerClose`): a terminal the ban fence already cancelled (or
+      // another process tracks) answers "absent" and may have run, so its attempt counts. A
+      // step that never ran is CANCELLED (proof for the claim's auto-release), else FAILED.
       const attempts =
         step.state === "PENDING"
           ? step.attempts
-          : closed === "closed"
-            ? attemptsAfterServerClose(step)
-            : step.attempts;
+          : attemptsAfterServerClose(step, closed ?? undefined);
       const changed = await tx.instanceStep.updateMany({
         where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
         data: {
@@ -2735,6 +2839,8 @@ export class RuntimeLifecycle {
         data: {
           state: succeeded ? "SUCCEEDED" : "FAILED",
           errorCode: code,
+          // A stop's or probe's word on whether the rank was idle (`proofHolds`).
+          rankIdle: result.rankIdle ?? null,
           deadline: null,
           leaseExpiresAt: null,
           operatorTerminalId: null,
@@ -2781,12 +2887,42 @@ export class RuntimeLifecycle {
     const mine = owned(step, await resolveRun(tx, instanceId));
     if (phase === "STOP" || phase === "STATUS") {
       const claim = instance.Ranks.find((row) => row.rank === rank);
+      // A leading stop that succeeded proves every launch of the runs before its own ended
+      // (it waited for each earlier start to answer): recorded on the rank, so what those runs
+      // launched is no longer named by later stops, required as a definition, or a node an
+      // agent's action must be trusted on (`launchesEnded`).
+      const idle = succeeded ? await this.answeredIdle(tx, step.id) : false;
+      if (succeeded && isLeadingStop(step)) {
+        if (idle) await recordStoppedThrough(tx, instanceId, rank, step.generation - 1);
+        else {
+          // Stopped, but the node had another step that may launch in flight for the rank: no
+          // proof, the leading stop is not satisfied. It goes again shortly, and this run's
+          // starts (and the release of what the earlier run holds) wait for it, as for any
+          // leading stop not yet answered.
+          await tx.instanceStep.updateMany({
+            where: { id: step.id, state: "SUCCEEDED" },
+            data: {
+              state: "PENDING",
+              errorCode: STATUS_LAUNCH_PENDING,
+              notBefore: new Date(now.getTime() + RANK_BUSY_RETRY_MS),
+              rankIdle: null,
+            },
+          });
+        }
+      }
       if (succeeded && claim) {
         // The node proved this rank stopped. `releaseClaim` decides whether that releases the
         // claim: a proof of this run, after its launches (the leading stop of a restart proves
         // only that the previous run ended: the claim stays, the new run uses it); a probe
         // releases a claim marked stopped, or a stopping run's.
-        await releaseClaim(tx, claim.id, now, { result: { stepId: step.id } });
+        const released = await releaseClaim(tx, claim.id, now, { result: { stepId: step.id } });
+        // A status probe that answered stopped but not idle proves nothing: the step says so
+        // (`STATUS_LAUNCH_PENDING`), so the stop evidence never shows it as confirmed.
+        if (!released && phase === "STATUS" && !idle)
+          await tx.instanceStep.updateMany({
+            where: { id: step.id, state: "SUCCEEDED" },
+            data: { errorCode: STATUS_LAUNCH_PENDING },
+          });
       } else if (!succeeded && mine && isLeadingStop(step) && instance.phase === "STARTING") {
         // The previous run could not be proven stopped: the new run must not start over it.
         await this.gangStop(tx, instance, "startup_failed");
@@ -2952,6 +3088,16 @@ export class RuntimeLifecycle {
     rank: { id: string; rank: number; instanceId: string },
   ): Promise<Date> {
     const now = this.now();
+    // Read again under the fence: the rank was picked before it, and a restart may have taken
+    // the claim again since (HELD, a new run's): that claim is not this probe's to release.
+    const current = await tx.instanceRank.findUnique({
+      where: { id: rank.id },
+      select: { claim: true },
+    });
+    if (current?.claim !== "HELD_UNKNOWN") return now;
+    // Nothing launched since the last proven stop: released without asking the node (a probe
+    // would name this run, which the node never ran, and never prove it).
+    if (await releaseClaim(tx, rank.id, now, { neverRan: true })) return now;
     // This run's probes (an earlier run's never goes out, and says nothing about this one).
     const run = await resolveRun(tx, rank.instanceId);
     const recent = await tx.instanceStep.findMany({
@@ -3126,8 +3272,17 @@ export class RuntimeLifecycle {
         }
         if (record?.phase === "stopped") {
           if (instance.phase === "STOPPING" || claim.claim === "HELD_UNKNOWN") {
+            // The node can only say what it was sent: nothing of this run starts on it after
+            // this record may release the claim (a start claimed earlier, not sent yet, is not
+            // delivered: `SendGuard.stopsStartsThrough`).
+            this.relay.fenceRunStarts?.(
+              ref.nodeId,
+              instance.id,
+              claim.rank,
+              await resolveRun(tx, instance.id),
+            );
             await releaseClaim(tx, claim.id, this.now(), {
-              observation: { stepId: evidence.stepId },
+              observation: { stepId: evidence.stepId, rankIdle: record.rankIdle === true },
             });
             if (instance.phase === "STOPPING") await this.settleStopping(tx, instance);
             return;

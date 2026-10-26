@@ -916,6 +916,11 @@ try {
     "23514",
   );
   await expectFailure(
+    "instance_rank_bounds a negative stopped-through run",
+    `UPDATE instance_rank SET "stoppedThroughRun" = -1 WHERE id = 'rank-w0'`,
+    "23514",
+  );
+  await expectFailure(
     "instance_step_shape head address",
     `UPDATE instance_step SET "headAddr" = '' WHERE id = 'step-m1'`,
     "23514",

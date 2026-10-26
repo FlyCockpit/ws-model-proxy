@@ -43,7 +43,7 @@ beforeEach(() => {
 describe("requiredDefinitionsByNode", () => {
   it("counts live claims' launch versions, unfinished steps' versions and physical launches", async () => {
     db.instanceRank.findMany.mockResolvedValue([
-      { nodeId: "n1", Instance: { launchVersionId: "v-current" } },
+      { nodeId: "n1", claim: "HELD", Instance: { launchVersionId: "v-current" } },
     ] as never);
     db.$queryRaw.mockResolvedValue([
       { instanceId: "i-1", rank: 0, nodeId: "n1", intent: intent("v-old") },
@@ -64,14 +64,13 @@ describe("requiredDefinitionsByNode", () => {
     expect([...(required.get("n2") ?? [])]).toEqual(["v-step-2"]);
     expect(required.get("n3")?.size).toBe(0);
 
-    // Live claims only, unfinished steps only, the owner's instances, server-origin versions.
-    expect(db.instanceRank.findMany.mock.calls[0]?.[0]).toMatchObject({
-      where: {
-        nodeId: { in: ["n1", "n2", "n3"] },
-        claim: { in: ["HELD", "HELD_UNKNOWN"] },
-        Instance: { userId: OWNER },
-      },
-    });
+    // Every rank on the nodes (live claims count their launch version), unfinished steps only,
+    // the owner's instances, server-origin versions.
+    expect(db.instanceRank.findMany.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        where: { nodeId: { in: ["n1", "n2", "n3"] }, Instance: { userId: OWNER } },
+      }),
+    );
     expect(db.instanceStep.findMany.mock.calls[0]?.[0]).toMatchObject({
       where: {
         state: { in: ["PENDING", "RUNNING", "AWAITING_OPERATOR"] },
@@ -87,6 +86,7 @@ describe("requiredDefinitionsByNode", () => {
     db.instanceRank.findMany.mockResolvedValue(
       Array.from({ length: 200 }, (_, index) => ({
         nodeId: `n${index % 4}`,
+        claim: "HELD",
         Instance: { launchVersionId: "v-new" },
       })) as never,
     );
@@ -114,13 +114,51 @@ describe("requiredDefinitionsByNode", () => {
     expect(text).toContain("DISTINCT ON");
     expect(values).toContainEqual(OWNER);
     expect(values).toContainEqual(["n0", "n1", "n2", "n3"]);
-    expect(values).toContainEqual(["HELD", "HELD_UNKNOWN"]);
+    // Whatever the claim, launches after the rank's last proven stop.
+    expect(values).not.toContainEqual(["HELD", "HELD_UNKNOWN"]);
+    expect(text).toContain(`NOT (r.claim = 'RELEASED' AND r."releasedUnprovenAt" IS NULL)`);
+    expect(text).toContain(`s.generation > r."stoppedThroughRun"`);
     expect(values).toContainEqual([...RUN_START_PHASES]);
     expect(values).toContainEqual([...RUNTIME_JOB_PRE_ADMISSION_ERRORS]);
     expect(values).toContainEqual(1);
   });
 
-  it("reads no physical launch without a live rank, and nothing without nodes", async () => {
+  it("counts a released rank's physical launch, never its launch version", async () => {
+    // A rank released without proof may still run v-old (the lookup returns it); a released
+    // claim's own launch version needs nothing.
+    db.instanceRank.findMany.mockResolvedValue([
+      {
+        nodeId: "n1",
+        claim: "RELEASED",
+        releasedUnprovenAt: new Date(),
+        stoppedThroughRun: 0,
+        Instance: { launchVersionId: "v-next" },
+      },
+    ] as never);
+    db.$queryRaw.mockResolvedValue([
+      { instanceId: "i-1", rank: 0, nodeId: "n1", intent: intent("v-old") },
+    ] as never);
+    serverVersions("v-next", "v-old");
+    const required = await requiredDefinitionsByNode(db, { userId: OWNER, nodeIds: ["n1"] });
+    expect([...(required.get("n1") ?? [])]).toEqual(["v-old"]);
+  });
+
+  it("reads no physical launch when every rank on the nodes was released with proof", async () => {
+    db.instanceRank.findMany.mockResolvedValue([
+      {
+        nodeId: "n1",
+        claim: "RELEASED",
+        releasedUnprovenAt: null,
+        stoppedThroughRun: 0,
+        Instance: { launchVersionId: "v-old" },
+      },
+    ] as never);
+    const required = await requiredDefinitionsByNode(db, { userId: OWNER, nodeIds: ["n1"] });
+    expect(required.get("n1")?.size).toBe(0);
+    expect(db.$queryRaw).not.toHaveBeenCalled();
+  });
+
+  it("reads no physical launch without a rank, and nothing without nodes", async () => {
     const required = await requiredDefinitionsByNode(db, { userId: OWNER, nodeIds: ["n1"] });
     expect(required.get("n1")?.size).toBe(0);
     expect(db.$queryRaw).not.toHaveBeenCalled();

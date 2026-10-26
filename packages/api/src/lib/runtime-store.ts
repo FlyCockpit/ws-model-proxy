@@ -216,8 +216,12 @@ export async function syncRuntimeModels(
 }
 
 /** The caller's node, with what trust checks need; `unknown_node` otherwise. */
-export async function ownedNode(userId: string, nodeId: string) {
-  const node = await prisma.node.findFirst({
+/**
+ * The caller's node, or `unknown_node`. Read in the caller's owner-fenced transaction (`db`)
+ * when it authorizes a write by its trust: a trust change waits for that fence.
+ */
+export async function ownedNode(userId: string, nodeId: string, db: Tx = prisma) {
+  const node = await db.node.findFirst({
     where: { id: nodeId, userId },
     select: { id: true, slug: true, trust: true, trustLowerRequestedAt: true },
   });
@@ -308,6 +312,8 @@ export async function writePlannedStarts(
     starts: readonly PlannedStartWrite[];
     /** Per start (same order): the stopping instances its new ranks wait for. */
     blockedBy: ReadonlyArray<readonly string[]>;
+    /** Why a restarted instance starts (default: a restart asked for). */
+    phaseReason?: "restart_requested" | "definition_changed";
   },
 ): Promise<string[]> {
   const now = new Date();
@@ -328,7 +334,7 @@ export async function writePlannedStarts(
           desiredState: "RUNNING",
           phase: "STARTING",
           phaseChangedAt: now,
-          phaseReason: "restart_requested",
+          phaseReason: input.phaseReason ?? "restart_requested",
           needsOperator: null,
           needsOperatorSince: null,
           restartsInWindow: 0,

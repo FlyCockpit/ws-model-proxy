@@ -26,12 +26,12 @@
   "reservations": [
     {
       "index": 0,
-      "nodeId": "nd7f3k9q2w8e4r6t1y5u0i3o",
+      "nodeId": "wk7f3k9q2w8e4r6t1y5u0i3o",
       "node": "worker-a"
     },
     {
       "index": 1,
-      "nodeId": "nd2b6n8m4v1c9x7z3l5k0j8h",
+      "nodeId": "wk2b6n8m4v1c9x7z3l5k0j8h",
       "node": "worker-b"
     }
   ]

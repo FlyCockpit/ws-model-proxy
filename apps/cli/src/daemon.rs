@@ -469,7 +469,7 @@ pub fn connect_foreground() -> Result<()> {
     #[cfg(unix)]
     crate::file_ops::report_abandoned_recovery();
     let mut link =
-        NodeLink::new(&crate::runtime_store::load_for(startup.trust_value()).unwrap_or_default());
+        NodeLink::new(&crate::runtime_store::load_for(startup.trust_value()).unwrap_or_default())?;
     let mut reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
     loop {
         check_shutdown()?;
@@ -929,8 +929,11 @@ struct Session<'a> {
     telemetry: Option<crate::telemetry::Telemetry>,
     defines: Defines,
     runtimes: NodeRuntimes,
+    /// The daemon's runner (`NodeLink::runner`), shared by every connection.
     #[cfg(unix)]
-    runner: Option<crate::runtimes::runner::Runner>,
+    runner: Option<&'a crate::runtimes::runner::Runner>,
+    /// The daemon's inventory worker (`NodeLink::inventories`), shared by every connection.
+    inventories: Arc<crate::runtimes::inventory::Inventories>,
     /// The newest instance observation applied.
     #[cfg(unix)]
     observed_generation: u64,
@@ -948,7 +951,7 @@ fn command_max(store: &Store) -> Duration {
 /// What outlives one relay connection: the worker channel and the node
 /// commands (a long command keeps running through a reconnect), plus the
 /// command results that ended while disconnected and the image worker's
-/// storage quota and pending cleanup.
+/// storage quota and pending cleanup, and the runtime step runner.
 struct NodeLink {
     // One owner across reconnects: cleanup cannot reset or bypass the node quota.
     images: Arc<crate::terminal_images::ImageWorker>,
@@ -956,10 +959,20 @@ struct NodeLink {
     worker_rx: Receiver<FromWorker>,
     execs: ExecRegistry,
     deferred: Vec<OutboundFrame>,
+    /// One runner across reconnects: a step admitted under an earlier
+    /// connection still runs, and a stop under a later one cancels it
+    /// (`admit_step`), and a stop's or status probe's answer says whether
+    /// any step that may launch is still in flight there (`rank_idle`).
+    #[cfg(unix)]
+    runner: Option<crate::runtimes::runner::Runner>,
+    /// The one inventory worker, across reconnects (`runtimes::inventory::Inventories`): it
+    /// sends snapshots in capture order, so an older one never reaches the server after a newer
+    /// one.
+    inventories: Arc<crate::runtimes::inventory::Inventories>,
 }
 
 impl NodeLink {
-    fn new(store: &Store) -> Self {
+    fn new(store: &Store) -> Result<Self> {
         let (worker_tx, worker_rx) =
             mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
         let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_COMMAND_MAX);
@@ -976,13 +989,25 @@ impl NodeLink {
             ),
         }
         execs.set_command_max(command_max(store));
-        Self {
+        let inventories = crate::runtimes::inventory::Inventories::start()
+            .context("starting the runtime inventory worker")?;
+        Ok(Self {
             images: Arc::new(crate::terminal_images::ImageWorker::new()),
             worker_tx,
             worker_rx,
             execs,
             deferred,
-        }
+            #[cfg(unix)]
+            runner: crate::runtimes::runner::Runner::start()
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "runtime steps are unavailable"
+                    );
+                })
+                .ok(),
+            inventories: Arc::new(inventories),
+        })
     }
 
     /// While disconnected: keep command output flowing into the registry
@@ -1004,6 +1029,14 @@ impl NodeLink {
         }
         let ended = self.execs.poll(Instant::now());
         self.deferred.extend(ended);
+        // Step results and observations of a closed session drop (as when
+        // each connection had its own runner): the next connection observes
+        // afresh. Drained so the runner's threads never block on a full
+        // channel while offline.
+        #[cfg(unix)]
+        if let Some(runner) = self.runner.as_ref() {
+            while runner.try_update().is_some() {}
+        }
     }
 }
 
@@ -1090,14 +1123,8 @@ fn run_relay_session(
         defines: Defines::default(),
         runtimes: NodeRuntimes::load(startup.trust_value(), &startup.runtime_hosts()),
         #[cfg(unix)]
-        runner: crate::runtimes::runner::Runner::start()
-            .inspect_err(|error| {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "runtime steps are unavailable"
-                );
-            })
-            .ok(),
+        runner: link.runner.as_ref().inspect(|runner| runner.observe()),
+        inventories: Arc::clone(&link.inventories),
         #[cfg(unix)]
         observed_generation: 0,
         metric_commands_applied: None,
@@ -1872,6 +1899,7 @@ where
         detail,
         terminal_id: terminal_id.clone(),
         exit_code: None,
+        rank_idle: None,
     };
     if let Some(operator) = &job.operator {
         use crate::sessions::OperatorDelivery;
@@ -2166,7 +2194,7 @@ fn sync_metric_commands(session: &mut Session<'_>) {
 
 /// Send a fresh `runtime.inventory` (built off this loop).
 fn send_inventory(session: &Session) {
-    crate::runtimes::inventory::spawn(
+    session.inventories.capture(
         session.worker_tx.clone(),
         session.runtimes.store.clone(),
         session.runtimes.instance_records(),
@@ -6022,10 +6050,10 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_stop_uses_the_jobs_reservations_else_the_launchs() {
+    fn a_recorded_stop_uses_the_jobs_reservations_else_the_launch_reservations() {
         let reservation = |index: u8, node: &str| crate::protocol::frames::JobReservation {
             index,
-            node_id: format!("nd{index}"),
+            node_id: format!("wk{index}"),
             node: node.into(),
             gpu_ids: None,
         };

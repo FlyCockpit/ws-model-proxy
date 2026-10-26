@@ -65,6 +65,52 @@ describe("effectiveHardware: unified GPUs", () => {
     expect(hardware.reservedNowMemoryGb).toBe(74);
   });
 
+  it("keeps the memory a claim took on a unified GPU when the node stops reporting it", () => {
+    // Reconnected after a failed GPU detection: the node reports its memory and no GPU.
+    const held = (claim: Record<string, unknown>) =>
+      effectiveHardware({
+        declaredResources: null,
+        nodeInfo: { ...GB10_INFO, gpus: [] },
+        nodeMetrics: null,
+        nodeMetricsAt: null,
+        heldClaims: [{ current: [claim], previous: [] }],
+        now: NOW,
+      }).reservedNowMemoryGb;
+    const discrete = { kind: "discrete", gpuCount: 1, vramGb: 96, gpus: ["nvidia:0"] };
+    // Recorded unified when admitted.
+    expect(held({ ...discrete, unifiedGpus: ["nvidia:0"] })).toBe(96);
+    // Recorded before claims said which: a GPU gone from the report may have been unified.
+    expect(held(discrete)).toBe(96);
+    // Recorded as a discrete GPU: its VRAM was never node memory.
+    expect(held({ ...discrete, unifiedGpus: [] })).toBe(0);
+  });
+
+  it("counts the unified memory a claim without recorded GPUs may hold on a mixed node, as placement does", () => {
+    // One unified and one dedicated NVIDIA GPU: an unrecorded 32 GiB claim may be on either.
+    const hardware = effectiveHardware({
+      declaredResources: null,
+      nodeInfo: {
+        nodeKind: "unified",
+        memoryTotalMiB: 65536,
+        unifiedMemoryMiB: 65536,
+        gpus: [
+          { vendor: "nvidia", index: 0, name: "iGPU", vramTotalMiB: null, apu: true },
+          { vendor: "nvidia", index: 1, name: "dGPU", vramTotalMiB: 49152 },
+        ],
+      },
+      nodeMetrics: null,
+      nodeMetricsAt: null,
+      heldClaims: [
+        {
+          current: [{ kind: "discrete", gpuCount: 1, vramGb: 32, vendor: "nvidia" }],
+          previous: [],
+        },
+      ],
+      now: NOW,
+    });
+    expect(hardware.reservedNowMemoryGb).toBe(32);
+  });
+
   it("counts a restart's old and new claims of one instance once (the larger), instances adding", () => {
     const hardware = effectiveHardware({
       declaredResources: null,

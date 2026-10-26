@@ -680,6 +680,7 @@ ALTER TABLE instance_rank ADD CONSTRAINT instance_rank_bounds CHECK (
   AND "unitName" LIKE '%-r' || rank::text
   AND jsonb_typeof(resources) = 'object'
   AND "plannedGeneration" >= 0
+  AND "stoppedThroughRun" >= 0
   -- A replaced run's claim (lib/reservations.ts retakeInstanceClaims): all of it, or none.
   AND num_nonnulls("prevResources", "prevPort", "prevGeneration") IN (0, 3)
   AND ("prevDistPort" IS NULL OR "prevPort" IS NOT NULL)
@@ -2694,9 +2695,9 @@ BEGIN
     ('runtime_model', 'id,userId,runtimeId,upstreamModelId,type', ''),
     ('runtime_share', 'id,runtimeId,ownerUserId,granteeUserId', ''),
     ('runtime_instance', 'id,userId,runtimeId,launchVersionId,handle,desiredState', 'versionId,runGeneration'),
-    ('instance_rank', 'id,instanceId,nodeId,rank,claim,plannedGeneration,prevResources,prevPort,prevDistPort,prevGeneration', ''),
+    ('instance_rank', 'id,instanceId,nodeId,rank,claim,plannedGeneration,prevResources,prevPort,prevDistPort,prevGeneration,stoppedThroughRun', ''),
     ('instance_reservation', 'id,instanceId,nodeId,index,resources,supersededGeneration,plannedGeneration', ''),
-    ('instance_step', 'id,instanceId,nodeId,rank,phase,sequence,generation,intent,intentHash,state,headAddr,mayHaveRun', ''),
+    ('instance_step', 'id,instanceId,nodeId,rank,phase,sequence,generation,intent,intentHash,state,headAddr,mayHaveRun,rankIdle', ''),
     ('runtime_operation', 'id,userId,profileId', ''),
     ('execution_target', 'id,userId,kind,instanceId,runtimeModelId,providerModelId', ''),
     ('profile', 'id,userId,slug', ''),

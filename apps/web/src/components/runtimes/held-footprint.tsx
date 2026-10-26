@@ -6,6 +6,32 @@ import { formatGb } from "@/components/nodes/node-badges";
 type Instance = Awaited<ReturnType<AppRouterClient["runtimes"]["get"]>>["instanceList"][number];
 
 /**
+ * What else a claim holds beside its port and memory: its dist port (a multi-node instance) and
+ * its GPUs, so a person sees every resource a release frees. Nothing when it has neither.
+ */
+export function ClaimDetails({
+  distPort,
+  gpus,
+}: {
+  distPort: number | null;
+  gpus: readonly string[];
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const parts = [
+    ...(distPort === null
+      ? []
+      : [t("dashboard:runtime.heldFootprint.distPort", { port: distPort })]),
+    ...(gpus.length === 0
+      ? []
+      : [t("dashboard:runtime.heldFootprint.gpus", { gpus: gpus.join(", ") })]),
+  ];
+  if (parts.length === 0) return null;
+  return (
+    <span className="block break-words text-xs text-muted-foreground">{parts.join(" · ")}</span>
+  );
+}
+
+/**
  * Everything else an instance's claim keeps held beside its parts' current ports: each part's
  * claim of the run a restart replaced (`previousClaim`, on the same node), and the memory held on
  * other nodes (`launch.reservations`), the current plan's and a replaced run's (superseded) that
@@ -49,6 +75,7 @@ export function HeldFootprint({
               memory: memory(entry.claim.memoryGb),
               node: nodeName(entry.node),
             })}
+            <ClaimDetails distPort={entry.claim.distPort} gpus={entry.claim.gpus} />
           </li>
         ))}
         {current.map((reservation) => (
@@ -57,6 +84,7 @@ export function HeldFootprint({
               memory: memory(reservation.memoryGb),
               node: nodeName(reservation.nodeSlug),
             })}
+            <ClaimDetails distPort={null} gpus={reservation.gpus} />
           </li>
         ))}
         {superseded.map((reservation, position) => (
@@ -66,6 +94,7 @@ export function HeldFootprint({
               memory: memory(reservation.memoryGb),
               node: nodeName(reservation.nodeSlug),
             })}
+            <ClaimDetails distPort={null} gpus={reservation.gpus} />
           </li>
         ))}
       </ul>

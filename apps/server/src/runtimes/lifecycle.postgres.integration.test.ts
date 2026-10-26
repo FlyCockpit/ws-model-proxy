@@ -48,7 +48,13 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     room: true,
     closeAnswer: "closed" as "closed" | "running" | "absent",
     /** Per step: what closing it answers instead of `closeAnswer`. */
-    closeAnswers: new Map<string, "closed" | "running" | "absent">(),
+    closeAnswers: new Map<string, "unopened" | "closed" | "running" | "absent">(),
+    /**
+     * Steps whose current dispatch's confirm screen came up here (`progress` sent
+     * `awaiting_operator` or later): closing one before that answers `unopened`, as the relay's
+     * tracker does.
+     */
+    screenUp: new Set<string>(),
     closed: [] as string[],
     closedTerminals: [] as string[],
   };
@@ -81,6 +87,8 @@ integration("runtime lifecycle (PostgreSQL)", () => {
         connection: "ONLINE",
         connectionGeneration: 1,
         trust: "FULL",
+        // A current CLI: it proves what it runs (`rankIdle`).
+        features: { rankIdle: true },
       },
     });
     const spec = {
@@ -286,7 +294,11 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     const created = new m.lifecycle.RuntimeLifecycle({
       ...(scoped ? { onlineNodeIds: () => (session.online ? [nodeId] : []) } : {}),
       sendToNode: (_nodeId, frame) => {
-        if (frame.type === "runtime.job") sent.push(frame);
+        if (frame.type === "runtime.job") {
+          sent.push(frame);
+          // A new dispatch opens a fresh terminal: its screen is not up yet.
+          operatorRelay.screenUp.delete(frame.stepId);
+        }
         return true;
       },
       nodeSession: (id) =>
@@ -296,12 +308,14 @@ integration("runtime lifecycle (PostgreSQL)", () => {
               connectionGeneration: session.connectionGeneration,
               trust: session.trust,
               operatorTerminals: operatorRelay.supported,
+              rankIdle: true,
             }
           : null,
       operatorRoom: () => operatorRelay.room,
       closeOperatorStep: (stepId) => {
         operatorRelay.closed.push(stepId);
-        return operatorRelay.closeAnswers.get(stepId) ?? operatorRelay.closeAnswer;
+        const answer = operatorRelay.closeAnswers.get(stepId) ?? operatorRelay.closeAnswer;
+        return answer === "closed" && !operatorRelay.screenUp.has(stepId) ? "unopened" : answer;
       },
       closeOperatorTerminal: (_node, terminalId) => {
         operatorRelay.closedTerminals.push(terminalId);
@@ -376,6 +390,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       rank: job.rank,
       intentHash: job.intentHash,
       ownerEpoch: job.ownerEpoch,
+      ...(job.phase === "stop" || job.phase === "status" ? { rankIdle: true } : {}),
       status,
       stopped: extra.stopped ?? false,
       ...(status === "failed" ? { error: extra.error ?? "command_failed" } : {}),
@@ -462,7 +477,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(stopped.Ranks[0]?.claim).toBe("RELEASED");
   });
 
-  it("gang-stops a failed start, restarts it once with a leading stop, then fails", async () => {
+  it("gang-stops a failed start, restarts it once (its leading stop satisfied), then fails", async () => {
     const lc = await engine();
     const id = await startInstance(30_102);
     await lc.runOnce();
@@ -475,7 +490,8 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(row.phase).toBe("STOPPED");
     expect(row.nextRestartAt).not.toBeNull();
 
-    // The backoff passed: the claim is retaken and generation 2 starts with a stop.
+    // The backoff passed: the claim is retaken and generation 2 begins. Its stop was proven,
+    // so its leading stop has nothing to stop: it is satisfied, never sent, and the START goes.
     await m.fixture.runtimeInstance.update({
       where: { id },
       data: { nextRestartAt: new Date(Date.now() - 1_000) },
@@ -485,12 +501,16 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     row = await instance(id);
     expect(row.phase).toBe("STARTING");
     expect(row.Ranks[0]?.claim).toBe("HELD");
-    const leading = sent.slice(before).find((j) => j.instanceId === id);
-    expect(leading?.phase).toBe("stop");
-    expect(leading?.generation).toBe(2);
-    if (!leading) return;
-    await answer(lc, leading, "succeeded", { stopped: true });
-    await lc.runOnce();
+    expect(row.Ranks[0]?.stoppedThroughRun).toBe(1);
+    expect(
+      await m.fixture.instanceStep.findFirst({
+        where: { instanceId: id, generation: 2, phase: "STOP" },
+        select: { state: true, attempts: true },
+      }),
+    ).toEqual({ state: "SUCCEEDED", attempts: 0 });
+    const first = sent.slice(before).find((j) => j.instanceId === id);
+    expect(first?.phase).toBe("start");
+    expect(first?.generation).toBe(2);
     await answer(lc, lastJob(id, "start"), "failed", { error: "command_failed" });
     await lc.runOnce();
     await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
@@ -925,6 +945,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       rank: old.rank,
       intentHash: old.intentHash,
       ownerEpoch: old.ownerEpoch,
+      ...(old.phase === "stop" || old.phase === "status" ? { rankIdle: true } : {}),
       status: "failed",
       stopped: false,
       error: "health_failed",
@@ -1103,6 +1124,14 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     const count = 66;
     const ids: string[] = [];
     for (let index = 0; index < count; index++) ids.push(await startInstance(31_000 + index));
+    // They ran: their first start step went out (a rank that never launched is released, not
+    // probed).
+    await lc.runOnce();
+    expect(
+      await m.fixture.instanceStep.count({
+        where: { instanceId: { in: ids }, rank: 0, attempts: { gt: 0 } },
+      }),
+    ).toBe(count);
     await m.fixture.runtimeInstance.updateMany({
       where: { id: { in: ids } },
       data: { desiredState: "STOPPED", phase: "STOPPED", phaseReason: "stop_requested" },
@@ -1278,6 +1307,8 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     status: "awaiting_operator" | "operator_running" | "operator_closed" | "succeeded" | "failed",
     extra: { exitCode?: number; terminalId?: string; error?: "command_failed" } = {},
   ) {
+    if (status === "awaiting_operator" || status === "operator_running")
+      operatorRelay.screenUp.add(job.stepId);
     await lc.handleJobResult(ref(), {
       type: "runtime.job.result",
       stepId: job.stepId,
@@ -1285,6 +1316,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       rank: job.rank,
       intentHash: job.intentHash,
       ownerEpoch: job.ownerEpoch,
+      ...(job.phase === "stop" || job.phase === "status" ? { rankIdle: true } : {}),
       status,
       stopped: false,
       terminalId: extra.terminalId ?? job.operator?.terminalId,
@@ -1792,6 +1824,29 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       expect(inst.Ranks[0]?.claim).toBe("RELEASED");
     } finally {
       await unban();
+    }
+  });
+
+  it("a close nothing here tracks keeps the attempt: the rank needs a proven stop", async () => {
+    // The screen's progress never reached this process (another one holds the session, or the
+    // write was lost): its columns say the screen never came up, but nothing proves it.
+    const lc = await engine();
+    const id = await startInstance(30_222, "USER", "operator");
+    await lc.runOnce();
+    const start = await step(id, "START");
+    expect(start.state).toBe("RUNNING");
+    operatorRelay.closeAnswers.set(start.id, "absent");
+    try {
+      await stopInstance(id);
+      await lc.runOnce();
+      const row = await step(id, "START");
+      expect(row).toMatchObject({ state: "FAILED", attempts: 1 });
+      // Not released without proof: a stop goes out, and its proof releases the claim.
+      expect((await instance(id)).Ranks[0]?.claim).toBe("HELD");
+      await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
+      expect((await instance(id)).Ranks[0]?.claim).toBe("RELEASED");
+    } finally {
+      operatorRelay.closeAnswers.clear();
     }
   });
 

@@ -34,7 +34,7 @@ import { agentBlockedNode, OCCUPANCY_SELECT } from "../lib/instance-occupancy";
 import { readLiveLoad } from "../lib/live-load";
 import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { isHiddenCodePoint } from "../lib/runtime-spec";
-import { INSTANCE_INCLUDE, instanceView, loadStepVersions } from "../lib/runtime-views";
+import { INSTANCE_INCLUDE, instanceView, loadStepRefs } from "../lib/runtime-views";
 import {
   latestStopChecks,
   nodeConnectionView,
@@ -270,7 +270,7 @@ async function instanceResult(context: SignedInContext, userId: string, instance
     row,
     await latestStopChecks(prisma, [row]),
     readLiveLoad(context.services?.liveLoad, [row.id]),
-    await loadStepVersions(prisma, userId, [row]),
+    await loadStepRefs(prisma, userId, [row]),
   );
 }
 

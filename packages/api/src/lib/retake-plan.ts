@@ -6,7 +6,14 @@
  * start may have taken that room meanwhile; retaking without this check would over-commit the
  * node. Callers hold the owner fence (every claim writer on the owner's nodes takes it), so the
  * check and the retake are one decision.
+ *
+ * An agent's instance restarts on the agent's rules (owner decision): every node the restart
+ * reaches must be at Full control, as for the agent's own restart (`runtime_start` with the
+ * instance id): its ranks, every reservation row still held, a replaced run's included, and the
+ * reservation nodes a launch that may still run names (the leading STOP acts there). Otherwise it is refused (`trust_relay`) and waits like any refused
+ * restart; a person may restart it.
  */
+import { agentBlockedNodeWithCleanup, OCCUPANCY_SELECT } from "./instance-occupancy";
 import { PlacementPlanner, type PlacementRefusal, type PlannedStart } from "./placement";
 import { loadPlacementContext } from "./placement-load";
 import type { RuntimeLaunch } from "./runtime-spec";
@@ -33,6 +40,25 @@ export async function planRetake(
   launch: RuntimeLaunch,
   now: Date,
 ): Promise<RetakePlan> {
+  if (instance.startedBy === "AGENT") {
+    const occupancy = await tx.runtimeInstance.findFirst({
+      where: { id: instance.id, userId: instance.userId },
+      select: OCCUPANCY_SELECT,
+    });
+    const blocked = occupancy
+      ? await agentBlockedNodeWithCleanup(tx, instance.userId, { id: instance.id, ...occupancy })
+      : null;
+    if (blocked)
+      return {
+        ok: false,
+        refusal: {
+          reason: "trust_relay",
+          subjectId: blocked.nodeId ?? instance.id,
+          message:
+            "A node this agent-started instance holds is Relay only: agents cannot start or stop runtimes there. A person can restart it in the browser.",
+        },
+      };
+  }
   const planner = new PlacementPlanner(
     // An agent's instance keeps the agent's rules (Full-control nodes only for reservations).
     await loadPlacementContext(tx, {

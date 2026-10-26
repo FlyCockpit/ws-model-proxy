@@ -4,6 +4,7 @@ import { hasProvedEmail } from "@ws-model-proxy/auth/proved-email";
 import prisma from "@ws-model-proxy/db";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { agentRulesApply } from "../contracts/auth-context";
+import type { RefusalReason } from "../contracts/refusals";
 import { runtimesContract as c, runtimeSlugSchema } from "../contracts/runtimes";
 import { callerActor } from "../lib/caller-actor";
 import { canonicalJson } from "../lib/canonical-json";
@@ -13,10 +14,14 @@ import {
   instanceCapacityFences,
   runtimeCapacityFences,
 } from "../lib/graph-write";
-import { agentBlockedNode, currentReservations, OCCUPANCY_SELECT } from "../lib/instance-occupancy";
-import { beginRun, resolveRun } from "../lib/instance-run";
+import {
+  agentBlockedNodeWithCleanup,
+  currentReservations,
+  OCCUPANCY_SELECT,
+} from "../lib/instance-occupancy";
 import { readLiveLoad } from "../lib/live-load";
-import { requiredDefinitionsByNode } from "../lib/node-definitions";
+import { PlacementPlanner } from "../lib/placement";
+import { loadPlacementContext } from "../lib/placement-load";
 import {
   isForeignKeyViolation,
   isUniqueViolation,
@@ -26,11 +31,10 @@ import {
 } from "../lib/refuse";
 import { jsonObject } from "../lib/registry-view";
 import { type RequestCompat, storedRequestCompat } from "../lib/request-compat";
-import { heldClaimsMatch, launchIdentity, reservationsKey } from "../lib/reservations";
+import { launchIdentity, reservationsKey } from "../lib/reservations";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
 import {
   authoredRuntimeSpecSchema,
-  RUNTIME_DEFINITIONS_MAX,
   type RuntimeSpec,
   runtimeSpecSchema,
   runtimeSpecWarnings,
@@ -43,14 +47,17 @@ import {
   derivedColumns,
   type LimitColumns,
   ownedNode,
+  type PlannedStartWrite,
   specIsInteractive,
   syncRuntimeModels,
+  type Tx,
   versionHashes,
+  writePlannedStarts,
 } from "../lib/runtime-store";
 import {
   INSTANCE_INCLUDE,
   instanceView,
-  loadStepVersions,
+  loadStepRefs,
   previousLaunchHashes,
   RUNTIME_SUMMARY_INCLUDE,
   type RuntimeSummaryRow,
@@ -150,10 +157,12 @@ async function createRuntime(context: SignedInContext, input: CreateInput) {
     throw new ORPCError("BAD_REQUEST", {
       message: "An always-on runtime names its node; a startable one does not.",
     });
-  if (input.nodeId) assertAgentMayUseNode(context, await ownedNode(userId, input.nodeId));
   let created: { runtimeId: string };
   try {
     created = await graphWrite([userId], async (tx) => {
+      // Under the owner fence: a trust change (a person's lowering, the node's report) waits
+      // for it, so the node is not lowered between this check and the write.
+      if (input.nodeId) assertAgentMayUseNode(context, await ownedNode(userId, input.nodeId, tx));
       const runtime = await tx.runtime.create({
         data: {
           userId,
@@ -409,7 +418,7 @@ export const runtimesRouter = {
       }),
     ]);
     const stopChecks = await latestStopChecks(prisma, instances);
-    const stepVersions = await loadStepVersions(prisma, userId, instances);
+    const stepRefs = await loadStepRefs(prisma, userId, instances);
     const liveLoad = readLiveLoad(
       context.services?.liveLoad,
       instances.map((row) => row.id),
@@ -434,7 +443,7 @@ export const runtimesRouter = {
       current: versionDetail(current, previous, factsFrom),
       requestProfile: profile ? requestProfileView(profile) : null,
       servedModels: models.map(runtimeModelView),
-      instanceList: instances.map((row) => instanceView(row, stopChecks, liveLoad, stepVersions)),
+      instanceList: instances.map((row) => instanceView(row, stopChecks, liveLoad, stepRefs)),
       shares: shares.map((share) => ({ id: share.id, email: share.Grantee.email })),
       contributions: models.flatMap((model) =>
         model.Members.filter((member) => member.shareId !== null).map((member) => ({
@@ -591,12 +600,20 @@ export const runtimesRouter = {
         runtime.id,
         "This runtime is defined on its node: edit its definition there. Limits and advanced settings can be changed here.",
       );
-    if (launchChanged && runtime.Node && effectiveTrust(runtime.Node) !== "FULL")
-      throw refuseAbout(
-        "launch_change_on_relay_only",
-        runtime.Node.id,
-        "This node is Relay only, so its always-on definition is frozen. Change it on the node, or raise trust with `wsmp trust full`.",
-      );
+    // Refused at Relay only: checked under the owner fence below (a trust change waits for it).
+    const assertDefinitionUnfrozen = async (tx: Tx) => {
+      if (!launchChanged || !runtime.Node) return;
+      const node = await tx.node.findUnique({
+        where: { id: runtime.Node.id },
+        select: { trust: true, trustLowerRequestedAt: true },
+      });
+      if (!node || effectiveTrust(node) !== "FULL")
+        throw refuseAbout(
+          "launch_change_on_relay_only",
+          runtime.Node.id,
+          "This node is Relay only, so its always-on definition is frozen. Change it on the node, or raise trust with `wsmp trust full`.",
+        );
+    };
     // A served model that moves to another type would break the pools it is in.
     const nextType = derivedColumns(spec).modelType;
     if (nextType !== current.modelType) {
@@ -617,17 +634,11 @@ export const runtimesRouter = {
     const agent = agentRulesApply(context.auth);
     const adoptedLive: string[] = [];
     const restarted: string[] = [];
-    const needsRestart: Array<{
-      instanceId: string;
-      reason:
-        | "launch_changed"
-        | "trust_relay"
-        | "interactive_needs_person"
-        | "definition_slots_full";
-    }> = [];
+    const needsRestart: Array<{ instanceId: string; reason: RefusalReason }> = [];
     const { version, operationId } = await graphWrite(
       [userId],
       async (tx) => {
+        await assertDefinitionUnfrozen(tx);
         // Read and classify under the owner fence (a trust change waits for it).
         adoptedLive.length = 0;
         restarted.length = 0;
@@ -638,48 +649,19 @@ export const runtimesRouter = {
             id: true,
             desiredState: true,
             LaunchVersion: { select: { launchHash: true, spec: true } },
+            // Every node the instance occupies (`OCCUPANCY_SELECT`, for agents), with the ranks'
+            // ports (a restart keeps its nodes and ports, as `runtime_start` with its id).
             Ranks: {
-              select: {
-                ...OCCUPANCY_SELECT.Ranks.select,
-                // Where the claim is, for `heldClaimsMatch`: its port, dist port, node labels.
-                Node: { select: { ...OCCUPANCY_SELECT.Ranks.select.Node.select, labels: true } },
-                resources: true,
-                port: true,
-                distPort: true,
-              },
-              orderBy: { rank: "asc" },
+              ...OCCUPANCY_SELECT.Ranks,
+              select: { ...OCCUPANCY_SELECT.Ranks.select, port: true, distPort: true },
             },
-            Fabric: { select: { name: true } },
-            // Every row (superseded ones still hold for agents' trust checks); what the
-            // instance claims now is the current rows (`currentReservations`).
-            Reservations: {
-              select: { ...OCCUPANCY_SELECT.Reservations.select, labels: true, resources: true },
-              orderBy: { index: "asc" },
-            },
+            Reservations: OCCUPANCY_SELECT.Reservations,
           },
         });
-        // A restart makes each of its Full-control nodes require the new version beside the old
-        // one (still running until its stop is proven): it must fit among the definitions each
-        // node already requires (`RUNTIME_DEFINITIONS_MAX`). Counted once per node.
-        const required =
-          input.restartRunning && runtime.origin === "SERVER"
-            ? await requiredDefinitionsByNode(tx, {
-                userId,
-                nodeIds: instances.flatMap((instance) =>
-                  instance.Ranks.flatMap((rank) => (rank.Node ? [rank.Node.id] : [])),
-                ),
-              })
-            : null;
-        const withNewVersion = new Set<string>();
-        const definitionSlotsFull = (ranks: (typeof instances)[number]["Ranks"]) =>
-          required !== null &&
-          ranks.some(
-            (rank) =>
-              rank.Node !== null &&
-              effectiveTrust(rank.Node) === "FULL" &&
-              !withNewVersion.has(rank.Node.id) &&
-              (required.get(rank.Node.id)?.size ?? 0) >= RUNTIME_DEFINITIONS_MAX,
-          );
+        // Restarted as `runtime_start` with the instance id restarts it (without stopping
+        // others): placed again on its nodes by the planner, its capacity, definition slots and
+        // labels included, so it may take other resources, ports or reservations.
+        const candidates: typeof instances = [];
         for (const instance of instances) {
           // Always-on: the address is the launch; nothing to restart. A started instance adopts
           // live only when what it launched has the new launch hash (an earlier launch change it
@@ -691,38 +673,15 @@ export const runtimesRouter = {
             (instance.LaunchVersion.launchHash === hashes.launchHash && sameReservations)
           )
             adoptedLive.push(instance.id);
-          else if (
-            !input.restartRunning ||
-            // The restart below keeps its claims where they are and as they are: only when what
-            // the instance holds (its rank claims and reservation rows, not its version's spec)
-            // is what the new version claims, and where they are (ports, node labels, fabric)
-            // satisfies it. Other resources, reservations, a changed fixed port or fabric are
-            // placed, with the planner's checks, only by a start (runtime_start with the
-            // instance id).
-            !heldClaimsMatch(
-              spec,
-              instance.Ranks,
-              currentReservations(instance.Reservations),
-              instance.Fabric,
-            ) ||
-            // Released claims (failed, stopped ranks) are re-placed by a start, not here.
-            instance.Ranks.some((rank) => rank.claim !== "HELD")
-          )
+          else if (!input.restartRunning || !spec.launch)
             needsRestart.push({ instanceId: instance.id, reason: "launch_changed" });
           // Every node the restart reaches: the ranks' and the reservations' (a worker lowered
           // to Relay only after placement, a replaced run's worker still holding).
-          else if (agent && agentBlockedNode(instance))
+          else if (agent && (await agentBlockedNodeWithCleanup(tx, userId, instance)))
             needsRestart.push({ instanceId: instance.id, reason: "trust_relay" });
           else if (agent && specIsInteractive(spec))
             needsRestart.push({ instanceId: instance.id, reason: "interactive_needs_person" });
-          else if (definitionSlotsFull(instance.Ranks))
-            needsRestart.push({ instanceId: instance.id, reason: "definition_slots_full" });
-          else {
-            restarted.push(instance.id);
-            for (const rank of instance.Ranks)
-              if (rank.Node && effectiveTrust(rank.Node) === "FULL")
-                withNewVersion.add(rank.Node.id);
-          }
+          else candidates.push(instance);
         }
 
         const created = await createVersion(tx, {
@@ -759,8 +718,50 @@ export const runtimesRouter = {
               data: { versionId: created.id, launchVersionId: created.id },
             });
         }
+        const starts: PlannedStartWrite[] = [];
+        const blockedBy: string[][] = [];
+        if (candidates.length > 0 && spec.launch) {
+          const planner = new PlacementPlanner(await loadPlacementContext(tx, { userId, agent }));
+          for (const instance of candidates) {
+            const reservationNodeIds: Array<string | null> = [];
+            for (const reservation of currentReservations(instance.Reservations))
+              reservationNodeIds[reservation.index] = reservation.nodeId;
+            const ranks = [...instance.Ranks].sort((a, b) => a.rank - b.rank);
+            const result = planner.place({
+              runtimeId: runtime.id,
+              versionId: created.id,
+              launch: spec.launch,
+              nodeIds: ranks.map((rank) => rank.nodeId ?? ""),
+              restart: {
+                instanceId: instance.id,
+                ports: ranks.map((rank) => rank.port),
+                distPort: ranks[0]?.distPort ?? null,
+                reservationNodeIds,
+              },
+              checkFrozen: false,
+              nodeOrigin: runtime.origin === "NODE",
+              // Nothing confirmed a preview: no other instance is stopped for it.
+              preempt: false,
+            });
+            if (!result.ok) {
+              needsRestart.push({ instanceId: instance.id, reason: result.refusal.reason });
+              continue;
+            }
+            restarted.push(instance.id);
+            starts.push({
+              runtimeId: runtime.id,
+              versionId: created.id,
+              instanceId: instance.id,
+              placements: result.start.placements,
+              reservations: result.start.reservations,
+              fabric: result.start.fabric,
+              distPort: result.start.distPort,
+            });
+            blockedBy.push(result.start.blockedBy);
+          }
+        }
         let restartOperationId: string | null = null;
-        if (restarted.length > 0) {
+        if (starts.length > 0) {
           const operation = await tx.runtimeOperation.create({
             data: {
               userId,
@@ -775,31 +776,16 @@ export const runtimesRouter = {
             select: { id: true },
           });
           restartOperationId = operation.id;
-          // The runs being replaced, read before the restart is written (a row from before runs
-          // existed is bootstrapped from its steps now).
-          for (const instanceId of restarted) await resolveRun(tx, instanceId);
-          await tx.runtimeInstance.updateMany({
-            where: { id: { in: restarted } },
-            data: {
-              versionId: created.id,
-              launchVersionId: created.id,
-              operationId: operation.id,
-              desiredState: "RUNNING",
-              phase: "STARTING",
-              phaseChangedAt: new Date(),
-              phaseReason: "definition_changed",
-              needsOperator: null,
-              needsOperatorSince: null,
-              restartsInWindow: 0,
-              restartWindowStartedAt: null,
-              nextRestartAt: null,
-            },
+          // The same write as `runtime_start`'s restart: each begins a new run in this commit
+          // (`instance-run.ts`), and its claims are the plan's.
+          await writePlannedStarts(tx, {
+            userId,
+            operationId: operation.id,
+            startedBy: actor.actor,
+            starts,
+            blockedBy,
+            phaseReason: "definition_changed",
           });
-          // Each restart begins a new run in this commit (`instance-run.ts`): nothing of the
-          // old run is dispatched from now on, and its late answers (a stop of a crash that was
-          // being stopped, a readiness) change nothing; the new run's leading stop proves the
-          // old one ended. The capacity fences above cover every instance of the runtime.
-          for (const instanceId of restarted) await beginRun(tx, instanceId);
         }
         const row = await tx.runtimeVersion.findUniqueOrThrow({
           where: { id: created.id },
@@ -831,34 +817,38 @@ export const runtimesRouter = {
       select: { id: true },
     });
     if (!runtime) throw notFound("That runtime does not exist.");
-    const busy = await prisma.runtimeInstance.count({
-      where: {
-        runtimeId: runtime.id,
-        OR: [
-          { desiredState: "RUNNING" },
-          { Ranks: { some: { claim: { in: ["HELD", "HELD_UNKNOWN"] } } } },
-        ],
-      },
-    });
-    if (busy > 0)
-      throw refuse("instances_running", "Stop this runtime's instances before deleting it.");
-    const pinned = await prisma.profileItem.count({ where: { runtimeId: runtime.id } });
-    if (pinned > 0)
-      throw refuse(
-        "pinned_by_profile",
-        "A profile pins this runtime. Remove it from the profile first.",
-      );
-    const members = await prisma.poolMember.findMany({
-      where: { RuntimeModel: { runtimeId: runtime.id } },
-      select: { id: true },
-    });
+    let members: Array<{ id: string }> = [];
     try {
-      await graphDelete({ userId, runtimeIds: [runtime.id] }, async (tx) => {
+      members = await graphDelete({ userId, runtimeIds: [runtime.id] }, async (tx) => {
+        // Decided under the fences (the owner's, and every instance's capacity fence): a start
+        // committed before them is seen here, and none commits until this delete does.
+        const busy = await tx.runtimeInstance.count({
+          where: {
+            runtimeId: runtime.id,
+            OR: [
+              { desiredState: "RUNNING" },
+              { Ranks: { some: { claim: { in: ["HELD", "HELD_UNKNOWN"] } } } },
+            ],
+          },
+        });
+        if (busy > 0)
+          throw refuse("instances_running", "Stop this runtime's instances before deleting it.");
+        const pinned = await tx.profileItem.count({ where: { runtimeId: runtime.id } });
+        if (pinned > 0)
+          throw refuse(
+            "pinned_by_profile",
+            "A profile pins this runtime. Remove it from the profile first.",
+          );
+        const removed = await tx.poolMember.findMany({
+          where: { RuntimeModel: { runtimeId: runtime.id } },
+          select: { id: true },
+        });
         // Its invites go with it (the cascade would too): no link opens a deleted runtime.
         await tx.shareInvite.deleteMany({ where: { runtimeId: runtime.id, ownerUserId: userId } });
         await tx.runtimeInstance.deleteMany({ where: { runtimeId: runtime.id } });
         await tx.runtime.update({ where: { id: runtime.id }, data: { currentVersionId: null } });
         await tx.runtime.delete({ where: { id: runtime.id } });
+        return removed;
       });
     } catch (error) {
       if (isForeignKeyViolation(error))
@@ -924,7 +914,10 @@ export const runtimesRouter = {
             });
           // Agents mark stopped only on Full-control nodes (a node that left counts as not Full):
           // the marked ranks' and the reservations' they hold memory on.
-          const blocked = agent ? agentBlockedNode({ ...instance, Ranks: ranks }) : null;
+          // Their status probes name what may still run there: the nodes it names count too.
+          const blocked = agent
+            ? await agentBlockedNodeWithCleanup(tx, userId, { ...instance, Ranks: ranks })
+            : null;
           if (blocked)
             throw refuseAbout(
               "trust_relay",
@@ -1002,7 +995,7 @@ export const runtimesRouter = {
         row,
         await latestStopChecks(prisma, [row]),
         readLiveLoad(context.services?.liveLoad, [row.id]),
-        await loadStepVersions(prisma, userId, [row]),
+        await loadStepRefs(prisma, userId, [row]),
       );
     }),
     releaseUnproven: runtimeReleaseUnproven,

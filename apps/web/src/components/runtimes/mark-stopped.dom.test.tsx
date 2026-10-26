@@ -75,6 +75,8 @@ const RUNTIME = {
           nodeId: "node-1",
           nodeSlug: "box",
           port: 30001,
+          distPort: 30002 as number | null,
+          gpus: ["nvidia:1"],
           reserved: "HELD",
           unitName: "u",
           nodeConnection: { state: "OFFLINE", since: "2026-10-07T09:00:00.000Z" },
@@ -89,6 +91,8 @@ const RUNTIME = {
           nodeId: "node-2",
           nodeSlug: "other",
           port: 30001,
+          distPort: 30002 as number | null,
+          gpus: [] as string[],
           reserved: "HELD",
           unitName: "u",
           nodeConnection: { state: "ONLINE", since: "2026-10-07T08:00:00.000Z" },
@@ -230,8 +234,24 @@ describe("MarkStoppedAction", () => {
     if (!instance) throw new Error("no instance");
     // The runtime's own node was removed; its reservation on w1 still holds (and one released).
     instance.reservations = [
-      { index: 0, nodeId: "w1", nodeSlug: "w1", labels: [], memoryGb: 100, reserved: "HELD" },
-      { index: 1, nodeId: "w2", nodeSlug: "w2", labels: [], memoryGb: 8, reserved: "RELEASED" },
+      {
+        index: 0,
+        nodeId: "w1",
+        nodeSlug: "w1",
+        labels: [],
+        memoryGb: 100,
+        gpus: [],
+        reserved: "HELD",
+      },
+      {
+        index: 1,
+        nodeId: "w2",
+        nodeSlug: "w2",
+        labels: [],
+        memoryGb: 8,
+        gpus: [],
+        reserved: "RELEASED",
+      },
     ];
     try {
       mount(<MarkStoppedAction runtimeId="rt-1" instanceId="inst-1" />);
@@ -253,12 +273,30 @@ describe("MarkStoppedAction", () => {
     if (!instance || !first) throw new Error("no instance");
     // After a restart moved the worker: the old one (w-old) and the old port still hold.
     instance.reservations = [
-      { index: 0, nodeId: "w-new", nodeSlug: "w-new", labels: [], memoryGb: 20, reserved: "HELD" },
+      {
+        index: 0,
+        nodeId: "w-new",
+        nodeSlug: "w-new",
+        labels: [],
+        memoryGb: 20,
+        gpus: ["amd:0", "amd:1"],
+        reserved: "HELD",
+      },
     ];
     instance.supersededReservations = [
-      { index: 0, nodeId: "w-old", nodeSlug: "w-old", labels: [], memoryGb: 100, reserved: "HELD" },
+      {
+        index: 0,
+        nodeId: "w-old",
+        nodeSlug: "w-old",
+        labels: [],
+        memoryGb: 100,
+        gpus: [],
+        reserved: "HELD",
+      },
     ];
-    Object.assign(first, { previousClaim: { port: 30005, distPort: null, memoryGb: 64 } });
+    Object.assign(first, {
+      previousClaim: { port: 30005, distPort: 30006, memoryGb: 64, gpus: ["nvidia:0"] },
+    });
     try {
       mount(<MarkStoppedAction runtimeId="rt-1" instanceId="inst-1" />);
       fireEvent.click(screen.getByRole("button", { name: ACTION }));
@@ -274,6 +312,20 @@ describe("MarkStoppedAction", () => {
       ).toBeTruthy();
       expect(
         within(dialog).getByText("dashboard:runtime.heldFootprint.previousClaim:30005|64 GB|box"),
+      ).toBeTruthy();
+      // Every resource held: the dist ports and GPUs too (the current claim's and the old ones).
+      expect(
+        within(dialog).getByText(
+          "dashboard:runtime.heldFootprint.distPort:30006 · dashboard:runtime.heldFootprint.gpus:nvidia:0",
+        ),
+      ).toBeTruthy();
+      expect(
+        within(dialog).getByText("dashboard:runtime.heldFootprint.gpus:amd:0, amd:1"),
+      ).toBeTruthy();
+      expect(
+        within(dialog).getByText(
+          "dashboard:runtime.heldFootprint.distPort:30002 · dashboard:runtime.heldFootprint.gpus:nvidia:1",
+        ),
       ).toBeTruthy();
     } finally {
       instance.reservations = [];

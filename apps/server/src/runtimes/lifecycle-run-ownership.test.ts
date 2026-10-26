@@ -40,7 +40,14 @@ type Instance = Row & {
   Ranks: Rank[];
   Reservations: Reservation[];
 };
-type NodeRow = { id: string; online: boolean; labels: string[]; memoryGb: number };
+type NodeRow = {
+  id: string;
+  online: boolean;
+  labels: string[];
+  memoryGb: number;
+  /** Stored hello features; absent: a current CLI (`rankIdle`). */
+  features?: Row;
+};
 
 const store = vi.hoisted(() => ({
   instances: [] as Instance[],
@@ -179,6 +186,7 @@ const db = vi.hoisted(() => {
     trust: "FULL",
     trustLowerRequestedAt: null,
     connectionGeneration: 1,
+    features: node.features ?? { rankIdle: true },
   });
   const answer = (model: string, method: string, args: Row = {}): unknown => {
     const where = (args.where ?? {}) as Row;
@@ -403,7 +411,7 @@ const { RuntimeLifecycle } = await import("./lifecycle.js");
 const { writePlannedStarts } = await import("@ws-model-proxy/api/lib/runtime-store");
 const { DbNull } = await import("@ws-model-proxy/db/json-null");
 const { releaseClaim } = await import("@ws-model-proxy/api/lib/claim-release");
-const { beginRun, resolveRun, slotOf, owned } = await import(
+const { beginRun, resolveRun, slotOf, owned, startsUnresolved } = await import(
   "@ws-model-proxy/api/lib/instance-run"
 );
 const { reservationClaim } = await import("@ws-model-proxy/api/lib/reservations");
@@ -452,7 +460,13 @@ function engine() {
       onlineNodeIds: () => store.nodes.filter((node) => node.online).map((node) => node.id),
       nodeSession: (nodeId: string) =>
         store.nodes.find((node) => node.id === nodeId)?.online
-          ? { userId: "u1", connectionGeneration: 1, trust: "full", operatorTerminals: true }
+          ? {
+              userId: "u1",
+              connectionGeneration: 1,
+              trust: "full",
+              operatorTerminals: true,
+              rankIdle: true,
+            }
           : null,
       sendToNode: (nodeId: string, frame: unknown) => {
         const job = frame as Row;
@@ -586,6 +600,8 @@ function result(frame: Row, outcome: Partial<JobResult>): JobResult {
     rank: Number(frame.rank ?? 0),
     intentHash: String(frame.intentHash),
     ownerEpoch: String(frame.ownerEpoch),
+    // A current CLI says whether the rank was idle when a stop or probe answered.
+    ...(frame.phase === "stop" || frame.phase === "status" ? { rankIdle: true } : {}),
     ...outcome,
   } as JobResult;
 }
@@ -625,6 +641,9 @@ function addGeneration(
       nodeId: "head",
       state: wanted?.state ?? "PENDING",
       attempts: wanted?.attempts ?? (wanted && wanted.state !== "PENDING" ? 1 : 0),
+      // A stop the node answered said its rank was idle.
+      rankIdle: step.phase === "STOP" && wanted?.state === "SUCCEEDED" ? true : null,
+      mayHaveRun: false,
       notBefore: null,
       errorCode: null,
       operatorHold: null,
@@ -666,6 +685,8 @@ function addStop(
     nodeId: "head",
     state,
     attempts: state === "PENDING" ? 0 : 1,
+    rankIdle: state === "SUCCEEDED" ? true : null,
+    mayHaveRun: false,
     notBefore: null,
     errorCode: null,
     operatorHold: null,
@@ -727,6 +748,8 @@ function inventoryRecord(id: string, phase: string, stepId?: string) {
     port: 30000,
     handle: main(id).handle as string,
     models: [],
+    // A current CLI: nothing that may launch was in flight for the rank as it observed.
+    rankIdle: true,
   };
 }
 async function inventory(records: ReturnType<typeof inventoryRecord>[]) {
@@ -1137,6 +1160,72 @@ describe("stop proofs are of the current run, after its launches (F5, R3-B-1, C3
     expect(answer).toEqual({ ok: true, stale: [main().handle] });
   });
 
+  it("a status probe and an inventory release fence their run's starts at the socket first", async () => {
+    // A START claimed earlier but not sent yet must not go out after a proof that may release
+    // the claim: the node can only say what it was sent.
+    const guards: Array<{ phase: unknown; through?: number }> = [];
+    const fences: number[] = [];
+    const fenced = () =>
+      new RuntimeLifecycle(
+        {
+          onlineNodeIds: () => ["head"],
+          nodeSession: () => ({
+            userId: "u1",
+            connectionGeneration: 1,
+            trust: "full",
+            rankIdle: true,
+          }),
+          sendToNode: (nodeId: string, frame: unknown, guard?: { stopsStartsThrough?: number }) => {
+            sent.push({ nodeId, frame: frame as Row });
+            guards.push({ phase: (frame as Row).phase, through: guard?.stopsStartsThrough });
+            return true;
+          },
+          fenceRunStarts: (_node: string, _instance: string, _rank: number, through: number) =>
+            fences.push(through),
+        } as unknown as ConstructorParameters<typeof RuntimeLifecycle>[0],
+        { now: () => now },
+      );
+    store.instances = [instance("inst", { phase: "STOPPED", runGeneration: 1 })];
+    store.steps = [];
+    Object.assign(rank(), { claim: "HELD_UNKNOWN", markedStoppedAt: now, lastStopCheckAt: null });
+    addGeneration("inst", 1, { START: { state: "SUCCEEDED" }, READINESS: { state: "SUCCEEDED" } });
+    const lc = fenced();
+    await lc.runOnce();
+    await lc.runOnce();
+    await lc.stop();
+    expect(guards.find((guard) => guard.phase === "status")).toEqual({
+      phase: "status",
+      through: 1,
+    });
+    // An inventory record that may release the claim fences first.
+    const gang = addStop("inst", 1, 0, "SUCCEEDED");
+    await lc.runtimeInventory(REF, {
+      snapshotId: "B".repeat(32),
+      chunkIndex: 0,
+      final: true,
+      alwaysOn: [],
+      instances: [inventoryRecord("inst", "stopped", gang.id as string)],
+    } as never);
+    expect(fences).toEqual([1]);
+    expect(rank().claim).toBe("RELEASED");
+  });
+
+  it("a stopped record whose node was not idle for the rank releases nothing", async () => {
+    store.instances = [
+      instance("inst", { phase: "STOPPING", runGeneration: 2, desiredState: "STOPPED" }),
+    ];
+    addGeneration("inst", 2, {
+      STOP: { state: "SUCCEEDED" },
+      START: { state: "SUCCEEDED" },
+      READINESS: { state: "SUCCEEDED" },
+    });
+    const gang = addStop("inst", 2, 0, "SUCCEEDED");
+    await inventory([
+      { ...inventoryRecord("inst", "stopped", gang.id as string), rankIdle: false },
+    ]);
+    expect(rank().claim).toBe("HELD");
+  });
+
   it("T6 control (I3): a record naming this run's gang STOP releases", async () => {
     store.instances = [
       instance("inst", { phase: "STOPPING", runGeneration: 2, desiredState: "STOPPED" }),
@@ -1218,7 +1307,9 @@ describe("stop proofs are of the current run, after its launches (F5, R3-B-1, C3
     const tx = db as never;
     // The leading stop (observed before START) proves nothing now.
     expect(
-      await releaseClaim(tx, rank().id, now, { observation: { stepId: g.STOP?.id as string } }),
+      await releaseClaim(tx, rank().id, now, {
+        observation: { stepId: g.STOP?.id as string, rankIdle: true },
+      }),
     ).toBe(false);
     expect(
       await releaseClaim(tx, rank().id, now, { result: { stepId: g.STOP?.id as string } }),
@@ -1234,10 +1325,105 @@ describe("stop proofs are of the current run, after its launches (F5, R3-B-1, C3
     addGeneration("gap", 9_000, { STOP: { state: "SUCCEEDED" }, START: { state: "SUCCEEDED" } });
     const gang = addStop("gap", 9_000, 0, "SUCCEEDED");
     expect(
-      await releaseClaim(tx, rank("gap").id, now, { observation: { stepId: gang.id as string } }),
+      await releaseClaim(tx, rank("gap").id, now, {
+        observation: { stepId: gang.id as string, rankIdle: true },
+      }),
     ).toBe(true);
   });
 
+  it("a status probe proves no stop while the node had a start in flight for the rank", async () => {
+    // Stopped and marked stopped before its gang stop went out: the START sent earlier still
+    // waits for the rank on the node. The probe answers stopped, but the node says the rank was
+    // not idle (`rankIdle`): no proof (a STOP would have cancelled it; a probe only looks).
+    store.instances = [instance("inst", { phase: "STOPPED", runGeneration: 1 })];
+    Object.assign(rank(), { claim: "HELD_UNKNOWN", markedStoppedAt: now });
+    const tx = db as never;
+    addGeneration("inst", 1, { START: { state: "RUNNING" } });
+    const probe = addStop("inst", 1, 0, "SUCCEEDED", "STATUS");
+    probe.rankIdle = false;
+    expect(await releaseClaim(tx, rank().id, now, { result: { stepId: probe.id as string } })).toBe(
+      false,
+    );
+    expect(rank().claim).toBe("HELD_UNKNOWN");
+    // Answered idle: the node had nothing that may launch for the rank, the probe proves it.
+    probe.rankIdle = true;
+    expect(await releaseClaim(tx, rank().id, now, { result: { stepId: probe.id as string } })).toBe(
+      true,
+    );
+  });
+  it("a start of a run proven stopped never holds a leading stop back", async () => {
+    // Run 1's gang stop succeeded, but recording its cancelled START's answer failed (it shows
+    // RUNNING). The restart retook the claim with proof: runs up to 1 are proven ended.
+    store.instances = [instance("inst", { phase: "STARTING", runGeneration: 2 })];
+    store.steps = [];
+    addGeneration("inst", 1, { START: { state: "RUNNING" } });
+    Object.assign(rank(), { stoppedThroughRun: 1 });
+    expect(await startsUnresolved(db as never, "inst", 0, 2)).toBe(false);
+    // Control: without the proven boundary it counts.
+    Object.assign(rank(), { stoppedThroughRun: 0 });
+    expect(await startsUnresolved(db as never, "inst", 0, 2)).toBe(true);
+  });
+  it("a status probe answered stopped but not idle records launch_pending on its step", async () => {
+    // Marked stopped while the START sent earlier still waits for the rank on the node: the probe
+    // answers stopped, not idle; the claim stays held, and the step says why it proved nothing.
+    store.instances = [instance("inst", { phase: "STOPPED", runGeneration: 1 })];
+    store.steps = [];
+    Object.assign(rank(), { claim: "HELD_UNKNOWN", markedStoppedAt: now, lastStopCheckAt: null });
+    addGeneration("inst", 1, { START: { state: "RUNNING" } });
+    const lc = engine();
+    await lc.runOnce();
+    // The probe is created this pass and sent the next.
+    await lc.runOnce();
+    const probe = lastFrame("status");
+    await lc.handleJobResult(
+      REF,
+      result(probe, { status: "succeeded", stopped: true, rankIdle: false }),
+    );
+    await lc.stop();
+    expect(rank().claim).toBe("HELD_UNKNOWN");
+    expect(stepById(probe.stepId as string)).toMatchObject({
+      state: "SUCCEEDED",
+      errorCode: "launch_pending",
+    });
+  });
+  it("a stop proves only when the node answers its rank idle; an older CLI gets no runtime job", async () => {
+    store.instances = [instance("inst", { phase: "STOPPING", runGeneration: 1 })];
+    store.steps = [];
+    addGeneration("inst", 1, { START: { state: "RUNNING" } });
+    const stop = addStop("inst", 1, 0, "SUCCEEDED");
+    // A step that may launch was still admitted (not cancelled) on the node: no proof.
+    stop.rankIdle = false;
+    expect(
+      await releaseClaim(db as never, rank().id, now, { result: { stepId: stop.id as string } }),
+    ).toBe(false);
+    stop.rankIdle = true;
+    expect(
+      await releaseClaim(db as never, rank().id, now, { result: { stepId: stop.id as string } }),
+    ).toBe(true);
+  });
+
+  it("refuses every runtime job to a CLI that cannot prove what it runs (cli_upgrade_required)", async () => {
+    store.instances = [instance("inst", { phase: "STARTING" })];
+    addGeneration("inst", 1, {});
+    const lc = new RuntimeLifecycle(
+      {
+        onlineNodeIds: () => ["head"],
+        nodeSession: () => ({ userId: "u1", connectionGeneration: 1, trust: "full" }),
+        sendToNode: (nodeId: string, frame: unknown) => {
+          sent.push({ nodeId, frame: frame as Row });
+          return true;
+        },
+      } as unknown as ConstructorParameters<typeof RuntimeLifecycle>[0],
+      { now: () => now },
+    );
+    sent.length = 0;
+    await lc.runOnce();
+    await lc.stop();
+    expect(sent).toEqual([]);
+    expect(
+      store.steps.find((step) => step.instanceId === "inst" && step.state === "FAILED"),
+    ).toMatchObject({ errorCode: "cli_upgrade_required" });
+  });
   it("T16: releaseClaim refuses a step of another rank, an unfinished result, a leading stop over HELD; never-ran is evaluated here", async () => {
     store.instances = [
       instance("inst", { phase: "STOPPING", runGeneration: 2 }),
@@ -1269,14 +1455,14 @@ describe("stop proofs are of the current run, after its launches (F5, R3-B-1, C3
       await releaseClaim(tx, rank().id, now, { unproven: { by: "u1", reason: "checked" } }),
     ).toBe(false);
     expect(rank().claim).toBe("HELD");
-    // Control: the current gang stop's result releases.
-    running.state = "SUCCEEDED";
+    // Control: the current gang stop's result (answered idle) releases.
+    Object.assign(running, { state: "SUCCEEDED", rankIdle: true });
     expect(
       await releaseClaim(tx, rank().id, now, { result: { stepId: running.id as string } }),
     ).toBe(true);
-    // An inventory observation waits for every start of the rank sent and unanswered.
+    // An inventory record proves the stop only with the node's word that the rank was idle.
     store.instances.push(instance("busy", { phase: "STOPPING", runGeneration: 2 }));
-    const busyStart = addGeneration("busy", 1, { START: { state: "RUNNING" } }).START as Row;
+    addGeneration("busy", 1, { START: { state: "RUNNING" } });
     const busyGang = {
       ...addStop("busy", 1, 0, "SUCCEEDED"),
       id: "busy-gang",
@@ -1285,11 +1471,14 @@ describe("stop proofs are of the current run, after its launches (F5, R3-B-1, C3
     };
     store.steps.push(busyGang);
     expect(
-      await releaseClaim(tx, rank("busy").id, now, { observation: { stepId: "busy-gang" } }),
+      await releaseClaim(tx, rank("busy").id, now, {
+        observation: { stepId: "busy-gang", rankIdle: false },
+      }),
     ).toBe(false);
-    busyStart.state = "FAILED";
     expect(
-      await releaseClaim(tx, rank("busy").id, now, { observation: { stepId: "busy-gang" } }),
+      await releaseClaim(tx, rank("busy").id, now, {
+        observation: { stepId: "busy-gang", rankIdle: true },
+      }),
     ).toBe(true);
     // Never-ran control: a run whose START was cancelled and whose leading stop succeeded.
     store.instances.push(instance("never", { phase: "STOPPING", runGeneration: 2 }));
@@ -1399,6 +1588,46 @@ describe("operator screens of an earlier run (DC3, T10, T11)", () => {
     expect(main().needsOperator).toBe("STEP");
   });
 
+  it("a leading stop answered not idle goes again; the new run waits for it", async () => {
+    // Run 1's START was lost with its session and still waits for the rank on the node when the
+    // restart's leading stop answers stopped, not idle (a step admitted after the stop's cancel).
+    store.instances = [instance("inst", { phase: "READY" })];
+    Object.assign(rank(), { stoppedThroughRun: 0 });
+    addGeneration("inst", 1, { START: { state: "SUCCEEDED" }, READINESS: { state: "SUCCEEDED" } });
+    await restart();
+    const lc = engine();
+    await lc.runOnce();
+    const leading = lastFrame("stop");
+    expect(leading.generation).toBe(2);
+    await lc.handleJobResult(
+      REF,
+      result(leading, { status: "succeeded", stopped: true, rankIdle: false }),
+    );
+    // Not satisfied: back in line, shortly.
+    expect(stepById(leading.stepId as string)).toMatchObject({
+      state: "PENDING",
+      errorCode: "launch_pending",
+    });
+    expect(rank().stoppedThroughRun).toBe(0);
+    sent.length = 0;
+    await lc.runOnce();
+    expect(framesTo("start")).toEqual([]);
+    expect(framesTo("stop")).toEqual([]);
+    // It goes again; answered idle, it proves run 1 ended.
+    const saved = now;
+    now = new Date(now.getTime() + 60_000);
+    try {
+      await lc.runOnce();
+      const again = lastFrame("stop");
+      expect(again.stepId).toBe(leading.stepId);
+      await lc.handleJobResult(REF, result(again, { status: "succeeded", stopped: true }));
+      expect(rank().stoppedThroughRun).toBe(1);
+      expect(stepById(leading.stepId as string)).toMatchObject({ state: "SUCCEEDED" });
+    } finally {
+      now = saved;
+      await lc.stop();
+    }
+  });
   it("T11: an accepted old run holds the successor's leading stop until it answers", async () => {
     const { lc, start, terminalId } = await interactiveStartOut();
     await lc.handleJobResult(REF, result(start, { status: "awaiting_operator", terminalId }));
@@ -1641,7 +1870,15 @@ describe("queued starts wait while a blocker's claim is not RELEASED (D13, carri
     ];
     rank("inst").blockedBy = ["blocker"];
     store.nodes.push({ id: "w9", online: false, labels: [], memoryGb: 64 });
-    // The blocker's own stop is out already (nothing more to send for it here).
+    // The blocker ran (a rank that never launched is released, not waited for), and its own
+    // stop is out already (nothing more to send for it here).
+    for (const step of Object.values(
+      addGeneration("blocker", 1, {
+        START: { state: "SUCCEEDED" },
+        READINESS: { state: "SUCCEEDED" },
+      }),
+    ))
+      if (step.state === "PENDING") step.state = "SUCCEEDED";
     addStop("blocker", 1, 0, "RUNNING");
   }
 

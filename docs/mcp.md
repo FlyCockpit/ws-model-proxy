@@ -147,7 +147,12 @@ a port in use, a node offline or on hold, no node with the labels), the
 instance stays `STOPPED` with `phaseReason` `waiting_<reason>` (for example
 `waiting_not_enough_memory`), retries every 30 seconds, and does not use its
 restart budget (`restartsInWindow`) while it waits. The runtime page shows the
-reason.
+reason. A restart keeps its ports only while they are free and inside the
+node's port range now; otherwise it takes other ports from the range (a port
+the launch fixes never moves). An instance an agent started restarts
+automatically only while every node it holds, reservations included (a replaced
+run's too), is at Full control; otherwise it waits with `waiting_trust_relay`
+until a person restarts it or the node is at Full control again.
 
 A restart of an instance that may still be running (`runtime_start` with its
 `instanceId`, or an automatic restart of a rank marked stopped) keeps what the
@@ -176,13 +181,18 @@ new run READY and does not stop it. Inside a run, an inventory record proves a
 stop only when it was taken after the run's last launch. So the new run's
 port, memory, GPUs and reservations stay held until that run's own stop is
 proven (or a person releases them). `runtimes_get` lists what still holds for
-it: each rank's `previousClaim` (port, dist port, memory) and the instance's
-`supersededReservations`, beside the current claims and `reservations`.
+it: each rank's `previousClaim` (port, dist port, memory, GPUs) and the
+instance's `supersededReservations`, beside the current claims (each rank's
+port, dist port and GPUs) and `reservations` (memory and GPUs).
 
 The new run first stops what the earlier one left running: its leading stop
 names the process that actually runs (its launch version, port and unit, even
-when the restart changed the definition), and it waits until every launch of
-the earlier run that was sent has answered (bounded by that step's timeout).
+when the restart changed the definition). Once a node proved a rank's stop,
+no later stop names what was launched before it (nor a port another instance
+took since), and its definition is no longer kept on the node. A release
+without proof keeps the launch: the next restart's leading stop still names it,
+and its definition stays. The leading stop waits until every launch of the
+earlier run that was sent has answered (bounded by that step's timeout).
 An earlier run's confirm screen nobody accepted is closed; a person's run that
 was already accepted keeps running, and the new run's stops wait for it. Once
 that accepted run is past its timeout, its person is asked to look at it
@@ -342,7 +352,8 @@ A spec has exactly one of:
     `reservations` (it is not part of the launch hash), so changing only the
     reservations of a running instance needs a restart (`needsRestart`,
     `launch_changed`) to place them again, and the version's `launchChanged`
-    is true. The instance view lists
+    is true. A definition update with `restartRunning` places them again, as
+    `runtime_start` with the instance id would. The instance view lists
     `reservations` (node, labels, `memoryGb`, `reserved`), the start preview
     lists where each goes, and node views count them in `reservedNowMemoryGb`
     and list them with `role: "reservation"`. The runtime's commands are told
@@ -397,22 +408,21 @@ canonical JSON and one command at most 4 KiB. `limits` (null: automatic) and
 `advanced` settings are separate inputs; `runtimes_get` shows their keys and
 effective values. Limit edits apply live; a changed definition saves a new
 version and needs `restartRunning` to reach running instances. That restart
-keeps each instance's claims where they are and as they are, so it is only
-for a version that claims what the instance actually holds (one rank claim per
-rank with that rank's `resources`, and its current reservation rows with each
-entry's labels and resources; the version the instance runs is not enough,
-since a claim taken for an earlier version stays as it was taken): an instance
-whose claims differ is listed in `needsRestart` (`launch_changed`) and is
-restarted with `runtime_start` (its instance id), which places the new claims
-with the start's capacity check.
+is the restart `runtime_start` with the instance id makes, without stopping
+other instances: each instance is placed again on its nodes by the planner
+(capacity, labels, ports, definition slots and reservations, with the new
+version's claims). An instance the planner refuses is listed in `needsRestart`
+with the refusal's reason (for example `not_enough_memory` or
+`label_mismatch`); the new version is still saved. Without `restartRunning`,
+each instance whose launch changed is listed with `launch_changed`.
 
-A Full-control node holds at most 128 server-origin runtime definitions it
-needs: the version of everything that runs or is stopping there (a restart
+A node holds at most 128 server-origin runtime definitions it needs, at any
+trust (a Relay-only node raised to Full control is sent all of them): the version of everything that runs or is stopping there (a restart
 counts both its old and its new version until the old run's stop is proven),
 and the version every unfinished step there names. These are always sent to
 the node; only other versions (current versions to start next, profile pins)
 are left out when the node is full. A start, restart or profile apply that
-would make a Full-control node need a 129th definition is refused
+would make a node need a 129th definition is refused
 `definition_slots_full` (the subject is the node; an unpinned start goes to
 another node). `runtime_update` with `restartRunning` lists such an instance
 in `needsRestart` with `definition_slots_full` (the new version is still

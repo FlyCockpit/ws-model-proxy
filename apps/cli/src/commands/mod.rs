@@ -11,6 +11,7 @@
 pub mod completions;
 pub mod config;
 pub mod hardware;
+pub mod launch_guard;
 pub mod login;
 pub mod logout;
 pub mod recover;

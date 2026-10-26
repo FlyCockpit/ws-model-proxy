@@ -8,7 +8,7 @@ import { useTranslation } from "react-i18next";
 
 import { ConfirmAction } from "@/components/access/confirm-action";
 import { InlineRetry } from "@/components/inline-retry";
-import { HeldFootprint } from "@/components/runtimes/held-footprint";
+import { ClaimDetails, HeldFootprint } from "@/components/runtimes/held-footprint";
 import { StatusPill } from "@/components/status-pill";
 import { TimeAgo } from "@/components/time-ago";
 import { refusalText } from "@/lib/refusal-text";
@@ -194,6 +194,7 @@ function ReleaseEvidence({
             node: rank.nodeSlug ?? t("dashboard:runtime.nodeGone"),
             port: rank.port,
           })}
+          <ClaimDetails distPort={rank.distPort} gpus={rank.gpus} />
         </dd>
         <dt className="text-muted-foreground">
           {t("dashboard:runtime.releaseUnproven.reasonLabel")}

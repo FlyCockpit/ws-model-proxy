@@ -8,6 +8,7 @@ import { effectiveHardware, liveMetrics } from "../nodes/hardware";
 import { effectiveTrust } from "../nodes/trust";
 import { parseHeldDefinitions } from "../nodes/views";
 import { occupiesNodesWhere } from "./instance-occupancy";
+import { physicalLaunchIntents } from "./instance-run";
 import { requiredDefinitionsByNode } from "./node-definitions";
 import type {
   PlacementContext,
@@ -20,6 +21,7 @@ import { reservationClaim } from "./reservations";
 import { nodeFabricsHash } from "./runtime-launch-hash";
 import { nodeFabricSetsSchema, runtimeSpecSchema } from "./runtime-spec";
 import type { Tx } from "./runtime-store";
+import { stepIntentSchema } from "./step-intent";
 
 export const PLACEMENT_NODE_SELECT = {
   id: true,
@@ -129,12 +131,23 @@ export function placementNodeOf(
   };
 }
 
-/** Whether a stored launch has a stop step a person runs in an operator terminal. */
-function hasInteractiveStop(spec: unknown): boolean {
+/**
+ * Whether a stored launch's stop of `rank` is a step a person runs in an operator terminal (a
+ * rank's commands, or the first when the launch has one for every rank, as steps read them);
+ * null when the spec is unreadable.
+ */
+function stopsInteractively(spec: unknown, rank: number): boolean | null {
   const parsed = runtimeSpecSchema.safeParse(spec);
-  if (!parsed.success) return false;
-  return (parsed.data.launch?.commands ?? []).some((commands) => !!commands.interactive?.stop);
+  if (!parsed.success || !parsed.data.launch) return null;
+  const commands = parsed.data.launch.commands[rank] ?? parsed.data.launch.commands[0];
+  return commands?.interactive?.stop === true;
 }
+
+/**
+ * Per instance, per rank, the spec of the launch that may still run there when it is not the
+ * current version's (`launchesThatMayRun`): a stop of that rank runs that launch's stop command.
+ */
+type LaunchedSpecs = ReadonlyMap<string, ReadonlyMap<number, unknown>>;
 
 /**
  * Instances holding a claim (not RELEASED) on one of these nodes, with all their claims: their
@@ -146,6 +159,7 @@ function hasInteractiveStop(spec: unknown): boolean {
 export async function loadPlacementInstances(
   db: Tx,
   nodeIds: readonly string[],
+  launched?: LaunchedSpecs,
 ): Promise<PlacementInstance[]> {
   if (nodeIds.length === 0) return [];
   const rows = await db.runtimeInstance.findMany({
@@ -172,6 +186,7 @@ export async function loadPlacementInstances(
         where: { claim: { not: "RELEASED" } },
         orderBy: { rank: "asc" },
         select: {
+          rank: true,
           nodeId: true,
           port: true,
           distPort: true,
@@ -241,8 +256,59 @@ export async function loadPlacementInstances(
           })),
     ],
     contributed: row.Runtime.Models.length > 0,
-    interactiveStop: hasInteractiveStop(row.LaunchVersion.spec),
+    // A held rank's stop runs the stop of the launch that may still run there (an earlier
+    // version's, `physicalLaunch`), else the current version's; an unreadable earlier version
+    // falls back to the current one, as the stop step does.
+    interactiveStop: row.Ranks.some((rank) => {
+      const earlier = launched?.get(row.id)?.get(rank.rank);
+      const fromEarlier = earlier === undefined ? null : stopsInteractively(earlier, rank.rank);
+      return fromEarlier ?? stopsInteractively(row.LaunchVersion.spec, rank.rank) ?? false;
+    }),
   }));
+}
+
+/**
+ * The launches of `userId`'s instances with a rank on these nodes that may still run
+ * (`physicalLaunchIntents`): per instance, the reservation nodes they name
+ * (`launchCleanupNodes` for one instance), and per rank the spec of a launch of another version
+ * than the instance's current one (owner-scoped; absent when unreadable).
+ */
+async function launchesThatMayRun(
+  db: Tx,
+  userId: string,
+  nodeIds: readonly string[],
+): Promise<{ cleanup: Map<string, Set<string>>; specs: LaunchedSpecs }> {
+  const cleanup = new Map<string, Set<string>>();
+  const versionOf = new Map<string, Map<number, string>>();
+  for (const launch of await physicalLaunchIntents(db, { userId, nodeIds })) {
+    const intent = stepIntentSchema.safeParse(launch.intent);
+    if (!intent.success) continue;
+    const ranks = versionOf.get(launch.instanceId) ?? new Map<number, string>();
+    ranks.set(launch.rank, intent.data.launchVersionId);
+    versionOf.set(launch.instanceId, ranks);
+    for (const reservation of intent.data.reservations ?? []) {
+      const named = cleanup.get(launch.instanceId) ?? new Set<string>();
+      named.add(reservation.nodeId);
+      cleanup.set(launch.instanceId, named);
+    }
+  }
+  const versionIds = [...new Set([...versionOf.values()].flatMap((ranks) => [...ranks.values()]))];
+  const versions =
+    versionIds.length === 0
+      ? []
+      : await db.runtimeVersion.findMany({
+          where: { id: { in: versionIds }, Runtime: { userId } },
+          select: { id: true, spec: true },
+        });
+  const specOf = new Map(versions.map((version) => [version.id, version.spec as unknown]));
+  const specs = new Map<string, Map<number, unknown>>();
+  for (const [instanceId, ranks] of versionOf) {
+    const byRank = new Map<number, unknown>();
+    for (const [rank, versionId] of ranks)
+      if (specOf.has(versionId)) byRank.set(rank, specOf.get(versionId));
+    specs.set(instanceId, byRank);
+  }
+  return { cleanup, specs };
 }
 
 export async function loadPlacementFabrics(db: Tx, userId: string): Promise<PlacementFabric[]> {
@@ -266,11 +332,19 @@ export async function loadPlacementContext(
     orderBy: { slug: "asc" },
   });
   const nodeIds = nodes.map((row) => row.id);
-  const [instances, fabrics, required] = await Promise.all([
-    loadPlacementInstances(db, nodeIds),
+  // A victim's stop runs the stops of its launches that may still run, and reaches the nodes
+  // they name: an agent preempts only where every one is at Full control and none waits for a
+  // person (batched, owner-scoped queries).
+  const launched = await launchesThatMayRun(db, input.userId, nodeIds);
+  const [loaded, fabrics, required] = await Promise.all([
+    loadPlacementInstances(db, nodeIds, launched.specs),
     loadPlacementFabrics(db, input.userId),
     requiredDefinitionsByNode(db, { userId: input.userId, nodeIds }),
   ]);
+  const instances = loaded.map((instance) => ({
+    ...instance,
+    cleanupNodeIds: [...(launched.cleanup.get(instance.id) ?? [])],
+  }));
   return {
     callerId: input.userId,
     agent: input.agent,

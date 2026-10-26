@@ -69,6 +69,20 @@ describe("launch.reservations", () => {
     expect(issueIds(service({ groupSize: 2, reservations: [] }))).toEqual([]);
   });
 
+  it("refuses reservations on a process launch: only a service's status reports the workers", () => {
+    expect(
+      issueIds(
+        service({
+          management: "process",
+          commands: [{ start: "launch-with-workers --port {{port}}" }],
+          readiness: { path: "/v1/models", expectedStatus: 200, timeoutMs: 60_000 },
+          reservations: [WORKER],
+        }),
+      ),
+    ).toEqual([["launch.management", "reservationsService"]]);
+    expect(issueIds(service({ management: "process", reservations: [] }))).toEqual([]);
+  });
+
   it("refuses a reservation without labels", () => {
     expect(issueIds(service({ reservations: [{ ...WORKER, labels: [] }] }))).toEqual([
       ["launch.reservations.0.labels", "reservationLabels"],

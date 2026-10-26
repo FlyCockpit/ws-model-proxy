@@ -30,6 +30,8 @@ export const RUNTIME_SPEC_ISSUES = {
   fixedPortGroup: "A fixed port needs groupSize 1.",
   reservationsGroup:
     "Reservations need groupSize 1; a multi-node runtime places a rank on every node instead.",
+  reservationsService:
+    "Reservations need management service: its status command must report the work on the reserved nodes too, so their memory is released only once that work stopped.",
   reservationLabels: "A reservation names at least one label to choose its node.",
   secretTwice: "Name each secret once.",
   serviceStop: "Service runtimes need a stop command.",

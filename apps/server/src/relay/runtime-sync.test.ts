@@ -10,7 +10,9 @@ const db = vi.hoisted(() => ({
   },
   instanceRank: {
     findMany: vi.fn(
-      async (): Promise<{ nodeId: string; Instance: { launchVersionId: string } }[]> => [],
+      async (): Promise<
+        { nodeId: string; claim: string; Instance: { launchVersionId: string } }[]
+      > => [],
     ),
   },
   /** The batched physical launches of live-claimed ranks (`physicalLaunchIntents`). */
@@ -21,6 +23,19 @@ const db = vi.hoisted(() => ({
   ),
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
+/** The owner fences a sync took, and whether one is held now. */
+const fenced = vi.hoisted(() => ({ owners: [] as string[][], held: false }));
+vi.mock("@ws-model-proxy/api/lib/graph-write", () => ({
+  graphWrite: async (owners: string[], work: (tx: unknown) => Promise<unknown>) => {
+    fenced.owners.push([...owners]);
+    fenced.held = true;
+    try {
+      return await work(db);
+    } finally {
+      fenced.held = false;
+    }
+  },
+}));
 
 const { buildCompleteOperation, capDesired, createRuntimeSync, loadNodeDefinitionState } =
   await import("./runtime-sync.js");
@@ -198,6 +213,31 @@ describe("createRuntimeSync", () => {
     };
     return { sent, relay, session, sync: createRuntimeSync(relay, { answerWaitMs: 200 }) };
   }
+
+  it("reads what the node requires and sends it under the owner's fence", async () => {
+    mockNode();
+    db.runtimeVersion.findMany.mockResolvedValue([]);
+    fenced.owners.length = 0;
+    const readUnderFence: boolean[] = [];
+    db.instanceStep.findMany.mockImplementationOnce(async () => {
+      readUnderFence.push(fenced.held);
+      return [];
+    });
+    const { relay, sent, sync } = setup();
+    const send = relay.sendToNode.getMockImplementation();
+    const sentUnderFence: boolean[] = [];
+    relay.sendToNode.mockImplementation((...args: Parameters<NonNullable<typeof send>>) => {
+      sentUnderFence.push(fenced.held);
+      return send?.(...args) ?? false;
+    });
+    void sync.syncNode("node-1");
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    expect(fenced.owners).toEqual([["user-1"]]);
+    expect(readUnderFence).toEqual([true]);
+    expect(sent.length).toBeGreaterThan(0);
+    expect(sentUnderFence.length).toBe(sent.length);
+    expect(sentUnderFence.every(Boolean)).toBe(true);
+  });
 
   it("answers expect at Full control and sends one complete operation after hello", async () => {
     mockNode();
@@ -562,7 +602,7 @@ describe("loadNodeDefinitionState", () => {
     ]);
     // The instance's live claim on the node: its launch version is v2 now.
     db.instanceRank.findMany.mockResolvedValueOnce([
-      { nodeId: "node-1", Instance: { launchVersionId: "v2" } },
+      { nodeId: "node-1", claim: "HELD", Instance: { launchVersionId: "v2" } },
     ]);
     db.runtimeVersion.findMany.mockImplementation(
       async (query: { where: Record<string, unknown> }) => {
@@ -615,6 +655,7 @@ describe("loadNodeDefinitionState", () => {
     db.instanceRank.findMany.mockResolvedValueOnce(
       Array.from({ length: 200 }, () => ({
         nodeId: "node-1",
+        claim: "HELD",
         Instance: { launchVersionId: "v2" },
       })),
     );

@@ -24,7 +24,7 @@ import { callerActor } from "../lib/caller-actor";
 import { canonicalJson } from "../lib/canonical-json";
 import { graphWrite, instanceCapacityFences } from "../lib/graph-write";
 import {
-  agentBlockedNode,
+  agentBlockedNodeWithCleanup,
   currentReservations,
   OCCUPANCY_SELECT,
   placedOnNodesWhere,
@@ -40,7 +40,7 @@ import {
   type Tx,
   writePlannedStarts,
 } from "../lib/runtime-store";
-import { INSTANCE_INCLUDE, instanceView, loadStepVersions, storedSpec } from "../lib/runtime-views";
+import { INSTANCE_INCLUDE, instanceView, loadStepRefs, storedSpec } from "../lib/runtime-views";
 
 type StartInput = z.infer<typeof c.start.input>;
 type StartPreview = z.infer<typeof startPreviewSchema>;
@@ -153,10 +153,13 @@ async function computeStart(
     if (!instance) throw notFound("That instance does not exist.");
     restart = { instanceId: instance.id };
     // An agent's restart reaches every node the instance holds now (the leading stop acts on the
-    // old launch, its ranks and reservations, a replaced run's included) besides the new plan's:
+    // old launch, its ranks and reservations, a replaced run's included, and the nodes a launch
+    // that may still run names) besides the new plan's:
     // each must be at Full control (a pending lowering counts as Relay only, a deleted node as
     // not Full), as a stop's (`runtimeStop`).
-    const blocked = agentRulesApply(context.auth) ? agentBlockedNode(instance) : null;
+    const blocked = agentRulesApply(context.auth)
+      ? await agentBlockedNodeWithCleanup(db, userId, instance)
+      : null;
     if (blocked) {
       refusals.push({
         reason: "trust_relay",
@@ -258,15 +261,13 @@ async function operationView(operationId: string) {
       Instances: { include: INSTANCE_INCLUDE, orderBy: { createdAt: "asc" } },
     },
   });
-  const stepVersions = await loadStepVersions(prisma, operation.userId, operation.Instances);
+  const stepRefs = await loadStepRefs(prisma, operation.userId, operation.Instances);
   return {
     id: operation.id,
     kind: operation.kind,
     createdAt: operation.createdAt.toISOString(),
     actor: actorRefOf(operation),
-    instances: operation.Instances.map((row) =>
-      instanceView(row, undefined, undefined, stepVersions),
-    ),
+    instances: operation.Instances.map((row) => instanceView(row, undefined, undefined, stepRefs)),
   };
 }
 
@@ -382,10 +383,11 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
         orderBy: { id: "asc" },
       });
       if (instances.length === 0) throw notFound("Nothing of this runtime is running there.");
-      // Every node the stop reaches: the ranks' and the reservations' that still hold.
+      // Every node the stop reaches: the ranks', the reservations' that still hold, and those a
+      // launch that may still run names.
       if (agentRulesApply(context.auth))
         for (const instance of instances) {
-          const blocked = agentBlockedNode(instance);
+          const blocked = await agentBlockedNodeWithCleanup(tx, userId, instance);
           if (blocked)
             throw refuseAbout("trust_relay", blocked.nodeId ?? instance.id, TRUST_RELAY_MESSAGE);
         }

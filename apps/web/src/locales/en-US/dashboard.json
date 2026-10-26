@@ -1426,7 +1426,7 @@
       "status_not_running": "the status command did not say running"
     },
     "processDetached": "The start command handed its server off (for example `docker compose up -d`), so the node cannot watch or stop it. Use management \"service\" with stop and status commands, and stop what is still running by hand.",
-    "cliUpgradeRequired": "This runtime reserves memory on other nodes, and wsmp on its node is too old to be told which ones. Upgrade wsmp on the node and restart it, then start the runtime again.",
+    "cliUpgradeRequired": "wsmp on this runtime's node is too old to run it. Upgrade wsmp on the node and restart it, then start the runtime again.",
     "needsOperator": {
       "STEP": "A step waits for you",
       "RESTART": "Restart needed",
@@ -1465,9 +1465,13 @@
           "port_in_use": "The port is still in use",
           "port_held_outside_runtime": "The port is still in use, though nothing is left in the service's units: usually something it started (a container or a daemon) runs outside them",
           "unowned_service": "The service runs outside the node's control and has no status command",
-          "not_stopped": "The node couldn't confirm it (update the node if this keeps happening)"
+          "not_stopped": "The node couldn't confirm it (update the node if this keeps happening)",
+          "launch_pending": "The node said it stopped, but a start sent to it earlier was still waiting there. wsmp checks again.",
+          "cli_upgrade_required": "This node's wsmp is too old to prove a stop. Upgrade wsmp on the node."
         },
-        "alsoHeld": "Also held until the stop is confirmed or you release it"
+        "alsoHeld": "Also held until the stop is confirmed or you release it",
+        "holds": "Holds",
+        "port": "Port {{port}}"
       },
       "held": {
         "pill": "Resources held until the stop is confirmed",
@@ -2069,7 +2073,9 @@
     "heldFootprint": {
       "previousClaim": "Port {{port}} and {{memory}} on {{node}}, kept for the run a restart replaced",
       "reservation": "{{memory}} on {{node}}",
-      "supersededReservation": "{{memory}} on {{node}}, kept for the run a restart replaced"
+      "supersededReservation": "{{memory}} on {{node}}, kept for the run a restart replaced",
+      "distPort": "dist port {{port}}",
+      "gpus": "GPUs {{gpus}}"
     }
   },
   "overview": {

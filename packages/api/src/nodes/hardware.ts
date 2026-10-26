@@ -110,15 +110,111 @@ function pick<T>(
 }
 
 /**
- * A claim's node memory (GiB) by its `resources` JSON (`runtimeResourceSchema`). VRAM a discrete
- * claim takes on a unified GPU (`unifiedGpuKeys`; the claim's recorded `gpus`, else any when
- * every GPU of the node is unified) is node memory too.
+ * The recorded GPUs of a claim (`resources.gpus`, keys placement picked) whose VRAM is node
+ * memory: those the node reports unified now, those the claim recorded as unified when it was
+ * admitted (`resources.unifiedGpus`), and, on a claim recorded before it recorded that (no
+ * `unifiedGpus`), those the node no longer reports (they may have been unified). So a node that
+ * stops reporting a GPU (a failed detection, a reconnect without it) never forgets the memory
+ * admitted on it. Null when the claim recorded no GPUs.
  */
-export function claimMemoryGb(
+export function sharedVramGpuKeys(
   resources: unknown,
-  unifiedGpuKeys: ReadonlySet<string>,
-  allUnified: boolean,
-): number {
+  reported: ReadonlyMap<string, { unified: boolean }>,
+): string[] | null {
+  if (!resources || typeof resources !== "object") return null;
+  const recorded = Reflect.get(resources, "gpus");
+  if (!Array.isArray(recorded)) return null;
+  const keys = recorded.filter((key): key is string => typeof key === "string");
+  const admitted = Reflect.get(resources, "unifiedGpus");
+  const admittedUnified = Array.isArray(admitted)
+    ? new Set(admitted.filter((key): key is string => typeof key === "string"))
+    : null;
+  return keys.filter((key) => {
+    const gpu = reported.get(key);
+    if (gpu?.unified || admittedUnified?.has(key)) return true;
+    return admittedUnified === null && gpu === undefined;
+  });
+}
+
+/** A GPU as the node reports it, for `claimVramHolds`. */
+export type ReportedGpu = { key: string; vendor: string; unified: boolean };
+
+/**
+ * Where a discrete claim's VRAM may be held on a node: node memory (`sharedGb`, the VRAM it takes
+ * on unified GPUs) and each dedicated GPU (`dedicated`, GiB per key). Where its GPUs are known
+ * (recorded and reported) it is charged where it is. Where they are not, it is charged on every
+ * GPU it may be on (the worst case, never a guess). A recorded GPU the node reports is held as
+ * it is reported now (dedicated: on that GPU; unified: node memory) and as it was admitted (node
+ * memory if recorded unified, `sharedVramGpuKeys`). One the node no longer reports (renumbered,
+ * a failed detection, maybe reclassified too) may be any other GPU of its vendor, of either
+ * kind: it is held on every dedicated one, and in node memory if it was unified when admitted
+ * (or recorded before claims said) or may be one of the vendor's unified GPUs now (as many such
+ * keys as there are unified candidates). A claim that recorded no GPUs may be on any GPUs of its
+ * vendor (any vendor if it names none): every dedicated one, and node memory for as many unified
+ * ones as it has GPUs (all of them when the node reports none it could be on).
+ */
+export function claimVramHolds(
+  resources: unknown,
+  gpus: readonly ReportedGpu[],
+): { sharedGb: number; dedicated: Map<string, number> } {
+  const dedicated = new Map<string, number>();
+  const holds = { sharedGb: 0, dedicated };
+  if (!resources || typeof resources !== "object" || Reflect.get(resources, "kind") !== "discrete")
+    return holds;
+  const vramGb = Reflect.get(resources, "vramGb");
+  const gpuCount = Reflect.get(resources, "gpuCount");
+  if (typeof vramGb !== "number" || typeof gpuCount !== "number" || gpuCount === 0) return holds;
+  const reported = new Map(gpus.map((gpu) => [gpu.key, gpu]));
+  const recordedRaw = Reflect.get(resources, "gpus");
+  const recorded = Array.isArray(recordedRaw)
+    ? [...new Set(recordedRaw.filter((key): key is string => typeof key === "string"))]
+    : null;
+  const own = new Set((recorded ?? []).filter((key) => reported.has(key)));
+  // Every GPU of `vendor` (null: any) the claim does not already hold where it is.
+  const candidates = (vendor: string | null) =>
+    gpus.filter((gpu) => (vendor === null || gpu.vendor === vendor) && !own.has(gpu.key));
+  const onEveryDedicated = (vendor: string | null) => {
+    for (const gpu of candidates(vendor))
+      if (!gpu.unified) dedicated.set(gpu.key, Math.max(dedicated.get(gpu.key) ?? 0, vramGb));
+  };
+  if (!recorded) {
+    const named = Reflect.get(resources, "vendor");
+    const vendor = typeof named === "string" ? named : null;
+    onEveryDedicated(vendor);
+    const possible = candidates(vendor);
+    const unified = possible.filter((gpu) => gpu.unified).length;
+    holds.sharedGb += vramGb * (possible.length === 0 ? gpuCount : Math.min(gpuCount, unified));
+    return holds;
+  }
+  const shared = new Set(sharedVramGpuKeys(resources, reported) ?? []);
+  // Per vendor, the missing keys not already node memory: each may be a unified GPU now.
+  const maybeUnified = new Map<string, number>();
+  for (const key of recorded) {
+    if (shared.has(key)) holds.sharedGb += vramGb;
+    const gpu = reported.get(key);
+    // A GPU reported dedicated now holds it there, whatever it was when admitted (a declaration
+    // corrected from unified keeps that memory too: either may be true of the running process).
+    if (gpu && !gpu.unified) dedicated.set(key, Math.max(dedicated.get(key) ?? 0, vramGb));
+    else if (!gpu) {
+      // Gone from the report: any GPU of its vendor now (the `vendor:` prefix of its key).
+      const vendor = key.split(":")[0] ?? "";
+      onEveryDedicated(vendor);
+      if (!shared.has(key)) maybeUnified.set(vendor, (maybeUnified.get(vendor) ?? 0) + 1);
+    }
+  }
+  for (const [vendor, count] of maybeUnified) {
+    const unified = candidates(vendor).filter((gpu) => gpu.unified).length;
+    holds.sharedGb += vramGb * Math.min(count, unified);
+  }
+  return holds;
+}
+
+/**
+ * A claim's node memory (GiB) by its `resources` JSON (`runtimeResourceSchema`): its memory, plus
+ * for a discrete claim the VRAM it may take on unified GPUs (`claimVramHolds`, as placement
+ * counts it).
+ */
+export function claimMemoryGb(resources: unknown, gpus: readonly ReportedGpu[]): number {
   if (!resources || typeof resources !== "object") return 0;
   const kind = Reflect.get(resources, "kind");
   const memoryGb = Reflect.get(resources, "memoryGb");
@@ -127,16 +223,7 @@ export function claimMemoryGb(
   if (kind === "cpu" && typeof ramGb === "number") return ramGb;
   if (kind !== "discrete") return 0;
   const ram = typeof ramGb === "number" ? ramGb : 0;
-  const vramGb = Reflect.get(resources, "vramGb");
-  const gpuCount = Reflect.get(resources, "gpuCount");
-  if (typeof vramGb !== "number" || typeof gpuCount !== "number") return ram;
-  const recorded = Reflect.get(resources, "gpus");
-  const shared = Array.isArray(recorded)
-    ? recorded.filter((key) => typeof key === "string" && unifiedGpuKeys.has(key)).length
-    : allUnified
-      ? gpuCount
-      : 0;
-  return ram + shared * vramGb;
+  return ram + claimVramHolds(resources, gpus).sharedGb;
 }
 
 /** One instance's claims on a node (`HardwareInput.heldClaims`). */
@@ -250,8 +337,6 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
   }
 
   const sortedGpus = [...gpus.values()].sort((a, b) => a.key.localeCompare(b.key));
-  const unifiedKeys = new Set(sortedGpus.filter((gpu) => gpu.unified).map((gpu) => gpu.key));
-  const allUnified = sortedGpus.length > 0 && unifiedKeys.size === sortedGpus.length;
   const headroom = kind.value === "unified" ? UNIFIED_HEADROOM_GB : 0;
   // VRAM reserved on a unified GPU is system memory.
   const reservedSharedGb = sortedGpus
@@ -263,7 +348,7 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
       (memoryGb.value ?? 0) - (reservedMemoryGb.value ?? 0) - reservedSharedGb - headroom,
     ),
   );
-  const memoryOf = (resources: unknown) => claimMemoryGb(resources, unifiedKeys, allUnified);
+  const memoryOf = (resources: unknown) => claimMemoryGb(resources, sortedGpus);
   const reservedNowMemoryGb = round(
     overlapMemoryGb(
       input.heldClaims.map((group) => ({

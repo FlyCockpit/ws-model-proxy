@@ -14,7 +14,7 @@ import { ConfirmAction } from "@/components/access/confirm-action";
 import { Help } from "@/components/help";
 import { InlineRetry } from "@/components/inline-retry";
 import { FieldError } from "@/components/nodes/field-error";
-import { HeldFootprint } from "@/components/runtimes/held-footprint";
+import { ClaimDetails, HeldFootprint } from "@/components/runtimes/held-footprint";
 import { StatusPill } from "@/components/status-pill";
 import { TimeAgo } from "@/components/time-ago";
 import { refusalText } from "@/lib/refusal-text";
@@ -276,6 +276,13 @@ function RankEvidence({ rank }: { rank: Rank }) {
                 )}
         </dt>
         <dd>{connection?.since ? <TimeAgo value={connection.since} /> : null}</dd>
+        <dt className="text-muted-foreground">
+          {t("dashboard:runtime.markStopped.evidence.holds")}
+        </dt>
+        <dd className="min-w-0 break-words">
+          {t("dashboard:runtime.markStopped.evidence.port", { port: rank.port })}
+          <ClaimDetails distPort={rank.distPort} gpus={rank.gpus} />
+        </dd>
         <dt className="text-muted-foreground">
           {t("dashboard:runtime.markStopped.evidence.lastCheck")}
         </dt>

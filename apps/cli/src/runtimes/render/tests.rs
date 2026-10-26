@@ -100,7 +100,7 @@ fn the_rendered_job_keeps_the_reservations_out_of_the_commands() {
     let mut sent = job(&hash, 0, 1);
     sent.reservations = vec![crate::protocol::frames::JobReservation {
         index: 0,
-        node_id: "nd7f3k9q2w8e4r6t1y5u0i3o".into(),
+        node_id: "wk7f3k9q2w8e4r6t1y5u0i3o".into(),
         node: "worker-a".into(),
         gpu_ids: Some("1".into()),
     }];

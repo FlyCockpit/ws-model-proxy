@@ -127,6 +127,38 @@ describe("placement without reservations", () => {
   });
 });
 
+describe("a reservation's GPUs come from one vendor", () => {
+  const discrete2: RuntimeResource = { kind: "discrete", gpuCount: 2, vramGb: 8 };
+  const worker = (gpus: PlacementNode["gpus"]) =>
+    node("w1", { labels: ["ds-worker"], memoryGb: 64, gpus });
+  const place = (gpus: PlacementNode["gpus"]) =>
+    new PlacementPlanner(context({ nodes: [node("head"), worker(gpus)] })).place(
+      request({ reservations: [{ labels: ["ds-worker"], resources: discrete2 }] }),
+    );
+
+  it("never mixes vendors when the reservation names none (the launcher gets plain indices)", () => {
+    // amd:0 + nvidia:0 would be gpuIds "0,0": one process cannot drive both.
+    expect(
+      refused(
+        place([
+          { key: "amd:0", vendor: "amd", vramGb: 24 },
+          { key: "nvidia:0", vendor: "nvidia", vramGb: 24 },
+        ]),
+      ).reason,
+    ).toBe("not_enough_memory");
+    const result = ok(
+      place([
+        { key: "amd:0", vendor: "amd", vramGb: 24 },
+        { key: "nvidia:0", vendor: "nvidia", vramGb: 24 },
+        { key: "nvidia:1", vendor: "nvidia", vramGb: 24 },
+      ]),
+    );
+    expect(result.start.reservations[0]?.resources).toMatchObject({
+      gpus: ["nvidia:0", "nvidia:1"],
+    });
+  });
+});
+
 describe("placement with reservations", () => {
   it("places each reservation on its own labelled node, never the rank's", () => {
     const result = ok(

@@ -31,14 +31,21 @@ function spec(name: string, memoryGb: number, reservation: string[] | null): Run
     modelType: "llm",
     models: [{ id: `m-${name}` }],
     launch: {
-      management: "process",
+      // Reservations need a service: its status reports the workers too.
+      management: "service",
       groupSize: 1,
       resources: [{ kind: "unified", memoryGb }],
       labels: ["r-head"],
       ...(reservation
         ? { reservations: [{ labels: reservation, resources: { kind: "unified", memoryGb } }] }
         : {}),
-      commands: [{ start: "vllm serve m --host 127.0.0.1 --port {{port}}", stop: "true" }],
+      commands: [
+        {
+          start: "vllm serve m --host 127.0.0.1 --port {{port}}",
+          stop: "true",
+          status: "exit 3",
+        },
+      ],
       readiness: { path: "/v1/models", expectedStatus: 200, timeoutMs: 60_000 },
       health: { intervalMs: 15_000, failureThreshold: 3, successThreshold: 1 },
     },
@@ -285,6 +292,8 @@ integration("reservations on PostgreSQL", () => {
           generation: 1,
           state: "SUCCEEDED",
           attempts: 1,
+          // The node answered it, its rank idle.
+          rankIdle: true,
           intent: {},
           intentHash: "0".repeat(64),
         },
@@ -367,6 +376,8 @@ integration("reservations on PostgreSQL", () => {
             generation: 2,
             state: "SUCCEEDED",
             attempts: 1,
+            // The node answered it, its rank idle.
+            rankIdle: true,
             intent: {},
             intentHash: "0".repeat(64),
           },

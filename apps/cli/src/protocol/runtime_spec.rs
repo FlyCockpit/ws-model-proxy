@@ -608,6 +608,12 @@ pub struct NodeFeatures {
     /// commands. Absent means an older CLI that ignores them.
     #[serde(default, skip_serializing_if = "is_false")]
     pub job_reservations: bool,
+    /// One runtime step runner outlives the node's relay connections, and
+    /// stop and status results and inventory records say whether the rank
+    /// had another step that may launch in flight (`rank_idle`). The server
+    /// sends runtime jobs only to a node with it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rank_idle: bool,
     /// The node's secrets: names and when they were last set (never values).
     pub secrets: Vec<SecretEntry>,
 }

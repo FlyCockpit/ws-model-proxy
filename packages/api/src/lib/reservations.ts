@@ -65,76 +65,6 @@ export function reservationsKey(spec: unknown): string {
   return canonicalJson(parsed.success ? launchReservations(parsed.data.launch) : []);
 }
 
-/** A claim's resources as declared (the GPUs the planner recorded, `gpus`, left out). */
-function declared(resources: unknown): string {
-  if (typeof resources !== "object" || resources === null || Array.isArray(resources))
-    return canonicalJson(resources ?? null);
-  const { gpus: _recorded, ...rest } = resources as Record<string, unknown>;
-  return canonicalJson(rest);
-}
-
-/** What `heldClaimsMatch` reads of a held rank claim: what it holds, and where. */
-export type HeldRankClaim = {
-  rank: number;
-  resources: unknown;
-  port: number;
-  distPort: number | null;
-  /** The rank's node (labels the launch's labels must be among); null once deleted. */
-  Node: { labels: readonly string[] } | null;
-};
-
-/**
- * Whether an instance's held claims are exactly what a spec claims, and where they are satisfies
- * everything else the spec asks of a placement: one rank claim per rank with that rank's
- * resource declaration, on a node with the launch's labels, on the launch's fixed port when it
- * fixes one, with a dist port when it is multi-node, in the fabric it names (by name: `fabric`,
- * the instance's fabric); and the current reservation rows with each entry's labels and
- * resources. A restart that keeps the instance's claims where they are and as they are (a
- * definition update's "restart running") is only for a version claiming the same as what the
- * instance HOLDS, which an older version spec does not prove (a claim taken for an earlier
- * version stays as it was taken). Anything else is placed, with the planner's checks, by a start
- * (runtime_start with the instance id). An unreadable spec matches nothing.
- */
-export function heldClaimsMatch(
-  spec: unknown,
-  ranks: ReadonlyArray<HeldRankClaim>,
-  reservations: ReadonlyArray<{ index: number; labels: unknown; resources: unknown }>,
-  fabric: { name: string } | null,
-): boolean {
-  const parsed = runtimeSpecSchema.safeParse(spec);
-  const launch = parsed.success ? parsed.data.launch : undefined;
-  if (!launch) return false;
-  if (ranks.length !== launch.groupSize) return false;
-  const byRank = [...ranks].sort((a, b) => a.rank - b.rank);
-  for (const [index, rank] of byRank.entries()) {
-    const want = launch.resources[launch.resources.length === 1 ? 0 : index];
-    if (rank.rank !== index || !want || declared(rank.resources) !== canonicalJson(want))
-      return false;
-    // Placement-affecting parts of the launch, against where the claim is.
-    if (launch.port && rank.port !== launch.port.fixed) return false;
-    if (!rank.Node || !launch.labels.every((label) => rank.Node?.labels.includes(label)))
-      return false;
-    if (launch.groupSize > 1 && rank.distPort === null) return false;
-  }
-  if (launch.groupSize > 1) {
-    // One fabric, the named one when the launch names it.
-    if (!fabric || (launch.fabric !== undefined && fabric.name !== launch.fabric)) return false;
-    if (new Set(byRank.map((rank) => rank.distPort)).size !== 1) return false;
-  }
-  const entries = launchReservations(launch);
-  if (reservations.length !== entries.length) return false;
-  const byIndex = [...reservations].sort((a, b) => a.index - b.index);
-  return entries.every((entry, index) => {
-    const row = byIndex[index];
-    return (
-      row !== undefined &&
-      row.index === index &&
-      canonicalJson(row.labels ?? null) === canonicalJson([...entry.labels]) &&
-      declared(row.resources) === canonicalJson(entry.resources)
-    );
-  });
-}
-
 /**
  * What a version launches, as far as a running instance must restart for it: the launch hash
  * (what nodes see) plus the server-only reservations. Equal to the launch hash without any
@@ -316,6 +246,8 @@ const RANK_CLAIM_SELECT = {
   prevPort: true,
   prevDistPort: true,
   prevGeneration: true,
+  stoppedThroughRun: true,
+  releasedUnprovenAt: true,
 } as const satisfies Prisma.InstanceRankSelect;
 
 type RankClaimRow = Prisma.InstanceRankGetPayload<{ select: typeof RANK_CLAIM_SELECT }>;
@@ -406,7 +338,20 @@ async function keepPreviousRankClaims(
     // what an earlier dispatch used of it stopped (proven or released by a person), so no
     // earlier dispatch may make it a previous claim again.
     const planned = changed || released ? latest : old.plannedGeneration;
-    if (!changed && previous === kept && planned === old.plannedGeneration) continue;
+    // Released with proof (a node's, or steps that never ran): every launch so far is proven
+    // stopped (`launchesEnded`), which the retaken claim no longer shows, so the rank records
+    // it. A release without proof records nothing: that process may still run.
+    const stoppedThroughRun =
+      released && old.releasedUnprovenAt === null
+        ? Math.max(latest, old.stoppedThroughRun)
+        : old.stoppedThroughRun;
+    if (
+      !changed &&
+      previous === kept &&
+      planned === old.plannedGeneration &&
+      stoppedThroughRun === old.stoppedThroughRun
+    )
+      continue;
     await tx.instanceRank.update({
       where: { id: old.id },
       data: {
@@ -415,6 +360,7 @@ async function keepPreviousRankClaims(
         prevDistPort: previous?.distPort ?? null,
         prevGeneration: previous?.generation ?? null,
         plannedGeneration: planned,
+        stoppedThroughRun,
       },
     });
   }

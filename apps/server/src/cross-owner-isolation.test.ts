@@ -448,6 +448,7 @@ describe("lifecycle dispatch", () => {
         connectionGeneration: 1,
         trust: "full" as const,
         operatorTerminals: false,
+        rankIdle: true,
       })),
       onlineNodeIds: () => ["node-a"],
     };
@@ -528,7 +529,7 @@ describe("definition sync", () => {
     db.instanceStep.findMany.mockResolvedValue([] as never);
     // One live-claimed rank, so its physical launch is read too.
     db.instanceRank.findMany.mockResolvedValue([
-      { nodeId: "node-a", Instance: { launchVersionId: "ver-a" } },
+      { nodeId: "node-a", claim: "HELD", Instance: { launchVersionId: "ver-a" } },
     ] as never);
     db.$queryRaw.mockResolvedValue([] as never);
     const state = await loadNodeDefinitionState("node-a");

@@ -530,6 +530,7 @@ mod tests {
             detail: None,
             terminal_id: None,
             exit_code: None,
+            rank_idle: None,
         };
         assert!(encode_control(&bad).is_err());
         let heartbeat = NodeFrame::Heartbeat {

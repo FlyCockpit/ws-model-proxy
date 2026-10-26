@@ -1399,6 +1399,8 @@ impl Executor {
                         handle: job.handle.clone(),
                         models: job.models(),
                         engine_facts: None,
+                        // The runner sets it (`observe_all_idle`).
+                        rank_idle: None,
                     },
                 )
             })

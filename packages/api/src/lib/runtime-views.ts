@@ -15,6 +15,7 @@ import type {
 } from "../contracts/runtimes";
 import { rankCommands, renderStepCommand, type StepCommandPhase } from "./command-render";
 import { type InstanceLiveLoad, NO_LIVE_LOAD } from "./live-load";
+import { recordedGpuKeys } from "./placement";
 import { jsonObject, registryView } from "./registry-view";
 import {
   COMPAT_ENDPOINTS,
@@ -327,30 +328,39 @@ export type StepVersion = {
   author: "USER" | "AGENT" | "SYSTEM";
 };
 
-/** Versions other than the instance's launch version that its steps name, by id. */
-export type StepVersions = ReadonlyMap<string, StepVersion>;
+/**
+ * What an instance's steps name besides the instance's own launch version and fabric
+ * (`loadStepRefs`): a stop or status probe of a restart's earlier launch names that launch's
+ * version and fabric.
+ */
+export type StepRefs = {
+  /** Other versions, by id. */
+  versions: ReadonlyMap<string, StepVersion>;
+  /** Other fabrics' names, by id. */
+  fabricNames: ReadonlyMap<string, string>;
+};
 
-export const NO_STEP_VERSIONS: StepVersions = new Map();
+export const NO_STEP_REFS: StepRefs = { versions: new Map(), fabricNames: new Map() };
 
 /** What a step view needs of its instance to show the command as the node renders it. */
-export type StepViewContext = StepVersion & {
-  /** The instance's launch version (`spec`, `launchHash`, `author` are its). */
-  launchVersionId: string;
-  /**
-   * Other versions its steps name (a stop or status probe of a restart's earlier launch,
-   * `loadStepVersions`). A step naming a version not here shows no command: never the
-   * successor's text or author.
-   */
-  versions: StepVersions;
-  /** The instance's fabric and its members' addresses (multi-node only). */
-  fabric: {
-    id: string;
-    name: string;
-    Members: ReadonlyArray<{ nodeId: string; ip: string }>;
-  } | null;
-  /** The node of rank 0 (the head). */
-  headNodeId: string | null;
-};
+export type StepViewContext = StepVersion &
+  StepRefs & {
+    /** The instance's launch version (`spec`, `launchHash`, `author` are its). */
+    launchVersionId: string;
+    /*
+     * `versions`: other versions its steps name (`loadStepRefs`). A step naming a version not
+     * there shows no command: never the successor's text or author. `fabricNames`: other fabrics
+     * its steps name: a step renders with its own fabric's name, never the successor's.
+     */
+    /** The instance's fabric and its members' addresses (multi-node only). */
+    fabric: {
+      id: string;
+      name: string;
+      Members: ReadonlyArray<{ nodeId: string; ip: string }>;
+    } | null;
+    /** The node of rank 0 (the head). */
+    headNodeId: string | null;
+  };
 
 export type StepRow = Pick<
   InstanceRow["Steps"][number],
@@ -400,12 +410,25 @@ function renderedView(
     headAddr ??= fabric?.Members.find((member) => member.nodeId === context.headNodeId)?.ip ?? null;
     if (!headAddr) return unavailable("head_addr");
   }
+  // The name of the fabric the job names (`intent.fabricId`), as the node checks it. A stop or
+  // status probe runs the rank's recorded launch, never re-rendered: the node does not check
+  // the fabric again (it may have been renamed or deleted since), so neither does the preview.
+  const fabricId = intent.nnodes > 1 ? intent.fabricId : null;
+  const recorded = phase === "STOP" || phase === "STATUS";
+  const fabricName =
+    fabricId === null
+      ? null
+      : recorded
+        ? (version.spec.launch?.fabric ?? null)
+        : context.fabric?.id === fabricId
+          ? context.fabric.name
+          : (context.fabricNames.get(fabricId) ?? null);
   const rendered = renderStepCommand({
     spec: version.spec,
     phase,
     intent,
     placeholders: stepJobPlaceholders(intent, headAddr),
-    fabricName: context.fabric?.name ?? null,
+    fabricName,
   });
   return { rendered, headAddr };
 }
@@ -457,19 +480,20 @@ export function stepView(step: StepRow, context: StepViewContext): StepView {
   };
 }
 
-/** The step-view context of an instance (`INSTANCE_INCLUDE`), with `loadStepVersions`' versions. */
+/** The step-view context of an instance (`INSTANCE_INCLUDE`), with `loadStepRefs`' refs. */
 export function stepViewContext(
   row: Pick<InstanceRow, "launchVersionId" | "LaunchVersion" | "Fabric"> & {
     Ranks: ReadonlyArray<{ rank: number; nodeId: string | null }>;
   },
-  versions: StepVersions = NO_STEP_VERSIONS,
+  refs: StepRefs = NO_STEP_REFS,
 ): StepViewContext {
   return {
     launchVersionId: row.launchVersionId,
     spec: safeSpec(row.LaunchVersion.spec),
     launchHash: row.LaunchVersion.launchHash,
     author: row.LaunchVersion.editor,
-    versions,
+    versions: refs.versions,
+    fabricNames: refs.fabricNames,
     fabric: row.Fabric,
     headNodeId: row.Ranks.find((rank) => rank.rank === 0)?.nodeId ?? null,
   };
@@ -481,37 +505,55 @@ function safeSpec(value: unknown): RuntimeSpec | null {
 }
 
 /**
- * The versions other than their launch version that these instances' steps name (a stop or
- * status probe of a restart's earlier launch), read under the owner: one query, none when every
- * step names its instance's launch version. A version not found is left out (its steps then
- * show no command).
+ * What these instances' steps name besides their own launch version and fabric (a stop or status
+ * probe of a restart's earlier launch), read under the owner: one query each for versions and
+ * fabrics, none when every step names its instance's own. One not found is left out (a step
+ * naming another version then shows no command; another fabric, no fabric name).
  */
-export async function loadStepVersions(
-  db: Pick<Prisma.TransactionClient, "runtimeVersion">,
+export async function loadStepRefs(
+  db: Pick<Prisma.TransactionClient, "runtimeVersion" | "fabric">,
   userId: string,
   rows: ReadonlyArray<{
     launchVersionId: string;
+    Fabric: { id: string } | null;
     Steps: ReadonlyArray<{ intent: Prisma.JsonValue }>;
   }>,
-): Promise<StepVersions> {
-  const ids = new Set<string>();
+): Promise<StepRefs> {
+  const versionIds = new Set<string>();
+  const fabricIds = new Set<string>();
   for (const row of rows)
     for (const step of row.Steps) {
       const intent = stepIntentSchema.safeParse(step.intent);
-      if (intent.success && intent.data.launchVersionId !== row.launchVersionId)
-        ids.add(intent.data.launchVersionId);
+      if (!intent.success) continue;
+      if (intent.data.launchVersionId !== row.launchVersionId)
+        versionIds.add(intent.data.launchVersionId);
+      const fabricId = intent.data.nnodes > 1 ? intent.data.fabricId : null;
+      if (fabricId !== null && fabricId !== row.Fabric?.id) fabricIds.add(fabricId);
     }
-  if (ids.size === 0) return NO_STEP_VERSIONS;
-  const versions = await db.runtimeVersion.findMany({
-    where: { id: { in: [...ids] }, Runtime: { userId } },
-    select: { id: true, spec: true, launchHash: true, editor: true },
-  });
-  return new Map(
-    versions.map((version) => [
-      version.id,
-      { spec: safeSpec(version.spec), launchHash: version.launchHash, author: version.editor },
-    ]),
-  );
+  if (versionIds.size === 0 && fabricIds.size === 0) return NO_STEP_REFS;
+  const [versions, fabrics] = await Promise.all([
+    versionIds.size === 0
+      ? []
+      : db.runtimeVersion.findMany({
+          where: { id: { in: [...versionIds] }, Runtime: { userId } },
+          select: { id: true, spec: true, launchHash: true, editor: true },
+        }),
+    fabricIds.size === 0
+      ? []
+      : db.fabric.findMany({
+          where: { id: { in: [...fabricIds] }, userId },
+          select: { id: true, name: true },
+        }),
+  ]);
+  return {
+    versions: new Map(
+      versions.map((version) => [
+        version.id,
+        { spec: safeSpec(version.spec), launchHash: version.launchHash, author: version.editor },
+      ]),
+    ),
+    fabricNames: new Map(fabrics.map((fabric) => [fabric.id, fabric.name])),
+  };
 }
 
 /**
@@ -544,6 +586,7 @@ function previousClaimView(rank: {
     port: rank.prevPort,
     distPort: rank.prevDistPort,
     memoryGb: reservationMemoryGb(rank.prevResources),
+    gpus: recordedGpuKeys(rank.prevResources) ?? [],
   };
 }
 
@@ -555,13 +598,13 @@ export function instanceView(
   row: InstanceRow,
   stopChecks: ReadonlyMap<string, StopCheck> = new Map(),
   liveLoad: ReadonlyMap<string, InstanceLiveLoad> = NO_LIVE_LOAD,
-  /** `loadStepVersions` of the row: without it, steps of another version show no command. */
-  stepVersions: StepVersions = NO_STEP_VERSIONS,
+  /** `loadStepRefs` of the row: without it, steps of another version show no command. */
+  stepRefs: StepRefs = NO_STEP_REFS,
 ): InstanceView {
   const now = new Date();
   const load = liveLoad.get(row.id) ?? null;
   const advanced = advancedView(row.Version.advanced);
-  const context = stepViewContext(row, stepVersions);
+  const context = stepViewContext(row, stepRefs);
   // Rows read without the include (older callers' fixtures) have none.
   const reservations = row.Reservations ?? [];
   const reserved = reservationClaim(row.Ranks);
@@ -571,6 +614,7 @@ export function instanceView(
     nodeSlug: reservation.Node?.slug ?? null,
     labels: reservation.labels,
     memoryGb: reservationMemoryGb(reservation.resources),
+    gpus: recordedGpuKeys(reservation.resources) ?? [],
     reserved,
     nodeConnection: nodeConnectionView(reservation.Node),
   });
@@ -600,6 +644,8 @@ export function instanceView(
       nodeId: rank.nodeId,
       nodeSlug: rank.Node?.slug ?? null,
       port: rank.port,
+      distPort: rank.distPort,
+      gpus: recordedGpuKeys(rank.resources) ?? [],
       reserved: rank.claim,
       unitName: rank.unitName,
       nodeConnection: nodeConnectionView(rank.Node),

@@ -90,6 +90,8 @@ export const instanceReservationViewSchema = z
     labels: z.array(z.string()),
     /** What it holds there (GiB of node memory, GPU memory included). */
     memoryGb: z.number(),
+    /** The GPUs it holds there (`vendor:index` keys); empty when none (or none recorded). */
+    gpus: z.array(z.string()),
     reserved: z.enum(CLAIM_STATE),
     nodeConnection: z
       .object({ state: z.enum(NODE_CONNECTION), since: isoDateSchema.nullable() })
@@ -105,6 +107,10 @@ export const instanceRankViewSchema = z
     nodeId: idSchema.nullable(),
     nodeSlug: z.string().nullable(),
     port: z.number().int(),
+    /** A multi-node instance's dist port on this node (taken with the claim); null otherwise. */
+    distPort: z.number().int().nullable(),
+    /** The GPUs the claim holds on this node (`vendor:index` keys); empty when none recorded. */
+    gpus: z.array(z.string()),
     reserved: z.enum(CLAIM_STATE),
     unitName: z.string(),
     /** The node's connection and since when (its last connect or disconnect); null if deleted. */
@@ -143,6 +149,8 @@ export const instanceRankViewSchema = z
         distPort: z.number().int().nullable(),
         /** GiB of node memory it holds (GPU memory included). */
         memoryGb: z.number(),
+        /** The GPUs it holds (`vendor:index` keys); empty when none recorded. */
+        gpus: z.array(z.string()),
       })
       .strict()
       .nullable(),
@@ -645,12 +653,8 @@ export const runtimesContract = {
           z
             .object({
               instanceId: idSchema,
-              reason: refusalReasonSchema.extract([
-                "launch_changed",
-                "trust_relay",
-                "interactive_needs_person",
-                "definition_slots_full",
-              ]),
+              /** `launch_changed` without `restartRunning`; else why its restart was refused. */
+              reason: refusalReasonSchema,
             })
             .strict(),
         ),

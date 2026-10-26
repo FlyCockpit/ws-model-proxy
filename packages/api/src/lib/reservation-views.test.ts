@@ -5,6 +5,8 @@ vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: { DbNull: null } }))
 import { type NodeDetailRow, toNodeDetail, toNodeSummary } from "../nodes/views";
 import { loadPlacementInstances } from "./placement-load";
 import { launchIdentity } from "./reservations";
+import { RUNTIME_PRESET_LIST } from "./runtime-presets";
+import { runtimeSpecSchema } from "./runtime-spec";
 import { type PlannedStartWrite, type Tx, writePlannedStarts } from "./runtime-store";
 import {
   INSTANCE_INCLUDE,
@@ -60,6 +62,44 @@ describe("loadPlacementInstances", () => {
     const { db } = loaderDb([instanceRow("HELD_UNKNOWN")]);
     const [instance] = await loadPlacementInstances(db, ["w1"]);
     expect(instance?.ranks.map((rank) => rank.claim)).toEqual(["HELD_UNKNOWN", "HELD_UNKNOWN"]);
+  });
+
+  it("an interactive stop is the stop of the launch that may still run, else the current version's", async () => {
+    const preset = RUNTIME_PRESET_LIST.find((item) => item.spec.launch?.management === "service");
+    const launch = preset?.spec.launch;
+    const first = launch?.commands[0];
+    if (!preset || !launch || !first) throw new Error("no service preset");
+    const spec = (interactive: boolean) => ({
+      ...preset.spec,
+      launch: {
+        ...launch,
+        commands: [
+          { ...first, stop: "halt", ...(interactive ? { interactive: { stop: true } } : {}) },
+        ],
+      },
+    });
+    for (const interactive of [true, false])
+      expect(runtimeSpecSchema.safeParse(spec(interactive)).success).toBe(true);
+    const row = (current: boolean) => ({
+      ...instanceRow("HELD"),
+      LaunchVersion: { spec: spec(current) },
+      Ranks: [{ ...instanceRow("HELD").Ranks[0], rank: 0 }],
+    });
+    const load = async (current: boolean, earlier?: boolean) => {
+      const { db } = loaderDb([row(current)]);
+      const launched =
+        earlier === undefined ? undefined : new Map([["inst-ds", new Map([[0, spec(earlier)]])]]);
+      const [instance] = await loadPlacementInstances(db, ["w1"], launched);
+      return instance?.interactiveStop;
+    };
+    // Restarted from an interactive v1 onto a non-interactive v2 that has not launched: the
+    // stop runs v1's, a person's.
+    expect(await load(false, true)).toBe(true);
+    // And the other way round: v1 still runs, its stop needs nobody.
+    expect(await load(true, false)).toBe(false);
+    // Nothing launched of another version: the current version's.
+    expect(await load(true)).toBe(true);
+    expect(await load(false)).toBe(false);
   });
 
   it("drops reservations once the rank released its claim", async () => {
@@ -395,7 +435,12 @@ describe("the instance view shows everything a recovery releases", () => {
     expect(shown.supersededReservations).toEqual([
       expect.objectContaining({ nodeId: "old-worker", memoryGb: 100, reserved: "HELD_UNKNOWN" }),
     ]);
-    expect(shown.ranks[0]?.previousClaim).toEqual({ port: 30000, distPort: null, memoryGb: 64 });
+    expect(shown.ranks[0]?.previousClaim).toEqual({
+      port: 30000,
+      distPort: null,
+      memoryGb: 64,
+      gpus: [],
+    });
   });
 
   it("a released claim holds nothing of the replaced run", () => {

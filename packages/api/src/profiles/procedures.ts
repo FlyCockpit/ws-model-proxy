@@ -12,7 +12,7 @@ import { profilesContract as c, type profileViewSchema } from "../contracts/prof
 import { assertMayWrite, callerActor } from "../lib/caller-actor";
 import { graphDelete, graphWrite, instanceCapacityFences } from "../lib/graph-write";
 import {
-  agentBlockedNode,
+  agentBlockedNodeWithCleanup,
   OCCUPANCY_SELECT,
   occupiedNodeIds,
   occupiedNodes,
@@ -142,9 +142,16 @@ function planInstanceNodes(instance: RunningInstance) {
   };
 }
 
-/** The node an agent's stop of this instance would reach that is not at Full control, if any. */
-function agentBlockedNodeId(instance: RunningInstance): string | null {
-  const blocked = agentBlockedNode(instance);
+/**
+ * The node an agent's stop of this instance would reach that is not at Full control, if any
+ * (with the nodes its launches that may still run name: its stops name them).
+ */
+async function agentBlockedNodeId(
+  db: Prisma.TransactionClient,
+  userId: string,
+  instance: RunningInstance,
+): Promise<string | null> {
+  const blocked = await agentBlockedNodeWithCleanup(db, userId, instance);
   return blocked ? (blocked.nodeId ?? instance.id) : null;
 }
 
@@ -318,12 +325,16 @@ async function loadPlanInput(
       ];
     }),
   );
-  const planInstances: PlanInstance[] = instances.map((instance) => ({
-    id: instance.id,
-    desiredRunning: instance.desiredState === "RUNNING",
-    ...planInstanceNodes(instance),
-    agentBlockedNodeId: agentBlockedNodeId(instance),
-  }));
+  // Only an agent's apply is refused on a blocked node (`profilePlan`): looked up only then.
+  const agentRules = agentRulesApply(context.auth);
+  const planInstances: PlanInstance[] = [];
+  for (const instance of instances)
+    planInstances.push({
+      id: instance.id,
+      desiredRunning: instance.desiredState === "RUNNING",
+      ...planInstanceNodes(instance),
+      agentBlockedNodeId: agentRules ? await agentBlockedNodeId(db, userId, instance) : null,
+    });
   const items: PlanItem[] = profile.Items;
   return {
     profile,
@@ -337,7 +348,7 @@ async function loadPlanInput(
       claimants,
       callerId: userId,
       fabrics,
-      agentRules: agentRulesApply(context.auth),
+      agentRules,
     },
   };
 }

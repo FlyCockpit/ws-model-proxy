@@ -6,8 +6,9 @@ import type { RuntimeSpec } from "./runtime-spec";
 
 // `physicalLaunchIntents` (one $queryRaw with DISTINCT ON) on real PostgreSQL: per (instance,
 // rank) the latest physical launch (a start-phase step dispatched at least once and not refused
-// before the node admitted it), newest run first; ranks whose claim was RELEASED, and other
-// owners' instances, are left out.
+// before the node admitted it), newest run first; launches proven stopped (`launchesEnded`: a
+// claim released with proof), and other owners' instances, are left out. A release without proof
+// ends nothing.
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -42,6 +43,7 @@ integration("physicalLaunchIntents on PostgreSQL", () => {
     graph: typeof import("./graph-write");
     runtimes: typeof import("../routers/runtimes");
     run: typeof import("./instance-run");
+    release: typeof import("./claim-release");
   };
   const node: Record<string, string> = {};
 
@@ -49,13 +51,14 @@ integration("physicalLaunchIntents on PostgreSQL", () => {
     process.env.DATABASE_URL = databaseUrl;
     process.env.BETTER_AUTH_SECRET ??= "integration-test-secret-integration-test-secret";
     process.env.BETTER_AUTH_URL ??= "http://localhost:3000";
-    const [db, graph, runtimes, run] = await Promise.all([
+    const [db, graph, runtimes, run, release] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("./graph-write"),
       import("../routers/runtimes"),
       import("./instance-run"),
+      import("./claim-release"),
     ]);
-    modules = { prisma: db.default, graph, runtimes, run };
+    modules = { prisma: db.default, graph, runtimes, run, release };
     for (const id of [USER, OTHER])
       await modules.prisma.user.create({
         data: { id, name: id, email: `${id}@example.test`, emailVerified: true },
@@ -161,7 +164,7 @@ integration("physicalLaunchIntents on PostgreSQL", () => {
       (row) => [row.instanceId, row.rank, row.nodeId, (row.intent as { marker: string }).marker],
     );
 
-  it("returns the latest launch per rank, skipping pre-admission refusals, undispatched steps, released claims and other owners", async () => {
+  it("returns the latest launch per rank, skipping pre-admission refusals, undispatched steps, launches a proof ended and other owners", async () => {
     const live = await started(USER, "live", "pl-a");
     const released = await started(USER, "released", "pl-b");
     const theirs = await started(OTHER, "theirs", "pl-theirs");
@@ -259,13 +262,93 @@ integration("physicalLaunchIntents on PostgreSQL", () => {
         [released, 0, b, "rel-start"],
       ].sort((x, y) => String(x[0]).localeCompare(String(y[0]))),
     );
-    await modules.graph.graphWrite([USER], (tx) =>
-      tx.instanceRank.updateMany({
+    // A person releases it without proof: the process may still run, so its launch stays.
+    const rankOf = async (instanceId: string) =>
+      (
+        await modules.prisma.instanceRank.findUniqueOrThrow({
+          where: { instanceId_rank: { instanceId, rank: 0 } },
+          select: { id: true },
+        })
+      ).id;
+    await modules.graph.graphWrite([USER], async (tx) => {
+      await tx.instanceRank.updateMany({
         where: { instanceId: released },
-        data: { claim: "RELEASED", claimChangedAt: new Date(), stoppedAt: new Date() },
+        data: { claim: "HELD_UNKNOWN", markedStoppedAt: new Date(), markedStoppedBy: USER },
+      });
+      expect(
+        await modules.release.releaseClaim(tx, await rankOf(released), new Date(), {
+          unproven: { by: USER, reason: "status_running" },
+        }),
+      ).toBe(true);
+    });
+    expect(await markers([a, b])).toEqual(
+      [
+        [live, 0, a, "g2-replayed"],
+        [released, 0, b, "rel-start"],
+      ].sort((x, y) => String(x[0]).localeCompare(String(y[0]))),
+    );
+
+    // A node's proof releases `proven`: every launch of it so far ended, so nothing of it, and
+    // no stop names it any more.
+    const proven = await started(USER, "proven", "pl-b");
+    await step(USER, proven, b, {
+      phase: "START",
+      generation: 1,
+      sequence: 120,
+      attempts: 1,
+      marker: "proven-start",
+    });
+    const stop = await modules.graph.graphWrite([USER], (tx) =>
+      tx.instanceStep.create({
+        data: {
+          instanceId: proven,
+          nodeId: b,
+          rank: 0,
+          phase: "STOP",
+          sequence: 150,
+          generation: 1,
+          state: "SUCCEEDED",
+          attempts: 1,
+          // The node answered it, its rank idle.
+          rankIdle: true,
+          intent: { marker: "proven-stop" },
+          intentHash: "0".repeat(64),
+        },
+        select: { id: true },
       }),
     );
-    expect(await markers([a, b])).toEqual([[live, 0, a, "g2-replayed"]]);
+    await modules.graph.graphWrite([USER], async (tx) => {
+      expect(
+        await modules.release.releaseClaim(tx, await rankOf(proven), new Date(), {
+          result: { stepId: stop.id },
+        }),
+      ).toBe(true);
+    });
+    expect((await markers([b])).map((row) => row[0])).toEqual([released]);
+    expect(await modules.run.physicalLaunch(modules.prisma, proven, 0)).toBeNull();
+    expect(await modules.run.physicalLaunch(modules.prisma, released, 0)).toMatchObject({
+      intent: { marker: "rel-start" },
+    });
+    // A restart retakes the claim: the rank records that run 1 is proven stopped, so its
+    // launch stays ended while the new claim holds.
+    const retake = await client(USER, CALLERS.fullAgent(USER)).start({
+      runtimeId: (
+        await modules.prisma.runtimeInstance.findUniqueOrThrow({
+          where: { id: proven },
+          select: { runtimeId: true },
+        })
+      ).runtimeId,
+      instanceId: proven,
+    });
+    expect(retake.mode).toBe("applied");
+    expect(
+      await modules.prisma.instanceRank.findUniqueOrThrow({
+        where: { instanceId_rank: { instanceId: proven, rank: 0 } },
+        select: { claim: true, stoppedThroughRun: true },
+      }),
+    ).toEqual({ claim: "HELD", stoppedThroughRun: 1 });
+    expect(await modules.run.physicalLaunch(modules.prisma, proven, 0)).toBeNull();
+    expect((await markers([b])).map((row) => row[0])).toEqual([released]);
 
     // Another owner's launch is never returned for this owner, whatever nodes are asked for.
     await step(OTHER, theirs, other, {
@@ -275,7 +358,7 @@ integration("physicalLaunchIntents on PostgreSQL", () => {
       attempts: 1,
       marker: "theirs",
     });
-    expect(await markers([a, b, other])).toEqual([[live, 0, a, "g2-replayed"]]);
+    expect((await markers([a, other])).map((row) => row[0])).toEqual([live]);
     expect(
       (
         await modules.run.physicalLaunchIntents(modules.prisma, {

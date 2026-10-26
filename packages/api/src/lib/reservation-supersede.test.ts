@@ -31,6 +31,8 @@ type RankRow = {
   prevPort: number | null;
   prevDistPort: number | null;
   prevGeneration: number | null;
+  stoppedThroughRun: number;
+  releasedUnprovenAt: Date | null;
 };
 type ReservationRow = {
   id: string;
@@ -68,6 +70,8 @@ function memoryDb(rankClaim: Claim, generation: number, dispatched = generation)
       prevPort: null,
       prevDistPort: null,
       prevGeneration: null,
+      stoppedThroughRun: 0,
+      releasedUnprovenAt: null,
     },
   ];
   /** Prisma's write data with `Prisma.DbNull` read as the null it stores. */
@@ -509,6 +513,22 @@ describe("a restart keeps the running rank's claim held until the old run stoppe
     await write(db, rankRestart(GB20, 30005));
     expect(ranks[0]).toMatchObject({ claim: "HELD", prevPort: null, plannedGeneration: 1 });
     expect(await admitsOther(db, "head", GB100)).toBe(true);
+  });
+
+  it("a retake of a claim released with proof records that every launch so far stopped", async () => {
+    // Run 1 was proven stopped (RELEASED, no person's release): the next run's leading STOP and
+    // the node's required definitions no longer name its launch.
+    const { db, ranks } = memoryDb("RELEASED", 1);
+    await write(db, rankRestart(GB100));
+    expect(ranks[0]).toMatchObject({ claim: "HELD", stoppedThroughRun: 1 });
+  });
+
+  it("a retake of a claim a person released without proof records nothing", async () => {
+    // That process may still run: the next run's leading STOP must still reach it.
+    const { db, ranks } = memoryDb("RELEASED", 1);
+    Object.assign(ranks[0] ?? {}, { releasedUnprovenAt: new Date() });
+    await write(db, rankRestart(GB100));
+    expect(ranks[0]).toMatchObject({ claim: "HELD", stoppedThroughRun: 0 });
   });
 
   it("an unchanged claim retaken after it was released is planned for the new run", async () => {

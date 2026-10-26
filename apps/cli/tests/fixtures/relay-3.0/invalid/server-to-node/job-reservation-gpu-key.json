@@ -23,7 +23,7 @@
   "reservations": [
     {
       "index": 0,
-      "nodeId": "nd7f3k9q2w8e4r6t1y5u0i3o",
+      "nodeId": "wk7f3k9q2w8e4r6t1y5u0i3o",
       "node": "worker-a",
       "gpuIds": "nvidia:1"
     }

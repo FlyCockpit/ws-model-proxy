@@ -187,6 +187,26 @@ export const RUNTIME_JOB_PRE_ADMISSION_ERRORS = [
   "session_disconnected",
 ] as const;
 
+/**
+ * The codes a node answers a runtime job it admitted with (`RUNTIME_JOB_ERRORS` in the relay
+ * frames, after the pre-admission codes). `job_deadline` is also the server's own close of a
+ * step past its deadline.
+ */
+export const RUNTIME_JOB_ADMITTED_ERRORS = [
+  "instance_unknown",
+  "owned_launch_unconfirmed",
+  "launch_unconfirmed",
+  "command_failed",
+  "readiness_failed",
+  "health_failed",
+  "job_deadline",
+  /**
+   * A `process` start handed its server off out of the node's units (its start unit has no task
+   * left while the port answers): it needs `management: "service"` with stop and status.
+   */
+  "process_detached",
+] as const;
+
 /** Rank claims that still hold their node (a stop not proven yet keeps HELD_UNKNOWN). */
 export const LIVE_CLAIMS = ["HELD", "HELD_UNKNOWN"] as const;
 
@@ -236,8 +256,9 @@ export function mayHaveRunAfterRequeue(attempts: number): true | undefined {
 
 /**
  * What makes a step a physical launch (`physicalLaunch`, `physicalLaunchIntents`): a start-phase
- * step of any run that was dispatched (attempts > 0) and whose answer does not prove it never ran
- * (`notRefusedBeforeAdmissionWhere`). Both lookups read these, so they cannot drift apart.
+ * step that was dispatched (attempts > 0), whose answer does not prove it never ran
+ * (`notRefusedBeforeAdmissionWhere`), and that is not proven stopped (`launchesEnded`). Both
+ * lookups read these, so they cannot drift apart.
  */
 const PHYSICAL_LAUNCH = {
   phases: RUN_START_PHASES,
@@ -246,27 +267,107 @@ const PHYSICAL_LAUNCH = {
 } as const;
 
 /**
+ * The rank's start-phase steps after run `after` that could have started a process (physical
+ * launches, `PHYSICAL_LAUNCH`). None after the rank's proven boundary: nothing it launched can
+ * still run (`physicalLaunch` finds none; `neverRan` in `claim-release.ts`).
+ */
+export function launchedAfterWhere(
+  instanceId: string,
+  rank: number,
+  after: number,
+): Prisma.InstanceStepWhereInput {
+  return {
+    instanceId,
+    rank,
+    generation: { gt: after },
+    phase: { in: [...PHYSICAL_LAUNCH.phases] },
+    attempts: { gte: PHYSICAL_LAUNCH.minAttempts },
+    ...notRefusedBeforeAdmissionWhere(),
+  };
+}
+
+/**
+ * The runs of a rank whose starts may still matter: those after its proven boundary
+ * (`launchesEnded`), or none at all once every launch is proven ended. What `startsUnresolved`
+ * reads, as the physical lookups do.
+ */
+async function liveRunsAfter(db: Db, instanceId: string, rank: number): Promise<number | null> {
+  const row = await db.instanceRank.findUnique({
+    where: { instanceId_rank: { instanceId, rank } },
+    select: { claim: true, releasedUnprovenAt: true, stoppedThroughRun: true },
+  });
+  if (!row) return 0;
+  const ended = launchesEnded(row);
+  return ended === "all" ? null : ended.throughRun;
+}
+
+/**
+ * The rank's start-phase steps after run `after` whose dispatch the node has not answered: sent
+ * and not answered (RUNNING, or AWAITING_OPERATOR), or sent and requeued when their session was
+ * lost (PENDING with an attempt: the node re-observes them on its return). `before`: only those
+ * of runs before it.
+ */
+function unresolvedStartsWhere(
+  instanceId: string,
+  rank: number,
+  after: number,
+  before?: number,
+): Prisma.InstanceStepWhereInput {
+  return {
+    instanceId,
+    rank,
+    generation: before === undefined ? { gt: after } : { gt: after, lt: before },
+    phase: { in: [...RUN_START_PHASES] },
+    OR: [
+      { state: { in: ["RUNNING", "AWAITING_OPERATOR"] } },
+      { state: "PENDING", attempts: { gt: 0 } },
+    ],
+  };
+}
+
+/**
+ * Whether a dispatch of a start of the rank, after its proven boundary, is unanswered
+ * (`unresolvedStartsWhere`): the server's own bookkeeping of when to send a stop. A leading stop
+ * waits for them, and one is satisfied without the node only when there are none (the lifecycle's
+ * `createGeneration`). What a node's stopped answer proves is the node's to say (`rankIdle`,
+ * `proofHolds` in `claim-release.ts`).
+ */
+export async function startsUnresolved(
+  db: Db,
+  instanceId: string,
+  rank: number,
+  before?: number,
+): Promise<boolean> {
+  const after = await liveRunsAfter(db, instanceId, rank);
+  if (after === null) return false;
+  return (
+    (await db.instanceStep.count({
+      where: unresolvedStartsWhere(instanceId, rank, after, before),
+    })) > 0
+  );
+}
+
+/**
  * The stored intent of the latest step of this rank that could have started a process (a
  * physical launch, `PHYSICAL_LAUNCH`), with the head's fabric address that launch was dispatched
  * with (a multi-node launch; null otherwise, or for a launch dispatched before steps recorded
  * it). What a stop or status probe must name to reach the process that actually runs (its
  * launch version, port, unit, head), even once the head's node is gone. Null when nothing was
- * ever launched.
+ * launched since the rank's last proven stop.
  */
 export async function physicalLaunch(
   db: Db,
   instanceId: string,
   rank: number,
 ): Promise<{ intent: Prisma.JsonValue; headAddr: string | null } | null> {
+  const row = await db.instanceRank.findUnique({
+    where: { instanceId_rank: { instanceId, rank } },
+    select: { claim: true, releasedUnprovenAt: true, stoppedThroughRun: true },
+  });
+  if (row && launchesEnded(row) === "all") return null;
   // One row, newest first (bounded however long the rank's history is).
   const latest = await db.instanceStep.findFirst({
-    where: {
-      instanceId,
-      rank,
-      phase: { in: [...PHYSICAL_LAUNCH.phases] },
-      attempts: { gte: PHYSICAL_LAUNCH.minAttempts },
-      ...notRefusedBeforeAdmissionWhere(),
-    },
+    where: launchedAfterWhere(instanceId, rank, row?.stoppedThroughRun ?? 0),
     select: { intent: true, headAddr: true },
     orderBy: [{ generation: "desc" }, { sequence: "desc" }],
   });
@@ -274,7 +375,44 @@ export async function physicalLaunch(
   return latest ? { intent: latest.intent, headAddr: latest.headAddr ?? null } : null;
 }
 
-/** One live-claimed rank's physical launch (`physicalLaunchIntents`). */
+/**
+ * Which of a rank's launches are proven stopped: all of them while its claim is RELEASED with
+ * proof (a node's proof, steps that never ran, its node's deletion: a release without proof
+ * records who made it), else those of runs up to `stoppedThroughRun` (written when a restart
+ * retakes a claim released with proof, `retakeInstanceClaims`, and when a run's leading STOP
+ * succeeds, `recordStoppedThrough`). A launch that may still run keeps
+ * its version required on the node and is what the next run's leading STOP names.
+ */
+export function launchesEnded(rank: {
+  claim: string;
+  releasedUnprovenAt: Date | null;
+  stoppedThroughRun: number;
+}): "all" | { throughRun: number } {
+  return rank.claim === "RELEASED" && rank.releasedUnprovenAt === null
+    ? "all"
+    : { throughRun: rank.stoppedThroughRun };
+}
+
+/**
+ * Records that every launch of this rank in runs up to `throughRun` is proven stopped
+ * (`stoppedThroughRun`, which only grows): a leading STOP of run `throughRun + 1` succeeded (the
+ * node answered stopped after every earlier start of the rank answered), or was satisfied because
+ * nothing launched since the last proven boundary. The claim stays (the new run uses it).
+ * Callers hold the instance's fences.
+ */
+export async function recordStoppedThrough(
+  db: Db,
+  instanceId: string,
+  rank: number,
+  throughRun: number,
+): Promise<void> {
+  await db.instanceRank.updateMany({
+    where: { instanceId, rank, stoppedThroughRun: { lt: throughRun } },
+    data: { stoppedThroughRun: throughRun },
+  });
+}
+
+/** One rank's physical launch (`physicalLaunchIntents`). */
 export type RankPhysicalLaunch = {
   instanceId: string;
   rank: number;
@@ -283,10 +421,11 @@ export type RankPhysicalLaunch = {
 };
 
 /**
- * `physicalLaunch` of every rank of `userId`'s instances with a live claim (`LIVE_CLAIMS`) on
- * one of these nodes, in one query whatever the number of ranks: the latest physical launch per
- * (instance, rank), served by the `(instanceId, rank, phase, sequence)` index. Ranks that never
- * launched are absent. Only the owner's instances (`runtime_instance."userId"`).
+ * `physicalLaunch` of every rank of `userId`'s instances on one of these nodes, in one query
+ * whatever the number of ranks: the latest physical launch per (instance, rank), served by the
+ * `(instanceId, rank, phase, sequence)` index. Whatever the claim: a rank released without proof
+ * may still run its launch. Ranks with no launch that may still run (`launchesEnded`) are absent.
+ * Only the owner's instances (`runtime_instance."userId"`).
  */
 export async function physicalLaunchIntents(
   db: Db,
@@ -294,10 +433,9 @@ export async function physicalLaunchIntents(
 ): Promise<RankPhysicalLaunch[]> {
   if (input.nodeIds.length === 0) return [];
   const nodeIds = [...input.nodeIds];
-  const claims = [...LIVE_CLAIMS];
   const phases = [...PHYSICAL_LAUNCH.phases];
   const preAdmission = [...RUNTIME_JOB_PRE_ADMISSION_ERRORS];
-  // `notRefusedBeforeAdmissionWhere` in SQL.
+  // `notRefusedBeforeAdmissionWhere` and `launchesEnded` in SQL.
   return db.$queryRaw<RankPhysicalLaunch[]>`
     SELECT DISTINCT ON (s."instanceId", s.rank)
       s."instanceId" AS "instanceId", s.rank AS rank, r."nodeId" AS "nodeId", s.intent AS intent
@@ -306,7 +444,8 @@ export async function physicalLaunchIntents(
     JOIN runtime_instance i ON i.id = s."instanceId"
     WHERE i."userId" = ${input.userId}
       AND r."nodeId" = ANY(${nodeIds}::text[])
-      AND r.claim::text = ANY(${claims}::text[])
+      AND NOT (r.claim = 'RELEASED' AND r."releasedUnprovenAt" IS NULL)
+      AND s.generation > r."stoppedThroughRun"
       AND s.phase::text = ANY(${phases}::text[])
       AND s.attempts >= ${PHYSICAL_LAUNCH.minAttempts}
       AND (s."mayHaveRun" OR s."errorCode" IS NULL

@@ -181,6 +181,7 @@ impl TerminalStartup {
             media_expand: true,
             live_stt: true,
             job_reservations: true,
+            rank_idle: true,
             secrets: crate::secrets::entries(),
         }
     }
@@ -251,6 +252,7 @@ mod tests {
         // Operator terminals need only a PTY: no switch, any trust level.
         assert_eq!(features.operator_terminals, cfg!(unix));
         assert!(features.job_reservations);
+        assert!(features.rank_idle);
         assert!(startup.full_control());
         assert_eq!(
             startup.trust(),

@@ -670,13 +670,13 @@ fn commands_see_the_reservations_worker_nodes() {
     placed.reservations = vec![
         JobReservation {
             index: 0,
-            node_id: "nd7f3k9q2w8e4r6t1y5u0i3o".into(),
+            node_id: "wk7f3k9q2w8e4r6t1y5u0i3o".into(),
             node: "worker-a".into(),
             gpu_ids: Some("1".into()),
         },
         JobReservation {
             index: 3,
-            node_id: "nd2b6n8m4v1c9x7z3l5k0j8h".into(),
+            node_id: "wk2b6n8m4v1c9x7z3l5k0j8h".into(),
             node: "worker-b".into(),
             gpu_ids: None,
         },
@@ -687,10 +687,10 @@ fn commands_see_the_reservations_worker_nodes() {
         vec![
             pair("WSMP_RESERVATION_COUNT", "2"),
             pair("WSMP_RESERVATION_0_NODE", "worker-a"),
-            pair("WSMP_RESERVATION_0_NODE_ID", "nd7f3k9q2w8e4r6t1y5u0i3o"),
+            pair("WSMP_RESERVATION_0_NODE_ID", "wk7f3k9q2w8e4r6t1y5u0i3o"),
             pair("WSMP_RESERVATION_0_GPUS", "1"),
             pair("WSMP_RESERVATION_3_NODE", "worker-b"),
-            pair("WSMP_RESERVATION_3_NODE_ID", "nd2b6n8m4v1c9x7z3l5k0j8h"),
+            pair("WSMP_RESERVATION_3_NODE_ID", "wk2b6n8m4v1c9x7z3l5k0j8h"),
         ]
     );
     // Persisted records written before the field still load, and an empty list is not stored.
@@ -708,7 +708,7 @@ fn a_new_start_replaces_the_recorded_reservations() {
     let mut first = job(JobPhase::Start);
     first.reservations = vec![JobReservation {
         index: 0,
-        node_id: "nd1".into(),
+        node_id: "wk1".into(),
         node: "worker-a".into(),
         gpu_ids: Some("0,3".into()),
     }];

@@ -4,8 +4,10 @@
  * node's cap (`RUNTIME_DEFINITIONS_MAX`, which the released CLI enforces):
  * - the launch version of every instance with a live claim (`LIVE_CLAIMS`) on the node;
  * - the version every unfinished step on the node names (`UNFINISHED_STEPS`);
- * - what each live-claimed rank on the node physically runs (its latest physical launch,
- *   `physicalLaunchIntents`): after a restart the earlier version, until its stop is proven.
+ * - what each rank on the node physically runs (its latest launch not proven stopped,
+ *   `physicalLaunchIntents`): after a restart the earlier version until its stop is proven, and
+ *   a launch whose claim a person released without proof (it may still run, and a restart's
+ *   leading STOP names it).
  * Only the node owner's server-origin runtimes count (a node-origin definition lives in the
  * node's runtimes.json and takes no slot). Reservations add nothing: nothing is dispatched to
  * their nodes.
@@ -14,10 +16,12 @@
  * (placement, `runtime_update` restarts), so what is refused is exactly what would not fit.
  */
 import type { Prisma } from "@ws-model-proxy/db";
-import { LIVE_CLAIMS, physicalLaunchIntents } from "./instance-run";
+import { LIVE_CLAIMS, launchesEnded, physicalLaunchIntents } from "./instance-run";
 import { stepIntentSchema } from "./step-intent";
 
 type Db = Prisma.TransactionClient;
+
+const LIVE: ReadonlySet<string> = new Set(LIVE_CLAIMS);
 
 /** Steps that may still be dispatched or answered: the version they name must stay held. */
 export const UNFINISHED_STEPS = ["PENDING", "RUNNING", "AWAITING_OPERATOR"] as const;
@@ -36,13 +40,16 @@ export async function requiredDefinitionsByNode(
   const required = new Map<string, Set<string>>(nodeIds.map((id) => [id, new Set<string>()]));
   if (nodeIds.length === 0) return required;
   const [ranks, steps] = await Promise.all([
+    // Every rank on the nodes (one released without proof may still run its launch, below).
     db.instanceRank.findMany({
-      where: {
-        nodeId: { in: nodeIds },
-        claim: { in: [...LIVE_CLAIMS] },
-        Instance: { userId },
+      where: { nodeId: { in: nodeIds }, Instance: { userId } },
+      select: {
+        nodeId: true,
+        claim: true,
+        releasedUnprovenAt: true,
+        stoppedThroughRun: true,
+        Instance: { select: { launchVersionId: true } },
       },
-      select: { nodeId: true, Instance: { select: { launchVersionId: true } } },
     }),
     db.instanceStep.findMany({
       where: {
@@ -53,13 +60,16 @@ export async function requiredDefinitionsByNode(
       select: { nodeId: true, intent: true },
     }),
   ]);
-  // Only when some rank holds: the physical launches of live-claimed ranks, in one query.
-  const physical = ranks.length > 0 ? await physicalLaunchIntents(db, { userId, nodeIds }) : [];
+  // Only when some rank may still run a launch: the nodes' physical launches, in one query.
+  const physical = ranks.some((rank) => launchesEnded(rank) !== "all")
+    ? await physicalLaunchIntents(db, { userId, nodeIds })
+    : [];
 
   // Candidate (node, version) pairs; versions are checked once below for owner and origin.
   const named: Array<{ nodeId: string; versionId: string }> = [];
   for (const rank of ranks)
-    if (rank.nodeId) named.push({ nodeId: rank.nodeId, versionId: rank.Instance.launchVersionId });
+    if (rank.nodeId && LIVE.has(rank.claim))
+      named.push({ nodeId: rank.nodeId, versionId: rank.Instance.launchVersionId });
   for (const row of [...steps, ...physical]) {
     const parsed = stepIntentSchema.safeParse(row.intent);
     if (parsed.success) named.push({ nodeId: row.nodeId, versionId: parsed.data.launchVersionId });

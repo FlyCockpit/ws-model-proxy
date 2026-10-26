@@ -9,8 +9,8 @@
  * (HELD and HELD_UNKNOWN; a stopping instance keeps its claim until the node proves the stop).
  * - Memory: `unified.memoryGb`, `cpu.ramGb` and `discrete.ramGb` count against the node's
  *   usable memory. A service runtime (no served models) claims its declared resources too.
- * - GPUs: a `discrete` rank takes `gpuCount` GPUs (of `vendor`, when set) that each have
- *   `vramGb` free. A unified GPU (GB10, an APU) has no VRAM of its own: what a rank takes on it
+ * - GPUs: a `discrete` rank takes `gpuCount` GPUs of one vendor (`vendor`, when set) that each
+ *   have `vramGb` free. A unified GPU (GB10, an APU) has no VRAM of its own: what a rank takes on it
  *   comes out of the node's usable memory. Claims are replayed in a fixed order with the same best-fit rule, so which
  *   GPU a claim holds is deterministic and freeing it gives back exactly what it took.
  * - Ports: every claim's `port` and `distPort` stay taken until the claim is released, also
@@ -55,8 +55,8 @@
  * node can take is refused before any node is tried for the rank, and each rank node tried
  * reuses the reservations' fits on every node that rank node's plan left unchanged.
  *
- * Definitions: a Full-control node holds at most `RUNTIME_DEFINITIONS_MAX` server-origin runtime
- * versions it requires (`PlacementNode.requiredVersionIds`: what runs or is stopping there,
+ * Definitions: a node holds at most `RUNTIME_DEFINITIONS_MAX` server-origin runtime versions it
+ * requires, at any trust (a Relay-only node raised to Full is sent them all) (`PlacementNode.requiredVersionIds`: what runs or is stopping there,
  * `node-definitions.ts`), which the definition sync always sends. A rank of a version the node
  * does not require yet takes one more; when none is left the node refuses
  * `definition_slots_full`. A stop frees no slot until it is proven, so preemption cannot help,
@@ -75,6 +75,7 @@
  * models another user's pool runs (contributed), or one whose stop waits for a person.
  */
 import type { RefusalReason } from "../contracts/refusals";
+import { claimVramHolds } from "../nodes/hardware";
 import { compareCodePoints } from "./canonical-json";
 import {
   type ClaimUsage,
@@ -127,8 +128,8 @@ export type PlacementNode = {
   heldVersionIds: ReadonlySet<string>;
   /**
    * Server-origin version ids the node requires now (`requiredDefinitionsByNode`): what runs or
-   * is stopping there. At Full control a rank of another version needs a free definition slot
-   * (`RUNTIME_DEFINITIONS_MAX`).
+   * is stopping there. A rank of another version needs a free definition slot
+   * (`RUNTIME_DEFINITIONS_MAX`), whatever the node's trust.
    */
   requiredVersionIds: ReadonlySet<string>;
   /**
@@ -182,8 +183,16 @@ export type PlacementInstance = {
   ranks: readonly PlacementRank[];
   /** One of its served models is a member of another user's pool. */
   contributed: boolean;
-  /** A stop step runs in an operator terminal and waits for a person. */
+  /**
+   * A stop step of a held rank runs in an operator terminal and waits for a person: the stop of
+   * the launch that may still run there, else the current version's (`loadPlacementInstances`).
+   */
   interactiveStop: boolean;
+  /**
+   * Reservation nodes its launches that may still run name (`launchCleanupNodes`): its stop
+   * reaches them too (`loadPlacementContext`); absent: none.
+   */
+  cleanupNodeIds?: readonly string[];
 };
 
 export type PlacementFabric = {
@@ -333,8 +342,16 @@ export function recordedGpuKeys(resources: unknown): string[] | null {
 /** What a rank's resources take from a node. Unparseable JSON takes nothing. */
 export function resourceNeeds(resources: unknown): Needs {
   let spec = resources;
-  if (resources && typeof resources === "object" && "gpus" in resources) {
-    const { gpus: _recorded, ...rest } = resources as Record<string, unknown>;
+  if (
+    resources &&
+    typeof resources === "object" &&
+    ("gpus" in resources || "unifiedGpus" in resources)
+  ) {
+    const {
+      gpus: _recorded,
+      unifiedGpus: _unified,
+      ...rest
+    } = resources as Record<string, unknown>;
     spec = rest;
   }
   const parsed = runtimeResourceSchema.safeParse(spec);
@@ -405,10 +422,14 @@ function cloneBudget(budget: Budget): Budget {
   };
 }
 
-/** Whether a rank of this request on `node` needs a definition slot the node does not have. */
-function definitionSlotsFull(node: PlacementNode, budget: Budget, request: PlacementRequest) {
+/**
+ * Whether a rank of this request on a node needs a definition slot the node does not have. Every
+ * node counts, whatever its trust: a Relay-only node raised to Full is sent everything it
+ * requires, so what it requires never exceeds the cap at any trust (and a trust change, which
+ * admission does not serialize with, never changes the count).
+ */
+function definitionSlotsFull(budget: Budget, request: PlacementRequest) {
   return (
-    node.trust === "FULL" &&
     !request.nodeOrigin &&
     !budget.definitions.has(request.versionId) &&
     budget.definitions.size >= RUNTIME_DEFINITIONS_MAX
@@ -428,10 +449,42 @@ function unifiedCount(budget: Budget, gpuKeys: readonly string[]): number {
   return budget.gpus.filter((gpu) => gpu.unified && gpuKeys.includes(gpu.key)).length;
 }
 
+/** The most GPU sets one search tries per vendor (bounded work on a node with many GPUs). */
+const GPU_SETS_MAX = 4_096;
+
 /**
- * The GPUs a rank takes: `gpuCount` GPUs of the vendor with `vramGb` free each, best fit
- * (least free first, then key). Unified GPUs share the node memory left after the rank's own
- * memory. Null when they do not exist.
+ * `count` of `sorted` of one vendor that `feasible` accepts (the whole fit rule, `freshFits` or
+ * `overFits`), per vendor in turn (the vendor of the best-fitting GPU first): every set of the vendor's GPUs in
+ * best-fit order (the best-fit `count` first, then sets that swap later GPUs first), at most
+ * {@link GPU_SETS_MAX} of them.
+ */
+function oneVendorFeasible<T extends { vendor: string }>(
+  sorted: readonly T[],
+  count: number,
+  feasible: (picked: readonly T[]) => boolean,
+): T[] | null {
+  for (const vendor of new Set(sorted.map((gpu) => gpu.vendor))) {
+    const same = sorted.filter((gpu) => gpu.vendor === vendor);
+    if (same.length < count) continue;
+    const indices = Array.from({ length: count }, (_, index) => index);
+    for (let tried = 0; tried < GPU_SETS_MAX; tried++) {
+      const picked = indices.map((index) => same[index] as T);
+      if (feasible(picked)) return picked;
+      // The next set in lexicographic order of positions, or none left.
+      let at = count - 1;
+      while (at >= 0 && indices[at] === same.length - count + at) at--;
+      if (at < 0) break;
+      indices[at] = (indices[at] ?? 0) + 1;
+      for (let next = at + 1; next < count; next++) indices[next] = (indices[next - 1] ?? 0) + 1;
+    }
+  }
+  return null;
+}
+
+/**
+ * The GPUs a rank takes: `gpuCount` GPUs of one vendor (the named one, else the first vendor with a fitting set) with
+ * `vramGb` free each, best fit (least free first, then key). Unified GPUs share the node memory
+ * left after the rank's own memory. Null when they do not exist.
  */
 function pickGpus(budget: Budget, needs: Needs): string[] | null {
   if (needs.gpuCount === 0) return [];
@@ -443,11 +496,47 @@ function pickGpus(budget: Budget, needs: Needs): string[] | null {
         free(gpu) + EPSILON >= needs.vramGb,
     )
     .sort((a, b) => free(a) - free(b) || compareCodePoints(a.key, b.key));
-  if (fitting.length < needs.gpuCount) return null;
-  const picked = fitting.slice(0, needs.gpuCount).map((gpu) => gpu.key);
-  const shared = unifiedCount(budget, picked) * needs.vramGb;
-  if (needs.memoryGb + shared > budget.memoryGb + EPSILON) return null;
-  return picked;
+  const chosen = oneVendorFeasible(fitting, needs.gpuCount, (picked) =>
+    freshFits(
+      budget,
+      needs,
+      picked.map((gpu) => gpu.key),
+    ),
+  );
+  return chosen ? chosen.map((gpu) => gpu.key) : null;
+}
+
+/**
+ * Whether a new claim with these needs fits on these GPUs: its memory and the VRAM of the
+ * unified ones in node memory, and each dedicated one's VRAM on that GPU (every claim is charged
+ * on every GPU it may be on, `claimUsage`, so over-commit shows as negative free VRAM there and
+ * nothing is placed on top). The one rule the GPU search and `fit` apply.
+ */
+function freshFits(budget: Budget, needs: Needs, gpuKeys: readonly string[]): boolean {
+  const shared = unifiedCount(budget, gpuKeys);
+  if (needs.memoryGb + shared * needs.vramGb > budget.memoryGb + EPSILON) return false;
+  for (const key of gpuKeys) {
+    const gpu = budget.gpus.find((candidate) => candidate.key === key);
+    if (gpu && !gpu.unified && gpu.freeGb + EPSILON < needs.vramGb) return false;
+  }
+  return true;
+}
+
+/**
+ * `freshFits` for a restart's claim over its old claims on the node: only its growth must fit,
+ * in node memory and on each GPU it uses.
+ */
+function overFits(budget: Budget, needs: Needs, gpuKeys: readonly string[], floor: Floor): boolean {
+  const take = overlapGrowth(floor.floor, floor.placed, usageOf(budget, needs, gpuKeys));
+  if (!grows(take.memoryGb, budget.memoryGb)) return false;
+  // On each GPU the new claim uses (one only its old run holds is freed once that run stops:
+  // its over-commit there is not the new claim's to cover).
+  for (const [key, gb] of take.gpus) {
+    if (!gpuKeys.includes(key)) continue;
+    const gpu = budget.gpus.find((candidate) => candidate.key === key);
+    if (gpu && !grows(gb, gpu.freeGb)) return false;
+  }
+  return true;
 }
 
 /**
@@ -521,44 +610,63 @@ function pickGpusOver(budget: Budget, needs: Needs, floor: Floor): string[] | nu
         left(a) - left(b) ||
         compareCodePoints(a.key, b.key),
     );
-  if (fitting.length < needs.gpuCount) return null;
-  return fitting.slice(0, needs.gpuCount).map((gpu) => gpu.key);
+  const chosen = oneVendorFeasible(fitting, needs.gpuCount, (picked) =>
+    overFits(
+      budget,
+      needs,
+      picked.map((gpu) => gpu.key),
+      floor,
+    ),
+  );
+  return chosen ? chosen.map((gpu) => gpu.key) : null;
 }
 
 /**
- * The GPUs an existing claim holds: the keys it recorded when they still exist with the vendor
- * it needs, else the best-fit pick, else (an over-committed node) the GPUs with the most free
- * VRAM. Over-commit then shows as negative free VRAM, so nothing more fits there.
+ * What an existing claim takes: its memory, and its VRAM on every GPU it may be on
+ * (`claimVramHolds`, shared with the node views): where it is when it recorded its GPUs and the
+ * node reports them, on every candidate GPU (and node memory for unified ones) where it does
+ * not. Never a guess, so each GPU's own room decides a new claim.
  */
-function claimGpus(budget: Budget, needs: Needs, resources: unknown): string[] {
-  if (needs.gpuCount === 0) return [];
-  const recorded = recordedGpuKeys(resources);
-  if (
-    recorded &&
-    recorded.length === needs.gpuCount &&
-    new Set(recorded).size === recorded.length &&
-    recorded.every((key) =>
-      budget.gpus.some(
-        (gpu) => gpu.key === key && (needs.vendor === null || gpu.vendor === needs.vendor),
-      ),
-    )
-  )
-    return recorded;
-  return (
-    pickGpus(budget, needs) ??
-    [...budget.gpus]
-      .sort(
-        (a, b) =>
-          gpuFreeGb(budget, b, 0) - gpuFreeGb(budget, a, 0) || compareCodePoints(a.key, b.key),
-      )
-      .slice(0, needs.gpuCount)
-      .map((gpu) => gpu.key)
-  );
+function claimUsage(budget: Budget, needs: Needs, resources: unknown): ClaimUsage {
+  if (needs.gpuCount === 0) return usageOf(budget, needs, []);
+  const holds = claimVramHolds(resources, budget.gpus);
+  return { memoryGb: needs.memoryGb + holds.sharedGb, gpus: holds.dedicated };
 }
 
-/** The lowest free port of the node's range (or the fixed one), or null. */
-function freePort(budget: Budget, node: PlacementNode, fixed: number | undefined): number | null {
-  if (fixed !== undefined) return budget.ports.has(fixed) ? null : fixed;
+/**
+ * The recorded GPUs of a claim that are unified (`unifiedGpus`, written with `gpus`, empty when
+ * none is: its absence marks a claim recorded before it, `sharedVramGpuKeys`).
+ */
+function unifiedOf(node: PlacementNode, gpuKeys: readonly string[]): { unifiedGpus: string[] } {
+  return {
+    unifiedGpus: gpuKeys.filter((key) => node.gpus.some((gpu) => gpu.key === key && gpu.unified)),
+  };
+}
+
+/**
+ * A rank's port: the version's fixed port (that one or none), or a restart's own port, kept only
+ * while it is inside the node's current range and free (else another port of the range, like a
+ * new start: the node refuses a dynamic port outside its range).
+ */
+type RankPort = { fixed?: number; kept?: number };
+
+/** What port rank `index` of the request wants (`RankPort`). */
+function wantedPort(request: PlacementRequest, index: number): RankPort {
+  const fixed = request.launch.port?.fixed;
+  if (fixed !== undefined) return { fixed };
+  const kept = request.restart?.ports[index];
+  return kept === undefined ? {} : { kept };
+}
+
+function inRange(port: number, [start, end]: readonly [number, number]): boolean {
+  return port >= start && port <= end;
+}
+
+/** The fixed port if free; else the kept port if usable; else the range's lowest free port. */
+function freePort(budget: Budget, node: PlacementNode, wanted: RankPort): number | null {
+  if (wanted.fixed !== undefined) return budget.ports.has(wanted.fixed) ? null : wanted.fixed;
+  const kept = wanted.kept;
+  if (kept !== undefined && inRange(kept, node.portRange) && !budget.ports.has(kept)) return kept;
   for (let port = node.portRange[0]; port <= node.portRange[1]; port++)
     if (!budget.ports.has(port)) return port;
   return null;
@@ -575,35 +683,57 @@ type Fit =
     }
   | { ok: false; reason: "not_enough_memory" | "port_in_use" | "no_free_ports" };
 
+/**
+ * The needs a claim is fitted with, in order: its own; then, when it wants GPUs and names no
+ * vendor, pinned to each vendor the node has. The unpinned pick takes the best-fitting GPUs'
+ * vendor, whose GPUs together may lack the room another vendor's have.
+ */
+function vendorTrials(budget: Budget, needs: Needs): Needs[] {
+  if (needs.vendor !== null || needs.gpuCount === 0) return [needs];
+  const vendors = [...new Set(budget.gpus.map((gpu) => gpu.vendor))].sort(compareCodePoints);
+  return [needs, ...vendors.map((vendor) => ({ ...needs, vendor }))];
+}
+
 function fit(
   node: PlacementNode,
   budget: Budget,
   resources: unknown,
-  fixedPort: number | undefined,
+  wanted: RankPort,
   /** False for a reservation: it takes no port (`port` is 0). */
   needsPort = true,
   /** A restart's old claims on this node (`Floor`): the claim takes its growth over them. */
   floor?: Floor,
 ): Fit {
-  if (floor) return fitOver(node, budget, resources, fixedPort, needsPort, floor);
-  const needs = resourceNeeds(resources);
+  let refused: Fit = { ok: false, reason: "not_enough_memory" };
+  for (const needs of vendorTrials(budget, resourceNeeds(resources))) {
+    const fitted = floor
+      ? fitOver(node, budget, needs, wanted, needsPort, floor)
+      : fitFresh(node, budget, needs, wanted, needsPort);
+    // Ports do not depend on the vendor.
+    if (fitted.ok || fitted.reason !== "not_enough_memory") return fitted;
+    refused = fitted;
+  }
+  return refused;
+}
+
+/** `fit` of a claim with these needs on a node it holds nothing on yet. */
+function fitFresh(
+  node: PlacementNode,
+  budget: Budget,
+  needs: Needs,
+  wanted: RankPort,
+  needsPort: boolean,
+): Fit {
   if (needs.memoryGb > budget.memoryGb + EPSILON) return { ok: false, reason: "not_enough_memory" };
-  const gpuKeys = pickGpus(budget, needs);
-  if (!gpuKeys) return { ok: false, reason: "not_enough_memory" };
-  // Over-committed claims show as negative free VRAM on some GPU: the vendor's total must
-  // cover the rank too, so no over-commit is ever placed on top. Unified GPUs were checked
-  // against node memory (where their over-commit shows) by the pick.
-  const dedicated = gpuKeys.length - unifiedCount(budget, gpuKeys);
-  const totalFree = budget.gpus
-    .filter((gpu) => !gpu.unified && (needs.vendor === null || gpu.vendor === needs.vendor))
-    .reduce((sum, gpu) => sum + gpu.freeGb, 0);
-  if (dedicated > 0 && totalFree + EPSILON < dedicated * needs.vramGb)
+  // GPUs the whole fit rule accepts (`freshFits`), or none.
+  const gpuKeys = needs.gpuCount === 0 ? [] : pickGpus(budget, needs);
+  if (!gpuKeys || !freshFits(budget, needs, gpuKeys))
     return { ok: false, reason: "not_enough_memory" };
   const take = usageOf(budget, needs, gpuKeys);
   if (!needsPort) return { ok: true, port: 0, gpuKeys, needs, take };
-  const port = freePort(budget, node, fixedPort);
+  const port = freePort(budget, node, wanted);
   if (port === null)
-    return { ok: false, reason: fixedPort === undefined ? "no_free_ports" : "port_in_use" };
+    return { ok: false, reason: wanted.fixed === undefined ? "no_free_ports" : "port_in_use" };
   return { ok: true, port, gpuKeys, needs, take };
 }
 
@@ -611,31 +741,20 @@ function fit(
 function fitOver(
   node: PlacementNode,
   budget: Budget,
-  resources: unknown,
-  fixedPort: number | undefined,
+  needs: Needs,
+  wanted: RankPort,
   needsPort: boolean,
   floor: Floor,
 ): Fit {
-  const needs = resourceNeeds(resources);
-  const gpuKeys = pickGpusOver(budget, needs, floor);
-  if (!gpuKeys) return { ok: false, reason: "not_enough_memory" };
+  // GPUs the whole fit rule accepts (`overFits`), or none.
+  const gpuKeys = needs.gpuCount === 0 ? [] : pickGpusOver(budget, needs, floor);
+  if (!gpuKeys || !overFits(budget, needs, gpuKeys, floor))
+    return { ok: false, reason: "not_enough_memory" };
   const take = overlapGrowth(floor.floor, floor.placed, usageOf(budget, needs, gpuKeys));
-  if (!grows(take.memoryGb, budget.memoryGb)) return { ok: false, reason: "not_enough_memory" };
-  // As in `fit`: over-commit on some GPU must not hide that the vendor's GPUs lack the room.
-  let growth = 0;
-  for (const [key, gb] of take.gpus) {
-    const gpu = budget.gpus.find((candidate) => candidate.key === key);
-    if (gpu && !grows(gb, gpu.freeGb)) return { ok: false, reason: "not_enough_memory" };
-    growth += Math.max(0, gb);
-  }
-  const totalFree = budget.gpus
-    .filter((gpu) => !gpu.unified && (needs.vendor === null || gpu.vendor === needs.vendor))
-    .reduce((sum, gpu) => sum + gpu.freeGb, 0);
-  if (!grows(growth, totalFree)) return { ok: false, reason: "not_enough_memory" };
   if (!needsPort) return { ok: true, port: 0, gpuKeys, needs, take };
-  const port = freePort(budget, node, fixedPort);
+  const port = freePort(budget, node, wanted);
   if (port === null)
-    return { ok: false, reason: fixedPort === undefined ? "no_free_ports" : "port_in_use" };
+    return { ok: false, reason: wanted.fixed === undefined ? "no_free_ports" : "port_in_use" };
   return { ok: true, port, gpuKeys, needs, take };
 }
 
@@ -908,26 +1027,23 @@ export class PlacementPlanner {
         },
       ]),
     );
-    // Replay every claim in one fixed order (instance id, rank), so GPU picks are stable:
-    // claims that recorded their GPUs first, then older claims onto what is left.
+    // Replay every claim (instance id, rank order): each is charged where it may be
+    // (`claimUsage`), whatever was replayed before it.
     const ordered = [...context.instances].sort((a, b) => compareCodePoints(a.id, b.id));
     const usages = new Map<string, ClaimUsage>();
-    for (const recordedPass of [true, false])
-      for (const instance of ordered)
-        instance.ranks.forEach((rank, index) => {
-          if (!rank.nodeId) return;
-          if ((recordedGpuKeys(rank.resources) !== null) !== recordedPass) return;
-          const budget = this.#budgets.get(rank.nodeId);
-          if (!budget) return;
-          if (!rank.reservation) {
-            budget.ports.add(rank.port);
-            if (rank.distPort !== null) budget.ports.add(rank.distPort);
-          }
-          const needs = resourceNeeds(rank.resources);
-          const usage = usageOf(budget, needs, claimGpus(budget, needs, rank.resources));
-          usages.set(`${instance.id}|${index}`, usage);
-          if (!this.#freedByStop(instance.id, rank)) applyUsage(budget, usage, 1);
-        });
+    for (const instance of ordered)
+      instance.ranks.forEach((rank, index) => {
+        if (!rank.nodeId) return;
+        const budget = this.#budgets.get(rank.nodeId);
+        if (!budget) return;
+        if (!rank.reservation) {
+          budget.ports.add(rank.port);
+          if (rank.distPort !== null) budget.ports.add(rank.distPort);
+        }
+        const usage = claimUsage(budget, resourceNeeds(rank.resources), rank.resources);
+        usages.set(`${instance.id}|${index}`, usage);
+        if (!this.#freedByStop(instance.id, rank)) applyUsage(budget, usage, 1);
+      });
     // One instance's old and new claims on a node overlap: what the replay counted twice of
     // them is given back (Σall − overlap), so the budget counts max(Σcurrent, Σprevious).
     for (const instance of ordered) {
@@ -1062,7 +1178,12 @@ export class PlacementPlanner {
     // dist_port: one port free on every rank's node (multi-node only).
     let distPort: number | null = null;
     if (request.launch.groupSize > 1) {
-      const plan = this.#distPlan(chosen.working, ranks, request.restart);
+      const plan = this.#distPlan(
+        chosen.working,
+        ranks,
+        request.restart,
+        request.launch.port?.fixed === undefined,
+      );
       if ("reason" in plan)
         return {
           ok: false,
@@ -1161,11 +1282,14 @@ export class PlacementPlanner {
           nodeNumber: index + 1,
           port: rank.port,
           fabricIp: memberIp(rank.node.id),
-          // The GPUs this rank takes are recorded with its claim (`gpus`), so later plans
-          // account the same GPUs.
+          // The GPUs this rank takes are recorded with its claim (`gpus`), and which of them
+          // share node memory (`unifiedGpus`), so later plans account the same GPUs and memory
+          // whatever the node reports then.
           resources: {
             ...(rankResources(request.launch, index) as Record<string, unknown>),
-            ...(rank.gpuKeys.length > 0 ? { gpus: [...rank.gpuKeys] } : {}),
+            ...(rank.gpuKeys.length > 0
+              ? { gpus: [...rank.gpuKeys], ...unifiedOf(rank.node, rank.gpuKeys) }
+              : {}),
           },
         })),
         reservations: reserved.map((choice, index) => {
@@ -1177,7 +1301,9 @@ export class PlacementPlanner {
             labels: [...(reservation?.labels ?? [])],
             resources: {
               ...((reservation?.resources ?? { kind: "none" }) as Record<string, unknown>),
-              ...(choice.gpuKeys.length > 0 ? { gpus: [...choice.gpuKeys] } : {}),
+              ...(choice.gpuKeys.length > 0
+                ? { gpus: [...choice.gpuKeys], ...unifiedOf(choice.node, choice.gpuKeys) }
+                : {}),
             },
             memoryGb:
               Math.round(
@@ -1244,7 +1370,7 @@ export class PlacementPlanner {
         rank.node,
         budget,
         rankResources(request.launch, index),
-        rank.port,
+        { fixed: rank.port },
         true,
         working.floors.get(rank.node.id),
       );
@@ -1264,7 +1390,7 @@ export class PlacementPlanner {
         reservation.node,
         budget,
         resources,
-        undefined,
+        {},
         false,
         working.floors.get(reservation.node.id),
       );
@@ -1323,14 +1449,12 @@ export class PlacementPlanner {
     }
     const ranks: RankChoice[] = [];
     for (const [index, node] of nodes.entries()) {
-      // A fixed port of the (new) version wins; otherwise a restart keeps its own port.
-      const fixedPort = launch.port?.fixed ?? request.restart?.ports[index];
       const choice = this.#rankOn(
         working,
         request,
         node,
         rankResources(launch, index),
-        fixedPort,
+        wantedPort(request, index),
         request.preempt,
       );
       if ("reason" in choice)
@@ -1568,7 +1692,12 @@ export class PlacementPlanner {
     const nodes = choice.ranks.map((rank) => rank.node);
     const refuser = this.#frozenRefuser(nodes, choice.fabric, request.launch);
     if (refuser) return { reason: "head_not_in_frozen_fabric", subjectId: refuser.id };
-    const plan = this.#distPlan(choice.working, choice.ranks, request.restart);
+    const plan = this.#distPlan(
+      choice.working,
+      choice.ranks,
+      request.restart,
+      request.launch.port?.fixed === undefined,
+    );
     if ("reason" in plan)
       return {
         reason: plan.reason,
@@ -1646,7 +1775,7 @@ export class PlacementPlanner {
           request,
           node,
           rankResources(request.launch, index),
-          request.launch.port?.fixed,
+          wantedPort(request, index),
           preempt,
         );
         if ("reason" in choice) {
@@ -1698,7 +1827,7 @@ export class PlacementPlanner {
         request,
         node,
         rankResources(request.launch, 0),
-        request.launch.port?.fixed,
+        wantedPort(request, 0),
         preempt,
       );
       if ("reason" in choice) reasons.add(choice.reason);
@@ -1819,7 +1948,7 @@ export class PlacementPlanner {
         request,
         node,
         entry.reservation.resources,
-        undefined,
+        {},
         request.preempt,
         false,
       );
@@ -1853,7 +1982,7 @@ export class PlacementPlanner {
           request,
           node,
           entry.reservation.resources,
-          undefined,
+          {},
           preempt,
           false,
         );
@@ -1934,7 +2063,7 @@ export class PlacementPlanner {
           request,
           node,
           reservation.resources,
-          undefined,
+          {},
           preempt,
           false,
         );
@@ -1979,15 +2108,7 @@ export class PlacementPlanner {
     for (const [index, option] of options.entries()) {
       const node = assigned[index]?.node;
       const choice = node
-        ? this.#rankOn(
-            working,
-            request,
-            node,
-            option.reservation.resources,
-            undefined,
-            preempt,
-            false,
-          )
+        ? this.#rankOn(working, request, node, option.reservation.resources, {}, preempt, false)
         : null;
       if (!choice || !node || "reason" in choice)
         return {
@@ -2031,7 +2152,7 @@ export class PlacementPlanner {
     request: PlacementRequest,
     node: PlacementNode,
     resources: RuntimeResource,
-    fixedPort: number | undefined,
+    wanted: RankPort,
     preempt: boolean,
     /** False for a reservation (no port). */
     needsPort = true,
@@ -2041,7 +2162,7 @@ export class PlacementPlanner {
     if (!budget) return { reason: "not_enough_memory" };
     // A rank's version must fit among the node's definitions; no stop frees one before it is
     // proven, so preemption cannot help (reservations take none).
-    if (needsPort && definitionSlotsFull(node, budget, request))
+    if (needsPort && definitionSlotsFull(budget, request))
       return { reason: "definition_slots_full" };
     const definition = needsPort && !request.nodeOrigin ? request.versionId : null;
     const waits = [...this.#draining].some(
@@ -2049,7 +2170,7 @@ export class PlacementPlanner {
         id !== request.restart?.instanceId && this.#heldOn(id, (nodeId) => nodeId === node.id),
     );
     const floor = working.floors.get(node.id);
-    const plain = fit(node, budget, resources, fixedPort, needsPort, floor);
+    const plain = fit(node, budget, resources, wanted, needsPort, floor);
     if (plain.ok) return rankChoice(node, budget, plain, [], waits, definition);
     // Ports are not freed by a stop (the claim keeps them until released): no preemption helps.
     if (!preempt || plain.reason !== "not_enough_memory") return { reason: plain.reason };
@@ -2077,7 +2198,7 @@ export class PlacementPlanner {
       this.#charge();
       const trial = cloneBudget(budget);
       for (const victim of victims) this.#freeOnNode(trial, victim, node.id);
-      const fitted = fit(node, trial, resources, fixedPort, needsPort, floor);
+      const fitted = fit(node, trial, resources, wanted, needsPort, floor);
       if (!fitted.ok) {
         if (fitted.reason !== "not_enough_memory") reason = fitted.reason;
         continue;
@@ -2202,6 +2323,10 @@ export class PlacementPlanner {
         const node = rank.nodeId ? this.#nodes.get(rank.nodeId) : undefined;
         if (node?.trust !== "FULL") return false;
       }
+      // And every node a launch of it that may still run names (a node not the caller's, or
+      // gone, counts as not Full).
+      for (const nodeId of instance.cleanupNodeIds ?? [])
+        if (this.#nodes.get(nodeId)?.trust !== "FULL") return false;
     }
     return true;
   }
@@ -2257,6 +2382,8 @@ export class PlacementPlanner {
     working: Working,
     ranks: readonly RankChoice[],
     restart: PlacementRequest["restart"],
+    /** The serving ports are not fixed by the launch: one may move off the only common port. */
+    movable: boolean,
   ):
     | { port: number; moves: Array<[RankChoice, number]> }
     | { reason: "no_free_ports" | "fabric_port_ranges_disjoint"; message?: string } {
@@ -2289,9 +2416,14 @@ export class PlacementPlanner {
             ", ",
           )} have no port in common, and a multi-node instance needs one dist port on every node. Make the ranges overlap.`,
       };
+    // A restart keeps its own dist port while every range still has it and it is free there.
     const own = restart?.distPort ?? null;
-    if (own !== null) return plan(own, false) ?? { reason: "no_free_ports" };
-    for (const allowMoves of restart ? [false] : [false, true])
+    const kept = own !== null && own >= start && own <= end ? plan(own, false) : null;
+    if (kept) return kept;
+    // Otherwise a port free everywhere; failing that, one a rank's serving port takes, moving
+    // that serving port to another of its node's ports (a restart's kept serving ports are a
+    // preference, as a start's are none; a fixed port never moves).
+    for (const allowMoves of movable ? [false, true] : [false])
       for (let port = start; port <= end; port++) {
         const found = plan(port, allowMoves);
         if (found) return found;

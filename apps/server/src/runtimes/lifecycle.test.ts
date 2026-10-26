@@ -73,6 +73,7 @@ const byReconcile = (a: Stopping, b: Stopping) =>
 
 const instanceRank = vi.hoisted(() => ({
   findMany: vi.fn(),
+  findUnique: vi.fn(),
   updateMany: vi.fn(),
 }));
 const instanceStep = vi.hoisted(() => ({
@@ -144,7 +145,7 @@ function engine(connected = true) {
     {
       sendToNode: () => true,
       nodeSession: () =>
-        connected ? { userId: "u1", connectionGeneration: 1, trust: "full" } : null,
+        connected ? { userId: "u1", connectionGeneration: 1, trust: "full", rankIdle: true } : null,
       onlineNodeIds: () => [NODE],
     },
     { now: () => clock },
@@ -195,6 +196,11 @@ beforeEach(() => {
         .sort(byCheck)
         .slice(0, args.take),
   );
+  // The probe reads the rank's claim again under the fence.
+  instanceRank.findUnique.mockImplementation(async (args: { where: { id: string } }) => {
+    const rank = store.ranks.find((row) => row.id === args.where.id);
+    return rank ? { claim: rank.claim } : null;
+  });
   instanceRank.updateMany.mockImplementation(
     async (args: {
       where: Prisma.InstanceRankWhereInput;
@@ -308,6 +314,32 @@ describe("held-unknown probe pass", () => {
     store.probes.set("r0000", [{ state: "FAILED", updatedAt: finished }]);
     await pass(engine(), "r");
     expect(store.ranks[0]?.lastStopCheckAt).toEqual(finished);
+  });
+
+  it("leaves alone a rank a restart took again after this pass read it", async () => {
+    // Read HELD_UNKNOWN, then a person's restart retakes it (HELD, a new run's claim) before
+    // the probe's fenced write: nothing of the new claim is released or probed.
+    seedRanks(1);
+    // After the pass stamped the rank (its claim), before the fenced write.
+    const lc = new RuntimeLifecycle(
+      {
+        sendToNode: () => true,
+        nodeSession: () => {
+          const rank = store.ranks[0];
+          if (rank) rank.claim = "HELD";
+          return { userId: "u1", connectionGeneration: 1, trust: "full", rankIdle: true };
+        },
+        onlineNodeIds: () => [NODE],
+      },
+      { now: () => clock },
+    );
+    expect(await pass(lc, "r")).toEqual(["r0000"]);
+    expect(store.ranks[0]?.claim).toBe("HELD");
+    // The fenced read saw the retaken claim and stopped there.
+    expect(instanceRank.findUnique).toHaveBeenCalled();
+    expect(instanceStep.findMany.mock.calls.some(([args]) => args.where.phase === "STATUS")).toBe(
+      false,
+    );
   });
 
   it("skips a rank another server process claimed after this pass read it", async () => {

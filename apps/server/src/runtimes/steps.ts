@@ -111,6 +111,11 @@ export type NewStep = {
    * dispatched with (`InstanceStep.headAddr`). Absent: resolved at dispatch.
    */
   headAddr?: string | null;
+  /**
+   * A leading STOP with nothing left to stop (every earlier launch of the rank is proven
+   * stopped): created SUCCEEDED, never sent. Absent: PENDING.
+   */
+  state?: "SUCCEEDED";
 };
 
 function commandsFor(launch: RuntimeLaunch, rank: number): RuntimeCommands {
@@ -260,7 +265,10 @@ function step(
 
 /**
  * Every step of start generation `generation` (≥ 1). `physical`: per rank, what runs there now
- * (its leading stop names it).
+ * (its leading stop names it). `ended`: ranks whose every earlier launch is proven stopped: their
+ * leading stop is satisfied already (SUCCEEDED, never sent). A node may keep a stopped record of
+ * an earlier version, which refuses a stop naming another one, while it takes the new version's
+ * start (nothing of the old one runs).
  */
 export function generationSteps(input: {
   instance: InstanceInput;
@@ -271,6 +279,7 @@ export function generationSteps(input: {
   physical?: ReadonlyMap<number, Physical>;
   /** The run's reservation nodes (single-node instances only). */
   reservations?: readonly StepReservation[];
+  ended?: ReadonlySet<number>;
 }): NewStep[] {
   const ranks = [...input.ranks].sort((a, b) => a.rank - b.rank);
   const nnodes = ranks.length;
@@ -285,15 +294,15 @@ export function generationSteps(input: {
   };
   for (const rank of ranks) {
     const commands = commandsFor(input.launch, rank.rank);
-    if (input.generation > 1)
-      steps.push(
-        step(
-          { ...common, rank, phase: "STOP" },
-          base + ORDER.STOP,
-          input.generation,
-          input.physical?.get(rank.rank),
-        ),
+    if (input.generation > 1) {
+      const leading = step(
+        { ...common, rank, phase: "STOP" },
+        base + ORDER.STOP,
+        input.generation,
+        input.physical?.get(rank.rank),
       );
+      steps.push(input.ended?.has(rank.rank) ? { ...leading, state: "SUCCEEDED" } : leading);
+    }
     if (commands.prepare)
       steps.push(
         step({ ...common, rank, phase: "PREPARE" }, base + ORDER.PREPARE, input.generation),

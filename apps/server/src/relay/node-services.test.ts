@@ -44,7 +44,7 @@ function relay(deliver = true) {
         return deliver;
       }),
       nodeSession: vi.fn(() => ({ ...session })),
-      requestTrustLower: vi.fn(() => true),
+      requestTrustLower: vi.fn(async () => undefined),
       closeSessionsForNodes: vi.fn(async () => undefined),
     },
   };
@@ -245,7 +245,7 @@ describe("node relay services", () => {
     await services.rescan?.("node-1");
     expect(r.sent[0]).toMatchObject({ type: "runtime.detect" });
     await services.lowerTrust?.("node-1");
-    expect(r.port.requestTrustLower).toHaveBeenCalledWith("node-1", expect.any(Date));
+    expect(r.port.requestTrustLower).toHaveBeenCalledWith("node-1");
     await services.disconnect?.("node-1", "node_deleted");
     expect(r.port.closeSessionsForNodes).toHaveBeenCalledWith(["node-1"]);
   });

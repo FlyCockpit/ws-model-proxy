@@ -14,7 +14,9 @@
  */
 import type { Prisma } from "@ws-model-proxy/db";
 import { effectiveTrust, type NodeTrustColumns } from "../nodes/trust";
+import { physicalLaunch } from "./instance-run";
 import { type ClaimStateValue, reservationClaim } from "./reservations";
+import { stepIntentSchema } from "./step-intent";
 
 /** What the trust and naming checks read of an occupied node. */
 export const OCCUPANCY_NODE_SELECT = {
@@ -158,6 +160,8 @@ export function occupiedNodeIds(row: OccupancyRow, scope: OccupancyScope): strin
 export function agentBlockedNode(
   row: OccupancyRow,
   reservations: OccupancyScope = "holding",
+  /** Nodes a launch that may still run names (`launchCleanupNodes`): its stop acts there too. */
+  cleanup: readonly OccupiedNode[] = [],
 ): OccupiedNode | null {
   const ranks = row.Ranks.map(
     (rank): OccupiedNode => ({
@@ -170,10 +174,55 @@ export function agentBlockedNode(
   );
   const reserved = occupiedNodes(row, reservations).filter((entry) => entry.role === "reservation");
   return (
-    [...ranks, ...reserved].find(
+    [...ranks, ...reserved, ...cleanup].find(
       (entry) => entry.node === null || effectiveTrust(entry.node) !== "FULL",
     ) ?? null
   );
+}
+
+/**
+ * The reservation nodes named by each rank's launch that may still run (`physicalLaunch`: not
+ * proven stopped): its stop and status probes name them (the job's `reservations`, which its
+ * commands are told), also once the rows that held them are gone (a claim released without
+ * proof keeps its launch, not its rows). An agent's action that stops, probes or restarts the
+ * instance reaches them, so `agentBlockedNode` checks them too (owner decision). Owner-scoped;
+ * a node no longer there counts as deleted (null). One lookup per rank.
+ */
+export async function launchCleanupNodes(
+  db: Prisma.TransactionClient,
+  userId: string,
+  instance: { id: string; Ranks: ReadonlyArray<{ rank: number }> },
+): Promise<OccupiedNode[]> {
+  const named = new Map<string, number>();
+  for (const rank of instance.Ranks) {
+    const stored = await physicalLaunch(db, instance.id, rank.rank);
+    const intent = stepIntentSchema.safeParse(stored?.intent ?? null);
+    if (!intent.success) continue;
+    for (const reservation of intent.data.reservations ?? [])
+      named.set(reservation.nodeId, reservation.index);
+  }
+  if (named.size === 0) return [];
+  const nodes =
+    (await db.node.findMany({
+      where: { id: { in: [...named.keys()] }, userId },
+      select: OCCUPANCY_NODE_SELECT,
+    })) ?? [];
+  return [...named].map(([nodeId, index]) => ({
+    nodeId,
+    role: "reservation",
+    position: index,
+    current: false,
+    node: nodes.find((node) => node.id === nodeId) ?? null,
+  }));
+}
+
+/** `agentBlockedNode` (holding scope) with the nodes the instance's live launches name. */
+export async function agentBlockedNodeWithCleanup(
+  db: Prisma.TransactionClient,
+  userId: string,
+  row: OccupancyRow & { id: string },
+): Promise<OccupiedNode | null> {
+  return agentBlockedNode(row, "holding", await launchCleanupNodes(db, userId, row));
 }
 
 /** The reservation rows of the current plan (not a replaced run's superseded ones). */

@@ -12,7 +12,7 @@ import { loadAgentNames } from "../lib/agent-names";
 import { assertMayWrite, callerActor } from "../lib/caller-actor";
 import { graphDelete, graphWrite } from "../lib/graph-write";
 import {
-  agentBlockedNode,
+  agentBlockedNodeWithCleanup,
   OCCUPANCY_SELECT,
   occupiesNodesWhere,
   placedOnNodesWhere,
@@ -542,7 +542,7 @@ async function deleteNode(
         orderBy: { id: "asc" },
       });
       for (const instance of affected) {
-        const blocked = agentBlockedNode(instance);
+        const blocked = await agentBlockedNodeWithCleanup(tx, userId, instance);
         if (blocked)
           throw refuseAbout(
             "trust_relay",

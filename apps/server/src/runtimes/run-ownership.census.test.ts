@@ -526,6 +526,10 @@ const CENSUS: Record<string, [number, string]> = {
     1,
     "Always-on instance's versions (no run).",
   ],
+  [`${LC} | afterStep | instanceStep.updateMany | other`]: [
+    2,
+    "A stopped answer that proved nothing (the node's rank was not idle): a status probe is marked launch_pending (errorCode only); a leading stop goes back to PENDING and is sent again shortly (its run's starts wait for it). No claim or run change.",
+  ],
   [`${LC} | afterStep | runtimeInstance.update | phase`]: [
     1,
     "READY after this run's READINESS (gated: `owned` returns first for an earlier run's step).",
@@ -712,6 +716,10 @@ const CENSUS: Record<string, [number, string]> = {
     1,
     "Read-only batched physical launches of live-claimed ranks (SELECT only, owner-scoped).",
   ],
+  "packages/api/src/lib/instance-run.ts | recordStoppedThrough | instanceRank.updateMany | other": [
+    1,
+    "A rank's proven-stopped boundary (stoppedThroughRun, only grows) after a leading stop succeeded or was satisfied (claim untouched).",
+  ],
   "packages/api/src/lib/instance-run.ts | resolveRun | runtimeInstance.updateMany | runGeneration":
     [1, "A legacy row's one-time bootstrap (WHERE runGeneration = 0)."],
   "packages/api/src/lib/metrics-query.ts | bucketExpr | Prisma.raw | opaque": [
@@ -799,10 +807,6 @@ const CENSUS: Record<string, [number, string]> = {
   "packages/api/src/routers/runtimes.ts | update | runtimeInstance.updateMany | other": [
     2,
     "Definition update: instances adopt the new version live (versionId; always-on also launchVersionId).",
-  ],
-  "packages/api/src/routers/runtimes.ts | update | runtimeInstance.updateMany | phase": [
-    1,
-    "Definition update restart: STARTING, then beginRun per restarted instance in the same transaction.",
   ],
   [`${DB}/capacity-lock-order.ts | deleteUserGraphInOrder | runtimeInstance.deleteMany | delete`]: [
     1,
@@ -990,8 +994,9 @@ const GATES: Array<[file: string, fn: string, gate: string]> = [
   [RS, "retakeInstanceClaims", "beginRun"],
   ["packages/api/src/lib/runtime-store.ts", "writePlannedStarts", "retakeInstanceClaims"],
   ["packages/api/src/lib/runtime-store.ts", "markInstancesStopping", "resolveRun"],
-  ["packages/api/src/routers/runtimes.ts", "update", "beginRun"],
-  ["packages/api/src/routers/runtimes.ts", "update", "heldClaimsMatch"],
+  // A definition update's restart is `runtime_start`'s: the planner, then its write.
+  ["packages/api/src/routers/runtimes.ts", "update", "place"],
+  ["packages/api/src/routers/runtimes.ts", "update", "writePlannedStarts"],
   // R5-B-1: every relay "running" answer about an operator step reconciles a missed acceptance.
   [LC, "settleOperatorSteps", "closeOperatorKeepingRun"],
   [LC, "reissueOperatorStep", "closeOperatorKeepingRun"],
@@ -1010,7 +1015,7 @@ const GATES: Array<[file: string, fn: string, gate: string]> = [
 const CONSUMERS: Array<[call: string, sites: string[]]> = [
   ["jobFrame", [`${LC} | claimStep`]],
   ["registerExecutionTargets", [`${LC} | afterStep`]],
-  ["runtimeInventory", [`${LC} | handlers`, `${SM} | handleInventoryChunk`]],
+  ["runtimeInventory", [`${LC} | handlers`, `${SM} | applyInventorySnapshot`]],
   ["inventoryEvidence", [`${LC} | runtimeInventory`]],
   // Who applies a node's job result (the engine's handler table only), and who recomputes a
   // person's attention (each after its own step write; the need authorizes nothing).
@@ -1195,7 +1200,8 @@ describe("run ownership census (T20, a reviewed tripwire)", { timeout: 60_000 },
     expect(at("tx.$executeRawUnsafe(text, id)")).toEqual(["opaque"]);
     expect(
       at(
-        "async function f(tx) {\n  const q = Prisma.sql`DELETE FROM instance_step`;\n  await tx.$executeRaw(q);\n}",
+        // Source text the census parses; it never runs.
+        "async function f(tx) {\n  const q = Prisma.sql`DELETE FROM instance_step`;\n  await tx.$executeRaw(q);\n}", // policy: bounded-delete
       ),
     ).toEqual(["fragment", "opaque"]);
     // DC6 (R5 A/B/C/D): what the earlier census dropped is listed now.

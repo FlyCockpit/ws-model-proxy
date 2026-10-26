@@ -490,6 +490,15 @@ export const runtimeLaunchSchema = z
         path: ["reservations"],
         ...specIssue("reservationsGroup"),
       });
+    // A reservation is released with the rank's claim, on the node's proof that the rank
+    // stopped. A process launch proves only its own node (no task left, ports free); a service's
+    // status command reports the launch wherever it runs, workers on reserved nodes included.
+    if (launch.reservations && launch.reservations.length > 0 && launch.management !== "service")
+      ctx.addIssue({
+        code: "custom",
+        path: ["management"],
+        ...specIssue("reservationsService"),
+      });
     // The node refuses a definition that names a secret twice.
     launch.secrets?.forEach((name, index) => {
       if (launch.secrets?.indexOf(name) !== index)
@@ -952,6 +961,13 @@ export const nodeFeaturesSchema = z
      * `cli_upgrade_required` instead.
      */
     jobReservations: z.boolean().optional(),
+    /**
+     * One runtime step runner outlives the node's relay connections, and its stop and status
+     * results and inventory records say whether the rank had another step that may launch in
+     * flight (`rankIdle`, the only stop proof: `proofHolds` in `claim-release.ts`). The server
+     * sends runtime jobs only to a node with it; an older CLI is told to upgrade.
+     */
+    rankIdle: z.boolean().optional(),
     /** The node's secrets: names and when they were last set (never values). */
     secrets: z
       .array(z.object({ name: nodeSecretNameSchema, updatedAt: z.iso.datetime() }).strict())

@@ -18,6 +18,7 @@
  * One operation per node is in flight; a sync asked for meanwhile runs after its final answer.
  */
 import { randomBytes } from "node:crypto";
+import { graphWrite } from "@ws-model-proxy/api/lib/graph-write";
 import { requiredDefinitionsByNode } from "@ws-model-proxy/api/lib/node-definitions";
 import {
   nodeFabricsHash,
@@ -31,7 +32,7 @@ import {
   runtimeSpecSchema,
 } from "@ws-model-proxy/api/lib/runtime-spec";
 import { nodeFabricSets } from "@ws-model-proxy/api/nodes/fabrics";
-import prisma from "@ws-model-proxy/db";
+import prisma, { type Prisma } from "@ws-model-proxy/db";
 import {
   CHUNK_BUDGET_BYTES,
   DEFINE_CHUNK_MAX_VERSIONS,
@@ -206,8 +207,11 @@ const VERSION_SELECT = {
   Runtime: { select: { id: true, slug: true, kind: true } },
 } as const;
 
-export async function loadNodeDefinitionState(nodeId: string): Promise<NodeDefinitionState | null> {
-  const node = await prisma.node.findUnique({
+export async function loadNodeDefinitionState(
+  nodeId: string,
+  db: Prisma.TransactionClient = prisma,
+): Promise<NodeDefinitionState | null> {
+  const node = await db.node.findUnique({
     where: { id: nodeId },
     select: {
       userId: true,
@@ -254,18 +258,18 @@ export async function loadNodeDefinitionState(nodeId: string): Promise<NodeDefin
   const userId = node.userId;
   // Every version a process or step on the node may still name (`node-definitions.ts`).
   const required =
-    (await requiredDefinitionsByNode(prisma, { userId, nodeIds: [nodeId] })).get(nodeId) ??
+    (await requiredDefinitionsByNode(db, { userId, nodeIds: [nodeId] })).get(nodeId) ??
     new Set<string>();
   const [needed, alwaysOn, pinned, startable] = await Promise.all([
-    prisma.runtimeVersion.findMany({
+    db.runtimeVersion.findMany({
       where: { id: { in: [...required] }, Runtime: { userId, origin: "SERVER" } },
       select: VERSION_SELECT,
     }),
-    prisma.runtimeVersion.findMany({
+    db.runtimeVersion.findMany({
       where: { CurrentOf: { userId, nodeId, kind: "ALWAYS_ON", origin: "SERVER" } },
       select: VERSION_SELECT,
     }),
-    prisma.runtimeVersion.findMany({
+    db.runtimeVersion.findMany({
       where: {
         // An item pinned to other nodes does not use this node's cap.
         ProfileItems: {
@@ -278,7 +282,7 @@ export async function loadNodeDefinitionState(nodeId: string): Promise<NodeDefin
       },
       select: VERSION_SELECT,
     }),
-    prisma.runtimeVersion.findMany({
+    db.runtimeVersion.findMany({
       where: { CurrentOf: { userId, kind: "STARTABLE", origin: "SERVER" } },
       select: VERSION_SELECT,
       orderBy: { createdAt: "desc" },
@@ -415,34 +419,52 @@ export function createRuntimeSync(
     inFlight.set(nodeId, op);
     const answer = new Promise<DefineOutcome | null>((resolve) => op.waiters.push(resolve));
     try {
-      const state = await loadNodeDefinitionState(nodeId);
-      // Replaced meanwhile (a new session took the slot): this operation is over.
-      if (inFlight.get(nodeId) !== op) return answer;
-      // The definitions are read under the node's owner (`loadNodeDefinitionState`); the live
-      // session must be that owner's node too (defence in depth).
-      if (!state?.fullControl || !nodeOwnerMatches(session, state.userId, "definition_sync")) {
+      const owner = await prisma.node.findUnique({
+        where: { id: nodeId },
+        select: { userId: true },
+      });
+      if (!owner) {
         finish(nodeId, op, null);
         return answer;
       }
-      const frames = buildCompleteOperation({
-        opId: op.opId,
-        desired: state.desired,
-        held: state.held,
-        node: state.node,
-      });
-      for (const frame of frames) {
-        // Pinned to the planned session and re-checked against its live trust.
-        const sent = relay.sendToNode(nodeId, frame, {
-          connectionGeneration: op.connectionGeneration,
-          requireFullTrust: true,
-          userId: state.userId,
-          ownerCheck: "definition_sync",
-        });
-        if (!sent) {
+      // Read and sent under the owner's fence, which every claim and step writer and every
+      // admission takes: what the node requires is one coherent state, and an admission waits
+      // until this operation's frames are on the socket (so nothing admitted after the read is
+      // removed before the sync it triggers, which queues behind this one).
+      await graphWrite([owner.userId], async (tx) => {
+        const state = await loadNodeDefinitionState(nodeId, tx);
+        // Replaced meanwhile (a new session took the slot): this operation is over.
+        if (inFlight.get(nodeId) !== op) return;
+        // The definitions are read under the node's owner (`loadNodeDefinitionState`); the live
+        // session must be that owner's node too (defence in depth).
+        if (
+          !state?.fullControl ||
+          state.userId !== owner.userId ||
+          !nodeOwnerMatches(session, state.userId, "definition_sync")
+        ) {
           finish(nodeId, op, null);
-          break;
+          return;
         }
-      }
+        const frames = buildCompleteOperation({
+          opId: op.opId,
+          desired: state.desired,
+          held: state.held,
+          node: state.node,
+        });
+        for (const frame of frames) {
+          // Pinned to the planned session and re-checked against its live trust.
+          const sent = relay.sendToNode(nodeId, frame, {
+            connectionGeneration: op.connectionGeneration,
+            requireFullTrust: true,
+            userId: state.userId,
+            ownerCheck: "definition_sync",
+          });
+          if (!sent) {
+            finish(nodeId, op, null);
+            break;
+          }
+        }
+      });
     } catch (error) {
       console.error("[runtime-sync] building the definition sync failed", errorName(error));
       finish(nodeId, op, null);
