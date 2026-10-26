@@ -140,17 +140,25 @@ fn guard_ends_what_the_command_left_behind_before_its_lock_goes() {
 }
 
 /// Whether this process started with SIGINT ignored (a shell's background job: `cmd &`). The
-/// command would inherit that, and a shell cannot undo it.
+/// command would inherit that, and a shell cannot undo it. Linux reads `/proc`; macOS has none,
+/// so `ps` reports the mask there. A mask that cannot be read counts as ignored: the test then
+/// has nothing it can rely on.
 fn interrupts_ignored() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            let mask = status
-                .lines()
-                .find_map(|line| line.strip_prefix("SigIgn:"))?;
-            u64::from_str_radix(mask.trim(), 16).ok()
-        })
-        .is_some_and(|mask| mask & (1 << (nix::libc::SIGINT - 1)) != 0)
+    let mask = match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigIgn:"))
+            .map(|mask| mask.trim().to_owned()),
+        Err(_) => Command::new("/bin/ps")
+            .args(["-o", "sigignore=", "-p", &std::process::id().to_string()])
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned()),
+    };
+    mask.and_then(|mask| u64::from_str_radix(&mask, 16).ok())
+        .is_none_or(|mask| mask & (1 << (nix::libc::SIGINT - 1)) != 0)
 }
 
 #[test]

@@ -170,7 +170,7 @@ mod tests {
         assert!(stat_is_zombie(b"42 (sleep) Z 1 42 42"));
         assert!(!stat_is_zombie(b"42 (sleep) S 1 42 42"));
         // A name cut inside a multibyte character, and one holding `) Z `.
-        assert!(stat_is_zombie(b"42 (caf\xc3) Z 1 42 42"));
+        assert!(stat_is_zombie(b"42 (wsmp-\xc3) Z 1 42 42"));
         assert!(!stat_is_zombie(b"42 (a) Z (b) R 1 42 42"));
         assert!(!stat_is_zombie(b"garbage"));
     }
@@ -179,15 +179,32 @@ mod tests {
     #[test]
     fn a_scan_lists_a_process_whose_name_is_not_utf8() {
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        // The kernel keeps the first 15 bytes of the file name: the name is cut inside `é`.
+        // The kernel keeps the first 15 bytes of the file name: the name is cut inside `é`. A
+        // script, not a copy of `sleep`: a multi-call coreutils binary picks its tool by name and
+        // would exit at once under this one.
         let name = std::ffi::OsStr::from_bytes(b"wsmp-scantest-\xc3\xa9");
         let program = dir.path().join(name);
-        std::fs::copy("/bin/sleep", &program).unwrap();
-        let mut child = std::process::Command::new(&program)
-            .arg("5")
-            .spawn()
-            .unwrap();
+        std::fs::write(&program, "#!/bin/sh\nread line\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Another test thread can fork while the script is still open for writing, which makes
+        // the exec fail with ETXTBSY until that child execs.
+        let mut attempts = 0;
+        let mut child = loop {
+            match std::process::Command::new(&program)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                spawned => break spawned.unwrap(),
+            }
+        };
         let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
         let comm = std::fs::read(format!("/proc/{pid}/comm")).unwrap();
         let listed = super::live();

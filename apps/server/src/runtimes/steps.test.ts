@@ -160,7 +160,8 @@ describe("stops of a recorded launch", () => {
 
 describe("reservation nodes in a run's steps", () => {
   const single = runtimeLaunchSchema.parse({
-    management: "process",
+    // Reservations need management service (its status command reports the reserved nodes).
+    management: "service",
     groupSize: 1,
     resources: [{ kind: "unified", memoryGb: 8 }],
     reservations: [
@@ -168,7 +169,7 @@ describe("reservation nodes in a run's steps", () => {
       { labels: ["b"], resources: { kind: "unified", memoryGb: 8 } },
     ],
     labels: [],
-    commands: [{ start: "serve --port {{port}}", stop: "true" }],
+    commands: [{ start: "serve --port {{port}}", stop: "true", status: "true" }],
     health: { intervalMs: 15_000, failureThreshold: 3, successThreshold: 1 },
   });
   const solo = { ...instance, fabricId: null };
