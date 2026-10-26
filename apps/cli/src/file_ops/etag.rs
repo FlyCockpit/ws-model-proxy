@@ -130,8 +130,10 @@ mod tests {
         let (p1, p2) = (dir.path().join("a"), dir.path().join("b"));
         std::fs::write(&p1, b"x").unwrap();
         std::fs::write(&p2, b"x").unwrap();
-        let s1 = crate::file_ops::resolve::Stat::from_metadata(&std::fs::metadata(&p1).unwrap());
-        let s2 = crate::file_ops::resolve::Stat::from_metadata(&std::fs::metadata(&p2).unwrap());
+        // With identity: on Windows plain metadata has none, and the two files would differ only
+        // when their modification times do.
+        let s1 = crate::file_ops::resolve::Stat::of_path(&p1).unwrap();
+        let s2 = crate::file_ops::resolve::Stat::of_path(&p2).unwrap();
         let a = EtagKey::from_bytes([1; 32]);
         let b = EtagKey::from_bytes([2; 32]);
         let one = a.strong(&s1, b"HF_TOKEN=hunter2\n");
