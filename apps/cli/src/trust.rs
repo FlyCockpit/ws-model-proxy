@@ -464,8 +464,42 @@ pub fn started_by_wsmp(pid: i32, daemon_pid: u32) -> Result<(), &'static str> {
 mod windows_tests {
     use super::*;
 
+    const RELAY_JOB_HELPER: &str = "WSMP_TEST_RELAY_JOB_HELPER";
+
+    /// Joining a job changes this whole process (and what every other test
+    /// in it starts), so the check runs in a child test process.
     #[test]
     fn the_relay_job_refuses_what_the_relay_started() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "trust::windows_tests::relay_job_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(RELAY_JOB_HELPER, "1")
+            .env_remove(JOB_MARKER_ENV)
+            .output()
+            .expect("helper");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("RELAY_JOB_OK"),
+            "the helper did not run: {stdout}"
+        );
+    }
+
+    /// The relay-like process of the test above. Does nothing unless spawned
+    /// by it.
+    #[test]
+    fn relay_job_helper() {
+        if std::env::var_os(RELAY_JOB_HELPER).is_none() {
+            return;
+        }
         let spawn = || {
             std::process::Command::new("cmd")
                 .args(["/C", "ping -n 30 127.0.0.1 >nul"])
@@ -493,6 +527,9 @@ mod windows_tests {
         drop(inside);
         let _ = outside.kill();
         let _ = outside.wait();
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "RELAY_JOB_OK").expect("stdout");
     }
 }
 
