@@ -709,8 +709,6 @@ pub fn host(args: &HostArgs<'_>) -> Result<()> {
                 return Err(error);
             }
         };
-    record.state = UnitState::Running;
-    write_json(&record_path, &record, "unit record")?;
     let mut command = std::process::Command::new(program);
     match line {
         ShellLine::List(list) => {
@@ -735,6 +733,11 @@ pub fn host(args: &HostArgs<'_>) -> Result<()> {
     };
     let group = child.id();
     let spawned = Instant::now();
+    // A running record promises the command was spawned, not that its shell or interrupt
+    // handler finished initializing. Keep it starting until spawn succeeds. If recording this
+    // fails, dropping the host's job still ends the command and everything it started.
+    record.state = UnitState::Running;
+    write_json(&record_path, &record, "unit record")?;
     let mut exited = false;
     loop {
         if let Some(grace) = stop_grace(args.dir, args.unit, args.invocation) {

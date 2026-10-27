@@ -58,6 +58,25 @@ fn read_text(file: &Path) -> Option<String> {
         .map(|text| text.trim().trim_start_matches('\u{feff}').to_string())
 }
 
+/// A failed readiness or interrupt assertion must still end this unit's whole job.
+struct StopOnDrop<'a> {
+    dir: &'a Path,
+    unit: &'a str,
+    invocation: &'a str,
+}
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = stop(
+            self.dir,
+            self.unit,
+            self.invocation,
+            Duration::ZERO,
+            Deadline::new(Duration::from_secs(10)),
+        );
+    }
+}
+
 /// A long-running start with a helper the command started detached (a
 /// console of its own, which Ctrl+Break cannot reach): the helper keeps the
 /// unit alive, and a stop ends the job, helper included, after the grace.
@@ -132,36 +151,100 @@ fn a_stop_ends_the_command_and_what_it_started() {
     );
 }
 
-/// Ctrl+Break ends a command that takes it, well before the grace.
+/// A child of the real runtime host with a known interrupt handler. The marker is written
+/// only after registration, and the acknowledgement only after Windows delivers Ctrl+Break.
+#[test]
+fn ctrl_break_helper() {
+    let Some(dir) = std::env::var_os("WSMP_RUNTIME_BREAK_HELPER") else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let mut signal = tokio::signal::windows::ctrl_break().expect("Ctrl+Break handler");
+        std::fs::write(dir.join("ready"), "ready").expect("ready marker");
+        tokio::time::timeout(Duration::from_secs(60), signal.recv())
+            .await
+            .expect("Ctrl+Break arrives")
+            .expect("signal listener stays open");
+        std::fs::write(dir.join("interrupted"), "Ctrl+Break").expect("interrupt acknowledgement");
+    });
+}
+
+/// Ctrl+Break ends a cooperative command before forced job termination, both as text through
+/// PowerShell and as a direct executable argv. A host's `running` state is not readiness of
+/// its command's interrupt handler; the old PowerShell/ping fixture could stop during startup.
 #[test]
 fn a_stop_breaks_the_command_first() {
-    let dir = tempfile::tempdir().expect("dir");
-    let invocation = launch(
-        dir.path(),
-        "wsmp-test-r1",
-        "ping -n 120 127.0.0.1 | Out-Null",
-    );
-    wait_for("the host", Duration::from_secs(30), || {
-        running(dir.path(), "wsmp-test-r1").expect("running")
-    });
-    let started = Instant::now();
-    stop(
-        dir.path(),
-        "wsmp-test-r1",
-        &invocation,
-        Duration::from_secs(20),
-        Deadline::new(Duration::from_secs(60)),
-    )
-    .expect("the stop");
-    assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "Ctrl+Break ended it before the grace: {:?}",
-        started.elapsed()
-    );
-    assert_eq!(
-        identity(dir.path(), "wsmp-test-r1", OWNER).expect("identity"),
-        None
-    );
+    for direct in [false, true] {
+        for attempt in 0..3 {
+            let dir = tempfile::tempdir().expect("dir");
+            let me = std::env::current_exe().expect("test binary");
+            let argv = [
+                me.to_string_lossy().into_owned(),
+                "--exact".into(),
+                "ctrl_break_helper".into(),
+            ];
+            let script = argv_script(CommandShell::Powershell, &argv).expect("script");
+            let invocation = start(
+                dir.path(),
+                &HostLaunch {
+                    exe: Path::new(EXE),
+                    owner: OWNER,
+                    unit: "wsmp-test-r1",
+                    slice: "wsmp_test_r0.slice",
+                    shell: CommandShell::Powershell,
+                    script: &script,
+                    argv: direct.then_some(argv.as_slice()),
+                    env: &[(
+                        "WSMP_RUNTIME_BREAK_HELPER".into(),
+                        dir.path().to_string_lossy().into_owned(),
+                    )],
+                },
+            )
+            .expect("the host starts");
+            let _cleanup = StopOnDrop {
+                dir: dir.path(),
+                unit: "wsmp-test-r1",
+                invocation: &invocation,
+            };
+            wait_for("the interrupt handler", Duration::from_secs(30), || {
+                read_text(&dir.path().join("ready")).as_deref() == Some("ready")
+                    && running(dir.path(), "wsmp-test-r1").expect("running")
+            });
+            let started = Instant::now();
+            stop(
+                dir.path(),
+                "wsmp-test-r1",
+                &invocation,
+                Duration::from_secs(20),
+                Deadline::new(Duration::from_secs(60)),
+            )
+            .expect("the stop");
+            // PowerShell may end its native child itself when it handles the same event. For a
+            // direct executable, require proof that the child received and handled Ctrl+Break.
+            if direct {
+                assert_eq!(
+                    read_text(&dir.path().join("interrupted")).as_deref(),
+                    Some("Ctrl+Break"),
+                    "the command handled Ctrl+Break before it ended (attempt {attempt})"
+                );
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "Ctrl+Break ended it before the grace (direct={direct}, attempt {attempt}): {:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                identity(dir.path(), "wsmp-test-r1", OWNER).expect("identity"),
+                None
+            );
+            assert!(!tasks_alive(dir.path(), "wsmp-test-r1").expect("unit"));
+        }
+    }
 }
 
 /// Exit 0 leaves the unit there, with nothing running, until a stop; a
