@@ -43,6 +43,7 @@ import {
   RUNTIME_RESERVATIONS_MAX,
   RUNTIME_SLUG_PATTERN,
   runtimeSpecSchema,
+  terminalShellIdSchema,
 } from "@ws-model-proxy/api/lib/runtime-spec";
 import {
   REALTIME_MAX_ITEM_SECONDS_MAX,
@@ -1357,6 +1358,8 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
       browserPublicKey: z.string().regex(/^[A-Za-z0-9_-]{1,512}$/),
       browserNonce: base64Url16Schema,
       identity: terminalIdentity.optional(),
+      /** Sent only to a node that advertised `features.terminals.shells`. */
+      shell: terminalShellIdSchema.optional(),
     })
     .strict(),
   z

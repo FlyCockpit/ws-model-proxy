@@ -64,13 +64,16 @@ fn human_shell_advertises_images_and_returns_the_saved_path_only_to_the_uploader
         .get(&(MULTI_TERMINAL.to_string(), label.clone()))
         .expect("offered upload");
     assert!(path.matches(&[1; 16]));
-    let offered = reply(&b, &frames)
-        .expect("offered reply")
-        .path
-        .expect("path");
+    let offered = reply(&b, &frames).expect("offered reply");
+    // Windows quotes the path for the terminal's shell itself; the browser quotes POSIX paths.
+    let text = offered.paste.clone().unwrap_or_else(|| {
+        crate::terminal_images::paste_text(offered.path.as_deref().expect("path"))
+    });
+    assert_eq!(offered.paste.is_some(), cfg!(windows));
+    let offered = offered.path.expect("path");
     let paste = TermPlaintextV2::ImagePaste(crate::terminal_images::ImagePaste {
         id: [1; 16],
-        data: crate::terminal_images::paste_text(&offered).into_bytes(),
+        data: text.into_bytes(),
     });
     let pasted = send(&mut terminals, &mut b, &label, &paste);
     assert_eq!(writer_changes(&pasted), vec![Some(label)]);

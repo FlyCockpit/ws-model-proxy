@@ -306,6 +306,7 @@ async function loadPlanInput(
       memoryGb: placement.memoryGb,
       gpus: placement.gpus,
       liveFreeMemoryGb: placement.liveFreeMemoryGb,
+      launch: placement.launch,
       frozenFabrics: placement.frozenFabrics,
     });
   }

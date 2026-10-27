@@ -11,7 +11,10 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::protocol::frames::{HelloNode, NodeTerminalIdentity, TrustState, TrustValue};
-use crate::protocol::runtime_spec::{FileFeatures, NodeFeatures, TerminalFeatures};
+use crate::protocol::runtime_spec::{
+    CommandShell, FileFeatures, LaunchFeatures, Management, NodeFeatures, NodePlatform,
+    TerminalFeatures,
+};
 use crate::terminal_crypto::CliTerminalKey;
 use crate::terminal_identity::{self, CliIdentity};
 
@@ -31,6 +34,9 @@ pub struct TerminalStartup {
     file_roots_source: crate::config::FileRootsSource,
     /// `config.json` `runtimeHosts`, re-read on hot reload.
     runtime_hosts: std::sync::Mutex<Vec<String>>,
+    /// The shells a browser terminal may start, the default first (none on
+    /// Unix: the login shell). Found once, as the relay starts.
+    shells: Vec<crate::shells::Shell>,
 }
 
 impl TerminalStartup {
@@ -71,6 +77,7 @@ impl TerminalStartup {
             file_roots,
             file_roots_source,
             runtime_hosts: std::sync::Mutex::new(config.runtime_hosts.clone()),
+            shells: crate::shells::discover(config.terminal_shell.as_deref()),
         }
     }
 
@@ -142,6 +149,16 @@ impl TerminalStartup {
         self.require_terminal_approval
     }
 
+    /// The shell a browser terminal starts: `id`, or the default when `None`.
+    /// `None` for an id this node did not advertise, and on Unix, where
+    /// terminals run the login shell.
+    pub fn shell(&self, id: Option<&str>) -> Option<&crate::shells::Shell> {
+        match id {
+            Some(id) => self.shells.iter().find(|shell| shell.id == id),
+            None => self.shells.first(),
+        }
+    }
+
     /// Browser terminals this machine keeps open at once (`maxTerminals`).
     pub fn max_terminals(&self) -> usize {
         self.max_terminals
@@ -163,15 +180,18 @@ impl TerminalStartup {
                 supported: crate::protocol::terminal_supported() && self.allow_human_terminal,
                 max: u8::try_from(self.max_terminals).unwrap_or(u8::MAX),
                 approval_required: self.require_terminal_approval,
+                shells: self.shells.iter().map(|shell| shell.id.clone()).collect(),
             },
             // Interactive runtime steps run in operator terminals wherever a
             // PTY can be offered, at every trust level (spec §4.7).
-            operator_terminals: crate::protocol::terminal_supported(),
+            operator_terminals: crate::protocol::operator_terminals_supported(),
             files: FileFeatures {
+                // As the tools take and show paths (Windows: `/c/...`), so the
+                // server's own root check matches what the node resolves.
                 roots: self.file_roots_configured.then(|| {
                     self.file_roots
                         .iter()
-                        .map(|root| root.display().to_string())
+                        .filter_map(|root| crate::file_ops::display_path(root))
                         .collect()
                 }),
                 as_root: self.allow_file_tools_as_root,
@@ -182,8 +202,40 @@ impl TerminalStartup {
             live_stt: true,
             job_reservations: true,
             rank_idle: true,
+            launch: self.launch_features(),
             secrets: crate::secrets::entries(),
         }
+    }
+
+    /// What runtime launches can run here. Linux runs processes in systemd units and Windows in
+    /// runtime hosts, and both wrap services; macOS only wraps services (their status commands
+    /// prove them). Unix text commands run in `sh`; Windows in the shells it found (never a WSL
+    /// distribution).
+    fn launch_features(&self) -> Option<LaunchFeatures> {
+        let platform = NodePlatform::current()?;
+        let management = match platform {
+            NodePlatform::Linux => vec![Management::Process, Management::Service],
+            NodePlatform::Macos => vec![Management::Service],
+            NodePlatform::Windows => vec![Management::Process, Management::Service],
+        };
+        let shells = if cfg!(windows) {
+            self.shells
+                .iter()
+                .filter_map(|shell| match shell.id.as_str() {
+                    "pwsh" => Some(CommandShell::Pwsh),
+                    "powershell" => Some(CommandShell::Powershell),
+                    "cmd" => Some(CommandShell::Cmd),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            vec![CommandShell::Sh]
+        };
+        Some(LaunchFeatures {
+            platform,
+            management,
+            shells,
+        })
     }
 
     /// The hello `node`: `identity_signature` signs the challenge, and the
@@ -241,16 +293,27 @@ mod tests {
         config.trust = Some(TrustValue::Relay);
         config.file_roots.clear();
         let features = startup.features();
-        assert_eq!(features.terminals.supported, cfg!(unix));
+        assert!(features.terminals.supported);
+        // Windows names its shells, the default first; Unix runs the login
+        // shell and names none.
+        assert_eq!(features.terminals.shells.is_empty(), cfg!(unix));
+        if cfg!(windows) {
+            let default = startup.shell(None).expect("a default shell");
+            assert_eq!(features.terminals.shells[0], default.id);
+            assert!(startup.shell(Some("cmd")).is_some());
+        }
+        assert!(startup.shell(Some("not-a-shell")).is_none());
         assert!(features.terminals.approval_required);
         assert_eq!(features.terminals.max, 4);
         assert_eq!(
             features.files.roots,
-            Some(vec![dir.path().display().to_string()])
+            Some(vec![
+                crate::file_ops::display_path(dir.path()).expect("shown")
+            ])
         );
         assert!(features.files.as_root);
-        // Operator terminals need only a PTY: no switch, any trust level.
-        assert_eq!(features.operator_terminals, cfg!(unix));
+        // Operator terminals need only a PTY (ConPTY on Windows): no switch, any trust level.
+        assert!(features.operator_terminals);
         assert!(features.job_reservations);
         assert!(features.rank_idle);
         assert!(startup.full_control());
@@ -306,7 +369,13 @@ mod tests {
             TerminalStartup::from_key_with_home(key(), &Config::default(), Some(home.path()));
         let files = startup.features().files;
         assert_eq!(files.source, FileRootsSource::Default);
-        assert_eq!(files.roots, Some(vec![physical.display().to_string()]));
+        // As the file tools show paths: as is on Unix, `/c/...` on Windows.
+        assert_eq!(
+            files.roots,
+            Some(vec![
+                crate::file_ops::display_path(&physical).expect("shown")
+            ])
+        );
         assert_eq!(startup.file_roots(), [physical]);
 
         let configured_dir = tempfile::tempdir().expect("configured");

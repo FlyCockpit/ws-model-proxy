@@ -14,18 +14,15 @@ pub(crate) enum FromWorker {
         frame: WsFrame,
     },
     Finished(String),
-    #[cfg(unix)]
     TerminalBytes {
         terminal_id: String,
         bytes: Vec<u8>,
     },
-    #[cfg(unix)]
     TerminalEof {
         terminal_id: String,
     },
     /// A terminal's input writer thread hit a write error. The main loop
     /// closes the terminal.
-    #[cfg(unix)]
     TerminalWriteFailed {
         terminal_id: String,
     },
@@ -43,7 +40,6 @@ pub(crate) enum FromWorker {
     Telemetry(String),
     /// 2.8: a node file op settled on a pool worker. The loop sends the frames
     /// only while the session still has the op pending.
-    #[cfg(unix)]
     FileFrames {
         op_id: String,
         frames: Vec<crate::file_relay::FileFrame>,

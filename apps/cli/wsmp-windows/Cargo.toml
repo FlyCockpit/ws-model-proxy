@@ -1,0 +1,49 @@
+[package]
+name = "wsmp-windows"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "The audited Windows FFI that the wsmp CLI needs and std cannot express safely."
+
+# A library of the `wsmp` binary, never released on its own.
+[package.metadata.dist]
+dist = false
+
+[target.'cfg(windows)'.dependencies]
+# Raw Win32 bindings, already in the CLI's tree (through tokio, tempfile and
+# others). Only the modules this crate calls are enabled.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+# The pipe server is tokio's; only its security-attributes constructor is
+# unsafe, and it is called here.
+tokio = { version = "1", default-features = false, features = ["net"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["net", "rt", "io-util", "macros", "time"] }
+
+# Unlike the `wsmp` crate (which forbids unsafe), this crate exists to hold
+# the unsafe calls. Each `unsafe` block carries a `// SAFETY:` comment and
+# every public function is safe to call.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+unwrap_used = "warn"
+todo = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"

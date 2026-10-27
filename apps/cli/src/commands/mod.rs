@@ -10,6 +10,8 @@
 
 pub mod completions;
 pub mod config;
+#[cfg(windows)]
+pub mod conpty_host;
 pub mod hardware;
 pub mod launch_guard;
 pub mod login;
@@ -17,6 +19,8 @@ pub mod logout;
 pub mod recover;
 pub mod run;
 pub mod runtime;
+#[cfg(windows)]
+pub mod runtime_host;
 pub mod secret;
 pub mod service;
 pub mod status;

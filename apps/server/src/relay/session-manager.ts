@@ -955,6 +955,7 @@ export class RelaySessionManager {
     connectionGeneration: number;
     trust: NodeTrustWire;
     operatorTerminals: boolean;
+    terminalShells: readonly string[];
     jobReservations: boolean;
     rankIdle: boolean;
   } | null {
@@ -966,6 +967,7 @@ export class RelaySessionManager {
       connectionGeneration: session.connectionGeneration,
       trust: session.trust,
       operatorTerminals: this.operatorTerminalsAllowed(session),
+      terminalShells: session.features?.terminals.shells ?? [],
       jobReservations: session.features?.jobReservations === true,
       rankIdle: session.features?.rankIdle === true,
     };
@@ -3193,12 +3195,20 @@ export class RelaySessionManager {
     identity?: TerminalHandshakeIdentity;
     connId: string;
     viewerId?: string;
+    /** A shell this node advertised; omitted for its default. */
+    shell?: string;
   }): boolean {
     const session = this.sessionsByNodeId.get(input.nodeId);
     if (!session) return false;
     if (!nodeOwnerMatches({ userId: session.identity.userId }, input.userId, "terminal_open"))
       return false;
     if (!this.canStartTerminal(session)) return false;
+    // Never sent to a node that did not advertise it: an older node refuses unknown fields.
+    if (
+      input.shell !== undefined &&
+      !(session.features?.terminals.shells ?? []).includes(input.shell)
+    )
+      return false;
     if (this.hasTerminal(input.terminalId)) return false;
     const approvalRequired = session.features?.terminals.approvalRequired === true;
     const counts = this.terminalCounts(input.userId, input.nodeId);
@@ -3228,6 +3238,7 @@ export class RelaySessionManager {
       browserPublicKey: input.browserPublicKey,
       browserNonce: input.browserNonce,
       ...(input.identity ? { identity: input.identity } : {}),
+      ...(input.shell !== undefined ? { shell: input.shell } : {}),
     });
     return true;
   }

@@ -323,6 +323,11 @@ pub struct OperatorOpen {
     /// The environment the command runs with (node secrets included: never
     /// printed, see the `Debug` impl).
     pub env: Vec<(String, String)>,
+    /// The shell the command was rendered for (the job's).
+    pub shell: crate::protocol::runtime_spec::CommandShell,
+    /// The arguments the command was rendered from, when it was an argv (Windows starts an
+    /// `.exe` directly).
+    pub argv: Option<Vec<String>>,
     pub events: SyncSender<OperatorEvent>,
 }
 
@@ -370,8 +375,7 @@ pub fn run_operator<R: Runtime>(
     }
     let probe = Deadline::new(STATUS_FIRST_LIMIT.min(budget));
     let status = job
-        .status_command
-        .as_deref()
+        .status_cmd()
         .map(|status| checking.status_until(&job, status, probe));
     match (job.action, status) {
         (JobPhase::Start | JobPhase::AfterJoin, Some(Ok(true))) => {

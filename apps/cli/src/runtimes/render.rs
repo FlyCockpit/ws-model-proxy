@@ -11,7 +11,9 @@ use crate::protocol::frames::{
     JobError, JobPhase, RuntimeJob, TrustValue, is_fabric_device_name, is_fabric_ip,
     runtime_unit_name,
 };
-use crate::protocol::runtime_spec::{Commands, Launch, RUNTIME_COMMAND_MAX_BYTES, RuntimeSpec};
+use crate::protocol::runtime_spec::{
+    CommandLine, CommandShell, Commands, Launch, RUNTIME_COMMAND_MAX_BYTES, RuntimeSpec,
+};
 use crate::runtime_store::Store;
 use crate::runtime_store::validate::{is_instance_handle, placeholders};
 
@@ -37,6 +39,9 @@ pub struct NodeFacts {
     pub addresses: BTreeMap<String, Vec<String>>,
     /// Usually `/sys`.
     pub sys: std::path::PathBuf,
+    /// The shells that run text commands here, the preferred first: `sh` on Unix, the
+    /// PowerShells and `cmd` found on Windows.
+    pub shells: Vec<CommandShell>,
 }
 
 impl NodeFacts {
@@ -44,6 +49,7 @@ impl NodeFacts {
         Self {
             addresses: crate::telemetry::interface_addresses(),
             sys: std::path::PathBuf::from("/sys"),
+            shells: available_shells(),
         }
     }
 }
@@ -76,14 +82,90 @@ fn fraction(value: &str) -> bool {
                 .is_some_and(|f| f.bytes().all(|b| b == b'0')))
 }
 
-fn phase_command(commands: &Commands, phase: JobPhase) -> Option<&str> {
+/// `sh` on Unix; on Windows the shells [`crate::shells::command_shells`] finds.
+pub fn available_shells() -> Vec<CommandShell> {
+    if !cfg!(windows) {
+        return vec![CommandShell::Sh];
+    }
+    crate::shells::command_shells()
+        .iter()
+        .filter_map(|shell| match shell.id.as_str() {
+            "pwsh" => Some(CommandShell::Pwsh),
+            "powershell" => Some(CommandShell::Powershell),
+            "cmd" => Some(CommandShell::Cmd),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The shell every command of a job runs in: the launch's (`sh` when absent) when the command
+/// set has a text command, else this node's own (`sh`, or the first PowerShell on Windows), into
+/// which its argv commands are rendered. `None` when this node has no such shell.
+pub fn job_shell(
+    launch: &Launch,
+    commands: &Commands,
+    available: &[CommandShell],
+) -> Option<CommandShell> {
+    let text = commands
+        .all()
+        .any(|(_, command)| matches!(command, CommandLine::Text(_)));
+    if text {
+        let shell = launch.shell.unwrap_or(CommandShell::Sh);
+        return available.contains(&shell).then_some(shell);
+    }
+    available
+        .iter()
+        .copied()
+        .find(|shell| *shell != CommandShell::Cmd)
+}
+
+/// One `sh` word: single quotes, a quote inside as `'\''`.
+fn sh_word(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// One PowerShell word: single quotes, every quote character PowerShell reads as one (the
+/// ASCII quote and the typographic ones) doubled.
+fn powershell_word(arg: &str) -> String {
+    let mut out = String::from("'");
+    for ch in arg.chars() {
+        if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(ch);
+        }
+        out.push(ch);
+    }
+    out.push('\'');
+    out
+}
+
+/// An argv as a script for `shell`: the program runs in place of the shell (`exec`) in `sh`.
+/// PowerShell runs it as its last command, so the status check every Windows script ends with
+/// (`windows::powershell_script`) exits with the program's status, or 1 when it could not start.
+/// `None` for `cmd`, which cannot quote an argument safely.
+///
+/// On Windows the script is how the command is shown, and how it runs when its program is not an
+/// `.exe`: one that is starts directly (`windows::invocation`).
+pub fn argv_script(shell: CommandShell, argv: &[String]) -> Option<String> {
+    let words = |word: fn(&str) -> String| argv.iter().map(|arg| word(arg)).collect::<Vec<_>>();
+    match shell {
+        CommandShell::Sh => Some(format!("exec {}", words(sh_word).join(" "))),
+        CommandShell::Pwsh => Some(format!(
+            "$PSNativeCommandArgumentPassing = 'Standard'; & {}",
+            words(powershell_word).join(" ")
+        )),
+        CommandShell::Powershell => Some(format!("& {}", words(powershell_word).join(" "))),
+        CommandShell::Cmd => None,
+    }
+}
+
+fn phase_command(commands: &Commands, phase: JobPhase) -> Option<&CommandLine> {
     match phase {
-        JobPhase::Prepare => commands.prepare.as_deref(),
+        JobPhase::Prepare => commands.prepare.as_ref(),
         JobPhase::Start => Some(&commands.start),
-        JobPhase::AfterJoin => commands.after_join.as_deref(),
-        JobPhase::Stop => commands.stop.as_deref(),
-        JobPhase::Status => commands.status.as_deref(),
-        JobPhase::Health => commands.health.as_deref(),
+        JobPhase::AfterJoin => commands.after_join.as_ref(),
+        JobPhase::Stop => commands.stop.as_ref(),
+        JobPhase::Status => commands.status.as_ref(),
+        JobPhase::Health => commands.health.as_ref(),
         JobPhase::Readiness => None,
     }
 }
@@ -159,39 +241,74 @@ pub fn render(
         return Err(refuse(JobError::BadJob, "operator"));
     }
     let values = typed_values(job, launch, store, facts)?;
-    let render_one = |text: &str, field: &str| -> Result<String, Refusal> {
-        let rendered = substitute(text, &values)
-            .map_err(|name| refuse(JobError::BadJob, format!("placeholders.{name}")))?;
-        if rendered.len() > RUNTIME_COMMAND_MAX_BYTES {
-            return Err(refuse(JobError::BadJob, field.to_string()));
-        }
-        Ok(rendered)
+    let Some(shell) = job_shell(launch, commands, &facts.shells) else {
+        return Err(refuse(
+            JobError::ExecutionMechanismUnavailable,
+            "launch.shell",
+        ));
     };
-    let command = match phase_command(commands, job.phase) {
-        Some(text) => render_one(text, "command")?,
-        None => String::new(),
+    let fill = |text: &str| {
+        substitute(text, &values)
+            .map_err(|name| refuse(JobError::BadJob, format!("placeholders.{name}")))
+    };
+    // A command's script, and an argv's arguments where a program may start without the shell
+    // (Windows). Sizes are checked before quoting: an argv is as long as its arguments joined with
+    // spaces.
+    let render_one =
+        |command: &CommandLine, field: &str| -> Result<(String, Option<Vec<String>>), Refusal> {
+            let refused = || refuse(JobError::BadJob, field.to_string());
+            match command {
+                CommandLine::Text(text) => {
+                    let rendered = fill(text)?;
+                    if rendered.len() > RUNTIME_COMMAND_MAX_BYTES {
+                        return Err(refused());
+                    }
+                    Ok((rendered, None))
+                }
+                CommandLine::Argv(argv) => {
+                    let rendered = argv
+                        .iter()
+                        .map(|arg| fill(arg))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let joined = rendered.iter().map(String::len).sum::<usize>()
+                        + rendered.len().saturating_sub(1);
+                    if joined > RUNTIME_COMMAND_MAX_BYTES {
+                        return Err(refused());
+                    }
+                    let script = argv_script(shell, &rendered).ok_or_else(refused)?;
+                    Ok((script, (shell != CommandShell::Sh).then_some(rendered)))
+                }
+            }
+        };
+    let (command, command_argv) = match phase_command(commands, job.phase) {
+        Some(command) => render_one(command, "command")?,
+        None => (String::new(), None),
     };
     // No stop command (a `process` runtime may leave it out): the stop is the
     // slice kill and the proof alone.
-    let stop_command = commands
+    let (stop_command, stop_argv) = commands
         .stop
-        .as_deref()
-        .map(|text| render_one(text, "stop"))
+        .as_ref()
+        .map(|command| render_one(command, "stop"))
         .transpose()?
         .unwrap_or_default();
-    let status_command = commands
-        .status
-        .as_deref()
-        .map(|text| render_one(text, "status"))
-        .transpose()?;
-    let health_command = commands
-        .health
-        .as_deref()
-        .map(|text| render_one(text, "health"))
-        .transpose()?;
+    let optional = |command: Option<&CommandLine>, field: &str| {
+        Ok::<_, Refusal>(
+            command
+                .map(|command| render_one(command, field))
+                .transpose()?
+                .map_or((None, None), |(script, argv)| (Some(script), argv)),
+        )
+    };
+    let (status_command, status_argv) = optional(commands.status.as_ref(), "status")?;
+    let (health_command, health_argv) = optional(commands.health.as_ref(), "health")?;
     // Where the engine listens: its fabric address when the start command
     // binds `{{fabric_ip}}`, else loopback.
-    let host = if placeholders(&commands.start).any(|name| name == "fabric_ip") {
+    let host = if commands
+        .start
+        .parts()
+        .any(|part| placeholders(part).any(|name| name == "fabric_ip"))
+    {
         values
             .get("fabric_ip")
             .cloned()
@@ -213,6 +330,11 @@ pub fn render(
         stop_command,
         status_command,
         health_command,
+        shell,
+        command_argv,
+        stop_argv,
+        status_argv,
+        health_argv,
         secrets: launch.secrets.clone().unwrap_or_default(),
         timeout_ms: capped_timeout(job.phase, job.timeout_ms),
         unit_name: job.unit_name.clone(),

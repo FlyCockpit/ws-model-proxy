@@ -17,6 +17,7 @@ function node(id: string, overrides: Partial<PlanNode> = {}): PlanNode {
     memoryGb: 64,
     gpus: [],
     liveFreeMemoryGb: null,
+    launch: null,
     ...overrides,
   };
 }

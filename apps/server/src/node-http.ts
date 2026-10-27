@@ -307,6 +307,162 @@ main "$@"
 `;
 }
 
+/**
+ * The Windows release target `/install.ps1` downloads (`wsmp-<target>.zip`, checksummed in
+ * `sha256.sum`). Windows 11 on ARM64 runs it under x64 emulation.
+ */
+export const CLI_WINDOWS_TARGET = "x86_64-pc-windows-msvc";
+
+/**
+ * The PowerShell installer (`irm <origin>/install.ps1 | iex`), for Windows PowerShell 5.1 and
+ * PowerShell 7. The counterpart of {@link installScript}: the checksummed release binary, else a
+ * cargo build, into `%CARGO_HOME%\bin` (`%USERPROFILE%\.cargo\bin`). Everything runs in one script
+ * block, so a download cut short does not parse and runs nothing. A failure throws (never `exit`,
+ * which would close the PowerShell window it runs in), which also stops a command after `iex` on
+ * the same line, such as the enrollment one-liner's `wsmp login`.
+ */
+export function windowsInstallScript(origin: string, source: CliInstallSource): string {
+  const releaseUrl = source.kind === "release" ? source.baseUrl.replace(/\/+$/, "") : "";
+  const sourceArgs =
+    source.kind === "release"
+      ? source.fallbackBranch
+        ? `'--branch', ${shellQuoted(source.fallbackBranch)}`
+        : `'--tag', ${shellQuoted(`v${SERVER_VERSION}`)}`
+      : source.rev
+        ? `'--rev', ${shellQuoted(source.rev)}`
+        : `'--branch', ${shellQuoted(CLI_PREVIEW_BRANCH)}`;
+  const sourceHint = sourceArgs.replaceAll("'", "").replace(",", "");
+  const summary =
+    source.kind === "source"
+      ? source.rev
+        ? `# Builds wsmp from source with cargo at commit ${source.rev} (WMP_CLI_SOURCE_REV).`
+        : `# Builds wsmp from source with cargo from the ${CLI_PREVIEW_BRANCH} branch (no release binaries yet).`
+      : `# Installs the checksummed wsmp ${SERVER_VERSION} release binary for Windows, or builds\n# v${SERVER_VERSION} from source with cargo where it does not run.`;
+  return `# WS Model Proxy node CLI (wsmp) installer for ${origin}
+${summary}
+# Run it in PowerShell: irm ${origin}/install.ps1 | iex
+& {
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$WsmpVersion = ${shellQuoted(SERVER_VERSION)}
+$WsmpReleaseUrl = ${shellQuoted(releaseUrl)}
+$WsmpRepository = ${shellQuoted(CLI_REPOSITORY)}
+$WsmpTarget = ${shellQuoted(CLI_WINDOWS_TARGET)}
+$WsmpSourceArgs = @(${sourceArgs})
+
+function Say([string]$Text) { Write-Host "wsmp: $Text" }
+
+# cargo's home: its bin directory is where cargo puts a source build, so the two never leave two copies.
+function Get-CargoHome {
+  if ($env:CARGO_HOME) { return $env:CARGO_HOME }
+  if (-not $env:USERPROFILE) { throw 'wsmp: set USERPROFILE (or CARGO_HOME), then run this again.' }
+  Join-Path $env:USERPROFILE '.cargo'
+}
+
+function Get-WsmpFile([string]$Url, [string]$OutFile) {
+  Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $OutFile
+}
+
+function Install-Release {
+  $dir = Join-Path (Get-CargoHome) 'bin'
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  # Copies an earlier install renamed out of the way while it ran, now free to go.
+  Get-ChildItem -LiteralPath $dir -Filter '.wsmp-old.*' -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+  $tmp = Join-Path $dir ('.wsmp-install.' + [IO.Path]::GetRandomFileName())
+  New-Item -ItemType Directory -Path $tmp | Out-Null
+  try {
+    $archive = "wsmp-$WsmpTarget.zip"
+    Say "downloading wsmp $WsmpVersion for $WsmpTarget from $WsmpReleaseUrl..."
+    $sums = Join-Path $tmp 'sha256.sum'
+    try { Get-WsmpFile "$WsmpReleaseUrl/sha256.sum" $sums } catch {
+      throw "wsmp: could not download $WsmpReleaseUrl/sha256.sum (is wsmp $WsmpVersion published there?)."
+    }
+    $zip = Join-Path $tmp $archive
+    try { Get-WsmpFile "$WsmpReleaseUrl/$archive" $zip } catch {
+      throw "wsmp: could not download $WsmpReleaseUrl/$archive."
+    }
+    $expected = $null
+    foreach ($line in Get-Content -LiteralPath $sums) {
+      $fields = @($line.Trim() -split '\\s+')
+      if ($fields.Count -ge 2 -and ($fields[1] -ceq $archive -or $fields[1] -ceq "*$archive")) {
+        $expected = $fields[0].ToLowerInvariant()
+        break
+      }
+    }
+    if ($expected -notmatch '^[0-9a-f]{64}$') {
+      throw "wsmp: sha256.sum has no checksum for $archive; not installing it."
+    }
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) {
+      throw "wsmp: checksum mismatch for $archive (expected $expected, got $actual); not installing it."
+    }
+    Say "checksum verified ($expected)."
+    $unpacked = Join-Path $tmp 'unpacked'
+    Expand-Archive -LiteralPath $zip -DestinationPath $unpacked
+    $binary = @((Join-Path $unpacked 'wsmp.exe'), (Join-Path $unpacked "wsmp-$WsmpTarget\\wsmp.exe")) |
+      Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $binary) { throw "wsmp: $archive does not contain wsmp.exe." }
+    $runs = $false
+    try { & $binary --version *> $null; $runs = $LASTEXITCODE -eq 0 } catch { $runs = $false }
+    if (-not $runs) {
+      throw "wsmp: the downloaded wsmp does not run on this machine; install Rust 1.88+ and run: cargo install --git $WsmpRepository ${sourceHint} --locked wsmp"
+    }
+    $installed = Join-Path $dir 'wsmp.exe'
+    if (Test-Path -LiteralPath $installed -PathType Container) {
+      throw "wsmp: $installed is a directory; remove it, then run this again."
+    }
+    # A running wsmp.exe (the service) cannot be replaced, but it can be renamed out of the way.
+    if (Test-Path -LiteralPath $installed) {
+      $old = Join-Path $dir ('.wsmp-old.' + [IO.Path]::GetRandomFileName())
+      Move-Item -LiteralPath $installed -Destination $old
+      Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+    }
+    Move-Item -LiteralPath $binary -Destination $installed
+    $installed
+  } finally {
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Install-Source {
+  $cargo = Get-Command cargo -ErrorAction SilentlyContinue
+  if (-not $cargo) {
+    $candidate = Join-Path (Get-CargoHome) 'bin\\cargo.exe'
+    if (Test-Path -LiteralPath $candidate) { $cargo = $candidate }
+  }
+  if (-not $cargo) {
+    throw 'wsmp: cargo is not installed. Install Rust 1.88 or newer from https://rustup.rs (with the Visual Studio C++ build tools), then run this again.'
+  }
+  Say "building wsmp from $WsmpRepository ($($WsmpSourceArgs -join ' ')) with cargo; this takes a few minutes..."
+  & $cargo install --git $WsmpRepository @WsmpSourceArgs --locked --force wsmp
+  if ($LASTEXITCODE -ne 0) { throw 'wsmp: cargo install failed.' }
+  $root = if ($env:CARGO_INSTALL_ROOT) { $env:CARGO_INSTALL_ROOT } else { Get-CargoHome }
+  Join-Path $root 'bin\\wsmp.exe'
+}
+
+$installed = $null
+if (-not $WsmpReleaseUrl) {
+  $installed = Install-Source
+} elseif ($env:PROCESSOR_ARCHITECTURE -in @('AMD64', 'ARM64')) {
+  $installed = Install-Release
+} else {
+  Say "no wsmp release binary fits this machine ($env:PROCESSOR_ARCHITECTURE); building from source instead."
+  $installed = Install-Source
+}
+$dir = Split-Path -Parent $installed
+Say "installed $installed."
+if (-not (@($env:Path -split ';') -contains $dir)) {
+  Say "$dir is not on your PATH: run \`"$installed\`", or add it to PATH."
+}
+$found = Get-Command wsmp -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($found -and $found.Source -ne $installed) {
+  Say "warning: $($found.Source) comes first on your PATH (an older wsmp); remove it."
+}
+}
+`;
+}
+
 type Refusal = { ok: false; error: "rate_limited"; retryAfterSec: number };
 
 function rateLimited(retryAfterMs: number): Refusal {
@@ -394,6 +550,19 @@ export function registerNodeHttpRoutes<E extends Env>(
       200,
       {
         "content-type": "text/x-shellscript; charset=utf-8",
+        "cache-control": "no-store",
+      },
+    ),
+  );
+  app.get("/install.ps1", (c) =>
+    c.body(
+      windowsInstallScript(
+        canonicalOrigin(),
+        cliInstallSource(env.WMP_CLI_SOURCE_REV, env.WMP_CLI_RELEASE_BASE_URL),
+      ),
+      200,
+      {
+        "content-type": "text/plain; charset=utf-8",
         "cache-control": "no-store",
       },
     ),

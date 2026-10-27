@@ -145,7 +145,7 @@ fn bounded_run_state_table() {
             "echo out; exit 3",
             5_000,
             1024,
-            Expect::Err(RunError::ExitStatus),
+            Expect::Err(RunError::ExitStatus(Some(3))),
             2_000,
         ),
         row(
@@ -153,7 +153,7 @@ fn bounded_run_state_table() {
             "echo out; kill -9 $$",
             5_000,
             1024,
-            Expect::Err(RunError::ExitStatus),
+            Expect::Err(RunError::ExitStatus(None)),
             2_000,
         ),
         row(
@@ -212,7 +212,7 @@ fn bounded_run_state_table() {
             "echo out; exec >&-; sleep 0.1; exit 4",
             5_000,
             1024,
-            Expect::Err(RunError::ExitStatus),
+            Expect::Err(RunError::ExitStatus(Some(4))),
             3_000,
         ),
         // E, then the program keeps running past the deadline.

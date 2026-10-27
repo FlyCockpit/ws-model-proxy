@@ -88,6 +88,11 @@ impl Stat {
         }
     }
 
+    /// The object at `path`, links followed (what a protected entry names).
+    pub fn of_path(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self::from_metadata(&std::fs::metadata(path)?))
+    }
+
     #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
     pub(crate) fn from_raw(st: &nix::sys::stat::FileStat) -> Self {
         Self {
@@ -152,7 +157,32 @@ pub struct ResolveOpts<'a> {
     pub cancel: Option<&'a super::Cancel>,
 }
 
+/// What a walk holds for a directory: its fd.
+pub type DirHandle = OwnedFd;
+
 impl Resolved {
+    /// The entry `name` of a directory a walk holds.
+    pub fn at(parent: &DirHandle, dir_path: PathBuf, name: OsString) -> FileResult<Self> {
+        Ok(Self {
+            dir: parent.try_clone()?,
+            dir_path,
+            name,
+            created: Vec::new(),
+        })
+    }
+
+    /// The metadata of the directory the path names itself.
+    pub fn dir_stat(&self) -> FileResult<Stat> {
+        Ok(Stat::from_metadata(
+            &File::from(self.open_dir()?).metadata()?,
+        ))
+    }
+
+    /// A link's text (`None` when it is not a link or not UTF-8).
+    pub fn read_link(&self) -> Option<String> {
+        read_link_at(&self.dir, &self.name.to_string_lossy())
+    }
+
     pub fn is_self(&self) -> bool {
         self.name == "."
     }
@@ -246,6 +276,14 @@ impl Resolved {
             );
         }
     }
+}
+
+/// A link's text in the directory `parent` (`None` when it is not a link or not
+/// UTF-8).
+pub fn read_link_at(parent: &DirHandle, name: &str) -> Option<String> {
+    readlinkat(parent.as_fd(), name)
+        .ok()
+        .and_then(|target| target.into_string().ok())
 }
 
 fn check_openable(kind: Kind) -> FileResult<()> {

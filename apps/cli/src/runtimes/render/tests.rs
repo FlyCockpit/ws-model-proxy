@@ -91,6 +91,7 @@ fn facts(iface: &str) -> NodeFacts {
     NodeFacts {
         addresses,
         sys: std::path::PathBuf::from("/nonexistent-sys"),
+        shells: vec![crate::protocol::runtime_spec::CommandShell::Sh],
     }
 }
 
@@ -475,4 +476,117 @@ fn a_process_runtime_without_a_stop_command_renders_an_empty_stop() {
     let start =
         render(&job(&hash, 0, 1), TrustValue::Full, &store, &facts("eth0")).expect("rendered");
     assert_eq!(start.stop_command, "");
+}
+
+fn argv_spec(start: Value, shell: Option<&str>) -> Value {
+    let mut spec = spec("unused", 1);
+    spec["launch"]["commands"][0] = json!({ "start": start, "status": ["probe", "{{port}}"] });
+    if let Some(shell) = shell {
+        spec["launch"]["shell"] = json!(shell);
+    }
+    spec
+}
+
+fn shells_facts(shells: &[CommandShell]) -> NodeFacts {
+    NodeFacts {
+        shells: shells.to_vec(),
+        ..facts("eth0")
+    }
+}
+
+#[test]
+fn an_argv_is_filled_per_argument_and_quoted_for_the_shell() {
+    let (store, hash) = store_with(argv_spec(
+        json!(["llama-server", "-m", "it's {{port}}", "--alias", "a b"]),
+        None,
+    ));
+    let rendered =
+        render(&job(&hash, 0, 1), TrustValue::Full, &store, &facts("eth0")).expect("rendered");
+    assert_eq!(rendered.shell, CommandShell::Sh);
+    assert_eq!(
+        rendered.command,
+        r"exec 'llama-server' '-m' 'it'\''s 30001' '--alias' 'a b'"
+    );
+    assert_eq!(
+        rendered.status_command.as_deref(),
+        Some("exec 'probe' '30001'")
+    );
+    // With only argv commands, Windows takes its first PowerShell (never `cmd`).
+    let windows = shells_facts(&[CommandShell::Cmd, CommandShell::Pwsh]);
+    let rendered = render(&job(&hash, 0, 1), TrustValue::Full, &store, &windows).expect("rendered");
+    assert_eq!(rendered.shell, CommandShell::Pwsh);
+    assert_eq!(
+        rendered.command,
+        "$PSNativeCommandArgumentPassing = 'Standard'; & 'llama-server' '-m' 'it''s 30001' '--alias' 'a b'"
+    );
+    // Each command keeps its own arguments beside its script, for a program that starts directly.
+    let start: Vec<String> = ["llama-server", "-m", "it's 30001", "--alias", "a b"]
+        .map(String::from)
+        .to_vec();
+    assert_eq!(rendered.command_argv.as_ref(), Some(&start));
+    assert_eq!(
+        rendered.status_cmd().and_then(|status| status.argv),
+        Some(&["probe".to_string(), "30001".to_string()][..])
+    );
+    assert_eq!(rendered.stop_argv, None);
+    assert_eq!(rendered.health_argv, None);
+    // Not on Unix, where `sh` runs every command.
+    let rendered =
+        render(&job(&hash, 0, 1), TrustValue::Full, &store, &facts("eth0")).expect("rendered");
+    assert_eq!(rendered.command_argv, None);
+    assert_eq!(rendered.status_argv, None);
+}
+
+#[test]
+fn each_command_keeps_its_own_argv() {
+    // A text start in the launch's shell, with an argv stop beside it.
+    let mut pwsh = spec("Start-Service ollama", 1);
+    pwsh["launch"]["shell"] = json!("pwsh");
+    pwsh["launch"]["commands"][0]["stop"] = json!(["sc.exe", "stop", "{{port}}"]);
+    let (store, hash) = store_with(pwsh);
+    let windows = shells_facts(&[CommandShell::Pwsh]);
+    let rendered = render(&job(&hash, 0, 1), TrustValue::Full, &store, &windows).expect("rendered");
+    assert_eq!(rendered.step_cmd().argv, None);
+    assert_eq!(rendered.step_cmd().script, "Start-Service ollama");
+    let stop = rendered.stop_cmd();
+    assert_eq!(
+        stop.argv,
+        Some(&["sc.exe".to_string(), "stop".into(), "30001".into()][..])
+    );
+    assert_eq!(
+        stop.script,
+        "$PSNativeCommandArgumentPassing = 'Standard'; & 'sc.exe' 'stop' '30001'"
+    );
+}
+
+#[test]
+fn powershell_words_double_every_quote_it_reads() {
+    assert_eq!(powershell_word("a\u{2019}b'c"), "'a\u{2019}\u{2019}b''c'");
+    assert_eq!(
+        argv_script(CommandShell::Powershell, &["x".into(), r"C:\dir\".into()]).as_deref(),
+        Some(r"& 'x' 'C:\dir\'")
+    );
+    // What Windows PowerShell 5.1 would change is rendered too: the node refuses it only when the
+    // program is not an `.exe` that starts directly.
+    assert!(argv_script(CommandShell::Powershell, &["x".into(), String::new()]).is_some());
+    assert!(argv_script(CommandShell::Pwsh, &["x".into(), String::new()]).is_some());
+    assert_eq!(argv_script(CommandShell::Cmd, &["x".into()]), None);
+}
+
+#[test]
+fn text_commands_need_the_launch_shell_here() {
+    let mut pwsh = spec("Start-Service ollama", 1);
+    pwsh["launch"]["shell"] = json!("pwsh");
+    let (store, hash) = store_with(pwsh);
+    let refused =
+        render(&job(&hash, 0, 1), TrustValue::Full, &store, &facts("eth0")).expect_err("no pwsh");
+    assert_eq!(refused.error, JobError::ExecutionMechanismUnavailable);
+    let windows = shells_facts(&[CommandShell::Pwsh]);
+    let rendered = render(&job(&hash, 0, 1), TrustValue::Full, &store, &windows).expect("rendered");
+    assert_eq!(rendered.shell, CommandShell::Pwsh);
+    assert_eq!(rendered.command, "Start-Service ollama");
+    // An argv beside text runs in the launch's shell too.
+    let (store, hash) = store_with(argv_spec(json!(["ollama", "serve"]), Some("pwsh")));
+    let rendered = render(&job(&hash, 0, 1), TrustValue::Full, &store, &windows).expect("rendered");
+    assert!(rendered.command.contains("& 'ollama' 'serve'"));
 }

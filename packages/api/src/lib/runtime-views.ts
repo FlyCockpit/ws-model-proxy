@@ -13,7 +13,12 @@ import type {
   runtimeVersionDetailSchema,
   runtimeVersionSummarySchema,
 } from "../contracts/runtimes";
-import { rankCommands, renderStepCommand, type StepCommandPhase } from "./command-render";
+import {
+  displayCommand,
+  rankCommands,
+  renderStepCommand,
+  type StepCommandPhase,
+} from "./command-render";
 import { type InstanceLiveLoad, NO_LIVE_LOAD } from "./live-load";
 import { recordedGpuKeys } from "./placement";
 import { jsonObject, registryView } from "./registry-view";
@@ -448,7 +453,8 @@ export function stepView(step: StepRow, context: StepViewContext): StepView {
     step.phase in INTERACTIVE_KEY
       ? INTERACTIVE_KEY[step.phase as keyof typeof INTERACTIVE_KEY]
       : null;
-  const command = known && commandKey && commands ? (commands[commandKey] ?? null) : null;
+  const saved = known && commandKey && commands ? commands[commandKey] : undefined;
+  const command = saved === undefined ? null : displayCommand(saved);
   // Dispatch opens a terminal from the intent's flag; the spec's flag only when it is unreadable.
   const interactive =
     intent?.interactive ??

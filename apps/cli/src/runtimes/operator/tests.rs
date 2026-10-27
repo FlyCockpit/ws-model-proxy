@@ -1,5 +1,6 @@
 use super::*;
 use crate::protocol::frames::InstancePhase;
+use crate::runtimes::executor::JobCommand;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -145,6 +146,8 @@ fn the_environment_drops_askpass_and_startup_files() {
         },
         screen: screen("x", CommandAuthor::User),
         env,
+        shell: crate::protocol::runtime_spec::CommandShell::Sh,
+        argv: None,
         events: std::sync::mpsc::sync_channel(1).0,
     };
     assert!(!format!("{open:?}").contains("secret"));
@@ -322,11 +325,11 @@ impl Runtime for Machine {
     fn identity(&self, _: &str, _: &str, _: Deadline) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
-    fn shell_until(&self, _: &Job, command: &str, _: Deadline) -> anyhow::Result<()> {
-        self.shells.borrow_mut().push(command.to_string());
+    fn shell_until(&self, _: &Job, command: JobCommand<'_>, _: Deadline) -> anyhow::Result<()> {
+        self.shells.borrow_mut().push(command.script.to_string());
         Ok(())
     }
-    fn status_until(&self, _: &Job, _: &str, _: Deadline) -> anyhow::Result<bool> {
+    fn status_until(&self, _: &Job, _: JobCommand<'_>, _: Deadline) -> anyhow::Result<bool> {
         let mut answers = self.status.borrow_mut();
         let answer = if answers.len() > 1 {
             answers.remove(0)
@@ -373,6 +376,11 @@ fn job(action: JobPhase) -> Job {
         stop_command: "sudo systemctl stop x".into(),
         status_command: Some("systemctl is-active x".into()),
         health_command: None,
+        command_argv: None,
+        stop_argv: None,
+        status_argv: None,
+        health_argv: None,
+        shell: crate::protocol::runtime_spec::CommandShell::Sh,
         secrets: Vec::new(),
         timeout_ms: 2_000,
         unit_name: "wsmp-i-abcdefabcdef-r0".into(),

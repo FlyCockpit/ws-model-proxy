@@ -104,6 +104,21 @@ describe("relay 3.0 file frames", () => {
     ).toBe(false);
   });
 
+  it("accepts a stat of a link whose target is missing or out of reach", () => {
+    const stat = (targetType: string) => ({
+      type: "file.result",
+      opId: OP_ID,
+      op: "stat",
+      result: {
+        entries: [{ path: "/home/me/link", type: "symlink", target: "/elsewhere", targetType }],
+      },
+    });
+    for (const targetType of ["file", "dir", "missing", "denied"]) {
+      expect(fileResultFrameSchema.safeParse(stat(targetType)).success).toBe(true);
+    }
+    expect(fileResultFrameSchema.safeParse(stat("socket")).success).toBe(false);
+  });
+
   it("accepts only library-shaped etags in results", () => {
     const write = {
       type: "file.result",

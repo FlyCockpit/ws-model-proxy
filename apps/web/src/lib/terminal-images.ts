@@ -39,8 +39,19 @@ export type TerminalImageReply = {
   id: string;
   received: number;
   path?: string;
+  /** With `path` from a Windows node: the text to paste, already quoted for the terminal's shell. */
+  paste?: string;
   error?: string;
 };
+
+/** An absolute POSIX path, or (only with node-quoted paste text) a Windows drive path. */
+const POSIX_PATH = /^\/[\x20-\x7e]+$/;
+const WINDOWS_PATH = /^[A-Za-z]:\\[\x20-\x7e]+$/;
+/** Room for the bracketed-paste markers inside the node's 16 KiB paste limit. */
+const TERMINAL_IMAGE_PASTE_TEXT_MAX = 16 * 1024 - 12;
+
+/** Printable ASCII ending in the space every paste carries. */
+const PASTE_TEXT = /^[\x20-\x7e]+ $/;
 
 export type TerminalImageMessage =
   | { kind: "imageCapabilities" }
@@ -110,7 +121,14 @@ export function decodeTerminalImageMessage(bytes: Uint8Array): TerminalImageMess
     !Number.isInteger(reply.received) ||
     reply.received < 0 ||
     reply.received > TERMINAL_IMAGE_MAX_BYTES ||
-    ("path" in reply && (typeof reply.path !== "string" || !/^\/[\x20-\x7e]+$/.test(reply.path))) ||
+    ("path" in reply &&
+      (typeof reply.path !== "string" ||
+        !(POSIX_PATH.test(reply.path) || ("paste" in reply && WINDOWS_PATH.test(reply.path))))) ||
+    ("paste" in reply &&
+      (!("path" in reply) ||
+        typeof reply.paste !== "string" ||
+        reply.paste.length > TERMINAL_IMAGE_PASTE_TEXT_MAX ||
+        !PASTE_TEXT.test(reply.paste))) ||
     ("error" in reply && (typeof reply.error !== "string" || reply.error.length > 64)) ||
     ("path" in reply && "error" in reply)
   ) {
@@ -122,14 +140,25 @@ export function decodeTerminalImageMessage(bytes: Uint8Array): TerminalImageMess
       id: reply.id,
       received: reply.received,
       ...("path" in reply ? { path: String(reply.path) } : {}),
+      ...("paste" in reply ? { paste: String(reply.paste) } : {}),
       ...("error" in reply ? { error: String(reply.error) } : {}),
     },
   };
 }
 
-/** Printable ASCII only: pasted controls or non-ASCII bytes can drive shell editors. */
-export function terminalImagePasteText(path: string): string {
-  if (!/^\/[\x20-\x7e]+$/.test(path)) throw new Error("invalid");
+/**
+ * Printable ASCII only: pasted controls or non-ASCII bytes can drive shell editors. A Windows
+ * node quotes the path for its terminal's shell (PowerShell, cmd, WSL) and sends the text, which
+ * is pasted as is; otherwise the path is quoted for `sh` here.
+ */
+export function terminalImagePasteText(path: string, paste?: string): string {
+  if (paste !== undefined) {
+    if (!PASTE_TEXT.test(paste) || paste.length > TERMINAL_IMAGE_PASTE_TEXT_MAX) {
+      throw new Error("invalid");
+    }
+    return paste;
+  }
+  if (!POSIX_PATH.test(path)) throw new Error("invalid");
   return /^[A-Za-z0-9_./-]+$/.test(path) ? `${path} ` : `'${path.replaceAll("'", "'\\''")}' `;
 }
 
@@ -214,7 +243,7 @@ export class TerminalImageTransfer {
         progress(Math.round((received / file.size) * 100));
         if (received === file.size) {
           if (!reply.path) throw new Error("invalid");
-          const text = terminalImagePasteText(reply.path);
+          const text = terminalImagePasteText(reply.path, reply.paste);
           completed = true;
           return { id, text, cancel };
         }

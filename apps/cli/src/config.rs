@@ -282,6 +282,12 @@ pub struct Config {
     /// when the relay starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_terminals: Option<u32>,
+    /// The shell a Windows browser terminal starts when the browser does not
+    /// pick one (`pwsh`, `powershell`, `cmd` or `wsl:<distribution>`). Unset,
+    /// or not installed: pwsh, then powershell, then cmd. Read once when the
+    /// relay starts; ignored on Unix, which runs the login shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_shell: Option<String>,
     /// Run the MCP node file tools even when the daemon is root (euid 0). Read
     /// once when the relay starts; off by default.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -459,6 +465,7 @@ struct ConfigWire {
     allow_human_terminal: bool,
     require_terminal_approval: bool,
     max_terminals: Option<u32>,
+    terminal_shell: Option<String>,
     allow_file_tools_as_root: bool,
     #[serde(deserialize_with = "deserialize_file_roots")]
     file_roots: Vec<PathBuf>,
@@ -479,6 +486,7 @@ impl Default for ConfigWire {
             allow_human_terminal: false,
             require_terminal_approval: false,
             max_terminals: None,
+            terminal_shell: None,
             allow_file_tools_as_root: false,
             file_roots: Vec::new(),
             disable_file_tools: false,
@@ -499,6 +507,7 @@ impl From<ConfigWire> for Config {
             allow_human_terminal: wire.allow_human_terminal,
             require_terminal_approval: wire.require_terminal_approval,
             max_terminals: wire.max_terminals,
+            terminal_shell: wire.terminal_shell,
             allow_file_tools_as_root: wire.allow_file_tools_as_root,
             file_roots: wire.file_roots,
             disable_file_tools: wire.disable_file_tools,
@@ -519,6 +528,7 @@ impl Default for Config {
             allow_human_terminal: false,
             require_terminal_approval: false,
             max_terminals: None,
+            terminal_shell: None,
             allow_file_tools_as_root: false,
             file_roots: Vec::new(),
             disable_file_tools: false,

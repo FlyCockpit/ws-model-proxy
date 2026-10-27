@@ -611,17 +611,32 @@ mod tests {
     fn a_scan_lists_a_process_whose_name_is_not_utf8() {
         use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
-        // The kernel keeps the first 15 bytes of the file name: the name is cut inside `é`.
+        // The kernel keeps the first 15 bytes of the file name: the name is cut inside `é`. A
+        // script, not a copy of `sleep`: a multi-call coreutils binary picks its tool by name and
+        // would exit at once under this one.
         let name = std::ffi::OsStr::from_bytes(b"wsmp-scantest-\xc3\xa9");
         let program = dir.path().join(name);
         // A shell, not `sleep`: a multicall coreutils (uutils) picks its tool by file name, and
         // a renamed copy exits at once. It waits for input until the test drops stdin.
         std::fs::copy("/bin/sh", &program).unwrap();
-        let mut child = std::process::Command::new(&program)
-            .args(["-c", "read line"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        // Another test thread can fork while the copy is still open for writing, which makes
+        // the exec fail with ETXTBSY until that child execs.
+        let mut attempts = 0;
+        let mut child = loop {
+            match std::process::Command::new(&program)
+                .args(["-c", "read line"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                spawned => break spawned.unwrap(),
+            }
+        };
         let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
         let comm = std::fs::read(format!("/proc/{pid}/comm")).unwrap();
         let listed = super::live();

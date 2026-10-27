@@ -539,6 +539,10 @@ impl FileRelay {
         if malformed.is_err() {
             return self.refuse(op_id, &summary, "bad_frame");
         }
+        // Windows serves the read tools only (see `file_ops`).
+        if cfg!(not(unix)) && !is_read_op(op) {
+            return self.refuse(op_id, &summary, "unsupported");
+        }
         let policy = self.runtime.policy();
         if let Err(reason) = admit(
             self.full_control,
@@ -707,5 +711,10 @@ impl Drop for FileRelay {
     }
 }
 
+// The relay's write paths are Unix; Windows has its own read tests.
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_tests;

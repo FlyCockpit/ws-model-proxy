@@ -137,6 +137,29 @@ describe("terminal image uploads", () => {
     );
   });
 
+  it("pastes a Windows node's own quoting as is", () => {
+    const { windowsReply } = vectors;
+    expect(decodeTerminalImageMessage(replyBytes(windowsReply))).toEqual({
+      kind: "imageReply",
+      reply: windowsReply,
+    });
+    expect(terminalImagePasteText(windowsReply.path, windowsReply.paste)).toBe(windowsReply.paste);
+    // A drive path only comes with the node's text, and that text with a path.
+    const { paste: _paste, ...withoutPaste } = windowsReply;
+    const { path: _path, ...withoutPath } = windowsReply;
+    for (const reply of [
+      withoutPaste,
+      withoutPath,
+      { ...windowsReply, paste: "C:\\image.png" },
+      { ...windowsReply, paste: "C:\\a\x1b[31m.png " },
+      { ...windowsReply, paste: 7 },
+    ]) {
+      expect(() => decodeTerminalImageMessage(replyBytes(reply))).toThrow();
+    }
+    expect(() => terminalImagePasteText(windowsReply.path)).toThrow();
+    expect(() => terminalImagePasteText(windowsReply.path, "line\nbreak ")).toThrow();
+  });
+
   it("refuses an older CLI without sending any bytes", async () => {
     const transfer = new TerminalImageTransfer();
     let sends = 0;

@@ -89,6 +89,16 @@ pub enum Command {
     /// Internal: run a runtime command so it cannot outlive the relay that started it.
     #[command(name = "__launch-guard", hide = true)]
     LaunchGuard(crate::commands::launch_guard::Args),
+    /// Internal: hosts one Windows browser terminal's console (started by
+    /// the relay).
+    #[cfg(windows)]
+    #[command(name = "__conpty-host", hide = true)]
+    ConptyHost(crate::commands::conpty_host::Args),
+    /// Internal: holds one Windows runtime unit's command and everything it
+    /// starts (started by the relay).
+    #[cfg(windows)]
+    #[command(name = "__runtime-host", hide = true)]
+    RuntimeHost(crate::commands::runtime_host::Args),
 
     /// Internal: how a launch guard starts its command (with the signals it blocked unblocked).
     #[command(name = "__launch-guard-exec", hide = true)]

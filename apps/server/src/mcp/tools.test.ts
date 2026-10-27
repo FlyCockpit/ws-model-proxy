@@ -427,6 +427,7 @@ describe("errors and output", () => {
       memoryGb: 126,
       gpus: [],
       liveFreeMemoryGb: null,
+      launch: null,
     });
     const placed = new PlacementPlanner({
       callerId: "u",

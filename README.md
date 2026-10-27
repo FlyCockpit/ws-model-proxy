@@ -122,7 +122,7 @@ pnpm policy:auth-session
 Releases are created manually from the `master` branch with the root `Release` GitHub Actions workflow. A release publishes:
 
 - The app container to GHCR.
-- Cross-platform `wsmp` CLI archives to the GitHub Release, with a `sha256.sum` checksum file and signed build-provenance attestations (`gh attestation verify <archive> --repo FlyCockpit/ws-model-proxy`). The workflow refuses to publish when a Linux or macOS archive or its checksum is missing.
+- Cross-platform `wsmp` CLI archives to the GitHub Release, with a `sha256.sum` checksum file and signed build-provenance attestations (`gh attestation verify <archive> --repo FlyCockpit/ws-model-proxy`). The workflow refuses to publish when a Linux, macOS or Windows archive or its checksum is missing.
 - The generated Homebrew formula to `FlyCockpit/homebrew-tap`.
 
 Before the first release, create a protected `release` environment and add `HOMEBREW_TAP_TOKEN` as an environment secret. It must have `contents:write` access to `FlyCockpit/homebrew-tap` so the release workflow can update `Formula/wsmp.rb`.
@@ -135,7 +135,7 @@ The usual way to install the CLI on a node is the server's own installer, which 
 curl -fsSL https://wsmp.example.com/install.sh | sh
 ```
 
-From the 0.4.0 release on, it installs the release binary of the server's version into `~/.cargo/bin` (`$CARGO_HOME/bin` when set) on Linux x86_64 and ARM64 (glibc 2.34 or newer) and macOS, after checking its SHA-256 against the release's `sha256.sum` (it refuses to install on a mismatch or a missing checksum). Other systems build the release tag from source with cargo (Rust 1.88 or newer). `WMP_CLI_RELEASE_BASE_URL` points it at a mirror of the release assets; `WMP_CLI_SOURCE_REV` makes it build that commit from source instead.
+From the 0.4.0 release on, it installs the release binary of the server's version into `~/.cargo/bin` (`$CARGO_HOME/bin` when set) on Linux x86_64 and ARM64 (glibc 2.34 or newer) and macOS, after checking its SHA-256 against the release's `sha256.sum` (it refuses to install on a mismatch or a missing checksum). Other systems build the release tag from source with cargo (Rust 1.88 or newer). `WMP_CLI_RELEASE_BASE_URL` points it at a mirror of the release assets; `WMP_CLI_SOURCE_REV` makes it build that commit from source instead. Windows nodes install with the release's PowerShell installer instead (see the [CLI README](apps/cli/README.md#windows)).
 
 Alternatively, after the first release, install the CLI with Homebrew (remove it before using `/install.sh`, or it can shadow `~/.cargo/bin/wsmp` on your `PATH`):
 

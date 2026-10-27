@@ -19,6 +19,39 @@ const ALLOWED_EXACT: &[&str] = &[
     "XDG_RUNTIME_DIR",
     "DBUS_SESSION_BUS_ADDRESS",
 ];
+/// Added to [`ALLOWED_EXACT`] on Windows. Without `SystemRoot` Winsock and the
+/// crypto providers fail to load, and PowerShell, `cmd` and installers need
+/// the profile, temp, program and shell lookup variables.
+const ALLOWED_WINDOWS: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "COMSPEC",
+    "PATHEXT",
+    "PSModulePath",
+    "USERPROFILE",
+    "USERNAME",
+    "USERDOMAIN",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "ProgramData",
+    "ALLUSERSPROFILE",
+    "PUBLIC",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "COMPUTERNAME",
+    "OS",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
 /// Product credential prefixes (`PRODUCT_CREDENTIAL_PREFIXES` in
 /// `packages/db/src/node-security.ts`; `CLI_OUTPUT_CREDENTIAL_PREFIXES` in
 /// `packages/config/src/cli-command-output.ts` is the same list).
@@ -32,6 +65,8 @@ const VALUE_PREFIXES: &[&str] = &[
 
 pub struct ScrubOptions<'a> {
     pub case_insensitive_names: bool,
+    /// Also keep [`ALLOWED_WINDOWS`].
+    pub windows_names: bool,
     pub denied_names: &'a [String],
 }
 
@@ -49,7 +84,7 @@ pub fn scrub_env(entries: &[(&str, &str)], options: &ScrubOptions<'_>) -> Vec<(S
 }
 
 fn keep_entry(name: &str, value: &str, options: &ScrubOptions<'_>) -> bool {
-    if !allowlisted(name, options.case_insensitive_names) {
+    if !allowlisted(name, options) {
         return false;
     }
     if denied_name(name, options) {
@@ -60,9 +95,16 @@ fn keep_entry(name: &str, value: &str, options: &ScrubOptions<'_>) -> bool {
         .any(|prefix| value.starts_with(prefix))
 }
 
-fn allowlisted(name: &str, case_insensitive: bool) -> bool {
+fn allowlisted(name: &str, options: &ScrubOptions<'_>) -> bool {
+    let case_insensitive = options.case_insensitive_names;
+    let windows: &[&str] = if options.windows_names {
+        ALLOWED_WINDOWS
+    } else {
+        &[]
+    };
     if ALLOWED_EXACT
         .iter()
+        .chain(windows)
         .any(|allowed| names_equal(name, allowed, case_insensitive))
     {
         return true;
@@ -113,6 +155,7 @@ pub fn scrub_parent_env(denied_names: &[String]) -> Vec<(String, String)> {
         &borrowed,
         &ScrubOptions {
             case_insensitive_names: cfg!(windows),
+            windows_names: cfg!(windows),
             denied_names,
         },
     );
@@ -360,6 +403,7 @@ mod tests {
             entries,
             &ScrubOptions {
                 case_insensitive_names: case_insensitive,
+                windows_names: case_insensitive,
                 denied_names: &denied_names,
             },
         )
@@ -638,6 +682,82 @@ mod tests {
             true,
         );
         assert_eq!(names(&kept), vec!["Path", "Lc_All"]);
+    }
+
+    #[test]
+    fn windows_keeps_the_system_and_profile_names() {
+        let entries = [
+            ("SYSTEMROOT", r"C:\Windows"),
+            ("windir", r"C:\Windows"),
+            ("ComSpec", r"C:\Windows\system32\cmd.exe"),
+            ("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
+            (
+                "PSModulePath",
+                r"C:\Program Files\WindowsPowerShell\Modules",
+            ),
+            ("USERPROFILE", r"C:\Users\example"),
+            ("APPDATA", r"C:\Users\example\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\example\AppData\Local"),
+            ("TEMP", r"C:\Users\example\AppData\Local\Temp"),
+            ("TMP", r"C:\Users\example\AppData\Local\Temp"),
+            ("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            ("SystemDrive", "C:"),
+            ("LOGONSERVER", r"\\EXAMPLE"),
+            ("OneDrive", r"C:\Users\example\OneDrive"),
+        ];
+        let kept = scrub(&entries, &[], true);
+        assert_eq!(
+            names(&kept),
+            vec![
+                "SYSTEMROOT",
+                "windir",
+                "ComSpec",
+                "PATHEXT",
+                "PSModulePath",
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "TEMP",
+                "TMP",
+                "ProgramFiles(x86)",
+                "SystemDrive",
+            ]
+        );
+        // Unix hosts never take the Windows names.
+        let kept = scrub(&entries, &[], false);
+        assert!(kept.is_empty());
+        // Credential-shaped values and denied names still go.
+        let kept = scrub(
+            &[("TEMP", "wsmp_key_example"), ("APPDATA", r"C:\x")],
+            &["appdata"],
+            true,
+        );
+        assert!(kept.is_empty());
+    }
+
+    /// A child given only the scrubbed env still sees `SystemRoot` and can
+    /// start PowerShell, which fails to load without it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_gets_system_root_and_runs_powershell() {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Environment]::GetEnvironmentVariable('SystemRoot'); $env:TEMP",
+            ])
+            .env_clear()
+            .envs(scrub_parent_env(&[]))
+            .output()
+            .expect("run powershell");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut lines = stdout.lines().map(str::trim);
+        let system_root = lines.next().unwrap_or_default();
+        let temp = lines.next().unwrap_or_default();
+        assert!(Path::new(system_root).is_dir(), "{stdout}");
+        assert!(Path::new(temp).is_dir(), "{stdout}");
     }
 
     #[test]

@@ -26,6 +26,7 @@ function node(id: string, overrides: Partial<PlacementNode> = {}): PlacementNode
     memoryGb: 126,
     gpus: [],
     liveFreeMemoryGb: null,
+    launch: null,
     ...overrides,
   };
 }

@@ -29,7 +29,7 @@ marker, root, mode = sys.argv[1:]
 pathlib.Path(root).write_text(str(os.getpid()))
 flags = 0
 stdio = {}
-if mode == 'detach':
+if mode in ('detach', 'detach-exit'):
     flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     stdio = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 elif mode in ('success', 'eof'):
@@ -50,7 +50,7 @@ if mode == 'eof':
     os.close(1)
     while not pathlib.Path(root).with_suffix('.exit').exists():
         time.sleep(0.005)
-elif mode not in ('success', 'root-exit'):
+elif mode not in ('success', 'root-exit', 'detach-exit'):
     time.sleep(60)
 "#,
         )

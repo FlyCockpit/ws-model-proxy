@@ -12,6 +12,12 @@
 //! windowed; `etag` keys content hashes; `atomic` implements the replace
 //! sequence; `read`, `stat`, `list`, `search`, `edit`, `write`, `mutate` are the
 //! tools; `pool` runs them off the relay loop.
+//!
+//! Windows serves the read tools only (`read`, `stat`, `list`, `search`): its
+//! `resolve` and `walk` (`resolve_windows.rs`, `walk_windows.rs`) work on paths
+//! and check the object actually opened, and present paths in a POSIX view
+//! (`C:\Users\ada` is `/c/Users/ada`). The write side, its recovery journal and
+//! `wsmp recover` need fd-relative opens and an atomic exchange, and stay Unix.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -21,39 +27,75 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+#[cfg(unix)]
 pub(crate) mod atomic;
+#[cfg(unix)]
 pub(crate) mod diff;
+#[cfg(unix)]
 pub mod edit;
 pub mod error;
 pub mod etag;
+#[cfg(unix)]
 mod exchange;
 pub(crate) mod fmt;
 pub(crate) mod glob;
+#[cfg(unix)]
 mod intent;
 pub mod list;
+#[cfg(unix)]
 pub mod mutate;
 pub mod policy;
 pub mod pool;
 pub mod read;
+#[cfg(unix)]
 mod recover;
+#[cfg(unix)]
 mod recovery;
+#[cfg(unix)]
 mod registry;
+#[cfg(unix)]
 pub(crate) use recover::{RecoverReport, recover_from_registry, recover_scan};
+#[cfg(unix)]
 pub(crate) use recovery::report_abandoned_recovery;
+#[cfg(unix)]
 pub(crate) use registry::abandoned_count as abandoned_recovery_count;
 pub mod redact;
+#[cfg(unix)]
+pub(crate) mod resolve;
+#[cfg(windows)]
+#[path = "resolve_windows.rs"]
 pub(crate) mod resolve;
 pub mod search;
 pub mod stat;
 pub(crate) mod text;
+#[cfg(unix)]
 pub(crate) mod walk;
+#[cfg(windows)]
+#[path = "walk_windows.rs"]
+pub(crate) mod walk;
+#[cfg(unix)]
 pub mod write;
 
 pub use error::{ErrorCode, FileError, FileResult};
+
+/// How a node path is shown to the server (file roots, resolved paths): as it
+/// is on Unix; on Windows in the POSIX view, `C:\Users\ada` as `/c/Users/ada`.
+/// `None` when it has no such form (not UTF-8; a share or device on Windows).
+pub fn display_path(path: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        path.to_str().map(str::to_string)
+    }
+    #[cfg(windows)]
+    {
+        resolve::posix_view(path)
+    }
+}
 pub use etag::EtagKey;
 pub use policy::Policy;
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;
 
 /// Cooperative cancellation, checked between files, chunks, and before the
@@ -87,6 +129,7 @@ impl Cancel {
 /// (test fault injection) or change the world between steps (race tests).
 /// `Vacating` is the last seam before capturing a public name into recovery.
 /// After capture, cancellation finishes or compensates; it cannot abandon a move.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     PinBeforeOpen,
@@ -117,6 +160,7 @@ pub enum Step {
     DirSynced,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub type StepHook = Arc<dyn Fn(Step) -> FileResult<()> + Send + Sync>;
 
 /// Tunable budgets; the defaults are the plan's values.
@@ -135,6 +179,7 @@ impl Default for Limits {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 /// At most one mutating operation per physical path at a time.
 #[derive(Debug, Default)]
 struct PathLocks {
@@ -146,12 +191,14 @@ struct PathLocks {
 /// delete hold it exclusively, so a directory cannot be moved or removed while a
 /// change below it is in flight (its path lock and its held parent fd would
 /// otherwise name different directories). Reads do not take it.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Default)]
 struct Namespace {
     state: Mutex<NsState>,
     changed: Condvar,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Default)]
 struct NsState {
     shared: usize,
@@ -161,6 +208,7 @@ struct NsState {
     waiting_exclusive: usize,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub struct NamespaceGuard<'a> {
     ns: &'a Namespace,
     exclusive: bool,
@@ -179,6 +227,7 @@ impl Drop for NamespaceGuard<'_> {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 impl Namespace {
     fn acquire(
         &self,
@@ -238,6 +287,7 @@ impl Namespace {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub struct PathGuard<'a> {
     locks: &'a PathLocks,
     path: PathBuf,
@@ -252,6 +302,7 @@ impl Drop for PathGuard<'_> {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 impl PathLocks {
     fn lock(&self, path: PathBuf, cancel: &Cancel, wait: Duration) -> FileResult<PathGuard<'_>> {
         let deadline = std::time::Instant::now() + wait;
@@ -318,6 +369,7 @@ impl FileOps {
         &self.policy
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn step(&self, step: Step) -> FileResult<()> {
         match &self.hook {
             Some(hook) => hook(step),
@@ -326,15 +378,18 @@ impl FileOps {
     }
 
     /// Shared namespace guard for a file mutation (see [`Namespace`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn namespace_shared(&self, cancel: &Cancel) -> FileResult<NamespaceGuard<'_>> {
         self.namespace.acquire(false, cancel, self.limits.lock_wait)
     }
 
     /// Exclusive namespace guard for a rename or delete.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn namespace_exclusive(&self, cancel: &Cancel) -> FileResult<NamespaceGuard<'_>> {
         self.namespace.acquire(true, cancel, self.limits.lock_wait)
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn lock_path(&self, path: PathBuf, cancel: &Cancel) -> FileResult<PathGuard<'_>> {
         self.locks.lock(path, cancel, self.limits.lock_wait)
     }
@@ -363,11 +418,13 @@ impl FileOps {
         search::search(self, args, cancel)
     }
 
+    #[cfg(unix)]
     pub fn edit(&self, args: &edit::EditArgs, cancel: &Cancel) -> FileResult<edit::EditResult> {
         self.policy.check_process()?;
         edit::edit(self, args, cancel)
     }
 
+    #[cfg(unix)]
     pub fn write(
         &self,
         args: &write::WriteArgs,
@@ -377,6 +434,7 @@ impl FileOps {
         write::write(self, args, cancel)
     }
 
+    #[cfg(unix)]
     pub fn rename(
         &self,
         args: &mutate::RenameArgs,
@@ -386,6 +444,7 @@ impl FileOps {
         mutate::rename(self, args, cancel)
     }
 
+    #[cfg(unix)]
     pub fn dir_create(
         &self,
         args: &mutate::MkdirArgs,
@@ -395,6 +454,7 @@ impl FileOps {
         mutate::mkdir(self, args, cancel)
     }
 
+    #[cfg(unix)]
     pub fn delete(
         &self,
         args: &mutate::DeleteArgs,
@@ -422,11 +482,24 @@ impl FileOps {
             "stat" => out(self.stat(&parse(args)?, cancel)?),
             "list" => out(self.dir_list(&parse(args)?, cancel)?),
             "search" => out(self.search(&parse(args)?, cancel)?),
+            #[cfg(unix)]
             "edit" => out(self.edit(&parse(args)?, cancel)?),
+            #[cfg(unix)]
             "write" => out(self.write(&parse(args)?, cancel)?),
+            #[cfg(unix)]
             "rename" => out(self.rename(&parse(args)?, cancel)?),
+            #[cfg(unix)]
             "mkdir" => out(self.dir_create(&parse(args)?, cancel)?),
+            #[cfg(unix)]
             "delete" => out(self.delete(&parse(args)?, cancel)?),
+            #[cfg(not(unix))]
+            "edit" | "write" | "rename" | "mkdir" | "delete" => {
+                drop(args);
+                Err(FileError::new(
+                    ErrorCode::Unsupported,
+                    "this node serves the read file tools only (Windows)",
+                ))
+            }
             other => Err(FileError::invalid(format!("unknown file op `{other}`"))),
         }
     }
@@ -434,6 +507,7 @@ impl FileOps {
 
 /// Validate the optional `reason` carried by write-class tools (it goes to the
 /// audit log in a later phase).
+#[cfg(unix)]
 pub(crate) fn check_reason(reason: &Option<String>) -> FileResult<()> {
     match reason {
         Some(reason) if reason.chars().count() > 500 => {

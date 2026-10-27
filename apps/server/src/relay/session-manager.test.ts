@@ -171,6 +171,7 @@ function hello(
     trust?: "full" | "relay";
     signature?: string;
     operatorTerminals?: boolean;
+    shells?: string[];
     jobReservations?: boolean;
   } = {},
 ) {
@@ -188,7 +189,12 @@ function hello(
     },
     trust: { value: trust, frozen: trust === "relay" },
     features: {
-      terminals: { supported: true, max: 4, approvalRequired: false },
+      terminals: {
+        supported: true,
+        max: 4,
+        approvalRequired: false,
+        ...(overrides.shells ? { shells: overrides.shells } : {}),
+      },
       operatorTerminals: overrides.operatorTerminals ?? false,
       files: { roots: ["/home/me"], asRoot: false, source: "configured" },
       runtimeHosts: [],
@@ -708,6 +714,7 @@ describe("RelaySessionManager (relay 3.0)", () => {
       connectionGeneration: generation,
       trust: "full",
       operatorTerminals: false,
+      terminalShells: [],
       // A hello without the flag (a CLI from before it): job reservations are not sent.
       jobReservations: false,
       // Nor runtime jobs at all (it cannot prove what it runs).
@@ -1473,6 +1480,32 @@ describe("RelaySessionManager (relay 3.0)", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it("names a shell in term.open only to a node that advertised it", async () => {
+    const open = (id: number, shell?: string) =>
+      manager.startTerminal({
+        terminalId: Buffer.alloc(16, id).toString("base64url"),
+        userId: "user-1",
+        nodeId: "node-1",
+        cols: 80,
+        rows: 24,
+        browserPublicKey: TERMINAL_KEY,
+        browserNonce: Buffer.alloc(16, 2).toString("base64url"),
+        connId: "conn-1",
+        ...(shell ? { shell } : {}),
+      });
+    const unix = await connect();
+    // A node that advertised no shells never sees the field (it would refuse the frame).
+    expect(open(1, "cmd")).toBe(false);
+    expect(open(2)).toBe(true);
+    expect(unix.last("term.open")).not.toHaveProperty("shell");
+    await manager.removeSession(unix as never);
+
+    const windows = await connect({ shells: ["pwsh", "cmd"] });
+    expect(open(3, "wsl:Ubuntu")).toBe(false);
+    expect(open(4, "cmd")).toBe(true);
+    expect(windows.last("term.open")).toMatchObject({ shell: "cmd" });
   });
 
   it("refuses browser shells on a node at Relay only", async () => {

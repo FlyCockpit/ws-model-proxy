@@ -1,5 +1,6 @@
-//! Per-user Linux and macOS service for the relay daemon: a systemd user
-//! unit, or a launchd agent that runs a small 0700 wrapper.
+//! Per-user service for the relay daemon: a systemd user unit (Linux), a
+//! launchd agent that runs a small 0700 wrapper (macOS), or a Task Scheduler
+//! task that starts at logon (Windows, see `windows_task`).
 //!
 //! The service needs no environment of its own: the node credential is in
 //! the state directory and node secrets are in `secrets.env`, both of which
@@ -10,8 +11,10 @@ use std::fs;
 #[cfg(target_os = "macos")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -43,7 +46,7 @@ enum CommandName {
     /// settings read only at start).
     Restart,
     /// Print the relay service's logs (journald on Linux, the launchd log
-    /// files on macOS).
+    /// files on macOS, the relay's own log file on Windows).
     Logs(LogsArgs),
 }
 
@@ -105,12 +108,19 @@ pub(crate) fn macos_log_dir() -> Result<PathBuf> {
     Ok(home.join("Library/Logs/ws-model-proxy"))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// The task definition `wsmp service install` registered, kept beside the
+/// state it pins (the task itself lives in Task Scheduler).
+#[cfg(windows)]
 pub(crate) fn service_file() -> Result<PathBuf> {
-    anyhow::bail!("service installation is only supported on Linux and macOS")
+    Ok(crate::paths::state_dir()?.join(windows_task::DEFINITION_FILE))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn service_file() -> Result<PathBuf> {
+    anyhow::bail!("service installation is only supported on Linux, macOS and Windows")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn executable() -> Result<String> {
     std::env::current_exe()
         .context("resolving the wsmp executable")?
@@ -349,7 +359,10 @@ fn xml_escape(value: &str) -> String {
 
 /// A line of install output: stdout, or stderr when the caller's stdout
 /// carries JSON (`wsmp login --json`).
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 fn say(to_stderr: bool, text: impl std::fmt::Display) -> Result<()> {
     if to_stderr {
         output::diagnostic(text)
@@ -427,7 +440,7 @@ pub fn install(to_stderr: bool) -> Result<()> {
     )
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn install(_to_stderr: bool) -> Result<()> {
     let _ = service_file()?;
     unreachable!()
@@ -464,7 +477,7 @@ fn uninstall() -> Result<()> {
     output::line("uninstalled relay service")
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn uninstall() -> Result<()> {
     let _ = service_file()?;
     unreachable!()
@@ -481,7 +494,7 @@ fn status() -> Result<()> {
     run_command("launchctl", &["print", &format!("{domain}/{MACOS_LABEL}")])
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn status() -> Result<()> {
     let _ = service_file()?;
     unreachable!()
@@ -505,7 +518,7 @@ fn restart() -> Result<()> {
     output::line(format!("restarted `{MACOS_LABEL}`"))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn restart() -> Result<()> {
     let _ = service_file()?;
     unreachable!()
@@ -570,7 +583,7 @@ fn logs(args: &LogsArgs) -> Result<()> {
     run_command("tail", &argv)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn logs(_args: &LogsArgs) -> Result<()> {
     let _ = service_file()?;
     unreachable!()
@@ -743,9 +756,442 @@ fn launchd_domain() -> Result<String> {
     Ok(format!("gui/{}", uid.trim()))
 }
 
+/// Windows: a Task Scheduler task of this user's, started at logon.
+///
+/// - It runs as the user, only while they are logged on (`InteractiveToken`,
+///   least privilege), so it needs no password and stops at logoff, like a
+///   Linux user service without linger. A Windows service would run in
+///   session 0 or need the user's password, and could not host terminals in
+///   the user's session.
+/// - `conhost.exe --headless` starts the relay with no console window.
+/// - A task cannot set environment variables, so the config and state paths
+///   are pinned as hidden `wsmp run` options instead, with `--log-file`, since
+///   Task Scheduler keeps no output.
+/// - Restarts: the relay already retries in-process (no `WSMP_STOP_ON_*`
+///   here). A relay that exits anyway is started again by a trigger that
+///   fires every 5 minutes while the user is logged on; a running relay
+///   makes it a no-op (`IgnoreNew`).
+/// - `schtasks /End` kills the relay without its graceful shutdown; its
+///   kill-on-close jobs still end every command and terminal it started.
+///
+/// Built everywhere so its rendering tests run on every CI platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod windows_task {
+    /// Kept in the state dir; marks the service as installed.
+    pub const DEFINITION_FILE: &str = "wsmp-relay-task.xml";
+    pub const LOG_FILE: &str = "relay.log";
+
+    /// One task per Windows user: Task Scheduler names are machine-wide.
+    pub fn task_name(user: &str) -> String {
+        let user: String = user
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("wsmp-relay-{user}")
+    }
+
+    /// One argument for a Windows command line, as `CommandLineToArgvW` (and
+    /// Rust's own argument parser) reads it back.
+    pub fn quote_arg(value: &str) -> String {
+        if !value.is_empty() && !value.contains([' ', '\t', '"']) {
+            return value.to_string();
+        }
+        let mut out = String::from("\"");
+        let mut backslashes = 0;
+        for ch in value.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                    out.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    out.push_str(&"\\".repeat(backslashes));
+                    out.push(ch);
+                    backslashes = 0;
+                }
+            }
+        }
+        // Backslashes before the closing quote are doubled, so `C:\dir\`
+        // does not swallow it.
+        out.push_str(&"\\".repeat(backslashes * 2));
+        out.push('"');
+        out
+    }
+
+    /// The `conhost.exe` arguments: headless, then `wsmp run` with the
+    /// pinned paths.
+    pub fn arguments(executable: &str, config: &str, state_dir: &str, log_file: &str) -> String {
+        [
+            "--headless",
+            executable,
+            "run",
+            "--service",
+            "--config",
+            config,
+            "--state-dir",
+            state_dir,
+            "--log-file",
+            log_file,
+        ]
+        .iter()
+        .map(|arg| quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+    }
+
+    /// The task definition `schtasks /Create /XML` reads. `user_sid` names
+    /// both the logon trigger and the principal.
+    pub fn render_xml(user_sid: &str, arguments: &str, working_directory: &str) -> String {
+        let sid = super::xml_escape(user_sid);
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+             <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+             \x20 <RegistrationInfo>\n\
+             \x20   <Description>WS Model Proxy relay (`wsmp run`), installed by `wsmp service install`.</Description>\n\
+             \x20 </RegistrationInfo>\n\
+             \x20 <Triggers>\n\
+             \x20   <LogonTrigger>\n\
+             \x20     <Enabled>true</Enabled>\n\
+             \x20     <UserId>{sid}</UserId>\n\
+             \x20   </LogonTrigger>\n\
+             \x20   <TimeTrigger>\n\
+             \x20     <Repetition>\n\
+             \x20       <Interval>PT5M</Interval>\n\
+             \x20       <StopAtDurationEnd>false</StopAtDurationEnd>\n\
+             \x20     </Repetition>\n\
+             \x20     <StartBoundary>2026-01-01T00:00:00</StartBoundary>\n\
+             \x20     <Enabled>true</Enabled>\n\
+             \x20   </TimeTrigger>\n\
+             \x20 </Triggers>\n\
+             \x20 <Principals>\n\
+             \x20   <Principal id=\"Author\">\n\
+             \x20     <UserId>{sid}</UserId>\n\
+             \x20     <LogonType>InteractiveToken</LogonType>\n\
+             \x20     <RunLevel>LeastPrivilege</RunLevel>\n\
+             \x20   </Principal>\n\
+             \x20 </Principals>\n\
+             \x20 <Settings>\n\
+             \x20   <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
+             \x20   <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
+             \x20   <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
+             \x20   <AllowHardTerminate>true</AllowHardTerminate>\n\
+             \x20   <StartWhenAvailable>false</StartWhenAvailable>\n\
+             \x20   <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n\
+             \x20   <IdleSettings>\n\
+             \x20     <StopOnIdleEnd>false</StopOnIdleEnd>\n\
+             \x20     <RestartOnIdle>false</RestartOnIdle>\n\
+             \x20   </IdleSettings>\n\
+             \x20   <AllowStartOnDemand>true</AllowStartOnDemand>\n\
+             \x20   <Enabled>true</Enabled>\n\
+             \x20   <Hidden>false</Hidden>\n\
+             \x20   <RunOnlyIfIdle>false</RunOnlyIfIdle>\n\
+             \x20   <WakeToRun>false</WakeToRun>\n\
+             \x20   <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n\
+             \x20   <Priority>5</Priority>\n\
+             \x20   <RestartOnFailure>\n\
+             \x20     <Interval>PT1M</Interval>\n\
+             \x20     <Count>999</Count>\n\
+             \x20   </RestartOnFailure>\n\
+             \x20 </Settings>\n\
+             \x20 <Actions Context=\"Author\">\n\
+             \x20   <Exec>\n\
+             \x20     <Command>%SystemRoot%\\System32\\conhost.exe</Command>\n\
+             \x20     <Arguments>{arguments}</Arguments>\n\
+             \x20     <WorkingDirectory>{working_directory}</WorkingDirectory>\n\
+             \x20   </Exec>\n\
+             \x20 </Actions>\n\
+             </Task>\n",
+            arguments = super::xml_escape(arguments),
+            working_directory = super::xml_escape(working_directory),
+        )
+    }
+
+    /// UTF-16LE with a byte-order mark, as the declaration says.
+    pub fn utf16_bytes(text: &str) -> Vec<u8> {
+        std::iter::once(0xFEFF_u16)
+            .chain(text.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
+    /// The last `count` lines of `text`.
+    pub fn last_lines(text: &str, count: usize) -> Vec<&str> {
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(count)..].to_vec()
+    }
+}
+
+#[cfg(windows)]
+fn windows_user() -> Result<String> {
+    std::env::var("USERNAME").context("`USERNAME` is not set")
+}
+
+#[cfg(windows)]
+fn windows_task_name() -> Result<String> {
+    Ok(windows_task::task_name(&windows_user()?))
+}
+
+#[cfg(windows)]
+fn windows_log_file() -> Result<PathBuf> {
+    Ok(crate::paths::log_dir()?.join(windows_task::LOG_FILE))
+}
+
+/// Runs `schtasks`, capturing its output: what it prints goes to the
+/// caller's stream only by choice (stdout may carry `--json`).
+#[cfg(windows)]
+fn schtasks(args: &[&str]) -> Result<String> {
+    let output = Command::new("schtasks")
+        .args(args)
+        .output()
+        .context("running `schtasks`")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    anyhow::bail!(
+        "`schtasks {}` failed with {}: {}",
+        args.first().copied().unwrap_or_default(),
+        output.status,
+        if stderr.is_empty() { stdout } else { stderr }
+    )
+}
+
+/// Whether Task Scheduler runs the task now. `Get-ScheduledTask` reports an
+/// enum (`Running`, `Ready`, …) that reads the same in every Windows
+/// language; `schtasks /Query` prints a localized status.
+#[cfg(windows)]
+fn windows_task_running(name: &str) -> bool {
+    // `task_name` keeps names to `[A-Za-z0-9._-]`, so single quotes suffice.
+    let script = format!("(Get-ScheduledTask -TaskName '{name}' -ErrorAction Stop).State");
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "Running")
+}
+
+/// Stops the task's relay: gracefully through its control pipe (it ends its
+/// commands and terminals and tells the server), then `schtasks /End` for the
+/// console host, which `/End` kills without its child. Waits (bounded) until
+/// Task Scheduler no longer counts the task as running and the pipe is gone;
+/// otherwise a `/Run` right after is dropped (`IgnoreNew`), or the new relay
+/// finds the pipe still taken.
+#[cfg(windows)]
+fn end_windows_task(name: &str) {
+    use crate::control::{ControlCommand, request_if_running};
+    if matches!(request_if_running(ControlCommand::Stop), Ok(Some(_))) {
+        let deadline = std::time::Instant::now() + crate::shutdown::SHUTDOWN_DEADLINE * 2;
+        while std::time::Instant::now() < deadline
+            && !matches!(request_if_running(ControlCommand::Status), Ok(None))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    let _ = schtasks(&["/End", "/TN", name]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        let pipe_gone = matches!(
+            crate::control::request_if_running(crate::control::ControlCommand::Status),
+            Ok(None)
+        );
+        if pipe_gone && !windows_task_running(name) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+#[cfg(windows)]
+pub fn install(to_stderr: bool) -> Result<()> {
+    let absolute = |path: PathBuf| -> Result<String> {
+        std::path::absolute(&path)
+            .with_context(|| format!("resolving `{}`", path.display()))?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("`{}` is not valid UTF-8", path.display()))
+    };
+    let executable = executable()?;
+    let config = absolute(crate::paths::config_file()?)?;
+    let state_dir = absolute(crate::paths::state_dir()?)?;
+    let log_file = absolute(windows_log_file()?)?;
+    let home = dirs::home_dir().context("could not determine the user home directory")?;
+    let sid = wsmp_windows::current_user_sid().context("reading this user's SID")?;
+    let arguments = windows_task::arguments(&executable, &config, &state_dir, &log_file);
+    let xml = windows_task::render_xml(&sid, &arguments, &home.display().to_string());
+    let file = service_file()?;
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
+    }
+    fs::write(&file, windows_task::utf16_bytes(&xml))
+        .with_context(|| format!("writing `{}`", file.display()))?;
+    let name = windows_task_name()?;
+    let file_arg = file.display().to_string();
+    schtasks(&["/Create", "/TN", &name, "/XML", &file_arg, "/F"])?;
+    // Reinstall or upgrade: a running relay is replaced by the new binary.
+    end_windows_task(&name);
+    schtasks(&["/Run", "/TN", &name])?;
+    for (option, value) in [
+        ("--config", &config),
+        ("--state-dir", &state_dir),
+        ("--log-file", &log_file),
+    ] {
+        say(to_stderr, format!("service pins `{option}` to `{value}`"))?;
+    }
+    say(
+        to_stderr,
+        "node secrets are read from `secrets.env` (`wsmp secret`); the service needs no environment",
+    )?;
+    say(
+        to_stderr,
+        "the relay runs while you are logged on to Windows and stops when you log off",
+    )?;
+    say(
+        to_stderr,
+        format!("installed and started the scheduled task `{name}`"),
+    )
+}
+
+#[cfg(windows)]
+fn uninstall() -> Result<()> {
+    let name = windows_task_name()?;
+    end_windows_task(&name);
+    // Already gone is fine.
+    let _ = schtasks(&["/Delete", "/TN", &name, "/F"]);
+    let file = service_file()?;
+    if file.exists() {
+        fs::remove_file(&file).with_context(|| format!("removing `{}`", file.display()))?;
+    }
+    output::line("uninstalled relay service")
+}
+
+#[cfg(windows)]
+fn status() -> Result<()> {
+    let name = windows_task_name()?;
+    output::line(schtasks(&["/Query", "/TN", &name, "/V", "/FO", "LIST"])?)
+}
+
+#[cfg(windows)]
+fn restart() -> Result<()> {
+    let file = service_file()?;
+    anyhow::ensure!(
+        file.exists(),
+        "the relay service is not installed (`{}` is missing); run `wsmp service install`",
+        file.display()
+    );
+    let name = windows_task_name()?;
+    end_windows_task(&name);
+    schtasks(&["/Run", "/TN", &name])?;
+    output::line(format!("restarted the scheduled task `{name}`"))
+}
+
+/// The relay's own log file: the last lines, then (with `--follow`) new ones
+/// as they come, across roll-overs.
+#[cfg(windows)]
+fn logs(args: &LogsArgs) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = windows_log_file()?;
+    let text = fs::read(&path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .with_context(|| format!("no relay service log at `{}` yet", path.display()))?;
+    for line in windows_task::last_lines(&text, args.lines as usize) {
+        output::line(line)?;
+    }
+    if !args.follow {
+        return Ok(());
+    }
+    let mut position = text.len() as u64;
+    let mut pending = String::new();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let Ok(mut file) = fs::File::open(&path) else {
+            continue;
+        };
+        let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if len < position {
+            // Rolled over: the new file starts from the top.
+            position = 0;
+            pending.clear();
+        }
+        if len == position {
+            continue;
+        }
+        file.seek(SeekFrom::Start(position))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        position += bytes.len() as u64;
+        pending.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(end) = pending.find('\n') {
+            let line: String = pending.drain(..=end).collect();
+            output::line(line.trim_end_matches(['\r', '\n']))?;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_task_quotes_arguments_as_windows_reads_them() {
+        use windows_task::quote_arg;
+        assert_eq!(quote_arg(r"C:\Users\me\wsmp.exe"), r"C:\Users\me\wsmp.exe");
+        assert_eq!(
+            quote_arg(r"C:\Program Files\wsmp\wsmp.exe"),
+            r#""C:\Program Files\wsmp\wsmp.exe""#
+        );
+        // A trailing backslash must not escape the closing quote.
+        assert_eq!(quote_arg(r"C:\my state\"), r#""C:\my state\\""#);
+        assert_eq!(quote_arg(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(quote_arg(""), r#""""#);
+    }
+
+    #[test]
+    fn windows_task_runs_the_relay_headless_with_pinned_paths() {
+        let arguments = windows_task::arguments(
+            r"C:\Users\Jo Doe\.cargo\bin\wsmp.exe",
+            r"C:\Users\Jo Doe\.config\ws-model-proxy\config.json",
+            r"C:\Users\Jo Doe\AppData\Local\ws-model-proxy",
+            r"C:\Users\Jo Doe\AppData\Local\ws-model-proxy\logs\relay.log",
+        );
+        assert!(
+            arguments
+                .starts_with(r#"--headless "C:\Users\Jo Doe\.cargo\bin\wsmp.exe" run --service "#)
+        );
+        assert!(
+            arguments.contains(r#"--state-dir "C:\Users\Jo Doe\AppData\Local\ws-model-proxy""#)
+        );
+        let xml = windows_task::render_xml("S-1-5-21-1-2-3-1001", &arguments, r"C:\Users\Jo & Doe");
+        assert!(xml.contains("<UserId>S-1-5-21-1-2-3-1001</UserId>"));
+        assert_eq!(xml.matches("<UserId>").count(), 2, "trigger and principal");
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+        assert!(xml.contains(r"<Command>%SystemRoot%\System32\conhost.exe</Command>"));
+        assert!(xml.contains("<Arguments>--headless &quot;C:\\Users\\Jo Doe"));
+        assert!(xml.contains(r"<WorkingDirectory>C:\Users\Jo &amp; Doe</WorkingDirectory>"));
+        // No secret or environment ever goes in.
+        assert!(!xml.contains("WSMP_"));
+        let bytes = windows_task::utf16_bytes("<a/>");
+        assert_eq!(&bytes[..4], &[0xFF, 0xFE, b'<', 0]);
+    }
+
+    #[test]
+    fn windows_task_names_are_per_user_and_safe() {
+        assert_eq!(windows_task::task_name("jo"), "wsmp-relay-jo");
+        assert_eq!(windows_task::task_name(r"Jo Doe\x"), "wsmp-relay-Jo_Doe_x");
+        assert_eq!(windows_task::last_lines("a\nb\nc\n", 2), ["b", "c"]);
+        assert_eq!(windows_task::last_lines("a\n", 5), ["a"]);
+    }
 
     #[test]
     fn systemd_unit_quotes_special_paths_and_pins_no_secret() {

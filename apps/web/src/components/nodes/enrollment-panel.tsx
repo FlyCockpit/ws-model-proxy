@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@ws-model-proxy/ui/components/tabs";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { CircleCheck, LoaderCircle, RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -55,7 +56,28 @@ export function EnrollmentPanel({
   const left = countdownText(code.expiresAt, now);
   return (
     <div className="min-w-0 space-y-4">
-      <CommandBlock command={result.installCommand} label={t("dashboard:nodes.add.commandLabel")} />
+      <Tabs defaultValue="unix">
+        <TabsList aria-label={t("dashboard:nodes.add.platformLabel")}>
+          <TabsTrigger value="unix">{t("dashboard:nodes.add.platformUnix")}</TabsTrigger>
+          <TabsTrigger value="windows">{t("dashboard:nodes.add.platformWindows")}</TabsTrigger>
+        </TabsList>
+        <TabsContent value="unix" className="space-y-2">
+          <CommandBlock
+            command={result.installCommand}
+            label={t("dashboard:nodes.add.commandLabel")}
+          />
+          <p className="text-xs text-muted-foreground">{t("dashboard:nodes.add.installsWhere")}</p>
+        </TabsContent>
+        <TabsContent value="windows" className="space-y-2">
+          <CommandBlock
+            command={result.windowsInstallCommand}
+            label={t("dashboard:nodes.add.commandLabel")}
+          />
+          <p className="text-xs text-muted-foreground">
+            {t("dashboard:nodes.add.installsWhereWindows")}
+          </p>
+        </TabsContent>
+      </Tabs>
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
         <p className="text-xs text-muted-foreground" aria-live="off">
           {t("dashboard:nodes.add.secretOnce")}{" "}
@@ -90,7 +112,6 @@ export function EnrollmentPanel({
           <li>{t("dashboard:nodes.add.terminalsAsked")}</li>
           <li>{t("dashboard:nodes.add.machineSteps.service")}</li>
         </ol>
-        <p className="text-xs text-muted-foreground">{t("dashboard:nodes.add.installsWhere")}</p>
       </div>
       {enrolled.length === 0 ? (
         <p className="flex items-center gap-2 text-sm" role="status">

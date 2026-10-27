@@ -44,9 +44,15 @@ pub const NODE_INTERFACE_MAX: usize = 32;
 pub const NODE_INTERFACE_ADDRESS_MAX: usize = 16;
 pub const NODE_DISK_MAX: usize = 16;
 
-/// Browser terminals need a PTY, which this CLI only has on Unix.
+/// Browser terminals: a PTY on Unix, a pseudoconsole (ConPTY) on Windows.
 pub fn terminal_supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
+}
+
+/// Operator terminals (interactive runtime steps) wrap the step in a
+/// `sudo -k` guard that has no Windows equivalent yet.
+pub fn operator_terminals_supported() -> bool {
+    cfg!(any(unix, windows))
 }
 
 /// The fatal error for a `protocol.error` (or an older server's reply) that

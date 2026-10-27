@@ -46,3 +46,13 @@ export function enrollmentInstallCommand(origin: string, code: string): string {
   const base = origin.replace(/\/+$/, "");
   return `curl -fsSL ${base}/install.sh | sh && ~/.cargo/bin/wsmp login ${base} --code ${code}`;
 }
+
+/**
+ * The same for Windows, to paste into PowerShell (Windows PowerShell 5.1 or PowerShell 7).
+ * `/install.ps1` installs into `%USERPROFILE%\.cargo\bin` and throws on any failure, which also
+ * stops the `wsmp login` after it (5.1 has no `&&`).
+ */
+export function enrollmentWindowsInstallCommand(origin: string, code: string): string {
+  const base = origin.replace(/\/+$/, "");
+  return `irm ${base}/install.ps1 | iex; & "$env:USERPROFILE\\.cargo\\bin\\wsmp.exe" login ${base} --code ${code}`;
+}

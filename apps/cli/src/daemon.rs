@@ -36,7 +36,6 @@ use url::Url;
 use crate::auth::{join, resolve_credential};
 use crate::config::{Config, ConfigLock, EndpointAuthMode};
 use crate::control::ControlServer;
-#[cfg(unix)]
 use crate::control::{self, ControlCommand, ControlResponse};
 use crate::media::{
     FetchedMedia, MEDIA_EXPAND_MAX_ASSET_BYTES, MEDIA_EXPAND_MAX_BODY_BYTES, MediaExpandError,
@@ -462,6 +461,9 @@ pub fn connect_foreground() -> Result<()> {
     // Orphans of commands re-parent to the relay (Linux), so `trust` still
     // finds it above them; see `subreaper`.
     crate::subreaper::start();
+    // Windows: before anything is started, so all of it is in the job that
+    // `trust::started_by_wsmp` asks.
+    crate::trust::join_relay_job();
     let mut config = Config::load_required()?;
     config.validate()?;
     let mut control = ControlServer::bind()?;
@@ -659,7 +661,6 @@ impl ConfigWatch {
 
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-#[cfg(unix)]
 fn status_response<'a>(
     startup: &TerminalStartup,
     node_slug: &'a str,
@@ -675,7 +676,6 @@ fn status_response<'a>(
     }
 }
 
-#[cfg(unix)]
 fn simple_response(ok: bool, state: &str, message: Option<&str>) -> ControlResponse<'static> {
     let state: &'static str = match state {
         "changed" => "changed",
@@ -688,6 +688,7 @@ fn simple_response(ok: bool, state: &str, message: Option<&str>) -> ControlRespo
         message: message.map(|text| -> &'static str {
             match text {
                 "raise" => "a process wsmp started cannot raise trust",
+                "caller" => "the caller is a process wsmp started",
                 _ => "the relay could not apply the change; see its log",
             }
         }),
@@ -698,7 +699,6 @@ fn simple_response(ok: bool, state: &str, message: Option<&str>) -> ControlRespo
 }
 
 /// Answer local control requests; returns what changed for the session.
-#[cfg(unix)]
 fn answer_control_requests(
     control: &mut ControlServer,
     startup: &TerminalStartup,
@@ -743,6 +743,24 @@ fn answer_control_requests(
                 };
                 let _ = control::respond(pending, &response);
             }
+            ControlCommand::Stop => {
+                // Answer first: the client waits for it, and the relay then
+                // unwinds through its normal shutdown on the next turn.
+                let _ = control::respond(pending, &simple_response(true, "changed", None));
+                tracing::info!("stopping at the request of a local `wsmp` command");
+                crate::shutdown::request_stop("wsmp service");
+            }
+            ControlCommand::CheckCaller => {
+                // No peer pid: refused, as for a raise.
+                let response = match pending
+                    .peer_pid
+                    .map(|pid| crate::trust::started_by_wsmp(pid, std::process::id()))
+                {
+                    Some(Ok(())) => simple_response(true, "unchanged", None),
+                    _ => simple_response(false, "refused", Some("caller")),
+                };
+                let _ = control::respond(pending, &response);
+            }
             ControlCommand::TrustFull => {
                 // No peer pid, no raise.
                 let allowed = pending.peer_pid.is_some_and(|pid| {
@@ -772,16 +790,6 @@ fn answer_control_requests(
         }
     }
     Ok(changes)
-}
-
-#[cfg(not(unix))]
-fn answer_control_requests(
-    _control: &mut ControlServer,
-    _startup: &TerminalStartup,
-    _node_slug: &str,
-    _connection: &str,
-) -> Result<Vec<NodeChange>> {
-    Ok(Vec::new())
 }
 
 fn wait_for_reconnect(
@@ -857,7 +865,6 @@ impl NodeRuntimes {
         self.retarget();
     }
 
-    #[cfg(unix)]
     fn set_instances(&mut self, instances: Vec<(Job, InstanceRecord)>) {
         self.instances = instances;
         self.retarget();
@@ -923,19 +930,16 @@ struct Session<'a> {
     /// Command statuses held until this connection is registered.
     deferred: &'a mut Vec<OutboundFrame>,
     stt: crate::stt::SttRegistry,
-    #[cfg(unix)]
     files: crate::file_relay::FileRelay,
     registered: bool,
     telemetry: Option<crate::telemetry::Telemetry>,
     defines: Defines,
     runtimes: NodeRuntimes,
     /// The daemon's runner (`NodeLink::runner`), shared by every connection.
-    #[cfg(unix)]
     runner: Option<&'a crate::runtimes::runner::Runner>,
     /// The daemon's inventory worker (`NodeLink::inventories`), shared by every connection.
     inventories: Arc<crate::runtimes::inventory::Inventories>,
     /// The newest instance observation applied.
-    #[cfg(unix)]
     observed_generation: u64,
     /// The metric commands hash the telemetry thread runs.
     metric_commands_applied: Option<String>,
@@ -963,7 +967,6 @@ struct NodeLink {
     /// connection still runs, and a stop under a later one cancels it
     /// (`admit_step`), and a stop's or status probe's answer says whether
     /// any step that may launch is still in flight there (`rank_idle`).
-    #[cfg(unix)]
     runner: Option<crate::runtimes::runner::Runner>,
     /// The one inventory worker, across reconnects (`runtimes::inventory::Inventories`): it
     /// sends snapshots in capture order, so an older one never reaches the server after a newer
@@ -997,7 +1000,6 @@ impl NodeLink {
             worker_rx,
             execs,
             deferred,
-            #[cfg(unix)]
             runner: crate::runtimes::runner::Runner::start()
                 .inspect_err(|error| {
                     tracing::warn!(
@@ -1033,7 +1035,6 @@ impl NodeLink {
         // each connection had its own runner): the next connection observes
         // afresh. Drained so the runner's threads never block on a full
         // channel while offline.
-        #[cfg(unix)]
         if let Some(runner) = self.runner.as_ref() {
             while runner.try_update().is_some() {}
         }
@@ -1106,7 +1107,6 @@ fn run_relay_session(
         stt: crate::stt::SttRegistry::new(worker_tx.clone()),
         // Node file ops run on the daemon's file pool, never on this loop;
         // the relay keeps only the ops it has pending.
-        #[cfg(unix)]
         files: {
             let runtime = crate::file_relay::shared_runtime(
                 startup.allow_file_tools_as_root(),
@@ -1122,10 +1122,8 @@ fn run_relay_session(
         telemetry: None,
         defines: Defines::default(),
         runtimes: NodeRuntimes::load(startup.trust_value(), &startup.runtime_hosts()),
-        #[cfg(unix)]
         runner: link.runner.as_ref().inspect(|runner| runner.observe()),
         inventories: Arc::clone(&link.inventories),
-        #[cfg(unix)]
         observed_generation: 0,
         metric_commands_applied: None,
     };
@@ -1185,7 +1183,6 @@ fn run_relay_session(
             break Err(error);
         }
         let now = Instant::now();
-        #[cfg(unix)]
         if let Err(error) = send_outbound_frames(&mut socket, session.terminals.poll(now)) {
             break Err(error);
         }
@@ -1203,7 +1200,6 @@ fn run_relay_session(
         if let Err(error) = send_stt_frames(&mut socket, &mut session.stt, stt_frames) {
             break Err(error);
         }
-        #[cfg(unix)]
         if let Err(error) = send_file_frames(&mut socket, session.files.expire_stale(now)) {
             break Err(error);
         }
@@ -1291,7 +1287,6 @@ fn run_relay_session(
         let _ = send_outbound_frames(&mut socket, session.execs.kill_all());
     }
     // In-flight file ops are cancelled; their results are dropped.
-    #[cfg(unix)]
     session.files.cancel_all();
     // The server fails these sessions itself when the relay drops.
     session.stt.abort_all();
@@ -1395,15 +1390,12 @@ where
                     let _ = worker.join.join();
                 }
             }
-            #[cfg(unix)]
             Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
                 send_outbound_frames(socket, session.terminals.on_bytes(&terminal_id, &bytes))?;
             }
-            #[cfg(unix)]
             Ok(FromWorker::TerminalEof { terminal_id }) => {
                 send_outbound_frames(socket, session.terminals.on_eof(&terminal_id))?;
             }
-            #[cfg(unix)]
             Ok(FromWorker::TerminalWriteFailed { terminal_id }) => {
                 tracing::warn!(
                     terminal_id,
@@ -1435,7 +1427,6 @@ where
                     .send(Message::Text(text.into()))
                     .map_err(|error| websocket_session_error(error, "sending telemetry", true))?;
             }
-            #[cfg(unix)]
             Ok(FromWorker::FileFrames { op_id, frames }) => {
                 // Cancelled or torn-down ops are no longer pending: drop them.
                 if session.files.complete(&op_id) {
@@ -1652,6 +1643,7 @@ where
             browser_public_key,
             browser_nonce,
             identity,
+            shell,
         } => {
             send_outbound_frames(
                 socket,
@@ -1666,6 +1658,7 @@ where
                         browser_public_key: &browser_public_key,
                         browser_nonce: &browser_nonce,
                         identity: identity.as_ref(),
+                        shell: shell.as_deref(),
                     },
                 ),
             )?;
@@ -1690,6 +1683,7 @@ where
                         browser_public_key: &browser_public_key,
                         browser_nonce: &browser_nonce,
                         identity: identity.as_ref(),
+                        shell: None,
                     },
                 ),
             )?;
@@ -1755,7 +1749,6 @@ where
             args,
             body_bytes,
         } => {
-            #[cfg(unix)]
             send_file_frames(
                 socket,
                 session.files.handle_op(
@@ -1765,25 +1758,9 @@ where
                     body_bytes.and_then(|bytes| usize::try_from(bytes).ok()),
                 ),
             )?;
-            #[cfg(not(unix))]
-            {
-                let _ = (op, args, body_bytes);
-                send_control(
-                    socket,
-                    &NodeFrame::FileRejected {
-                        op_id,
-                        reason: "unsupported".to_string(),
-                        detail: None,
-                    },
-                    "sending a file op rejection",
-                )?;
-            }
         }
         ServerFrame::FileCancel { op_id } => {
-            #[cfg(unix)]
             session.files.handle_cancel(&op_id);
-            #[cfg(not(unix))]
-            let _ = op_id;
         }
         // Speech frames were handled above.
         ServerFrame::SttOpen { .. }
@@ -1835,7 +1812,6 @@ where
         return Ok(());
     }
     if changes.contains(&NodeChange::Lowered) {
-        #[cfg(unix)]
         session.files.lower_trust();
         let interrupted = session.execs.interrupt_all();
         // Operator terminals are allowed at Relay only: they stay.
@@ -1848,7 +1824,6 @@ where
         }
     }
     if changes.contains(&NodeChange::Raised) {
-        #[cfg(unix)]
         session.files.raise_trust();
     }
     // Trust changes switch the held set; host changes re-check addresses.
@@ -1953,7 +1928,6 @@ where
             .store
             .find(&job.launch_version_id, &job.launch_hash)
             .is_some();
-        #[cfg(unix)]
         let recorded =
             crate::runtimes::runner::recorded_job(&job.instance_id, job.rank).filter(|known| {
                 known.version_id == job.launch_version_id
@@ -1962,8 +1936,6 @@ where
                     && known.handle == job.handle
                     && known.runtime_id == job.runtime_id
             });
-        #[cfg(not(unix))]
-        let recorded: Option<Job> = None;
         // A stop, and a status probe proving one, also work after the server dropped it.
         if !held && job.phase != JobPhase::Stop && job.phase != JobPhase::Status {
             Err(refused_with(missing, "launchVersionId"))
@@ -2000,7 +1972,6 @@ where
             .close_confirming_for_rank(&job.instance_id, job.rank);
         send_outbound_frames(socket, closed)?;
     }
-    #[cfg(unix)]
     {
         let ticket = match &job.operator {
             None => None,
@@ -2041,15 +2012,6 @@ where
         }
         Ok(())
     }
-    #[cfg(not(unix))]
-    {
-        let _ = rendered;
-        send_control(
-            socket,
-            &refusal(JobError::ExecutionMechanismUnavailable, None),
-            "refusing a runtime job",
-        )
-    }
 }
 
 /// A check or stop from the rank's own record (never re-rendered). An
@@ -2088,17 +2050,12 @@ fn from_record(
 
 /// The operator ticket of an admitted interactive job. The screen shows
 /// what the node itself rendered (or recorded), never server-supplied text.
-#[cfg(unix)]
 fn operator_ticket(
     job: &crate::protocol::frames::RuntimeJob,
     operator: &crate::protocol::frames::JobOperator,
     rendered: &Job,
 ) -> crate::runtimes::runner::OperatorTicket {
-    let command = if rendered.action == JobPhase::Stop {
-        rendered.stop_command.clone()
-    } else {
-        rendered.command.clone()
-    };
+    let command = rendered.operator_cmd().script.to_string();
     crate::runtimes::runner::OperatorTicket {
         ids: operator_ids(job, &operator.terminal_id),
         screen: crate::runtimes::operator::OperatorScreen {
@@ -2136,7 +2093,6 @@ fn drain_runner<S>(
 where
     S: std::io::Read + std::io::Write,
 {
-    #[cfg(unix)]
     while let Some(update) = session
         .runner
         .as_ref()
@@ -2175,8 +2131,6 @@ where
         }
         send_inventory(session);
     }
-    #[cfg(not(unix))]
-    let _ = (socket, session);
     Ok(())
 }
 
@@ -2613,10 +2567,7 @@ where
             );
         }
         ServerBinaryMetadata::FileBody { op_id } => {
-            #[cfg(unix)]
             send_file_frames(socket, session.files.handle_body(&op_id, body))?;
-            #[cfg(not(unix))]
-            let _ = (&op_id, &body);
             return Ok(());
         }
         ServerBinaryMetadata::SttAudio { session_id, seq } => {
@@ -3593,7 +3544,6 @@ where
     Ok(())
 }
 
-#[cfg(unix)]
 fn send_file_frames<S>(
     socket: &mut tungstenite::WebSocket<S>,
     frames: Vec<crate::file_relay::FileFrame>,
@@ -3897,9 +3847,23 @@ pub const STOP_ON_REJECTED_CREDENTIAL_ENV: &str = "WSMP_STOP_ON_REJECTED_CREDENT
 /// daemon, exiting would only restart or lose the relay, so it keeps retrying
 /// and picks up a new `wsmp login` by itself.
 fn stop_on_unusable_credential() -> bool {
-    use std::io::IsTerminal;
     std::env::var_os(STOP_ON_REJECTED_CREDENTIAL_ENV).is_some_and(|value| value == "1")
-        || std::io::stderr().is_terminal()
+        || person_watching()
+}
+
+/// Set by `wsmp run --service`: a service manager started this relay. The
+/// Windows task runs it under `conhost --headless`, whose console stderr is
+/// a terminal that nobody sees.
+static AS_SERVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn run_as_service() {
+    AS_SERVICE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a person sees this relay's stderr: a terminal, and not a service.
+fn person_watching() -> bool {
+    use std::io::IsTerminal;
+    !AS_SERVICE.load(std::sync::atomic::Ordering::SeqCst) && std::io::stderr().is_terminal()
 }
 
 /// Set by a systemd unit that also lists exit 5 in `RestartPreventExitStatus=`
@@ -3918,12 +3882,11 @@ struct StopOn {
 
 impl StopOn {
     fn here() -> Self {
-        use std::io::IsTerminal;
         Self {
             credential: stop_on_unusable_credential(),
             protocol: std::env::var_os(STOP_ON_PROTOCOL_MISMATCH_ENV)
                 .is_some_and(|value| value == "1")
-                || std::io::stderr().is_terminal(),
+                || person_watching(),
         }
     }
 
@@ -6012,6 +5975,11 @@ mod tests {
             stop_command: "sudo systemctl stop x".into(),
             status_command: Some("systemctl is-active x".into()),
             health_command: None,
+            command_argv: None,
+            stop_argv: None,
+            status_argv: None,
+            health_argv: None,
+            shell: crate::protocol::runtime_spec::CommandShell::Sh,
             secrets: Vec::new(),
             timeout_ms: 60_000,
             unit_name: "wsmp-i-abcdefabcdef-r0".into(),
@@ -6069,7 +6037,6 @@ mod tests {
         assert_eq!(job.reservations, vec![reservation(1, "worker-b")]);
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_operator_screen_shows_what_the_node_rendered_not_the_server_handle() {
         let mut job = stop_job(true);

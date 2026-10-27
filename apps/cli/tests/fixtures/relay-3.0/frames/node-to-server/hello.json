@@ -35,6 +35,7 @@
     "liveStt": true,
     "jobReservations": true,
     "rankIdle": true,
+    "launch": { "platform": "linux", "management": ["process", "service"], "shells": ["sh"] },
     "secrets": [
       {
         "name": "WSMP_SECRET_LLAMA_KEY",

@@ -19,6 +19,11 @@ fn job(action: JobPhase) -> Job {
         stop_command: "true".into(),
         status_command: None,
         health_command: None,
+        command_argv: None,
+        stop_argv: None,
+        status_argv: None,
+        health_argv: None,
+        shell: crate::protocol::runtime_spec::CommandShell::Sh,
         secrets: Vec::new(),
         timeout_ms: 1_000,
         unit_name: "wsmp-i-abcdefabcdef-r0".into(),
@@ -118,10 +123,10 @@ impl Runtime for Fake {
     fn identity(&self, unit: &str, _: &str, _: Deadline) -> Result<Option<String>> {
         Ok(self.units.borrow().get(unit).cloned())
     }
-    fn shell_until(&self, _: &Job, _: &str, _: Deadline) -> Result<()> {
+    fn shell_until(&self, _: &Job, _: JobCommand<'_>, _: Deadline) -> Result<()> {
         Ok(())
     }
-    fn status_until(&self, _: &Job, _: &str, _: Deadline) -> Result<bool> {
+    fn status_until(&self, _: &Job, _: JobCommand<'_>, _: Deadline) -> Result<bool> {
         self.status_alive.get().context("unknown")
     }
     fn stop(&self, unit: &str, _: &str, invocation: &str, _: Deadline) -> Result<()> {
@@ -394,8 +399,6 @@ fn health_hysteresis_marks_unhealthy_then_ready() {
     );
 }
 
-// The result frame comes from the runner, which is Unix-only.
-#[cfg(unix)]
 #[test]
 fn a_failed_health_probe_says_why() {
     let root = tempfile::tempdir().expect("root");
@@ -446,10 +449,10 @@ impl Runtime for Stalling {
     fn identity(&self, unit: &str, owner: &str, deadline: Deadline) -> Result<Option<String>> {
         self.inner.identity(unit, owner, deadline)
     }
-    fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()> {
+    fn shell_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<()> {
         self.inner.shell_until(job, command, deadline)
     }
-    fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
+    fn status_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<bool> {
         self.inner.status_until(job, command, deadline)
     }
     fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()> {
@@ -756,10 +759,10 @@ impl Runtime for Flaky {
         anyhow::ensure!(!self.erroring.get(), "manager timed out");
         self.inner.identity(unit, owner, deadline)
     }
-    fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()> {
+    fn shell_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<()> {
         self.inner.shell_until(job, command, deadline)
     }
-    fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
+    fn status_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<bool> {
         self.inner.status_until(job, command, deadline)
     }
     fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()> {
@@ -1489,4 +1492,119 @@ fn a_node_without_units_proves_a_stop_by_its_status_and_its_ports() {
         (true, None)
     );
     assert!(!path.exists());
+}
+
+/// The executor on Windows with the real runtime: a `process` start runs a stand-in server (a
+/// PowerShell TCP listener answering 200) in a runtime host, readiness reaches it, and a stop
+/// without a stop command ends the host's job and proves the port free. Runs in a child test
+/// process whose state directory is a temporary one.
+#[cfg(windows)]
+#[test]
+fn a_windows_process_runtime_starts_serves_and_stops() {
+    const MARK: &str = "WSMP_EXECUTOR_WINDOWS_E2E";
+    if std::env::var_os(MARK).is_none() {
+        let state = tempfile::tempdir().expect("state");
+        // A file, not a pipe: a runtime host inherits the child's handles, and a pipe it held
+        // would keep this wait open for as long as the host lives.
+        let log = state.path().join("child.log");
+        let file = std::fs::File::create(&log).expect("log");
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "runtimes::executor::tests::a_windows_process_runtime_starts_serves_and_stops",
+                "--nocapture",
+            ])
+            .env(MARK, "1")
+            .env("WSMP_STATE_DIR", state.path())
+            .stdout(file.try_clone().expect("log"))
+            .stderr(file)
+            .status()
+            .expect("the child test runs");
+        assert!(
+            status.success(),
+            "{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        return;
+    }
+    // `cargo test --all-targets` builds it; `cargo test --lib` alone does not.
+    assert_ne!(
+        super::windows::host_exe().expect("exe"),
+        std::env::current_exe().expect("test binary"),
+        "build the wsmp binary first (`cargo build`)"
+    );
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port")
+        .port();
+    let server = r#"$l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, PORT)
+$l.Start()
+while ($true) {
+  $c = $l.AcceptTcpClient()
+  $s = $c.GetStream()
+  $buf = New-Object byte[] 4096
+  $null = $s.Read($buf, 0, $buf.Length)
+  $reply = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`nContent-Length: 2`r`nConnection: close`r`n`r`nok")
+  $s.Write($reply, 0, $reply.Length)
+  $c.Close()
+}"#
+    .replace("PORT", &port.to_string());
+    let rendered = |phase| {
+        let mut job = job(phase);
+        job.port = port;
+        job.shell = crate::protocol::runtime_spec::CommandShell::Powershell;
+        job.command = if phase == JobPhase::Start {
+            server.clone()
+        } else {
+            String::new()
+        };
+        job.stop_command = String::new();
+        job.spec["launch"]["commands"][0]
+            .as_object_mut()
+            .expect("commands")
+            .remove("stop");
+        job
+    };
+    /// Whatever a failed assertion leaves running ends with the test.
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Ok(hosts) = super::windows::hosts_dir() {
+                let _ = super::windows::stop_slice(
+                    &hosts,
+                    "wsmp_i_abcdefabcdef_r0.slice",
+                    Duration::ZERO,
+                    Deadline::new(Duration::from_secs(20)),
+                );
+            }
+        }
+    }
+    let _cleanup = Cleanup;
+    let dir = instances_dir().expect("instances");
+    let mut executor = Executor::load(dir.join("in1-r0.json")).expect("load");
+    let runtime = NativeRuntime { cancel: None };
+    let long = || Deadline::new(Duration::from_secs(60));
+    let started = executor.execute(rendered(JobPhase::Start), &runtime, long());
+    // Launched once the host runs its command; the server answers when it is ready.
+    assert_eq!(started.status, JobStatus::Succeeded, "{started:?}");
+    let mut ready = executor.execute(rendered(JobPhase::Readiness), &runtime, long());
+    for _ in 0..30 {
+        if ready.status == JobStatus::Succeeded {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        ready = executor.execute(rendered(JobPhase::Readiness), &runtime, long());
+    }
+    assert_eq!(ready.status, JobStatus::Succeeded, "{ready:?}");
+    assert_eq!(
+        executor.observations(&runtime, long())[0].1.phase,
+        InstancePhase::Ready
+    );
+    let stopped = executor.execute(rendered(JobPhase::Stop), &runtime, long());
+    assert!(stopped.stopped, "{stopped:?}");
+    assert!(runtime.port_free("127.0.0.1", port), "the server is gone");
+    assert_eq!(
+        executor.observations(&runtime, long())[0].1.phase,
+        InstancePhase::Stopped
+    );
 }

@@ -211,7 +211,6 @@ fn instance_rows(store: &Store, executors: &[Executor], stop_proof: bool) -> Vec
     rows
 }
 
-#[cfg(unix)]
 fn prove(executor: &Executor, job: &Job) -> String {
     use std::time::Duration;
 
@@ -222,11 +221,6 @@ fn prove(executor: &Executor, job: &Job) -> String {
         Ok(Some(reason)) => reason.to_string(),
         Err(_) => "unknown".to_string(),
     }
-}
-
-#[cfg(not(unix))]
-fn prove(_executor: &Executor, _job: &Job) -> String {
-    "unknown".to_string()
 }
 
 /// `snake_case` name of a serde enum value (phases, kinds, engines).

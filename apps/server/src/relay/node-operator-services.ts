@@ -57,9 +57,13 @@ export class NodeCommandStartError extends Error {
 
 export type NodeOperatorRelayPort = {
   sendToNode(nodeId: string, frame: ServerToNodeControlFrame, guard?: SendGuard): boolean;
-  nodeSession(
-    nodeId: string,
-  ): { userId: string; connectionGeneration: number; trust: NodeTrustWire } | null;
+  nodeSession(nodeId: string): {
+    userId: string;
+    connectionGeneration: number;
+    trust: NodeTrustWire;
+    /** The shells the node advertised for browser terminals (Windows), default first. */
+    terminalShells?: readonly string[];
+  } | null;
 };
 
 export type NodeOperatorHandlers = Pick<
@@ -299,6 +303,13 @@ export function createNodeOperatorServices(
         data: { reason: "trust_relay", subjectId: args.nodeId },
       });
     }
+    // Only a shell this node advertised: the node maps the id to a program it found.
+    if (args.shell !== undefined && !session.terminalShells?.includes(args.shell)) {
+      throw new ORPCError("BAD_REQUEST", {
+        message: "That shell is not available on the node.",
+        data: { reason: "shell_unavailable", subjectId: args.nodeId },
+      });
+    }
     // The size and any typed command stay with the browser: it opens at its own fitted size
     // and types the command itself (terminal I/O is sealed end to end; the server cannot).
     return tickets.mint({
@@ -306,6 +317,7 @@ export function createNodeOperatorServices(
       sessionId: args.sessionId,
       impersonatedBy: args.impersonatedBy ?? null,
       nodeId: args.nodeId,
+      shell: args.shell ?? null,
     });
   };
 

@@ -79,6 +79,8 @@ pub const RUNTIME_PLACEHOLDERS: [&str; 12] = [
 pub const NODE_FABRICS_MAX: usize = 16;
 pub const FABRIC_MEMBERS_MAX: usize = 64;
 pub const RUNTIME_COMMAND_MAX_BYTES: usize = 4096;
+/// The most arguments an argv command holds (its program included).
+pub const RUNTIME_ARGV_MAX: usize = 64;
 /// Canonical bytes of one spec; below the 64 KiB control cap so one define
 /// envelope always fits one chunk.
 pub const RUNTIME_SPEC_MAX_BYTES: usize = 48 * 1024;
@@ -299,6 +301,10 @@ pub struct Launch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fabric: Option<String>,
     pub commands: Vec<Commands>,
+    /// The interpreter of the text commands; `sh` when absent. An argv
+    /// command needs none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<CommandShell>,
     /// Node secrets (names) exported to every command of this runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Vec<String>>,
@@ -363,23 +369,69 @@ pub enum Resource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Commands {
-    pub start: String,
+    pub start: CommandLine,
     /// Optional for a `process` runtime (its stop is the rank's slice kill
     /// and the node's proof); a `service` runtime must have one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stop: Option<String>,
+    pub stop: Option<CommandLine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prepare: Option<String>,
+    pub prepare: Option<CommandLine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after_join: Option<String>,
+    pub after_join: Option<CommandLine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
+    pub status: Option<CommandLine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub health: Option<String>,
+    pub health: Option<CommandLine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive: Option<Interactive>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts_sec: Option<Timeouts>,
+}
+
+/// A runtime command: text the launch's shell runs (`launch.shell`), or an
+/// argv: a program and its arguments, each filled in on its own and run
+/// with no shell of the author's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CommandLine {
+    Text(String),
+    Argv(Vec<String>),
+}
+
+impl CommandLine {
+    /// Every piece of text the command holds, for placeholder and size checks.
+    pub fn parts(&self) -> impl Iterator<Item = &str> {
+        let (text, argv) = match self {
+            Self::Text(text) => (Some(text.as_str()), &[][..]),
+            Self::Argv(argv) => (None, argv.as_slice()),
+        };
+        text.into_iter().chain(argv.iter().map(String::as_str))
+    }
+
+    /// The command as one line of text: the text itself, or the argv joined
+    /// with spaces (what `status_can_report_stopped` reads).
+    pub fn joined(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Argv(argv) => argv.join(" "),
+        }
+    }
+}
+
+impl Commands {
+    /// Every command of the set with its field name, `start` first.
+    pub fn all(&self) -> impl Iterator<Item = (&'static str, &CommandLine)> {
+        [
+            ("start", Some(&self.start)),
+            ("stop", self.stop.as_ref()),
+            ("prepare", self.prepare.as_ref()),
+            ("afterJoin", self.after_join.as_ref()),
+            ("status", self.status.as_ref()),
+            ("health", self.health.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(field, command)| command.map(|command| (field, command)))
+    }
 }
 
 /// Whether a status command could ever say stopped (exit 3). Refused: an
@@ -614,8 +666,56 @@ pub struct NodeFeatures {
     /// sends runtime jobs only to a node with it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub rank_idle: bool,
+    /// What runtime launches this node can run. Absent on older CLIs: the
+    /// server then reads the node's `executionMechanism`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchFeatures>,
     /// The node's secrets: names and when they were last set (never values).
     pub secrets: Vec<SecretEntry>,
+}
+
+/// The operating system a node runs, as runtime launches see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodePlatform {
+    Linux,
+    Macos,
+    Windows,
+}
+
+impl NodePlatform {
+    /// This build's platform; `None` where runtimes never run.
+    pub fn current() -> Option<Self> {
+        if cfg!(target_os = "linux") {
+            Some(Self::Linux)
+        } else if cfg!(target_os = "macos") {
+            Some(Self::Macos)
+        } else if cfg!(windows) {
+            Some(Self::Windows)
+        } else {
+            None
+        }
+    }
+}
+
+/// The interpreter of a launch's text commands (`launch.shell`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandShell {
+    Sh,
+    Pwsh,
+    Powershell,
+    Cmd,
+}
+
+/// What a node can launch: placement leaves out a node whose platform,
+/// management modes or shells cannot run a runtime's launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LaunchFeatures {
+    pub platform: NodePlatform,
+    pub management: Vec<Management>,
+    pub shells: Vec<CommandShell>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -629,12 +729,17 @@ pub struct SecretEntry {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TerminalFeatures {
     pub supported: bool,
     pub max: u8,
     pub approval_required: bool,
+    /// The shells a `term.open` may name (`crate::shells`), the node's
+    /// default first. Empty, and left out, where terminals run the login
+    /// shell (Unix).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shells: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

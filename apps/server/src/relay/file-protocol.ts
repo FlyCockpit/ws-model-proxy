@@ -260,7 +260,9 @@ export const statEntrySchema = z
     owner: z.string().max(256).optional(),
     etag: reportedEtagSchema.optional(),
     target: shortText.optional(),
-    targetType: z.enum(["file", "dir", "symlink", "other"]).optional(),
+    // A link's target: its type, or that it does not exist or lies where the node's policy
+    // does not reach (`file_ops::stat` in the CLI).
+    targetType: z.enum(["file", "dir", "symlink", "other", "missing", "denied"]).optional(),
     resolvedPath: shortText.optional(),
     error: z.string().max(64).optional(),
   })

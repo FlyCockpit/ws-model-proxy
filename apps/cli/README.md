@@ -53,6 +53,19 @@ Or build a release tag with cargo directly:
 cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.2 --locked wsmp
 ```
 
+**Windows.** In PowerShell (Windows PowerShell 5.1 or PowerShell 7), from your server:
+
+```powershell
+irm https://wsmp.example.com/install.ps1 | iex
+```
+
+It installs the server's version like `install.sh` does: the release's
+`wsmp-x86_64-pc-windows-msvc.zip`, checked against `sha256.sum` (it refuses to install on a
+mismatch or a missing checksum), into `%USERPROFILE%\.cargo\bin` (`%CARGO_HOME%\bin` when set),
+else a source build with cargo. Windows 11 on ARM64 runs the x86_64 binary. The Nodes page's
+**Add a node** has a Windows tab with this command and the login after it. Windows 11 on x86_64
+is supported. See [Windows](#windows) for what runs there and what does not.
+
 ## Log in
 
 On the server's **Nodes** page, create an enrollment code, then on this computer run:
@@ -130,6 +143,22 @@ journal is not persistent, user units may log only to the system journal, which 
 `~/Library/Logs/ws-model-proxy/relay.*.log` on macOS. Upgrading from 0.3: run `wsmp service
 install` again so the unit stops loading `service.env`, then delete that file.
 
+**Windows.** The service is a Task Scheduler task of yours, `wsmp-relay-<username>`. It starts
+when you log on, runs as you with no extra privileges and no console window, and stops when you
+log off. It needs no password and no administrator rights. A relay that exits is started again
+within 5 minutes while you are logged on. A task cannot set environment variables, so the task
+passes the config and state paths to `wsmp run` itself. It also passes a log file,
+`%LOCALAPPDATA%\ws-model-proxy\logs\relay.log`, which rolls over at 10 MiB and keeps 4 older files.
+`wsmp service logs` reads that file. Node state is in `%LOCALAPPDATA%\ws-model-proxy` on Windows.
+
+**Windows terminals.** Browser terminals run on a Windows pseudoconsole (ConPTY, Windows 10 1809 or
+later), at Full control only. The browser picks the shell: PowerShell 7 (`pwsh`), Windows
+PowerShell, Command Prompt, or a WSL distribution, defaulting to the node's choice, which is pwsh,
+then Windows PowerShell, then Command Prompt (`wsmp config set-terminal-shell <id>` changes it). The
+shells are found when the relay starts. Each terminal runs in a job of its own, so closing it ends
+everything its shell started. A pasted image's path is quoted for the terminal's shell
+(PowerShell, Command Prompt, or `/mnt/c/...` in WSL).
+
 **Linux: enable lingering.** A user service stops when you log out, and runtimes are started as
 transient user units, which need a user manager that outlives your sessions. Enable it once:
 
@@ -192,6 +221,13 @@ service's cgroup still holds them. On macOS only the relay's descendants are ref
 walk), so a detached process escapes. If you do not trust the code on this account, Relay only does
 not make it safe.
 
+On Windows there is no `/proc` to walk. The relay puts itself in a job object when it starts, so
+everything it starts, and everything those start, is a member, and a running relay answers
+whether a caller is one of its own. Runtimes run in jobs of their own that outlive the relay, so
+their members are refused whether or not a relay runs. What Windows does not cover: a member can
+ask a process outside wsmp's jobs to start something for it (Task Scheduler, WMI, Explorer), and
+that is then not a member. This is why browser terminals on Windows need Full control.
+
 Lowering only stops new agent access through wsmp. It does not undo or contain software an agent
 already left on the node while it had Full control, such as a systemd user service: that software
 runs as the same user and can even raise trust again locally. If you distrust what an agent did,
@@ -220,7 +256,8 @@ The server asks a node to do two different kinds of work:
 - **Runtimes** are definitions the server stores and versions: an always-on inference server
   already running here, or a startable one (or a service) with start, readiness and health
   commands, and a stop command where it needs one (a `process` runtime may leave it out: the
-  node's stop ends everything in that part's systemd slice and proves it). The server sends the
+  node's stop ends everything in that part's systemd slice, or its runtime hosts' jobs on
+  Windows, and proves it). The server sends the
   definitions to the node, then starts and stops instances by
   version; the node renders each command from the definition it holds, so a start never runs
   text it was not given in a definition. At Relay only, the held definitions are frozen and can
@@ -261,6 +298,87 @@ runtime the inventory runs no status command and checks no unit first, so it nam
 `port_in_use`. To check the ports it binds each one for an instant, as
 the relay does; it writes nothing and runs no definition command. Runtimes are defined in the web app or through MCP.
 
+**Shells.** A runtime's text commands run in the shell its launch names (`launch.shell`: `sh`, the
+default, or `pwsh`, `powershell` or `cmd`). An argv command
+(`["llama-server", "-m", "{{model}}", "--port", "{{port}}"]`) runs on every node, which quotes it
+for its own shell (`cmd` cannot take one). The server places a launch only on nodes whose
+management mode and shells can run it. It does not match the node's operating system: a launch
+whose `sh` commands only Linux can run (`systemctl`) may still be placed on macOS.
+
+**Windows runtimes.**
+- A launch (prepare, start, after-join) runs in a runtime host (`wsmp __runtime-host`) with a hidden
+  console. Everything its command starts stays in the host's job.
+- The runtime keeps running while the relay restarts.
+- A stop sends Ctrl+Break to the command, then ends the whole job after 10 seconds (at most half
+  the step's time).
+- Status, stop and health commands run to completion in a job of their own.
+- An argv command whose program is an `.exe` on the command's `PATH` (or an absolute path to
+  one) starts directly, without a shell: it gets every argument exactly, and its exit status is the
+  command's. Any other program (a `.cmd` or `.bat` shim such as `npx`, a PowerShell command) runs
+  through the shell.
+- PowerShell commands exit with their last command's status, as `sh` does, so a status command
+  says stopped by exiting 3. A program that cannot be found fails the command (exit 1).
+- An interactive step (one that needs its person: a prompt to answer, a sign-in to finish) opens
+  an operator terminal as on Linux. Enter runs the step's script in its shell on a pseudoconsole,
+  inside a job that ends with the relay. There is no `sudo -k` around it: Windows caches no sudo
+  credential.
+
+## Windows
+
+`wsmp` runs natively on Windows 11 (x86_64). Windows 10 1809 or later may work, but it is not
+supported.
+
+**What runs.**
+- the relay and `wsmp service` (a Task Scheduler task);
+- trust and the local control commands;
+- browser terminals (ConPTY, with PowerShell 7, Windows PowerShell, Command Prompt or a WSL
+  distribution);
+- node commands;
+- runtimes in PowerShell or `cmd`, including interactive steps;
+- the read file tools: read, stat, list and search.
+
+Install PowerShell 7 (`pwsh`) for runtimes. Windows PowerShell 5.1 works, but it changes some
+arguments it passes to a program (an empty one, or one with a quote in it). An argv whose program
+is an `.exe` does not go through it; one that would (a `.cmd` shim, say) fails with such an
+argument there.
+
+**File tools on Windows.**
+- **Paths** are written and shown in a POSIX view: `C:\Users\ada\notes.txt` is
+  `/c/Users/ada/notes.txt`, with the drive letter in lower case. The node advertises its file
+  roots in the same form.
+- **Refused names:** anything that could reach a different object than it spells. That covers
+  `.` and `..`, `\`, `:` (alternate data streams), wildcards, trailing dots or spaces, and device
+  names such as `NUL`.
+- **Links and junctions** are resolved by Windows, and the policy is checked against the file
+  actually opened. So a link out of the file roots, or to a protected file, is refused, and list
+  and search never walk into one.
+- **Elevated `wsmp`** counts as running as root (see `set-file-tools-as-root`).
+
+**Not on Windows (yet).**
+- The file tools that change files (edit, write, rename, mkdir and delete) are refused with
+  `unsupported`. They need the Unix side's atomic replace and recovery journal.
+- Engines that need Linux, such as vLLM and SGLang. llama.cpp's `llama-server`, Ollama and LM
+  Studio run natively.
+
+**Limits to know.**
+- The service runs while you are logged on. At log off, Windows ends it and the runtimes it
+  started.
+- The trust check has the gap described under [Trust](#trust).
+- A runtime host keeps the relay's own stdout and stderr open when they are pipes, as with
+  `wsmp run | Tee-Object relay.log`, until the runtime stops. The service and a relay run in a
+  terminal have console handles instead, so they are not affected.
+
+**WSL2 instead.** The Linux `wsmp` in a WSL2 distribution has every Linux feature: the file tools
+that change files, and vLLM with CUDA on WSL.
+1. Enable systemd in the distribution (`/etc/wsl.conf`: `[boot]` then `systemd=true`), then run
+   `wsl --shutdown`.
+2. Install `wsmp` with `install.sh` inside the distribution.
+3. Run `loginctl enable-linger $USER` and `wsmp service install` as on any Linux.
+
+Agents then see Linux, not Windows, and files under `/mnt/c` are slow. WSL can stop a distribution
+that nothing is using: after you close your terminals, check that the node stays connected, and
+start the distribution at log on if it does not.
+
 ## Other commands
 
 | Command | What it does |
@@ -274,6 +392,7 @@ the relay does; it writes nothing and runs no definition command. Runtimes are d
 | `wsmp config set-human-terminal on\|off` | Allow browser terminals (the same setting `wsmp login` asks about). |
 | `wsmp config set-terminal-approval on\|off` | Require approval before a browser opens a terminal. |
 | `wsmp config set-max-terminals <1-32>` | Cap browser terminals open at once. |
+| `wsmp config set-terminal-shell <id>\|default` | Windows: the shell a browser terminal starts by default (`pwsh`, `powershell`, `cmd`, `wsl:<distro>`). |
 | `wsmp config set-file-tools-as-root on\|off` | Allow the file tools when wsmp runs as root. |
 | `wsmp terminal fingerprint` | This node's terminal identity, as browsers show it. |
 | `wsmp terminal approve <code>` / `approvals list\|revoke` | Manage approved browser identities. |

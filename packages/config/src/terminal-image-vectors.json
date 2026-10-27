@@ -18,5 +18,11 @@
     "id": "000102030405060708090a0b0c0d0e0f",
     "received": 8,
     "path": "/tmp/wsmp-terminal-example/image.png"
+  },
+  "windowsReply": {
+    "id": "000102030405060708090a0b0c0d0e0f",
+    "received": 8,
+    "path": "C:\\Users\\Ada Lovelace\\AppData\\Local\\Temp\\wsmp-terminal-example\\image.png",
+    "paste": "'C:\\Users\\Ada Lovelace\\AppData\\Local\\Temp\\wsmp-terminal-example\\image.png' "
   }
 }

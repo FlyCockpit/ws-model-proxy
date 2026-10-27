@@ -144,6 +144,7 @@ vi.mock("@/utils/orpc", () => {
               code: codeView(id),
               secret: "wsmp_enr_AAAAAAAAAAAAAAAAAAAAAAAAAA",
               installCommand: `curl -fsSL https://proxy.test/install.sh | sh && ~/.cargo/bin/wsmp login https://proxy.test --code ${id}`,
+              windowsInstallCommand: `irm https://proxy.test/install.ps1 | iex; & wsmp.exe login https://proxy.test --code ${id}`,
             };
           }),
           revoke: mutation("nodes.enrollmentCodes.revoke", () => ({ ok: true })),
@@ -213,6 +214,7 @@ function node(overrides: Record<string, unknown> = {}) {
     fabrics: [],
     gpus: [{ vendor: "nvidia", name: "GB10" }],
     secretNames: [],
+    terminalShells: [],
     ...overrides,
   };
 }
@@ -314,6 +316,11 @@ describe("Welcome", () => {
     expect(screen.getByText(/dashboard:nodes.add.expiresIn:(59:\d\d|1:00:00)/)).toBeTruthy();
     expect(screen.getByText("dashboard:nodes.add.machineSteps.trust")).toBeTruthy();
     expect(screen.getByRole("status").textContent).toContain("dashboard:nodes.add.waiting");
+    // The Windows tab shows the PowerShell command for the same code.
+    fireEvent.click(screen.getByRole("tab", { name: "dashboard:nodes.add.platformWindows" }));
+    expect(await screen.findByText(/install\.ps1 \| iex; .* --code code-1/)).toBeTruthy();
+    expect(screen.getByText("dashboard:nodes.add.installsWhereWindows")).toBeTruthy();
+    fireEvent.click(screen.getByRole("tab", { name: "dashboard:nodes.add.platformUnix" }));
 
     // New code: a fresh code, and the one it replaces is revoked.
     fireEvent.click(screen.getByRole("button", { name: /dashboard:nodes.add.newCode/ }));

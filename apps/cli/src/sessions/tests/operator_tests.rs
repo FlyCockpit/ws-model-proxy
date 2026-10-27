@@ -3,11 +3,25 @@
 
 use super::*;
 use crate::protocol::frames::{CommandAuthor, JobPhase, JobStatus, TrustValue};
+use crate::protocol::runtime_spec::CommandShell;
 use crate::runtimes::operator::{
     MAX_OPERATOR_TERMINALS, OperatorEvent, OperatorIds, OperatorOpen, OperatorScreen,
 };
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::mpsc::Receiver;
+
+/// A command that succeeds at once, in the platform's operator shell.
+const TRUE: &str = if cfg!(windows) { "exit 0" } else { "true" };
+
+/// The shell operator commands are rendered for here.
+fn shell() -> CommandShell {
+    if cfg!(windows) {
+        CommandShell::Powershell
+    } else {
+        CommandShell::Sh
+    }
+}
 
 fn relay_startup() -> TerminalStartup {
     let config = Config {
@@ -30,11 +44,31 @@ fn ids(terminal_id: &str, step_id: &str) -> OperatorIds {
     }
 }
 
-/// A `sudo` stand-in on `PATH` that only records its arguments.
+/// A `sudo` stand-in on `PATH` that only records its arguments (Unix; Windows has no `sudo`
+/// bookkeeping, and the stand-in only gives the operator environment).
 struct FakeSudo {
+    #[cfg_attr(windows, allow(dead_code))]
     dir: tempfile::TempDir,
 }
 
+#[cfg(windows)]
+impl FakeSudo {
+    fn new() -> Self {
+        Self {
+            dir: tempfile::tempdir().expect("dir"),
+        }
+    }
+
+    fn env(&self) -> Vec<(String, String)> {
+        crate::sessions::operator_base_env()
+    }
+
+    fn calls(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+#[cfg(unix)]
 impl FakeSudo {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("dir");
@@ -74,6 +108,16 @@ fn request(
     command: &str,
     env: Vec<(String, String)>,
 ) -> (OperatorOpen, Receiver<OperatorEvent>) {
+    request_in(shell(), terminal_id, step_id, command, env)
+}
+
+fn request_in(
+    shell: CommandShell,
+    terminal_id: &str,
+    step_id: &str,
+    command: &str,
+    env: Vec<(String, String)>,
+) -> (OperatorOpen, Receiver<OperatorEvent>) {
     let (events, rx) = mpsc::sync_channel(8);
     (
         OperatorOpen {
@@ -87,6 +131,8 @@ fn request(
                 author: CommandAuthor::Agent,
             },
             env,
+            shell,
+            argv: None,
             events,
         },
         rx,
@@ -191,7 +237,7 @@ fn operator_terminals_never_advertise_or_accept_image_uploads() {
     let mut terminals = multi_registry(tx);
     let startup = relay_startup();
     let sudo = FakeSudo::new();
-    let (open, _events) = request(MULTI_TERMINAL, "step-image", ":", sudo.env());
+    let (open, _events) = request(MULTI_TERMINAL, "step-image", TRUE, sudo.env());
     reserve_and_open(&mut terminals, open);
     let mut viewer = TestViewer::new(1);
     let frames = attach_viewer(&mut terminals, &startup, &mut viewer);
@@ -324,6 +370,7 @@ fn a_decline_closes_the_terminal_without_running_anything() {
     assert!(sudo.calls().is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn enter_runs_only_the_command_between_two_sudo_resets_and_a_failure_closes() {
     let (tx, rx) = channel();
@@ -376,7 +423,7 @@ fn a_clean_exit_hands_the_step_back_for_its_proof() {
     let mut terminals = multi_registry(tx);
     let startup = relay_startup();
     let sudo = FakeSudo::new();
-    let (open, events) = request(MULTI_TERMINAL, "step1", "true", sudo.env());
+    let (open, events) = request(MULTI_TERMINAL, "step1", TRUE, sudo.env());
     let _ = reserve_and_open(&mut terminals, open);
     let mut a = TestViewer::new(1);
     let _ = attach_viewer(&mut terminals, &startup, &mut a);
@@ -392,6 +439,8 @@ fn a_clean_exit_hands_the_step_back_for_its_proof() {
     assert!(frames.is_empty());
 }
 
+// Checks the running command by its pid (Unix).
+#[cfg(unix)]
 #[test]
 fn a_stop_closes_confirm_screens_but_never_a_running_command() {
     let (tx, _rx) = channel();
@@ -400,7 +449,7 @@ fn a_stop_closes_confirm_screens_but_never_a_running_command() {
     let sudo = FakeSudo::new();
     let (open, events) = request(MULTI_TERMINAL, "step1", "sleep 30", sudo.env());
     let _ = reserve_and_open(&mut terminals, open);
-    let (other, other_events) = request("term-other", "step2", "true", sudo.env());
+    let (other, other_events) = request("term-other", "step2", TRUE, sudo.env());
     let _ = reserve_and_open(&mut terminals, other);
     let mut a = TestViewer::new(1);
     let _ = attach_viewer(&mut terminals, &startup, &mut a);
@@ -456,9 +505,9 @@ fn a_newer_terminal_replaces_a_confirming_one_and_the_cap_refuses() {
     let (tx, _rx) = channel();
     let mut terminals = multi_registry(tx);
     let sudo = FakeSudo::new();
-    let (first, first_events) = request("term-1", "step1", "true", sudo.env());
+    let (first, first_events) = request("term-1", "step1", TRUE, sudo.env());
     let _ = reserve_and_open(&mut terminals, first);
-    let (second, _second_events) = request("term-2", "step1", "true", sudo.env());
+    let (second, _second_events) = request("term-2", "step1", TRUE, sudo.env());
     let frames = reserve_and_open(&mut terminals, second);
     assert_eq!(
         results(&frames),
@@ -480,7 +529,7 @@ fn a_newer_terminal_replaces_a_confirming_one_and_the_cap_refuses() {
         keep.push(events);
     }
     assert_eq!(terminals.operator_count(), MAX_OPERATOR_TERMINALS);
-    let (over, over_events) = request("term-over", "s-over", "true", sudo.env());
+    let (over, over_events) = request("term-over", "s-over", TRUE, sudo.env());
     let frames = reserve_and_open(&mut terminals, over);
     assert!(matches!(
         controls(&frames)[..],
@@ -536,7 +585,7 @@ fn a_terminal_id_opens_once_and_re_deliveries_never_run_twice() {
         terminals.operator_delivery("step2", MULTI_TERMINAL),
         OperatorDelivery::Clash
     );
-    let (open, events) = request(MULTI_TERMINAL, "step1", "true", sudo.env());
+    let (open, events) = request(MULTI_TERMINAL, "step1", TRUE, sudo.env());
     let frames = terminals.open_operator(open);
     assert_eq!(results(&frames)[0].0, JobStatus::AwaitingOperator);
     // Re-delivered while open: re-report.
@@ -551,7 +600,7 @@ fn a_terminal_id_opens_once_and_re_deliveries_never_run_twice() {
         terminals.operator_delivery("step1", MULTI_TERMINAL),
         OperatorDelivery::Repeat(None)
     );
-    let (again, again_events) = request(MULTI_TERMINAL, "step1", "true", sudo.env());
+    let (again, again_events) = request(MULTI_TERMINAL, "step1", TRUE, sudo.env());
     let frames = terminals.open_operator(again);
     assert_eq!(
         results(&frames),
@@ -578,14 +627,14 @@ fn a_newer_dispatch_cancels_an_older_terminal_not_opened_yet() {
         .expect("new");
     // The older runner thread reaches its open: it closes at once and lets
     // go of the rank, so the newer one can run.
-    let (old, old_events) = request("term-old", "step1", "true", sudo.env());
+    let (old, old_events) = request("term-old", "step1", TRUE, sudo.env());
     let frames = terminals.open_operator(old);
     assert_eq!(
         results(&frames),
         vec![(JobStatus::OperatorClosed, None, Some("term-old".into()))]
     );
     assert_eq!(old_events.try_recv(), Ok(OperatorEvent::Closed));
-    let (new, _new_events) = request("term-new", "step1", "true", sudo.env());
+    let (new, _new_events) = request("term-new", "step1", TRUE, sudo.env());
     let frames = terminals.open_operator(new);
     assert_eq!(results(&frames)[0].0, JobStatus::AwaitingOperator);
 }
@@ -599,7 +648,7 @@ fn a_close_before_the_terminal_opens_keeps_it_from_ever_opening() {
         .reserve_operator("step1", MULTI_TERMINAL)
         .expect("reserved");
     assert!(terminals.close_from_server(MULTI_TERMINAL).is_empty());
-    let (open, events) = request(MULTI_TERMINAL, "step1", "true", sudo.env());
+    let (open, events) = request(MULTI_TERMINAL, "step1", TRUE, sudo.env());
     let frames = terminals.open_operator(open);
     assert_eq!(
         results(&frames),
@@ -618,7 +667,7 @@ fn lowering_trust_closes_confirm_screens_and_pending_terminals() {
     let (tx, _rx) = channel();
     let mut terminals = multi_registry(tx);
     let sudo = FakeSudo::new();
-    let (open, events) = request(MULTI_TERMINAL, "step1", "true", sudo.env());
+    let (open, events) = request(MULTI_TERMINAL, "step1", TRUE, sudo.env());
     let _ = reserve_and_open(&mut terminals, open);
     terminals
         .reserve_operator("step2", "term-later")
@@ -634,7 +683,7 @@ fn lowering_trust_closes_confirm_screens_and_pending_terminals() {
     );
     assert_eq!(events.try_recv(), Ok(OperatorEvent::Closed));
     // Rendered under the old trust: it never opens.
-    let (later, later_events) = request("term-later", "step2", "true", sudo.env());
+    let (later, later_events) = request("term-later", "step2", TRUE, sudo.env());
     let frames = terminals.open_operator(later);
     assert_eq!(results(&frames)[0].0, JobStatus::OperatorClosed);
     assert_eq!(later_events.try_recv(), Ok(OperatorEvent::Closed));
@@ -664,6 +713,7 @@ fn queue_shell_approval(terminals: &mut TerminalRegistry, dir: &Path) {
             browser_public_key: browser.public_b64url(),
             browser_nonce: &nonce,
             identity: Some(&identity),
+            shell: None,
         },
     );
     assert!(matches!(
@@ -712,4 +762,87 @@ fn an_approval_is_checked_against_the_trust_of_its_auth() {
     );
     assert!(terminals.sessions.is_empty());
     assert!(terminals.pending.is_empty());
+}
+
+/// Windows: the step runs in its shell on a pseudoconsole, and what the person types reaches it.
+#[cfg(windows)]
+#[test]
+fn a_windows_operator_command_reads_what_its_person_types() {
+    let (tx, rx) = channel();
+    let mut terminals = multi_registry(tx);
+    let startup = relay_startup();
+    let (open, events) = request_in(
+        CommandShell::Powershell,
+        MULTI_TERMINAL,
+        "step1",
+        "$answer = Read-Host 'Sign in done?'; if ($answer -eq 'yes') { exit 0 } else { exit 4 }",
+        crate::sessions::operator_base_env(),
+    );
+    let _ = reserve_and_open(&mut terminals, open);
+    let mut a = TestViewer::new(1);
+    let _ = attach_viewer(&mut terminals, &startup, &mut a);
+    let _ = type_keys(&mut terminals, &mut a, b"\r");
+    assert_eq!(events.try_recv(), Ok(OperatorEvent::Accepted));
+    let _ = type_keys(&mut terminals, &mut a, b"yes\r");
+    let frames = run_until_closed(&mut terminals, &rx);
+    assert_eq!(exits(&frames), vec![Some(0)]);
+    assert_eq!(events.try_recv(), Ok(OperatorEvent::ExitedOk));
+}
+
+/// Windows: a Command Prompt step runs as written (its quotes intact), and a failure closes the
+/// terminal with the command's exit code.
+#[cfg(windows)]
+#[test]
+fn a_windows_cmd_step_runs_as_written_and_a_failure_closes() {
+    let (tx, rx) = channel();
+    let mut terminals = multi_registry(tx);
+    let startup = relay_startup();
+    let (open, events) = request_in(
+        CommandShell::Cmd,
+        MULTI_TERMINAL,
+        "step1",
+        r#"if "a b"=="a b" (exit 5) else (exit 6)"#,
+        crate::sessions::operator_base_env(),
+    );
+    let _ = reserve_and_open(&mut terminals, open);
+    let mut a = TestViewer::new(1);
+    let _ = attach_viewer(&mut terminals, &startup, &mut a);
+    let _ = type_keys(&mut terminals, &mut a, b"\r");
+    assert_eq!(events.try_recv(), Ok(OperatorEvent::Accepted));
+    let frames = run_until_closed(&mut terminals, &rx);
+    assert_eq!(exits(&frames), vec![Some(5)]);
+    assert_eq!(
+        results(&frames),
+        vec![(
+            JobStatus::OperatorClosed,
+            Some(5),
+            Some(MULTI_TERMINAL.to_string())
+        )]
+    );
+    assert_eq!(events.try_recv(), Ok(OperatorEvent::Closed));
+}
+
+/// Windows: `%NAME%` in a Command Prompt step expands as at a prompt (a raw command line, not
+/// one quoted for `CommandLineToArgvW`).
+#[cfg(windows)]
+#[test]
+fn a_windows_cmd_step_expands_variables_as_typed() {
+    let (tx, rx) = channel();
+    let mut terminals = multi_registry(tx);
+    let startup = relay_startup();
+    let (open, events) = request_in(
+        CommandShell::Cmd,
+        MULTI_TERMINAL,
+        "step1",
+        r#"if "%WSMP_JOB%"=="1" (exit 0) else (exit 7)"#,
+        crate::sessions::operator_base_env(),
+    );
+    let _ = reserve_and_open(&mut terminals, open);
+    let mut a = TestViewer::new(1);
+    let _ = attach_viewer(&mut terminals, &startup, &mut a);
+    let _ = type_keys(&mut terminals, &mut a, b"\r");
+    let frames = run_until_closed(&mut terminals, &rx);
+    assert_eq!(exits(&frames), vec![Some(0)]);
+    assert_eq!(events.try_recv(), Ok(OperatorEvent::Accepted));
+    assert_eq!(events.try_recv(), Ok(OperatorEvent::ExitedOk));
 }

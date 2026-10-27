@@ -104,8 +104,8 @@ pub enum RunError {
     Timeout,
     /// stdout was longer than the limit.
     OutputTooLarge,
-    /// The program exited nonzero or was ended by a signal.
-    ExitStatus,
+    /// The program exited nonzero (its exit code) or was ended by a signal (`None`).
+    ExitStatus(Option<i32>),
     /// The caller cancelled, or the daemon is exiting.
     Cancelled,
     /// A local resource is missing (no stdout pipe, no thread, or too many
@@ -375,6 +375,16 @@ fn kill_all_in(shared: &'static Mutex<Registry>) {
     }
 }
 
+/// A program's arguments: a list std quotes for the platform, or (Windows) the command line
+/// after the program passed as is, for `cmd.exe`, which does not read its command line the way
+/// std quotes it.
+#[derive(Clone, Copy)]
+enum Args<'a> {
+    List(&'a [String]),
+    #[cfg(windows)]
+    Raw(&'a str),
+}
+
 /// Run `program` with the limits above and return its stdout.
 ///
 /// `cancel`, when set, ends the run at the next poll (a few milliseconds),
@@ -387,7 +397,16 @@ pub fn run(
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, RunError> {
     let deadline = Instant::now() + timeout;
-    run_inner(program, args, deadline, limit, cancel, None, false, &[])
+    run_inner(
+        program,
+        Args::List(args),
+        deadline,
+        limit,
+        cancel,
+        None,
+        false,
+        &[],
+    )
 }
 
 /// Total budget variant: settlement shares the caller's absolute deadline.
@@ -401,7 +420,7 @@ pub fn run_until(
 ) -> Result<Vec<u8>, RunError> {
     run_inner(
         program,
-        args,
+        Args::List(args),
         deadline,
         limit,
         cancel,
@@ -423,7 +442,7 @@ pub fn run_until_env(
 ) -> Result<Vec<u8>, RunError> {
     run_inner(
         program,
-        args,
+        Args::List(args),
         deadline,
         limit,
         cancel,
@@ -446,7 +465,7 @@ pub fn run_until_any_status(
 ) -> Result<Vec<u8>, RunError> {
     run_inner(
         program,
-        args,
+        Args::List(args),
         deadline,
         limit,
         cancel,
@@ -456,10 +475,33 @@ pub fn run_until_any_status(
     )
 }
 
+/// [`run_until_env`] with the command line after `program` passed as is: `cmd.exe /d /s /c
+/// "…"` runs the text between the outer quotes exactly as written.
+#[cfg(windows)]
+pub fn run_raw_until_env(
+    program: &str,
+    raw: &str,
+    deadline: Instant,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+    env: &[(String, String)],
+) -> Result<Vec<u8>, RunError> {
+    run_inner(
+        program,
+        Args::Raw(raw),
+        deadline,
+        limit,
+        cancel,
+        Some(deadline),
+        false,
+        env,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_inner(
     program: &str,
-    args: &[String],
+    args: Args<'_>,
     deadline: Instant,
     limit: usize,
     cancel: Option<&AtomicBool>,
@@ -483,8 +525,17 @@ fn run_inner(
         return Err(RunError::Cancelled);
     }
     let mut command = Command::new(program);
+    match args {
+        Args::List(args) => {
+            command.args(args);
+        }
+        #[cfg(windows)]
+        Args::Raw(raw) => {
+            use std::os::windows::process::CommandExt;
+            command.raw_arg(raw);
+        }
+    }
     command
-        .args(args)
         .env_clear()
         .envs(crate::child_env::scrub_parent_env(&[]))
         .envs(
@@ -498,6 +549,8 @@ fn run_inner(
         .stderr(Stdio::null());
     // A launch guard starts a session of its own (a group leader cannot), and its session is
     // what is killed when it did not end on its own.
+    #[cfg(unix)]
+    let Args::List(args) = args;
     #[cfg(unix)]
     let session = args
         .first()
@@ -594,7 +647,7 @@ fn run_inner(
     }
     match finished.status {
         Some(status) if status.success() || any_status => Ok(buffer),
-        Some(_) => Err(RunError::ExitStatus),
+        Some(status) => Err(RunError::ExitStatus(status.code())),
         // Exited but never reaped in the grace: no verdict on its status.
         None => Err(RunError::Timeout),
     }

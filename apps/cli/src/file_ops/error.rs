@@ -111,6 +111,7 @@ impl FileError {
     }
 
     /// `io_error` carries the errno name only (never a path or file content).
+    #[cfg(unix)]
     pub fn errno(errno: nix::errno::Errno) -> Self {
         match errno {
             nix::errno::Errno::ENOENT => {
@@ -124,6 +125,7 @@ impl FileError {
         }
     }
 
+    #[cfg(unix)]
     pub fn io(err: &std::io::Error) -> Self {
         match err.raw_os_error() {
             Some(raw) => Self::errno(nix::errno::Errno::from_raw(raw)),
@@ -131,9 +133,25 @@ impl FileError {
         }
     }
 
+    /// Windows: by kind, with the error's name only (never a path).
+    #[cfg(not(unix))]
+    pub fn io(err: &std::io::Error) -> Self {
+        match err.kind() {
+            std::io::ErrorKind::NotFound => {
+                Self::new(ErrorCode::NotFound, "no such file or directory")
+            }
+            std::io::ErrorKind::NotADirectory => {
+                Self::new(ErrorCode::NotADir, "a path component is not a directory")
+            }
+            std::io::ErrorKind::AlreadyExists => Self::new(ErrorCode::Exists, "already exists"),
+            other => Self::new(ErrorCode::IoError, format!("{other:?}")),
+        }
+    }
+
     /// Mutations may have committed before completion or rollback failed.
     /// Both relay paths interpret `io_error` as an unknown mutation outcome;
     /// a definitive refusal (including `cancelled`) would invite an unsafe retry.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn mutation_uncertain() -> Self {
         Self::new(ErrorCode::IoError, "the mutation outcome is unknown")
     }
@@ -164,6 +182,7 @@ impl From<std::io::Error> for FileError {
     }
 }
 
+#[cfg(unix)]
 impl From<nix::errno::Errno> for FileError {
     fn from(errno: nix::errno::Errno) -> Self {
         Self::errno(errno)
@@ -229,6 +248,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn io_error_carries_errno_name_only() {
         let err = FileError::errno(nix::errno::Errno::EXDEV);
         assert_eq!(err.code, ErrorCode::IoError);

@@ -187,6 +187,7 @@ export function toNodeListRow(row: NodeListSelected, now: Date): NodeListRow {
     })).sort((a, b) => a.name.localeCompare(b.name)),
     gpus: hardware.gpus.map((gpu) => ({ vendor: gpu.vendor, name: gpu.name })),
     secretNames: features.success ? features.data.secrets.map((secret) => secret.name) : [],
+    terminalShells: features.success ? (features.data.terminals.shells ?? []) : [],
   };
 }
 

@@ -22,8 +22,16 @@ use crate::protocol::frames::{
     InstancePhase, InstanceRecord, JobError, JobPhase, JobReservation, JobStatus,
 };
 use crate::protocol::runtime_spec::{
-    Management, Readiness, RuntimeSpec, status_can_report_stopped,
+    CommandShell, Management, Readiness, RuntimeSpec, status_can_report_stopped,
 };
+
+fn sh() -> CommandShell {
+    CommandShell::Sh
+}
+
+fn is_sh(shell: &CommandShell) -> bool {
+    *shell == CommandShell::Sh
+}
 
 const STATE_LIMIT: usize = 2 * 1024 * 1024;
 const INSTANCES_DIR: &str = "runtime-instances";
@@ -52,6 +60,21 @@ pub struct Job {
     pub stop_command: String,
     pub status_command: Option<String>,
     pub health_command: Option<String>,
+    /// The shell every command above runs in (argv commands were rendered for it). Records
+    /// written before it existed ran `sh`.
+    #[serde(default = "sh", skip_serializing_if = "is_sh")]
+    pub shell: CommandShell,
+    /// Each argv command's arguments, stored beside its script (`command_argv` is `command`'s):
+    /// on Windows one whose program is an `.exe` starts directly, not through `shell`. Absent for
+    /// a text command, and where `sh` runs every command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_argv: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_argv: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_argv: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_argv: Option<Vec<String>>,
     /// Node secret names exported to every command (values never stored).
     pub secrets: Vec<String>,
     pub timeout_ms: u64,
@@ -80,6 +103,37 @@ pub struct Job {
 impl Job {
     fn key(&self) -> String {
         format!("{}:{}", self.instance_id, self.rank)
+    }
+
+    /// The step's own command.
+    pub fn step_cmd(&self) -> JobCommand<'_> {
+        JobCommand::new(&self.command, self.command_argv.as_deref())
+    }
+
+    /// What an interactive step's operator terminal runs: the stop command for a stop, else the
+    /// step's own.
+    pub fn operator_cmd(&self) -> JobCommand<'_> {
+        if self.action == JobPhase::Stop {
+            self.stop_cmd()
+        } else {
+            self.step_cmd()
+        }
+    }
+
+    pub fn stop_cmd(&self) -> JobCommand<'_> {
+        JobCommand::new(&self.stop_command, self.stop_argv.as_deref())
+    }
+
+    pub fn status_cmd(&self) -> Option<JobCommand<'_>> {
+        self.status_command
+            .as_deref()
+            .map(|script| JobCommand::new(script, self.status_argv.as_deref()))
+    }
+
+    pub fn health_cmd(&self) -> Option<JobCommand<'_>> {
+        self.health_command
+            .as_deref()
+            .map(|script| JobCommand::new(script, self.health_argv.as_deref()))
     }
 
     pub fn parsed_spec(&self) -> Option<RuntimeSpec> {
@@ -130,6 +184,20 @@ impl Job {
             && self.host == other.host
             && self.stop_command == other.stop_command
             && self.status_command == other.status_command
+    }
+}
+
+/// One of a job's commands as it runs: its rendered script, and the arguments it was rendered
+/// from when it was an argv (Windows starts an `.exe` from them directly).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobCommand<'a> {
+    pub script: &'a str,
+    pub argv: Option<&'a [String]>,
+}
+
+impl<'a> JobCommand<'a> {
+    pub fn new(script: &'a str, argv: Option<&'a [String]>) -> Self {
+        Self { script, argv }
     }
 }
 
@@ -413,7 +481,8 @@ fn unix_now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// What the executor needs from the machine. `NativeRuntime` is systemd.
+/// What the executor needs from the machine. `NativeRuntime` is systemd (Linux) or runtime
+/// hosts (Windows).
 pub trait Runtime {
     fn cancelled(&self) -> bool {
         false
@@ -434,9 +503,9 @@ pub trait Runtime {
     ) -> Result<Option<String>> {
         self.identity(&phase_unit(job), owner, deadline)
     }
-    fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()>;
+    fn shell_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<()>;
     /// true alive, false positively stopped (exit 3); errors are unknown.
-    fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool>;
+    fn status_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<bool>;
     fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()>;
     /// Probes the launch's readiness URL once: `Ok` when it answers the
     /// expected status, else why not.
@@ -867,7 +936,7 @@ impl Executor {
                                     job.management() == Management::Service,
                                     "owned launch unconfirmed"
                                 );
-                                let Some(status) = job.status_command.as_deref() else {
+                                let Some(status) = job.status_cmd() else {
                                     return Err(error);
                                 };
                                 anyhow::ensure!(
@@ -1048,7 +1117,7 @@ impl Executor {
             jobs.push(&record.job);
         }
         let mut ports: Vec<(&str, u16)> = Vec::new();
-        let mut statuses: Vec<(&Job, &str)> = Vec::new();
+        let mut statuses: Vec<(&Job, JobCommand<'_>)> = Vec::new();
         // A status command that can never say stopped (`true`, `exit 0`, ...: the rule a new
         // definition is refused by) proves nothing. Where the runtime contains its ranks it is
         // left out and the units, slice and ports decide; without units it is still asked, so
@@ -1061,11 +1130,15 @@ impl Executor {
                     ports.push((owner.host.as_str(), port));
                 }
             }
-            match owner.status_command.as_deref() {
-                Some(status) if contains && !status_can_report_stopped(status) => {
+            match owner.status_cmd() {
+                Some(status) if contains && !status_can_report_stopped(status.script) => {
                     constant_status = true;
                 }
-                Some(status) if !statuses.iter().any(|(_, seen)| *seen == status) => {
+                Some(status)
+                    if !statuses
+                        .iter()
+                        .any(|(_, seen)| seen.script == status.script) =>
+                {
                     statuses.push((owner, status));
                 }
                 _ => {}
@@ -1195,7 +1268,7 @@ impl Executor {
         if !job.stop_command.trim().is_empty() {
             // A stop command that fails is not proof either way; the unit
             // stop and status below decide.
-            if let Err(error) = runtime.shell_until(job, &job.stop_command, deadline) {
+            if let Err(error) = runtime.shell_until(job, job.stop_cmd(), deadline) {
                 tracing::warn!(
                     instance_id = job.instance_id,
                     error = %format!("{error:#}"),
@@ -1355,7 +1428,7 @@ impl Executor {
                 let owned = !record.invocations.is_empty()
                     && record.invocations.iter().all(|(unit, identity)| {
                         if identity == "external" || identity == "self-detached" {
-                            return job.status_command.as_deref().is_some_and(|status| {
+                            return job.status_cmd().is_some_and(|status| {
                                 runtime
                                     .status_until(job, status, deadline.cap(Duration::from_secs(5)))
                                     .is_ok_and(|alive| alive)
@@ -1498,8 +1571,7 @@ impl<R: Runtime> OperatorRan<'_, R> {
             return Ok("external".to_owned());
         }
         let status = job
-            .status_command
-            .as_deref()
+            .status_cmd()
             .ok_or_else(|| fail(JobError::LaunchUnconfirmed))?;
         if wait_for_status(job, self.inner, status, true, deadline)? {
             Ok("external".to_owned())
@@ -1530,15 +1602,15 @@ impl<R: Runtime> Runtime for OperatorRan<'_, R> {
     ) -> Result<Option<String>> {
         self.launched(job, deadline).map(Some)
     }
-    fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()> {
+    fn shell_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<()> {
         // An interactive stop's command already ran in its operator terminal
         // (or status showed it is not needed): never run it again here.
-        if job.action == JobPhase::Stop && command == job.stop_command {
+        if job.action == JobPhase::Stop && command.script == job.stop_command {
             return Ok(());
         }
         self.inner.shell_until(job, command, deadline)
     }
-    fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
+    fn status_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<bool> {
         self.inner.status_until(job, command, deadline)
     }
     fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()> {
@@ -1565,7 +1637,7 @@ impl<R: Runtime> Runtime for OperatorRan<'_, R> {
 fn wait_for_status(
     job: &Job,
     runtime: &impl Runtime,
-    status: &str,
+    status: JobCommand<'_>,
     want: bool,
     deadline: Deadline,
 ) -> Result<bool> {
@@ -1595,23 +1667,23 @@ fn probe_once(
     runtime: &impl Runtime,
     deadline: Deadline,
 ) -> std::result::Result<(), HealthMiss> {
-    let command = |health: &str| {
+    let command = |health: JobCommand<'_>| {
         runtime
             .shell_until(job, health, deadline)
             .map_err(|_| HealthMiss::CommandFailed)
     };
     if job.action != JobPhase::Readiness
-        && let Some(health) = job.health_command.as_deref()
+        && let Some(health) = job.health_cmd()
     {
         return command(health);
     }
     if job.readiness().is_some() {
         return runtime.healthy_until(job, deadline);
     }
-    if let Some(health) = job.health_command.as_deref() {
+    if let Some(health) = job.health_cmd() {
         return command(health);
     }
-    let alive = job.status_command.as_deref().is_some_and(|status| {
+    let alive = job.status_cmd().is_some_and(|status| {
         runtime
             .status_until(job, status, deadline)
             .is_ok_and(|alive| alive)
@@ -1638,8 +1710,7 @@ fn serving_confirmed(
     ) {
         let status = record
             .job
-            .status_command
-            .as_deref()
+            .status_cmd()
             .context("external service requires status proof")?;
         return runtime.status_until(&record.job, status, deadline.cap(Duration::from_secs(30)));
     }
@@ -1718,11 +1789,12 @@ pub fn command_env(job: &Job) -> Result<Vec<(String, String)>> {
     Ok(found)
 }
 
-#[cfg(unix)]
 pub use native::NativeRuntime;
 
-#[cfg(unix)]
 pub(crate) mod native;
+
+#[cfg(windows)]
+pub mod windows;
 
 #[cfg(test)]
 mod tests;

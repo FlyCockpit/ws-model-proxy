@@ -664,7 +664,7 @@ export class TerminalBrowserHub {
         return;
       }
       // The id the procedure minted (and audited) with the ticket.
-      const { terminalId, nodeId } = redeemed;
+      const { terminalId, nodeId, shell } = redeemed;
       // A new terminal has no viewers yet, so a fresh id cannot collide.
       const viewerId = randomBytes(16).toString("base64url");
       // From here on the terminal id names this open too.
@@ -675,7 +675,7 @@ export class TerminalBrowserHub {
         viewerId,
         ...(ref.requestId ? { requestId: ref.requestId } : {}),
       });
-      await this.openTerminal(conn, data, nodeId, terminalId, viewerId, ref);
+      await this.openTerminal(conn, data, nodeId, terminalId, viewerId, shell, ref);
       return;
     }
     if (data.type === "auth") {
@@ -1028,6 +1028,8 @@ export class TerminalBrowserHub {
     nodeId: string,
     terminalId: string,
     viewerId: string,
+    /** The ticket's shell (checked against the node when minted); null: the node's default. */
+    shell: string | null,
     /** Names the frame and, since `opening`, the terminal made for it. */
     ref: FrameRef,
   ) {
@@ -1047,6 +1049,11 @@ export class TerminalBrowserHub {
       this.sendError(conn, availability.reason, ref);
       return;
     }
+    // The node may have reconnected with other shells since the ticket was minted.
+    if (shell !== null && !live?.features.terminals.shells?.includes(shell)) {
+      this.sendError(conn, "unsupported", ref);
+      return;
+    }
     const approvalRequired = live?.features.terminals.approvalRequired === true;
     const counts = relaySessionManager.terminalCounts(conn.userId, row.id);
     if (!approvalRequired && terminalLimitReached(counts)) {
@@ -1064,6 +1071,7 @@ export class TerminalBrowserHub {
       ...(message.identity ? { identity: message.identity } : {}),
       connId: conn.id,
       viewerId,
+      ...(shell !== null ? { shell } : {}),
     });
     if (!started) {
       this.sendError(conn, "offline", ref);

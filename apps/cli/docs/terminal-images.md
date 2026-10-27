@@ -1,7 +1,7 @@
 # Images in browser terminals
 
-On macOS and Linux, paste or drop a PNG, JPEG, or WebP image into a human
-browser terminal. The browser sends the bytes to the CLI over the terminal's
+On macOS, Linux and Windows, paste or drop a PNG, JPEG, or WebP image into a
+human browser terminal. The browser sends the bytes to the CLI over the terminal's
 existing encrypted connection. The CLI writes a temporary file, acknowledges
 the completed upload, and the browser pastes its absolute path using xterm's
 paste API. This respects the application's bracketed-paste mode, changes no
@@ -25,7 +25,8 @@ shutdown removes the files and their directory. A process crash or forced
 kill can leave temporary files behind for the OS's temporary-file cleanup.
 
 Files are created with mode `0600` in a session-specific temporary directory
-created with mode `0700`. The CLI chooses the operating system's temporary
+created with mode `0700` (on Windows, in your temporary folder, which only you
+can read). The CLI chooses the operating system's temporary
 location using `tempfile`; no `/tmp` path is hardcoded. The file must be
 accessible from the agent's environment: entering SSH or a container from
 the terminal does not transfer the file into that environment.
@@ -74,6 +75,22 @@ Atomic request states protect file lifetime while PTY queueing races expiry.
 Graceful daemon shutdown stops and joins the worker after terminal
 teardown; the existing shutdown deadline still bounds a stuck filesystem.
 
+## Windows
+
+A Windows node quotes the path for the terminal's shell itself and sends the
+text to paste in its reply (`paste`, below). The browser pastes that text as
+is, after the same printable-ASCII check; it quotes only POSIX paths itself.
+
+- PowerShell (`pwsh`, Windows PowerShell): single quotes when the path needs
+  them, a quote inside doubled. Nothing expands in single quotes.
+- Command Prompt: double quotes when the path needs them. A path with `%` is
+  refused (`path`), because cmd expands `%NAME%` even inside quotes.
+- A WSL distribution: the Windows path under the distribution's drive mount
+  (`C:\...` becomes `/mnt/c/...`), quoted for `sh`. The mount root comes from
+  `[automount] root` in the distribution's `/etc/wsl.conf`, read through
+  `\\wsl.localhost\<distro>` on the first upload, and is `/mnt/` when it sets
+  none.
+
 ## Encrypted wire extension
 
 This is an optional, compatible extension to relay protocol 3.0, which shipped
@@ -94,6 +111,11 @@ output, and upload bytes never enter the PTY input queue.
 | `0x12` | CLI → browser | UTF-8 JSON: `{id, received, path?, error?}` |
 | `0x13` | Browser → CLI | 16-byte upload ID, then xterm's UTF-8 path paste (1–16384 bytes) |
 | `0x14` | Browser → CLI | 16-byte upload ID: cancel only this viewer's unclaimed upload |
+
+The reply's JSON is `{id, received, path?, paste?, error?}`. `paste` comes
+only with `path`, and only from a Windows node: the exact text to paste
+(printable ASCII ending in a space), quoted for the terminal's shell. A Windows
+`path` (`C:\...`) is accepted only together with `paste`.
 
 Formats: `0` = PNG, `1` = JPEG, `2` = WebP. IDs are rendered as 32 lowercase
 hexadecimal characters in replies. `received` acknowledges the contiguous

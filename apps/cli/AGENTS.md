@@ -26,6 +26,7 @@ The Rust command-line relay client for WS Model Proxy. The `wsmp` CLI enrolls a 
 | `src/exit.rs` | Stable process exit codes. |
 | `tests/cli.rs` | Black-box tests that run the built binary. |
 | `xtask/` | CLI workspace automation: `sync-docs`. |
+| `wsmp-windows/` | The audited Windows FFI (control-pipe DACL and peer checks, the relay job, the terminal pseudoconsole, the runtime host's job). The only place `unsafe` is allowed. |
 | `docs/` | CLI-specific error handling and release notes. |
 | `tap/` | Notes for publishing the generated Homebrew formula. |
 
@@ -56,7 +57,7 @@ cargo xtask sync-docs --check
 
 1. Do not weaken lint or CI gates to make a change pass. Fix the issue instead.
 2. Do not bypass commit or CI checks with `git commit --no-verify` or force-pushing the default branch.
-3. No `unsafe`; the crate forbids it.
+3. No `unsafe`; the crate forbids it. Win32 calls std cannot make safely go in `wsmp-windows/`, one documented call per `unsafe` block behind a safe function.
 4. No secrets in source, tests, fixtures, docs, or commit messages.
 5. Do not add dependencies casually. Prefer the standard library and explain new crates.
 6. stdout is for command output only. Logs, progress, and diagnostics go to stderr.

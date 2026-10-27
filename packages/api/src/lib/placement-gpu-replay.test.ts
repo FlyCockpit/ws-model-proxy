@@ -32,6 +32,7 @@ function node(gpus: PlacementNode["gpus"]): PlacementNode {
     memoryGb: 64,
     gpus,
     liveFreeMemoryGb: null,
+    launch: null,
   };
 }
 

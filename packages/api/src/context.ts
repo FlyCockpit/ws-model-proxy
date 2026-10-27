@@ -197,6 +197,8 @@ export type NodeOperatorServices = {
     cols: number;
     rows: number;
     typedCommand?: string;
+    /** A shell the node advertised (Windows); omitted for the node's default. */
+    shell?: string;
   }): Promise<{ ticket: string; terminalId: string; expiresAt: Date }>;
   /** `exec.start`: start a command; resolves once the node answered `exec.started`. */
   startCommand(args: {
