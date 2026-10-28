@@ -457,6 +457,20 @@ fn parse_shell(name: &str) -> Option<CommandShell> {
     }
 }
 
+/// The shell a node command or metric command runs in when none is named: PowerShell 7, else
+/// Windows PowerShell (every Windows 11 has it). Never `sh` or `cmd`, so what is on `PATH` (Git
+/// Bash) cannot change how commands run.
+pub fn default_shell() -> Result<CommandShell> {
+    crate::shells::command_shells()
+        .iter()
+        .find_map(|found| match found.id.as_str() {
+            "pwsh" => Some(CommandShell::Pwsh),
+            "powershell" => Some(CommandShell::Powershell),
+            _ => None,
+        })
+        .context("neither `pwsh` nor `powershell` is installed")
+}
+
 /// The program of a Windows shell this node found.
 pub fn shell_program(shell: CommandShell) -> Result<PathBuf> {
     let id = shell_name(shell);

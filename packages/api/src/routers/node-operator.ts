@@ -292,6 +292,11 @@ const commands = {
           "BAD_REQUEST",
         );
       }
+      if (nodeReason === "spawn_failed") {
+        throw new ORPCError("BAD_REQUEST", {
+          message: `Node ${node.slug} could not start the command: its program was not found or could not be started (on Windows, also an argument cmd cannot be given safely, such as a line break for a .bat or .cmd), or its script could not be written there.`,
+        });
+      }
       if (nodeReason === "bad_command" && (argv || input.shell)) {
         // A node from before shells could be named cannot read the request at all.
         throw refuseAbout(

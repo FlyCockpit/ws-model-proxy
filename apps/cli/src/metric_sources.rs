@@ -239,18 +239,37 @@ pub fn run_command(
     if crate::child_env::validate_command(command).is_err() || command.trim().is_empty() {
         return Err(MetricCommandError::Spawn);
     }
-    let (shell, flag) = crate::child_env::exec_shell();
-    let args = [flag.to_string(), command.to_string()];
-    crate::bounded_run::run(shell, &args, timeout, OUTPUT_LIMIT, cancel).map_err(
-        |error| match error {
+    #[cfg(unix)]
+    let (shell, args) = {
+        let (shell, flag) = crate::child_env::exec_shell();
+        (
+            shell.to_string(),
+            vec![flag.to_string(), command.to_string()],
+        )
+    };
+    // As a node command without `shell`: in PowerShell (`-EncodedCommand`; only stdout is read).
+    #[cfg(windows)]
+    let (shell, args) = {
+        use crate::runtimes::executor::windows::{
+            ShellLine, default_shell, shell_line, shell_program,
+        };
+        let shell = default_shell().map_err(|_| MetricCommandError::Spawn)?;
+        let program = shell_program(shell).map_err(|_| MetricCommandError::Spawn)?;
+        let Ok(ShellLine::List(args)) = shell_line(shell, command) else {
+            return Err(MetricCommandError::Spawn);
+        };
+        (program.to_string_lossy().into_owned(), args)
+    };
+    crate::bounded_run::run(&shell, &args, timeout, OUTPUT_LIMIT, cancel).map_err(|error| {
+        match error {
             RunError::Spawn | RunError::Resources | RunError::Cancelled => {
                 MetricCommandError::Spawn
             }
             RunError::Timeout => MetricCommandError::Timeout,
             RunError::OutputTooLarge => MetricCommandError::OutputTooLarge,
             RunError::ExitStatus(_) => MetricCommandError::ExitStatus,
-        },
-    )
+        }
+    })
 }
 
 /// A command as the runner sees it.

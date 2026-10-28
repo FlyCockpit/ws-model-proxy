@@ -12,6 +12,9 @@ fn run(line: &ExecLine<'_>, shell: Option<CommandShell>) -> (ExecState, String) 
     let (tx, rx) = channel();
     // PowerShell can take many seconds to start on a loaded machine: the lifetime must not end it.
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(120));
+    // Scripts of this run only, so what is left in the folder is this command's.
+    let scripts = tempfile::tempdir().expect("scripts");
+    execs.scripts = scripts.path().to_path_buf();
     let id = fresh_id();
     let started = execs.start(
         &enabled_startup(false),
@@ -41,8 +44,12 @@ fn run(line: &ExecLine<'_>, shell: Option<CommandShell>) -> (ExecState, String) 
         let _ = execs.poll(Instant::now());
     }
     // A PowerShell command's script goes with it.
-    let script = execs.scripts.join(format!("{id}.ps1"));
-    assert!(!script.exists(), "{}", script.display());
+    let left: Vec<_> = std::fs::read_dir(scripts.path())
+        .expect("scripts")
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
     match execs.status(&id, NODE_COMMAND_TAIL_MAX_BYTES).pop() {
         Some(OutboundFrame::Control(NodeFrame::ExecStatus(status))) => {
             (status.state, status.tail.unwrap_or_default())
@@ -240,6 +247,31 @@ fn a_restarted_daemon_removes_the_scripts_a_crash_left() {
     assert_eq!(execs.scripts, scripts);
     assert!(!scripts.join("left-1.ps1").exists());
     assert!(scripts.join("keep.txt").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_script_that_cannot_be_written_is_a_failed_start_not_a_missing_shell() {
+    let dir = tempfile::tempdir().expect("dir");
+    // A file where the script folder should be.
+    let blocked = dir.path().join("scripts");
+    std::fs::write(&blocked, "not a folder").expect("file");
+    let (tx, _rx) = channel();
+    let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
+    execs.scripts = blocked;
+    let frames = execs.start(
+        &enabled_startup(false),
+        &fresh_id(),
+        &ExecLine::Text("Write-Output hi"),
+        None,
+        None,
+        TEST_TIMEOUT_MS,
+    );
+    assert!(
+        matches!(controls(&frames).as_slice(), [NodeFrame::ExecRejected { reason, .. }] if reason == REASON_SPAWN_FAILED),
+        "{:?}",
+        controls(&frames)
+    );
 }
 
 #[test]

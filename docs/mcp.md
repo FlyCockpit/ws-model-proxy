@@ -87,7 +87,9 @@ command and everything it started). A command lives at most its timeout
   `winget`) runs outside the command's job: `cancel` and the timeout do not end
   it or what it started.
 
-A shell the node does not report is refused with `shell_unavailable`. A node
+A shell the node does not report is refused with `shell_unavailable`. A command
+the node could not start (its program missing, an argument cmd cannot be given)
+is refused as a bad request saying so. A node
 whose wsmp predates argv commands and `shell` refuses them (`upgrade_wsmp`);
 plain text without `shell` still works there.
 

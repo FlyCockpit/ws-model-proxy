@@ -363,6 +363,16 @@ describe("node commands", () => {
     await expect(
       client(FULL_AGENT, refusedWith("bad_command")).commands.run(runInput),
     ).rejects.toMatchObject({ data: { reason: "node_offline" } });
+    // The node is there; the command did not start: not "offline".
+    await expect(
+      client(FULL_AGENT, refusedWith("spawn_failed")).commands.run({
+        ...runInput,
+        command: ["npm.cmd", "a\nb"],
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: expect.stringContaining("could not start the command"),
+    });
   });
 
   it("refuses hidden characters in the command", async () => {
