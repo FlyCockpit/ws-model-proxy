@@ -877,13 +877,13 @@ mod tests {
                 assert_eq!(run(&["cmd", "/d", "/c", "exit 7"], direct), Some(7));
                 assert_eq!(run(&["cmd", "/d", "/c", "exit 0"], direct), Some(0));
                 // Not found: PowerShell runs it, and it fails.
-                assert_eq!(run(&["wsmp-no-such-program", "x"], direct), Some(1));
+                assert_eq!(run(&[MISSING_PROGRAM, "x"], direct), Some(1));
             }
             // A script whose last command is a program that is not there fails too.
             assert_eq!(
                 run_script(
                     shell,
-                    "& 'wsmp-no-such-program'",
+                    &format!("& '{MISSING_PROGRAM}'"),
                     None,
                     deadline(),
                     None,
@@ -894,6 +894,11 @@ mod tests {
             );
         }
     }
+
+    /// A program that is not there, by a full path: PowerShell reports a bare name it cannot find
+    /// only after searching every installed module for it (seconds per call, past the deadline
+    /// on a CI runner with many modules), and a path skips that search.
+    const MISSING_PROGRAM: &str = r"C:\wsmp-no-such-dir\wsmp-no-such-program.exe";
 
     #[test]
     fn an_exe_is_found_and_anything_else_is_left_to_the_shell() {
