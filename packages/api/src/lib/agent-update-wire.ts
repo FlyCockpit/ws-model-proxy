@@ -88,7 +88,7 @@ export const AGENT_UPDATE_DETAIL_MAX_CHARS = 4000;
 /** The dead-man deadline the server sends (`rollbackAfterSecs`). */
 export const AGENT_UPDATE_ROLLBACK_SECS_MIN = 30;
 export const AGENT_UPDATE_ROLLBACK_SECS_MAX = 600;
-export const AGENT_UPDATE_ROLLBACK_SECS_DEFAULT = 90;
+export const AGENT_UPDATE_ROLLBACK_SECS_DEFAULT = 180;
 
 /** An `agent.update` updateId: 16 random bytes, unpadded base64url. */
 export const agentUpdateIdSchema = z.string().regex(/^[A-Za-z0-9_-]{21}[AQgw]$/);

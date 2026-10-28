@@ -38,7 +38,7 @@ pub use file_info::{
 #[cfg(windows)]
 pub use host_job::{HOST_JOB_SLOTS, HostJob, in_host_job, send_ctrl_break};
 #[cfg(windows)]
-pub use memory::{MemoryStatus, memory_status};
+pub use memory::{MemoryStatus, memory_status, uptime_ms};
 
 #[cfg(windows)]
 pub use imp::{

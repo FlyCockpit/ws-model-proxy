@@ -102,6 +102,7 @@ import {
   protocolErrorMessage,
   RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+  RELAY_SELF_UPDATE_REQUIRED_MESSAGE,
   RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
   RELAY_STALE_AFTER_MS,
   RELAY_UNREGISTERED_STALE_AFTER_MS,
@@ -1586,6 +1587,18 @@ export class RelaySessionManager {
     }
 
     if (message.type === "hello") {
+      // A wsmp older than self-update: refused by capability (it could never take an update).
+      if (!session.registered && !message.features.selfUpdate) {
+        console.error("[relay] refused a hello without self-update", { code: "upgrade_cli" });
+        closeWithProtocolError(socket, "upgrade_cli", RELAY_SELF_UPDATE_REQUIRED_MESSAGE);
+        await recordRejectedNodeHello(session.identity, rejectedHelloFacts(frame), now).catch(
+          (recordError: unknown) => {
+            console.error("[relay] recording a refused hello failed", errorName(recordError));
+          },
+        );
+        await this.removeSession(socket, now);
+        return;
+      }
       await this.handleHello(session, message, now);
       return;
     }

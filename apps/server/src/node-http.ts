@@ -677,6 +677,34 @@ export function parseSha256Sum(
 
 type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
+/** The body, read only up to `max` bytes: a larger one is refused once it passes the cap. */
+async function readCapped(response: Response, max: number): Promise<Uint8Array> {
+  const declared = Number(response.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > max)
+    throw new CliManifestUnavailable("sha256.sum is too large.");
+  if (!response.body) return new Uint8Array(0);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => undefined);
+      throw new CliManifestUnavailable("sha256.sum is too large.");
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
 /** GET over https only (a redirect away from https is refused), at most 64 KiB of text. */
 async function fetchSmallText(fetchImpl: FetchLike, start: string): Promise<string> {
   let url = start;
@@ -695,10 +723,7 @@ async function fetchSmallText(fetchImpl: FetchLike, start: string): Promise<stri
       continue;
     }
     if (!response.ok) throw new CliManifestUnavailable(`sha256.sum answered ${response.status}.`);
-    const body = new Uint8Array(await response.arrayBuffer());
-    if (body.byteLength > SHA256_SUM_MAX_BYTES)
-      throw new CliManifestUnavailable("sha256.sum is too large.");
-    return new TextDecoder().decode(body);
+    return new TextDecoder().decode(await readCapped(response, SHA256_SUM_MAX_BYTES));
   }
   throw new CliManifestUnavailable("Too many redirects.");
 }

@@ -1891,6 +1891,16 @@ where
             timeout_ms,
         } => {
             // The frame rules let exactly one of `command` and `argv` through.
+            if session.update.holds_new_work() {
+                return send_control(
+                    socket,
+                    &NodeFrame::ExecRejected {
+                        command_id,
+                        reason: "updating".into(),
+                    },
+                    "refusing a command during an update",
+                );
+            }
             let line = match (&command, &argv) {
                 (Some(text), _) => ExecLine::Text(text),
                 (None, Some(argv)) => ExecLine::Argv(argv),
@@ -2055,6 +2065,23 @@ where
         exit_code: None,
         rank_idle: None,
     };
+    // About to restart into a new build: nothing new starts (the server sends
+    // a start refused this way again, without counting an attempt).
+    if session.update.holds_new_work()
+        && matches!(
+            job.phase,
+            JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin
+        )
+    {
+        return send_control(
+            socket,
+            &refusal(
+                JobError::SessionDisconnected,
+                Some("wsmp is restarting into an update".into()),
+            ),
+            "refusing a runtime step during an update",
+        );
+    }
     if let Some(operator) = &job.operator {
         use crate::sessions::OperatorDelivery;
         match session

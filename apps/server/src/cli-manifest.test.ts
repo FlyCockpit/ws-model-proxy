@@ -103,6 +103,33 @@ describe("the release manifest", () => {
     );
   });
 
+  it("stops reading a sha256.sum once it passes 64 KiB, whatever it declares", async () => {
+    const source = { kind: "release" as const, baseUrl: RELEASE };
+    let pulled = 0;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1;
+        controller.enqueue(new Uint8Array(16 * 1024).fill(0x20));
+      },
+    });
+    await expect(
+      readCliReleaseManifest(
+        source,
+        fetchStub({ [`${RELEASE}/sha256.sum`]: () => new Response(endless) }).fetchImpl,
+      ),
+    ).rejects.toBeInstanceOf(CliManifestUnavailable);
+    expect(pulled).toBeLessThan(10);
+    await expect(
+      readCliReleaseManifest(
+        source,
+        fetchStub({
+          [`${RELEASE}/sha256.sum`]: () =>
+            new Response(SUMS, { headers: { "content-length": String(1024 * 1024) } }),
+        }).fetchImpl,
+      ),
+    ).rejects.toBeInstanceOf(CliManifestUnavailable);
+  });
+
   it("fails closed: a missing sha256.sum, one with no archive, or a redirect away from https", async () => {
     const source = { kind: "release" as const, baseUrl: RELEASE };
     await expect(readCliReleaseManifest(source, fetchStub({}).fetchImpl)).rejects.toBeInstanceOf(

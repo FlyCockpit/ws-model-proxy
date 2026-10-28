@@ -54,6 +54,13 @@ export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires relay protoc
  */
 export const RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE =
   "This wsmp build does not match the server: its hello was rejected. Re-run the server's install.sh to install the matching wsmp, then restart it.";
+/**
+ * A hello without `features.selfUpdate`: a wsmp older than self-update (0.4.2 and earlier). It
+ * is refused by capability, not by a protocol bump, so a wsmp that can update itself is never
+ * turned away at hello: the server sends it the update instead (`apps/cli/docs/releasing.md`).
+ */
+export const RELAY_SELF_UPDATE_REQUIRED_MESSAGE =
+  "This server needs a newer wsmp, one that can update itself. Re-run the server's install.sh (install.ps1 on Windows), then restart wsmp.";
 export const RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE =
   "This wsmp speaks a newer relay protocol than the server. Upgrade WS Model Proxy and restart wsmp.";
 

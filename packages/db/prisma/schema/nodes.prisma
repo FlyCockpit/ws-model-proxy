@@ -350,6 +350,9 @@ model NodeAgentUpdateBatch {
   /// The wsmp version the run installs, pinned when it starts: the canary validated this
   /// release, so a server that offers another one stops the run (`release_changed`).
   targetVersion   String?
+  /// The release's archives, pinned with the version (`agentUpdateReleaseDigest`): another
+  /// build under the same version also stops the run (`release_changed`).
+  targetDigest    String?
   /// Where and why the run stopped: the update's phase (`failed`, `rolled_back`, `timed_out`,
   /// `refused`), `release_changed`, or `stopped` (by the owner).
   stoppedNodeId   String?

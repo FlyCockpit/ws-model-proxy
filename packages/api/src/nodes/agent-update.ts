@@ -24,6 +24,7 @@ import {
   advanceAgentUpdateBatch,
   agentUpdateEligibility,
   agentUpdateRefusalMessage,
+  agentUpdateReleaseDigest,
   chooseCanary,
   orderForBatch,
   parseWsl,
@@ -324,9 +325,8 @@ export const agentUpdateProcedures = {
     });
     if (running)
       throw refuse("agent_update_in_progress", "An Update all run is already in progress.");
-    const { views, candidates } = await loadOverview(userId, port, now);
-    // Pinned for the whole run: every node gets the release the canary validated.
-    const release = await port.release();
+    // One read of the release: the nodes are judged against the release the run pins.
+    const { views, candidates, release } = await loadOverview(userId, port, now);
     let canary: string | null;
     if (input.canaryNodeId !== undefined) {
       const chosen = views.find((view) => view.nodeId === input.canaryNodeId);
@@ -348,7 +348,14 @@ export const agentUpdateProcedures = {
     let batchId: string;
     try {
       const created = await prisma.nodeAgentUpdateBatch.create({
-        data: { userId, canaryNodeId: canary, nodeIds, targetVersion: release.version },
+        // Pinned for the whole run: every node gets the release the canary validated.
+        data: {
+          userId,
+          canaryNodeId: canary,
+          nodeIds,
+          targetVersion: release.version,
+          targetDigest: agentUpdateReleaseDigest(release),
+        },
         select: { id: true },
       });
       batchId = created.id;

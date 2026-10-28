@@ -170,6 +170,11 @@ export const REFUSAL_REASONS = [
    */
   "agent_update_unsupported",
   /**
+   * The browser update is not offered on the node's platform yet (it has not been verified
+   * there): run the install command on the node.
+   */
+  "agent_update_platform",
+  /**
    * The server has no release binary to offer: it builds wsmp from source, its release manifest
    * could not be read, or the release has no build for the node's target.
    */

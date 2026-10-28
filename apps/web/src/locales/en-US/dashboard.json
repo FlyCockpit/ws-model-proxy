@@ -843,6 +843,7 @@
     "agent_update_in_progress": "An update of this node, or an Update all run, is already in progress.",
     "agent_update_opted_out": "The machine's operator turned off remote updates in wsmp's config on that machine.",
     "agent_update_unsupported": "This wsmp install cannot update itself. Run the command shown on the node.",
+    "agent_update_platform": "Updates from the browser aren't offered on this node's platform yet. Run the command shown on the node.",
     "agent_update_current": "The node already runs this server's wsmp."
   },
   "models": {

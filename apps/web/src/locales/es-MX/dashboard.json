@@ -843,6 +843,7 @@
     "agent_update_in_progress": "Ya hay una actualización de este nodo, o una de Actualizar todos, en curso.",
     "agent_update_opted_out": "El operador de la máquina desactivó las actualizaciones remotas en la configuración de wsmp de esa máquina.",
     "agent_update_unsupported": "Esta instalación de wsmp no puede actualizarse sola. Ejecuta en el nodo el comando que se muestra.",
+    "agent_update_platform": "Las actualizaciones desde el navegador aún no están disponibles en la plataforma de este nodo. Ejecuta en el nodo el comando que se muestra.",
     "agent_update_current": "El nodo ya corre el wsmp de este servidor."
   },
   "models": {

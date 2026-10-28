@@ -75,6 +75,11 @@ pub fn source_command(version: &str) -> String {
     )
 }
 
+/// Why an install without a receipt is not updated: nothing says the install
+/// script put it there (a distro package or a copied binary must not be
+/// overwritten).
+pub const UNKNOWN_METHOD: &str = "wsmp cannot tell how it was installed (it has no install receipt); reinstall it once with the server's install script (`install.sh` or `install.ps1`) to allow updates";
+
 #[cfg(test)]
 mod tests {
     use super::*;

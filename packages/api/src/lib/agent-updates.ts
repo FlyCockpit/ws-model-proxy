@@ -8,7 +8,7 @@
  *
  * The relay is injected ({@link AgentUpdatePort}): the API package never imports the server.
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import prisma from "@ws-model-proxy/db";
 import type { RefusalReason } from "../contracts/refusals";
 import { effectiveTrust } from "../nodes/trust";
@@ -47,6 +47,20 @@ export type AgentUpdateRelease =
   | { kind: "source"; version: string; commit: string | null }
   /** The manifest could not be read (no `sha256.sum`, a network failure): fail closed. */
   | { kind: "unavailable"; version: string; commit: string | null };
+
+/**
+ * What identifies a release's builds: SHA-256 over its version and every target's archive
+ * checksum, in target order. `null` when the server offers no release binaries.
+ */
+export function agentUpdateReleaseDigest(release: AgentUpdateRelease): string | null {
+  if (release.kind !== "release") return null;
+  const lines = Object.keys(release.artifacts)
+    .sort()
+    .map((target) => `${target} ${release.artifacts[target]?.sha256 ?? ""}\n`);
+  return createHash("sha256")
+    .update(`${release.version}\n${lines.join("")}`)
+    .digest("hex");
+}
 
 export type AgentUpdateServerInfo = {
   version: string;
@@ -226,6 +240,33 @@ function storedSelfUpdate(features: unknown): NodeSelfUpdate | null {
   return own.success ? own.data : null;
 }
 
+/**
+ * Where the browser update is offered: each operating system with the strategy verified on a
+ * real machine there (the dead-man, the restart, the confirmation). Linux covers WSL. Add
+ * Windows (`self-replace`) and macOS (`self-replace`, `homebrew`) once they pass there: a server
+ * deploy, no new wsmp.
+ */
+export const AGENT_UPDATE_OFFERED: ReadonlyArray<{
+  os: "linux" | "macos" | "windows";
+  strategy: AgentUpdateStrategy;
+}> = [{ os: "linux", strategy: "self-replace" }];
+
+function osOf(target: string): "linux" | "macos" | "windows" | null {
+  if (target.includes("-linux-")) return "linux";
+  if (target.includes("-apple-darwin")) return "macos";
+  if (target.includes("-windows-")) return "windows";
+  return null;
+}
+
+/** Whether the browser update is offered for this build with this strategy. */
+export function agentUpdateOffered(
+  build: NodeBuild | null,
+  strategy: AgentUpdateStrategy,
+): boolean {
+  const os = build ? osOf(build.target) : null;
+  return AGENT_UPDATE_OFFERED.some((entry) => entry.os === os && entry.strategy === strategy);
+}
+
 function isWindows(row: AgentUpdateNodeRow, build: NodeBuild | null): boolean {
   if (build) return build.target.includes("windows");
   const parsed = nodeFeaturesSchema.safeParse(row.features);
@@ -280,7 +321,8 @@ export type AgentUpdateActive = { phase: AgentUpdatePhase; strategy: string } | 
  * Whether the owner may update this node now, and if not why (the first that applies):
  * in progress, already current, offline (no live session here), not Full control, the owner's
  * policy off, a wsmp without self-update (`upgrade_wsmp`), no strategy the server knows
- * (source build, pinned or foreign Homebrew), the node's operator opted out, or no release
+ * (source build, pinned or foreign Homebrew), not offered on its platform yet
+ * ({@link AGENT_UPDATE_OFFERED}), the node's operator opted out, or no release
  * artifact for its target (a source-build server, an unreadable manifest).
  */
 export function agentUpdateEligibility(input: {
@@ -319,11 +361,13 @@ export function agentUpdateEligibility(input: {
               ? "upgrade_wsmp"
               : !strategy
                 ? "agent_update_unsupported"
-                : selfUpdate.remote === "off"
-                  ? "agent_update_opted_out"
-                  : !artifact
-                    ? "agent_update_unavailable"
-                    : null;
+                : !agentUpdateOffered(build, strategy)
+                  ? "agent_update_platform"
+                  : selfUpdate.remote === "off"
+                    ? "agent_update_opted_out"
+                    : !artifact
+                      ? "agent_update_unavailable"
+                      : null;
   const homebrewFailed =
     input.latest?.strategy === "homebrew" &&
     (input.latest.phase === "timed_out" || input.latest.phase === "failed");
@@ -369,6 +413,8 @@ export function agentUpdateRefusalMessage(reason: RefusalReason, slug: string): 
       return `The wsmp on ${slug} cannot update itself yet. Run the install command on the node once.`;
     case "agent_update_unsupported":
       return `This install of wsmp on ${slug} cannot update itself. Run the shown command on the node.`;
+    case "agent_update_platform":
+      return `Browser updates are not offered on ${slug}'s platform yet. Run the install command on the node.`;
     case "agent_update_opted_out":
       return `The operator of ${slug} turned remote updates off on the node.`;
     case "agent_update_unavailable":
@@ -438,7 +484,12 @@ export async function startAgentUpdate(
     nodeId: string;
     force: boolean;
     origin: string;
-    batch?: { id: string; position: number; targetVersion?: string | null };
+    batch?: {
+      id: string;
+      position: number;
+      targetVersion?: string | null;
+      targetDigest?: string | null;
+    };
     now?: Date;
   },
 ): Promise<StartOutcome> {
@@ -462,6 +513,13 @@ export async function startAgentUpdate(
   const release = await port.release();
   // An "Update all" run installs only the release its canary validated.
   if (input.batch?.targetVersion && release.version !== input.batch.targetVersion)
+    return { kind: "release_changed" };
+  // The same version, built again (another commit, other archives): not what the canary ran.
+  if (
+    input.batch?.targetDigest &&
+    release.kind === "release" &&
+    agentUpdateReleaseDigest(release) !== input.batch.targetDigest
+  )
     return { kind: "release_changed" };
   const server = await port.server();
   const eligibility = agentUpdateEligibility({
@@ -699,6 +757,7 @@ type BatchRow = {
   currentNodeId: string | null;
   skippedNodeIds: string[];
   targetVersion: string | null;
+  targetDigest: string | null;
   updatedAt: Date;
 };
 
@@ -711,6 +770,7 @@ const BATCH_DRIVER_SELECT = {
   currentNodeId: true,
   skippedNodeIds: true,
   targetVersion: true,
+  targetDigest: true,
   updatedAt: true,
 } as const;
 
@@ -783,7 +843,12 @@ export async function advanceAgentUpdateBatch(
       nodeId,
       force: false,
       origin,
-      batch: { id: batch.id, position: batch.position, targetVersion: batch.targetVersion },
+      batch: {
+        id: batch.id,
+        position: batch.position,
+        targetVersion: batch.targetVersion,
+        targetDigest: batch.targetDigest,
+      },
       now,
     });
     if (outcome.kind === "started") return;

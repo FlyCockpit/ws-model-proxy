@@ -156,7 +156,7 @@ fn emit(json: bool, result: &UpdateResult, text: String) -> Result<()> {
     }
 }
 
-const CLI_ROLLBACK_SECS: u32 = 90;
+const CLI_ROLLBACK_SECS: u32 = 180;
 
 fn update(args: &Args) -> Result<()> {
     let config = crate::config::Config::load_required()?;
@@ -195,6 +195,7 @@ fn update(args: &Args) -> Result<()> {
             "this wsmp was built from source; run: {}",
             crate::update::source_command(&manifest.version)
         ),
+        InstallMethod::Unknown => anyhow::bail!("{}", crate::update::UNKNOWN_METHOD),
         other => anyhow::bail!(
             "this wsmp was installed with `{}`; update it the same way",
             other.as_str()
@@ -213,7 +214,8 @@ fn update(args: &Args) -> Result<()> {
     }
     let state_dir = crate::paths::state_dir()?;
     let update_dir = state_dir.join("update");
-    let _lock = state::UpdateLock::acquire(&update_dir)?
+    // Released before the restart: the new build takes it to confirm.
+    let lock = state::UpdateLock::acquire(&update_dir)?
         .context("another update is in progress on this machine")?;
     if let Some(previous) = state::load(&update_dir)?
         && previous.phase.in_progress()
@@ -237,6 +239,7 @@ fn update(args: &Args) -> Result<()> {
         scheduler: scheduler.as_deref(),
         tar: crate::update::install::system_tar(),
         current_version: current.clone(),
+        before_swap: None,
     };
 
     if identity.method == InstallMethod::Homebrew {
@@ -258,6 +261,7 @@ fn update(args: &Args) -> Result<()> {
         if !service {
             settle_without_service(&update_dir)?;
         }
+        drop(lock);
         return finish(args.json, service, &current, &manifest.version, None);
     }
 
@@ -305,6 +309,7 @@ fn update(args: &Args) -> Result<()> {
             },
         )?;
     }
+    drop(lock);
     finish(
         args.json,
         service,
@@ -413,7 +418,7 @@ fn status(json: bool) -> Result<()> {
         if report.receipt.is_some() {
             ""
         } else {
-            " (guessed: no install receipt)"
+            " (no install receipt)"
         }
     ))?;
     if let Some(binary) = &report.binary {
@@ -451,7 +456,7 @@ fn rollback(update_id: &str) -> Result<()> {
         tracing::info!(update_id, ?outcome, "update dead-man");
         match outcome {
             Rollback::NotDue(wait) => {
-                if early_run_done() {
+                if early_run_done(&update_dir) {
                     return Ok(());
                 }
                 std::thread::sleep(wait.min(Duration::from_secs(600)));
@@ -474,19 +479,27 @@ fn rollback(update_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Windows: the dead-man's early trigger only starts the relay task again
-/// after the exit 75 (Task Scheduler's `RestartOnFailure` waits a minute); the
-/// deadline trigger comes back for the check. Elsewhere the dead-man waits.
-fn early_run_done() -> bool {
+/// Windows: the dead-man's early trigger, well before the deadline job
+/// fires, only starts the relay task again after the exit 75 (Task
+/// Scheduler's `RestartOnFailure` waits a minute); the deadline trigger comes
+/// back for the check. A deadline run that finds the update not due (the new
+/// build moved the deadline, or the machine rebooted) waits, as elsewhere.
+fn early_run_done(update_dir: &std::path::Path) -> bool {
     #[cfg(windows)]
     {
-        if let Err(error) = crate::commands::service::kick_relay_task() {
+        let early = state::load(update_dir)
+            .ok()
+            .flatten()
+            .and_then(|current| current.deadman_at)
+            .is_some_and(|fires_at| crate::update::unix_now() + 3 < fires_at);
+        if early && let Err(error) = crate::commands::service::kick_relay_task() {
             tracing::warn!(error = %format!("{error:#}"), "starting the relay task failed");
         }
-        true
+        early
     }
     #[cfg(not(windows))]
     {
+        let _ = update_dir;
         false
     }
 }

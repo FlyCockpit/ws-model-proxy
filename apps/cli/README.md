@@ -395,18 +395,22 @@ start the distribution at log on if it does not.
 ## Updating
 
 The node's owner can update a Full-control node from the Nodes page (**Update**), or run `wsmp
-update` on the node. Either way wsmp installs the server's version:
+update` on the node. Either way wsmp installs the server's version. The server offers **Update**
+only on platforms where it has been verified (Linux and WSL for now); elsewhere the Nodes page
+shows the command to run on the node, and `wsmp update` there still works.
 
 1. It downloads the release archive beside the binary (never in `/tmp`), checks its SHA-256, and
    runs the new build's `--version`, which must print the server's version. Nothing changes if any
    of that fails.
 2. It keeps the current binary as `wsmp.prev`, arms a rollback job that runs `wsmp.prev` at a
-   deadline (90 s by default), puts the new binary in place and restarts the relay service (exit
-   code 75). The rollback job is a persistent systemd user timer and service
+   deadline (180 s by default), puts the new binary in place and restarts the relay service (exit
+   code 75). The window counts from the new build's start: each time it starts unconfirmed (at
+   most three times) it moves the deadline to a full window after that start, so a slow restart
+   or reconnect does not roll back a good build. The rollback job is a persistent systemd user timer and service
    (`wsmp-update-deadman.{timer,service}`, beside the relay's unit) on Linux and WSL, a one-shot
    LaunchAgent (`com.flycockpit.wsmp.update-deadman`) on macOS, and a one-shot scheduled task
-   (`wsmp-update-deadman-<user>`) on Windows. On Linux and macOS it survives a reboot during the
-   trial; the new build then gets a full window from the boot to confirm before it is rolled back.
+   (`wsmp-update-deadman-<user>`) on Windows. It survives a reboot during the trial; the new
+   build then gets a full window from the boot to confirm before it is rolled back.
 3. The new build confirms once it has connected, applied the server's definitions and stayed up
    for 30 s; it then removes the rollback job. A build that does not confirm is rolled back: the
    failed build is kept as `wsmp.failed`, the previous one returns, and the relay tells the server
@@ -426,8 +430,15 @@ update` on the node. Either way wsmp installs the server's version:
   Runtimes page, and the node installs once they have stopped), and `wsmp update` needs
   `--force` while any runs. Linux and Windows instances keep running and are adopted by the new
   relay.
+- wsmp updates itself only where it knows how it was installed: from `<state>/install.json`,
+  which this release's `install.sh` and `install.ps1` write, or from a Homebrew `Cellar` or cargo
+  path. A binary without a receipt (installed by an older script, a package or a copy) is never
+  overwritten: run the install script once to allow updates.
+- Where instances stop with the relay (macOS), the node checks again that it is idle after the
+  download, and from that check to the restart it starts no runtime launch and no node command
+  (the server sends a refused launch step again after the restart).
 - `wsmp update status [--json]` shows the build, how it was installed (from
-  `<state>/install.json`, or guessed for older installs) and the last update.
+  `<state>/install.json`, or `unknown`) and the last update.
 
 ## Other commands
 

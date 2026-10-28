@@ -17,11 +17,14 @@
 //! the name is free, so arming twice is safe. The rollback command removes
 //! the job (Linux: the unit files too) after a run.
 //!
-//! A reboot during the trial: the Linux and macOS jobs come back and the
-//! rollback check gives a build that started after the reboot a full window
-//! first. Where a job does not come back (a Windows deadline missed while the
-//! machine was off), the new binary re-arms a missing dead-man each time it
-//! starts unconfirmed (at most [`super::agent::MAX_UNCONFIRMED_STARTS`] times).
+//! The window counts from the new build's start: it moves the deadline to a
+//! full window after each unconfirmed start (at most
+//! [`super::agent::MAX_UNCONFIRMED_STARTS`]), and a job that fires before
+//! that finds the update not due and waits. A reboot during the trial: every
+//! job comes back (`Persistent=true`, `RunAtLoad`, `StartWhenAvailable`), and
+//! the rollback check gives a build that started after the reboot a full
+//! window first ([`booted_at`]). The new binary re-arms a dead-man that went
+//! missing.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -563,8 +566,8 @@ impl Scheduler for ScheduledTask {
     }
     fn running(&self) -> Result<bool> {
         let script = format!(
-            "(Get-ScheduledTask -TaskName '{}' -ErrorAction Stop).State",
-            Self::name()?
+            "(Get-ScheduledTask -TaskName {} -ErrorAction Stop).State",
+            powershell_quote(&Self::name()?)
         );
         let (_, output) = run_bounded(
             "powershell",
@@ -614,10 +617,18 @@ impl Scheduler for ScheduledTask {
     }
 }
 
-/// When this machine last started (Unix seconds), where the dead-man can come
-/// back after a reboot: Linux (`btime` in `/proc/stat`) and macOS
-/// (`kern.boottime`). `None` elsewhere: a Windows deadline missed while the
-/// machine was off does not fire, and the new build re-arms instead.
+/// `value` as a PowerShell single-quoted string (a `'` in it is doubled, as
+/// in a user name such as `O'Brien`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// When this machine last started (Unix seconds): Linux (`btime` in
+/// `/proc/stat`), macOS (`kern.boottime`) and Windows (now less the uptime).
+/// Each dead-man comes back after a reboot (`Persistent=true`, `RunAtLoad`,
+/// `StartWhenAvailable`), and the rollback check uses this to give a build
+/// that started after the reboot a full window of its own.
 pub fn booted_at() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -638,7 +649,11 @@ pub fn booted_at() -> Option<u64> {
         }
         parse_kern_boottime(&text)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        Some(super::unix_now().saturating_sub(wsmp_windows::uptime_ms() / 1000))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         None
     }
@@ -721,6 +736,14 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::FakeScheduler;
     use super::*;
+
+    #[test]
+    fn task_names_are_quoted_for_powershell() {
+        assert_eq!(
+            powershell_quote("wsmp-update-deadman-O'Brien"),
+            "'wsmp-update-deadman-O''Brien'"
+        );
+    }
 
     fn spec(id: &str) -> DeadmanSpec {
         DeadmanSpec {

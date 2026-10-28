@@ -275,6 +275,7 @@ function hello(socket: FakeSocket, slug: string, kind: CliKind, features?: CliFe
       mediaExpand: false,
       liveStt: false,
       secrets: [],
+      selfUpdate: { strategies: ["self-replace"], instancesSurvive: true, remote: "allowed" },
     },
     definitions: [],
     heldMetricCommandsHash: null,

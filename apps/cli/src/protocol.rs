@@ -4,7 +4,10 @@
 //!
 //! The server accepts exactly protocol 3.0 and so does this CLI. Server
 //! frames are parsed strictly (`deny_unknown_fields`) and then checked for
-//! the cross-field rules serde cannot express (`ServerFrame::validate`). A
+//! the cross-field rules serde cannot express (`ServerFrame::validate`),
+//! except the fields of [`OPEN_FRAMES`] this build does not know, which are
+//! dropped: the frames an update needs keep working for this build when a
+//! later server adds a field to them. A
 //! frame that fails either is classified by [`control_frame_fault`] or
 //! [`binary_frame_fault`]: it ends at most the request, terminal, command,
 //! file op or speech session it names, except a malformed model-relay frame,
@@ -88,17 +91,50 @@ pub fn encode_control(frame: &NodeFrame) -> Result<String> {
     Ok(text)
 }
 
+/// The frames a session and a self-update depend on, with the fields this
+/// build reads. A later server may add a field to them; this build drops it
+/// and goes on, so it can still connect and take the update that knows it.
+/// Every other frame keeps refusing unknown fields.
+pub const OPEN_FRAMES: &[(&str, &[&str])] = &[
+    ("hello.challenge", &["type", "nonce", "origin"]),
+    (
+        "hello.ok",
+        &["type", "id", "protocolVersion", "nodeId", "definitionSync"],
+    ),
+    ("heartbeat.pong", &["type", "id", "receivedAt"]),
+    (
+        "agent.update",
+        &[
+            "type",
+            "updateId",
+            "version",
+            "artifactUrl",
+            "sha256",
+            "signature",
+            "force",
+            "rollbackAfterSecs",
+        ],
+    ),
+];
+
 /// Parses one server control frame strictly (shape, then cross-field rules).
 pub fn parse_server_control(text: &str) -> Result<ServerFrame> {
     anyhow::ensure!(
         text.len() <= RELAY_JSON_CONTROL_MAX_BYTES,
         "JSON control frame exceeds 64 KiB"
     );
-    let value: Value = serde_json::from_str(text).context("parsing relay server control frame")?;
+    let mut value: Value =
+        serde_json::from_str(text).context("parsing relay server control frame")?;
     let type_name = value
         .get("type")
         .and_then(Value::as_str)
-        .context("relay server control frame has no type")?;
+        .context("relay server control frame has no type")?
+        .to_string();
+    if let Some((_, known)) = OPEN_FRAMES.iter().find(|(name, _)| *name == type_name)
+        && let Some(fields) = value.as_object_mut()
+    {
+        fields.retain(|field, _| known.contains(&field.as_str()));
+    }
     if type_name.starts_with("stt.")
         && let Some(config) = value.get("config")
     {
@@ -579,15 +615,44 @@ mod tests {
     }
 
     #[test]
+    fn frames_an_update_needs_take_a_later_servers_fields() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/relay-3.0/frames/server-to-node");
+        for (name, known) in OPEN_FRAMES {
+            let text = std::fs::read_to_string(dir.join(format!("{name}.json"))).expect("fixture");
+            let mut json: Value = serde_json::from_str(&text).expect("json");
+            // The list names every field this build has (the fixture has them all).
+            let fields: Vec<String> = json.as_object().expect("object").keys().cloned().collect();
+            for field in &fields {
+                assert!(
+                    known.contains(&field.as_str()),
+                    "{name}: {field} is not listed"
+                );
+            }
+            let today = parse_server_control(&text).expect("parses");
+            json["addedLater"] = serde_json::json!({ "any": ["shape"] });
+            let later = parse_server_control(&json.to_string()).expect("a later field is dropped");
+            assert_eq!(later, today, "{name}");
+        }
+    }
+
+    #[test]
     fn server_frames_are_parsed_strictly() {
         assert!(matches!(
             parse_server_control(r#"{"type":"heartbeat.pong","id":"1","receivedAt":"now"}"#),
             Ok(ServerFrame::HeartbeatPong { .. })
         ));
-        // Unknown fields and 2.x frames are refused.
+        // A later server's new field in a frame an update needs is dropped.
+        assert!(matches!(
+            parse_server_control(r#"{"type":"heartbeat.pong","id":"1","receivedAt":"now","x":1}"#),
+            Ok(ServerFrame::HeartbeatPong { .. })
+        ));
+        // Unknown fields elsewhere, and 2.x frames, are refused.
         assert!(
-            parse_server_control(r#"{"type":"heartbeat.pong","id":"1","receivedAt":"now","x":1}"#)
-                .is_err()
+            parse_server_control(
+                r#"{"type":"term.close","terminalId":"AAAAAAAAAAAAAAAAAAAAAA","x":1}"#
+            )
+            .is_err()
         );
         assert!(parse_server_control(r#"{"type":"inventory.ok","id":"1"}"#).is_err());
         // A hello.challenge without an origin (a 2.x server) is refused.

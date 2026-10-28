@@ -30,6 +30,9 @@ pub trait Progress {
     fn report(&mut self, phase: UpdatePhase, reason: Option<UpdateReason>, detail: Option<String>);
 }
 
+/// The last check before the swap: `Err` with why it must not happen now.
+pub type BeforeSwap<'a> = dyn Fn(&mut dyn Progress) -> std::result::Result<(), String> + 'a;
+
 /// The machine an update runs on.
 pub struct Machine<'a> {
     /// The node's state directory (`--state-dir` of the dead-man).
@@ -43,6 +46,10 @@ pub struct Machine<'a> {
     pub scheduler: Option<&'a dyn Scheduler>,
     pub tar: PathBuf,
     pub current_version: String,
+    /// Asked last, before anything is armed or moved: `Err` with why the swap
+    /// must not happen now (the node is busy again). The relay keeps the node
+    /// idle from a yes until it restarts.
+    pub before_swap: Option<&'a BeforeSwap<'a>>,
 }
 
 impl Machine<'_> {
@@ -216,6 +223,12 @@ fn install_files(
             );
         }
     }
+    // Last, before anything outside the staging directory changes.
+    if let Some(before_swap) = machine.before_swap
+        && let Err(why) = before_swap(progress)
+    {
+        return stop(progress, UpdatePhase::Refused, UpdateReason::Busy, why);
+    }
     if let Err(error) =
         install::stage_new(&found, layout).and_then(|()| install::prepare_prev(layout))
     {
@@ -227,7 +240,21 @@ fn install_files(
         );
     }
 
-    // The rollback copy exists before the state that names it.
+    let to_sha256 = match install::sha256_file(&layout.new) {
+        Ok(sha256) => sha256,
+        Err(error) => {
+            return stop(
+                progress,
+                UpdatePhase::Failed,
+                UpdateReason::Internal,
+                format!("{error:#}"),
+            );
+        }
+    };
+
+    // The rollback copy and `wsmp.new` exist before the state that names
+    // them; the swap takes `wsmp.new` away, which is how the dead-man knows a
+    // swap happened when the process died before it saved `swapped`.
     let update_dir = machine.update_dir();
     let mut current = UpdateState {
         update_id: request.update_id.clone(),
@@ -235,11 +262,15 @@ fn install_files(
         strategy: UpdateStrategy::SelfReplace,
         from_version: machine.current_version.clone(),
         to_version: request.version.clone(),
+        to_sha256: Some(to_sha256),
         live_path: layout.live.clone(),
         prev_path: layout.prev.clone(),
         failed_path: layout.failed.clone(),
         rollback_after_secs: request.rollback_after_secs,
         deadline: super::unix_now() + u64::from(request.rollback_after_secs),
+        deadman_at: machine
+            .scheduler
+            .map(|_| super::unix_now() + u64::from(request.rollback_after_secs)),
         attempts: 0,
         phase: Phase::Armed,
         reason: None,
@@ -304,17 +335,23 @@ fn install_files(
 /// confirms it after the restart (no dead-man: D10).
 pub fn record_homebrew(machine: &Machine<'_>, request: &Request) -> Result<()> {
     let now = super::unix_now();
+    // `opt/wsmp` now leads to the new keg's binary.
+    let to_sha256 = std::fs::canonicalize(&machine.live)
+        .ok()
+        .and_then(|binary| install::sha256_file(&binary).ok());
     let current = UpdateState {
         update_id: request.update_id.clone(),
         origin: request.origin,
         strategy: UpdateStrategy::Homebrew,
         from_version: machine.current_version.clone(),
         to_version: request.version.clone(),
+        to_sha256,
         live_path: machine.live.clone(),
         prev_path: machine.live.clone(),
         failed_path: machine.live.clone(),
         rollback_after_secs: request.rollback_after_secs,
         deadline: now + u64::from(request.rollback_after_secs),
+        deadman_at: None,
         attempts: 0,
         phase: Phase::Swapped,
         reason: None,
@@ -325,6 +362,15 @@ pub fn record_homebrew(machine: &Machine<'_>, request: &Request) -> Result<()> {
     state::save(&machine.update_dir(), &current)
 }
 
+/// How long the dead-man, a confirming build and a starting relay wait for
+/// the update lock before they look again later.
+#[cfg(not(test))]
+pub const LOCK_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub const LOCK_WAIT: Duration = Duration::from_millis(200);
+/// The dead-man's next look when an install or a confirmation holds the lock.
+const LOCKED_RETRY: Duration = Duration::from_secs(5);
+
 /// One look of the dead-man at the update.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rollback {
@@ -332,7 +378,8 @@ pub enum Rollback {
     NotOurs,
     /// Confirmed, already rolled back, or failed.
     Settled,
-    /// Not due yet.
+    /// Not due yet, or the lock is held (an install still running past the
+    /// deadline, or a confirmation): look again after this.
     NotDue(Duration),
     /// The update never swapped; it is marked failed and nothing moved.
     NeverSwapped,
@@ -342,15 +389,35 @@ pub enum Rollback {
     NoCopy,
 }
 
+/// The files of `current`'s update.
+fn layout_of(current: &UpdateState) -> Result<Layout> {
+    Ok(Layout {
+        live: current.live_path.clone(),
+        prev: current.prev_path.clone(),
+        failed: current.failed_path.clone(),
+        ..Layout::beside(&current.live_path, &current.update_id)?
+    })
+}
+
+/// Whether the swap began: it takes `wsmp.new` away (and on Windows moves
+/// the live binary aside first). An `armed` state with either gone is a swap
+/// whose `swapped` was never saved.
+fn swap_began(layout: &Layout) -> bool {
+    std::fs::symlink_metadata(&layout.new).is_err()
+        || std::fs::symlink_metadata(&layout.live).is_err()
+}
+
 /// The dead-man's check: roll back `update_id` if it is due and still
 /// unconfirmed. `log_tail` is the failed build's log, kept for the report.
 ///
-/// Nothing happens before the deadline, in any phase: a job that starts at
-/// once (macOS `RunAtLoad`) must not take an update that is still being
-/// installed (`Armed`) for an abandoned one. `booted_at` (Unix seconds) is when
-/// the machine last started: after a reboot during the trial, the deadline is
-/// a full window after the boot, so a build that comes up after the reboot can
-/// still confirm before a dead-man that fires at boot rolls it back.
+/// It holds the update lock, so a confirmation cannot land while it rolls
+/// back (nor an install still running). Nothing happens before the deadline,
+/// in any phase: a job that starts at once (macOS `RunAtLoad`) must not take
+/// an update that is still being installed (`Armed`) for an abandoned one.
+/// `booted_at` (Unix seconds) is when the machine last started: after a
+/// reboot during the trial, the deadline is a full window after the boot, so
+/// a build that comes up after the reboot can still confirm before a dead-man
+/// that fires at boot rolls it back.
 pub fn rollback_if_unconfirmed(
     update_dir: &Path,
     update_id: &str,
@@ -358,16 +425,16 @@ pub fn rollback_if_unconfirmed(
     booted_at: Option<u64>,
     log_tail: impl FnOnce() -> Option<String>,
 ) -> Result<Rollback> {
+    let Some(_lock) = state::UpdateLock::wait(update_dir, LOCK_WAIT)? else {
+        return Ok(Rollback::NotDue(LOCKED_RETRY));
+    };
     let Some(mut current) = state::load(update_dir)? else {
         return Ok(Rollback::NotOurs);
     };
     if current.update_id != update_id {
         return Ok(Rollback::NotOurs);
     }
-    if matches!(
-        current.phase,
-        Phase::Confirmed | Phase::RolledBack | Phase::Failed
-    ) {
+    if !current.phase.in_progress() {
         return Ok(Rollback::Settled);
     }
     let window = u64::from(current.rollback_after_secs);
@@ -380,27 +447,20 @@ pub fn rollback_if_unconfirmed(
     if now + 1 < due {
         return Ok(Rollback::NotDue(Duration::from_secs(due - now)));
     }
-    match current.phase {
-        Phase::Confirmed | Phase::RolledBack | Phase::Failed => return Ok(Rollback::Settled),
-        // Still armed at the deadline: the installer stopped before the swap.
-        Phase::Armed => {
+    let layout = layout_of(&current)?;
+    if current.phase == Phase::Armed {
+        if !swap_began(&layout) {
+            // Still armed at the deadline: the installer stopped before the swap.
             current.fail(
                 UpdateReason::Internal,
                 "the update stopped before the swap; nothing was changed",
             )?;
             state::save(update_dir, &current)?;
-            let _ =
-                std::fs::remove_file(Layout::beside(&current.live_path, &current.update_id)?.new);
+            let _ = std::fs::remove_file(&layout.new);
             return Ok(Rollback::NeverSwapped);
         }
-        Phase::Swapped => {}
+        current.advance(Phase::Swapped)?;
     }
-    let layout = Layout {
-        live: current.live_path.clone(),
-        prev: current.prev_path.clone(),
-        failed: current.failed_path.clone(),
-        ..Layout::beside(&current.live_path, &current.update_id)?
-    };
     if !install::restore(&layout)? {
         current.fail(
             UpdateReason::Internal,
@@ -415,26 +475,41 @@ pub fn rollback_if_unconfirmed(
     Ok(Rollback::RolledBack)
 }
 
-/// The new binary has met every condition: record `confirmed`, disarm the
-/// dead-man and write the install receipt. The confirmed state, when it was
-/// this binary's update.
+/// How a confirmation ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirm {
+    /// Recorded `confirmed`.
+    Confirmed(Box<UpdateState>),
+    /// The dead-man rolled this build back first: it is no longer the live
+    /// binary, so the relay restarts into the one that is.
+    RolledBack,
+    /// Another update owns the state, or it ended some other way.
+    NotOurs,
+}
+
+/// The new binary of `update_id` has met every condition: record
+/// `confirmed`, disarm the dead-man and write the install receipt, all under
+/// the update lock. An error (the lock is held) is tried again later.
 pub fn confirm(
     update_dir: &Path,
     scheduler: Option<&dyn Scheduler>,
-    current_version: &str,
+    update_id: &str,
     receipt: impl FnOnce(&UpdateState) -> Option<super::receipt::InstallReceipt>,
-) -> Result<Option<UpdateState>> {
-    let Some(mut current) = state::load(update_dir)? else {
-        return Ok(None);
+) -> Result<Confirm> {
+    let Some(_lock) = state::UpdateLock::wait(update_dir, LOCK_WAIT)? else {
+        anyhow::bail!("the update state is locked");
     };
-    if current.to_version != current_version {
-        return Ok(None);
+    let Some(mut current) = state::load(update_dir)? else {
+        return Ok(Confirm::NotOurs);
+    };
+    if current.update_id != update_id {
+        return Ok(Confirm::NotOurs);
     }
-    if current.phase == Phase::Armed {
-        current.advance(Phase::Swapped)?;
-    }
-    if current.phase != Phase::Swapped {
-        return Ok(None);
+    match current.phase {
+        Phase::Armed => current.advance(Phase::Swapped)?,
+        Phase::Swapped => {}
+        Phase::RolledBack => return Ok(Confirm::RolledBack),
+        Phase::Confirmed | Phase::Failed => return Ok(Confirm::NotOurs),
     }
     current.advance(Phase::Confirmed)?;
     state::save(update_dir, &current)?;
@@ -454,7 +529,7 @@ pub fn confirm(
     if let Ok(layout) = Layout::beside(&current.live_path, &current.update_id) {
         let _ = std::fs::remove_file(layout.retired);
     }
-    Ok(Some(current))
+    Ok(Confirm::Confirmed(Box::new(current)))
 }
 
 /// What a starting relay does about the update state.
@@ -470,16 +545,32 @@ pub enum OnStart {
     RolledBackSelf,
 }
 
-/// Look at the update state when the relay starts. A new binary that is
-/// still unconfirmed counts the start, re-arms a dead-man that a reboot
-/// lost, and rolls itself back after `max_starts` unconfirmed starts.
+/// The build that is starting: its version and the SHA-256 of its binary.
+#[derive(Debug, Clone, Copy)]
+pub struct Running<'a> {
+    pub version: &'a str,
+    /// `None` when the binary could not be read: the version decides then.
+    pub sha256: Option<&'a str>,
+}
+
+/// Look at the update state when the relay starts, under the update lock. A
+/// new build that is still unconfirmed counts the start, gives itself a full
+/// window from now (the restart, the reconnect and the definition sync do not
+/// eat into it), re-arms a dead-man that went missing, and rolls itself back
+/// after `max_starts` unconfirmed starts.
 pub fn on_start(
     update_dir: &Path,
     scheduler: Option<&dyn Scheduler>,
-    current_version: &str,
+    running: Running<'_>,
     max_starts: u32,
     now: u64,
 ) -> Result<OnStart> {
+    if !state::path(update_dir).exists() {
+        return Ok(OnStart::Nothing);
+    }
+    let Some(_lock) = state::UpdateLock::wait(update_dir, LOCK_WAIT)? else {
+        anyhow::bail!("the update state is locked");
+    };
     let Some(mut current) = state::load(update_dir)? else {
         return Ok(OnStart::Nothing);
     };
@@ -490,20 +581,23 @@ pub fn on_start(
             OnStart::Nothing
         });
     }
-    if current.to_version != current_version {
+    if !current.is_new_build(running.version, running.sha256) {
         // This is not the new build: the swap did not happen or did not take.
-        let why = if current.phase == Phase::Armed {
+        let layout = layout_of(&current)?;
+        let why = if current.phase == Phase::Armed && !swap_began(&layout) {
+            let _ = std::fs::remove_file(&layout.new);
             "the update stopped before the swap; nothing was changed".to_string()
+        } else if current.to_version == running.version {
+            format!(
+                "a different build of wsmp {} started instead of the new one",
+                running.version
+            )
         } else {
             format!(
-                "wsmp {current_version} started instead of {}",
-                current.to_version
+                "wsmp {} started instead of {}",
+                running.version, current.to_version
             )
         };
-        if current.phase == Phase::Armed {
-            let _ =
-                std::fs::remove_file(Layout::beside(&current.live_path, &current.update_id)?.new);
-        }
         current.fail(UpdateReason::Internal, why)?;
         state::save(update_dir, &current)?;
         if let Some(scheduler) = scheduler {
@@ -524,16 +618,12 @@ pub fn on_start(
         return Ok(OnStart::AwaitConfirm(current));
     }
     if current.attempts > max_starts {
-        let layout = Layout {
-            live: current.live_path.clone(),
-            prev: current.prev_path.clone(),
-            failed: current.failed_path.clone(),
-            ..Layout::beside(&current.live_path, &current.update_id)?
-        };
+        let layout = layout_of(&current)?;
         if install::restore(&layout)? {
             current.advance(Phase::RolledBack)?;
             current.detail = Some(format!(
-                "wsmp {current_version} started {max_starts} times without confirming"
+                "wsmp {} started {max_starts} times without confirming",
+                running.version
             ));
             state::save(update_dir, &current)?;
             if let Some(scheduler) = scheduler {
@@ -542,11 +632,16 @@ pub fn on_start(
             return Ok(OnStart::RolledBackSelf);
         }
     }
+    // The window counts from this start: a dead-man that fires at the old
+    // deadline finds the update not due and waits.
+    current.deadline = current
+        .deadline
+        .max(now + u64::from(current.rollback_after_secs));
     if let Some(scheduler) = scheduler
         && current.attempts <= max_starts
         && !scheduler.present().unwrap_or(true)
     {
-        // A reboot dropped the dead-man (systemd's timer is transient).
+        // The dead-man went missing (removed by hand, or a task that expired).
         let spec = DeadmanSpec {
             update_id: current.update_id.clone(),
             prev: current.prev_path.clone(),
@@ -557,7 +652,7 @@ pub fn on_start(
             fire_in: Duration::from_secs(u64::from(current.rollback_after_secs)),
         };
         match super::deadman::arm(scheduler, &spec, super::deadman::ARM_WAIT) {
-            Ok(()) => current.deadline = now + u64::from(current.rollback_after_secs),
+            Ok(()) => current.deadman_at = Some(now + u64::from(current.rollback_after_secs)),
             Err(error) => tracing::warn!(
                 error = %format!("{error:#}"),
                 "re-arming the update dead-man failed"
@@ -681,10 +776,15 @@ mod tests {
                 scheduler: Some(&self.scheduler),
                 tar: install::system_tar(),
                 current_version: "0.4.2".into(),
+                before_swap: None,
             }
         }
         fn live_text(&self) -> String {
             std::fs::read_to_string(&self.live).expect("live")
+        }
+        #[cfg(unix)]
+        fn live_sha(&self) -> String {
+            install::sha256_file(&self.live).expect("hash")
         }
         fn untouched(&self) {
             assert!(self.live_text().contains("0.4.2"));
@@ -695,6 +795,21 @@ mod tests {
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
                 .collect();
             assert_eq!(names, ["wsmp"], "leftovers");
+        }
+    }
+
+    /// The old build starting (its hash does not matter once the update ended).
+    #[cfg(unix)]
+    const OLD_BUILD: Running<'static> = Running {
+        version: "0.4.2",
+        sha256: None,
+    };
+
+    #[cfg(unix)]
+    fn new_build(sha256: &str) -> Running<'_> {
+        Running {
+            version: "0.4.3",
+            sha256: Some(sha256),
         }
     }
 
@@ -755,13 +870,26 @@ mod tests {
         );
 
         // The new binary starts: it awaits confirmation, the dead-man stays.
-        let start =
-            on_start(&node.update_dir(), Some(&node.scheduler), "0.4.3", 3, 0).expect("start");
+        assert_eq!(saved.to_sha256.as_deref(), Some(node.live_sha().as_str()));
+        let start = on_start(
+            &node.update_dir(),
+            Some(&node.scheduler),
+            new_build(&node.live_sha()),
+            3,
+            0,
+        )
+        .expect("start");
         assert!(matches!(start, OnStart::AwaitConfirm(ref s) if s.attempts == 1));
         assert_eq!(*node.scheduler.registrations.borrow(), 1);
-        let confirmed = confirm(&node.update_dir(), Some(&node.scheduler), "0.4.3", |_| None)
-            .expect("confirm")
-            .expect("ours");
+        let Confirm::Confirmed(confirmed) = confirm(
+            &node.update_dir(),
+            Some(&node.scheduler),
+            &saved.update_id,
+            |_| None,
+        )
+        .expect("confirm") else {
+            panic!("not confirmed");
+        };
         assert_eq!(confirmed.phase, Phase::Confirmed);
         assert!(confirmed.needs_report());
         assert!(node.scheduler.registered.borrow().is_none(), "disarmed");
@@ -917,7 +1045,7 @@ mod tests {
         );
         // The old binary starts and reports the rollback with the log tail.
         let start =
-            on_start(&node.update_dir(), Some(&node.scheduler), "0.4.2", 3, 0).expect("start");
+            on_start(&node.update_dir(), Some(&node.scheduler), OLD_BUILD, 3, 0).expect("start");
         let OnStart::Report(report) = start else {
             panic!("expected a report, got {start:?}");
         };
@@ -945,25 +1073,49 @@ mod tests {
     #[test]
     fn a_crash_looping_build_rolls_itself_back_and_a_lost_dead_man_is_re_armed() {
         let (node, saved) = swapped_node();
-        // A reboot dropped the transient timer: the first start re-arms it.
+        // The dead-man went missing: the first start re-arms it.
         *node.scheduler.registered.borrow_mut() = None;
-        let first =
-            on_start(&node.update_dir(), Some(&node.scheduler), "0.4.3", 2, 1_000).expect("start");
+        let sha = node.live_sha();
+        let first_at = saved.deadline + 10;
+        let first = on_start(
+            &node.update_dir(),
+            Some(&node.scheduler),
+            new_build(&sha),
+            2,
+            first_at,
+        )
+        .expect("start");
         assert!(matches!(first, OnStart::AwaitConfirm(_)));
         assert!(node.scheduler.registered.borrow().is_some());
         let rearmed = state::load(&node.update_dir())
             .expect("load")
             .expect("state");
+        // The window counts from the start.
         assert_eq!(
             rearmed.deadline,
-            1_000 + u64::from(saved.rollback_after_secs)
+            first_at + u64::from(saved.rollback_after_secs)
         );
+        assert_eq!(rearmed.deadman_at, rearmed.deadline.into());
         assert!(matches!(
-            on_start(&node.update_dir(), Some(&node.scheduler), "0.4.3", 2, 1_005).expect("start"),
+            on_start(
+                &node.update_dir(),
+                Some(&node.scheduler),
+                new_build(&sha),
+                2,
+                first_at + 5
+            )
+            .expect("start"),
             OnStart::AwaitConfirm(_)
         ));
         assert_eq!(
-            on_start(&node.update_dir(), Some(&node.scheduler), "0.4.3", 2, 1_010).expect("start"),
+            on_start(
+                &node.update_dir(),
+                Some(&node.scheduler),
+                new_build(&sha),
+                2,
+                first_at + 10
+            )
+            .expect("start"),
             OnStart::RolledBackSelf
         );
         assert!(node.live_text().contains("0.4.2"));
@@ -1036,14 +1188,20 @@ mod tests {
         let mut armed = state::sample(node.live.parent().expect("bin"), Phase::Armed);
         armed.live_path = node.live.clone();
         state::save(&node.update_dir(), &armed).expect("save");
+        let new = Layout::beside(&armed.live_path, &armed.update_id)
+            .expect("layout")
+            .new;
+        std::fs::write(&new, b"new build").expect("staged");
         let start =
-            on_start(&node.update_dir(), Some(&node.scheduler), "0.4.2", 3, 0).expect("start");
+            on_start(&node.update_dir(), Some(&node.scheduler), OLD_BUILD, 3, 0).expect("start");
         let OnStart::Report(report) = start else {
             panic!("expected a report, got {start:?}");
         };
         assert_eq!(report.phase, Phase::Failed);
         assert!(node.live_text().contains("0.4.2"));
+        assert!(!new.exists(), "the staged build is removed");
         // The dead-man for an update that never swapped moves nothing.
+        std::fs::write(&new, b"new build").expect("staged");
         state::save(&node.update_dir(), &armed).expect("save");
         assert_eq!(
             rollback_if_unconfirmed(
@@ -1057,6 +1215,148 @@ mod tests {
             Rollback::NeverSwapped
         );
         assert!(node.live_text().contains("0.4.2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_swap_whose_state_was_never_saved_is_still_rolled_back() {
+        // The installer died between the swap and saving `swapped`.
+        let (node, mut saved) = swapped_node();
+        saved.phase = Phase::Armed;
+        state::save(&node.update_dir(), &saved).expect("save");
+        let due = rollback_if_unconfirmed(
+            &node.update_dir(),
+            &saved.update_id,
+            saved.deadline,
+            None,
+            || None,
+        )
+        .expect("due");
+        assert_eq!(due, Rollback::RolledBack);
+        assert!(node.live_text().contains("0.4.2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_rolled_back_first_never_confirms() {
+        let (node, saved) = swapped_node();
+        assert_eq!(
+            rollback_if_unconfirmed(
+                &node.update_dir(),
+                &saved.update_id,
+                saved.deadline,
+                None,
+                || None
+            )
+            .expect("due"),
+            Rollback::RolledBack
+        );
+        assert_eq!(
+            confirm(&node.update_dir(), None, &saved.update_id, |_| None).expect("confirm"),
+            Confirm::RolledBack
+        );
+        assert_eq!(
+            state::load(&node.update_dir())
+                .expect("load")
+                .expect("state")
+                .phase,
+            Phase::RolledBack
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_keeps_the_dead_man_and_a_confirmation_apart() {
+        let (node, saved) = swapped_node();
+        let held = state::UpdateLock::acquire(&node.update_dir())
+            .expect("lock")
+            .expect("free");
+        assert_eq!(
+            rollback_if_unconfirmed(
+                &node.update_dir(),
+                &saved.update_id,
+                saved.deadline,
+                None,
+                || None
+            )
+            .expect("locked"),
+            Rollback::NotDue(LOCKED_RETRY)
+        );
+        assert!(confirm(&node.update_dir(), None, &saved.update_id, |_| None).is_err());
+        assert!(node.live_text().contains("0.4.3"), "nothing moved");
+        drop(held);
+        assert!(matches!(
+            confirm(&node.update_dir(), None, &saved.update_id, |_| None).expect("confirm"),
+            Confirm::Confirmed(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_build_of_the_same_version_is_not_the_update() {
+        // The install stopped before the swap; the old build has the same version.
+        let (node, saved) = swapped_node();
+        let other = on_start(
+            &node.update_dir(),
+            Some(&node.scheduler),
+            new_build(&"0".repeat(64)),
+            3,
+            0,
+        )
+        .expect("start");
+        let OnStart::Report(report) = other else {
+            panic!("expected a report, got {other:?}");
+        };
+        assert_eq!(report.update_id, saved.update_id);
+        assert_eq!(report.phase, Phase::Failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_window_counts_from_the_new_builds_start() {
+        let (node, saved) = swapped_node();
+        let window = u64::from(saved.rollback_after_secs);
+        // A slow restart: the new build starts just before the first deadline.
+        let started = saved.deadline - 1;
+        on_start(
+            &node.update_dir(),
+            Some(&node.scheduler),
+            new_build(&node.live_sha()),
+            3,
+            started,
+        )
+        .expect("start");
+        assert_eq!(
+            rollback_if_unconfirmed(
+                &node.update_dir(),
+                &saved.update_id,
+                saved.deadline,
+                None,
+                || None
+            )
+            .expect("first deadline"),
+            Rollback::NotDue(Duration::from_secs(window - 1))
+        );
+        assert!(node.live_text().contains("0.4.3"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_node_busy_again_before_the_swap_is_left_alone() {
+        let node = Node::new();
+        let archive = archive_with("#!/bin/sh\necho 'wsmp 0.4.3'\n");
+        let url = serve(archive.clone());
+        let busy = |_: &mut dyn Progress| Err("an instance started".to_string());
+        let machine = Machine {
+            before_swap: Some(&busy),
+            ..node.machine()
+        };
+        let mut progress = Recorded::default();
+        let ended = self_replace(&machine, &request(url, sha(&archive)), &mut progress);
+        assert_eq!(ended, Ended::Stopped);
+        assert_eq!(progress.last_reason(), Some(UpdateReason::Busy));
+        node.untouched();
+        assert_eq!(state::load(&node.update_dir()).expect("load"), None);
     }
 
     #[test]

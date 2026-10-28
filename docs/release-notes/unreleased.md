@@ -6,12 +6,19 @@ Fold these into `docs/release-notes/X.Y.Z.md` when the release is cut
 ## Every node must be upgraded
 
 This release does not work with `wsmp` 0.4.2 or older. Upgrade the server first, then every
-node. The relay protocol is now 3.1: the server refuses a 3.0 agent when it connects, with a
-message to upgrade, and the agent stops instead of restarting every few seconds. The Nodes page
-shows such a node as needing an upgrade. Older agents do not "remain compatible", whatever the
-0.4.2 notes said about earlier releases.
+node. The relay protocol stays 3.0, but the server refuses an agent that cannot update itself
+(its hello has no `features.selfUpdate`: 0.4.2 and older) when it connects, with a message to
+re-run the install script. The Nodes page shows such a node as needing an upgrade. Older agents
+do not "remain compatible", whatever the 0.4.2 notes said about earlier releases. An old agent
+under its systemd unit stops; one under launchd or Task Scheduler keeps retrying, at most every
+5 minutes, until it is upgraded.
 
-Upgrade each node with the command for its platform, then restart its service:
+This is the last upgrade done by hand: from this release on, the server never turns away an
+agent that can update itself, and updates it from the Nodes page instead.
+
+Upgrade each node with the command for its platform, then restart its service. Use the install
+script even on a node that has wsmp: it writes the install receipt (below), without which wsmp
+does not update itself.
 
 - Linux and macOS (installed with the script): `curl -fsSL <server>/install.sh | sh`
 - Windows: `irm <server>/install.ps1 | iex`
@@ -107,13 +114,26 @@ the new `agent.update` frame).
 - `/install.sh` and `/install.ps1` now write an install receipt, `install.json` in the node's
   state directory (`~/.local/state/ws-model-proxy`, `%LOCALAPPDATA%\ws-model-proxy`, or
   `WSMP_STATE_DIR`), so the node knows how it was installed.
+- **Update** is offered only for Linux nodes (WSL included) for now. Windows and macOS nodes show
+  the command to run on the node, and `wsmp update` works there; the server will offer them
+  once the update has been verified on those platforms (a server deploy, no new wsmp).
+- wsmp updates itself only where it knows how it was installed: this release's install receipt,
+  a Homebrew `Cellar` path, or a cargo install. A binary without one (installed by an older
+  script, a package or a copy) is never overwritten.
+- The rollback window is 180 s by default and counts from the new build's start, so a slow
+  restart or reconnect does not roll back a good build. A reboot during the trial gives the new
+  build a full window after the boot, on every platform.
+- wsmp now ignores fields it does not know in `hello.challenge`, `hello.ok`, `heartbeat.pong`
+  and `agent.update`, so a later server can add one without cutting this release off.
 - New procedures `nodes.agentUpdate.{overview,start,startAll,stopAll,setPolicy}`: people only
   (the owner's own browser session; never agents, MCP or an admin), not MCP tools.
   "Update all" updates a canary first, then the rest one at a time, and stops at the first
-  node that does not confirm. Runs are kept in the database, so a server restart resumes them.
+  node that does not confirm. It installs only the release the canary ran (its version and
+  every archive's checksum), and stops if the server starts offering another. Runs are kept in the database, so a server restart resumes them.
 - Database: additive (`db push` safe). `node` gains `cliBuild`, `environment` and
   `agentUpdatePolicy` (default `ALLOWED`); new tables `node_agent_update` and
-  `node_agent_update_batch`, with two partial unique indexes in the schema hardening.
+  `node_agent_update_batch` (with `targetVersion` and `targetDigest`), with two partial unique
+  indexes in the schema hardening.
 
 ## Upgrading: stop runtime instances first
 

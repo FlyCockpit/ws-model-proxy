@@ -109,6 +109,12 @@ pub fn check_gate(gate: &Gate, version: &str) -> Result<UpdateStrategy, (UpdateR
         InstallMethod::Source => {
             return Err((UpdateReason::SourceBuild, super::source_command(version)));
         }
+        InstallMethod::Unknown => {
+            return Err((
+                UpdateReason::UnsupportedMethod,
+                super::UNKNOWN_METHOD.into(),
+            ));
+        }
         other => {
             return Err((
                 UpdateReason::UnsupportedMethod,
@@ -179,10 +185,12 @@ struct Shared {
     /// The owner forced the update (`force`): the server stops the instances
     /// through its own stop operations; node commands are not waited for.
     force: AtomicBool,
+    /// From the last idle check to the restart: the relay starts no runtime
+    /// launch and no node command, so the node stays idle.
+    hold: AtomicBool,
 }
 
 struct Worker {
-    update_id: String,
     rx: Receiver<Event>,
     shared: Arc<Shared>,
 }
@@ -214,6 +222,11 @@ pub struct DaemonUpdate {
     /// Progress frames that wait for a registered session.
     outbox: Vec<NodeFrame>,
     restart: bool,
+    /// The update this relay is installing or has installed (a repeat of its
+    /// `agent.update` is never refused).
+    current_id: Option<String>,
+    /// SHA-256 of this binary, read at start while an update is in flight.
+    own_sha256: Option<String>,
 }
 
 impl DaemonUpdate {
@@ -230,15 +243,27 @@ impl DaemonUpdate {
             worker: None,
             outbox: Vec::new(),
             restart: false,
+            current_id: None,
+            own_sha256: None,
         };
         let Ok(update_dir) = super::update_dir() else {
             return Ok(tracker);
         };
+        if state::load(&update_dir)
+            .ok()
+            .flatten()
+            .is_some_and(|current| current.phase.in_progress())
+        {
+            tracker.own_sha256 = own_sha256();
+        }
         let scheduler = super::deadman::platform();
         match flow::on_start(
             &update_dir,
             scheduler.as_deref(),
-            super::build::version(),
+            flow::Running {
+                version: super::build::version(),
+                sha256: tracker.own_sha256.as_deref(),
+            },
             MAX_UNCONFIRMED_STARTS,
             super::unix_now(),
         ) {
@@ -250,6 +275,7 @@ impl DaemonUpdate {
                     attempt = state.attempts,
                     "this build is an update that has not confirmed yet"
                 );
+                tracker.current_id = Some(state.update_id.clone());
                 tracker.awaiting = Some(state);
             }
             Ok(OnStart::Report(state)) => tracker.report = Some(state),
@@ -281,15 +307,16 @@ impl DaemonUpdate {
                 Some(detail),
             )]
         };
-        if let Some(worker) = &self.worker {
-            // The same update, forced while it waits: stop the instances, go on.
-            if worker.update_id == frame.update_id
-                && frame.force
-                && worker.shared.waiting.load(Ordering::SeqCst)
-            {
-                worker.shared.force.store(true, Ordering::SeqCst);
-                return Vec::new();
-            }
+        let recorded = || {
+            super::update_dir()
+                .ok()
+                .and_then(|dir| state::load(&dir).ok().flatten())
+                .is_some_and(|current| current.update_id == frame.update_id)
+        };
+        if self.current_id.as_deref() == Some(frame.update_id.as_str()) || recorded() {
+            return self.repeat(&frame);
+        }
+        if self.worker.is_some() {
             return refuse(
                 UpdateReason::InProgress,
                 "another update is in progress on this node".into(),
@@ -332,11 +359,8 @@ impl DaemonUpdate {
             });
         match spawned {
             Ok(_) => {
-                self.worker = Some(Worker {
-                    update_id,
-                    rx,
-                    shared,
-                });
+                self.current_id = Some(update_id);
+                self.worker = Some(Worker { rx, shared });
                 Vec::new()
             }
             Err(error) => refuse(
@@ -344,6 +368,37 @@ impl DaemonUpdate {
                 format!("starting the update: {error}"),
             ),
         }
+    }
+
+    /// A repeat of the update this relay owns: a late `force` reaches a worker
+    /// that still waits for idleness; an update that ended is reported again;
+    /// otherwise nothing (the progress already on its way says it).
+    fn repeat(&mut self, frame: &UpdateFrame) -> Vec<NodeFrame> {
+        if let Some(worker) = &self.worker {
+            if frame.force {
+                worker.shared.force.store(true, Ordering::SeqCst);
+            }
+            return Vec::new();
+        }
+        if self.awaiting.is_some() || self.restart {
+            return Vec::new();
+        }
+        super::update_dir()
+            .ok()
+            .and_then(|dir| state::load(&dir).ok().flatten())
+            .filter(|current| current.update_id == frame.update_id && !current.phase.in_progress())
+            .map(|current| vec![report_frame(&current)])
+            .unwrap_or_default()
+    }
+
+    /// From the last idle check to the restart into a new build: start no
+    /// runtime launch and no node command (they would end at the restart).
+    pub fn holds_new_work(&self) -> bool {
+        self.restart
+            || self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.shared.hold.load(Ordering::SeqCst))
     }
 
     /// The worker waits for the node to go idle: the relay loop reports idleness.
@@ -441,7 +496,7 @@ impl DaemonUpdate {
         let result = flow::confirm(
             &update_dir,
             scheduler.as_deref(),
-            super::build::version(),
+            &awaiting.update_id,
             |confirmed| {
                 let identity = super::build::identity();
                 Some(super::receipt::InstallReceipt {
@@ -455,7 +510,7 @@ impl DaemonUpdate {
             },
         );
         match result {
-            Ok(Some(confirmed)) => {
+            Ok(flow::Confirm::Confirmed(confirmed)) => {
                 tracing::info!(
                     update_id = confirmed.update_id,
                     from = confirmed.from_version,
@@ -465,7 +520,15 @@ impl DaemonUpdate {
                     self.outbox.push(report_frame(&confirmed));
                 }
             }
-            Ok(None) => tracing::warn!(
+            Ok(flow::Confirm::RolledBack) => {
+                // The previous build is live again and reports the rollback.
+                tracing::warn!(
+                    update_id = awaiting.update_id,
+                    "the update rolled back before it confirmed; restarting into the previous wsmp"
+                );
+                self.restart = true;
+            }
+            Ok(flow::Confirm::NotOurs) => tracing::warn!(
                 update_id = awaiting.update_id,
                 "the update state changed before it confirmed"
             ),
@@ -495,6 +558,9 @@ impl DaemonUpdate {
         let Ok(update_dir) = super::update_dir() else {
             return;
         };
+        let Ok(Some(_lock)) = state::UpdateLock::wait(&update_dir, flow::LOCK_WAIT) else {
+            return;
+        };
         if let Ok(Some(mut current)) = state::load(&update_dir)
             && &current.update_id == update_id
             && !current.reported
@@ -508,7 +574,7 @@ impl DaemonUpdate {
 /// Wait (bounded) until the node is idle: no instance runs and, unless the
 /// update is forced, no node command. A forced update's instances are stopped
 /// by the server. `false` when it did not go idle in time.
-fn wait_idle(shared: &Shared, sink: &mut Sink, limit: Duration) -> bool {
+fn wait_idle(shared: &Shared, progress: &mut dyn Progress, limit: Duration) -> bool {
     let idle = || {
         shared.no_instances.load(Ordering::SeqCst)
             && (shared.force.load(Ordering::SeqCst) || shared.no_commands.load(Ordering::SeqCst))
@@ -520,7 +586,7 @@ fn wait_idle(shared: &Shared, sink: &mut Sink, limit: Duration) -> bool {
         shared.waiting.store(false, Ordering::SeqCst);
         return true;
     }
-    sink.report(UpdatePhase::WaitingIdle, None, None);
+    progress.report(UpdatePhase::WaitingIdle, None, None);
     let until = Instant::now() + limit;
     while Instant::now() < until {
         std::thread::sleep(Duration::from_secs(1));
@@ -547,7 +613,7 @@ fn run_worker(
         tx: tx.clone(),
     };
     let update_dir = state_dir.join("update");
-    let _lock = match state::UpdateLock::acquire(&update_dir) {
+    let lock = match state::UpdateLock::acquire(&update_dir) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
             sink.report(
@@ -576,6 +642,7 @@ fn run_worker(
         );
         return;
     }
+    let waited_from = Instant::now();
     if !instances_survive() && !wait_idle(shared, &mut sink, IDLE_WAIT_MAX) {
         sink.report(
             UpdatePhase::Refused,
@@ -584,6 +651,20 @@ fn run_worker(
         );
         return;
     }
+    // The node may have got busy during the download: hold new work, then
+    // wait (within the same limit) until it is idle again.
+    let before_swap = |progress: &mut dyn Progress| -> Result<(), String> {
+        if instances_survive() {
+            return Ok(());
+        }
+        shared.hold.store(true, Ordering::SeqCst);
+        let left = IDLE_WAIT_MAX.saturating_sub(waited_from.elapsed());
+        if wait_idle(shared, progress, left) {
+            return Ok(());
+        }
+        shared.hold.store(false, Ordering::SeqCst);
+        Err("the node did not go idle within 30 minutes".into())
+    };
     let scheduler = super::deadman::platform();
     let machine = Machine {
         state_dir,
@@ -592,6 +673,7 @@ fn run_worker(
         scheduler: scheduler.as_deref(),
         tar: super::install::system_tar(),
         current_version: super::build::version().to_string(),
+        before_swap: Some(&before_swap),
     };
     let request = Request {
         update_id: frame.update_id.clone(),
@@ -606,10 +688,23 @@ fn run_worker(
         UpdateStrategy::SelfReplace => flow::self_replace(&machine, &request, &mut sink),
         UpdateStrategy::Homebrew => homebrew(&machine, &request, &mut sink),
     };
+    // The new build takes the lock when it starts.
+    drop(lock);
     if ended == Ended::Swapped {
         sink.report(UpdatePhase::Restarting, None, None);
         let _ = tx.send(Event::Restart);
     }
+}
+
+/// SHA-256 of the running binary: the file the process was started from
+/// (Linux reads it through `/proc/self/exe`, which stays that file even after
+/// a rename over its path).
+fn own_sha256() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    let exe = std::path::PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let exe = std::env::current_exe().ok()?;
+    super::install::sha256_file(&exe).ok()
 }
 
 /// The Homebrew strategy (D10): refuse a pinned or foreign install, keep the
@@ -823,6 +918,8 @@ mod tests {
             worker: None,
             outbox: Vec::new(),
             restart: false,
+            current_id: None,
+            own_sha256: None,
         }
     }
 
@@ -830,8 +927,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Shared::default());
         shared.waiting.store(true, Ordering::SeqCst);
+        tracker.current_id = Some(id.into());
         tracker.worker = Some(Worker {
-            update_id: id.into(),
             rx,
             shared: Arc::clone(&shared),
         });
@@ -846,23 +943,40 @@ mod tests {
     }
 
     #[test]
-    fn the_same_update_forced_while_it_waits_stops_waiting_for_commands() {
+    fn a_repeat_of_the_same_update_is_never_refused() {
         let mut tracker = tracker();
         let id = "AAAAAAAAAAAAAAAAAAAAAA";
         let (shared, _tx) = waiting_worker(&mut tracker, id);
         assert!(tracker.wants_idle());
-        // Another update, or the same one unforced, is refused.
+        // Another update is refused.
         let other = tracker.request(frame("BBBBBBBBBBBBBBBBBBBBBB", true), &gate());
         assert_eq!(reason_of(&other), Some(UpdateReason::InProgress));
-        let again = tracker.request(frame(id, false), &gate());
-        assert_eq!(reason_of(&again), Some(UpdateReason::InProgress));
-        // The same id with force: no answer; the server stops the instances.
+        // The same one unforced: no answer, the worker goes on.
+        assert!(tracker.request(frame(id, false), &gate()).is_empty());
+        assert!(!shared.force.load(Ordering::SeqCst));
+        // With force: no answer; the server stops the instances.
         assert!(tracker.request(frame(id, true), &gate()).is_empty());
         assert!(shared.force.load(Ordering::SeqCst));
-        // Not waiting (already installing): even a forced repeat is in progress.
+        // A late force once the worker stopped waiting: still no refusal.
         shared.waiting.store(false, Ordering::SeqCst);
-        let late = tracker.request(frame(id, true), &gate());
-        assert_eq!(reason_of(&late), Some(UpdateReason::InProgress));
+        assert!(tracker.request(frame(id, true), &gate()).is_empty());
+        // Awaiting the restart: the same id gets no answer either.
+        tracker.worker = None;
+        tracker.restart = true;
+        assert!(tracker.request(frame(id, true), &gate()).is_empty());
+    }
+
+    #[test]
+    fn new_work_is_held_from_the_last_idle_check_to_the_restart() {
+        let mut tracker = tracker();
+        let (shared, _tx) = waiting_worker(&mut tracker, "AAAAAAAAAAAAAAAAAAAAAA");
+        assert!(!tracker.holds_new_work());
+        shared.hold.store(true, Ordering::SeqCst);
+        assert!(tracker.holds_new_work());
+        tracker.worker = None;
+        assert!(!tracker.holds_new_work(), "the worker stopped: no hold");
+        tracker.restart = true;
+        assert!(tracker.holds_new_work());
     }
 
     #[test]

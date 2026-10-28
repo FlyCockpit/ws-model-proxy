@@ -87,15 +87,14 @@ pub struct Evidence<'a> {
     pub crates2: Option<&'a str>,
     /// [`compiled_commit`]: set only on release builds.
     pub compiled_commit: Option<&'a str>,
-    pub windows: bool,
 }
 
 /// How this wsmp was installed. A receipt for this very binary wins. Without
-/// one (installs older than self-update), guess: a binary in a Homebrew
-/// `Cellar` is Homebrew's, one in a cargo `target/` directory or that cargo
-/// lists as built from git (or a local path) is a source build, one cargo lists
-/// from a registry is `cargo install`; anything else came from the install
-/// script. A release build (one with a compiled-in commit) is never taken for
+/// one, only what is certain: a binary in a Homebrew `Cellar` is Homebrew's,
+/// one in a cargo `target/` directory or that cargo lists as built from git
+/// (or a local path) is a source build, one cargo lists from a registry is
+/// `cargo install`; anything else is unknown. Only the install scripts write
+/// a receipt, so a script install older than self-update reinstalls once. A release build (one with a compiled-in commit) is never taken for
 /// cargo's even when a stale `.crates2.json` entry names it.
 pub fn detect(evidence: &Evidence<'_>) -> InstallMethod {
     if let Some(receipt) = evidence.receipt {
@@ -132,11 +131,9 @@ pub fn detect(evidence: &Evidence<'_>) -> InstallMethod {
             }
         }
     }
-    if evidence.windows {
-        InstallMethod::ScriptPs1
-    } else {
-        InstallMethod::Script
-    }
+    // Not the install script's for sure (a distro package, a copied binary):
+    // never overwritten from the browser.
+    InstallMethod::Unknown
 }
 
 /// `…/target/debug/wsmp` or `…/target/release/wsmp` (and cross builds'
@@ -193,7 +190,6 @@ pub fn identity() -> Identity {
         cargo_bin: cargo_bin.as_deref(),
         crates2: crates2.as_deref(),
         compiled_commit: compiled_commit(),
-        windows: cfg!(windows),
     });
     // The receipt's commit counts only for the version it describes.
     let commit = compiled_commit().map(str::to_string).or_else(|| {
@@ -300,11 +296,11 @@ mod tests {
         };
         assert_eq!(guess(Some(GIT), None), InstallMethod::Source);
         assert_eq!(guess(Some(REGISTRY), None), InstallMethod::Cargo);
-        assert_eq!(guess(None, None), InstallMethod::Script);
-        // A release binary install.sh put over an old `cargo install`.
+        assert_eq!(guess(None, None), InstallMethod::Unknown);
+        // A release binary put over an old `cargo install`: not cargo's.
         assert_eq!(
             guess(Some(GIT), Some(&"a".repeat(40))),
-            InstallMethod::Script
+            InstallMethod::Unknown
         );
         let homebrew = detect(&Evidence {
             exe: Some(Path::new(
@@ -318,12 +314,11 @@ mod tests {
             ..Evidence::default()
         });
         assert_eq!(dev, InstallMethod::Source);
-        let windows = detect(&Evidence {
-            exe: Some(Path::new("C:/Users/u/.cargo/bin/wsmp.exe")),
-            windows: true,
+        let copied = detect(&Evidence {
+            exe: Some(Path::new("/usr/bin/wsmp")),
             ..Evidence::default()
         });
-        assert_eq!(windows, InstallMethod::ScriptPs1);
+        assert_eq!(copied, InstallMethod::Unknown);
     }
 
     #[test]

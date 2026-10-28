@@ -4,7 +4,9 @@
 
 use std::io;
 
-use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows_sys::Win32::System::SystemInformation::{
+    GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+};
 
 use crate::imp::check;
 
@@ -33,6 +35,13 @@ pub fn memory_status() -> io::Result<MemoryStatus> {
     })
 }
 
+/// How long this machine has run since it started, in milliseconds
+/// (`GetTickCount64`; it counts sleep and hibernation too).
+pub fn uptime_ms() -> u64 {
+    // SAFETY: `GetTickCount64` takes no arguments and cannot fail.
+    unsafe { GetTickCount64() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,5 +52,12 @@ mod tests {
         // Any machine that runs the tests has more than 256 MiB.
         assert!(status.total_bytes > 256 << 20, "{status:?}");
         assert!(status.available_bytes <= status.total_bytes, "{status:?}");
+    }
+
+    #[test]
+    fn uptime_counts_up() {
+        let first = uptime_ms();
+        assert!(first > 0);
+        assert!(uptime_ms() >= first);
     }
 }

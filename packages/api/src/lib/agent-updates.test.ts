@@ -8,12 +8,13 @@ vi.mock("@ws-model-proxy/db", () => ({
   },
 }));
 
-import type { AgentUpdateFrame } from "./agent-update-wire";
+import { AGENT_UPDATE_ROLLBACK_SECS_DEFAULT, type AgentUpdateFrame } from "./agent-update-wire";
 import {
   type AgentUpdatePort,
   advanceAgentUpdateBatch,
   agentUpdateDeadline,
   agentUpdateEligibility,
+  agentUpdateReleaseDigest,
   applyAgentUpdateProgress,
   chooseCanary,
   cleanAgentUpdateDetail,
@@ -184,6 +185,25 @@ describe("eligibility", () => {
     );
   });
 
+  it("offers the update only on platforms it was verified on (Linux, WSL included)", () => {
+    const on = (target: string, strategies: string[] = ["self-replace"]) =>
+      check(
+        { cliBuild: { commit: null, installMethod: "script", target } },
+        { live: { ...live, selfUpdate: { ...SELF_UPDATE, strategies } } },
+      );
+    expect(on(TARGET).canUpdate).toBe(true);
+    for (const target of ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]) {
+      expect(on(target)).toMatchObject({
+        canUpdate: false,
+        blockedReason: "agent_update_platform",
+      });
+      expect(on(target).manualCommand).not.toBeNull();
+    }
+    expect(on("aarch64-apple-darwin", ["homebrew"]).blockedReason).toBe("agent_update_platform");
+    // Homebrew on Linux has not been verified either.
+    expect(on(TARGET, ["homebrew"]).blockedReason).toBe("agent_update_platform");
+  });
+
   it("ignores a strategy it does not know (a newer CLI)", () => {
     expect(
       check({}, { live: { ...live, selfUpdate: { ...SELF_UPDATE, strategies: ["binstall"] } } })
@@ -232,7 +252,7 @@ describe("startAgentUpdate", () => {
       sha256: "a".repeat(64),
       signature: null,
       force: false,
-      rollbackAfterSecs: 90,
+      rollbackAfterSecs: AGENT_UPDATE_ROLLBACK_SECS_DEFAULT,
     });
     expect(frame?.updateId).toMatch(/^[A-Za-z0-9_-]{21}[AQgw]$/);
     expect(store.tables.nodeAgentUpdate[0]).toMatchObject({
@@ -403,8 +423,9 @@ describe("progress and the deadline", () => {
     const node = { nodeId: "node-1", userId: OWNER };
     const t0 = new Date();
     await applyAgentUpdateProgress(node, { updateId: id, phase: "swapped" }, t0);
-    expect(await expireAgentUpdates(new Date(t0.getTime() + 200_000))).toBe(0);
-    expect(await expireAgentUpdates(new Date(t0.getTime() + 211_000))).toBe(1);
+    // The default window (180 s) plus the restart slack (120 s).
+    expect(await expireAgentUpdates(new Date(t0.getTime() + 290_000))).toBe(0);
+    expect(await expireAgentUpdates(new Date(t0.getTime() + 301_000))).toBe(1);
     expect(store.tables.nodeAgentUpdate[0]).toMatchObject({
       phase: "TIMED_OUT",
       reason: "swapped",
@@ -418,7 +439,7 @@ describe("progress and the deadline", () => {
 });
 
 describe("Update all", () => {
-  function batchOf(nodeIds: string[]) {
+  function batchOf(nodeIds: string[], targetDigest: string | null = null) {
     store.tables.nodeAgentUpdateBatch.push({
       id: "batch-1",
       userId: OWNER,
@@ -430,6 +451,7 @@ describe("Update all", () => {
       currentUpdateId: null,
       skippedNodeIds: [],
       targetVersion: "0.4.3",
+      targetDigest,
       stoppedNodeId: null,
       stoppedReason: null,
       endedAt: null,
@@ -506,6 +528,32 @@ describe("Update all", () => {
     expect(newer.sent).toEqual([]);
     expect(batch()).toMatchObject({ state: "STOPPED", stoppedReason: "release_changed" });
     expect(untouchedNodeIds(batch() as never)).toEqual(["n2", "n3"]);
+  });
+
+  it("stops when the same version is offered with other archives (another build)", async () => {
+    addNodes({ id: "n1", slug: "n1" }, { id: "n2", slug: "n2" });
+    const { port: p, sent } = port();
+    batchOf(["n1", "n2"], agentUpdateReleaseDigest(await p.release()));
+    await advanceAgentUpdateBatch(p, "batch-1", ORIGIN);
+    expect(sent.map(({ nodeId }) => nodeId)).toEqual(["n1"]);
+    await report("n1", "confirmed");
+    const rebuilt = port({
+      release: async () => ({
+        kind: "release",
+        version: "0.4.3",
+        commit: null,
+        releaseUrl: "https://r.example/v0.4.3",
+        artifacts: {
+          [TARGET]: {
+            url: `https://r.example/v0.4.3/wsmp-${TARGET}.tar.xz`,
+            sha256: "c".repeat(64),
+          },
+        },
+      }),
+    });
+    await advanceAgentUpdateBatch(rebuilt.port, "batch-1", ORIGIN);
+    expect(rebuilt.sent).toEqual([]);
+    expect(batch()).toMatchObject({ state: "STOPPED", stoppedReason: "release_changed" });
   });
 
   it("stops at the first failure and leaves the rest untouched", async () => {

@@ -70,6 +70,11 @@ pub struct UpdateState {
     pub strategy: UpdateStrategy,
     pub from_version: String,
     pub to_version: String,
+    /// SHA-256 of the new binary: a build is the update only when its own
+    /// bytes match (one version can have several builds). `None` from a
+    /// state written before it was recorded: the version decides then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_sha256: Option<String>,
     /// The binary the service runs.
     pub live_path: PathBuf,
     /// The rollback copy (the binary that was live before).
@@ -78,7 +83,12 @@ pub struct UpdateState {
     pub failed_path: PathBuf,
     pub rollback_after_secs: u32,
     /// Unix seconds: the dead-man rolls back an unconfirmed update after this.
+    /// The new build moves it to a full window after its own start.
     pub deadline: u64,
+    /// Unix seconds: when the armed dead-man's deadline job fires (the first
+    /// deadline). Windows' early run, before it, only starts the relay task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadman_at: Option<u64>,
     /// Starts of the new binary while unconfirmed.
     pub attempts: u32,
     pub phase: Phase,
@@ -113,6 +123,15 @@ impl UpdateState {
         self.reason = Some(reason);
         self.detail = Some(super::clip_detail(&detail.into()));
         Ok(())
+    }
+
+    /// Whether the build that runs (`version`, and the SHA-256 of its own
+    /// binary when it could be read) is this update's new build.
+    pub fn is_new_build(&self, version: &str, sha256: Option<&str>) -> bool {
+        match (&self.to_sha256, sha256) {
+            (Some(expected), Some(actual)) => expected == actual,
+            _ => self.to_version == version,
+        }
     }
 
     /// A finished server update the server has not heard the end of.
@@ -150,54 +169,75 @@ pub fn save(update_dir: &Path, state: &UpdateState) -> Result<()> {
         .map(|_| ())
 }
 
-/// One update at a time on this machine: `<state>/update/lock`, held while an
-/// update downloads, verifies and swaps. A lock older than an hour is stale (a
-/// process that died holding it).
+/// One update at a time on this machine, and one writer of its state:
+/// `<state>/update/lock`, held while an update downloads, verifies and swaps,
+/// and while the new build confirms, the dead-man rolls back or a starting
+/// relay looks at the state. It is an OS lock (`flock`, or the file opened
+/// unshared on Windows), so the end of the process that holds it frees it.
 pub struct UpdateLock {
-    path: PathBuf,
+    #[cfg(unix)]
+    _file: nix::fcntl::Flock<std::fs::File>,
+    #[cfg(not(unix))]
+    _file: std::fs::File,
 }
 
-const LOCK_STALE_SECS: u64 = 60 * 60;
-
 impl UpdateLock {
+    /// The lock if it is free now.
     pub fn acquire(update_dir: &Path) -> Result<Option<Self>> {
         std::fs::create_dir_all(update_dir)
             .with_context(|| format!("creating `{}`", update_dir.display()))?;
         let path = update_dir.join("lock");
-        for _ in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    let _ = writeln!(file, "{}", std::process::id());
-                    return Ok(Some(Self { path }));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age.as_secs() > LOCK_STALE_SECS);
-                    if !stale {
-                        return Ok(None);
-                    }
-                    let _ = std::fs::remove_file(&path);
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("creating `{}`", path.display()));
-                }
-            }
-        }
-        Ok(None)
+        Self::try_open(&path).with_context(|| format!("locking `{}`", path.display()))
     }
-}
 
-impl Drop for UpdateLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+    /// The lock, waiting up to `wait` for it.
+    pub fn wait(update_dir: &Path, wait: std::time::Duration) -> Result<Option<Self>> {
+        let until = std::time::Instant::now() + wait;
+        loop {
+            if let Some(lock) = Self::acquire(update_dir)? {
+                return Ok(Some(lock));
+            }
+            if std::time::Instant::now() >= until {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    #[cfg(unix)]
+    fn try_open(path: &Path) -> Result<Option<Self>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(path)?;
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(file) => Ok(Some(Self { _file: file })),
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
+            Err((_, error)) => Err(error.into()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn try_open(path: &Path) -> Result<Option<Self>> {
+        use std::os::windows::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(path)
+        {
+            Ok(file) => Ok(Some(Self { _file: file })),
+            // ERROR_SHARING_VIOLATION
+            Err(error) if error.raw_os_error() == Some(32) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -209,6 +249,8 @@ pub(crate) fn sample(dir: &Path, phase: Phase) -> UpdateState {
         strategy: UpdateStrategy::SelfReplace,
         from_version: "0.4.2".into(),
         to_version: "0.4.3".into(),
+        to_sha256: None,
+        deadman_at: None,
         live_path: dir.join("wsmp"),
         prev_path: dir.join("wsmp.prev"),
         failed_path: dir.join("wsmp.failed"),
