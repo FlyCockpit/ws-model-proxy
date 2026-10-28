@@ -71,6 +71,7 @@ export const CLI_AGENT_WIRE_REASONS = [
   "not_found",
   "already_open",
   "spawn_failed",
+  "shell_unavailable",
   "bad_handshake",
   "bad_frame",
   "expired",

@@ -6,6 +6,7 @@ import type { AnonymousAuth, CallerAuth } from "./contracts/auth-context";
 import type { modelsContract } from "./contracts/models";
 import type { LiveLoadReader } from "./lib/live-load";
 import type { NodeRelayServices } from "./lib/node-relay-services";
+import type { RuntimeShell } from "./lib/runtime-spec";
 
 export type CreateContextOptions = {
   context: HonoContext;
@@ -200,12 +201,17 @@ export type NodeOperatorServices = {
     /** A shell the node advertised (Windows); omitted for the node's default. */
     shell?: string;
   }): Promise<{ ticket: string; terminalId: string; expiresAt: Date }>;
-  /** `exec.start`: start a command; resolves once the node answered `exec.started`. */
+  /**
+   * `exec.start`: start a command; resolves once the node answered `exec.started`. When the node
+   * refused it, the error's `nodeReason` is the node's reason (`bad_command`, `shell_unavailable`).
+   */
   startCommand(args: {
     userId: string;
     nodeId: string;
     commandId: string;
-    command: string;
+    /** Text for `shell`, or a program and its arguments. */
+    command: string | string[];
+    shell?: RuntimeShell;
     cwd?: string;
     timeoutMs: number;
   }): Promise<{ startedAt: Date; endsBy: Date }>;

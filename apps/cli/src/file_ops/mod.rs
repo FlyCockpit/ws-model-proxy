@@ -29,9 +29,10 @@ use serde_json::Value;
 
 #[cfg(unix)]
 pub(crate) mod atomic;
-#[cfg(unix)]
+#[cfg(windows)]
+#[path = "atomic_windows.rs"]
+pub(crate) mod atomic;
 pub(crate) mod diff;
-#[cfg(unix)]
 pub mod edit;
 pub mod error;
 pub mod etag;
@@ -44,6 +45,10 @@ mod intent;
 pub mod list;
 #[cfg(unix)]
 pub mod mutate;
+#[cfg(windows)]
+#[path = "mutate_windows.rs"]
+pub mod mutate;
+mod mutate_args;
 pub mod policy;
 pub mod pool;
 pub mod read;
@@ -73,7 +78,6 @@ pub(crate) mod walk;
 #[cfg(windows)]
 #[path = "walk_windows.rs"]
 pub(crate) mod walk;
-#[cfg(unix)]
 pub mod write;
 
 pub use error::{ErrorCode, FileError, FileResult};
@@ -91,12 +95,52 @@ pub fn display_path(path: &std::path::Path) -> Option<String> {
         resolve::posix_view(path)
     }
 }
+/// The key a path is locked under: the path itself on Unix; on Windows its
+/// POSIX view lower-cased, as NTFS compares names (`Notes.txt` and `notes.txt`
+/// are one file, and `\\?\C:\` and `C:\` one drive).
+fn lock_key(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(view) = resolve::posix_view(&path) {
+            return PathBuf::from(view.to_lowercase());
+        }
+    }
+    path
+}
+
 pub use etag::EtagKey;
 pub use policy::Policy;
 
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_lock_tests {
+    use super::*;
+
+    #[test]
+    fn spellings_of_one_ntfs_name_share_a_lock() {
+        let key = |path: &str| lock_key(PathBuf::from(path));
+        assert_eq!(key(r"\\?\C:\Work\Notes.txt"), key(r"c:\work\notes.TXT"));
+        assert_ne!(key(r"C:\Work\notes.txt"), key(r"C:\Work\notes2.txt"));
+        let ops = FileOps::new(
+            Policy::new(Vec::new(), Vec::new(), false),
+            EtagKey::random(),
+        );
+        let cancel = Cancel::new();
+        let _held = ops
+            .lock_path(PathBuf::from(r"C:\Work\Notes.txt"), &cancel)
+            .expect("first");
+        cancel.cancel();
+        // The other spelling waits for the same lock (here: cancelled while it waits).
+        assert!(
+            ops.lock_path(PathBuf::from(r"c:\work\notes.txt"), &cancel)
+                .is_err()
+        );
+    }
+}
 
 /// Cooperative cancellation, checked between files, chunks, and before the
 /// commit point of a mutation.
@@ -391,7 +435,8 @@ impl FileOps {
 
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn lock_path(&self, path: PathBuf, cancel: &Cancel) -> FileResult<PathGuard<'_>> {
-        self.locks.lock(path, cancel, self.limits.lock_wait)
+        self.locks
+            .lock(lock_key(path), cancel, self.limits.lock_wait)
     }
 
     pub fn read(&self, args: &read::ReadArgs, cancel: &Cancel) -> FileResult<read::ReadOutcome> {
@@ -418,13 +463,11 @@ impl FileOps {
         search::search(self, args, cancel)
     }
 
-    #[cfg(unix)]
     pub fn edit(&self, args: &edit::EditArgs, cancel: &Cancel) -> FileResult<edit::EditResult> {
         self.policy.check_process()?;
         edit::edit(self, args, cancel)
     }
 
-    #[cfg(unix)]
     pub fn write(
         &self,
         args: &write::WriteArgs,
@@ -434,7 +477,6 @@ impl FileOps {
         write::write(self, args, cancel)
     }
 
-    #[cfg(unix)]
     pub fn rename(
         &self,
         args: &mutate::RenameArgs,
@@ -444,7 +486,6 @@ impl FileOps {
         mutate::rename(self, args, cancel)
     }
 
-    #[cfg(unix)]
     pub fn dir_create(
         &self,
         args: &mutate::MkdirArgs,
@@ -454,7 +495,6 @@ impl FileOps {
         mutate::mkdir(self, args, cancel)
     }
 
-    #[cfg(unix)]
     pub fn delete(
         &self,
         args: &mutate::DeleteArgs,
@@ -482,24 +522,11 @@ impl FileOps {
             "stat" => out(self.stat(&parse(args)?, cancel)?),
             "list" => out(self.dir_list(&parse(args)?, cancel)?),
             "search" => out(self.search(&parse(args)?, cancel)?),
-            #[cfg(unix)]
             "edit" => out(self.edit(&parse(args)?, cancel)?),
-            #[cfg(unix)]
             "write" => out(self.write(&parse(args)?, cancel)?),
-            #[cfg(unix)]
             "rename" => out(self.rename(&parse(args)?, cancel)?),
-            #[cfg(unix)]
             "mkdir" => out(self.dir_create(&parse(args)?, cancel)?),
-            #[cfg(unix)]
             "delete" => out(self.delete(&parse(args)?, cancel)?),
-            #[cfg(not(unix))]
-            "edit" | "write" | "rename" | "mkdir" | "delete" => {
-                drop(args);
-                Err(FileError::new(
-                    ErrorCode::Unsupported,
-                    "this node serves the read file tools only (Windows)",
-                ))
-            }
             other => Err(FileError::invalid(format!("unknown file op `{other}`"))),
         }
     }
@@ -507,7 +534,6 @@ impl FileOps {
 
 /// Validate the optional `reason` carried by write-class tools (it goes to the
 /// audit log in a later phase).
-#[cfg(unix)]
 pub(crate) fn check_reason(reason: &Option<String>) -> FileResult<()> {
     match reason {
         Some(reason) if reason.chars().count() > 500 => {

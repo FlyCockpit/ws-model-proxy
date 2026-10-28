@@ -60,6 +60,41 @@ command and everything it started). A command lives at most its timeout
 (default 1 hour) and never longer than the node's command lifetime (1 minute to
 24 hours). Each poll returns at most a 64 KiB output tail.
 
+`command` is text (at most 4096 bytes) or an argv, as in a runtime's commands:
+
+- **Text** runs in `shell`, one of the shells the node reports
+  (`features.launch.shells` in `nodes_get`: `sh` on Linux and macOS; `pwsh`,
+  `powershell` and `cmd` on Windows, when installed). Without `shell` it runs in
+  `sh` on Linux and macOS, and in PowerShell on Windows: `pwsh` (PowerShell 7)
+  when installed, else `powershell` (Windows PowerShell 5.1, on every Windows
+  11). The default is the first of `features.launch.shells`: write for
+  PowerShell 5.1 (no `&&`, `||` or `?:`) unless that is `pwsh`. A Microsoft
+  Store `pwsh` is never used (it would run outside the job that ends the
+  command). It never runs in Git Bash's `sh`, even when that is on `PATH`.
+  PowerShell's output is UTF-8. Name
+  `shell: "cmd"` for Command Prompt syntax (`dir /s`, `set X=1 && …`); `cmd` gets
+  the text exactly as you sent it, but it expands `%VAR%` when it reads the
+  whole line (a variable set earlier on the same line stays literal) and treats
+  `|`, `&` and `>` as operators unless you escape them with `^`.
+- **An argv** (`["curl", "-d", "{\"a\": 1}", "http://…"]`) passes each argument
+  to the program without a shell reading quotes, variables or pipes. On Windows
+  an `.exe` on `PATH` gets each argument exactly. A `.bat` or `.cmd` (the `npm`,
+  `npx` and `pnpm` shims) runs in cmd with each argument escaped for it, so `%`,
+  `^`, `&` and `"` reach the batch file as written; an argument cmd cannot be
+  given safely (one with a line break, say) fails the command at start
+  (`spawn_failed`) rather than run differently. Anything else (a PowerShell
+  command) runs in `shell` (default as for text; never `cmd`), which reads it
+  as PowerShell does. To reach WSL, use an argv:
+  `["wsl.exe", "-e", "bash", "-c", "…"]`. A Microsoft Store app (Store Python,
+  `winget`) runs outside the command's job: `cancel` and the timeout do not end
+  it or what it started.
+
+A shell the node does not report is refused with `shell_unavailable`. A command
+the node could not start (its program missing, an argument cmd cannot be given)
+is refused as a bad request saying so. A node
+whose wsmp predates argv commands and `shell` refuses them (`upgrade_wsmp`);
+plain text without `shell` still works there.
+
 Anything that should keep running or serve traffic must be a runtime. A server
 started with a command is invisible to the proxy and dies with the command. When
 a step needs a person (for example a `sudo` password), queue it with
@@ -396,7 +431,9 @@ A spec has exactly one of:
 A runtime that serves models also declares `api` (`openai` or `anthropic`),
 `engine` (`vllm`, `sglang`, `llama_cpp`, `ollama`, `lm_studio`, `other`),
 `modelType` (`llm`, `embeddings`, `transcription`) and `models` (`{id,
-capabilities?, embeddingContract?, transcription?}`), and may set a
+capabilities?, embeddingContract?, transcription?}`; without `capabilities`,
+or with an empty list, a model has its type's: `text_generation`, `embedding`
+or `audio_input`), and may set a
 `metricsReader` (`builtin`, a `route`, or a `command`) and `expandMedia`
 (inline remote media for servers that cannot fetch URLs). A startable runtime
 without models is a **service**: it claims its resources but is never a pool
@@ -500,7 +537,16 @@ people-only. The model API accepts the key as `Authorization: Bearer`,
 ### Node metric commands
 
 `node_update` takes `metricCommands`: at most 16 entries (32 KiB together) of
-`{ name, command, intervalSecs (5–3600), timeoutSecs (1–60), format, map? }`.
+`{ name, command, shell?, intervalSecs (5–3600), timeoutSecs (1–60), format, map? }`.
+`command` and `shell` work as for `node_command_run`: text runs in `shell`
+(default `sh`; on Windows PowerShell, the first of `features.launch.shells`),
+or an argv starts its program with no shell. A metric that runs often should be
+an argv when it is one program (`["nvidia-smi", "--query-gpu=power.draw",
+"--format=csv,noheader,nounits"]`): on Windows every PowerShell run costs a few
+hundred milliseconds of CPU, where an `.exe` starts at once. Name
+`shell: "cmd"` for Command Prompt text. A shell the node does not report is
+refused (`shell_unavailable`); the node must run this release's wsmp for
+`shell` or an argv, even `shell: "sh"` (older: `upgrade_wsmp`).
 `format` is `lines` (`<metric> <value>` per line), `json` or `prometheus`.
 Without `map`, `json` reads a top-level number and `prometheus` the first sample,
 recorded as `name`. `map` names up to 16 metrics, each `{ series, labels?,

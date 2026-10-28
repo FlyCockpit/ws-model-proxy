@@ -57,6 +57,7 @@ use crate::output_mask::StreamMasker;
 use crate::protocol::frames::{
     ExecState, ExecStatus, NODE_COMMAND_MAX_MS, NODE_COMMAND_TAIL_MAX_BYTES, TerminalIdentity,
 };
+use crate::protocol::runtime_spec::CommandShell;
 use crate::protocol::{NodeBinaryMetadata, NodeFrame, terminal_supported};
 use crate::relay_bus::FromWorker;
 use crate::startup::TerminalStartup;
@@ -113,6 +114,7 @@ const REASON_BAD_CWD: &str = "bad_cwd";
 const REASON_NOT_FOUND: &str = "not_found";
 const REASON_ALREADY_OPEN: &str = "already_open";
 const REASON_SPAWN_FAILED: &str = "spawn_failed";
+const REASON_SHELL_UNAVAILABLE: &str = "shell_unavailable";
 const REASON_BAD_HANDSHAKE: &str = "bad_handshake";
 const REASON_BAD_FRAME: &str = "bad_frame";
 const REASON_EXPIRED: &str = "expired";
@@ -2947,6 +2949,24 @@ struct ExecSession {
     /// Exit status and the instant `try_wait` reaped the direct child.
     reaped: Option<(Option<i32>, Option<i32>, Instant)>,
     _tracked: LiveChildGuard,
+    /// The PowerShell script the command runs, removed with the session.
+    _script: Option<ScriptFile>,
+}
+
+/// A command's script file, removed when dropped.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct ScriptFile(PathBuf);
+
+impl Drop for ScriptFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A node command ready to start: its program and arguments, and the script file it reads.
+struct ExecProcess {
+    process: std::process::Command,
+    script: Option<ScriptFile>,
 }
 
 /// A command that ended, kept for `exec.poll`.
@@ -2977,6 +2997,22 @@ pub(crate) struct ExecRegistry {
     /// can report them `interrupted` (and end their process groups) when it
     /// starts again. `None` in tests that do not persist.
     table: Option<PathBuf>,
+    /// Where a PowerShell command's script is written (Windows): beside the table, in the state
+    /// directory; in the temporary directory in tests that do not persist.
+    scripts: PathBuf,
+}
+
+/// Remove the scripts commands left in `dir` (`<command id>.ps1`).
+fn sweep_scripts(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "ps1") {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// One running command as persisted (no command text, no output).
@@ -3050,6 +3086,7 @@ impl ExecRegistry {
             command_max,
             shut_down: false,
             table: None,
+            scripts: std::env::temp_dir().join(format!("wsmp-exec-scripts-{}", std::process::id())),
         }
     }
 
@@ -3097,6 +3134,12 @@ impl ExecRegistry {
         }
         while self.ended.len() > EXEC_RECENT_MAX {
             self.ended.pop_front();
+        }
+        // A command's script lives beside the table and goes with the command. Every command a
+        // previous daemon started has ended by now: what it left (a crash) holds command text.
+        if let Some(dir) = path.parent() {
+            self.scripts = dir.join("exec-scripts");
+            sweep_scripts(&self.scripts);
         }
         self.table = Some(path);
         self.save_table();
@@ -3185,7 +3228,8 @@ impl ExecRegistry {
         &mut self,
         startup: &TerminalStartup,
         command_id: &str,
-        command: &str,
+        line: &ExecLine<'_>,
+        shell: Option<CommandShell>,
         cwd: Option<&str>,
         timeout_ms: u64,
     ) -> Vec<OutboundFrame> {
@@ -3202,10 +3246,21 @@ impl ExecRegistry {
         if self.sessions.len() >= MAX_EXECS {
             return vec![exec_rejected(command_id, REASON_LIMIT)];
         }
-        if let Err(reason) = child_env::validate_command(command) {
+        let checked = match line {
+            ExecLine::Text(command) => child_env::validate_command(command),
+            ExecLine::Argv(argv) => child_env::validate_argv(argv),
+        };
+        if let Err(reason) = checked {
             tracing::warn!(command_id, reason, "rejecting an exec command");
             return vec![exec_rejected(command_id, REASON_BAD_COMMAND)];
         }
+        let process = match exec_process(line, shell, &self.scripts) {
+            Ok(process) => process,
+            Err((reason, why)) => {
+                tracing::warn!(command_id, why, "rejecting an exec command");
+                return vec![exec_rejected(command_id, reason)];
+            }
+        };
         let home = match user_home() {
             Ok(path) => path,
             Err(reason) => {
@@ -3221,7 +3276,7 @@ impl ExecRegistry {
             }
         };
         let lifetime = Duration::from_millis(timeout_ms).min(self.command_max);
-        match spawn_exec(&self.tx, command_id, command, &cwd, lifetime) {
+        match spawn_exec(&self.tx, command_id, process, &line.text(), &cwd, lifetime) {
             Ok(session) => {
                 let frame = NodeFrame::ExecStarted {
                     command_id: command_id.to_string(),
@@ -3240,6 +3295,26 @@ impl ExecRegistry {
                 vec![exec_rejected(command_id, REASON_SPAWN_FAILED)]
             }
         }
+    }
+
+    /// [`Self::start`] for a text command in the default shell.
+    #[cfg(test)]
+    pub(crate) fn start_text(
+        &mut self,
+        startup: &TerminalStartup,
+        command_id: &str,
+        command: &str,
+        cwd: Option<&str>,
+        timeout_ms: u64,
+    ) -> Vec<OutboundFrame> {
+        self.start(
+            startup,
+            command_id,
+            &ExecLine::Text(command),
+            None,
+            cwd,
+            timeout_ms,
+        )
     }
 
     pub(crate) fn cancel(&mut self, command_id: &str) -> Vec<OutboundFrame> {
@@ -3554,18 +3629,194 @@ fn kill_exec(pid: u32, child: Option<&mut ExecChild>, fallback_to_pid: bool) {
     }
 }
 
+/// What an `exec.start` runs: text for a shell, or a program and its arguments.
+pub(crate) enum ExecLine<'a> {
+    Text(&'a str),
+    Argv(&'a [String]),
+}
+
+impl ExecLine<'_> {
+    /// The command as one line (output masking hides secrets written in it).
+    fn text(&self) -> String {
+        match self {
+            Self::Text(command) => (*command).to_string(),
+            Self::Argv(argv) => argv.join(" "),
+        }
+    }
+}
+
+/// Why a node command did not start: its `exec.rejected` reason, and what the log says.
+type NotStarted = (&'static str, &'static str);
+
+/// The node has no such shell (`shell_unavailable`).
+fn no_shell(why: &'static str) -> NotStarted {
+    (REASON_SHELL_UNAVAILABLE, why)
+}
+
+/// The program and arguments of a node command, before its directory and environment. Text runs
+/// in `shell` (absent: [`child_env::exec_shell`]); an argv starts its program directly, each
+/// argument passed exactly. Errs when this node has no such shell.
+#[cfg(not(windows))]
+fn exec_process(
+    line: &ExecLine<'_>,
+    shell: Option<CommandShell>,
+    _scripts: &Path,
+) -> Result<ExecProcess, NotStarted> {
+    if shell.is_some_and(|shell| shell != CommandShell::Sh) {
+        return Err(no_shell("only `sh` runs commands here"));
+    }
+    let process = match line {
+        ExecLine::Text(command) => {
+            let (program, flag) = child_env::exec_shell();
+            let mut process = std::process::Command::new(program);
+            process.arg(flag).arg(command);
+            process
+        }
+        ExecLine::Argv(argv) => {
+            let (program, args) = argv
+                .split_first()
+                .ok_or((REASON_BAD_COMMAND, "the argv is empty"))?;
+            let mut process = std::process::Command::new(program);
+            process.args(args);
+            process
+        }
+    };
+    Ok(ExecProcess {
+        process,
+        script: None,
+    })
+}
+
+/// The program and arguments of a node command, before its directory and environment. Text runs
+/// in `shell` (absent: `pwsh`, else `powershell`); `cmd` gets the text as written (`/d /s /c
+/// "…"`, not quoted the way a C program reads its arguments). An argv starts an `.exe`
+/// directly with each argument exact, a `.bat` or `.cmd` through std's batch-file escaping, and
+/// anything else (a PowerShell command) in `shell` (absent: `pwsh`, else `powershell`), from a
+/// script file in `scripts`. Errs when this node has no such shell, or the script cannot be
+/// written.
+#[cfg(windows)]
+fn exec_process(
+    line: &ExecLine<'_>,
+    shell: Option<CommandShell>,
+    scripts: &Path,
+) -> Result<ExecProcess, NotStarted> {
+    use crate::runtimes::executor::windows::{find_program, powershell_script, shell_program};
+    use rand::distr::{Alphanumeric, SampleString};
+    use std::os::windows::process::CommandExt;
+    let plain = |process| {
+        Ok(ExecProcess {
+            process,
+            script: None,
+        })
+    };
+    // The default, for text and argv alike (`default_shell`: PowerShell, never what `PATH` has).
+    let default_shell = || {
+        crate::runtimes::executor::windows::default_shell()
+            .map_err(|_| no_shell("neither `pwsh` nor `powershell` is installed"))
+    };
+    let (shell, script) = match line {
+        ExecLine::Text(command) => match shell {
+            // Not one of the shells this node advertises (`features.launch.shells`).
+            Some(CommandShell::Sh) => return Err(no_shell("`sh` is not a command shell here")),
+            Some(CommandShell::Cmd) => {
+                let mut process = std::process::Command::new(
+                    shell_program(CommandShell::Cmd)
+                        .map_err(|_| no_shell("`cmd` is not installed"))?,
+                );
+                process.raw_arg(format!("/d /s /c \"{command}\""));
+                return plain(process);
+            }
+            Some(shell) => (shell, (*command).to_string()),
+            None => (default_shell()?, (*command).to_string()),
+        },
+        ExecLine::Argv(argv) => {
+            match shell {
+                Some(CommandShell::Sh) => return Err(no_shell("an argv runs in PowerShell here")),
+                Some(CommandShell::Cmd) => return Err(no_shell("cmd cannot run an argv")),
+                _ => {}
+            }
+            // An `.exe` starts with each argument exact. So does a `.bat` or `.cmd` (npm, npx
+            // and pnpm are such shims): std runs it in cmd with every argument escaped for cmd's
+            // second parse (`%`, `^`, `&`, `"`), or refuses to start it when one cannot be.
+            if let Some((program, args)) = argv.split_first()
+                && let Some(found) = find_program(program, &scrub_parent_env(&[])).filter(|found| {
+                    found
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| {
+                            ["exe", "com", "bat", "cmd"]
+                                .iter()
+                                .any(|known| ext.eq_ignore_ascii_case(known))
+                        })
+                })
+            {
+                let mut process = std::process::Command::new(found);
+                process.args(args);
+                return plain(process);
+            }
+            // A PowerShell command, or a program not found: PowerShell runs it.
+            let shell = match shell {
+                Some(shell) => shell,
+                None => default_shell()?,
+            };
+            let script = crate::runtimes::render::argv_script(shell, argv)
+                .ok_or(no_shell("cmd cannot run an argv"))?;
+            (shell, script)
+        }
+    };
+    let program = shell_program(shell).map_err(|_| no_shell("the shell is not installed"))?;
+    // `-File`, not `-EncodedCommand`: given a command, PowerShell writes its error, warning and
+    // progress streams to a redirected stderr as CLIXML. The file holds the command's text, so
+    // it is in wsmp's own state directory, goes with the command, and a crash's leftovers go
+    // when the next daemon starts (`ExecRegistry::with_table`). Its name is this node's own
+    // random one: the server's command id never becomes a path.
+    let unwritten = |error: std::io::Error| {
+        tracing::warn!(error = %error, "writing an exec script failed");
+        (
+            REASON_SPAWN_FAILED,
+            "the command's script could not be written",
+        )
+    };
+    std::fs::create_dir_all(scripts).map_err(unwritten)?;
+    let path = scripts.join(format!(
+        "{}.ps1",
+        Alphanumeric.sample_string(&mut rand::rng(), 24)
+    ));
+    let mut text = String::from('\u{feff}');
+    text.push_str(&powershell_script(&script));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(unwritten)?;
+    let script_file = ScriptFile(path);
+    file.write_all(text.as_bytes()).map_err(unwritten)?;
+    drop(file);
+    let mut process = std::process::Command::new(program);
+    process
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive"])
+        // Process scope only: the script is this command, which `-Command` would run as well.
+        .args(["-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script_file.0);
+    Ok(ExecProcess {
+        process,
+        script: Some(script_file),
+    })
+}
+
 fn spawn_exec(
     tx: &SyncSender<FromWorker>,
     command_id: &str,
+    exec: ExecProcess,
     command: &str,
     cwd: &Path,
     lifetime: Duration,
 ) -> anyhow::Result<ExecSession> {
-    let (program, flag) = child_env::exec_shell();
-    let mut process = std::process::Command::new(program);
+    let ExecProcess {
+        mut process,
+        script,
+    } = exec;
     process
-        .arg(flag)
-        .arg(command)
         .current_dir(cwd)
         .env_clear()
         .stdin(std::process::Stdio::null())
@@ -3582,7 +3833,7 @@ fn spawn_exec(
     #[cfg(not(windows))]
     let mut child = crate::subreaper::spawn(|| process.spawn(), |child| Some(child.id()))?;
     #[cfg(windows)]
-    let mut child = crate::job_tree::spawn(process)?;
+    let mut child = crate::job_tree::spawn_hidden(process)?;
     let pid = child.id();
     #[cfg(not(windows))]
     let tracked = LiveChildGuard::track(LiveChild::ExecGroup(pid));
@@ -3649,6 +3900,7 @@ fn spawn_exec(
         start_ticks: process_start_ticks(pid),
         reaped: None,
         _tracked: tracked,
+        _script: script,
     })
 }
 
@@ -3691,7 +3943,8 @@ mod tests {
     }
 
     fn slow_command() -> &'static str {
-        if child_env::exec_shell().0 == "sh" {
+        // `ping.exe` is a child process the command's job must end (PowerShell runs it too).
+        if cfg!(unix) {
             "sleep 30"
         } else {
             "ping -n 30 127.0.0.1"
@@ -3706,18 +3959,18 @@ mod tests {
             let tree = Tree::new();
             let (tx, rx) = channel();
             let mut execs = ExecRegistry::new(tx, Duration::from_secs(30));
-            // Git Bash can make exec_shell choose sh; both shells and their
-            // descendants must remain in the Windows job.
+            // The default shell (PowerShell) and its descendants must
+            // remain in the Windows job.
             let mode = if action == "root-exit" {
                 "root-exit"
             } else {
                 "detach"
             };
-            // Exec needs one shell string for sh -c or cmd /C. The fixture
-            // cwd lets both shells use relative paths without embedded quotes
-            // or Windows backslash escaping, even when the cwd has spaces.
+            // The fixture cwd lets the command use relative paths without
+            // embedded quotes or Windows backslash escaping, even when the cwd
+            // has spaces.
             let command = format!("python tree.py grandchild.pid root.pid {mode}");
-            let frames = execs.start(
+            let frames = execs.start_text(
                 &enabled_startup(false),
                 "windows-tree",
                 &command,
@@ -3829,7 +4082,7 @@ mod tests {
             let startup = enabled_startup(false);
             // Refused: bad cwd, and the command carries a secret-looking token.
             let secret_cmd = "echo TOPSECRET_TOKEN_9f3a";
-            let _ = execs.start(
+            let _ = execs.start_text(
                 &startup,
                 "ref1",
                 secret_cmd,
@@ -3866,7 +4119,7 @@ mod tests {
             let mut execs = ExecRegistry::new(tx, Duration::from_secs(30));
             let command = slow_command();
             let dir = cwd.path().to_string_lossy().into_owned();
-            let started = execs.start(
+            let started = execs.start_text(
                 &enabled_startup(false),
                 "started1",
                 command,
@@ -3904,19 +4157,19 @@ mod tests {
         let (tx, _rx) = channel();
         let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
         let startup = enabled_startup(false);
-        let rejected = execs.start(&startup, "one", &"a".repeat(4097), None, TEST_TIMEOUT_MS);
+        let rejected = execs.start_text(&startup, "one", &"a".repeat(4097), None, TEST_TIMEOUT_MS);
         assert!(matches!(
             &rejected[0],
             OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })
                 if reason == REASON_BAD_COMMAND
         ));
-        let rejected = execs.start(&startup, "two", "echo\0no", None, TEST_TIMEOUT_MS);
+        let rejected = execs.start_text(&startup, "two", "echo\0no", None, TEST_TIMEOUT_MS);
         assert!(matches!(
             &rejected[0],
             OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })
                 if reason == REASON_BAD_COMMAND
         ));
-        let rejected = execs.start(
+        let rejected = execs.start_text(
             &startup,
             "three",
             "echo ok",
@@ -3934,7 +4187,7 @@ mod tests {
         let mut execs = ExecRegistry::new(tx, Duration::from_secs(30));
         for index in 0..MAX_EXECS {
             assert!(matches!(
-                execs.start(
+                execs.start_text(
                     &startup,
                     &format!("cmd-{index}"),
                     slow_command(),
@@ -3944,7 +4197,7 @@ mod tests {
                 OutboundFrame::Control(NodeFrame::ExecStarted { .. })
             ));
         }
-        let rejected = execs.start(&startup, "c", slow_command(), None, TEST_TIMEOUT_MS);
+        let rejected = execs.start_text(&startup, "c", slow_command(), None, TEST_TIMEOUT_MS);
         assert!(matches!(
             &rejected[0],
             OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })
@@ -4025,7 +4278,7 @@ mod tests {
         let (tx, rx) = channel();
         let mut execs = ExecRegistry::new(tx, Duration::from_millis(200));
         let startup = enabled_startup(false);
-        execs.start(&startup, "slow", slow_command(), None, TEST_TIMEOUT_MS);
+        execs.start_text(&startup, "slow", slow_command(), None, TEST_TIMEOUT_MS);
         std::thread::sleep(Duration::from_millis(350));
         let deadline = Instant::now() + Duration::from_secs(2);
         let frames = loop {
@@ -4076,7 +4329,7 @@ mod tests {
         let (tx, rx) = channel();
         tracing::subscriber::with_default(subscriber, || {
             let mut execs = ExecRegistry::new(tx, Duration::from_millis(200));
-            execs.start(
+            execs.start_text(
                 &enabled_startup(false),
                 "slow",
                 slow_command(),
@@ -4124,7 +4377,7 @@ mod tests {
         let (tx, rx) = channel();
         let pid = {
             let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
-            execs.start(
+            execs.start_text(
                 &enabled_startup(false),
                 "sleep",
                 slow_command(),
@@ -4135,6 +4388,11 @@ mod tests {
             drop(execs);
             pid
         };
+        // Ending a Windows job is asynchronous: a loaded machine can list the process a moment.
+        let until = Instant::now() + Duration::from_secs(5);
+        while process_exists(pid) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(!process_exists(pid), "child was not reaped");
         drop(rx);
     }
@@ -4151,7 +4409,7 @@ mod tests {
         );
         let (tx, rx) = channel();
         let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
-        execs.start(
+        execs.start_text(
             &enabled_startup(false),
             "group",
             &command,
@@ -4470,7 +4728,7 @@ mod tests {
         } else {
             slow_command()
         };
-        execs.start(
+        execs.start_text(
             &enabled_startup(false),
             "sleep",
             command,
@@ -4527,7 +4785,7 @@ mod tests {
         let command = format!("sleep 120 & echo $! > '{}'; exit", pidfile.display());
         let (tx, rx) = channel();
         let mut execs = ExecRegistry::new(tx, Duration::from_secs(30));
-        execs.start(
+        execs.start_text(
             &enabled_startup(false),
             "group",
             &command,
@@ -6113,7 +6371,7 @@ mod tests {
             .and_then(|pty| pty.pid)
             .expect("shell pid");
         let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
-        execs.start(
+        execs.start_text(
             &startup,
             "forced",
             &format!("sleep 120 & echo $! > '{}'; wait", exec_file.display()),
@@ -6320,6 +6578,7 @@ mod tests {
         }
     }
 
+    mod exec_shell_tests;
     mod output_mask_tests;
 
     mod operator_tests;

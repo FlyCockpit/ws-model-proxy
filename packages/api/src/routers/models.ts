@@ -12,6 +12,7 @@ import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { type SessionNames, sessionNames } from "../lib/model-names";
 import { callableIdsFor, MEMBER_INCLUDE, poolStatus } from "../lib/pool-views";
 import { notFound, refuse } from "../lib/refuse";
+import { effectiveModelCapabilities } from "../lib/runtime-model-capabilities";
 import { transcriptionProfileSchema } from "../lib/transcription-profile";
 
 const POOL_SELECT = {
@@ -332,11 +333,12 @@ type Capability = (typeof MODEL_CAPABILITY)[number];
 type TestSurface = (typeof TEST_SURFACES)[number];
 
 function effectiveCapabilities(model: {
+  type: (typeof MODEL_TYPE)[number];
   detectedCapabilities: Capability[];
   capabilities: Capability[];
   capabilitiesOverridden: boolean;
 }): Capability[] {
-  return model.capabilitiesOverridden ? model.capabilities : model.detectedCapabilities;
+  return effectiveModelCapabilities(model);
 }
 
 function unionCapabilities(lists: Capability[][]): Capability[] {

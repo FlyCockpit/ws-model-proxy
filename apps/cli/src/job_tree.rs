@@ -18,7 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use process_wrap::tokio::{
-    ChildWrapper as TokioChildWrapper, CommandWrap as TokioCommandWrap, JobObject, KillOnDrop,
+    ChildWrapper as TokioChildWrapper, CommandWrap as TokioCommandWrap, CreationFlags, JobObject,
+    KillOnDrop,
 };
 
 const LOCK_GRACE: Duration = Duration::from_millis(200);
@@ -174,6 +175,17 @@ impl Drop for Child {
 
 pub(crate) fn spawn(command: Command) -> io::Result<Child> {
     spawn_with(command, |_| {})
+}
+
+/// [`spawn`] with a hidden console of its own (`CREATE_NO_WINDOW`), for commands: what they
+/// change in their console (PowerShell's UTF-8 output sets the code page) never reaches the
+/// terminal running `wsmp run` or a command running alongside. Flags set on `command` itself
+/// would be lost: the job wrapper sets the creation flags.
+pub(crate) fn spawn_hidden(command: Command) -> io::Result<Child> {
+    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+    spawn_with(command, |wrap| {
+        wrap.wrap(CreationFlags(CREATE_NO_WINDOW));
+    })
 }
 
 fn spawn_with(
@@ -545,6 +557,39 @@ mod tests {
             // case the root has already exited and been reaped anyway.
             assert_dead(grandchild);
         }
+    }
+
+    /// The code page of the console a plain child shares with this test (its own when the test
+    /// has none).
+    fn shared_code_page() -> String {
+        let out = Command::new("cmd")
+            .args(["/C", "chcp"])
+            .output()
+            .expect("chcp");
+        String::from_utf8_lossy(&out.stdout)
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect()
+    }
+
+    #[test]
+    fn a_hidden_child_has_its_own_console_and_stays_in_the_job() {
+        let before = shared_code_page();
+        let other = if before == "437" { "850" } else { "437" };
+        let mut command = Command::new("cmd");
+        command.args(["/C", &format!("chcp {other} >nul")]);
+        let mut child = spawn_hidden(command).expect("hidden spawn");
+        child.wait().expect("exited");
+        // Without CREATE_NO_WINDOW the child shares this console and changes its code page.
+        assert_eq!(shared_code_page(), before);
+
+        let tree = Tree::new();
+        let mut command = Command::new("cmd");
+        command.args(tree.command("detach"));
+        let child = spawn_hidden(command).expect("hidden spawn");
+        let grandchild = tree.read_marker().parse().expect("grandchild PID");
+        drop(child);
+        assert_dead(grandchild);
     }
 
     #[test]

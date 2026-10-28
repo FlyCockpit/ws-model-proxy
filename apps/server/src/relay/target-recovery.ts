@@ -194,8 +194,8 @@ export async function listDueOwnedTargetRecoveries(
             detectedCapabilities: { has: "TEXT_GENERATION" },
           },
           { type: "LLM", capabilitiesOverridden: true, capabilities: { has: "TEXT_GENERATION" } },
-          // A spec that lists a model without capabilities stores none; the node serves it
-          // as its type's default (text generation for an LLM).
+          // A model saved before definitions stored their type's default has none; the node
+          // serves it as its type (text generation for an LLM).
           { type: "LLM", capabilitiesOverridden: false, detectedCapabilities: { isEmpty: true } },
           { type: "EMBEDDINGS" },
         ],

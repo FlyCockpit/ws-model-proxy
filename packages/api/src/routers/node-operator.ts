@@ -26,6 +26,8 @@ import {
 } from "../contracts/nodes";
 import { callerActor } from "../lib/caller-actor";
 import { commandAuditSubject } from "../lib/command-audit";
+import { displayCommand } from "../lib/command-render";
+import { launchCapabilities } from "../lib/launch-capabilities";
 import { notifyQueuedCommand } from "../lib/needs-you-mail";
 import {
   type NodeCommandRow,
@@ -79,6 +81,8 @@ type OperatorNode = {
   slug: string;
   connection: "ONLINE" | "OFFLINE";
   commandMaxMs: number;
+  features: unknown;
+  nodeInfo: unknown;
 };
 
 /** The caller's node, at Full control (and online unless `allowOffline`). */
@@ -96,6 +100,8 @@ async function fullControlNode(
       trustLowerRequestedAt: true,
       connection: true,
       commandMaxMs: true,
+      features: true,
+      nodeInfo: true,
     },
   });
   if (!node) throw notFound("That node or command does not exist.");
@@ -195,14 +201,43 @@ async function callerStillLive(auth: CallerAuth | { kind: "anonymous" }, userId:
   return owner !== null && !userCredentialAccessBlocked(owner, now) && credential !== null;
 }
 
+/**
+ * The node's reason for refusing a command (`startCommand`'s error), when it gave one. Node text:
+ * compared with known reasons only, never shown.
+ */
+function nodeRefusal(error: unknown): string | null {
+  if (typeof error !== "object" || error === null || !("nodeReason" in error)) return null;
+  return typeof error.nodeReason === "string" ? error.nodeReason : null;
+}
+
 const commands = {
   run: contractProcedure(c.commands.run).handler(async ({ context, input }) => {
     assertAgentMayWrite(context.auth);
     const userId = userIdOf(context);
     const node = await fullControlNode(userId, input.nodeId);
     const operator = services(context);
-    const issue = runtimeTextIssue(input.command);
-    if (issue) throw new ORPCError("BAD_REQUEST", { message: issue });
+    const argv = typeof input.command === "string" ? null : input.command;
+    for (const text of argv ?? [input.command as string]) {
+      const issue = runtimeTextIssue(text);
+      if (issue) throw new ORPCError("BAD_REQUEST", { message: issue });
+    }
+    if (argv && input.shell === "cmd") {
+      throw new ORPCError("BAD_REQUEST", {
+        message: "cmd cannot run an argv: send text, or leave shell out.",
+      });
+    }
+    // The node refuses a shell it does not have too; this says which it has.
+    const shells = launchCapabilities(node.features, node.nodeInfo)?.shells;
+    if (input.shell && shells && !shells.has(input.shell)) {
+      throw refuseAbout(
+        "shell_unavailable",
+        node.id,
+        `Node ${node.slug} has no ${input.shell} for commands. It has: ${[...shells].join(", ") || "none"}.`,
+        "BAD_REQUEST",
+      );
+    }
+    // The audit keeps a digest of the command as a person would read it.
+    const auditText = argv ? displayCommand(argv) : (input.command as string);
     const { actor, agentTokenId, mcpGrantId } = callerActor(context.auth, userId);
     const commandId = randomBytes(16).toString("base64url");
     const timeoutMs = Math.min(input.timeoutMs, node.commandMaxMs);
@@ -215,7 +250,7 @@ const commands = {
         actor,
         agentTokenId,
         mcpGrantId,
-        subject: commandAuditSubject(input.command),
+        subject: commandAuditSubject(auditText),
         startedAt,
         endsBy: new Date(startedAt.getTime() + timeoutMs),
       },
@@ -236,6 +271,7 @@ const commands = {
         nodeId: node.id,
         commandId,
         command: input.command,
+        ...(input.shell !== undefined ? { shell: input.shell } : {}),
         ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
         timeoutMs,
       });
@@ -244,14 +280,41 @@ const commands = {
         outcome: "failed",
         reason: "start_failed",
       });
-      throw error instanceof ORPCError
-        ? error
-        : refuseAbout(
-            "node_offline",
-            node.id,
-            `Node ${node.slug} did not start the command.`,
-            "CONFLICT",
-          );
+      if (error instanceof ORPCError) throw error;
+      const nodeReason = nodeRefusal(error);
+      if (nodeReason === "shell_unavailable") {
+        throw refuseAbout(
+          "shell_unavailable",
+          node.id,
+          `Node ${node.slug} cannot run this command in ${input.shell ?? "its default shell"}${
+            argv ? " (an argv that is not an .exe runs in pwsh or powershell)" : ""
+          }.`,
+          "BAD_REQUEST",
+        );
+      }
+      if (nodeReason === "spawn_failed") {
+        throw refuseAbout(
+          "command_not_started",
+          node.id,
+          `Node ${node.slug} could not start the command: its program was not found or could not be started (on Windows, also an argument cmd cannot be given safely, such as a line break for a .bat or .cmd), or its script could not be written there.`,
+          "BAD_REQUEST",
+        );
+      }
+      if (nodeReason === "bad_command" && (argv || input.shell)) {
+        // A node from before shells could be named cannot read the request at all.
+        throw refuseAbout(
+          "upgrade_wsmp",
+          node.id,
+          `Node ${node.slug} refused the command; if its wsmp predates argv commands and shell, upgrade it, or send plain text.`,
+          "CONFLICT",
+        );
+      }
+      throw refuseAbout(
+        "node_offline",
+        node.id,
+        `Node ${node.slug} did not start the command.`,
+        "CONFLICT",
+      );
     }
     return pollAndSettle(operator, row, COMMAND_RUN_ANSWER_MS, false);
   }),

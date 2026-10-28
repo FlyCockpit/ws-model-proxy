@@ -60,7 +60,7 @@ export function relayFailureMessage(failure: ModelApiFailure): string {
   if (failure === "request_too_large") return "Model API request body is too large.";
   if (failure === "timeout") return "Relay request timed out.";
   if (failure === "unsupported_capability")
-    return "The selected model does not support this endpoint.";
+    return "The selected model does not support this endpoint. A runtime's model can do what its definition declares (modelType, and models[].capabilities), unless its owner overrode them.";
   if (failure === "upstream_4xx") return "The upstream endpoint rejected the request.";
   if (failure === "upstream_5xx") return "The upstream endpoint failed.";
   if (failure === "transport") return "Relay transport failed.";

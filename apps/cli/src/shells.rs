@@ -96,6 +96,9 @@ pub fn command_shells() -> Vec<Shell> {
 pub fn command_shells() -> Vec<Shell> {
     let mut shells = Vec::new();
     let system32 = system32();
+    // Never the Microsoft Store build (an app execution alias under `WindowsApps`): Windows
+    // starts a packaged app in a job of its own, not the one wsmp put the command in, so ending
+    // that job (cancel, timeout, a closed terminal) would leave it and everything it started.
     let pwsh = on_path("pwsh.exe").or_else(|| {
         std::env::var_os("ProgramFiles")
             .map(|dir| PathBuf::from(dir).join(r"PowerShell\7\pwsh.exe"))
@@ -141,9 +144,17 @@ pub fn command_shells() -> Vec<Shell> {
 fn on_path(file: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .filter(|dir| dir.is_absolute())
+        .filter(|dir| dir.is_absolute() && !packaged(dir))
         .map(|dir| dir.join(file))
         .find(|candidate| candidate.is_file())
+}
+
+/// Whether `path` is where Microsoft Store apps live: their app execution aliases
+/// (`%LOCALAPPDATA%\Microsoft\WindowsApps`) or their packages (`%ProgramFiles%\WindowsApps`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn packaged(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
 }
 
 /// `wsl.exe --list --quiet`, bounded to a few seconds: the distribution
@@ -269,6 +280,31 @@ mod tests {
             ["Debian", "kali-linux"]
         );
         assert!(distribution_names(b"").is_empty());
+    }
+
+    // Windows paths: elsewhere `\` is not a separator, so the folder is never a component.
+    #[cfg(windows)]
+    #[test]
+    fn store_app_folders_are_recognised() {
+        for path in [
+            r"C:\Users\ada\AppData\Local\Microsoft\WindowsApps",
+            r"C:\Users\ada\AppData\Local\Microsoft\windowsapps\pwsh.exe",
+            r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.9.0_x64__8wekyb3d8bbwe\pwsh.exe",
+        ] {
+            assert!(packaged(std::path::Path::new(path)), "{path}");
+        }
+        for path in [
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            r"C:\Apps\Windows\pwsh.exe",
+        ] {
+            assert!(!packaged(std::path::Path::new(path)), "{path}");
+        }
+        assert!(
+            command_shells()
+                .iter()
+                .all(|shell| !packaged(&shell.program)),
+            "a Store shell was offered"
+        );
     }
 
     #[test]

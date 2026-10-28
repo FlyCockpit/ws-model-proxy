@@ -1581,7 +1581,15 @@ pub enum ServerFrame {
     #[serde(rename = "exec.start")]
     ExecStart {
         command_id: String,
-        command: String,
+        /// A text command, run in `shell`. Exactly one of `command` and `argv`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        /// A program and its arguments, each passed exactly (no shell parses them).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        argv: Option<Vec<String>>,
+        /// Absent: `sh` (Windows: `pwsh`, else `powershell`). Never `cmd` with `argv`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell: Option<super::runtime_spec::CommandShell>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
         /// Capped by the node's `command_max_ms`; the node kills the whole
@@ -2005,10 +2013,28 @@ impl ServerFrame {
                 !id.trim().is_empty() && id.encode_utf16().count() <= 128,
                 "a relay id is 1-128 characters",
             ),
-            Self::ExecStart { timeout_ms, .. } => rule(
+            Self::ExecStart {
+                command,
+                argv,
+                shell,
+                timeout_ms,
+                ..
+            } => rule(
                 (1_000..=NODE_COMMAND_MAX_MS).contains(timeout_ms),
                 "a command lifetime is 1 s to 24 h",
-            ),
+            )
+            .and_then(|()| {
+                rule(
+                    command.is_some() != argv.is_some(),
+                    "a command is text or an argv, not both",
+                )
+            })
+            .and_then(|()| {
+                rule(
+                    !(argv.is_some() && *shell == Some(super::runtime_spec::CommandShell::Cmd)),
+                    "cmd cannot run an argv",
+                )
+            }),
             Self::ExecPoll { tail_bytes, .. } => rule(
                 (*tail_bytes as usize) <= NODE_COMMAND_TAIL_MAX_BYTES,
                 "a poll asks for at most 64 KiB of tail",

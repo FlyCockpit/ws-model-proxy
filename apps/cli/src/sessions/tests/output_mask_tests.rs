@@ -54,7 +54,7 @@ fn run_to_end(execs: &mut ExecRegistry, rx: &mpsc::Receiver<FromWorker>) -> Vec<
 fn exec_has_independent_stream_state_and_flushes_before_the_end_without_eof() {
     let (tx, rx) = channel();
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
-    let started = execs.start(
+    let started = execs.start_text(
         &enabled_startup(false),
         "mask-exec",
         slow_command(),
@@ -98,7 +98,7 @@ fn exec_has_independent_stream_state_and_flushes_before_the_end_without_eof() {
 fn exec_flushes_each_eof_immediately_while_the_child_is_running() {
     let (tx, rx) = channel();
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
-    let _ = execs.start(
+    let _ = execs.start_text(
         &enabled_startup(false),
         "mask-eof",
         slow_command(),
@@ -132,7 +132,7 @@ fn exec_flushes_each_eof_immediately_while_the_child_is_running() {
 fn exec_recovers_after_a_long_line_without_hiding_later_results() {
     let (tx, rx) = channel();
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
-    let _ = execs.start(
+    let _ = execs.start_text(
         &enabled_startup(false),
         "mask-long",
         slow_command(),
@@ -165,8 +165,13 @@ fn exec_recovers_after_a_long_line_without_hiding_later_results() {
 fn real_exec_pipe_output_uses_the_masker_on_both_streams() {
     let (tx, rx) = channel();
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
-    let command = include_str!("../../../tests/fixtures/masking/stream-exec-colored.sh");
-    let _ = execs.start(
+    // The same output from the node's default shell: `sh`, or PowerShell on Windows.
+    let command = if cfg!(windows) {
+        include_str!("../../../tests/fixtures/masking/stream-exec-colored.ps1")
+    } else {
+        include_str!("../../../tests/fixtures/masking/stream-exec-colored.sh")
+    };
+    let _ = execs.start_text(
         &enabled_startup(false),
         "mask-real",
         command,
@@ -192,10 +197,15 @@ fn exec_command_text_naming_the_hf_token_file_selects_the_hf_class() {
     let (tx, rx) = channel();
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
     // The command only NAMES the token file (in a comment); nothing reads it.
-    let _ = execs.start(
+    let command = if cfg!(windows) {
+        "[Console]::Out.Write(\"plainword`n\"); [Console]::Error.Write(\"other`n\") # ~/.cache/huggingface/token"
+    } else {
+        "printf 'plainword\\n'; printf 'other\\n' >&2 # ~/.cache/huggingface/token"
+    };
+    let _ = execs.start_text(
         &enabled_startup(false),
         "mask-hf",
-        "printf 'plainword\\n'; printf 'other\\n' >&2 # ~/.cache/huggingface/token",
+        command,
         None,
         TEST_TIMEOUT_MS,
     );
@@ -213,7 +223,7 @@ fn an_unknown_command_polls_as_unknown_and_tails_fit_one_frame() {
     let unknown = polled(&execs, "never-started");
     assert_eq!(unknown.state, ExecState::Unknown);
     assert!(NodeFrame::ExecStatus(unknown).validate().is_ok());
-    let _ = execs.start(
+    let _ = execs.start_text(
         &enabled_startup(false),
         "big",
         slow_command(),

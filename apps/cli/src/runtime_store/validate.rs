@@ -683,7 +683,12 @@ pub fn validate_metric_commands(commands: &[NodeMetricCommand]) -> Check {
             metric_name_ok(&command.name) && names.insert(&command.name),
             || path("name"),
         )?;
-        ensure(command_ok(&command.command), || path("command"))?;
+        ensure(command_line_ok(&command.command), || path("command"))?;
+        ensure(
+            !(matches!(command.command, CommandLine::Argv(_))
+                && command.shell == Some(CommandShell::Cmd)),
+            || path("shell"),
+        )?;
         ensure((5..=3_600).contains(&command.interval_secs), || {
             path("intervalSecs")
         })?;

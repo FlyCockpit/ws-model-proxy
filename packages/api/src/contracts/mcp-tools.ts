@@ -534,7 +534,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "node_command_run",
     description:
-      'Run a one-off command (downloads while experimenting, builds, diagnostics, benchmarks) on a Full-control node; answers within ~15 s, then poll with node_command_get. Anything that should keep running or serve traffic must be a runtime: a server started here is invisible to the proxy and dies with the command. confirm: "RUN".',
+      'Run a one-off command (downloads, builds, diagnostics) on a Full-control node; answers within ~15 s, then poll node_command_get. command: text in shell (default: first of features.launch.shells; on Windows PowerShell 7 or 5.1) or an argv no shell parses. Anything serving traffic must be a runtime: a server started here is invisible to the proxy and dies with the command. confirm: "RUN".',
     input: nodesContract.commands.run.input,
     output: nodesContract.commands.run.output,
     procedures: ["nodes.commands.run"],

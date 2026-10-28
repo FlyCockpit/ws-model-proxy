@@ -4,6 +4,7 @@
  */
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { displayCommand } from "@ws-model-proxy/api/lib/command-render";
 import {
   declaredHardwareSchema,
   GPU_VENDORS,
@@ -334,7 +335,7 @@ export function MetricCommandsCard({ node }: { node: NodeDetail }) {
                       })}
                       className="max-h-48 min-w-0 overflow-x-auto overflow-y-auto overscroll-contain whitespace-pre-wrap break-all rounded-md border bg-muted/40 p-2 font-mono text-xs"
                     >
-                      {command.command}
+                      {displayCommand(command.command)}
                     </pre>
                   </li>
                 ))}

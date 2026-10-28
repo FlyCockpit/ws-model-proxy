@@ -312,21 +312,12 @@ fn complete_session_bus(
     }
 }
 
-/// `sh -c` when `sh` exists; Windows otherwise falls back to `cmd /C`.
-/// Windows execs use a job object to kill the whole tree on cancellation.
+/// `sh -c`, the shell of node and metric commands on Unix. Windows has none of its own: those
+/// commands run in PowerShell (`runtimes::executor::windows::default_shell`), whatever is on
+/// `PATH`.
+#[cfg(unix)]
 pub fn exec_shell() -> (&'static str, &'static str) {
-    if cfg!(unix) || sh_on_path() {
-        ("sh", "-c")
-    } else {
-        ("cmd", "/C")
-    }
-}
-
-fn sh_on_path() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join("sh").is_file() || dir.join("sh.exe").is_file())
+    ("sh", "-c")
 }
 
 pub fn validate_command(command: &str) -> Result<(), &'static str> {
@@ -334,6 +325,23 @@ pub fn validate_command(command: &str) -> Result<(), &'static str> {
         return Err("command is longer than 4096 bytes");
     }
     if command.as_bytes().contains(&0) {
+        return Err("command contains NUL");
+    }
+    Ok(())
+}
+
+/// [`validate_command`] for an argv: a program, and arguments that fit the same bound.
+pub fn validate_argv(argv: &[String]) -> Result<(), &'static str> {
+    if argv.first().is_none_or(|program| program.trim().is_empty()) {
+        return Err("the argv has no program");
+    }
+    if argv.len() > crate::protocol::runtime_spec::RUNTIME_ARGV_MAX {
+        return Err("the argv has too many arguments");
+    }
+    if argv.iter().map(|arg| arg.len() + 1).sum::<usize>() > 4097 {
+        return Err("command is longer than 4096 bytes");
+    }
+    if argv.iter().any(|arg| arg.as_bytes().contains(&0)) {
         return Err("command contains NUL");
     }
     Ok(())

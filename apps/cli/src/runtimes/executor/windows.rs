@@ -457,6 +457,20 @@ fn parse_shell(name: &str) -> Option<CommandShell> {
     }
 }
 
+/// The shell a node command or metric command runs in when none is named: PowerShell 7, else
+/// Windows PowerShell (every Windows 11 has it). Never `sh` or `cmd`, so what is on `PATH` (Git
+/// Bash) cannot change how commands run.
+pub fn default_shell() -> Result<CommandShell> {
+    crate::shells::command_shells()
+        .iter()
+        .find_map(|found| match found.id.as_str() {
+            "pwsh" => Some(CommandShell::Pwsh),
+            "powershell" => Some(CommandShell::Powershell),
+            _ => None,
+        })
+        .context("neither `pwsh` nor `powershell` is installed")
+}
+
 /// The program of a Windows shell this node found.
 pub fn shell_program(shell: CommandShell) -> Result<PathBuf> {
     let id = shell_name(shell);
@@ -467,11 +481,20 @@ pub fn shell_program(shell: CommandShell) -> Result<PathBuf> {
         .with_context(|| format!("`{id}` is not installed on this node"))
 }
 
-/// A PowerShell script that exits as `sh` would: with the status of its last
-/// command, a native program's exit code included (PowerShell itself would
-/// exit 1). An `exit` in the script still ends it at once.
+/// A PowerShell script that writes UTF-8 and exits as `sh` would: with the status of its last
+/// command, a native program's exit code included (PowerShell itself would exit 1). An `exit` in
+/// the script still ends it at once.
+///
+/// UTF-8: a service's console has the OEM code page (437 on a US Windows), in which PowerShell
+/// writes `é` as one byte wsmp cannot read. The console's code page is switched for the script
+/// (programs it starts write UTF-8 too, and PowerShell reads their output as such); without a
+/// console there is nothing to switch.
 pub fn powershell_script(script: &str) -> String {
-    format!("{script}\nif (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}")
+    format!(
+        "try {{ [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) }} catch {{}}\n\
+         $OutputEncoding = [Text.UTF8Encoding]::new($false)\n\
+         {script}\nif (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}"
+    )
 }
 
 /// `-EncodedCommand`'s argument: the script as base64 of its UTF-16LE text, so
@@ -563,10 +586,17 @@ pub fn invocation(
     })
 }
 
-/// `name` as PowerShell would find it, when that is an `.exe` or `.com`: an absolute path as it
-/// is, a bare name in each absolute `PATH` directory in turn; either with each `PATHEXT`
-/// extension unless it already ends in one. A relative path is left to the shell.
-fn find_exe(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
+/// `name` as PowerShell would find it, when that is an `.exe` or `.com`: see [`find_program`].
+pub fn find_exe(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
+    let found = find_program(name, env)?;
+    let extension = found.extension()?.to_str()?.to_ascii_lowercase();
+    matches!(extension.as_str(), "exe" | "com").then_some(found)
+}
+
+/// `name` as PowerShell would find it: an absolute path as it is, a bare name in each absolute
+/// `PATH` directory in turn; either with each `PATHEXT` extension unless it already ends in one.
+/// A relative path is left to the shell.
+pub fn find_program(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
     let var = |key: &str| {
         env.iter()
             .rev()
@@ -597,7 +627,7 @@ fn find_exe(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
             })
             .collect()
     };
-    let found = if name.contains(['\\', '/', ':']) {
+    if name.contains(['\\', '/', ':']) {
         if !path.is_absolute() {
             return None;
         }
@@ -609,9 +639,7 @@ fn find_exe(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
             .filter(|dir| dir.is_absolute())
             .flat_map(|dir| candidates(&dir.join(name)))
             .find(|candidate| candidate.is_file())
-    }?;
-    let extension = found.extension()?.to_str()?.to_ascii_lowercase();
-    matches!(extension.as_str(), "exe" | "com").then_some(found)
+    }
 }
 
 /// Runs one of a job's commands to completion (bounded, in a job of its own): its output is

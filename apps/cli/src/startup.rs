@@ -218,8 +218,11 @@ impl TerminalStartup {
             NodePlatform::Macos => vec![Management::Service],
             NodePlatform::Windows => vec![Management::Process, Management::Service],
         };
+        // The default command shell first (what a command without `shell` runs in: pwsh, else
+        // powershell), whatever the terminal default is.
         let shells = if cfg!(windows) {
-            self.shells
+            let mut shells: Vec<CommandShell> = self
+                .shells
                 .iter()
                 .filter_map(|shell| match shell.id.as_str() {
                     "pwsh" => Some(CommandShell::Pwsh),
@@ -227,7 +230,13 @@ impl TerminalStartup {
                     "cmd" => Some(CommandShell::Cmd),
                     _ => None,
                 })
-                .collect()
+                .collect();
+            shells.sort_by_key(|shell| match shell {
+                CommandShell::Pwsh => 0,
+                CommandShell::Powershell => 1,
+                CommandShell::Cmd | CommandShell::Sh => 2,
+            });
+            shells
         } else {
             vec![CommandShell::Sh]
         };
@@ -301,6 +310,12 @@ mod tests {
             let default = startup.shell(None).expect("a default shell");
             assert_eq!(features.terminals.shells[0], default.id);
             assert!(startup.shell(Some("cmd")).is_some());
+            // Commands name their default first, whatever the terminal's is.
+            #[cfg(windows)]
+            assert_eq!(
+                features.launch.as_ref().map(|launch| launch.shells[0]),
+                crate::runtimes::executor::windows::default_shell().ok()
+            );
         }
         assert!(startup.shell(Some("not-a-shell")).is_none());
         assert!(features.terminals.approval_required);

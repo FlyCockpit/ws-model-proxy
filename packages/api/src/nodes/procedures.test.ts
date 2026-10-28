@@ -377,6 +377,74 @@ describe("nodes.update", () => {
     ).rejects.toMatchObject({ data: { reason: "trust_relay" } });
   });
 
+  it("refuses a metric command shell the node does not have, and an argv for cmd", async () => {
+    const linux = {
+      ...trustRow,
+      slug: "box",
+      nodeInfo: null,
+      features: {
+        terminals: { supported: true, max: 4, approvalRequired: false },
+        operatorTerminals: false,
+        files: { roots: null, asRoot: false, source: "default" },
+        runtimeHosts: [],
+        mediaExpand: true,
+        liveStt: true,
+        secrets: [],
+        launch: { platform: "linux", management: ["process", "service"], shells: ["sh"] },
+      },
+    };
+    const metric = {
+      name: "gpu_power",
+      command: "Get-Counter",
+      intervalSecs: 5,
+      timeoutSecs: 5,
+      format: "lines" as const,
+    };
+    db.node.findFirst.mockResolvedValueOnce(linux as never);
+    await expect(
+      client().update({ nodeId: "node-1", metricCommands: [{ ...metric, shell: "pwsh" }] }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { reason: "shell_unavailable" } });
+    await expect(
+      client().update({
+        nodeId: "node-1",
+        metricCommands: [{ ...metric, command: ["nvidia-smi"], shell: "cmd" }],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("tells a node without features.launch to upgrade before saving an argv or a shell", async () => {
+    // v0.4.2: no `launch`, and a metric command it cannot parse would end its session.
+    const released = {
+      ...trustRow,
+      slug: "box",
+      nodeInfo: { executionMechanism: "systemd+linger" },
+      features: {
+        terminals: { supported: true, max: 4, approvalRequired: false },
+        operatorTerminals: false,
+        files: { roots: null, asRoot: false, source: "default" },
+        runtimeHosts: [],
+        mediaExpand: true,
+        liveStt: true,
+        secrets: [],
+      },
+    };
+    const metric = {
+      name: "gpu_power",
+      command: "nvidia-smi",
+      intervalSecs: 5,
+      timeoutSecs: 5,
+      format: "lines" as const,
+    };
+    for (const changed of [{ command: ["nvidia-smi"] }, { shell: "sh" as const }]) {
+      db.node.findFirst.mockResolvedValueOnce(released as never);
+      await expect(
+        client().update({ nodeId: "node-1", metricCommands: [{ ...metric, ...changed }] }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { reason: "upgrade_wsmp" } });
+    }
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
   it("refuses a read-only agent before reading the node", async () => {
     await expect(
       client(READ_AGENT).update({ nodeId: "node-1", labels: ["a"] }),

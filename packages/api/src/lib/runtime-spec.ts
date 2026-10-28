@@ -301,6 +301,10 @@ export const specEmbeddingContractSchema = z
 export const runtimeSpecModelSchema = z
   .object({
     id: servedModelIdSchema,
+    /**
+     * Absent or empty: the model type's (`text_generation` for an llm, `embedding` for
+     * embeddings, `audio_input` for transcription), on the node and the server alike.
+     */
     capabilities: z.array(z.enum(MODEL_CAPABILITIES)).max(MODEL_CAPABILITIES.length).optional(),
     embeddingContract: specEmbeddingContractSchema.optional(),
     transcription: transcriptionProfileSchema.optional(),
@@ -821,7 +825,15 @@ export function runtimeSpecIsService(spec: Pick<RuntimeSpec, "models" | "address
 export const nodeMetricCommandSchema = z
   .object({
     name: z.string().regex(NODE_METRIC_COMMAND_NAME_PATTERN),
-    command: runtimeCommandSchema,
+    /** Text run in `shell`, or an argv started with no shell (as `node_command_run`). */
+    command: runtimeCommandLineSchema,
+    /**
+     * The text's interpreter, one the node reports (`features.launch.shells`). Absent: `sh`; on
+     * Windows `pwsh`, else `powershell`. An argv starts its program directly (Windows: an
+     * `.exe`, `.bat` or `.cmd`; anything else runs in PowerShell), the cheapest way to run one
+     * program often. Never `cmd` with an argv.
+     */
+    shell: z.enum(RUNTIME_SHELLS).optional(),
     intervalSecs: z.number().int().min(5).max(3_600),
     timeoutSecs: z.number().int().min(1).max(60),
     /**
@@ -835,8 +847,27 @@ export const nodeMetricCommandSchema = z
       .refine((map) => Object.keys(map).length <= 16, specIssue("metricsPerCommand"))
       .optional(),
   })
-  .strict();
+  .strict()
+  .refine((command) => typeof command.command === "string" || command.shell !== "cmd", {
+    path: ["shell"],
+    message: "cmd cannot run an argv.",
+  });
 export type NodeMetricCommand = z.infer<typeof nodeMetricCommandSchema>;
+
+/**
+ * Whether a metric command has a shape only a node that reports `features.launch` can read: an
+ * argv or a `shell`. A released CLI without it reads `command` as text and refuses unknown
+ * fields, and a `runtime.define` it cannot parse ends its session, so it is never sent one.
+ */
+export function metricCommandNeedsLaunch(command: NodeMetricCommand): boolean {
+  return typeof command.command !== "string" || command.shell !== undefined;
+}
+
+/** Whether the node reports `features.launch` (it reads argv and `shell` metric commands). */
+export function reportsLaunchFeatures(features: unknown): boolean {
+  const parsed = nodeFeaturesSchema.safeParse(features);
+  return parsed.success && parsed.data.launch !== undefined;
+}
 
 /** Canonical UTF-8 size, or null when the value cannot be hashed (other issues report why). */
 export function canonicalBytes(value: unknown): number | null {

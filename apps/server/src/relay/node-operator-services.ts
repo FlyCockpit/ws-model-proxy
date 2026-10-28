@@ -49,7 +49,11 @@ export const EXEC_START_TIMEOUT_MS = 15_000;
 export const EXEC_POLL_ANSWER_TIMEOUT_MS = 5_000;
 
 export class NodeCommandStartError extends Error {
-  constructor(readonly code: "not_delivered" | "rejected" | "no_answer" | "disconnected") {
+  constructor(
+    readonly code: "not_delivered" | "rejected" | "no_answer" | "disconnected",
+    /** The node's `exec.rejected` reason (`rejected` only); never put in the message. */
+    readonly nodeReason?: string,
+  ) {
     super(`The node did not start the command (${code}).`);
     this.name = "NodeCommandStartError";
   }
@@ -182,7 +186,10 @@ export function createNodeOperatorServices(
         {
           type: "exec.start",
           commandId: args.commandId,
-          command: args.command,
+          ...(typeof args.command === "string"
+            ? { command: args.command }
+            : { argv: args.command }),
+          ...(args.shell !== undefined ? { shell: args.shell } : {}),
           ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
           timeoutMs: args.timeoutMs,
         },
@@ -385,7 +392,7 @@ export function createNodeOperatorServices(
       if (!entry || !sameSession(node, entry)) return;
       settleStart(frame.commandId);
       tracker.forget(frame.commandId, node.nodeId);
-      entry.reject(new NodeCommandStartError("rejected"));
+      entry.reject(new NodeCommandStartError("rejected", frame.reason));
     },
     "exec.status": async (node, frame) => {
       const ended = frame.state !== "running";

@@ -38,9 +38,11 @@ import {
   portRangeSchema,
   READER_SIGNALS,
   RUNTIME_APIS,
+  RUNTIME_ARGV_MAX,
   RUNTIME_DEFINITIONS_MAX,
   RUNTIME_KINDS,
   RUNTIME_RESERVATIONS_MAX,
+  RUNTIME_SHELLS,
   RUNTIME_SLUG_PATTERN,
   runtimeSpecSchema,
   terminalShellIdSchema,
@@ -1392,12 +1394,23 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("exec.start"),
       commandId: base64Url16Schema,
-      command: z.string().min(1).max(16_384),
+      /** A text command, run in `shell`. Exactly one of `command` and `argv`. */
+      command: z.string().min(1).max(16_384).optional(),
+      /** A program and its arguments, each passed exactly (no shell parses them). */
+      argv: z.array(z.string().max(16_384)).min(1).max(RUNTIME_ARGV_MAX).optional(),
+      /** Absent: `sh` (Windows: `pwsh`, else `powershell`). */
+      shell: z.enum(RUNTIME_SHELLS).optional(),
       cwd: z.string().min(1).max(4096).optional(),
       /** Requested lifetime; the node caps it at its commandMaxMs and kills the whole tree. */
       timeoutMs: z.number().int().min(1_000).max(NODE_COMMAND_MAX_MS),
     })
-    .strict(),
+    .strict()
+    .refine((frame) => (frame.command === undefined) !== (frame.argv === undefined), {
+      message: "A command is text or an argv, not both.",
+    })
+    .refine((frame) => frame.argv === undefined || frame.shell !== "cmd", {
+      message: "cmd cannot run an argv.",
+    }),
   /** Ask for a command's state and output tail; answered with `exec.status`. */
   z
     .object({

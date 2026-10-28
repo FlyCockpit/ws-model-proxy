@@ -333,11 +333,17 @@ supported.
 - trust and the local control commands;
 - browser terminals (ConPTY, with PowerShell 7, Windows PowerShell, Command Prompt or a WSL
   distribution);
-- node commands;
+- node commands: in PowerShell by default (`pwsh`, else Windows PowerShell), in `cmd` when asked,
+  or as an argv;
 - runtimes in PowerShell or `cmd`, including interactive steps;
-- the read file tools: read, stat, list and search.
+- the file tools: read, stat, list, search, write, edit, rename, mkdir and delete.
 
-Install PowerShell 7 (`pwsh`) for runtimes. Windows PowerShell 5.1 works, but it changes some
+Install PowerShell 7 (`pwsh`) for runtimes and node commands, with its MSI or
+`winget install Microsoft.PowerShell`. `wsmp` does not use the Microsoft Store build: Windows
+starts a Store app in a job of its own, outside the job `wsmp` ends a command, runtime or
+terminal with, so what it started would keep running. Programs from the Store that a command
+names itself (Store Python, `winget`) run outside that job too: cancelling or timing out the
+command does not end them. Windows PowerShell 5.1 works, but it changes some
 arguments it passes to a program (an empty one, or one with a quote in it). An argv whose program
 is an `.exe` does not go through it; one that would (a `.cmd` shim, say) fails with such an
 argument there.
@@ -353,10 +359,16 @@ argument there.
   actually opened. So a link out of the file roots, or to a protected file, is refused, and list
   and search never walk into one.
 - **Elevated `wsmp`** counts as running as root (see `set-file-tools-as-root`).
+- **Writes** replace a file atomically: the new content goes to a staging file beside it
+  (`.<name>.wsmp-<random>`), the etag is checked again, and the staging file is renamed over the
+  target. A rename never replaces a destination it did not check. `mode` is refused (Windows has
+  none).
+- **Not yet as on Unix:** there is no recovery journal (`wsmp recover`). A crash during a write
+  can leave a staging file behind; delete it by hand. A writer that replaces the file between the
+  last check and the rename is overwritten. A replaced file takes its folder's inherited
+  permissions, not an explicit ACL of its own, and loses the hidden or system attribute.
 
 **Not on Windows (yet).**
-- The file tools that change files (edit, write, rename, mkdir and delete) are refused with
-  `unsupported`. They need the Unix side's atomic replace and recovery journal.
 - Engines that need Linux, such as vLLM and SGLang. llama.cpp's `llama-server`, Ollama and LM
   Studio run natively.
 
@@ -368,8 +380,8 @@ argument there.
   `wsmp run | Tee-Object relay.log`, until the runtime stops. The service and a relay run in a
   terminal have console handles instead, so they are not affected.
 
-**WSL2 instead.** The Linux `wsmp` in a WSL2 distribution has every Linux feature: the file tools
-that change files, and vLLM with CUDA on WSL.
+**WSL2 instead.** The Linux `wsmp` in a WSL2 distribution has every Linux feature: the file
+tools' recovery journal, and vLLM with CUDA on WSL.
 1. Enable systemd in the distribution (`/etc/wsl.conf`: `[boot]` then `systemd=true`), then run
    `wsl --shutdown`.
 2. Install `wsmp` with `install.sh` inside the distribution.

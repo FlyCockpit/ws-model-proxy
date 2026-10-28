@@ -11,8 +11,30 @@ Install it from the server with `irm <server>/install.ps1 | iex`, or with the Wi
 runtime only on nodes whose management modes and shells can run it (a Windows node has no `sh`,
 so no `sh` launch lands there). Image paste works in
 Windows terminals once the web app is upgraded too: the node quotes the path for the terminal's
-shell. Interactive runtime steps open operator terminals there as on Linux. On Windows the node file tools serve reads only (read, stat, list and search), with paths in a POSIX view (`/c/Users/...`). The tools that change files are refused there. The CLI README's Windows
-section lists the limits, and the WSL2 alternative.
+shell. Interactive runtime steps open operator terminals there as on Linux. On Windows the node
+file tools take paths in a POSIX view (`/c/Users/...`). Writes, edits, renames, mkdir and delete
+work there too, with atomic replace but without the Unix recovery journal. The CLI README's
+Windows section lists the limits, and the WSL2 alternative.
+
+`node_command_run` can now name its shell (`shell`: `sh`, `pwsh`, `powershell` or `cmd`, one the
+node reports), or take an argv (`command: ["curl", "-d", "…"]`) whose arguments reach the program
+without a shell reading them; on Windows a `.cmd` shim such as `npm` gets them escaped for cmd.
+Command text is at most 4096 bytes, what nodes accept. On Windows, a command without `shell` runs
+in PowerShell (`pwsh`, else Windows PowerShell; never a Microsoft Store `pwsh`, which Windows runs
+outside the job that ends a command, so install PowerShell 7 with its MSI or winget), never in
+Git Bash's `sh`; the node lists its default first in `features.launch.shells`, and PowerShell
+writes UTF-8 even in a console with the OEM code page (every command, metric command and
+runtime step has a hidden console of its own, so the terminal running `wsmp run` keeps its
+code page); name `shell: "cmd"`
+for Command Prompt, which now gets the text exactly as sent. A node must run this release's
+`wsmp` for `shell` or an argv: an older one refuses the command, and the server says to upgrade
+it. A command the node could not start is refused with `command_not_started`.
+
+Node metric commands take the same `shell` and argv forms. On Windows a metric without `shell`
+runs in PowerShell; one that runs a single program often is cheaper as an argv, which starts the
+program with no shell. A node must run this release's `wsmp` to take a metric command with
+`shell` or an argv: saving one for an older node is refused with `upgrade_wsmp`, and one saved
+earlier is not sent to it.
 
 Runtime commands can now be argv lists, which every node quotes for its own shell, and a launch
 can name its shell (`launch.shell`: `sh`, `pwsh`, `powershell` or `cmd`). On Windows an argv whose
