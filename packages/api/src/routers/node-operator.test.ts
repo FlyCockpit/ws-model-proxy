@@ -335,6 +335,10 @@ describe("node commands", () => {
     await expect(
       client(FULL_AGENT, operator()).commands.run({ ...runInput, command: [" ", "x"] }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    // Past what the node accepts: refused here, never sent (the node would call it bad_command).
+    await expect(
+      client(FULL_AGENT, operator()).commands.run({ ...runInput, command: "x".repeat(4097) }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.nodeCommand.create).not.toHaveBeenCalled();
   });
 

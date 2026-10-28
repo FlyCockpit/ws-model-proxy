@@ -123,10 +123,33 @@ pub(crate) fn replace(
     ops.step(Step::EtagRechecked)?;
     cancel.check()?;
     drop(orig);
-    std::fs::rename(&staging, &target).map_err(|error| FileError::io(&error))?;
+    rename_retrying(&staging, &target).map_err(|error| FileError::io(&error))?;
     staged.armed = false;
     let _ = ops.step(Step::Renamed);
     Ok((Stat::of_path(&target)?, Vec::new()))
+}
+
+/// `std::fs::rename`, again a few times (under two seconds in all) while another
+/// process holds the target open without delete sharing: an antivirus scan or
+/// the search indexer lets go within moments.
+pub(crate) fn rename_retrying(from: &Path, to: &Path) -> std::io::Result<()> {
+    // ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION.
+    const BUSY: [i32; 2] = [5, 32];
+    let mut wait = std::time::Duration::from_millis(25);
+    for _ in 0..6 {
+        match std::fs::rename(from, to) {
+            Err(error)
+                if error
+                    .raw_os_error()
+                    .is_some_and(|code| BUSY.contains(&code)) =>
+            {
+                std::thread::sleep(wait);
+                wait *= 2;
+            }
+            done => return done,
+        }
+    }
+    std::fs::rename(from, to)
 }
 
 /// The name must still open the file we read, and that file must still hold
@@ -176,4 +199,31 @@ pub(crate) fn create_new(
     let stat = Stat::of_file(&file)?;
     staged.armed = false;
     Ok((stat, Vec::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rename_waits_out_a_brief_open_without_delete_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().expect("dir");
+        let (from, to) = (dir.path().join("new"), dir.path().join("target"));
+        std::fs::write(&from, b"new").expect("new");
+        std::fs::write(&to, b"old").expect("target");
+        // FILE_SHARE_READ only, as a scanner might open it.
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&to)
+            .expect("hold");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        rename_retrying(&from, &to).expect("renamed once released");
+        release.join().expect("release");
+        assert_eq!(std::fs::read(&to).expect("target"), b"new");
+    }
 }

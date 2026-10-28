@@ -1398,7 +1398,7 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
       command: z.string().min(1).max(16_384).optional(),
       /** A program and its arguments, each passed exactly (no shell parses them). */
       argv: z.array(z.string().max(16_384)).min(1).max(RUNTIME_ARGV_MAX).optional(),
-      /** Absent: `sh` (Windows: `sh` when it is on PATH, else `cmd`). */
+      /** Absent: `sh` (Windows: `pwsh`, else `powershell`). */
       shell: z.enum(RUNTIME_SHELLS).optional(),
       cwd: z.string().min(1).max(4096).optional(),
       /** Requested lifetime; the node caps it at its commandMaxMs and kills the whole tree. */

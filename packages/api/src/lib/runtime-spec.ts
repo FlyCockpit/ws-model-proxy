@@ -301,6 +301,10 @@ export const specEmbeddingContractSchema = z
 export const runtimeSpecModelSchema = z
   .object({
     id: servedModelIdSchema,
+    /**
+     * Absent or empty: the model type's (`text_generation` for an llm, `embedding` for
+     * embeddings, `audio_input` for transcription), on the node and the server alike.
+     */
     capabilities: z.array(z.enum(MODEL_CAPABILITIES)).max(MODEL_CAPABILITIES.length).optional(),
     embeddingContract: specEmbeddingContractSchema.optional(),
     transcription: transcriptionProfileSchema.optional(),

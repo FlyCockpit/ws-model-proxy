@@ -333,7 +333,8 @@ supported.
 - trust and the local control commands;
 - browser terminals (ConPTY, with PowerShell 7, Windows PowerShell, Command Prompt or a WSL
   distribution);
-- node commands, in PowerShell, `cmd` or as an argv;
+- node commands: in PowerShell by default (`pwsh`, else Windows PowerShell), in `cmd` when asked,
+  or as an argv;
 - runtimes in PowerShell or `cmd`, including interactive steps;
 - the file tools: read, stat, list, search, write, edit, rename, mkdir and delete.
 

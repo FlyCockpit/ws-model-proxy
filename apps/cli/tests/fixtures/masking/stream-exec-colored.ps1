@@ -1,0 +1,1 @@
+$e = [char]27; [Console]::Out.Write("APP_TO$e[31mKEN$e[0m=session-value-one-107`n"); [Console]::Error.Write("stderr-visible`n"); [Console]::Out.Write("next-session-value-107"); [Console]::Error.Write("serve --api-$e[31mkey$e[0m session-flag-value-107")

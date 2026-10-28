@@ -185,7 +185,7 @@ pub(crate) fn rename(
     match &dst {
         Some(dst) => {
             still_same(&to, dst)?;
-            std::fs::rename(&from_path, &to_path)?;
+            super::atomic::rename_retrying(&from_path, &to_path)?;
         }
         None => wsmp_windows::move_no_replace(&from_path, &to_path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {

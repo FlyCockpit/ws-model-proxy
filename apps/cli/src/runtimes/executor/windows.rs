@@ -563,10 +563,17 @@ pub fn invocation(
     })
 }
 
-/// `name` as PowerShell would find it, when that is an `.exe` or `.com`: an absolute path as it
-/// is, a bare name in each absolute `PATH` directory in turn; either with each `PATHEXT`
-/// extension unless it already ends in one. A relative path is left to the shell.
+/// `name` as PowerShell would find it, when that is an `.exe` or `.com`: see [`find_program`].
 pub fn find_exe(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
+    let found = find_program(name, env)?;
+    let extension = found.extension()?.to_str()?.to_ascii_lowercase();
+    matches!(extension.as_str(), "exe" | "com").then_some(found)
+}
+
+/// `name` as PowerShell would find it: an absolute path as it is, a bare name in each absolute
+/// `PATH` directory in turn; either with each `PATHEXT` extension unless it already ends in one.
+/// A relative path is left to the shell.
+pub fn find_program(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
     let var = |key: &str| {
         env.iter()
             .rev()
@@ -597,7 +604,7 @@ pub fn find_exe(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
             })
             .collect()
     };
-    let found = if name.contains(['\\', '/', ':']) {
+    if name.contains(['\\', '/', ':']) {
         if !path.is_absolute() {
             return None;
         }
@@ -609,9 +616,7 @@ pub fn find_exe(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
             .filter(|dir| dir.is_absolute())
             .flat_map(|dir| candidates(&dir.join(name)))
             .find(|candidate| candidate.is_file())
-    }?;
-    let extension = found.extension()?.to_str()?.to_ascii_lowercase();
-    matches!(extension.as_str(), "exe" | "com").then_some(found)
+    }
 }
 
 /// Runs one of a job's commands to completion (bounded, in a job of its own): its output is

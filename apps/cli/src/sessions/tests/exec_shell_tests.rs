@@ -41,7 +41,7 @@ fn run(line: &ExecLine<'_>, shell: Option<CommandShell>) -> (ExecState, String) 
         let _ = execs.poll(Instant::now());
     }
     // A PowerShell command's script goes with it.
-    let script = std::env::temp_dir().join(format!("wsmp-exec-{}-{id}.ps1", std::process::id()));
+    let script = execs.scripts.join(format!("{id}.ps1"));
     assert!(!script.exists(), "{}", script.display());
     match execs.status(&id, NODE_COMMAND_TAIL_MAX_BYTES).pop() {
         Some(OutboundFrame::Control(NodeFrame::ExecStatus(status))) => {
@@ -186,12 +186,60 @@ fn powershell_runs_text_with_its_own_quoting_and_variables() {
 
 #[cfg(windows)]
 #[test]
+fn a_cmd_shim_gets_its_arguments_past_cmd_s_second_parse() {
+    // npm, npx and pnpm are such shims: cmd would read `&`, `%NAME%` and `^` in their arguments.
+    let dir = tempfile::tempdir().expect("dir");
+    let shim = dir.path().join("echo-args.cmd");
+    std::fs::write(&shim, "@echo off\r\necho(%1\r\necho(%2\r\necho(%3\r\n").expect("shim");
+    let argv = vec![
+        shim.to_string_lossy().into_owned(),
+        "a&b".to_string(),
+        "%PATH%".to_string(),
+        "x^y z".to_string(),
+    ];
+    let (state, output) = run(&ExecLine::Argv(&argv), None);
+    assert_eq!(state, ExecState::Succeeded, "{output}");
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines, ["\"a&b\"", "\"%PATH%\"", "\"x^y z\""], "{output}");
+    // One cmd cannot be handed safely is refused before anything runs.
+    let unsafe_argv = vec![shim.to_string_lossy().into_owned(), "a\nb".to_string()];
+    assert_eq!(
+        rejection(&ExecLine::Argv(&unsafe_argv), None),
+        REASON_SPAWN_FAILED
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn text_without_a_shell_runs_in_powershell_on_windows() {
+    let (state, output) = run(&ExecLine::Text("$PSVersionTable.PSEdition"), None);
+    assert_eq!(state, ExecState::Succeeded, "{output}");
+    assert!(matches!(output.trim_end(), "Core" | "Desktop"), "{output}");
+}
+
+#[cfg(windows)]
+#[test]
 fn an_argv_cannot_run_in_sh_on_windows() {
     let argv = vec!["whoami".to_string()];
     assert_eq!(
         rejection(&ExecLine::Argv(&argv), Some(CommandShell::Sh)),
         REASON_SHELL_UNAVAILABLE
     );
+}
+
+#[test]
+fn a_restarted_daemon_removes_the_scripts_a_crash_left() {
+    let dir = tempfile::tempdir().expect("dir");
+    let scripts = dir.path().join("exec-scripts");
+    std::fs::create_dir_all(&scripts).expect("scripts");
+    std::fs::write(scripts.join("left-1.ps1"), "Write-Output token").expect("left");
+    std::fs::write(scripts.join("keep.txt"), "not a script").expect("other");
+    let (tx, _rx) = channel();
+    let (execs, _) = ExecRegistry::new(tx, Duration::from_secs(20))
+        .with_table(dir.path().join("node-commands.json"));
+    assert_eq!(execs.scripts, scripts);
+    assert!(!scripts.join("left-1.ps1").exists());
+    assert!(scripts.join("keep.txt").exists());
 }
 
 #[test]

@@ -380,6 +380,15 @@ const commandTextSchema = z
   .min(1)
   .refine((value) => new TextEncoder().encode(value).byteLength <= 16_384, "At most 16 KiB.");
 
+/** A command a node runs (`node_command_run`): at most what the node accepts (`validate_command`). */
+const nodeCommandTextSchema = z
+  .string()
+  .min(1)
+  .refine(
+    (value) => new TextEncoder().encode(value).byteLength <= RUNTIME_COMMAND_MAX_BYTES,
+    `At most ${RUNTIME_COMMAND_MAX_BYTES} bytes.`,
+  );
+
 /** A program and its arguments, each passed to it exactly: no shell parses them. */
 const commandArgvSchema = z
   .array(z.string())
@@ -825,12 +834,12 @@ export const nodesContract = {
         .object({
           nodeId: idSchema,
           /** Text run in `shell`, or an argv: a program and its arguments, passed exactly. */
-          command: z.union([commandTextSchema, commandArgvSchema]),
+          command: z.union([nodeCommandTextSchema, commandArgvSchema]),
           /**
            * The text command's interpreter, one the node has (`features.launch.shells`). Absent:
-           * `sh`; on Windows `sh` when it is on PATH, else `cmd`. An argv needs no shell; on
-           * Windows one that is not an `.exe` runs in PowerShell (`pwsh` or `powershell`, never
-           * `cmd`).
+           * `sh` on Linux and macOS, `pwsh` (else `powershell`) on Windows. An argv needs no
+           * shell; on Windows one that is not an `.exe`, `.bat` or `.cmd` runs in PowerShell
+           * (`pwsh` or `powershell`, never `cmd`).
            */
           shell: z.enum(RUNTIME_SHELLS).optional(),
           cwd: z.string().min(1).max(4_096).optional(),

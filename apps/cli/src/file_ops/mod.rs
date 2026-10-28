@@ -95,12 +95,52 @@ pub fn display_path(path: &std::path::Path) -> Option<String> {
         resolve::posix_view(path)
     }
 }
+/// The key a path is locked under: the path itself on Unix; on Windows its
+/// POSIX view lower-cased, as NTFS compares names (`Notes.txt` and `notes.txt`
+/// are one file, and `\\?\C:\` and `C:\` one drive).
+fn lock_key(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(view) = resolve::posix_view(&path) {
+            return PathBuf::from(view.to_lowercase());
+        }
+    }
+    path
+}
+
 pub use etag::EtagKey;
 pub use policy::Policy;
 
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_lock_tests {
+    use super::*;
+
+    #[test]
+    fn spellings_of_one_ntfs_name_share_a_lock() {
+        let key = |path: &str| lock_key(PathBuf::from(path));
+        assert_eq!(key(r"\\?\C:\Work\Notes.txt"), key(r"c:\work\notes.TXT"));
+        assert_ne!(key(r"C:\Work\notes.txt"), key(r"C:\Work\notes2.txt"));
+        let ops = FileOps::new(
+            Policy::new(Vec::new(), Vec::new(), false),
+            EtagKey::random(),
+        );
+        let cancel = Cancel::new();
+        let _held = ops
+            .lock_path(PathBuf::from(r"C:\Work\Notes.txt"), &cancel)
+            .expect("first");
+        cancel.cancel();
+        // The other spelling waits for the same lock (here: cancelled while it waits).
+        assert!(
+            ops.lock_path(PathBuf::from(r"c:\work\notes.txt"), &cancel)
+                .is_err()
+        );
+    }
+}
 
 /// Cooperative cancellation, checked between files, chunks, and before the
 /// commit point of a mutation.
@@ -395,7 +435,8 @@ impl FileOps {
 
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn lock_path(&self, path: PathBuf, cancel: &Cancel) -> FileResult<PathGuard<'_>> {
-        self.locks.lock(path, cancel, self.limits.lock_wait)
+        self.locks
+            .lock(lock_key(path), cancel, self.limits.lock_wait)
     }
 
     pub fn read(&self, args: &read::ReadArgs, cancel: &Cancel) -> FileResult<read::ReadOutcome> {

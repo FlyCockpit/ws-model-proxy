@@ -1587,7 +1587,7 @@ pub enum ServerFrame {
         /// A program and its arguments, each passed exactly (no shell parses them).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         argv: Option<Vec<String>>,
-        /// Absent: `sh` (Windows: `sh` when it is on `PATH`, else `cmd`). Never `cmd` with `argv`.
+        /// Absent: `sh` (Windows: `pwsh`, else `powershell`). Never `cmd` with `argv`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shell: Option<super::runtime_spec::CommandShell>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -60,21 +60,27 @@ command and everything it started). A command lives at most its timeout
 (default 1 hour) and never longer than the node's command lifetime (1 minute to
 24 hours). Each poll returns at most a 64 KiB output tail.
 
-`command` is text or an argv, as in a runtime's commands:
+`command` is text (at most 4096 bytes) or an argv, as in a runtime's commands:
 
 - **Text** runs in `shell`, one of the shells the node reports
   (`features.launch.shells` in `nodes_get`: `sh` on Linux and macOS; `pwsh`,
   `powershell` and `cmd` on Windows, when installed). Without `shell` it runs in
-  `sh`, and on Windows in `sh` when one is on `PATH` (Git Bash), else `cmd`. On
-  Windows prefer `shell: "pwsh"` (or `"powershell"`): `cmd` expands `%VAR%` when
-  it reads the whole line, so a variable set earlier on the same line stays
-  literal, and it treats `|`, `&` and `>` as operators unless you escape them
-  with `^`. `cmd` gets the text exactly as you sent it.
+  `sh` on Linux and macOS, and in PowerShell on Windows: `pwsh` (PowerShell 7)
+  when installed, else `powershell` (Windows PowerShell 5.1, on every Windows
+  11). It never runs in Git Bash's `sh`, even when that is on `PATH`. Name
+  `shell: "cmd"` for Command Prompt syntax (`dir /s`, `set X=1 && …`); `cmd` gets
+  the text exactly as you sent it, but it expands `%VAR%` when it reads the
+  whole line (a variable set earlier on the same line stays literal) and treats
+  `|`, `&` and `>` as operators unless you escape them with `^`.
 - **An argv** (`["curl", "-d", "{\"a\": 1}", "http://…"]`) passes each argument
-  to the program exactly; no shell reads quotes, variables or pipes. On Windows
-  an `.exe` on `PATH` starts directly; anything else (a `.cmd` shim such as
-  `npm`, a PowerShell command) runs in `shell` (`pwsh` or `powershell`, default
-  `pwsh` when installed). `cmd` cannot run an argv. To reach WSL, use an argv:
+  to the program without a shell reading quotes, variables or pipes. On Windows
+  an `.exe` on `PATH` gets each argument exactly. A `.bat` or `.cmd` (the `npm`,
+  `npx` and `pnpm` shims) runs in cmd with each argument escaped for it, so `%`,
+  `^`, `&` and `"` reach the batch file as written; an argument cmd cannot be
+  given safely (one with a line break, say) fails the command at start
+  (`spawn_failed`) rather than run differently. Anything else (a PowerShell
+  command) runs in `shell` (default as for text; never `cmd`), which reads it
+  as PowerShell does. To reach WSL, use an argv:
   `["wsl.exe", "-e", "bash", "-c", "…"]`.
 
 A shell the node does not report is refused with `shell_unavailable`. A node
@@ -417,7 +423,9 @@ A spec has exactly one of:
 A runtime that serves models also declares `api` (`openai` or `anthropic`),
 `engine` (`vllm`, `sglang`, `llama_cpp`, `ollama`, `lm_studio`, `other`),
 `modelType` (`llm`, `embeddings`, `transcription`) and `models` (`{id,
-capabilities?, embeddingContract?, transcription?}`), and may set a
+capabilities?, embeddingContract?, transcription?}`; without `capabilities`,
+or with an empty list, a model has its type's: `text_generation`, `embedding`
+or `audio_input`), and may set a
 `metricsReader` (`builtin`, a `route`, or a `command`) and `expandMedia`
 (inline remote media for servers that cannot fetch URLs). A startable runtime
 without models is a **service**: it claims its resources but is never a pool

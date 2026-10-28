@@ -2997,6 +2997,22 @@ pub(crate) struct ExecRegistry {
     /// can report them `interrupted` (and end their process groups) when it
     /// starts again. `None` in tests that do not persist.
     table: Option<PathBuf>,
+    /// Where a PowerShell command's script is written (Windows): beside the table, in the state
+    /// directory; in the temporary directory in tests that do not persist.
+    scripts: PathBuf,
+}
+
+/// Remove the scripts commands left in `dir` (`<command id>.ps1`).
+fn sweep_scripts(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "ps1") {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// One running command as persisted (no command text, no output).
@@ -3070,6 +3086,7 @@ impl ExecRegistry {
             command_max,
             shut_down: false,
             table: None,
+            scripts: std::env::temp_dir().join(format!("wsmp-exec-scripts-{}", std::process::id())),
         }
     }
 
@@ -3117,6 +3134,12 @@ impl ExecRegistry {
         }
         while self.ended.len() > EXEC_RECENT_MAX {
             self.ended.pop_front();
+        }
+        // A command's script lives beside the table and goes with the command. Every command a
+        // previous daemon started has ended by now: what it left (a crash) holds command text.
+        if let Some(dir) = path.parent() {
+            self.scripts = dir.join("exec-scripts");
+            sweep_scripts(&self.scripts);
         }
         self.table = Some(path);
         self.save_table();
@@ -3231,7 +3254,7 @@ impl ExecRegistry {
             tracing::warn!(command_id, reason, "rejecting an exec command");
             return vec![exec_rejected(command_id, REASON_BAD_COMMAND)];
         }
-        let process = match exec_process(line, shell, command_id) {
+        let process = match exec_process(line, shell, command_id, &self.scripts) {
             Ok(process) => process,
             Err(reason) => {
                 tracing::warn!(command_id, reason, "rejecting an exec command");
@@ -3630,6 +3653,7 @@ fn exec_process(
     line: &ExecLine<'_>,
     shell: Option<CommandShell>,
     _command_id: &str,
+    _scripts: &Path,
 ) -> Result<ExecProcess, &'static str> {
     if shell.is_some_and(|shell| shell != CommandShell::Sh) {
         return Err("only `sh` runs commands here");
@@ -3655,18 +3679,19 @@ fn exec_process(
 }
 
 /// The program and arguments of a node command, before its directory and environment. Text runs
-/// in `shell`; absent, in `sh` when it is on `PATH`, else `cmd`, which gets the text as written
-/// (`/d /s /c "…"`, not quoted the way a C program reads its arguments). An argv starts an `.exe`
-/// directly with each argument exact, and anything else (a `.cmd` shim, a PowerShell command) in
-/// `shell` (absent: `pwsh`, else `powershell`), from a script file. Errs when this node has no
-/// such shell.
+/// in `shell` (absent: `pwsh`, else `powershell`); `cmd` gets the text as written (`/d /s /c
+/// "…"`, not quoted the way a C program reads its arguments). An argv starts an `.exe`
+/// directly with each argument exact, a `.bat` or `.cmd` through std's batch-file escaping, and
+/// anything else (a PowerShell command) in `shell` (absent: `pwsh`, else `powershell`), from a
+/// script file. Errs when this node has no such shell.
 #[cfg(windows)]
 fn exec_process(
     line: &ExecLine<'_>,
     shell: Option<CommandShell>,
     command_id: &str,
+    scripts: &Path,
 ) -> Result<ExecProcess, &'static str> {
-    use crate::runtimes::executor::windows::{find_exe, powershell_script, shell_program};
+    use crate::runtimes::executor::windows::{find_program, powershell_script, shell_program};
     use std::os::windows::process::CommandExt;
     let plain = |process| {
         Ok(ExecProcess {
@@ -3674,17 +3699,23 @@ fn exec_process(
             script: None,
         })
     };
+    // The default, for text and argv alike: PowerShell 7, else Windows PowerShell (every
+    // Windows 11 has it). Never `sh`: Git Bash on PATH must not change how commands run.
+    let default_shell = || {
+        crate::shells::command_shells()
+            .iter()
+            .find_map(|found| match found.id.as_str() {
+                "pwsh" => Some(CommandShell::Pwsh),
+                "powershell" => Some(CommandShell::Powershell),
+                _ => None,
+            })
+            .ok_or("neither `pwsh` nor `powershell` is installed")
+    };
     let (shell, script) = match line {
         ExecLine::Text(command) => match shell {
-            // Not one of the shells this node advertises (`features.launch.shells`): only the
-            // default picks it, as before shells could be named.
+            // Not one of the shells this node advertises (`features.launch.shells`).
             Some(CommandShell::Sh) => return Err("`sh` is not a command shell here"),
-            None if child_env::exec_shell().0 == "sh" => {
-                let mut process = std::process::Command::new("sh");
-                process.arg("-c").arg(command);
-                return plain(process);
-            }
-            None | Some(CommandShell::Cmd) => {
+            Some(CommandShell::Cmd) => {
                 let mut process = std::process::Command::new(
                     shell_program(CommandShell::Cmd).map_err(|_| "`cmd` is not installed")?,
                 );
@@ -3692,6 +3723,7 @@ fn exec_process(
                 return plain(process);
             }
             Some(shell) => (shell, (*command).to_string()),
+            None => (default_shell()?, (*command).to_string()),
         },
         ExecLine::Argv(argv) => {
             match shell {
@@ -3699,24 +3731,29 @@ fn exec_process(
                 Some(CommandShell::Cmd) => return Err("cmd cannot run an argv"),
                 _ => {}
             }
+            // An `.exe` starts with each argument exact. So does a `.bat` or `.cmd` (npm, npx
+            // and pnpm are such shims): std runs it in cmd with every argument escaped for cmd's
+            // second parse (`%`, `^`, `&`, `"`), or refuses to start it when one cannot be.
             if let Some((program, args)) = argv.split_first()
-                && let Some(exe) = find_exe(program, &scrub_parent_env(&[]))
+                && let Some(found) = find_program(program, &scrub_parent_env(&[])).filter(|found| {
+                    found
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| {
+                            ["exe", "com", "bat", "cmd"]
+                                .iter()
+                                .any(|known| ext.eq_ignore_ascii_case(known))
+                        })
+                })
             {
-                let mut process = std::process::Command::new(exe);
+                let mut process = std::process::Command::new(found);
                 process.args(args);
                 return plain(process);
             }
-            // A `.cmd` shim, a PowerShell command, or a program not found: PowerShell runs it.
+            // A PowerShell command, or a program not found: PowerShell runs it.
             let shell = match shell {
                 Some(shell) => shell,
-                None => crate::shells::command_shells()
-                    .iter()
-                    .find_map(|found| match found.id.as_str() {
-                        "pwsh" => Some(CommandShell::Pwsh),
-                        "powershell" => Some(CommandShell::Powershell),
-                        _ => None,
-                    })
-                    .ok_or("neither `pwsh` nor `powershell` is installed")?,
+                None => default_shell()?,
             };
             let script = crate::runtimes::render::argv_script(shell, argv)
                 .ok_or("cmd cannot run an argv")?;
@@ -3725,10 +3762,14 @@ fn exec_process(
     };
     let program = shell_program(shell).map_err(|_| "the shell is not installed")?;
     // `-File`, not `-EncodedCommand`: given a command, PowerShell writes its error, warning and
-    // progress streams to a redirected stderr as CLIXML. The file is the user's own (the
-    // temporary directory is private to them) and goes with the command.
-    let path =
-        std::env::temp_dir().join(format!("wsmp-exec-{}-{command_id}.ps1", std::process::id()));
+    // progress streams to a redirected stderr as CLIXML. The file holds the command's text, so
+    // it is in wsmp's own state directory, goes with the command, and a crash's leftovers go
+    // when the next daemon starts (`ExecRegistry::with_table`).
+    if let Err(error) = std::fs::create_dir_all(scripts) {
+        tracing::warn!(error = %error, "creating the exec script directory failed");
+        return Err("the command's script could not be written");
+    }
+    let path = scripts.join(format!("{command_id}.ps1"));
     let mut text = String::from('\u{feff}');
     text.push_str(&powershell_script(&script));
     let mut file = std::fs::OpenOptions::new()
@@ -3896,7 +3937,8 @@ mod tests {
     }
 
     fn slow_command() -> &'static str {
-        if child_env::exec_shell().0 == "sh" {
+        // `ping.exe` is a child process the command's job must end (PowerShell runs it too).
+        if cfg!(unix) {
             "sleep 30"
         } else {
             "ping -n 30 127.0.0.1"
@@ -3911,16 +3953,16 @@ mod tests {
             let tree = Tree::new();
             let (tx, rx) = channel();
             let mut execs = ExecRegistry::new(tx, Duration::from_secs(30));
-            // Git Bash can make exec_shell choose sh; both shells and their
-            // descendants must remain in the Windows job.
+            // The default shell (PowerShell) and its descendants must
+            // remain in the Windows job.
             let mode = if action == "root-exit" {
                 "root-exit"
             } else {
                 "detach"
             };
-            // Exec needs one shell string for sh -c or cmd /C. The fixture
-            // cwd lets both shells use relative paths without embedded quotes
-            // or Windows backslash escaping, even when the cwd has spaces.
+            // The fixture cwd lets the command use relative paths without
+            // embedded quotes or Windows backslash escaping, even when the cwd
+            // has spaces.
             let command = format!("python tree.py grandchild.pid root.pid {mode}");
             let frames = execs.start_text(
                 &enabled_startup(false),

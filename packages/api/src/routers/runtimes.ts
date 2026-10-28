@@ -270,7 +270,9 @@ function runtimeModelView(model: RuntimeModelRow) {
     id: model.id,
     upstreamModelId: model.upstreamModelId,
     type: model.type,
-    detectedCapabilities: model.detectedCapabilities,
+    // A model saved before definitions stored their type's default has none: show the default
+    // the node serves it with.
+    detectedCapabilities: effectiveModelCapabilities({ ...model, capabilitiesOverridden: false }),
     capabilities: effectiveModelCapabilities(model),
     capabilitiesOverridden: model.capabilitiesOverridden,
     retired: model.retired,

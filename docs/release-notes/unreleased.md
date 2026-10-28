@@ -18,9 +18,12 @@ Windows section lists the limits, and the WSL2 alternative.
 
 `node_command_run` can now name its shell (`shell`: `sh`, `pwsh`, `powershell` or `cmd`, one the
 node reports), or take an argv (`command: ["curl", "-d", "…"]`) whose arguments reach the program
-exactly. Without either, a command runs as before, except that on Windows `cmd` now gets the text
-exactly as sent (before, every `"` reached it as `\"`). A node must run this release's `wsmp` for
-`shell` or an argv: an older one refuses the command, and the server says to upgrade it.
+without a shell reading them; on Windows a `.cmd` shim such as `npm` gets them escaped for cmd.
+Command text is at most 4096 bytes, what nodes accept. On Windows, a command without `shell` runs
+in PowerShell (`pwsh`, else Windows PowerShell), never in Git Bash's `sh`; name `shell: "cmd"`
+for Command Prompt, which now gets the text exactly as sent. A node must run this release's
+`wsmp` for `shell` or an argv: an older one refuses the command, and the server says to upgrade
+it.
 
 Runtime commands can now be argv lists, which every node quotes for its own shell, and a launch
 can name its shell (`launch.shell`: `sh`, `pwsh`, `powershell` or `cmd`). On Windows an argv whose
