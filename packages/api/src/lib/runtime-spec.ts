@@ -825,7 +825,15 @@ export function runtimeSpecIsService(spec: Pick<RuntimeSpec, "models" | "address
 export const nodeMetricCommandSchema = z
   .object({
     name: z.string().regex(NODE_METRIC_COMMAND_NAME_PATTERN),
-    command: runtimeCommandSchema,
+    /** Text run in `shell`, or an argv started with no shell (as `node_command_run`). */
+    command: runtimeCommandLineSchema,
+    /**
+     * The text's interpreter, one the node reports (`features.launch.shells`). Absent: `sh`; on
+     * Windows `pwsh`, else `powershell`. An argv starts its program directly (Windows: an
+     * `.exe`, `.bat` or `.cmd`; anything else runs in PowerShell), the cheapest way to run one
+     * program often. Never `cmd` with an argv.
+     */
+    shell: z.enum(RUNTIME_SHELLS).optional(),
     intervalSecs: z.number().int().min(5).max(3_600),
     timeoutSecs: z.number().int().min(1).max(60),
     /**
@@ -839,7 +847,11 @@ export const nodeMetricCommandSchema = z
       .refine((map) => Object.keys(map).length <= 16, specIssue("metricsPerCommand"))
       .optional(),
   })
-  .strict();
+  .strict()
+  .refine((command) => typeof command.command === "string" || command.shell !== "cmd", {
+    path: ["shell"],
+    message: "cmd cannot run an argv.",
+  });
 export type NodeMetricCommand = z.infer<typeof nodeMetricCommandSchema>;
 
 /** Canonical UTF-8 size, or null when the value cannot be hashed (other issues report why). */

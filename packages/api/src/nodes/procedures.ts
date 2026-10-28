@@ -17,6 +17,7 @@ import {
   occupiesNodesWhere,
   placedOnNodesWhere,
 } from "../lib/instance-occupancy";
+import { launchCapabilities } from "../lib/launch-capabilities";
 import {
   isForeignKeyViolation,
   isUniqueViolation,
@@ -90,11 +91,30 @@ export const nodeProcedures = {
         trustChangedAt: true,
         trustLowerRequestedAt: true,
         heldMetricCommandsHash: true,
+        slug: true,
+        features: true,
+        nodeInfo: true,
       },
     });
     if (!node) throw notFound("That node does not exist.");
     if (!isFullControl(node)) throw relayOnly(node.id);
-    if (input.metricCommands) nodeMetricCommandsSchema.parse(input.metricCommands);
+    if (input.metricCommands) {
+      nodeMetricCommandsSchema.parse(input.metricCommands);
+      // The node refuses a shell it does not have too (the command reports `spawn`); this says
+      // which it has.
+      const shells = launchCapabilities(node.features, node.nodeInfo)?.shells;
+      const missing = input.metricCommands.find(
+        (command) => command.shell && shells && !shells.has(command.shell),
+      );
+      if (missing?.shell && shells) {
+        throw refuseAbout(
+          "shell_unavailable",
+          node.id,
+          `Node ${node.slug} has no ${missing.shell} for metric command ${missing.name}. It has: ${[...shells].join(", ") || "none"}.`,
+          "BAD_REQUEST",
+        );
+      }
+    }
 
     const changed = (
       ["labels", "portRange", "hardware", "metricCommands", "fabrics", "commandMaxMs"] as const

@@ -377,6 +377,42 @@ describe("nodes.update", () => {
     ).rejects.toMatchObject({ data: { reason: "trust_relay" } });
   });
 
+  it("refuses a metric command shell the node does not have, and an argv for cmd", async () => {
+    const linux = {
+      ...trustRow,
+      slug: "box",
+      nodeInfo: null,
+      features: {
+        terminals: { supported: true, max: 4, approvalRequired: false },
+        operatorTerminals: false,
+        files: { roots: null, asRoot: false, source: "default" },
+        runtimeHosts: [],
+        mediaExpand: true,
+        liveStt: true,
+        secrets: [],
+        launch: { platform: "linux", management: ["process", "service"], shells: ["sh"] },
+      },
+    };
+    const metric = {
+      name: "gpu_power",
+      command: "Get-Counter",
+      intervalSecs: 5,
+      timeoutSecs: 5,
+      format: "lines" as const,
+    };
+    db.node.findFirst.mockResolvedValueOnce(linux as never);
+    await expect(
+      client().update({ nodeId: "node-1", metricCommands: [{ ...metric, shell: "pwsh" }] }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { reason: "shell_unavailable" } });
+    await expect(
+      client().update({
+        nodeId: "node-1",
+        metricCommands: [{ ...metric, command: ["nvidia-smi"], shell: "cmd" }],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
   it("refuses a read-only agent before reading the node", async () => {
     await expect(
       client(READ_AGENT).update({ nodeId: "node-1", labels: ["a"] }),

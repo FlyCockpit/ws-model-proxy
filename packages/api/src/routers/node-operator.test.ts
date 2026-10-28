@@ -369,10 +369,7 @@ describe("node commands", () => {
         ...runInput,
         command: ["npm.cmd", "a\nb"],
       }),
-    ).rejects.toMatchObject({
-      code: "BAD_REQUEST",
-      message: expect.stringContaining("could not start the command"),
-    });
+    ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { reason: "command_not_started" } });
   });
 
   it("refuses hidden characters in the command", async () => {

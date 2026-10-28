@@ -226,6 +226,44 @@ fn text_without_a_shell_runs_in_powershell_on_windows() {
 
 #[cfg(windows)]
 #[test]
+fn powershell_writes_utf8_in_a_console_with_the_oem_code_page() {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW: a console of its own, hidden, in the system's OEM code page, as a
+    // service's commands get (not the test terminal's, which may well be UTF-8 already).
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let scripts = tempfile::tempdir().expect("scripts");
+    for shell in
+        crate::shells::command_shells()
+            .iter()
+            .filter_map(|found| match found.id.as_str() {
+                "pwsh" => Some(CommandShell::Pwsh),
+                "powershell" => Some(CommandShell::Powershell),
+                _ => None,
+            })
+    {
+        let ExecProcess {
+            mut process,
+            script: _script,
+        } = exec_process(
+            &ExecLine::Text("Write-Output 'caf\u{e9} \u{2713}'; cmd /c echo caf\u{e9}"),
+            Some(shell),
+            scripts.path(),
+        )
+        .expect("process");
+        let out = process
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ran");
+        let text = String::from_utf8(out.stdout.clone())
+            .unwrap_or_else(|_| panic!("{shell:?} wrote non-UTF-8: {:?}", out.stdout));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines, ["caf\u{e9} \u{2713}", "caf\u{e9}"], "{shell:?}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn an_argv_cannot_run_in_sh_on_windows() {
     let argv = vec!["whoami".to_string()];
     assert_eq!(

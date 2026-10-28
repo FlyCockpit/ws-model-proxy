@@ -597,7 +597,12 @@ pub enum MetricCommandFormat {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeMetricCommand {
     pub name: String,
-    pub command: String,
+    /// Text run in `shell`, or an argv started with no shell (as `node_command_run`).
+    pub command: CommandLine,
+    /// The text's interpreter (absent: `sh`; on Windows `pwsh`, else `powershell`). Never
+    /// `cmd` with an argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<CommandShell>,
     pub interval_secs: u16,
     pub timeout_secs: u8,
     pub format: MetricCommandFormat,

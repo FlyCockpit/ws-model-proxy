@@ -35,7 +35,7 @@ use crate::protocol::frames::{
     CustomMetric, MetricCommandError, MetricCommandState, MetricCommandStatus,
 };
 use crate::protocol::runtime_spec::{
-    Aggregate, MetricCommandFormat, NodeMetricCommand, ReaderMapEntry,
+    Aggregate, CommandLine, CommandShell, MetricCommandFormat, NodeMetricCommand, ReaderMapEntry,
 };
 use crate::protocol::{
     NODE_METRIC_COMMAND_VALUES_MAX, NODE_METRIC_COMMANDS_MAX, NODE_METRICS_CUSTOM_MAX,
@@ -232,43 +232,117 @@ fn parse_labels(mut text: &str) -> Option<(BTreeMap<String, String>, &str)> {
 /// stderr discarded, stdout cap, deadline, bounded reap, daemon-exit kill)
 /// is [`crate::bounded_run::run`]; this maps its errors to the wire codes.
 pub fn run_command(
-    command: &str,
+    command: &CommandLine,
+    shell: Option<CommandShell>,
     timeout: Duration,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, MetricCommandError> {
-    if crate::child_env::validate_command(command).is_err() || command.trim().is_empty() {
+    if !command_ok(command, shell) {
         return Err(MetricCommandError::Spawn);
     }
-    #[cfg(unix)]
-    let (shell, args) = {
-        let (shell, flag) = crate::child_env::exec_shell();
-        (
-            shell.to_string(),
-            vec![flag.to_string(), command.to_string()],
-        )
-    };
-    // As a node command without `shell`: in PowerShell (`-EncodedCommand`; only stdout is read).
-    #[cfg(windows)]
-    let (shell, args) = {
-        use crate::runtimes::executor::windows::{
-            ShellLine, default_shell, shell_line, shell_program,
-        };
-        let shell = default_shell().map_err(|_| MetricCommandError::Spawn)?;
-        let program = shell_program(shell).map_err(|_| MetricCommandError::Spawn)?;
-        let Ok(ShellLine::List(args)) = shell_line(shell, command) else {
-            return Err(MetricCommandError::Spawn);
-        };
-        (program.to_string_lossy().into_owned(), args)
-    };
-    crate::bounded_run::run(&shell, &args, timeout, OUTPUT_LIMIT, cancel).map_err(|error| {
-        match error {
-            RunError::Spawn | RunError::Resources | RunError::Cancelled => {
-                MetricCommandError::Spawn
-            }
-            RunError::Timeout => MetricCommandError::Timeout,
-            RunError::OutputTooLarge => MetricCommandError::OutputTooLarge,
-            RunError::ExitStatus(_) => MetricCommandError::ExitStatus,
+    let invocation = invocation(command, shell).ok_or(MetricCommandError::Spawn)?;
+    let ran = match invocation {
+        Invocation::List(program, args) => {
+            crate::bounded_run::run(&program, &args, timeout, OUTPUT_LIMIT, cancel)
         }
+        #[cfg(windows)]
+        Invocation::Raw(program, raw) => crate::bounded_run::run_raw_until_env(
+            &program,
+            &raw,
+            Instant::now() + timeout,
+            OUTPUT_LIMIT,
+            cancel,
+            &[],
+        ),
+    };
+    ran.map_err(|error| match error {
+        RunError::Spawn | RunError::Resources | RunError::Cancelled => MetricCommandError::Spawn,
+        RunError::Timeout => MetricCommandError::Timeout,
+        RunError::OutputTooLarge => MetricCommandError::OutputTooLarge,
+        RunError::ExitStatus(_) => MetricCommandError::ExitStatus,
+    })
+}
+
+/// Whether this node runs `command` in `shell` at all: text within the node command bounds, or an
+/// argv with a program; on Unix `sh` only, and never `cmd` with an argv.
+fn command_ok(command: &CommandLine, shell: Option<CommandShell>) -> bool {
+    let fits = match command {
+        CommandLine::Text(text) => {
+            !text.trim().is_empty() && crate::child_env::validate_command(text).is_ok()
+        }
+        CommandLine::Argv(argv) => crate::child_env::validate_argv(argv).is_ok(),
+    };
+    let shell_ok = match (command, shell) {
+        (_, None) => true,
+        (CommandLine::Argv(_), Some(CommandShell::Cmd)) => false,
+        (_, Some(shell)) => cfg!(windows) != (shell == CommandShell::Sh),
+    };
+    fits && shell_ok
+}
+
+/// How a metric command starts: a program and its arguments, or (Windows `cmd`) a program and
+/// the command line after it as written.
+enum Invocation {
+    List(String, Vec<String>),
+    #[cfg(windows)]
+    Raw(String, String),
+}
+
+/// Text in `sh -c`; an argv started directly.
+#[cfg(unix)]
+fn invocation(command: &CommandLine, _shell: Option<CommandShell>) -> Option<Invocation> {
+    Some(match command {
+        CommandLine::Text(text) => {
+            let (shell, flag) = crate::child_env::exec_shell();
+            Invocation::List(shell.to_string(), vec![flag.to_string(), text.clone()])
+        }
+        CommandLine::Argv(argv) => {
+            let (program, args) = argv.split_first()?;
+            Invocation::List(program.clone(), args.to_vec())
+        }
+    })
+}
+
+/// As a node command: text in `shell` (absent: PowerShell, `-EncodedCommand`, as only stdout is
+/// read), `cmd` given the text as written; an argv naming an `.exe`, `.bat` or `.cmd` started
+/// directly (std escapes a batch file's arguments), anything else in PowerShell.
+#[cfg(windows)]
+fn invocation(command: &CommandLine, shell: Option<CommandShell>) -> Option<Invocation> {
+    use crate::runtimes::executor::windows::{
+        ShellLine, default_shell, find_program, shell_line, shell_program,
+    };
+    let shell = match shell {
+        Some(shell) => shell,
+        None => default_shell().ok()?,
+    };
+    let script = match command {
+        CommandLine::Text(text) => text.clone(),
+        CommandLine::Argv(argv) => {
+            let (program, args) = argv.split_first()?;
+            if let Some(found) = find_program(program, &crate::child_env::scrub_parent_env(&[]))
+                .filter(|found| {
+                    found
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| {
+                            ["exe", "com", "bat", "cmd"]
+                                .iter()
+                                .any(|known| ext.eq_ignore_ascii_case(known))
+                        })
+                })
+            {
+                return Some(Invocation::List(
+                    found.to_string_lossy().into_owned(),
+                    args.to_vec(),
+                ));
+            }
+            crate::runtimes::render::argv_script(shell, argv)?
+        }
+    };
+    let program = shell_program(shell).ok()?.to_string_lossy().into_owned();
+    Some(match shell_line(shell, &script).ok()? {
+        ShellLine::List(args) => Invocation::List(program, args),
+        ShellLine::Raw(raw) => Invocation::Raw(program, raw),
     })
 }
 
@@ -276,7 +350,8 @@ pub fn run_command(
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandSpec {
     pub name: String,
-    pub command: String,
+    pub command: CommandLine,
+    pub shell: Option<CommandShell>,
     pub interval_secs: u32,
     pub timeout_secs: u32,
     pub format: MetricCommandFormat,
@@ -292,15 +367,25 @@ impl CommandSpec {
         let valid = is_metric_name(&definition.name)
             && (INTERVAL_MIN_SECS..=INTERVAL_MAX_SECS).contains(&interval_secs)
             && (TIMEOUT_MIN_SECS..=TIMEOUT_MAX_SECS).contains(&timeout_secs)
-            && !definition.command.trim().is_empty()
-            && crate::child_env::validate_command(&definition.command).is_ok();
+            && command_ok(&definition.command, definition.shell);
+        // Text in the default shell hashes as its text, as before shells and argvs; anything
+        // else as the JSON of both, so a change of either is a new command.
+        let command_sha256 = match (&definition.command, definition.shell) {
+            (CommandLine::Text(text), None) => sha256_hex(text.as_bytes()),
+            (command, shell) => sha256_hex(
+                serde_json::json!({ "command": command, "shell": shell })
+                    .to_string()
+                    .as_bytes(),
+            ),
+        };
         valid.then(|| Self {
             name: definition.name.clone(),
             command: definition.command.clone(),
+            shell: definition.shell,
             interval_secs,
             timeout_secs,
             format: definition.format,
-            command_sha256: sha256_hex(definition.command.as_bytes()),
+            command_sha256,
             map: definition.map.clone(),
         })
     }
@@ -313,6 +398,7 @@ pub fn run_spec(
 ) -> Result<Vec<Series>, MetricCommandError> {
     let output = run_command(
         &spec.command,
+        spec.shell,
         Duration::from_secs(u64::from(spec.timeout_secs)),
         cancel,
     )?;
@@ -827,12 +913,90 @@ mod tests {
     fn definition(name: &str, command: &str) -> NodeMetricCommand {
         NodeMetricCommand {
             name: name.to_string(),
-            command: command.to_string(),
+            command: CommandLine::Text(command.to_string()),
+            shell: None,
             interval_secs: 10,
             timeout_secs: 5,
             format: MetricCommandFormat::Lines,
             map: None,
         }
+    }
+
+    fn run_once(
+        command: CommandLine,
+        shell: Option<CommandShell>,
+    ) -> Result<String, MetricCommandError> {
+        run_command(&command, shell, Duration::from_secs(30), None)
+            .map(|out| String::from_utf8_lossy(&out).trim().to_string())
+    }
+
+    #[test]
+    fn an_argv_metric_starts_its_program_without_a_shell() {
+        let argv: &[&str] = if cfg!(windows) {
+            &[
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "6+1",
+            ]
+        } else {
+            &["printf", "%s", "7"]
+        };
+        let argv = CommandLine::Argv(argv.iter().map(|arg| (*arg).to_string()).collect());
+        assert_eq!(run_once(argv.clone(), None).as_deref(), Ok("7"));
+        // cmd never runs an argv, here or anywhere.
+        assert_eq!(
+            run_once(argv, Some(CommandShell::Cmd)),
+            Err(MetricCommandError::Spawn)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_metric_runs_in_the_shell_it_names() {
+        let text = |text: &str| CommandLine::Text(text.to_string());
+        assert_eq!(run_once(text("6+1"), None).as_deref(), Ok("7"));
+        assert_eq!(
+            run_once(text("6+1"), Some(CommandShell::Powershell)).as_deref(),
+            Ok("7")
+        );
+        assert_eq!(
+            run_once(text("set /a 6+1"), Some(CommandShell::Cmd)).as_deref(),
+            Ok("7")
+        );
+        assert_eq!(
+            run_once(text("echo 7"), Some(CommandShell::Sh)),
+            Err(MetricCommandError::Spawn)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_metric_runs_in_sh_only() {
+        let text = CommandLine::Text("echo 7".to_string());
+        assert_eq!(
+            run_once(text.clone(), Some(CommandShell::Sh)).as_deref(),
+            Ok("7")
+        );
+        assert_eq!(
+            run_once(text, Some(CommandShell::Pwsh)),
+            Err(MetricCommandError::Spawn)
+        );
+    }
+
+    #[test]
+    fn a_shell_or_argv_is_part_of_the_command_s_identity() {
+        let plain = CommandSpec::from_definition(&definition("m", "echo 7")).expect("plain");
+        assert_eq!(plain.command_sha256, sha256_hex(b"echo 7"));
+        let mut named = definition("m", "echo 7");
+        named.shell = Some(if cfg!(windows) {
+            CommandShell::Cmd
+        } else {
+            CommandShell::Sh
+        });
+        let named = CommandSpec::from_definition(&named).expect("named");
+        assert_ne!(named.command_sha256, plain.command_sha256);
     }
 
     #[test]
@@ -1035,7 +1199,12 @@ escaped{v="a\"b"} 1
         let command = format!("sleep 30 & echo $! > '{}'; sleep 30", pid_file.display());
         let started = Instant::now();
         assert_eq!(
-            run_command(&command, Duration::from_secs(1), None),
+            run_command(
+                &CommandLine::Text(command),
+                None,
+                Duration::from_secs(1),
+                None
+            ),
             Err(MetricCommandError::Timeout)
         );
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -1094,7 +1263,7 @@ escaped{v="a\"b"} 1
             match change {
                 Change::Command => {
                     let mut changed = slow.clone();
-                    changed.command = format!("{command}; echo 2");
+                    changed.command = CommandLine::Text(format!("{command}; echo 2"));
                     runner.set_commands(&[changed]);
                 }
                 Change::Withdraw => runner.set_commands(&[]),

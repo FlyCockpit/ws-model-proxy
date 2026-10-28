@@ -481,11 +481,20 @@ pub fn shell_program(shell: CommandShell) -> Result<PathBuf> {
         .with_context(|| format!("`{id}` is not installed on this node"))
 }
 
-/// A PowerShell script that exits as `sh` would: with the status of its last
-/// command, a native program's exit code included (PowerShell itself would
-/// exit 1). An `exit` in the script still ends it at once.
+/// A PowerShell script that writes UTF-8 and exits as `sh` would: with the status of its last
+/// command, a native program's exit code included (PowerShell itself would exit 1). An `exit` in
+/// the script still ends it at once.
+///
+/// UTF-8: a service's console has the OEM code page (437 on a US Windows), in which PowerShell
+/// writes `é` as one byte wsmp cannot read. The console's code page is switched for the script
+/// (programs it starts write UTF-8 too, and PowerShell reads their output as such); without a
+/// console there is nothing to switch.
 pub fn powershell_script(script: &str) -> String {
-    format!("{script}\nif (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}")
+    format!(
+        "try {{ [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) }} catch {{}}\n\
+         $OutputEncoding = [Text.UTF8Encoding]::new($false)\n\
+         {script}\nif (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}"
+    )
 }
 
 /// `-EncodedCommand`'s argument: the script as base64 of its UTF-16LE text, so

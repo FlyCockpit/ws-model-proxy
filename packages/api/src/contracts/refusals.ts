@@ -152,6 +152,13 @@ export const REFUSAL_REASONS = [
    * shell the launch's text commands need (`features.launch`).
    */
   "unsupported_platform",
+  // Node commands with a shell or an argv.
+  /**
+   * The node is there, but could not start the command: its program is missing or cannot be
+   * started, or (Windows) an argument cmd cannot be given safely, or its script could not be
+   * written.
+   */
+  "command_not_started",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

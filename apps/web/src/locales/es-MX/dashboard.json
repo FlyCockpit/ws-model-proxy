@@ -1557,6 +1557,7 @@
       "not_your_runtime": "Aquí solo puedes agregar tus propios modelos servidos.",
       "secret_needs_node": "Define este secreto en el nodo.",
       "command_not_running": "Ese comando no se está ejecutando.",
+      "command_not_started": "El nodo no pudo iniciar ese comando.",
       "other": "Esto no puede ejecutarse como en la vista previa.",
       "fabric_in_use": "Una instancia multinodo en ejecución usa esta red.",
       "invite_needs_link": "Esta invitación necesita su enlace para aceptarse.",
