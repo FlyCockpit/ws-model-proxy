@@ -115,6 +115,7 @@ pub const OPEN_FRAMES: &[(&str, &[&str])] = &[
             "rollbackAfterSecs",
         ],
     ),
+    ("agent.update.ack", &["type", "updateId"]),
 ];
 
 /// Parses one server control frame strictly (shape, then cross-field rules).

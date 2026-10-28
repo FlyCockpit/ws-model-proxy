@@ -5,6 +5,8 @@
  * the server deadline (`timed_out`) and drives "Update all" runs from the database (so a restart
  * of this server resumes them).
  */
+
+import { AGENT_UPDATE_TERMINAL_PHASES } from "@ws-model-proxy/api/lib/agent-update-wire";
 import type {
   AgentUpdateLiveNode,
   AgentUpdatePort,
@@ -165,6 +167,13 @@ export function createAgentUpdates(relay: RelayPort, deps: AgentUpdateDeps = {})
         frame,
       );
       if (result.ended) wake();
+      // The node reports an update's end on every session until this says it is stored.
+      if (AGENT_UPDATE_TERMINAL_PHASES.has(frame.phase) && result.settled)
+        relay.sendToNode(
+          node.nodeId,
+          { type: "agent.update.ack", updateId: frame.updateId },
+          { connectionGeneration: node.connectionGeneration, userId: node.userId },
+        );
     },
   };
 

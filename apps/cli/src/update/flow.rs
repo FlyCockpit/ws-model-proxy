@@ -33,6 +33,10 @@ pub trait Progress {
 /// The last check before the swap: `Err` with why it must not happen now.
 pub type BeforeSwap<'a> = dyn Fn(&mut dyn Progress) -> std::result::Result<(), String> + 'a;
 
+/// Whether the update may still go on (the node's trust, its operator's
+/// setting): asked between the steps, and refuses with the reason when not.
+pub type Proceed<'a> = dyn Fn() -> std::result::Result<(), (UpdateReason, String)> + 'a;
+
 /// The machine an update runs on.
 pub struct Machine<'a> {
     /// The node's state directory (`--state-dir` of the dead-man).
@@ -50,6 +54,20 @@ pub struct Machine<'a> {
     /// must not happen now (the node is busy again). The relay keeps the node
     /// idle from a yes until it restarts.
     pub before_swap: Option<&'a BeforeSwap<'a>>,
+    /// Asked after the download, before the new build runs, and before the
+    /// swap.
+    pub proceed: Option<&'a Proceed<'a>>,
+}
+
+impl Machine<'_> {
+    fn may_proceed(&self, progress: &mut dyn Progress) -> std::result::Result<(), Ended> {
+        match self.proceed.map(|proceed| proceed()) {
+            Some(Err((reason, detail))) => {
+                Err(stop(progress, UpdatePhase::Refused, reason, detail))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Machine<'_> {
@@ -157,6 +175,9 @@ fn install_files(
         );
     }
 
+    if let Err(ended) = machine.may_proceed(progress) {
+        return ended;
+    }
     progress.report(UpdatePhase::Verifying, None, None);
     match install::sha256_file(&archive) {
         Ok(actual) if actual == request.sha256 => {}
@@ -204,6 +225,10 @@ fn install_files(
             );
         }
     };
+    // The new build runs here (`--version`): not once the update may not go on.
+    if let Err(ended) = machine.may_proceed(progress) {
+        return ended;
+    }
     match install::probe_version(&found) {
         Ok(version) if version == request.version => {}
         Ok(version) => {
@@ -228,6 +253,9 @@ fn install_files(
         && let Err(why) = before_swap(progress)
     {
         return stop(progress, UpdatePhase::Refused, UpdateReason::Busy, why);
+    }
+    if let Err(ended) = machine.may_proceed(progress) {
+        return ended;
     }
     if let Err(error) =
         install::stage_new(&found, layout).and_then(|()| install::prepare_prev(layout))
@@ -288,8 +316,7 @@ fn install_files(
     }
     let failed = |current: &mut UpdateState, progress: &mut dyn Progress, detail: String| {
         if current.fail(UpdateReason::Internal, detail.clone()).is_ok() {
-            // The progress says it; the server needs no second report.
-            current.reported = true;
+            // Reported again on later sessions until the server acknowledges it.
             let _ = state::save(&update_dir, current);
         }
         stop(
@@ -333,10 +360,11 @@ fn install_files(
 
 /// Record a Homebrew upgrade that installed `to_version`, so the new binary
 /// confirms it after the restart (no dead-man: D10).
-pub fn record_homebrew(machine: &Machine<'_>, request: &Request) -> Result<()> {
+/// `stable` is the keg-independent `opt/wsmp/bin/wsmp`, which now leads to
+/// the new keg's binary (the old keg stays: Homebrew's cleanup is off).
+pub fn record_homebrew(machine: &Machine<'_>, request: &Request, stable: &Path) -> Result<()> {
     let now = super::unix_now();
-    // `opt/wsmp` now leads to the new keg's binary.
-    let to_sha256 = std::fs::canonicalize(&machine.live)
+    let to_sha256 = std::fs::canonicalize(stable)
         .ok()
         .and_then(|binary| install::sha256_file(&binary).ok());
     let current = UpdateState {
@@ -346,9 +374,9 @@ pub fn record_homebrew(machine: &Machine<'_>, request: &Request) -> Result<()> {
         from_version: machine.current_version.clone(),
         to_version: request.version.clone(),
         to_sha256,
-        live_path: machine.live.clone(),
-        prev_path: machine.live.clone(),
-        failed_path: machine.live.clone(),
+        live_path: stable.to_path_buf(),
+        prev_path: stable.to_path_buf(),
+        failed_path: stable.to_path_buf(),
         rollback_after_secs: request.rollback_after_secs,
         deadline: now + u64::from(request.rollback_after_secs),
         deadman_at: None,
@@ -473,6 +501,18 @@ pub fn rollback_if_unconfirmed(
     current.detail = log_tail().map(|tail| super::clip_detail(&tail));
     state::save(update_dir, &current)?;
     Ok(Rollback::RolledBack)
+}
+
+/// What the dead-man of `update_id` can tell without the lock: the update
+/// settled ([`Rollback::Settled`]) or another one replaced it
+/// ([`Rollback::NotOurs`]). `None` while it may still need a rollback.
+pub fn no_longer_due(update_dir: &Path, update_id: &str) -> Option<Rollback> {
+    match state::load(update_dir) {
+        Ok(Some(current)) if current.update_id != update_id => Some(Rollback::NotOurs),
+        Ok(Some(current)) if !current.phase.in_progress() => Some(Rollback::Settled),
+        Ok(None) => Some(Rollback::NotOurs),
+        _ => None,
+    }
 }
 
 /// How a confirmation ended.
@@ -777,6 +817,7 @@ mod tests {
                 tar: install::system_tar(),
                 current_version: "0.4.2".into(),
                 before_swap: None,
+                proceed: None,
             }
         }
         fn live_text(&self) -> String {
@@ -980,7 +1021,10 @@ mod tests {
             .expect("load")
             .expect("state");
         assert_eq!(saved.phase, Phase::Failed);
-        assert!(!saved.needs_report(), "the progress already said it");
+        assert!(
+            saved.needs_report(),
+            "reported until the server acknowledges it"
+        );
     }
 
     /// Swapped in, as `self_replace` leaves it, with a new build that dies at once.
@@ -1357,6 +1401,56 @@ mod tests {
         assert_eq!(progress.last_reason(), Some(UpdateReason::Busy));
         node.untouched();
         assert_eq!(state::load(&node.update_dir()).expect("load"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_dead_man_sees_its_update_settle_without_the_lock() {
+        let (node, saved) = swapped_node();
+        assert_eq!(no_longer_due(&node.update_dir(), &saved.update_id), None);
+        let _held = state::UpdateLock::acquire(&node.update_dir())
+            .expect("lock")
+            .expect("free");
+        let mut done = saved.clone();
+        done.advance(Phase::Confirmed).expect("confirm");
+        state::save(&node.update_dir(), &done).expect("save");
+        assert_eq!(
+            no_longer_due(&node.update_dir(), &saved.update_id),
+            Some(Rollback::Settled)
+        );
+        assert_eq!(
+            no_longer_due(&node.update_dir(), "BBBBBBBBBBBBBBBBBBBBBB"),
+            Some(Rollback::NotOurs)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_homebrew_update_records_the_new_kegs_build() {
+        let node = Node::new();
+        let prefix = node.root.path().join("brew");
+        let new_keg = prefix.join("Cellar/wsmp/0.4.3/bin");
+        std::fs::create_dir_all(&new_keg).expect("keg");
+        std::fs::write(new_keg.join("wsmp"), "new build").expect("binary");
+        let opt = prefix.join("opt/wsmp");
+        std::fs::create_dir_all(opt.parent().expect("opt")).expect("opt dir");
+        std::os::unix::fs::symlink(prefix.join("Cellar/wsmp/0.4.3"), &opt).expect("link");
+        let stable = opt.join("bin/wsmp");
+        record_homebrew(
+            &node.machine(),
+            &request(String::new(), String::new()),
+            &stable,
+        )
+        .expect("record");
+        let saved = state::load(&node.update_dir())
+            .expect("load")
+            .expect("state");
+        assert_eq!(
+            saved.to_sha256.as_deref(),
+            Some(sha(b"new build").as_str()),
+            "the new keg's binary, not the running one"
+        );
+        assert_eq!(saved.live_path, stable);
     }
 
     #[test]

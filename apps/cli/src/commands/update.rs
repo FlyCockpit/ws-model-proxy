@@ -240,6 +240,7 @@ fn update(args: &Args) -> Result<()> {
         tar: crate::update::install::system_tar(),
         current_version: current.clone(),
         before_swap: None,
+        proceed: None,
     };
 
     if identity.method == InstallMethod::Homebrew {
@@ -440,12 +441,25 @@ fn status(json: bool) -> Result<()> {
     }
 }
 
+/// How often a waiting dead-man looks at the update again.
+const DEADMAN_LOOK_EVERY: Duration = Duration::from_secs(5);
+
 /// The dead-man: roll back when due and unconfirmed, then restart the
 /// service and remove itself.
 fn rollback(update_id: &str) -> Result<()> {
     let update_dir = crate::update::update_dir()?;
     let scheduler = crate::update::deadman::platform();
     loop {
+        // Read without the lock (the file is replaced atomically): a dead-man
+        // whose update confirmed or was replaced ends now, even while an
+        // installer holds the lock to arm the next one.
+        if let Some(gone) = flow::no_longer_due(&update_dir, update_id) {
+            tracing::info!(update_id, outcome = ?gone, "update dead-man");
+            if gone == Rollback::NotOurs {
+                return Ok(());
+            }
+            break;
+        }
         let outcome = flow::rollback_if_unconfirmed(
             &update_dir,
             update_id,
@@ -459,7 +473,8 @@ fn rollback(update_id: &str) -> Result<()> {
                 if early_run_done(&update_dir) {
                     return Ok(());
                 }
-                std::thread::sleep(wait.min(Duration::from_secs(600)));
+                // In short steps, to see a confirmation soon.
+                std::thread::sleep(wait.min(DEADMAN_LOOK_EVERY));
             }
             Rollback::RolledBack => {
                 if let Err(error) = crate::commands::service::restart_quietly() {

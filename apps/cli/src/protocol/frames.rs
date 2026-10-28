@@ -1738,6 +1738,11 @@ pub enum ServerFrame {
         force: bool,
         rollback_after_secs: u32,
     },
+    /// The server stored how `update_id` ended (the node's `confirmed`,
+    /// `rolled_back` or `failed`): the node stops reporting it. Until then it
+    /// reports the end again after each `hello.ok`.
+    #[serde(rename = "agent.update.ack")]
+    AgentUpdateAck { update_id: String },
     #[serde(rename = "stt.open")]
     SttOpen {
         session_id: String,
@@ -2237,6 +2242,10 @@ impl ServerFrame {
     /// Cross-field rules serde cannot express.
     pub fn validate(&self) -> Result<(), FrameRuleError> {
         match self {
+            Self::AgentUpdateAck { update_id } => rule(
+                is_op_id_shaped(update_id),
+                "an update id is 22 base64url characters",
+            ),
             Self::AgentUpdate {
                 update_id,
                 version,

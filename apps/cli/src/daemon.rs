@@ -846,7 +846,7 @@ fn wait_for_reconnect(
         // An update that finished installing while disconnected restarts now,
         // not on the next connection: its rollback deadline is already running.
         // (Offline, its progress frames stay queued; the new build reports.)
-        let (_, restart) = link.update.poll();
+        let (_, restart) = link.update.poll(startup.full_control());
         if restart {
             tracing::info!("restarting into the installed update");
             return Err(
@@ -1243,7 +1243,7 @@ fn run_relay_session(
         if let Err(error) = drain_runner(&mut socket, &mut session) {
             break Err(error);
         }
-        if let Err(error) = poll_updates(&mut socket, &mut session) {
+        if let Err(error) = poll_updates(&mut socket, startup, &mut session) {
             break Err(error);
         }
         let now = Instant::now();
@@ -1709,6 +1709,7 @@ where
                 send_control(socket, &frame, "answering an update")?;
             }
         }
+        ServerFrame::AgentUpdateAck { update_id } => session.update.acked(&update_id),
         ServerFrame::RuntimeDetect { id } => {
             // Off this loop: a scan takes seconds. Ports the node's own
             // instances hold are runtimes already, not discoveries.
@@ -2348,6 +2349,7 @@ const UPDATE_IDLE_CHECK: Duration = Duration::from_secs(2);
 /// by the server, through its normal stop operations.
 fn poll_updates<S>(
     socket: &mut tungstenite::WebSocket<S>,
+    startup: &TerminalStartup,
     session: &mut Session,
 ) -> RelaySessionResult<()>
 where
@@ -2364,10 +2366,9 @@ where
             .update
             .set_idle(running.is_empty(), session.execs.running() == 0);
     }
-    let (frames, restart) = session.update.poll();
+    let (frames, restart) = session.update.poll(startup.full_control());
     for frame in frames {
         send_control(socket, &frame, "sending update progress")?;
-        session.update.sent(&frame);
     }
     if restart {
         return Err(RelaySessionError::RestartForUpdate);

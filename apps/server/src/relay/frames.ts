@@ -1084,6 +1084,17 @@ export const agentUpdateFrameSchema = z
   .strict();
 
 /**
+ * The server stored how an update ended (server → node): the node stops reporting that end,
+ * which it otherwise sends again after each `hello.ok`.
+ */
+export const agentUpdateAckFrameSchema = z
+  .object({
+    type: z.literal("agent.update.ack"),
+    updateId: base64Url16Schema,
+  })
+  .strict();
+
+/**
  * Where an update is (node → server). `confirmed` and `rolled_back` come from the binary that
  * runs after the restart, on a later session. `reason` exactly with `refused` and `failed`
  * (as the CLI's `frames.rs`). `detail` is node text (a manual command or a log
@@ -1495,6 +1506,7 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
   /** Nested union on `op` (one `file.op` type). */
   fileOpFrameSchema,
   agentUpdateFrameSchema,
+  agentUpdateAckFrameSchema,
   z.object({ type: z.literal("file.cancel"), opId: fileOpId }).strict(),
   z
     .object({

@@ -9,7 +9,7 @@ vi.mock("@ws-model-proxy/api/nodes/enroll-exchange", () => ({
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: {} }));
 const lib = vi.hoisted(() => ({
-  applyAgentUpdateProgress: vi.fn(async () => ({ applied: true, ended: false })),
+  applyAgentUpdateProgress: vi.fn(async () => ({ applied: true, ended: false, settled: false })),
   expireAgentUpdates: vi.fn(async () => 0),
   advanceAgentUpdateBatches: vi.fn(async () => undefined),
   pruneAgentUpdates: vi.fn(async () => undefined),
@@ -117,7 +117,11 @@ describe("the self-update relay port", () => {
       updateId: "AAAAAAAAAAAAAAAAAAAAAA",
       phase: "confirmed" as const,
     };
-    lib.applyAgentUpdateProgress.mockResolvedValueOnce({ applied: true, ended: true });
+    lib.applyAgentUpdateProgress.mockResolvedValueOnce({
+      applied: true,
+      ended: true,
+      settled: true,
+    });
     await updates.handlers["agent.update.progress"]?.(node, frame);
     expect(lib.applyAgentUpdateProgress).toHaveBeenCalledWith(
       { nodeId: "node-1", userId: "owner-1" },
@@ -126,6 +130,43 @@ describe("the self-update relay port", () => {
     await updates.tick();
     expect(lib.expireAgentUpdates).toHaveBeenCalled();
     expect(lib.advanceAgentUpdateBatches).toHaveBeenCalled();
+  });
+
+  it("acknowledges an end once it is stored, and only then", async () => {
+    const r = relay();
+    const updates = createAgentUpdates(r, { manifest: { get: async () => MANIFEST } });
+    const frame = {
+      type: "agent.update.progress" as const,
+      updateId: "AAAAAAAAAAAAAAAAAAAAAA",
+      phase: "confirmed" as const,
+    };
+    lib.applyAgentUpdateProgress.mockResolvedValueOnce({
+      applied: true,
+      ended: true,
+      settled: true,
+    });
+    await updates.handlers["agent.update.progress"]?.(node, frame);
+    expect(r.sendToNode).toHaveBeenCalledWith(
+      "node-1",
+      { type: "agent.update.ack", updateId: frame.updateId },
+      { connectionGeneration: node.connectionGeneration, userId: node.userId },
+    );
+    // Not stored (a write that kept losing): no ack, so the node reports it again.
+    r.sendToNode.mockClear();
+    lib.applyAgentUpdateProgress.mockResolvedValueOnce({
+      applied: false,
+      ended: false,
+      settled: false,
+    });
+    await updates.handlers["agent.update.progress"]?.(node, frame);
+    // A phase before the end is never acknowledged.
+    lib.applyAgentUpdateProgress.mockResolvedValueOnce({
+      applied: true,
+      ended: false,
+      settled: false,
+    });
+    await updates.handlers["agent.update.progress"]?.(node, { ...frame, phase: "downloading" });
+    expect(r.sendToNode).not.toHaveBeenCalled();
   });
 
   it("ticks deadlines before batches, and never runs two passes at once", async () => {

@@ -466,8 +466,10 @@ impl Scheduler for LaunchAgent {
 // ── Windows ──
 
 /// The one-shot task: a +5 s trigger (start the relay again) and the deadline
-/// trigger, both running `conhost --headless <prev> update rollback …`. It
-/// expires an hour after the deadline and Task Scheduler then deletes it.
+/// trigger, both running `conhost --headless <prev> update rollback …`. The
+/// triggers never expire: a machine off for days still runs the deadline at
+/// the next log on (`StartWhenAvailable`), and the rollback command removes
+/// the task once the update is settled.
 pub fn render_windows_task(
     user_sid: &str,
     arguments: &str,
@@ -483,7 +485,6 @@ pub fn render_windows_task(
             .replace('"', "&quot;")
             .replace('\'', "&apos;")
     };
-    let end = at(deadline_unix + 3600);
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
          <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
@@ -493,12 +494,10 @@ pub fn render_windows_task(
          \x20 <Triggers>\n\
          \x20   <TimeTrigger>\n\
          \x20     <StartBoundary>{kick}</StartBoundary>\n\
-         \x20     <EndBoundary>{end}</EndBoundary>\n\
          \x20     <Enabled>true</Enabled>\n\
          \x20   </TimeTrigger>\n\
          \x20   <TimeTrigger>\n\
          \x20     <StartBoundary>{deadline}</StartBoundary>\n\
-         \x20     <EndBoundary>{end}</EndBoundary>\n\
          \x20     <Enabled>true</Enabled>\n\
          \x20   </TimeTrigger>\n\
          \x20 </Triggers>\n\
@@ -514,7 +513,6 @@ pub fn render_windows_task(
          \x20   <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
          \x20   <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
          \x20   <StartWhenAvailable>true</StartWhenAvailable>\n\
-         \x20   <DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter>\n\
          \x20   <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>\n\
          \x20   <Enabled>true</Enabled>\n\
          \x20 </Settings>\n\
@@ -853,7 +851,10 @@ mod tests {
         let xml = render_windows_task("S-1-5-21-1", &arguments, 1_700_000_005, 1_700_000_090);
         assert!(xml.contains("<StartBoundary>2023-11-14T22:13:25Z</StartBoundary>"));
         assert!(xml.contains("<StartBoundary>2023-11-14T22:14:50Z</StartBoundary>"));
-        assert!(xml.contains("<DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter>"));
+        // Never expires: a machine off for days still runs the deadline at log on.
+        assert!(!xml.contains("EndBoundary"));
+        assert!(!xml.contains("DeleteExpiredTaskAfter"));
+        assert!(xml.contains("<StartWhenAvailable>true</StartWhenAvailable>"));
         assert!(xml.contains("&quot;C:\\Users\\A B"));
         assert_eq!(windows_task_name("me"), "wsmp-update-deadman-me");
     }

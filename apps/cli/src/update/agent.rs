@@ -188,6 +188,8 @@ struct Shared {
     /// From the last idle check to the restart: the relay starts no runtime
     /// launch and no node command, so the node stays idle.
     hold: AtomicBool,
+    /// The node lost Full control: the update stops at its next step.
+    lowered: AtomicBool,
 }
 
 struct Worker {
@@ -215,7 +217,6 @@ impl Progress for Sink {
 pub struct DaemonUpdate {
     started: Instant,
     awaiting: Option<UpdateState>,
-    report: Option<UpdateState>,
     registered: bool,
     synced: bool,
     worker: Option<Worker>,
@@ -237,7 +238,6 @@ impl DaemonUpdate {
         let mut tracker = Self {
             started: Instant::now(),
             awaiting: None,
-            report: None,
             registered: false,
             synced: false,
             worker: None,
@@ -278,7 +278,12 @@ impl DaemonUpdate {
                 tracker.current_id = Some(state.update_id.clone());
                 tracker.awaiting = Some(state);
             }
-            Ok(OnStart::Report(state)) => tracker.report = Some(state),
+            // Sent after each `hello.ok` until the server acknowledges it.
+            Ok(OnStart::Report(state)) => tracing::info!(
+                update_id = state.update_id,
+                phase = ?state.phase,
+                "an update ended; reporting it"
+            ),
             Ok(OnStart::RolledBackSelf) => {
                 return Err(anyhow::anyhow!(
                     "this build did not confirm after {MAX_UNCONFIRMED_STARTS} starts and rolled back; restarting into the previous wsmp"
@@ -424,8 +429,14 @@ impl DaemonUpdate {
     pub fn on_hello_ok(&mut self, sync: DefinitionSync) {
         self.registered = true;
         self.synced = sync == DefinitionSync::None;
-        if let Some(report) = self.report.take() {
-            self.outbox.push(report_frame(&report));
+        // An update's end, until the server acknowledges it (`agent.update.ack`):
+        // a report the server got but did not store is sent again.
+        if let Some(ended) = super::update_dir()
+            .ok()
+            .and_then(|dir| state::load(&dir).ok().flatten())
+            .filter(UpdateState::needs_report)
+        {
+            self.outbox.push(report_frame(&ended));
         }
     }
 
@@ -442,8 +453,12 @@ impl DaemonUpdate {
     }
 
     /// Frames to send now (only while registered), and whether to exit for
-    /// the restart into a new build.
-    pub fn poll(&mut self) -> (Vec<NodeFrame>, bool) {
+    /// the restart into a new build. `full_control` is the node's trust now: a
+    /// worker of a node lowered to Relay only stops at its next step.
+    pub fn poll(&mut self, full_control: bool) -> (Vec<NodeFrame>, bool) {
+        if !full_control && let Some(worker) = &self.worker {
+            worker.shared.lowered.store(true, Ordering::SeqCst);
+        }
         let mut finished = false;
         if let Some(worker) = &self.worker {
             loop {
@@ -540,21 +555,9 @@ impl DaemonUpdate {
         }
     }
 
-    /// A frame went out: an update's end the server now knows is not
+    /// The server stored how `update_id` ended (`agent.update.ack`): it is not
     /// reported again.
-    pub fn sent(&self, frame: &NodeFrame) {
-        let NodeFrame::AgentUpdateProgress {
-            update_id, phase, ..
-        } = frame
-        else {
-            return;
-        };
-        if !matches!(
-            phase,
-            UpdatePhase::Confirmed | UpdatePhase::RolledBack | UpdatePhase::Failed
-        ) {
-            return;
-        }
+    pub fn acked(&self, update_id: &str) {
         let Ok(update_dir) = super::update_dir() else {
             return;
         };
@@ -562,8 +565,8 @@ impl DaemonUpdate {
             return;
         };
         if let Ok(Some(mut current)) = state::load(&update_dir)
-            && &current.update_id == update_id
-            && !current.reported
+            && current.update_id == update_id
+            && current.needs_report()
         {
             current.reported = true;
             let _ = state::save(&update_dir, &current);
@@ -665,6 +668,23 @@ fn run_worker(
         shared.hold.store(false, Ordering::SeqCst);
         Err("the node did not go idle within 30 minutes".into())
     };
+    // Full control and the operator's setting hold for the whole update, not
+    // only when it was asked for.
+    let proceed = || -> Result<(), (UpdateReason, String)> {
+        if shared.lowered.load(Ordering::SeqCst) {
+            return Err((
+                UpdateReason::NotOwnerTrust,
+                "the node was lowered to Relay only; nothing was changed".into(),
+            ));
+        }
+        if remote_setting() == RemoteUpdates::Off {
+            return Err((
+                UpdateReason::OptedOut,
+                "this machine's operator turned remote updates off; nothing was changed".into(),
+            ));
+        }
+        Ok(())
+    };
     let scheduler = super::deadman::platform();
     let machine = Machine {
         state_dir,
@@ -674,6 +694,7 @@ fn run_worker(
         tar: super::install::system_tar(),
         current_version: super::build::version().to_string(),
         before_swap: Some(&before_swap),
+        proceed: Some(&proceed),
     };
     let request = Request {
         update_id: frame.update_id.clone(),
@@ -747,6 +768,9 @@ pub fn homebrew(machine: &Machine<'_>, request: &Request, progress: &mut dyn Pro
     if let Err(error) = crate::commands::service::ensure_stable_executable() {
         tracing::warn!(error = %format!("{error:#}"), "the service could not be moved to the stable Homebrew path");
     }
+    if let Some(Err((reason, detail))) = machine.proceed.map(|proceed| proceed()) {
+        return fail(progress, UpdatePhase::Refused, reason, detail);
+    }
     progress.report(UpdatePhase::Downloading, None, None);
     if let Err(error) = super::homebrew::upgrade(&keg) {
         return fail(
@@ -779,7 +803,7 @@ pub fn homebrew(machine: &Machine<'_>, request: &Request, progress: &mut dyn Pro
             );
         }
     }
-    if let Err(error) = flow::record_homebrew(machine, request) {
+    if let Err(error) = flow::record_homebrew(machine, request, &stable) {
         return fail(
             progress,
             UpdatePhase::Failed,
@@ -912,7 +936,6 @@ mod tests {
         DaemonUpdate {
             started: Instant::now(),
             awaiting: None,
-            report: None,
             registered: true,
             synced: true,
             worker: None,
@@ -967,6 +990,16 @@ mod tests {
     }
 
     #[test]
+    fn a_node_lowered_to_relay_only_stops_its_update() {
+        let mut tracker = tracker();
+        let (shared, _tx) = waiting_worker(&mut tracker, "AAAAAAAAAAAAAAAAAAAAAA");
+        let _ = tracker.poll(true);
+        assert!(!shared.lowered.load(Ordering::SeqCst));
+        let _ = tracker.poll(false);
+        assert!(shared.lowered.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn new_work_is_held_from_the_last_idle_check_to_the_restart() {
         let mut tracker = tracker();
         let (shared, _tx) = waiting_worker(&mut tracker, "AAAAAAAAAAAAAAAAAAAAAA");
@@ -1017,10 +1050,10 @@ mod tests {
         .expect("send");
         tx.send(Event::Restart).expect("send");
         // Disconnected: restart at once, the progress waits.
-        assert_eq!(tracker.poll(), (Vec::new(), true));
+        assert_eq!(tracker.poll(true), (Vec::new(), true));
         // Registered: the progress goes out first.
         tracker.registered = true;
-        let (frames, restart) = tracker.poll();
+        let (frames, restart) = tracker.poll(true);
         assert_eq!(frames.len(), 1);
         assert!(restart);
         // A new update while the restart is pending is in progress.

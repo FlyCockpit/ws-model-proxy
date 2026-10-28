@@ -372,7 +372,7 @@ describe("progress and the deadline", () => {
         phase: "refused",
         reason: "checksum_mismatch",
       }),
-    ).toEqual({ applied: true, ended: true });
+    ).toEqual({ applied: true, ended: true, settled: true });
     expect(raced).toBe(true);
     expect(store.tables.nodeAgentUpdate[0]).toMatchObject({
       phase: "REFUSED",
@@ -386,22 +386,24 @@ describe("progress and the deadline", () => {
     expect(await applyAgentUpdateProgress(node, { updateId: id, phase: "downloading" })).toEqual({
       applied: true,
       ended: false,
+      settled: false,
     });
+    // Nothing this node could ever store: acknowledged, so it stops reporting it.
     expect(
       await applyAgentUpdateProgress(node, { updateId: "x".repeat(21) + "A", phase: "failed" }),
-    ).toEqual({ applied: false, ended: false });
+    ).toEqual({ applied: false, ended: false, settled: true });
     expect(
       await applyAgentUpdateProgress(
         { nodeId: "node-2", userId: OWNER },
         { updateId: id, phase: "failed" },
       ),
-    ).toEqual({ applied: false, ended: false });
+    ).toEqual({ applied: false, ended: false, settled: true });
     expect(
       await applyAgentUpdateProgress(
         { nodeId: "node-1", userId: "someone-else" },
         { updateId: id, phase: "failed" },
       ),
-    ).toEqual({ applied: false, ended: false });
+    ).toEqual({ applied: false, ended: false, settled: true });
     expect(store.tables.nodeAgentUpdate[0]?.phase).toBe("DOWNLOADING");
     const done = await applyAgentUpdateProgress(node, {
       updateId: id,
@@ -409,7 +411,11 @@ describe("progress and the deadline", () => {
       reason: "busy",
       detail: "wsmp update --force",
     });
-    expect(done).toEqual({ applied: true, ended: true });
+    expect(done).toEqual({ applied: true, ended: true, settled: true });
+    // The same end again (the node did not get the ack): settled, nothing written.
+    expect(
+      await applyAgentUpdateProgress(node, { updateId: id, phase: "refused", reason: "busy" }),
+    ).toEqual({ applied: false, ended: false, settled: true });
     expect(store.tables.nodeAgentUpdate[0]).toMatchObject({
       phase: "REFUSED",
       reason: "busy",
@@ -434,6 +440,7 @@ describe("progress and the deadline", () => {
     expect(await applyAgentUpdateProgress(node, { updateId: id, phase: "confirmed" })).toEqual({
       applied: true,
       ended: true,
+      settled: true,
     });
   });
 });

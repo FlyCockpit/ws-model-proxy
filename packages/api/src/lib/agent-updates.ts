@@ -646,7 +646,7 @@ export async function applyAgentUpdateProgress(
     detail?: string;
   },
   now: Date = new Date(),
-): Promise<{ applied: boolean; ended: boolean }> {
+): Promise<{ applied: boolean; ended: boolean; settled: boolean }> {
   const ended = AGENT_UPDATE_TERMINAL_PHASES.has(frame.phase);
   // A report that loses the conditional write to another report of the same update (frames
   // handled concurrently: `verifying`, then at once `refused`) reads the row again and tries
@@ -657,9 +657,15 @@ export async function applyAgentUpdateProgress(
       where: { id: frame.updateId, nodeId: node.nodeId, userId: node.userId },
       select: { phase: true, rollbackAfterSecs: true },
     });
-    if (!row) return { applied: false, ended: false };
-    if (!progressAllowed(phaseFromDb(row.phase), frame.phase))
-      return { applied: false, ended: false };
+    // No such update of this node (pruned, or never): nothing to store, ever.
+    if (!row) return { applied: false, ended: false, settled: true };
+    const stored = phaseFromDb(row.phase);
+    if (!progressAllowed(stored, frame.phase))
+      return {
+        applied: false,
+        ended: false,
+        settled: AGENT_UPDATE_TERMINAL_PHASES.has(stored),
+      };
     const written = await prisma.nodeAgentUpdate.updateMany({
       // Unchanged since the read: a concurrent report or the deadline wins once.
       where: { id: frame.updateId, nodeId: node.nodeId, userId: node.userId, phase: row.phase },
@@ -672,9 +678,9 @@ export async function applyAgentUpdateProgress(
         endedAt: ended ? now : null,
       },
     });
-    if (written.count === 1) return { applied: true, ended };
+    if (written.count === 1) return { applied: true, ended, settled: ended };
   }
-  return { applied: false, ended: false };
+  return { applied: false, ended: false, settled: false };
 }
 
 /** How often one progress report re-reads after losing to a concurrent write. */

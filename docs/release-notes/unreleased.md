@@ -103,10 +103,13 @@ the new `agent.update` frame).
 - The relay hello now accepts `node.build` (commit, install method, target), `node.environment`
   (`wsl`) and `features.selfUpdate`. Upgrade the **server first**: a newer `wsmp` that sends
   these fields is refused by an older server.
-- New frames, extending relay 3.0 in place: `agent.update` (server → node) and
-  `agent.update.progress` (node → server). The server sends `agent.update` only to a node that
-  reports `features.selfUpdate`, at Full control, owned by the person clicking, with its
-  per-node setting on.
+- New frames, extending relay 3.0 in place: `agent.update` and `agent.update.ack` (server →
+  node) and `agent.update.progress` (node → server). The server sends `agent.update` only to a
+  node that reports `features.selfUpdate`, at Full control, owned by the person clicking, with
+  its per-node setting on. The node reports how an update ended after every `hello.ok` until
+  the server answers `agent.update.ack`, sent once the end is stored, so a server restart
+  cannot lose it. An update stops at its next step if the node is lowered to Relay only or its
+  operator turns remote updates off.
 - `GET /cli/manifest.json` lists the release the server installs (each target's archive and its
   SHA-256 from the release's `sha256.sum`). It fails closed (503) when the checksums cannot be
   read, and reports `sourceBuild: true` with no archives when the server builds wsmp from source
