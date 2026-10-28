@@ -11,6 +11,7 @@
  * circuit) is `disconnectNodeAtGeneration` in `@ws-model-proxy/api/lib/pool-routing`. Runtime inventory → runtimes/models/instances/targets is lane A2
  * and arrives through the session manager's node frame handlers.
  */
+import type { NodeBuild, NodeEnvironment } from "@ws-model-proxy/api/lib/agent-update-wire";
 import type { NodeFeatures } from "@ws-model-proxy/api/lib/runtime-spec";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import {
@@ -18,6 +19,7 @@ import {
   fences,
   runCapacityOrderedTransaction,
 } from "@ws-model-proxy/db/capacity-lock-order";
+import { DbNull } from "@ws-model-proxy/db/json-null";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { HeldDefinition, NodeTrustWire } from "./frames.js";
 import type { NodeIdentity } from "./node-credential-auth.js";
@@ -100,6 +102,9 @@ export type NodeHelloFacts = {
   identityPublicKey: string;
   trust: NodeTrustWire;
   features: NodeFeatures;
+  /** Self-update: the build and environment the node reports (absent on older CLIs). */
+  build?: NodeBuild;
+  environment?: NodeEnvironment;
   definitions: HeldDefinition[];
   heldMetricCommandsHash: string | null;
   heldFabricsHash: string | null;
@@ -192,6 +197,12 @@ export async function registerNodeHello(input: {
       ...trustLowerColumns(trust.trust, reportedTrust, trust.trustLowerRequestedAt !== null),
       features: hello.features as Prisma.InputJsonValue,
       featuresAt: now,
+      // Each hello says it again: a node that no longer reports them (a downgrade) clears them.
+      cliBuild: hello.build ? (hello.build as Prisma.InputJsonValue) : DbNull,
+      environment:
+        hello.environment && Object.keys(hello.environment).length > 0
+          ? (hello.environment as Prisma.InputJsonValue)
+          : DbNull,
       heldDefinitions: hello.definitions as Prisma.InputJsonValue,
       heldMetricCommandsHash: hello.heldMetricCommandsHash,
       heldFabricsHash: hello.heldFabricsHash,

@@ -215,6 +215,8 @@ const GRAPH_WRITERS: Record<string, string> = {
     "M: enrollment exchange creates or takes over the node under graphWrite (the code owner's fence), code row FOR UPDATE",
   "packages/api/src/nodes/fabrics.ts":
     "M: fabric memberships, written inside nodes.update's graphWrite (owner fence first)",
+  "packages/api/src/nodes/agent-update.ts":
+    "H status: the node's agentUpdatePolicy (one owner-guarded statement on an unfenced column); self-update rows live in unfenced tables",
   "packages/api/src/nodes/secrets.ts":
     "H status: node features secret names after a confirmed secret write (one owner-guarded compare-and-set statement on an unfenced column)",
   "packages/api/src/nodes/procedures.ts":

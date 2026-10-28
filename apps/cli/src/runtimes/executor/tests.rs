@@ -1,7 +1,7 @@
 use super::*;
 use std::cell::{Cell, RefCell};
 
-fn job(action: JobPhase) -> Job {
+pub(crate) fn job(action: JobPhase) -> Job {
     Job {
         step_id: format!("step-{action:?}"),
         instance_id: "in1".into(),
@@ -1607,4 +1607,52 @@ while ($true) {
         executor.observations(&runtime, long())[0].1.phase,
         InstancePhase::Stopped
     );
+}
+
+/// Self-update (D3): the relay after an update adopts the instances the
+/// version before it started. `tests/fixtures/instance-state/0.4.2-ready.json`
+/// is a record exactly as 0.4.2 wrote it (a started, ready rank); a change to
+/// the record format must keep reading it.
+#[test]
+fn the_next_version_adopts_instances_the_previous_one_started() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let fixture = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/instance-state/0.4.2-ready.json"),
+    )
+    .expect("fixture");
+    std::fs::write(&path, fixture).expect("write");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    let runtime = Fake::new(path.clone());
+    // The unit the previous relay launched is still there.
+    runtime
+        .units
+        .borrow_mut()
+        .insert("wsmp-i-abcdefabcdef-r0".into(), "invocation".into());
+    let mut executor = Executor::load(path.clone()).expect("the record of 0.4.2 loads");
+    let ranks = executor.ranks();
+    assert_eq!(ranks.len(), 1);
+    assert_eq!(ranks[0].phase, InstancePhase::Ready);
+    assert_eq!(ranks[0].units, ["wsmp-i-abcdefabcdef-r0"]);
+    assert_eq!(
+        executor.observations(&runtime, deadline())[0].1.phase,
+        InstancePhase::Ready
+    );
+    // A re-delivered start answers from history: nothing is launched twice.
+    let mut retry = job(JobPhase::Start);
+    retry.owner_epoch = "after-update".into();
+    assert_eq!(
+        executor.execute(retry, &runtime, deadline()).status,
+        JobStatus::Succeeded
+    );
+    assert_eq!(runtime.launches.get(), 0);
+    // And the adopted unit is the one a stop ends.
+    let stopped = executor.execute(job(JobPhase::Stop), &runtime, deadline());
+    assert!(stopped.stopped);
+    assert!(runtime.units.borrow().is_empty());
 }

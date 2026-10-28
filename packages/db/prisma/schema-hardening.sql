@@ -12,7 +12,7 @@ BEGIN;
 -- when a table named anywhere in this file is missing here.
 LOCK TABLE "user", session, node, node_credential, node_enrollment_code, node_enrollment_use,
   fabric, fabric_member, node_command, node_audit_event,
-  queued_node_command, runtime, runtime_version, runtime_model, runtime_share, runtime_instance,
+  queued_node_command, node_agent_update, node_agent_update_batch, runtime, runtime_version, runtime_model, runtime_share, runtime_instance,
   instance_rank, instance_reservation, claim_release_request, instance_step, runtime_operation, execution_target, profile, profile_node,
   profile_item, pool, pool_routing, pool_fallback, pool_advanced, pool_sidecar, pool_member,
   pool_routing_rule, api_key, api_key_pool, agent_token, share, share_invite, provider_account,
@@ -508,6 +508,14 @@ $queued_node_command_transition$;
 DROP TRIGGER IF EXISTS queued_node_command_transition ON queued_node_command;
 CREATE TRIGGER queued_node_command_transition BEFORE UPDATE ON queued_node_command
 FOR EACH ROW EXECUTE FUNCTION enforce_queued_node_command_transition();
+
+-- wsmp self-update: at most one update in flight per node and one "Update all" run per owner
+-- (the procedures refuse a second with agent_update_in_progress; a lost race is a unique
+-- violation, refused the same way).
+CREATE UNIQUE INDEX IF NOT EXISTS node_agent_update_one_active
+  ON node_agent_update ("nodeId") WHERE "endedAt" IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS node_agent_update_batch_one_running
+  ON node_agent_update_batch ("userId") WHERE state = 'RUNNING';
 
 -- ═══════════════════════════════ runtimes ═══════════════════════════════
 

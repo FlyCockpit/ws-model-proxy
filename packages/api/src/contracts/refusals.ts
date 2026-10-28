@@ -159,6 +159,25 @@ export const REFUSAL_REASONS = [
    * written.
    */
   "command_not_started",
+  // wsmp self-update (nodes.agentUpdate.*).
+  /** The owner turned browser updates off for this node (its setting). */
+  "agent_update_off",
+  /** The node's operator turned remote updates off on the node (`remoteUpdates: off`). */
+  "agent_update_opted_out",
+  /**
+   * This install of wsmp cannot update itself (a source build, a pinned or foreign Homebrew
+   * formula): run the manual command on the node.
+   */
+  "agent_update_unsupported",
+  /**
+   * The server has no release binary to offer: it builds wsmp from source, its release manifest
+   * could not be read, or the release has no build for the node's target.
+   */
+  "agent_update_unavailable",
+  /** An update of this node (or an "Update all" run) is already in progress. */
+  "agent_update_in_progress",
+  /** The node already runs this server's wsmp. */
+  "agent_update_current",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

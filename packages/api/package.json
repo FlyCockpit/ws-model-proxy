@@ -29,6 +29,12 @@
     "./lib/node-relay-services": {
       "default": "./src/lib/node-relay-services.ts"
     },
+    "./lib/agent-update-wire": {
+      "default": "./src/lib/agent-update-wire.ts"
+    },
+    "./lib/agent-updates": {
+      "default": "./src/lib/agent-updates.ts"
+    },
     "./lib/live-load": {
       "default": "./src/lib/live-load.ts"
     },

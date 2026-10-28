@@ -1037,6 +1037,29 @@ export const terminalShellIdSchema = z
   .regex(/^(?:pwsh|powershell|cmd|wsl:[A-Za-z0-9._-]{1,64})$/);
 export const TERMINAL_SHELLS_MAX = 16;
 
+/** The self-update strategies the server knows how to drive (`agent.update`). */
+export const AGENT_UPDATE_STRATEGIES = ["self-replace", "homebrew"] as const;
+export type AgentUpdateStrategy = (typeof AGENT_UPDATE_STRATEGIES)[number];
+
+/**
+ * `features.selfUpdate`. `strategies` empty: this install cannot update itself (a source build,
+ * a pinned or foreign Homebrew formula); the server shows the manual command. A strategy the
+ * server does not know is accepted (a newer CLI) and never chosen. `instancesSurvive`: running
+ * instances outlive an agent restart on this platform. `remote`: the node-local
+ * `remoteUpdates` setting (`off`: the node refuses `agent.update` with `opted_out`).
+ */
+export const nodeSelfUpdateSchema = z
+  .object({
+    strategies: z
+      .array(z.string().regex(/^[a-z][a-z0-9-]{0,31}$/))
+      .max(8)
+      .refine((values) => new Set(values).size === values.length, "strategies are distinct"),
+    instancesSurvive: z.boolean(),
+    remote: z.enum(["allowed", "off"]),
+  })
+  .strict();
+export type NodeSelfUpdate = z.infer<typeof nodeSelfUpdateSchema>;
+
 export const nodeFeaturesSchema = z
   .object({
     terminals: z
@@ -1107,6 +1130,11 @@ export const nodeFeaturesSchema = z
     secrets: z
       .array(z.object({ name: nodeSecretNameSchema, updatedAt: z.iso.datetime() }).strict())
       .max(NODE_SECRETS_MAX),
+    /**
+     * How this install of wsmp can update itself (`agent.update`). Absent on CLIs older than
+     * self-update: the server never sends them `agent.update` and shows the manual command.
+     */
+    selfUpdate: nodeSelfUpdateSchema.optional(),
   })
   .strict();
 export type NodeFeatures = z.infer<typeof nodeFeaturesSchema>;

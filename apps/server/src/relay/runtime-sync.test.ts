@@ -280,7 +280,12 @@ describe("createRuntimeSync", () => {
     expect(await done).toMatchObject({ held });
     expect(db.node.updateMany).toHaveBeenCalledWith({
       where: { id: "node-1", connectionGeneration: 4 },
-      data: { heldDefinitions: held, heldMetricCommandsHash: null, heldFabricsHash: null },
+      data: {
+        heldDefinitions: held,
+        refusedDefinitions: [],
+        heldMetricCommandsHash: null,
+        heldFabricsHash: null,
+      },
     });
   });
 
@@ -366,14 +371,45 @@ describe("createRuntimeSync", () => {
       opId: frame.opId,
       chunkIndex: 0,
       final: true,
-      results: [{ runtimeId: "rt1", versionId: "v1", status: "rejected", reason: "invalid" }],
+      results: [
+        {
+          runtimeId: "rt1",
+          versionId: "v1",
+          status: "rejected",
+          reason: "invalid",
+          detail: "put[0].spec.launch.commands[0].start",
+        },
+      ],
       held: [],
       heldMetricCommandsHash: null,
       heldPortRange: null,
       heldFabricsHash: null,
       frozen: false,
     });
-    expect(await push).toEqual([{ nodeId: "node-1", status: "rejected", reason: "invalid" }]);
+    // The node's reason and the path it could not read: never "pending" for a refusal.
+    expect(await push).toEqual([
+      {
+        nodeId: "node-1",
+        status: "rejected",
+        reason: "invalid",
+        detail: "put[0].spec.launch.commands[0].start",
+      },
+    ]);
+    // Stored, so the runtime's page keeps saying "refused" after this answer.
+    expect(db.node.updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          refusedDefinitions: [
+            {
+              runtimeId: "rt1",
+              versionId: "v1",
+              reason: "invalid",
+              detail: "put[0].spec.launch.commands[0].start",
+            },
+          ],
+        }),
+      }),
+    );
 
     // No answer within the wait: pending.
     const slow = sync.pushRuntimeDefinitions({ userId: "user-1", runtimeId: "rt1" });

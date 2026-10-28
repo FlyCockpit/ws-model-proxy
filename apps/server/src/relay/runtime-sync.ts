@@ -343,6 +343,7 @@ export type PushDefinitionsResult = Array<{
   nodeId: string;
   status: "applied" | "unchanged" | "rejected" | "pending" | "skipped_trust_relay";
   reason: string | null;
+  detail?: string | null;
 }>;
 
 export function createRuntimeSync(
@@ -489,6 +490,20 @@ export function createRuntimeSync(
       console.warn("[runtime-sync] the node refused its node part", frame.node.reason ?? "");
     if (!frame.final) return;
     const held = frame.held ?? [];
+    // A refused version is never held, so every complete operation puts it again and the node
+    // refuses it again: the final answer's refusals replace the stored ones.
+    const refusedDefinitions = [...op.results.values()].flatMap((result) =>
+      result.status === "rejected"
+        ? [
+            {
+              runtimeId: result.runtimeId,
+              versionId: result.versionId,
+              reason: result.reason ?? null,
+              detail: result.detail ?? null,
+            },
+          ]
+        : [],
+    );
     // Status columns: no graph fence. A stale session's answer does not overwrite a newer one.
     let stored = false;
     try {
@@ -496,6 +511,7 @@ export function createRuntimeSync(
         where: { id: ref.nodeId, connectionGeneration: ref.connectionGeneration },
         data: {
           heldDefinitions: held,
+          refusedDefinitions,
           heldMetricCommandsHash: frame.heldMetricCommandsHash ?? null,
           heldFabricsHash: frame.heldFabricsHash ?? null,
         },
@@ -587,7 +603,12 @@ export function createRuntimeSync(
         const versionId = runtime?.currentVersionId;
         const entry = versionId ? outcome.results.get(versionId) : undefined;
         if (entry?.status === "rejected")
-          return { nodeId: node.id, status: "rejected" as const, reason: entry.reason ?? null };
+          return {
+            nodeId: node.id,
+            status: "rejected" as const,
+            reason: entry.reason ?? null,
+            detail: entry.detail ?? null,
+          };
         if (entry?.status === "applied")
           return { nodeId: node.id, status: "applied" as const, reason: null };
         return { nodeId: node.id, status: "unchanged" as const, reason: null };

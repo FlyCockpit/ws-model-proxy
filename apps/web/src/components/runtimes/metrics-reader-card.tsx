@@ -25,6 +25,7 @@ import z from "zod";
 
 import { FieldErrors } from "@/components/field-errors";
 import { NativeSelect } from "@/components/native-select";
+import { rejectedDefinesWarning } from "@/lib/define-rejections";
 import {
   draftToReader,
   nextFreeSignal,
@@ -122,6 +123,8 @@ export function MetricsReaderCard({
             restart: result.needsRestart.length,
           }),
         );
+        const rejected = rejectedDefinesWarning(t, result.define);
+        if (rejected) toast.warning(rejected);
       } catch (error) {
         toast.error(refusalText(error));
       }

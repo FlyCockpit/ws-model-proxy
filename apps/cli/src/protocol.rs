@@ -206,6 +206,10 @@ pub enum FrameFault {
     RejectFile {
         op_id: String,
     },
+    /// A malformed `agent.update` that names an update: answer `failed`.
+    RejectUpdate {
+        update_id: String,
+    },
     /// A malformed `stt.open` that names a session: answer `stt.error`.
     RejectStt {
         session_id: String,
@@ -438,6 +442,13 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
             None => FrameFault::Ignore,
         };
     }
+    // A bad update concerns the update, never the relay.
+    if type_name == "agent.update" {
+        return match string_field(value, "updateId").filter(|id| is_op_id_shaped(id)) {
+            Some(update_id) => FrameFault::RejectUpdate { update_id },
+            None => FrameFault::Ignore,
+        };
+    }
     // A malformed frame of a known 3.0 type is a broken server; a frame type
     // this protocol does not have is refused and dropped.
     if text_frame && known_server_frame(type_name) {
@@ -472,6 +483,24 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_malformed_update_is_refused_by_id_and_never_fatal() {
+        let named = serde_json::json!({
+            "type": "agent.update",
+            "updateId": "q8Zr0T3vX1yB2nC4dE5fGw",
+            "version": "0.4.3",
+        });
+        assert!(matches!(
+            interactive_fault(&named, true),
+            FrameFault::RejectUpdate { update_id } if update_id == "q8Zr0T3vX1yB2nC4dE5fGw"
+        ));
+        let unnamed = serde_json::json!({ "type": "agent.update", "updateId": "x" });
+        assert!(matches!(
+            interactive_fault(&unnamed, true),
+            FrameFault::Ignore
+        ));
+    }
 
     /// Field names of an object, for strict metadata checks.
     fn keys(value: &Value) -> Vec<String> {

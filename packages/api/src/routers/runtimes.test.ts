@@ -2329,6 +2329,47 @@ describe("runtimes.get: live load", () => {
   });
 });
 
+describe("runtimes.get: refused definitions", () => {
+  it("lists the caller's nodes that refused this runtime, with the node's reason and path", async () => {
+    db.runtime.findFirst.mockResolvedValue(runtimeRow() as never);
+    db.runtimeVersion.findFirstOrThrow.mockResolvedValue(versionRow() as never);
+    db.runtimeModel.findMany.mockResolvedValue([]);
+    db.runtimeShare.findMany.mockResolvedValue([]);
+    db.runtimeRequestProfile.findFirst.mockResolvedValue(null);
+    db.runtimeInstance.findMany.mockResolvedValue([]);
+    db.node.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+      {
+        id: "node-1",
+        slug: "spark",
+        refusedDefinitions: [
+          {
+            runtimeId: "rt-1",
+            versionId: "ver-1",
+            reason: "invalid",
+            detail: "put[0].spec.launch.commands[0].start",
+          },
+          { runtimeId: "rt-other", versionId: "ver-9", reason: "invalid", detail: null },
+        ],
+      },
+      { id: "node-2", slug: "box", refusedDefinitions: [] },
+    ] as never);
+    const runtime = await client().get({ runtimeId: "rt-1" });
+    expect(runtime.refusedOn).toEqual([
+      {
+        nodeId: "node-1",
+        nodeSlug: "spark",
+        versionId: "ver-1",
+        reason: "invalid",
+        detail: "put[0].spec.launch.commands[0].start",
+      },
+    ]);
+    // Only the caller's own nodes are read.
+    expect(db.node.findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({ where: { userId: expect.any(String) } }),
+    );
+  });
+});
+
 describe("runtimes.shares.create: a direct share only to a proved mailbox", () => {
   const owner = { name: "Owner", locale: "en-US" };
   const input = { runtimeId: "rt-1", email: "Friend@Example.test" };

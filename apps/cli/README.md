@@ -202,7 +202,8 @@ step it skipped; run `wsmp service install` or `wsmp config set-human-terminal o
 
 The same refusal covers every command that changes wsmp itself: `wsmp login`, `wsmp secret
 set|remove`, the `wsmp config` setters (`init`, `set-…`, `clear-file-roots`), `wsmp service
-install|uninstall|restart`, `wsmp logout`, `wsmp terminal approve` and `wsmp recover --apply`.
+install|uninstall|restart`, `wsmp logout`, `wsmp terminal approve`, `wsmp recover --apply` and
+`wsmp update`.
 `wsmp run` checks only `WSMP_JOB`, since the relay's own service starts it. Reading (`wsmp config
 show|path`, `wsmp service status|logs`, `wsmp runtime list|test`, listings) and lowering (`wsmp trust relay`, `wsmp
 terminal approvals revoke`) work from anywhere.
@@ -391,6 +392,43 @@ Agents then see Linux, not Windows, and files under `/mnt/c` are slow. WSL can s
 that nothing is using: after you close your terminals, check that the node stays connected, and
 start the distribution at log on if it does not.
 
+## Updating
+
+The node's owner can update a Full-control node from the Nodes page (**Update**), or run `wsmp
+update` on the node. Either way wsmp installs the server's version:
+
+1. It downloads the release archive beside the binary (never in `/tmp`), checks its SHA-256, and
+   runs the new build's `--version`, which must print the server's version. Nothing changes if any
+   of that fails.
+2. It keeps the current binary as `wsmp.prev`, arms a rollback job that runs `wsmp.prev` at a
+   deadline (90 s by default), puts the new binary in place and restarts the relay service (exit
+   code 75). The rollback job is a persistent systemd user timer and service
+   (`wsmp-update-deadman.{timer,service}`, beside the relay's unit) on Linux and WSL, a one-shot
+   LaunchAgent (`com.flycockpit.wsmp.update-deadman`) on macOS, and a one-shot scheduled task
+   (`wsmp-update-deadman-<user>`) on Windows. On Linux and macOS it survives a reboot during the
+   trial; the new build then gets a full window from the boot to confirm before it is rolled back.
+3. The new build confirms once it has connected, applied the server's definitions and stayed up
+   for 30 s; it then removes the rollback job. A build that does not confirm is rolled back: the
+   failed build is kept as `wsmp.failed`, the previous one returns, and the relay tells the server
+   (with the end of the failed build's log).
+
+- **Homebrew** installs are updated with `brew upgrade flycockpit/tap/wsmp`, with no automatic
+  rollback; a pinned formula or one from another tap is refused. Recover by hand with `brew
+  reinstall flycockpit/tap/wsmp && wsmp service restart`.
+- **Source builds** (`cargo install --git`, or a server that pins `WMP_CLI_SOURCE_REV`) are never
+  replaced; the Nodes page shows the `cargo install` command to run.
+- The relay must run as its installed service (`wsmp service install`) for an update from the
+  browser: something has to restart it.
+- `wsmp config set-remote-updates off` refuses updates from the browser on this machine
+  (`allowed` is the default); `wsmp update` here still works.
+- On macOS, runtime instances may stop when the relay restarts: an update from the browser waits
+  until none runs (or the owner forces it: the server stops them first, as any stop from the
+  Runtimes page, and the node installs once they have stopped), and `wsmp update` needs
+  `--force` while any runs. Linux and Windows instances keep running and are adopted by the new
+  relay.
+- `wsmp update status [--json]` shows the build, how it was installed (from
+  `<state>/install.json`, or guessed for older installs) and the last update.
+
 ## Other commands
 
 | Command | What it does |
@@ -406,6 +444,8 @@ start the distribution at log on if it does not.
 | `wsmp config set-max-terminals <1-32>` | Cap browser terminals open at once. |
 | `wsmp config set-terminal-shell <id>\|default` | Windows: the shell a browser terminal starts by default (`pwsh`, `powershell`, `cmd`, `wsl:<distro>`). |
 | `wsmp config set-file-tools-as-root on\|off` | Allow the file tools when wsmp runs as root. |
+| `wsmp config set-remote-updates allowed\|off` | Allow or refuse updates from the browser ([Updating](#updating)). |
+| `wsmp update [--force]` / `wsmp update status` | Install the server's wsmp here, or show the last update ([Updating](#updating)). |
 | `wsmp terminal fingerprint` | This node's terminal identity, as browsers show it. |
 | `wsmp terminal approve <code>` / `approvals list\|revoke` | Manage approved browser identities. |
 | `wsmp recover [--apply] [--scan]` | List or finish interrupted file writes ([guide](docs/file-recovery.md)). |
@@ -424,6 +464,7 @@ Commands that print data take `--json` (`wsmp service` does not). Logs go to std
 | 3 | not found |
 | 4 | the relay has no usable credential (none saved, rejected with HTTP 401, or refused at hello as revoked or enrolled with another identity); run `wsmp login`. Only under the systemd unit and in an interactive terminal; elsewhere the relay retries instead. The systemd unit does not restart on this code. |
 | 5 | the server refused this wsmp's relay protocol (HTTP 426 or an `upgrade_cli`/`upgrade_server` refusal at hello). Re-run the server's `install.sh` to install the matching wsmp (or upgrade the server), then restart wsmp. Only under a systemd unit written by this version's `wsmp service install` (it does not restart on this code) and in an interactive terminal; elsewhere, including an older unit, the relay logs it and retries every 5 minutes (re-run `wsmp service install` to update an older unit). |
+| 75 | the relay installed an update and exits so its service starts the new binary (systemd restarts it, launchd's `KeepAlive` does, and on Windows the update's rollback task starts the relay task again) |
 | 128 + signal | the relay stopped on SIGHUP (129), SIGINT (130), or SIGTERM (143); on Unix it dies from that signal after cleanup |
 
 ## Development

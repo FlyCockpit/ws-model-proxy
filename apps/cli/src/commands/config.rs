@@ -86,6 +86,12 @@ enum Sub {
     /// `default` goes back to pwsh, then powershell, then cmd. Takes effect
     /// the next time wsmp starts.
     SetTerminalShell { shell: String },
+    /// Whether this node's owner may update wsmp from the browser: `allowed`
+    /// (the default) or `off`. `wsmp update` here still works. Applies at once.
+    SetRemoteUpdates {
+        #[arg(value_enum)]
+        state: crate::protocol::runtime_spec::RemoteUpdates,
+    },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -117,6 +123,7 @@ impl Sub {
             Self::SetMaxTerminals { .. } => "wsmp config set-max-terminals",
             Self::SetFileToolsAsRoot { .. } => "wsmp config set-file-tools-as-root",
             Self::SetTerminalShell { .. } => "wsmp config set-terminal-shell",
+            Self::SetRemoteUpdates { .. } => "wsmp config set-remote-updates",
         })
     }
 }
@@ -155,6 +162,7 @@ pub fn run(args: &Args) -> Result<()> {
             shown["fileRoots"] = serde_json::to_value(&roots)?;
             shown["fileRootsSource"] = serde_json::to_value(source)?;
             shown["maxTerminals"] = cfg.effective_max_terminals().into();
+            shown["remoteUpdates"] = cfg.remote_updates.as_str().into();
             if cfg!(windows) {
                 // What a browser can pick now, the default first.
                 shown["terminalShells"] = crate::shells::discover(cfg.terminal_shell.as_deref())
@@ -359,6 +367,23 @@ pub fn run(args: &Args) -> Result<()> {
                     None => output::line("cleared `terminalShell`")?,
                 }
                 output::line("Restart wsmp to apply.")?;
+            }
+        }
+        Sub::SetRemoteUpdates { state } => {
+            let state = *state;
+            Config::update(false, |cfg| {
+                cfg.remote_updates = state;
+                Ok(())
+            })?;
+            // The running relay reports the new setting at once.
+            let _ = crate::control::request_if_running(crate::control::ControlCommand::Reload);
+            if args.json {
+                output::json(&SetValue {
+                    key: "remoteUpdates",
+                    value: state.as_str(),
+                })?;
+            } else {
+                output::line(format!("set `remoteUpdates` to `{}`", state.as_str()))?;
             }
         }
     }

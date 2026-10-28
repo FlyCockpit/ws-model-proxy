@@ -1,0 +1,6 @@
+{
+  "type": "agent.update.progress",
+  "updateId": "q8Zr0T3vX1yB2nC4dE5fGw",
+  "phase": "refused",
+  "detail": "cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.3 --locked --force wsmp"
+}

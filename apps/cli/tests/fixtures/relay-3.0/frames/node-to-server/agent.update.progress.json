@@ -1,0 +1,6 @@
+{
+  "type": "agent.update.progress",
+  "updateId": "q8Zr0T3vX1yB2nC4dE5fGw",
+  "phase": "rolled_back",
+  "detail": "thread 'main' panicked at src/daemon.rs: definition sync failed"
+}

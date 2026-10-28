@@ -388,6 +388,23 @@ export const runtimeDetailSchema = runtimeSummarySchema
     ),
     /** Nodes holding an older version of this runtime frozen (Relay only). */
     frozenOn: z.array(z.object({ nodeId: idSchema, versionId: idSchema }).strict()),
+    /**
+     * Your nodes that refused a version of this runtime in their last define answer (they could
+     * not parse or accept it): `reason` is the node's code (`invalid`, ...), `detail` the JSON
+     * path when it gave one. A node listed here never "applies later" on its own: fix the
+     * definition, or upgrade wsmp on the node.
+     */
+    refusedOn: z.array(
+      z
+        .object({
+          nodeId: idSchema,
+          nodeSlug: z.string(),
+          versionId: idSchema,
+          reason: z.string().nullable(),
+          detail: z.string().nullable(),
+        })
+        .strict(),
+    ),
   })
   .strict();
 
@@ -520,6 +537,8 @@ export const defineResultSchema = z
     nodeId: idSchema,
     status: z.enum(["applied", "unchanged", "rejected", "pending", "skipped_trust_relay"]),
     reason: z.string().nullable(),
+    /** `rejected` only: the JSON path the node could not parse or accept (never spec text). */
+    detail: z.string().nullable().optional(),
   })
   .strict();
 

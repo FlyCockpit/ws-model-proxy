@@ -15,6 +15,16 @@
  * `file.op` drops `mode`/`readGrant` (the node's trust decides).
  */
 
+import {
+  AGENT_UPDATE_DETAIL_MAX_CHARS,
+  AGENT_UPDATE_NODE_PHASES,
+  AGENT_UPDATE_REASONS,
+  AGENT_UPDATE_ROLLBACK_SECS_MAX,
+  AGENT_UPDATE_ROLLBACK_SECS_MIN,
+  agentUpdateArtifactUrlAllowed,
+  nodeBuildSchema,
+  nodeEnvironmentSchema,
+} from "@ws-model-proxy/api/lib/agent-update-wire";
 import { gpuIds } from "@ws-model-proxy/api/lib/command-render";
 import { embeddingContractSchema } from "@ws-model-proxy/api/lib/embedding-contract";
 import {
@@ -925,6 +935,10 @@ export const helloFrameSchema = z
           .object({ publicKey: p256PublicKeySchema, signature: p256SignatureSchema })
           .strict()
           .optional(),
+        /** Commit, install method and target triple (self-update; absent on older CLIs). */
+        build: nodeBuildSchema.optional(),
+        /** Sent only when there is something to say (`wsl: true`). */
+        environment: nodeEnvironmentSchema.optional(),
       })
       .strict()
       .refine(
@@ -1037,6 +1051,63 @@ export const execStatusFrameSchema = z
     (frame) =>
       frame.exitCode === undefined || frame.state === "succeeded" || frame.state === "failed",
     { message: "An exit code only for succeeded or failed commands." },
+  );
+
+// ── wsmp self-update ──
+
+/**
+ * Install this version (server → node, Full control, owner's browser only). Sent only to a node
+ * whose hello reports `features.selfUpdate` (older CLIs ignore an unknown frame type, but the
+ * server never expects them to act). `signature` is reserved for minisign (D9): null today.
+ */
+export const agentUpdateFrameSchema = z
+  .object({
+    type: z.literal("agent.update"),
+    updateId: base64Url16Schema,
+    version: z
+      .string()
+      .max(80)
+      .regex(/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/),
+    artifactUrl: z
+      .string()
+      .max(2048)
+      .refine(agentUpdateArtifactUrlAllowed, "https only (http to loopback for tests)."),
+    sha256: sha256HexSchema,
+    signature: z.string().min(1).max(4096).nullable(),
+    force: z.boolean(),
+    rollbackAfterSecs: z
+      .number()
+      .int()
+      .min(AGENT_UPDATE_ROLLBACK_SECS_MIN)
+      .max(AGENT_UPDATE_ROLLBACK_SECS_MAX),
+  })
+  .strict();
+
+/**
+ * Where an update is (node → server). `confirmed` and `rolled_back` come from the binary that
+ * runs after the restart, on a later session. `reason` exactly with `refused` and `failed`
+ * (as the CLI's `frames.rs`). `detail` is node text (a manual command or a log
+ * tail): stored and shown as plain text only.
+ */
+export const agentUpdateProgressFrameSchema = z
+  .object({
+    type: z.literal("agent.update.progress"),
+    updateId: base64Url16Schema,
+    phase: z.enum(AGENT_UPDATE_NODE_PHASES),
+    reason: z.enum(AGENT_UPDATE_REASONS).optional(),
+    detail: z
+      .string()
+      .refine(
+        (detail) => Array.from(detail).length <= AGENT_UPDATE_DETAIL_MAX_CHARS,
+        "detail is at most 4000 characters.",
+      )
+      .optional(),
+  })
+  .strict()
+  .refine(
+    (frame) =>
+      (frame.phase === "refused" || frame.phase === "failed") === (frame.reason !== undefined),
+    { message: "A reason exactly for refused and failed." },
   );
 
 export const nodeToServerControlFrameSchema = z.discriminatedUnion("type", [
@@ -1243,6 +1314,7 @@ export const nodeToServerControlFrameSchema = z.discriminatedUnion("type", [
   execStatusFrameSchema,
   fileResultFrameSchema,
   fileRejectedFrameSchema,
+  agentUpdateProgressFrameSchema,
   ...sttClientControlSchemas,
 ]);
 export type NodeToServerControlFrame = z.infer<typeof nodeToServerControlFrameSchema>;
@@ -1422,6 +1494,7 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("exec.cancel"), commandId: base64Url16Schema }).strict(),
   /** Nested union on `op` (one `file.op` type). */
   fileOpFrameSchema,
+  agentUpdateFrameSchema,
   z.object({ type: z.literal("file.cancel"), opId: fileOpId }).strict(),
   z
     .object({

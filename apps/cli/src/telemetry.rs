@@ -1266,12 +1266,14 @@ fn collect_node_metrics(
             load5: load.map(|(_, five, _)| five),
             load15: load.map(|(_, _, fifteen)| fifteen),
         }),
-        memory: memory.map(|fields| NodeMemoryMetrics {
-            total_mib: fields.get("MemTotal").copied(),
-            available_mib: fields.get("MemAvailable").copied(),
-            swap_total_mib: fields.get("SwapTotal").copied(),
-            swap_free_mib: fields.get("SwapFree").copied(),
-        }),
+        memory: memory
+            .map(|fields| NodeMemoryMetrics {
+                total_mib: fields.get("MemTotal").copied(),
+                available_mib: fields.get("MemAvailable").copied(),
+                swap_total_mib: fields.get("SwapTotal").copied(),
+                swap_free_mib: fields.get("SwapFree").copied(),
+            })
+            .or_else(windows_memory),
         disks: Some(root_disk().into_iter().collect()),
         gpus: Some({
             let rows = gpu.rows();
@@ -1290,6 +1292,27 @@ fn collect_node_metrics(
                 None
             }
         },
+    }
+}
+
+/// Physical memory on Windows, which has no `/proc/meminfo`. Swap is left out:
+/// Windows reports a commit limit (memory plus page files), not a swap size.
+fn windows_memory() -> Option<NodeMemoryMetrics> {
+    #[cfg(windows)]
+    {
+        const MIB: u64 = 1024 * 1024;
+        wsmp_windows::memory_status()
+            .ok()
+            .map(|status| NodeMemoryMetrics {
+                total_mib: Some(status.total_bytes / MIB),
+                available_mib: Some(status.available_bytes / MIB),
+                swap_total_mib: None,
+                swap_free_mib: None,
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        None
     }
 }
 

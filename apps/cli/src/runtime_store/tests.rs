@@ -393,3 +393,134 @@ fn bind_warnings_follow_the_server_rule() {
     assert!(!has_all_interfaces("--host 10.0.0.0.5"));
     assert!(!has_all_interfaces("a::b"));
 }
+
+// ── A define this build cannot read whole (`repair`) ──
+
+fn partial(name: &str) -> String {
+    std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/relay-3.0/partial/server-to-node")
+            .join(name),
+    )
+    .expect("fixture")
+}
+
+impl Fx {
+    /// [`Fx::send`] for a frame that does not parse whole: what the daemon
+    /// does, repair, handle the rest, then add the refusals to the answer.
+    fn send_partial(&mut self, text: &str) -> DefineOutcome {
+        assert!(
+            parse_server_control(text).is_err(),
+            "the frame must not parse whole"
+        );
+        // What one unreadable part cost before: the whole session.
+        assert_eq!(
+            crate::protocol::control_frame_fault(text),
+            crate::protocol::FrameFault::Fatal
+        );
+        let repaired =
+            repair::repair_runtime_define(text, parse_server_control, |_| {}).expect("repaired");
+        let ctx = DefineContext {
+            trust: TrustValue::Full,
+            runtime_hosts: &self.hosts,
+            busy_ports: &self.busy,
+        };
+        let mut outcome = self
+            .defines
+            .handle(&repaired.text, &repaired.frame, &ctx, &self.live)
+            .expect("handled");
+        repaired.refusals.merge_into(&mut outcome.answer);
+        assert!(outcome.answer.validate().is_ok(), "{:?}", outcome.answer);
+        outcome
+    }
+}
+
+#[test]
+fn one_unreadable_definition_is_refused_by_id_and_the_other_applies() {
+    let mut fx = Fx::new();
+    let outcome = fx.send_partial(&partial("runtime.define-one-unreadable.json"));
+    assert!(outcome.changed);
+    let NodeFrame::RuntimeDefineResult { results, node, .. } = &outcome.answer else {
+        panic!("result");
+    };
+    let by_version: Vec<_> = results
+        .iter()
+        .map(|r| {
+            (
+                r.version_id.as_str(),
+                r.status,
+                r.reason,
+                r.detail.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        by_version,
+        [
+            (
+                "vr2z9y8x7w6v5u4t3s2r1q0p9",
+                DefineStatus::Applied,
+                None,
+                None
+            ),
+            (
+                "vr3newerspecfromalaterwsm",
+                DefineStatus::Rejected,
+                Some(DefineRejectReason::Invalid),
+                Some("spec.futureField"),
+            ),
+        ]
+    );
+    assert_eq!(node.as_ref().map(|n| n.status), Some(DefineStatus::Applied));
+    let held: Vec<_> = fx
+        .store()
+        .held
+        .iter()
+        .map(|h| h.version_id.clone())
+        .collect();
+    assert_eq!(held, ["vr2z9y8x7w6v5u4t3s2r1q0p9"]);
+}
+
+#[test]
+fn an_unreadable_node_part_is_refused_and_the_held_one_stays() {
+    let mut fx = Fx::new();
+    fx.send_partial(&partial("runtime.define-one-unreadable.json"));
+    let before = fx.store().node.clone();
+    assert!(before.is_some());
+    let outcome = fx.send_partial(&partial("runtime.define-node-unreadable.json"));
+    let NodeFrame::RuntimeDefineResult {
+        results,
+        node,
+        held_port_range,
+        ..
+    } = &outcome.answer
+    else {
+        panic!("result");
+    };
+    assert_eq!(
+        node.as_ref().map(|n| (n.status, n.reason)),
+        Some((DefineStatus::Rejected, Some(DefineRejectReason::Invalid)))
+    );
+    // The definition beside it is still handled.
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, DefineStatus::Unchanged);
+    // The node keeps its previous node part (ports 30000-30999, not 31000-31999).
+    assert_eq!(*held_port_range, Some(Some([30000, 30999])));
+    assert_eq!(fx.store().node, before);
+}
+
+#[test]
+fn a_frame_with_nothing_to_take_out_is_not_repaired() {
+    // A broken envelope (no `opId`) stays malformed: the caller's fault rules apply.
+    let text = r#"{"type":"runtime.define","chunkIndex":0,"final":true,"put":[]}"#;
+    assert!(repair::repair_runtime_define(text, parse_server_control, |_| {}).is_none());
+    // Not a define at all.
+    assert!(
+        repair::repair_runtime_define(
+            r#"{"type":"heartbeat.pong","id":"x"}"#,
+            parse_server_control,
+            |_| {}
+        )
+        .is_none()
+    );
+}

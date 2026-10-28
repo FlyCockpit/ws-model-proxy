@@ -33,7 +33,11 @@ import { flushNodeAudit, stopNodeAuditWriter } from "./relay/node-audit.js";
 import { sweepExpiredNodeCommands } from "./relay/node-commands.js";
 import { sweepExpiredFileOps } from "./relay/node-file-ops.js";
 import { flushNodeMetricsRollup, stopNodeMetricsRollup } from "./relay/node-metrics-rollup.js";
-import { installNodeFrameHandlers, startRuntimeLifecycle } from "./relay/node-wiring.js";
+import {
+  installNodeFrameHandlers,
+  startAgentUpdates,
+  startRuntimeLifecycle,
+} from "./relay/node-wiring.js";
 import { RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { flushRuntimeLoadRollup, stopRuntimeLoadRollup } from "./relay/runtime-load-rollup.js";
 import { relaySessionManager } from "./relay/session-manager.js";
@@ -154,6 +158,8 @@ relaySessionManager.setRelayAttemptStarter((input) => startRelayAttempt(input));
 installNodeFrameHandlers();
 // Runtime instances: steps, dispatch, results, restarts, health (runtimes/lifecycle.ts).
 const stopRuntimeLifecycle = startRuntimeLifecycle();
+// wsmp self-update: the server deadline and Update all runs (relay/agent-updates.ts).
+const stopAgentUpdates = startAgentUpdates();
 const stopCacheAffinityCleanup = startCacheAffinityCleanup();
 const stopAffinityResidencyRepair = startAffinityResidencyRepair();
 const stopAffinityAuthorityMaintenance = startAffinityAuthorityMaintenance();
@@ -234,6 +240,7 @@ installServerShutdown({
     stopNodeMetricsRollup,
     stopRelayMaintenance,
     stopRuntimeLifecycle,
+    stopAgentUpdates,
   ],
   stopUserDeletionSweep,
   userDeletionSweepClient,

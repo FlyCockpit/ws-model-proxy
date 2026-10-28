@@ -3147,6 +3147,11 @@ impl ExecRegistry {
     }
 
     /// The node definition's `commandMaxMs` (applies to later commands).
+    /// Node commands running now.
+    pub(crate) fn running(&self) -> usize {
+        self.sessions.len()
+    }
+
     pub(crate) fn set_command_max(&mut self, command_max: Duration) {
         self.command_max = command_max.min(DEFAULT_COMMAND_MAX);
     }

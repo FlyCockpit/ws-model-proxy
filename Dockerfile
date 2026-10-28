@@ -163,6 +163,11 @@ RUN rm -rf node_modules/.pnpm/typescript@* \
 FROM base AS runner
 
 ENV NODE_ENV=production
+# The same build identifier at runtime: a 40-hex BUILD_VERSION is the server's commit (the
+# commit of the wsmp release it serves), so the Nodes page can tell two builds of one version
+# apart. Empty: nodes are compared by version only.
+ARG BUILD_VERSION=""
+ENV BUILD_VERSION=$BUILD_VERSION
 ENV NODE_OPTIONS="--max-old-space-size=512"
 WORKDIR /app
 

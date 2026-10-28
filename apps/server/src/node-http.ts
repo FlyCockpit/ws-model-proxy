@@ -6,6 +6,12 @@
  * - `GET /install.sh`: installs the `wsmp` CLI: a checksummed release binary (by default once
  *   `CLI_RELEASE_BINARIES_BY_DEFAULT` is flipped at release, or with `WMP_CLI_RELEASE_BASE_URL`),
  *   else a cargo source build (`installScript`).
+ * - `GET /install.ps1`: the same for Windows (`windowsInstallScript`). Both installers write the
+ *   install receipt `<state_dir>/install.json` the node's self-update reads.
+ * - `GET /cli/manifest.json`: the release `wsmp` self-update installs (`agent.update`): version,
+ *   and each target's archive URL and SHA-256 from the release's `sha256.sum`. Fails closed
+ *   (503) when the checksums cannot be read; `sourceBuild: true` with no artifacts when this
+ *   server builds the CLI from source.
  * - `POST /api/node/enroll`: exchanges an enrollment code for the node credential
  *   (`@ws-model-proxy/api/nodes/enroll-exchange`). Unauthenticated by design (the code is the
  *   credential): no cookies, no CSRF, rate-limited per client IP before any lookup and per code
@@ -97,6 +103,33 @@ export function cliInstallSource(
     : { kind: "source" };
 }
 
+/**
+ * The commit of the wsmp this server installs, when it can vouch for it: a pinned source build's
+ * rev, or this image's own commit (`BUILD_VERSION`, the git SHA the release workflow builds the
+ * image and the CLI from) while it serves the GitHub Release of its own version. Binaries from
+ * `WMP_CLI_RELEASE_BASE_URL`, or a preview-branch build, have no commit it knows.
+ */
+export function cliInstallCommit(
+  source: CliInstallSource,
+  buildVersion: string | undefined = env.BUILD_VERSION,
+): string | null {
+  if (source.kind === "source") return source.rev ?? null;
+  if (source.fallbackBranch || source.baseUrl !== defaultCliReleaseBaseUrl()) return null;
+  return buildVersion && /^[0-9a-f]{40}$/.test(buildVersion) ? buildVersion : null;
+}
+
+/** The cargo arguments `/install.sh` builds from source with (unquoted, for display). */
+function cargoSourceArgs(source: CliInstallSource): string {
+  if (source.kind === "release")
+    return source.fallbackBranch ? `--branch ${source.fallbackBranch}` : `--tag v${SERVER_VERSION}`;
+  return source.rev ? `--rev ${source.rev}` : `--branch ${CLI_PREVIEW_BRANCH}`;
+}
+
+/** The source build a node runs by hand (self-update D8: never from the browser). */
+export function cargoInstallCommand(source: CliInstallSource): string {
+  return `cargo install --git ${CLI_REPOSITORY} ${cargoSourceArgs(source)} --locked --force wsmp`;
+}
+
 // Values are embedded in single quotes; refuse anything that could leave them.
 function shellQuoted(value: string): string {
   if (!/^[A-Za-z0-9._~%+@:/=-]*$/.test(value)) {
@@ -121,6 +154,8 @@ function canonicalOrigin(): string {
  */
 export function installScript(origin: string, source: CliInstallSource): string {
   const releaseUrl = source.kind === "release" ? source.baseUrl.replace(/\/+$/, "") : "";
+  // The commit a source build is pinned to (the receipt names it); nothing otherwise.
+  const sourceRev = source.kind === "source" ? (source.rev ?? "") : "";
   const sourceArgs =
     source.kind === "release"
       ? source.fallbackBranch
@@ -143,6 +178,7 @@ set -eu
 WSMP_VERSION=${shellQuoted(SERVER_VERSION)}
 WSMP_RELEASE_URL=${shellQuoted(releaseUrl)}
 WSMP_REPOSITORY=${shellQuoted(CLI_REPOSITORY)}
+WSMP_SOURCE_REV=${shellQuoted(sourceRev)}
 
 say() { printf 'wsmp: %s\\n' "$*"; }
 die() { printf 'wsmp: %s\\n' "$*" >&2; exit 1; }
@@ -190,6 +226,53 @@ detect_target() {
       printf '%s-apple-darwin' "$arch"
       ;;
   esac
+}
+
+# The node's state directory, exactly as wsmp resolves it (apps/cli/src/paths.rs state_dir):
+# WSMP_STATE_DIR, else $XDG_STATE_HOME/ws-model-proxy, else ~/.local/state/ws-model-proxy.
+# Nothing (no receipt) when a variable is set but empty or there is no HOME.
+state_dir() {
+  if [ -n "\${WSMP_STATE_DIR+x}" ]; then
+    [ -n "$WSMP_STATE_DIR" ] || return 1
+    printf '%s' "$WSMP_STATE_DIR"
+  elif [ -n "\${XDG_STATE_HOME+x}" ]; then
+    [ -n "$XDG_STATE_HOME" ] || return 1
+    printf '%s/ws-model-proxy' "$XDG_STATE_HOME"
+  else
+    [ -n "\${HOME:-}" ] || return 1
+    printf '%s/.local/state/ws-model-proxy' "$HOME"
+  fi
+}
+
+# A JSON string, or null for nothing (or text with control characters).
+json_str() {
+  case "$1" in
+    "" | *[[:cntrl:]]*) printf 'null' ;;
+    *) printf '"%s"' "$(printf '%s' "$1" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')" ;;
+  esac
+}
+
+# The install receipt <state_dir>/install.json: how this wsmp was installed (self-update reads
+# it to choose how to update). Best effort: a failure here never fails the install.
+write_receipt() {
+  method=$1
+  target=$2
+  commit=$3
+  state=$(state_dir) || return 0
+  version=$("$installed" --version 2>/dev/null | awk 'NR == 1 { print $2 }') || version=""
+  case "$version" in *[!0-9A-Za-z.+-]*) version="" ;; esac
+  (umask 077 && mkdir -p "$state") || return 1
+  receipt="$state/.install.json.$$"
+  printf '{"method":"%s","version":%s,"commit":%s,"target":%s,"binary":%s,"installedAt":"%s"}\\n' \\
+    "$method" "$(json_str "$version")" "$(json_str "$commit")" "$(json_str "$target")" \\
+    "$(json_str "$installed")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$receipt" &&
+    mv -f "$receipt" "$state/install.json"
+}
+
+# The target triple of a source build (rustc's host), or nothing.
+rust_host() {
+  command -v rustc >/dev/null 2>&1 || return 0
+  rustc -vV 2>/dev/null | awk '/^host: / { print $2 }'
 }
 
 # curl only: wget cannot refuse a redirect away from https for a single download.
@@ -248,6 +331,8 @@ install_release() {
   # Rename over the old binary: a running wsmp keeps its old file.
   chmod 755 "$binary" && mv -f "$binary" "$dir/wsmp" || die "could not install into $dir."
   installed="$dir/wsmp"
+  receipt_method=script
+  receipt_target=$target
 }
 
 # A non-interactive SSH shell skips the profile that puts rustup's cargo on PATH: source
@@ -272,6 +357,8 @@ install_source() {
   say "building wsmp from $WSMP_REPOSITORY ($*) with cargo; this takes a few minutes..."
   cargo install --git "$WSMP_REPOSITORY" "$@" --locked --force wsmp
   installed="\${CARGO_INSTALL_ROOT:-$(cargo_home)}/bin/wsmp"
+  receipt_method=source
+  receipt_target=$(rust_host)
 }
 
 finish() {
@@ -289,6 +376,8 @@ finish() {
 
 main() {
   installed=""
+  receipt_method=""
+  receipt_target=""
   if [ -z "$WSMP_RELEASE_URL" ]; then
     install_source ${sourceArgs}
   else
@@ -300,6 +389,8 @@ main() {
       install_source ${sourceArgs}
     fi
   fi
+  write_receipt "$receipt_method" "$receipt_target" "$WSMP_SOURCE_REV" ||
+    say "warning: could not write the install receipt (wsmp still works)."
   finish
 }
 
@@ -332,6 +423,7 @@ export function windowsInstallScript(origin: string, source: CliInstallSource): 
         ? `'--rev', ${shellQuoted(source.rev)}`
         : `'--branch', ${shellQuoted(CLI_PREVIEW_BRANCH)}`;
   const sourceHint = sourceArgs.replaceAll("'", "").replace(",", "");
+  const sourceRev = source.kind === "source" ? (source.rev ?? "") : "";
   const summary =
     source.kind === "source"
       ? source.rev
@@ -349,6 +441,7 @@ $WsmpReleaseUrl = ${shellQuoted(releaseUrl)}
 $WsmpRepository = ${shellQuoted(CLI_REPOSITORY)}
 $WsmpTarget = ${shellQuoted(CLI_WINDOWS_TARGET)}
 $WsmpSourceArgs = @(${sourceArgs})
+$WsmpSourceRev = ${shellQuoted(sourceRev)}
 
 function Say([string]$Text) { Write-Host "wsmp: $Text" }
 
@@ -441,15 +534,75 @@ function Install-Source {
   Join-Path $root 'bin\\wsmp.exe'
 }
 
+# The node's state directory, exactly as wsmp resolves it (apps/cli/src/paths.rs state_dir):
+# WSMP_STATE_DIR, else $XDG_STATE_HOME\\ws-model-proxy, else %LOCALAPPDATA%\\ws-model-proxy.
+function Get-WsmpStateDir {
+  if ($null -ne $env:WSMP_STATE_DIR) {
+    if ($env:WSMP_STATE_DIR -eq '') { return $null }
+    return $env:WSMP_STATE_DIR
+  }
+  if ($null -ne $env:XDG_STATE_HOME) {
+    if ($env:XDG_STATE_HOME -eq '') { return $null }
+    return (Join-Path $env:XDG_STATE_HOME 'ws-model-proxy')
+  }
+  $local = [Environment]::GetFolderPath('LocalApplicationData')
+  if (-not $local) { return $null }
+  Join-Path $local 'ws-model-proxy'
+}
+
+# The install receipt <state_dir>\\install.json: how this wsmp was installed (self-update reads
+# it to choose how to update). Best effort: a failure here never fails the install.
+function Write-WsmpReceipt([string]$Method, [string]$Target, [string]$Binary) {
+  try {
+    $state = Get-WsmpStateDir
+    if (-not $state) { return }
+    $version = $null
+    try {
+      $line = @(& $Binary --version 2>$null) | Select-Object -First 1
+      if ($line -match '^\\S+\\s+([0-9A-Za-z.+-]+)\\s*$') { $version = $Matches[1] }
+    } catch { $version = $null }
+    $receipt = [ordered]@{
+      method = $Method
+      version = $version
+      commit = $(if ($WsmpSourceRev) { $WsmpSourceRev } else { $null })
+      target = $(if ($Target) { $Target } else { $null })
+      binary = $Binary
+      installedAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    New-Item -ItemType Directory -Force -Path $state | Out-Null
+    $path = Join-Path $state 'install.json'
+    $tmp = "$path.$PID.tmp"
+    [IO.File]::WriteAllText($tmp, ($receipt | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding $false))
+    Move-Item -LiteralPath $tmp -Destination $path -Force
+  } catch {
+    Say 'warning: could not write the install receipt (wsmp still works).'
+  }
+}
+
+function Get-RustHost {
+  $rustc = Get-Command rustc -ErrorAction SilentlyContinue
+  if (-not $rustc) { return $null }
+  try {
+    foreach ($line in @(& $rustc -vV 2>$null)) { if ($line -match '^host: (\\S+)$') { return $Matches[1] } }
+  } catch { }
+  $null
+}
+
 $installed = $null
+$receiptMethod = 'source'
+$receiptTarget = $null
 if (-not $WsmpReleaseUrl) {
   $installed = Install-Source
 } elseif ($env:PROCESSOR_ARCHITECTURE -in @('AMD64', 'ARM64')) {
   $installed = Install-Release
+  $receiptMethod = 'script-ps1'
+  $receiptTarget = $WsmpTarget
 } else {
   Say "no wsmp release binary fits this machine ($env:PROCESSOR_ARCHITECTURE); building from source instead."
   $installed = Install-Source
 }
+if ($receiptMethod -eq 'source') { $receiptTarget = Get-RustHost }
+Write-WsmpReceipt $receiptMethod $receiptTarget $installed
 $dir = Split-Path -Parent $installed
 Say "installed $installed."
 if (-not (@($env:Path -split ';') -contains $dir)) {
@@ -461,6 +614,205 @@ if ($found -and $found.Source -ne $installed) {
 }
 }
 `;
+}
+
+// ── The release manifest (`GET /cli/manifest.json`, self-update) ──
+
+export const CLI_MANIFEST_PATH = "/cli/manifest.json";
+const SHA256_SUM_MAX_BYTES = 64 * 1024;
+const MANIFEST_FETCH_TIMEOUT_MS = 10_000;
+const MANIFEST_MAX_REDIRECTS = 5;
+/** How long a read manifest is used, and how soon a failed read is tried again. */
+export const CLI_MANIFEST_TTL_MS = 5 * 60_000;
+export const CLI_MANIFEST_FAILURE_TTL_MS = 30_000;
+
+export type CliReleaseManifest = {
+  version: string;
+  /** The commit the release was built from, when the server knows it (a pinned source build). */
+  commit: string | null;
+  /** Where the archives and `sha256.sum` live; null for a source build. */
+  releaseUrl: string | null;
+  /** This server builds the CLI from source: nothing to download (self-update D8). */
+  sourceBuild: boolean;
+  /** By target triple: the archive and its SHA-256 from `sha256.sum`. */
+  artifacts: Record<string, { url: string; sha256: string }>;
+};
+
+/** The release could not be read: no update is offered (fail closed). */
+export class CliManifestUnavailable extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CliManifestUnavailable";
+  }
+}
+
+const ARCHIVE_NAME = /^wsmp-([A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,3})\.(?:tar\.xz|zip)$/;
+
+/**
+ * The archives `sha256.sum` lists (`<hex>  <name>` or `<hex> *<name>`), by target. Fails closed:
+ * a malformed line naming an archive, or one archive listed with two checksums, refuses the file.
+ */
+export function parseSha256Sum(
+  text: string,
+  releaseUrl: string,
+): Record<string, { url: string; sha256: string }> {
+  const artifacts: Record<string, { url: string; sha256: string }> = {};
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/\r$/, "").trim();
+    if (line === "") continue;
+    const match = /^([0-9A-Fa-f]{64}) [ *](.+)$/.exec(line);
+    const name = match?.[2] ?? line.split(/\s+/).pop() ?? "";
+    const archive = ARCHIVE_NAME.exec(name.replace(/^\*/, ""));
+    if (!archive) continue;
+    const target = archive[1] ?? "";
+    if (!match) throw new CliManifestUnavailable(`sha256.sum has a malformed line for ${name}.`);
+    const sha256 = (match[1] ?? "").toLowerCase();
+    const existing = artifacts[target];
+    if (existing && (existing.sha256 !== sha256 || !existing.url.endsWith(`/${name}`)))
+      throw new CliManifestUnavailable(`sha256.sum lists ${target} twice.`);
+    artifacts[target] = { url: `${releaseUrl}/${name}`, sha256 };
+  }
+  return artifacts;
+}
+
+type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
+
+/** GET over https only (a redirect away from https is refused), at most 64 KiB of text. */
+async function fetchSmallText(fetchImpl: FetchLike, start: string): Promise<string> {
+  let url = start;
+  for (let hop = 0; hop <= MANIFEST_MAX_REDIRECTS; hop += 1) {
+    const response = await fetchImpl(url, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS),
+    });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) throw new CliManifestUnavailable("A redirect without a location.");
+      const next = new URL(location, url);
+      if (next.protocol !== "https:")
+        throw new CliManifestUnavailable("A redirect away from https was refused.");
+      url = next.href;
+      continue;
+    }
+    if (!response.ok) throw new CliManifestUnavailable(`sha256.sum answered ${response.status}.`);
+    const body = new Uint8Array(await response.arrayBuffer());
+    if (body.byteLength > SHA256_SUM_MAX_BYTES)
+      throw new CliManifestUnavailable("sha256.sum is too large.");
+    return new TextDecoder().decode(body);
+  }
+  throw new CliManifestUnavailable("Too many redirects.");
+}
+
+/** Reads the manifest of what `/install.sh` installs (no cache). */
+export async function readCliReleaseManifest(
+  source: CliInstallSource,
+  fetchImpl: FetchLike = fetch,
+): Promise<CliReleaseManifest> {
+  if (source.kind === "source")
+    return {
+      version: SERVER_VERSION,
+      commit: source.rev ?? null,
+      releaseUrl: null,
+      sourceBuild: true,
+      artifacts: {},
+    };
+  const releaseUrl = source.baseUrl.replace(/\/+$/, "");
+  let text: string;
+  try {
+    text = await fetchSmallText(fetchImpl, `${releaseUrl}/sha256.sum`);
+  } catch (error) {
+    if (error instanceof CliManifestUnavailable) throw error;
+    throw new CliManifestUnavailable("sha256.sum could not be downloaded.");
+  }
+  const artifacts = parseSha256Sum(text, releaseUrl);
+  if (Object.keys(artifacts).length === 0)
+    throw new CliManifestUnavailable("sha256.sum lists no wsmp archive.");
+  return {
+    version: SERVER_VERSION,
+    commit: cliInstallCommit(source),
+    releaseUrl,
+    sourceBuild: false,
+    artifacts,
+  };
+}
+
+/**
+ * The manifest, cached briefly (a read for 5 minutes, a failure for 30 seconds), one read at a
+ * time. `get` throws {@link CliManifestUnavailable} when it cannot be read.
+ */
+export function createCliManifestCache(options: {
+  source: () => CliInstallSource;
+  fetch?: FetchLike;
+  now?: () => number;
+  ttlMs?: number;
+  failureTtlMs?: number;
+}) {
+  const now = options.now ?? Date.now;
+  let cached: {
+    at: number;
+    ok: boolean;
+    value: CliReleaseManifest | CliManifestUnavailable;
+  } | null = null;
+  let reading: Promise<CliReleaseManifest> | null = null;
+  const fresh = () =>
+    cached !== null &&
+    now() - cached.at <
+      (cached.ok
+        ? (options.ttlMs ?? CLI_MANIFEST_TTL_MS)
+        : (options.failureTtlMs ?? CLI_MANIFEST_FAILURE_TTL_MS));
+  return {
+    async get(): Promise<CliReleaseManifest> {
+      if (cached && fresh()) {
+        if (cached.ok) return cached.value as CliReleaseManifest;
+        throw cached.value;
+      }
+      reading ??= readCliReleaseManifest(options.source(), options.fetch)
+        .then((manifest) => {
+          cached = { at: now(), ok: true, value: manifest };
+          return manifest;
+        })
+        .catch((error: unknown) => {
+          const failure =
+            error instanceof CliManifestUnavailable
+              ? error
+              : new CliManifestUnavailable("The release manifest could not be read.");
+          cached = { at: now(), ok: false, value: failure };
+          throw failure;
+        })
+        .finally(() => {
+          reading = null;
+        });
+      return reading;
+    },
+  };
+}
+
+/** This server's: what its `/install.sh` installs. */
+export const cliReleaseManifests = createCliManifestCache({
+  source: () => cliInstallSource(env.WMP_CLI_SOURCE_REV, env.WMP_CLI_RELEASE_BASE_URL),
+});
+
+/** `GET /cli/manifest.json`. 503 when the release's checksums cannot be read (fail closed). */
+export function cliManifestHandler(
+  cache: { get(): Promise<CliReleaseManifest> } = cliReleaseManifests,
+) {
+  return async (c: Context) => {
+    try {
+      return c.json(await cache.get(), 200, { "cache-control": "no-store" });
+    } catch (error) {
+      return c.json(
+        {
+          error: "manifest_unavailable",
+          message:
+            error instanceof CliManifestUnavailable
+              ? error.message
+              : "The release manifest could not be read.",
+        },
+        503,
+        { "cache-control": "no-store" },
+      );
+    }
+  };
 }
 
 type Refusal = { ok: false; error: "rate_limited"; retryAfterSec: number };
@@ -480,6 +832,8 @@ export type NodeEnrollDeps = {
   findOwner?: typeof findEnrollmentCodeOwner;
   /** Close the relay sessions of credentials the exchange revoked (a re-login or Replace). */
   closeRevokedSessions?: (credentialIds: readonly string[]) => Promise<unknown>;
+  /** The release manifest cache (`GET /cli/manifest.json`). */
+  manifest?: { get(): Promise<CliReleaseManifest> };
 };
 
 /** `POST /api/node/enroll`. Status 200 when enrolled, 429 when rate-limited, 400 otherwise. */
@@ -567,6 +921,7 @@ export function registerNodeHttpRoutes<E extends Env>(
       },
     ),
   );
+  app.get(CLI_MANIFEST_PATH, cliManifestHandler(deps.manifest));
   app.use(
     NODE_ENROLL_PATH,
     bodyLimit({

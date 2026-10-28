@@ -706,6 +706,30 @@ describe("RelaySessionManager (relay 3.0)", () => {
     expect(manager.sendToNode("node-2", { type: "runtime.detect", id: "d1" })).toBe(false);
   });
 
+  it("routes self-update progress to its handler, and drops one it cannot read", async () => {
+    const socket = await connect();
+    const progress = vi.fn();
+    manager.setNodeFrameHandlers({ "agent.update.progress": progress });
+    const frame = {
+      type: "agent.update.progress",
+      updateId: "AAAAAAAAAAAAAAAAAAAAAA",
+      phase: "downloading",
+    };
+    await manager.handleTextFrame(socket, JSON.stringify(frame));
+    expect(progress).toHaveBeenCalledWith(
+      expect.objectContaining({ nodeId: "node-1", userId: "user-1" }),
+      frame,
+    );
+    // A malformed report (an unknown reason from a newer CLI) costs the node nothing.
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ ...frame, phase: "failed", reason: "brand_new_reason" }),
+    );
+    expect(progress).toHaveBeenCalledTimes(1);
+    expect(manager.getOnlineNodeIds()).toEqual(["node-1"]);
+    expect(socket.last("protocol.error")).toBeUndefined();
+  });
+
   it("pins lane sends to the live session and its Full control", async () => {
     await connect();
     const session = manager.nodeSession("node-1");
@@ -719,6 +743,8 @@ describe("RelaySessionManager (relay 3.0)", () => {
       jobReservations: false,
       // Nor runtime jobs at all (it cannot prove what it runs).
       rankIdle: false,
+      // Nor agent.update (it predates self-update).
+      selfUpdate: null,
     });
     const frame = { type: "runtime.detect" as const, id: "d2" };
     expect(manager.sendToNode("node-1", frame, { connectionGeneration: generation + 1 })).toBe(

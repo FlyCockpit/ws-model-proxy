@@ -116,18 +116,7 @@ pub(crate) fn rename(
     }
     // Names that differ in case only are one name on NTFS: the move renames it.
     let case_only = same_path(&from_path, &to_path);
-    let (first, second) = if from_path <= to_path {
-        (from_path.clone(), to_path.clone())
-    } else {
-        (to_path.clone(), from_path.clone())
-    };
-    let _lock_a = ops.lock_path(first, cancel)?;
-    // A case-only rename names one file: its one lock is already held.
-    let _lock_b = if case_only {
-        None
-    } else {
-        Some(ops.lock_path(second, cancel)?)
-    };
+    let _locks = ops.lock_pair(from_path.clone(), to_path.clone(), cancel)?;
 
     let src = from
         .lstat()?

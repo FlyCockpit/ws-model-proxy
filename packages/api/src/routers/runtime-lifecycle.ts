@@ -341,7 +341,6 @@ export const runtimeStart = contractProcedure(c.start).handler(async ({ input, c
 
 export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, context }) => {
   const userId = context.session.user.id;
-  const actor = callerActor(context.auth, userId);
   const where =
     "instanceId" in input
       ? { id: input.instanceId, userId, desiredState: "RUNNING" as const }
@@ -352,10 +351,40 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
           // On that node: a rank there, or a reservation of its current plan there.
           ...(input.nodeId ? placedOnNodesWhere([input.nodeId]) : {}),
         };
+  const operationId = await stopInstancesWhere(context, userId, where);
+  if (!operationId) throw notFound("Nothing of this runtime is running there.");
+  return operationView(operationId);
+});
+
+/**
+ * Every running instance placed on `nodeId` (a rank there, or a reservation of its plan there),
+ * stopped as `runtimes.stop` stops them: one recorded STOP operation, dispatched. A forced wsmp
+ * update uses it on a node whose instances do not survive the agent's restart. Null when
+ * nothing runs there.
+ */
+export async function stopInstancesOnNode(
+  context: SignedInContext,
+  userId: string,
+  nodeId: string,
+): Promise<string | null> {
+  return stopInstancesWhere(context, userId, {
+    userId,
+    desiredState: "RUNNING" as const,
+    ...placedOnNodesWhere([nodeId]),
+  });
+}
+
+/** The STOP operation of `runtimes.stop`, for the running instances `where` selects. */
+async function stopInstancesWhere(
+  context: SignedInContext,
+  userId: string,
+  where: Prisma.RuntimeInstanceWhereInput,
+): Promise<string | null> {
+  const actor = callerActor(context.auth, userId);
   // Read, check and write under the owner fence, so a trust lowering (an owner write) cannot
   // land in between and let an agent's stop through; then the capacity fences of the stops.
   let ids: string[] = [];
-  const operationId = await graphWrite(
+  const operationId: string | null = await graphWrite(
     [userId],
     async (tx) => {
       const operation = await tx.runtimeOperation.create({
@@ -382,7 +411,7 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
         select: { id: true, ...OCCUPANCY_SELECT },
         orderBy: { id: "asc" },
       });
-      if (instances.length === 0) throw notFound("Nothing of this runtime is running there.");
+      if (instances.length === 0) throw new NothingRunning();
       // Every node the stop reaches: the ranks', the reservations' that still hold, and those a
       // launch that may still run names.
       if (agentRulesApply(context.auth))
@@ -394,7 +423,13 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
       ids = instances.map((instance) => instance.id);
       return instanceCapacityFences(ids);
     },
-  );
+  ).catch((error: unknown) => {
+    if (error instanceof NothingRunning) return null;
+    throw error;
+  });
+  if (!operationId) return null;
   await context.services?.dispatchRuntimeOperation?.({ userId, operationId });
-  return operationView(operationId);
-});
+  return operationId;
+}
+
+class NothingRunning extends Error {}

@@ -4,6 +4,7 @@ import { ArrowLeft } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
+import { AgentUpdateCard } from "@/components/nodes/agent-update-card";
 import { HoldCard, TemporaryCard, TrustCard } from "@/components/nodes/node-control-cards";
 import {
   HardwareCard,
@@ -67,6 +68,7 @@ function NodeDetailPage() {
           <NodeDetailHeader node={node.data} lang={lang} />
           <div className="grid min-w-0 gap-4 lg:grid-cols-2">
             <TrustCard node={node.data} />
+            <AgentUpdateCard nodeId={node.data.id} />
             <HoldCard node={node.data} lang={lang} />
             <RunsHereCard node={node.data} lang={lang} />
             {/* Forms start from the server's values and restart when those change (another tab,

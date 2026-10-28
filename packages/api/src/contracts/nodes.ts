@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { AGENT_UPDATE_PHASES, nodeBuildSchema } from "../lib/agent-update-wire";
 import {
   declaredHardwareSchema,
   fabricNameSchema,
@@ -11,6 +12,7 @@ import {
   nodeFeaturesSchema,
   nodeMetricCommandsSchema,
   nodeSecretNameSchema,
+  nodeSelfUpdateSchema,
   portRangeSchema,
   RUNTIME_ARGV_MAX,
   RUNTIME_COMMAND_MAX_BYTES,
@@ -28,6 +30,7 @@ import {
   INSTANCE_PHASE,
   idSchema,
   isoDateSchema,
+  NODE_AGENT_UPDATE_POLICY_VALUES,
   NODE_AUDIT_KIND,
   NODE_AUDIT_OUTCOME,
   NODE_COMMAND_STATE,
@@ -47,6 +50,7 @@ import {
   sha256Schema,
 } from "./common";
 import { mutation, query } from "./procedure";
+import { refusalReasonSchema } from "./refusals";
 
 // ── Views ──
 
@@ -471,6 +475,74 @@ export const nodeFileMutationOutputSchema = z
 
 // ── Procedures ──
 
+// ── wsmp self-update (nodes.agentUpdate.*) ──
+
+export const NODE_AGENT_UPDATE_POLICY = NODE_AGENT_UPDATE_POLICY_VALUES;
+
+/** One update of a node's wsmp. `detail` is node text: show it as plain text only. */
+export const agentUpdateViewSchema = z
+  .object({
+    id: z.string(),
+    phase: z.enum(AGENT_UPDATE_PHASES),
+    /**
+     * `refused` / `failed`: the node's reason code. `timed_out`: the phase it was stuck in.
+     */
+    reason: z.string().nullable(),
+    detail: z.string().nullable(),
+    fromVersion: z.string().nullable(),
+    toVersion: z.string(),
+    force: z.boolean(),
+    createdAt: isoDateSchema,
+    updatedAt: isoDateSchema,
+    endedAt: isoDateSchema.nullable(),
+  })
+  .strict();
+
+export const nodeAgentUpdateViewSchema = z
+  .object({
+    nodeId: idSchema,
+    slug: z.string(),
+    connection: z.enum(NODE_CONNECTION),
+    /** Effective trust (a pending lowering is Relay only). */
+    trust: z.enum(NODE_TRUST),
+    version: z.string().nullable(),
+    build: nodeBuildSchema.nullable(),
+    wsl: z.boolean(),
+    outdated: z.boolean(),
+    policy: z.enum(NODE_AGENT_UPDATE_POLICY),
+    selfUpdate: nodeSelfUpdateSchema.nullable(),
+    canUpdate: z.boolean(),
+    /** Why not (a refusal reason code), when `canUpdate` is false. */
+    blockedReason: refusalReasonSchema.nullable(),
+    /** What to run on the node when it cannot update itself (or to recover a Homebrew failure). */
+    manualCommand: z.string().nullable(),
+    /** What Force would stop. */
+    runningInstances: z.array(z.object({ id: idSchema, name: z.string() }).strict()),
+    latest: agentUpdateViewSchema.nullable(),
+  })
+  .strict();
+
+/**
+ * An "Update all" run. `stoppedReason`: `stopped` (the owner stopped it), or the phase that
+ * stopped it: `refused`, `failed`, `rolled_back`, `timed_out` (an unavailable canary is
+ * `refused`), or `release_changed` (the server offers another release than the canary
+ * validated, after a deploy during the run). `untouchedNodeIds`: passed over, and once stopped
+ * every node not reached.
+ */
+export const agentUpdateBatchViewSchema = z
+  .object({
+    id: idSchema,
+    state: z.enum(["running", "done", "stopped"]),
+    canaryNodeId: idSchema,
+    nodeIds: z.array(idSchema),
+    currentNodeId: idSchema.nullable(),
+    stoppedReason: z
+      .enum(["stopped", "refused", "failed", "rolled_back", "timed_out", "release_changed"])
+      .nullable(),
+    untouchedNodeIds: z.array(idSchema),
+  })
+  .strict();
+
 export const nodesContract = {
   list: query(
     "agent",
@@ -668,6 +740,58 @@ export const nodesContract = {
       .strict(),
     "Lower to Relay only (sticks on the node; only `wsmp trust full` on the node raises it). Running node commands are killed with their process trees and marked INTERRUPTED.",
   ),
+  /**
+   * wsmp self-update (plan D4, D7, D8): the owner's own browser session only (human access:
+   * never MCP, OAuth or agent tokens; never an admin, never an impersonation), Full-control
+   * nodes only, the node's policy ALLOWED. Not for agents.
+   */
+  agentUpdate: {
+    overview: query(
+      "human",
+      noInputSchema,
+      z
+        .object({
+          server: z
+            .object({
+              version: z.string(),
+              commit: z.string().nullable(),
+              sourceBuild: z.boolean(),
+            })
+            .strict(),
+          nodes: z.array(nodeAgentUpdateViewSchema),
+          /** The node `startAll` picks with no `canaryNodeId` (fewest running instances, then slug). */
+          defaultCanaryNodeId: idSchema.nullable(),
+          /** The running "Update all", else the latest one of the last day. */
+          batch: agentUpdateBatchViewSchema.nullable(),
+        })
+        .strict(),
+      "Your nodes' wsmp builds against this server's, whether each can update from here (or why not, with the command to run on the node), its latest update and the Update all run.",
+    ),
+    start: mutation(
+      "human",
+      z.object({ nodeId: idSchema, force: z.boolean().optional() }).strict(),
+      agentUpdateViewSchema,
+      "Update one node's wsmp to this server's version (it rolls back by itself if the new build does not come up). Force stops its running instances first; forcing an update that waits for idle resends it forced.",
+    ),
+    startAll: mutation(
+      "human",
+      z.object({ canaryNodeId: idSchema.optional() }).strict(),
+      agentUpdateBatchViewSchema,
+      "Update every node that can update: the canary first, then the rest one at a time, stopping at the first that does not confirm.",
+    ),
+    stopAll: mutation(
+      "human",
+      z.object({ batchId: idSchema }).strict(),
+      agentUpdateBatchViewSchema,
+      "Stop an Update all run: no further node starts (the update in flight finishes).",
+    ),
+    setPolicy: mutation(
+      "human",
+      z.object({ nodeId: idSchema, policy: z.enum(NODE_AGENT_UPDATE_POLICY) }).strict(),
+      z.object({ policy: z.enum(NODE_AGENT_UPDATE_POLICY) }).strict(),
+      "Allow or turn off browser updates of this node's wsmp.",
+    ),
+  },
   enrollmentCodes: {
     list: query(
       "session",

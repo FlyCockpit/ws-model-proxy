@@ -17,6 +17,39 @@ enum NodeConnection {
   ONLINE
 }
 
+/// Whether the node's owner may update its `wsmp` from the browser (`nodes.agentUpdate.*`).
+/// Room for AUTOMATIC later (self-update D6).
+enum NodeAgentUpdatePolicy {
+  ALLOWED
+  OFF
+}
+
+/// Where one `wsmp` self-update is (`agent.update.progress` phases, plus the server-only
+/// REQUESTED and TIMED_OUT). Terminal: CONFIRMED, ROLLED_BACK, FAILED, REFUSED, TIMED_OUT.
+enum NodeAgentUpdatePhase {
+  /// Sent; nothing back from the node yet.
+  REQUESTED
+  REFUSED
+  WAITING_IDLE
+  DOWNLOADING
+  VERIFYING
+  ARMED
+  SWAPPED
+  RESTARTING
+  CONFIRMED
+  ROLLED_BACK
+  FAILED
+  /// The server's deadline passed without CONFIRMED (also how a Homebrew failure surfaces).
+  TIMED_OUT
+}
+
+/// An "Update all" run (self-update D7): canary first, then one node at a time.
+enum NodeAgentUpdateBatchState {
+  RUNNING
+  DONE
+  STOPPED
+}
+
 /// Who did something. Shared by every audit and provenance column.
 enum Actor {
   USER
@@ -25,17 +58,17 @@ enum Actor {
 }
 
 model Node {
-  id                      String         @id @default(cuid(2))
-  createdAt               DateTime       @default(now())
-  updatedAt               DateTime       @default(now()) @updatedAt
+  id                      String                @id @default(cuid(2))
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @default(now()) @updatedAt
   userId                  String
   /// Chosen at enrollment (default: hostname). Unique per user; never silently re-bound.
   slug                    String
   /// Display name set in the browser. Hello never writes it.
   name                    String?
-  connection              NodeConnection @default(OFFLINE)
+  connection              NodeConnection        @default(OFFLINE)
   /// Monotonic fence: +1 per accepted hello; a stale disconnect cannot overwrite a successor.
-  connectionGeneration    Int            @default(0)
+  connectionGeneration    Int                   @default(0)
   lastConnectedAt         DateTime?
   lastDisconnectedAt      DateTime?
   lastHeartbeatAt         DateTime?
@@ -57,7 +90,11 @@ model Node {
   trustLowerRequestedBy   String?
   /// Node-reported: every runtime version it holds (several per runtime are normal),
   /// [{ runtimeId, versionId, launchHash }]. Frozen while trust is RELAY (no separate flag).
-  heldDefinitions         Json           @default("[]")
+  heldDefinitions         Json                  @default("[]")
+  /// Node-reported: the definitions it refused in its last complete define answer (it could
+  /// not parse or validate them), [{ runtimeId, versionId, reason, detail }]. Replaced by every
+  /// final answer, so the runtime's page says "refused" with the reason instead of "pending".
+  refusedDefinitions      Json                  @default("[]")
   /// RELAY only: the fabric memberships frozen with the node's definition when trust was
   /// lowered: [{ fabricId, name, selfIp, memberIps }]. A Relay-only multi-node start needs its
   /// head's address in the frozen membership of the fabric the instance uses.
@@ -71,7 +108,7 @@ model Node {
   /// Node metric commands: part of the node's definition, edited by people/agents at FULL,
   /// pushed with runtime.define, frozen at RELAY, no hash approvals:
   /// [{ name, command, intervalSecs, timeoutSecs, format: json|prometheus|lines, map }].
-  metricCommands          Json           @default("[]")
+  metricCommands          Json                  @default("[]")
   metricCommandsHash      String?
   /// Node-reported features (terminals, operator terminals, file roots, file tools as root,
   /// terminal approval, max terminals, runtime hosts, media expansion, live STT).
@@ -91,13 +128,13 @@ model Node {
   /// Who declared it: USER (a person, shown as source "browser") or AGENT (source "agent").
   declaredResourcesBy     Actor?
   /// Placement labels (people; agents at FULL, audited). Effective = these ∪ node-declared.
-  labels                  String[]       @default([])
+  labels                  String[]              @default([])
   /// Longest lifetime of one node command (`node_command_run` timeoutMs is capped by it).
   /// Part of the node definition (people; agents at FULL); 1 min .. 24 h.
-  commandMaxMs            Int            @default(86400000)
+  commandMaxMs            Int                   @default(86400000)
   /// Port range for started instances (people; agents at FULL, audited).
-  portStart               Int            @default(30000)
-  portEnd                 Int            @default(30999)
+  portStart               Int                   @default(30000)
+  portEnd                 Int                   @default(30999)
   /// Local servers the node found on common ports (runtime.detected).
   detectedServers         Json?
   detectedServersAt       DateTime?
@@ -113,6 +150,13 @@ model Node {
   /// this long, releasing everything exactly like a manual delete. People only (a deletion
   /// policy: agents may not change it). Null: kept. 1 min .. 30 days (BigInt: > 2^31 ms).
   removeAfterOfflineMs    BigInt?
+  /// Node-reported build (hello `node.build`): { commit, installMethod, target }. Null when the
+  /// node's wsmp does not report one (older than self-update).
+  cliBuild                Json?
+  /// Node-reported environment (hello `node.environment`): { wsl }. Null when nothing to say.
+  environment             Json?
+  /// The owner may update this node's wsmp from the browser (people only).
+  agentUpdatePolicy       NodeAgentUpdatePolicy @default(ALLOWED)
 
   User           User                  @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   HoldProfile    Profile?              @relation("NodeHoldProfile", fields: [holdProfileId], references: [id], onDelete: SetNull, onUpdate: Cascade)
@@ -126,6 +170,7 @@ model Node {
   Commands       NodeCommand[]
   FabricMembers  FabricMember[]
   ReplacedBy     NodeEnrollmentCode[]  @relation("EnrollmentReplaces")
+  AgentUpdates   NodeAgentUpdate[]
 
   @@unique([userId, slug])
   @@unique([id, userId])
@@ -246,6 +291,77 @@ model NodeCommand {
   @@index([userId, createdAt])
   @@index([state, endsBy])
   @@map("node_command")
+}
+
+/// One `wsmp` self-update of a node (`agent.update`), started by its owner in the browser or by
+/// an "Update all" batch. At most one per node is in flight (`endedAt` null; the hardening's
+/// `node_agent_update_one_active`). History: ended rows are deleted after 30 days.
+model NodeAgentUpdate {
+  /// The relay updateId (16 random bytes, base64url).
+  id                String               @id
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @default(now()) @updatedAt
+  userId            String
+  nodeId            String
+  batchId           String?
+  fromVersion       String?
+  fromCommit        String?
+  toVersion         String
+  /// `self-replace` or `homebrew` (the node's strategy the server chose).
+  strategy          String
+  force             Boolean              @default(false)
+  /// The dead-man deadline sent to the node (30..600).
+  rollbackAfterSecs Int
+  phase             NodeAgentUpdatePhase @default(REQUESTED)
+  /// The node's (or the server's) reason code for REFUSED / FAILED / TIMED_OUT.
+  reason            String?
+  /// Node text (a manual command or a log tail), at most 4000 characters. Shown as plain text.
+  detail            String?
+  /// When the server gives up waiting for the next phase (then TIMED_OUT). Null once ended.
+  deadlineAt        DateTime?
+  endedAt           DateTime?
+
+  Node  Node                  @relation(fields: [nodeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Batch NodeAgentUpdateBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([nodeId, createdAt])
+  @@index([batchId])
+  @@index([endedAt, deadlineAt])
+  @@map("node_agent_update")
+}
+
+/// "Update all" (self-update D7): the canary first, then the rest one at a time, stopping at the
+/// first update that does not confirm. Driven from these rows (a server restart resumes it).
+model NodeAgentUpdateBatch {
+  id              String                    @id @default(cuid(2))
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @default(now()) @updatedAt
+  userId          String
+  canaryNodeId    String
+  /// Every node of the run, in order, canary first.
+  nodeIds         String[]
+  state           NodeAgentUpdateBatchState @default(RUNNING)
+  /// Index in `nodeIds` of the node being updated (or next to consider).
+  position        Int                       @default(0)
+  currentNodeId   String?
+  currentUpdateId String?
+  /// Nodes passed over when their turn came (offline, lowered trust, policy off ...).
+  skippedNodeIds  String[]                  @default([])
+  /// The wsmp version the run installs, pinned when it starts: the canary validated this
+  /// release, so a server that offers another one stops the run (`release_changed`).
+  targetVersion   String?
+  /// Where and why the run stopped: the update's phase (`failed`, `rolled_back`, `timed_out`,
+  /// `refused`), `release_changed`, or `stopped` (by the owner).
+  stoppedNodeId   String?
+  stoppedReason   String?
+  endedAt         DateTime?
+
+  User    User              @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Updates NodeAgentUpdate[]
+
+  @@index([userId, createdAt])
+  @@index([state])
+  @@map("node_agent_update_batch")
 }
 
 /// A named fast network between nodes (owner decision round 3), e.g. a cabled QSFP pair or a

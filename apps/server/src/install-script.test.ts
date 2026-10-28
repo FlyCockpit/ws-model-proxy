@@ -374,6 +374,31 @@ describe.skipIf(!canRun)("install.sh behavior", () => {
     );
   });
 
+  it("writes the install receipt where wsmp reads its state", () => {
+    const out = run(releaseScript);
+    expect(out.status).toBe(0);
+    const receipt = JSON.parse(
+      readFileSync(join(out.home, ".local/state/ws-model-proxy/install.json"), "utf8"),
+    );
+    expect(receipt).toMatchObject({
+      method: "script",
+      version: "0.4.0",
+      commit: null,
+      target: "x86_64-unknown-linux-gnu",
+      binary: join(out.home, ".cargo/bin/wsmp"),
+    });
+    expect(receipt.installedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+  });
+
+  it("records a pinned source build as method source with its commit", () => {
+    const out = run(installScript(ORIGIN, cliInstallSource(REV, RELEASE)));
+    expect(out.status).toBe(0);
+    const receipt = JSON.parse(
+      readFileSync(join(out.home, ".local/state/ws-model-proxy/install.json"), "utf8"),
+    );
+    expect(receipt).toMatchObject({ method: "source", commit: REV });
+  });
+
   it("builds the pinned commit and never downloads when WMP_CLI_SOURCE_REV is set", () => {
     const out = run(installScript(ORIGIN, cliInstallSource(REV, RELEASE)));
     expect(out.status).toBe(0);

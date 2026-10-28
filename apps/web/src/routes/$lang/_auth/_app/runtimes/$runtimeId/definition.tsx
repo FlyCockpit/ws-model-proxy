@@ -23,6 +23,7 @@ import { RuntimeSpecFields } from "@/components/runtimes/runtime-spec-fields";
 import { VersionHistory } from "@/components/runtimes/version-history";
 import { StatusPill } from "@/components/status-pill";
 import { useAppForm } from "@/hooks/use-app-form";
+import { rejectedDefinesWarning } from "@/lib/define-rejections";
 import { refusalText } from "@/lib/refusal-text";
 import {
   editorValues,
@@ -149,6 +150,8 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
         );
         if (result.warnings.includes("binds_all_interfaces"))
           toast.warning(t("dashboard:runtime.bindsAllInterfaces"));
+        const rejected = rejectedDefinesWarning(t, result.define);
+        if (rejected) toast.warning(rejected);
       } catch (error) {
         toast.error(refusalText(error));
       }

@@ -281,6 +281,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      # Baked into wsmp (`option_env!`): its hello reports the commit it was built from, so the
+      # server can tell two builds of one version apart (apps/cli/docs/releasing.md).
+      WSMP_BUILD_COMMIT: ${{ github.sha }}
     steps:
       - name: Enable Windows long paths
         run: git config --global core.longpaths true
@@ -352,6 +355,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
+      WSMP_BUILD_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

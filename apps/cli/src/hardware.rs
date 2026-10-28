@@ -158,12 +158,29 @@ fn read_text(path: &Path) -> Option<String> {
     Some(text)
 }
 
+/// Physical memory on Windows, which has no `/proc/meminfo`; it stands in for
+/// `MemTotal` (no carve-out applies there).
+fn windows_total_mib() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        wsmp_windows::memory_status()
+            .ok()
+            .map(|status| mib(status.total_bytes))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 fn gather(nvidia: Vec<GpuRow>) -> Sources {
-    let meminfo_total_mib = read_text(Path::new("/proc/meminfo")).and_then(|text| {
-        crate::telemetry::parse_meminfo(&text)
-            .get("MemTotal")
-            .copied()
-    });
+    let meminfo_total_mib = read_text(Path::new("/proc/meminfo"))
+        .and_then(|text| {
+            crate::telemetry::parse_meminfo(&text)
+                .get("MemTotal")
+                .copied()
+        })
+        .or_else(windows_total_mib);
     let mut sources = Sources {
         meminfo_total_mib,
         cpu_model: read_text(Path::new("/proc/cpuinfo"))

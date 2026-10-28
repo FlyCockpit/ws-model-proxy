@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "owner_id": "oDnj0znTQsnR4hIIXU8qM4fs",
+  "records": {
+    "in1:0": {
+      "job": {
+        "stepId": "step-Start",
+        "instanceId": "in1",
+        "runtimeId": "rt1",
+        "versionId": "vr1",
+        "launchHash": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+        "rank": 0,
+        "action": "start",
+        "intentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ownerEpoch": "epoch",
+        "command": "sleep 30",
+        "stopCommand": "true",
+        "statusCommand": null,
+        "healthCommand": null,
+        "secrets": [],
+        "timeoutMs": 1000,
+        "unitName": "wsmp-i-abcdefabcdef-r0",
+        "handle": "i-abcdefabcdef",
+        "port": 30001,
+        "host": "127.0.0.1",
+        "spec": {
+          "api": "openai",
+          "engine": "vllm",
+          "launch": {
+            "commands": [
+              {
+                "start": "sleep 30",
+                "stop": "true"
+              }
+            ],
+            "groupSize": 1,
+            "health": {
+              "failureThreshold": 2,
+              "intervalMs": 30000,
+              "successThreshold": 1
+            },
+            "labels": [],
+            "management": "process",
+            "readiness": {
+              "expectedStatus": 200,
+              "path": "/health",
+              "timeoutMs": 60000
+            },
+            "resources": [
+              {
+                "kind": "none"
+              }
+            ]
+          },
+          "modelType": "llm",
+          "models": [
+            {
+              "id": "m"
+            }
+          ]
+        }
+      },
+      "phase": "ready",
+      "invocations": {
+        "wsmp-i-abcdefabcdef-r0": "invocation"
+      },
+      "pending": null,
+      "completed": {
+        "step-Readiness": {
+          "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "outcome": {
+            "status": "succeeded",
+            "stopped": false
+          },
+          "action": "readiness"
+        },
+        "step-Start": {
+          "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "outcome": {
+            "status": "succeeded",
+            "stopped": false
+          },
+          "action": "start"
+        }
+      },
+      "observed_step": "step-Readiness",
+      "observed_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "consecutive_health_failures": 0,
+      "consecutive_health_successes": 0,
+      "outside_units": false
+    }
+  }
+}

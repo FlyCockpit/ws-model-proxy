@@ -68,6 +68,8 @@ use crate::tokens::{CompletionTextCollector, standardized_completion_metrics};
 
 const RELAY_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
+/// The first wait after a session failed fatally (see the relay loop).
+const RELAY_FATAL_INITIAL_DELAY: Duration = Duration::from_secs(5);
 /// How long the main loop parks in `socket.read()` before waking to drain worker
 /// output and send heartbeats. Bounds worker-frame latency (response streaming)
 /// without busy-spinning.
@@ -420,6 +422,9 @@ enum RelaySessionError {
     Fatal(anyhow::Error),
     /// A shutdown signal arrived; the session has already cleaned up.
     Shutdown(i32),
+    /// An update is in place: exit with `RestartForUpdate` so the service
+    /// starts the new binary.
+    RestartForUpdate,
 }
 
 type RelaySessionResult<T> = std::result::Result<T, RelaySessionError>;
@@ -470,9 +475,16 @@ pub fn connect_foreground() -> Result<()> {
     let startup = TerminalStartup::capture(&config)?;
     #[cfg(unix)]
     crate::file_ops::report_abandoned_recovery();
-    let mut link =
-        NodeLink::new(&crate::runtime_store::load_for(startup.trust_value()).unwrap_or_default())?;
+    // A new build that keeps failing to confirm rolls itself back here (exit 75).
+    let updates = crate::update::agent::DaemonUpdate::start()?;
+    let mut link = NodeLink::new(
+        &crate::runtime_store::load_for(startup.trust_value()).unwrap_or_default(),
+        updates,
+    )?;
     let mut reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
+    // Its own backoff: a session that keeps failing the same way waits 5 s,
+    // then twice as long each time, up to 5 minutes.
+    let mut fatal_delay = RELAY_FATAL_INITIAL_DELAY;
     loop {
         check_shutdown()?;
         let node_slug = ensure_cli_slug(&mut config)?;
@@ -531,6 +543,7 @@ pub fn connect_foreground() -> Result<()> {
             }) => {
                 if reset_backoff {
                     reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
+                    fatal_delay = RELAY_FATAL_INITIAL_DELAY;
                 }
                 let floor = retry_floor(&error);
                 wait = reconnect_wait(reconnect_delay, floor);
@@ -544,10 +557,36 @@ pub fn connect_foreground() -> Result<()> {
                     "relay websocket disconnected; reconnecting after backoff"
                 );
             }
-            Err(RelaySessionError::Fatal(error)) => return Err(error),
+            // Only a stop code (a rejected credential, a refused protocol)
+            // ends the process: the service does not restart it after those.
+            // Anything else fatal to the session (a frame it cannot read, a
+            // broken server) reconnects in this process, slower each time,
+            // instead of exiting into a tight service restart loop.
+            Err(RelaySessionError::Fatal(error))
+                if crate::exit::code_for(&error) != crate::exit::ExitCode::Failure =>
+            {
+                return Err(error);
+            }
+            Err(RelaySessionError::Fatal(error)) => {
+                wait = reconnect_wait(fatal_delay, None);
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    retry_delay_secs = wait.as_secs(),
+                    "relay session failed; reconnecting after backoff"
+                );
+                fatal_delay = next_reconnect_delay(fatal_delay);
+            }
             Err(RelaySessionError::Shutdown(signal)) => {
                 tracing::info!(signal, "relay stopped cleanly after a shutdown signal");
                 return Err(crate::shutdown::ShutdownRequested { signal }.into());
+            }
+            Err(RelaySessionError::RestartForUpdate) => {
+                tracing::info!("restarting into the installed update");
+                return Err(
+                    anyhow::anyhow!("restarting into the installed update").context(
+                        crate::exit::CodedError::new(crate::exit::ExitCode::RestartForUpdate),
+                    ),
+                );
             }
         }
         wait_for_reconnect(&mut control, &startup, &node_slug, wait, &mut link)?;
@@ -804,6 +843,18 @@ fn wait_for_reconnect(
     while Instant::now() < deadline {
         check_shutdown()?;
         link.drain_offline();
+        // An update that finished installing while disconnected restarts now,
+        // not on the next connection: its rollback deadline is already running.
+        // (Offline, its progress frames stay queued; the new build reports.)
+        let (_, restart) = link.update.poll();
+        if restart {
+            tracing::info!("restarting into the installed update");
+            return Err(
+                anyhow::anyhow!("restarting into the installed update").context(
+                    crate::exit::CodedError::new(crate::exit::ExitCode::RestartForUpdate),
+                ),
+            );
+        }
         // Trust and features changed while disconnected reach the next hello.
         let changes = answer_control_requests(control, startup, node_slug, "reconnecting")?;
         if changes.contains(&NodeChange::Lowered) {
@@ -943,6 +994,10 @@ struct Session<'a> {
     observed_generation: u64,
     /// The metric commands hash the telemetry thread runs.
     metric_commands_applied: Option<String>,
+    /// The daemon's update tracker (across reconnects).
+    update: &'a mut crate::update::agent::DaemonUpdate,
+    /// When the node's idleness was last read for a waiting update.
+    update_idle_checked: Option<Instant>,
 }
 
 /// The command lifetime cap the held node definition sets (24 h without one).
@@ -972,10 +1027,12 @@ struct NodeLink {
     /// sends snapshots in capture order, so an older one never reaches the server after a newer
     /// one.
     inventories: Arc<crate::runtimes::inventory::Inventories>,
+    /// The update in flight or awaiting confirmation, across reconnects.
+    update: crate::update::agent::DaemonUpdate,
 }
 
 impl NodeLink {
-    fn new(store: &Store) -> Result<Self> {
+    fn new(store: &Store, update: crate::update::agent::DaemonUpdate) -> Result<Self> {
         let (worker_tx, worker_rx) =
             mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
         let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_COMMAND_MAX);
@@ -1009,6 +1066,7 @@ impl NodeLink {
                 })
                 .ok(),
             inventories: Arc::new(inventories),
+            update,
         })
     }
 
@@ -1045,6 +1103,7 @@ impl NodeLink {
 fn node_features(startup: &TerminalStartup) -> crate::protocol::runtime_spec::NodeFeatures {
     let mut features = startup.features();
     features.secrets = crate::secrets::entries();
+    features.self_update = Some(crate::update::agent::features());
     features
 }
 
@@ -1126,6 +1185,8 @@ fn run_relay_session(
         inventories: Arc::clone(&link.inventories),
         observed_generation: 0,
         metric_commands_applied: None,
+        update: &mut link.update,
+        update_idle_checked: None,
     };
 
     let server_url = config.server_url.as_deref().unwrap_or_default();
@@ -1180,6 +1241,9 @@ fn run_relay_session(
             break Err(error);
         }
         if let Err(error) = drain_runner(&mut socket, &mut session) {
+            break Err(error);
+        }
+        if let Err(error) = poll_updates(&mut socket, &mut session) {
             break Err(error);
         }
         let now = Instant::now();
@@ -1279,6 +1343,7 @@ fn run_relay_session(
         }
     };
 
+    session.update.on_session_end();
     // Stops the sampling thread; a scrape in flight finishes on its own.
     drop(session.telemetry.take());
     let _ = send_outbound_frames(&mut socket, session.terminals.kill_all());
@@ -1292,7 +1357,10 @@ fn run_relay_session(
     session.stt.abort_all();
     abort_all_workers(std::mem::take(&mut session.workers));
     let result = settle_after_shutdown(result, crate::shutdown::requested());
-    if matches!(result, Err(RelaySessionError::Shutdown(_))) {
+    if matches!(
+        result,
+        Err(RelaySessionError::Shutdown(_) | RelaySessionError::RestartForUpdate)
+    ) {
         // The connection is still open: say goodbye so the server marks the
         // node offline now instead of waiting for a heartbeat timeout. The
         // shutdown deadline bounds a peer that never answers.
@@ -1439,6 +1507,41 @@ where
     }
 }
 
+/// A control frame that does not parse: what it concerns (one request, one
+/// terminal, one command, ...) is refused by name, or the session ends
+/// ([`FrameFault::Fatal`]). The log names the frame's type and serde's message,
+/// which names the field that failed.
+fn handle_unreadable<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    session: &mut Session,
+    text: &str,
+    error: &anyhow::Error,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    let value = serde_json::from_str::<serde_json::Value>(text).ok();
+    let frame_type = value
+        .as_ref()
+        .and_then(|value| value.get("type")?.as_str().map(str::to_owned));
+    // The JSON path that failed, when serde can place it (`$` when it cannot).
+    let path = value
+        .as_ref()
+        .and_then(crate::runtime_store::repair::first_error::<ServerFrame>)
+        .map(|(path, _)| path);
+    tracing::warn!(
+        frame_type = frame_type.as_deref().unwrap_or("(none)"),
+        path = path.as_deref().unwrap_or("(unknown)"),
+        error = %format!("{error:#}"),
+        "a relay frame could not be read"
+    );
+    let fault = control_frame_fault(text);
+    if let Some(result) = apply_stt_fault(socket, &mut session.stt, &fault) {
+        return result;
+    }
+    apply_frame_fault(socket, fault, &mut session.terminals, session.execs, error)
+}
+
 fn handle_text<S>(
     socket: &mut tungstenite::WebSocket<S>,
     config: &Config,
@@ -1449,16 +1552,35 @@ fn handle_text<S>(
 where
     S: std::io::Read + std::io::Write,
 {
+    // A `runtime.define` with one definition (or a node part) this build cannot
+    // read: those parts are refused by id and the rest is handled, instead of
+    // the whole frame ending the session (`runtime_store::repair`).
+    let mut repaired_text = None;
+    let mut define_refusals = None;
     let frame = match parse_server_control(text) {
         Ok(frame) => frame,
         Err(error) => {
-            let fault = control_frame_fault(text);
-            if let Some(result) = apply_stt_fault(socket, &mut session.stt, &fault) {
-                return result;
+            if let Some(repaired) = crate::runtime_store::repair::repair_runtime_define(
+                text,
+                parse_server_control,
+                |part| {
+                    tracing::warn!(
+                        part = %part.part,
+                        path = %part.path,
+                        error = %part.error,
+                        "refusing a runtime definition this wsmp cannot read"
+                    );
+                },
+            ) {
+                repaired_text = Some(repaired.text);
+                define_refusals = Some(repaired.refusals);
+                repaired.frame
+            } else {
+                return handle_unreadable(socket, session, text, &error);
             }
-            return apply_frame_fault(socket, fault, &mut session.terminals, session.execs, &error);
         }
     };
+    let text = repaired_text.as_deref().unwrap_or(text);
     if let Some(message) = SttServerMessage::from_frame(&frame) {
         let endpoints = if matches!(message, SttServerMessage::Open { .. }) {
             session.runtimes.endpoints()
@@ -1483,6 +1605,7 @@ where
             }
             session.registered = true;
             tracing::info!(id, node_id, ?definition_sync, "relay registration accepted");
+            session.update.on_hello_ok(definition_sync);
             send_inventory(session);
         }
         ServerFrame::HelloChallenge { .. } => {
@@ -1519,9 +1642,16 @@ where
                 busy_ports: &busy_ports,
             };
             let live = crate::runtime_store::live_path().map_err(RelaySessionError::Fatal)?;
+            let is_final = matches!(frame, ServerFrame::RuntimeDefine { is_final: true, .. });
             match session.defines.handle(text, &frame, &ctx, &live) {
-                Ok(outcome) => {
+                Ok(mut outcome) => {
+                    if let Some(refusals) = &define_refusals {
+                        refusals.merge_into(&mut outcome.answer);
+                    }
                     send_control(socket, &outcome.answer, "answering a runtime definition")?;
+                    if is_final {
+                        session.update.on_definitions_applied();
+                    }
                     if outcome.changed {
                         session
                             .runtimes
@@ -1541,6 +1671,42 @@ where
                         "a runtime definition could not be applied"
                     );
                 }
+            }
+        }
+        ServerFrame::AgentUpdate {
+            update_id,
+            version,
+            artifact_url,
+            sha256,
+            signature,
+            force,
+            rollback_after_secs,
+        } => {
+            let identity = crate::update::build::identity();
+            let gate = crate::update::agent::Gate {
+                full_control: startup.full_control(),
+                remote: Config::load_required()
+                    .map(|config| config.remote_updates)
+                    .unwrap_or_default(),
+                method: identity.method,
+                has_live: identity.live.is_some(),
+                under_service: under_service_manager(),
+            };
+            tracing::info!(update_id, version, force, "update requested");
+            let frames = session.update.request(
+                crate::update::agent::UpdateFrame {
+                    update_id,
+                    version,
+                    artifact_url,
+                    sha256,
+                    signature,
+                    force,
+                    rollback_after_secs,
+                },
+                &gate,
+            );
+            for frame in frames {
+                send_control(socket, &frame, "answering an update")?;
             }
         }
         ServerFrame::RuntimeDetect { id } => {
@@ -2147,6 +2313,41 @@ where
     Ok(())
 }
 
+/// How often a waiting update reads whether the node is idle.
+const UPDATE_IDLE_CHECK: Duration = Duration::from_secs(2);
+
+/// Drive the update tracker: idleness for a waiting update, progress frames,
+/// the confirmation, and the restart. A forced update's instances are stopped
+/// by the server, through its normal stop operations.
+fn poll_updates<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    session: &mut Session,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    if session.update.wants_idle()
+        && session
+            .update_idle_checked
+            .is_none_or(|at| at.elapsed() >= UPDATE_IDLE_CHECK)
+    {
+        session.update_idle_checked = Some(Instant::now());
+        let running = crate::update::agent::running_instances();
+        session
+            .update
+            .set_idle(running.is_empty(), session.execs.running() == 0);
+    }
+    let (frames, restart) = session.update.poll();
+    for frame in frames {
+        send_control(socket, &frame, "sending update progress")?;
+        session.update.sent(&frame);
+    }
+    if restart {
+        return Err(RelaySessionError::RestartForUpdate);
+    }
+    Ok(())
+}
+
 /// Node metric commands follow the held (frozen at Relay only) node
 /// definition; applied as soon as it changes.
 fn sync_metric_commands(session: &mut Session<'_>) {
@@ -2515,6 +2716,19 @@ where
             // `reject_malformed` builds the refusal through `exec_rejected`,
             // which logs that command's one outcome line.
             send_outbound_frames(socket, execs.reject_malformed(&command_id))
+        }
+        FrameFault::RejectUpdate { update_id } => {
+            tracing::warn!(update_id, "refusing a malformed update request");
+            send_control(
+                socket,
+                &NodeFrame::AgentUpdateProgress {
+                    update_id,
+                    phase: crate::protocol::frames::UpdatePhase::Failed,
+                    reason: Some(crate::protocol::frames::UpdateReason::Internal),
+                    detail: Some("the node could not read this `agent.update`".into()),
+                },
+                "refusing an update",
+            )
         }
         FrameFault::RejectFile { op_id } => {
             tracing::warn!("refusing a malformed file op");
@@ -3871,6 +4085,20 @@ static AS_SERVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 pub fn run_as_service() {
     AS_SERVICE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the installed relay service runs this relay, so an exit is
+/// restarted: the systemd unit `wsmp service install` writes (it sets
+/// [`STOP_ON_REJECTED_CREDENTIAL_ENV`]), its launchd agent (launchd names the
+/// job in `XPC_SERVICE_NAME`), or the Windows task (`wsmp run --service`).
+pub fn under_service_manager() -> bool {
+    if cfg!(target_os = "macos") {
+        return std::env::var("XPC_SERVICE_NAME").is_ok_and(|name| name == "com.flycockpit.wsmp");
+    }
+    if cfg!(windows) {
+        return AS_SERVICE.load(std::sync::atomic::Ordering::SeqCst);
+    }
+    std::env::var_os(STOP_ON_REJECTED_CREDENTIAL_ENV).is_some_and(|value| value == "1")
 }
 
 /// Whether a person sees this relay's stderr: a terminal, and not a service.

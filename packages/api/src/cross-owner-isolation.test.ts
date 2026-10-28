@@ -356,8 +356,38 @@ function servicesSpy() {
     run: vi.fn(async () => ({ ok: true as const, result: {} })),
     auditRefused: vi.fn(),
   };
+  const agentUpdates = {
+    server: vi.fn(async () => ({
+      version: "0.4.3",
+      commit: null,
+      sourceBuild: false,
+      cargoInstall: "cargo install wsmp",
+    })),
+    release: vi.fn(async () => ({
+      kind: "release" as const,
+      version: "0.4.3",
+      commit: null,
+      releaseUrl: "https://r.example",
+      artifacts: {
+        "x86_64-unknown-linux-gnu": { url: "https://r.example/w.tar.xz", sha256: "0".repeat(64) },
+      },
+    })),
+    // A's node is live and would accept the update: only an owner check keeps it out.
+    liveNode: vi.fn(() => ({
+      userId: VICTIM,
+      connectionGeneration: 1,
+      trust: "full" as const,
+      selfUpdate: {
+        strategies: ["self-replace"],
+        instancesSurvive: true,
+        remote: "allowed" as const,
+      },
+    })),
+    send: vi.fn(() => true),
+  };
   const services = {
     nodes,
+    agentUpdates,
     nodeOperator,
     nodeFiles,
     runtimeSteps,
@@ -374,6 +404,7 @@ function servicesSpy() {
       ...Object.entries(nodes),
       ...Object.entries(nodeOperator),
       ...Object.entries(nodeFiles),
+      ["agentUpdates.send", agentUpdates.send],
       ["dispatchRuntimeOperation", services.dispatchRuntimeOperation],
       ["pushRuntimeDefinitions", services.pushRuntimeDefinitions],
       ["modelTest", services.modelTest],
@@ -453,6 +484,14 @@ const CASES: ReadonlyArray<[string, unknown]> = [
   ["nodes.enrollmentCodes.create", { replaceNodeId: "node-a" }],
   ["nodes.credentials.revoke", { credentialId: "cred-a" }],
   ["nodes.lowerTrust", { nodeId: "node-a" }],
+  // wsmp self-update: nothing reaches A's node (no agent.update, no policy write).
+  ["nodes.agentUpdate.overview", {}],
+  ["nodes.agentUpdate.start", { nodeId: "node-a" }],
+  ["nodes.agentUpdate.start", { nodeId: "node-a", force: true }],
+  ["nodes.agentUpdate.startAll", { canaryNodeId: "node-a" }],
+  ["nodes.agentUpdate.startAll", {}],
+  ["nodes.agentUpdate.stopAll", { batchId: "row-a" }],
+  ["nodes.agentUpdate.setPolicy", { nodeId: "node-a", policy: "OFF" }],
   ["nodes.secrets.set", { nodeId: "node-a", name: "WSMP_SECRET_HF", value: "stolen" }],
   ["nodes.secrets.delete", { nodeId: "node-a", name: "WSMP_SECRET_HF" }],
   ["nodes.terminals.openTicket", { nodeId: "node-a", cols: 80, rows: 24 }],

@@ -17,6 +17,7 @@ use tempfile::NamedTempFile;
 use nix::fcntl::{Flock, FlockArg};
 
 use crate::protocol::frames::TrustValue;
+use crate::protocol::runtime_spec::RemoteUpdates;
 use crate::slug::validate_slug;
 
 pub const CONFIG_VERSION: u8 = 3;
@@ -300,6 +301,15 @@ pub struct Config {
     /// relay starts.
     #[serde(default, skip_serializing_if = "is_false")]
     pub disable_file_tools: bool,
+    /// Whether the node's owner may update this wsmp from their browser (`allowed`, the
+    /// default, or `off`). Read when an update arrives; a person on this machine sets it
+    /// (`wsmp config set-remote-updates`).
+    #[serde(default, skip_serializing_if = "is_allowed")]
+    pub remote_updates: RemoteUpdates,
+}
+
+fn is_allowed(value: &RemoteUpdates) -> bool {
+    *value == RemoteUpdates::Allowed
 }
 
 impl Config {
@@ -470,6 +480,7 @@ struct ConfigWire {
     #[serde(deserialize_with = "deserialize_file_roots")]
     file_roots: Vec<PathBuf>,
     disable_file_tools: bool,
+    remote_updates: RemoteUpdates,
 }
 
 impl Default for ConfigWire {
@@ -490,6 +501,7 @@ impl Default for ConfigWire {
             allow_file_tools_as_root: false,
             file_roots: Vec::new(),
             disable_file_tools: false,
+            remote_updates: RemoteUpdates::Allowed,
         }
     }
 }
@@ -511,6 +523,7 @@ impl From<ConfigWire> for Config {
             allow_file_tools_as_root: wire.allow_file_tools_as_root,
             file_roots: wire.file_roots,
             disable_file_tools: wire.disable_file_tools,
+            remote_updates: wire.remote_updates,
         }
     }
 }
@@ -532,6 +545,7 @@ impl Default for Config {
             allow_file_tools_as_root: false,
             file_roots: Vec::new(),
             disable_file_tools: false,
+            remote_updates: RemoteUpdates::Allowed,
         }
     }
 }

@@ -1797,4 +1797,4 @@ pub(crate) mod native;
 pub mod windows;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

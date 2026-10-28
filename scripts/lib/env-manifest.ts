@@ -266,12 +266,12 @@ export const ENV_VARS: EnvVar[] = [
     key: "BUILD_VERSION",
     group: "runtime",
     source: "manual",
-    inSchema: false,
     comment: [
       "Build identifier (e.g. the git SHA) baked into the web bundle as",
       "`__APP_VERSION__`. Read at build time by apps/web/vite.config.ts and the",
-      "Dockerfile ARG — not by the Zod schemas. Unset falls back to `git rev-parse`,",
-      "then to a random per-build id.",
+      "Dockerfile ARG. Unset falls back to `git rev-parse`, then to a random",
+      "per-build id. At runtime, a 40-hex value is the server's commit: the Nodes",
+      "page marks a node outdated when its wsmp was built from another commit.",
     ],
   },
   {

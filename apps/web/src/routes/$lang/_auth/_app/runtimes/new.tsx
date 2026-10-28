@@ -24,6 +24,7 @@ import { NativeSelect } from "@/components/native-select";
 import { PageHeading } from "@/components/page-stub";
 import { RuntimeSpecFields } from "@/components/runtimes/runtime-spec-fields";
 import { useAppForm } from "@/hooks/use-app-form";
+import { rejectedDefinesWarning } from "@/lib/define-rejections";
 import { refusalText } from "@/lib/refusal-text";
 import {
   editorValues,
@@ -167,6 +168,8 @@ function RuntimeForm({ preset }: { preset: Preset }) {
         toast.success(t("dashboard:runtime.created"));
         if (result.warnings.includes("binds_all_interfaces"))
           toast.warning(t("dashboard:runtime.bindsAllInterfaces"));
+        const rejected = rejectedDefinesWarning(t, result.define);
+        if (rejected) toast.warning(rejected);
         await navigate({
           to: "/$lang/runtimes/$runtimeId",
           params: { lang, runtimeId: result.runtime.id },

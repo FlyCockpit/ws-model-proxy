@@ -28,6 +28,7 @@ import {
   MarkStoppedAction,
   StopNotConfirmedHelp,
 } from "@/components/runtimes/mark-stopped";
+import { RefusedOnCard } from "@/components/runtimes/refused-on-card";
 import { HeldPartsRelease } from "@/components/runtimes/release-unproven";
 import { RuntimeSharingCard } from "@/components/runtimes/runtime-sharing-card";
 import { ServedModelCapabilities } from "@/components/runtimes/served-model-capabilities";
@@ -121,6 +122,7 @@ function RuntimeOverview({ runtime }: { runtime: RuntimeDetail }) {
         </p>
         {runtime.origin === "NODE" ? <NodeOriginNote runtime={runtime} /> : null}
       </div>
+      <RefusedOnCard lang={lang} runtime={runtime} />
       {runtime.service ? (
         <Card>
           <CardHeader>

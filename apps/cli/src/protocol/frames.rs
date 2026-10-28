@@ -1093,7 +1093,108 @@ pub struct HelloNode {
     pub terminal_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_identity: Option<NodeTerminalIdentity>,
+    /// Which build this is (two `0.4.2` builds can differ). Absent on older CLIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<NodeBuild>,
+    /// Sent only when there is something to say (`wsl: true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<NodeEnvironment>,
 }
+
+/// How this wsmp was installed (`hello.node.build.installMethod`, the install receipt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstallMethod {
+    /// The server's `install.sh`.
+    Script,
+    /// The server's `install.ps1`.
+    ScriptPs1,
+    Homebrew,
+    /// `cargo install` from a registry.
+    Cargo,
+    Binstall,
+    Npm,
+    /// Built from a git revision (`WMP_CLI_SOURCE_REV`, `cargo install --git`): never replaced
+    /// from the browser (D8).
+    Source,
+    Unknown,
+}
+
+impl InstallMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Script => "script",
+            Self::ScriptPs1 => "script-ps1",
+            Self::Homebrew => "homebrew",
+            Self::Cargo => "cargo",
+            Self::Binstall => "binstall",
+            Self::Npm => "npm",
+            Self::Source => "source",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeBuild {
+    /// The git commit this binary was built from (40 lowercase hex), `null` when unknown.
+    pub commit: Option<String>,
+    pub install_method: InstallMethod,
+    /// The Rust target triple this binary was built for.
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeEnvironment {
+    /// The node runs inside WSL (`/proc/sys/kernel/osrelease` names Microsoft).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub wsl: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// `agent.update.progress` `phase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePhase {
+    Refused,
+    WaitingIdle,
+    Downloading,
+    Verifying,
+    Armed,
+    Swapped,
+    Restarting,
+    Confirmed,
+    RolledBack,
+    Failed,
+}
+
+/// `agent.update.progress` `reason` (only with `refused` or `failed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateReason {
+    NotOwnerTrust,
+    OptedOut,
+    SourceBuild,
+    UnsupportedMethod,
+    Busy,
+    SignatureMismatch,
+    ChecksumMismatch,
+    DownloadFailed,
+    VersionMismatch,
+    AlreadyCurrent,
+    InProgress,
+    Internal,
+}
+
+/// `agent.update.progress` `detail` cap (UTF-16 code units, as the server counts).
+pub const UPDATE_DETAIL_MAX_CHARS: usize = 4000;
+/// `agent.update` `rollbackAfterSecs` bounds.
+pub const UPDATE_ROLLBACK_SECS_RANGE: std::ops::RangeInclusive<u32> = 30..=600;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1429,6 +1530,17 @@ pub enum NodeFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<Value>,
     },
+    /// One step of an `agent.update` (or its end). `confirmed` and `rolled_back` come from the
+    /// binary that runs after the restart, on a new relay session.
+    #[serde(rename = "agent.update.progress")]
+    AgentUpdateProgress {
+        update_id: String,
+        phase: UpdatePhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<UpdateReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     #[serde(rename = "stt.opened")]
     SttOpened { session_id: String },
     #[serde(rename = "stt.audio.ack")]
@@ -1612,6 +1724,20 @@ pub enum ServerFrame {
     },
     #[serde(rename = "file.cancel")]
     FileCancel { op_id: String },
+    /// Install `version` from `artifactUrl` and restart into it, rolling back by itself
+    /// unless the new build confirms within `rollbackAfterSecs`. Older agents drop it
+    /// (unknown type); the server sends it only to a node that reports `features.selfUpdate`.
+    #[serde(rename = "agent.update")]
+    AgentUpdate {
+        update_id: String,
+        version: String,
+        artifact_url: String,
+        sha256: String,
+        /// Reserved (D9): a detached signature of the artifact. Ignored today.
+        signature: Option<String>,
+        force: bool,
+        rollback_after_secs: u32,
+    },
     #[serde(rename = "stt.open")]
     SttOpen {
         session_id: String,
@@ -1864,6 +1990,84 @@ pub fn is_node_slug(value: &str) -> bool {
         && !value.contains("--")
 }
 
+/// 22 base64url characters: a 16-byte id (`updateId`).
+pub fn is_op_id_shaped(id: &str) -> bool {
+    id.len() == 22
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// A git commit id: 40 lowercase hex characters.
+pub fn is_commit(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// 64 lowercase hex characters.
+pub fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A Rust target triple as `hello.node.build.target` carries it: 1-80 of `[A-Za-z0-9_.-]`.
+pub fn is_target_triple(value: &str) -> bool {
+    (1..=80).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// `MAJOR.MINOR.PATCH` with an optional `-pre` / `+build` of `[0-9A-Za-z.-]`, at most 64
+/// characters (what `wsmp --version` prints after `wsmp `).
+pub fn is_release_version(value: &str) -> bool {
+    if value.is_empty() || value.len() > 64 {
+        return false;
+    }
+    let core_end = value.find(['-', '+']).unwrap_or(value.len());
+    let (core, rest) = value.split_at(core_end);
+    let numbers: Vec<&str> = core.split('.').collect();
+    numbers.len() == 3
+        && numbers.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|b| b.is_ascii_digit())
+                && (part.len() == 1 || !part.starts_with('0'))
+        })
+        && rest
+            .bytes()
+            .skip(1)
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+        && (rest.is_empty() || rest.len() > 1)
+}
+
+/// `https://…`, or `http://` to `localhost`, `127.0.0.1` or `[::1]` (tests, development). At
+/// most 2048 characters, no credentials.
+pub fn is_update_artifact_url(value: &str) -> bool {
+    if value.len() > 2048 {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match url.scheme() {
+        "https" => url.host().is_some(),
+        "http" => match url.host() {
+            Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+            Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 /// `http://(127.0.0.1|[::1]|localhost):<1-5 digits>` with an optional `/v1`
 /// (the TS `runtime.detected` `baseUrl` pattern).
 fn is_detected_base_url(url: &str) -> bool {
@@ -1883,7 +2087,40 @@ fn is_detected_base_url(url: &str) -> bool {
 impl NodeFrame {
     /// Cross-field rules serde cannot express.
     pub fn validate(&self) -> Result<(), FrameRuleError> {
+        if let Self::Hello { node, .. } = self
+            && let Some(build) = &node.build
+        {
+            rule(
+                build.commit.as_deref().is_none_or(is_commit),
+                "a build commit is 40 lowercase hex characters",
+            )?;
+            rule(
+                is_target_triple(&build.target),
+                "a build target is 1-80 characters of a target triple",
+            )?;
+        }
         match self {
+            Self::AgentUpdateProgress {
+                update_id,
+                phase,
+                reason,
+                detail,
+            } => {
+                rule(
+                    is_op_id_shaped(update_id),
+                    "an update id is 22 base64url characters",
+                )?;
+                rule(
+                    matches!(phase, UpdatePhase::Refused | UpdatePhase::Failed) == reason.is_some(),
+                    "reason exactly for refused and failed updates",
+                )?;
+                rule(
+                    detail
+                        .as_ref()
+                        .is_none_or(|text| text.encode_utf16().count() <= UPDATE_DETAIL_MAX_CHARS),
+                    "an update detail is at most 4000 characters",
+                )
+            }
             Self::Hello {
                 trust, features, ..
             }
@@ -2000,6 +2237,42 @@ impl ServerFrame {
     /// Cross-field rules serde cannot express.
     pub fn validate(&self) -> Result<(), FrameRuleError> {
         match self {
+            Self::AgentUpdate {
+                update_id,
+                version,
+                artifact_url,
+                sha256,
+                signature,
+                rollback_after_secs,
+                ..
+            } => {
+                rule(
+                    is_op_id_shaped(update_id),
+                    "an update id is 22 base64url characters",
+                )?;
+                rule(
+                    is_release_version(version),
+                    "an update version is a release version",
+                )?;
+                rule(
+                    is_update_artifact_url(artifact_url),
+                    "an update artifact is an https URL (http only to localhost)",
+                )?;
+                rule(
+                    is_sha256_hex(sha256),
+                    "an update sha256 is 64 lowercase hex characters",
+                )?;
+                rule(
+                    signature
+                        .as_ref()
+                        .is_none_or(|text| !text.is_empty() && text.len() <= 4096),
+                    "an update signature is 1-4096 characters",
+                )?;
+                rule(
+                    UPDATE_ROLLBACK_SECS_RANGE.contains(rollback_after_secs),
+                    "rollbackAfterSecs is 30 to 600",
+                )
+            }
             Self::RuntimeJob(job) => job.validate(),
             Self::SecretSet(secret) => secret.validate(),
             Self::TermOpen {
@@ -2446,6 +2719,89 @@ mod tests {
         })
         .expect("serializes");
         assert!(wire.get("reservations").is_none());
+    }
+
+    #[test]
+    fn agent_updates_follow_the_rules() {
+        let frames = round_trip::<ServerFrame>("frames/server-to-node");
+        let (_, update) = frames
+            .into_iter()
+            .find(|(name, _)| name == "agent.update.json")
+            .expect("agent.update fixture");
+        assert!(update.validate().is_ok());
+        let broken = |change: &dyn Fn(&mut Value)| {
+            let mut json = serde_json::to_value(&update).expect("serializes");
+            change(&mut json);
+            serde_json::from_value::<ServerFrame>(json)
+                .map_or(true, |frame| frame.validate().is_err())
+        };
+        for url in [
+            "http://example.com/a.tar.xz",
+            "ftp://example.com/a.tar.xz",
+            "https://user:pw@example.com/a.tar.xz",
+            "file:///tmp/a.tar.xz",
+            "not a url",
+        ] {
+            assert!(broken(&|json| json["artifactUrl"] = url.into()), "{url}");
+        }
+        for url in [
+            "http://127.0.0.1:8080/a.tar.xz",
+            "http://localhost/a.tar.xz",
+            "http://[::1]:3000/a.zip",
+            "https://objects.example.com/a.zip?sig=1",
+        ] {
+            assert!(!broken(&|json| json["artifactUrl"] = url.into()), "{url}");
+        }
+        assert!(broken(&|json| json["rollbackAfterSecs"] = 29.into()));
+        assert!(broken(&|json| json["rollbackAfterSecs"] = 601.into()));
+        assert!(!broken(&|json| json["rollbackAfterSecs"] = 30.into()));
+        assert!(!broken(&|json| json["rollbackAfterSecs"] = 600.into()));
+        assert!(broken(&|json| json["sha256"] = "ab".into()));
+        assert!(broken(&|json| json["updateId"] = "short".into()));
+        assert!(broken(&|json| json["version"] = "v0.4.3".into()));
+        assert!(broken(&|json| json["version"] = "0.4".into()));
+        assert!(!broken(&|json| json["version"] = "0.5.0-rc.1".into()));
+        assert!(broken(&|json| json["signature"] = "".into()));
+        assert!(!broken(&|json| json["signature"] = "RWQ...".into()));
+        assert!(broken(&|json| json["unknown"] = true.into()));
+    }
+
+    #[test]
+    fn update_progress_follows_the_rules() {
+        let frame = |phase: UpdatePhase, reason: Option<UpdateReason>, detail: Option<String>| {
+            NodeFrame::AgentUpdateProgress {
+                update_id: "q8Zr0T3vX1yB2nC4dE5fGw".into(),
+                phase,
+                reason,
+                detail,
+            }
+        };
+        assert!(
+            frame(UpdatePhase::Downloading, None, None)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            frame(UpdatePhase::Failed, Some(UpdateReason::Internal), None)
+                .validate()
+                .is_ok()
+        );
+        assert!(frame(UpdatePhase::Failed, None, None).validate().is_err());
+        assert!(
+            frame(UpdatePhase::Swapped, Some(UpdateReason::Busy), None)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            frame(UpdatePhase::RolledBack, None, Some("é".repeat(4000)))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            frame(UpdatePhase::RolledBack, None, Some("x".repeat(4001)))
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
