@@ -122,7 +122,12 @@ pub(crate) fn rename(
         (to_path.clone(), from_path.clone())
     };
     let _lock_a = ops.lock_path(first, cancel)?;
-    let _lock_b = ops.lock_path(second, cancel)?;
+    // A case-only rename names one file: its one lock is already held.
+    let _lock_b = if case_only {
+        None
+    } else {
+        Some(ops.lock_path(second, cancel)?)
+    };
 
     let src = from
         .lstat()?
