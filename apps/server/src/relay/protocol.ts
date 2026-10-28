@@ -61,6 +61,13 @@ export const RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE =
  */
 export const RELAY_SELF_UPDATE_REQUIRED_MESSAGE =
   "This server needs a newer wsmp, one that can update itself. Re-run the server's install.sh (install.ps1 on Windows), then restart wsmp.";
+
+/** Whether a parsed hello may register: only a wsmp that can update itself is let in. */
+export function helloCanSelfUpdate(
+  hello: Extract<NodeToServerControlFrame, { type: "hello" }>,
+): boolean {
+  return Boolean(hello.features.selfUpdate);
+}
 export const RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE =
   "This wsmp speaks a newer relay protocol than the server. Upgrade WS Model Proxy and restart wsmp.";
 

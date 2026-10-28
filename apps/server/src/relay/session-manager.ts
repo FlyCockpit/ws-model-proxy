@@ -95,6 +95,7 @@ import {
   describeRelayControlParseError,
   encodeRelayBinaryFrame,
   encodeRelayServerControlMessage,
+  helloCanSelfUpdate,
   helloNeedsUpgrade,
   isCurrentProtocolHello,
   parseRelayBinaryFrame,
@@ -1588,7 +1589,7 @@ export class RelaySessionManager {
 
     if (message.type === "hello") {
       // A wsmp older than self-update: refused by capability (it could never take an update).
-      if (!session.registered && !message.features.selfUpdate) {
+      if (!session.registered && !helloCanSelfUpdate(message)) {
         console.error("[relay] refused a hello without self-update", { code: "upgrade_cli" });
         closeWithProtocolError(socket, "upgrade_cli", RELAY_SELF_UPDATE_REQUIRED_MESSAGE);
         await recordRejectedNodeHello(session.identity, rejectedHelloFacts(frame), now).catch(

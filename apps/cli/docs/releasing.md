@@ -60,6 +60,13 @@ Self-update only works while a node can still connect and take the next update, 
 - **Never add a value to an enum field of those frames** (`hello.ok`'s `definitionSync`, say):
   an older wsmp cannot read the frame. Add a new field instead. `protocol.error`'s `code` is the
   one exception: wsmp reads a code it does not know as a generic error and reconnects.
+- **CI holds the server to these rules.** `apps/cli/tests/fixtures/released/<version>/` keeps
+  what a released wsmp sends while idle and during an update, and the frames above it reads;
+  `apps/server/src/relay/released-compat.test.ts` checks that today's server accepts the first
+  and still sends fields and values the release reads. When you cut a release, copy those files
+  into a new `released/<version>/` from `relay-3.0/` (with `node.version` set to the release).
+  Never edit a released copy to make the test pass; change the server instead. The `0.4.3` copy
+  may still follow protocol changes until `v0.4.3` is tagged.
 - The browser update is offered only where it has been verified on a real machine
   (`AGENT_UPDATE_OFFERED` in `packages/api/src/lib/agent-updates.ts`): add a platform there,
   with a server deploy, once its dead-man, restart and confirmation pass on it.
