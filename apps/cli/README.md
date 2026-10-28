@@ -338,7 +338,12 @@ supported.
 - runtimes in PowerShell or `cmd`, including interactive steps;
 - the file tools: read, stat, list, search, write, edit, rename, mkdir and delete.
 
-Install PowerShell 7 (`pwsh`) for runtimes. Windows PowerShell 5.1 works, but it changes some
+Install PowerShell 7 (`pwsh`) for runtimes and node commands, with its MSI or
+`winget install Microsoft.PowerShell`. `wsmp` does not use the Microsoft Store build: Windows
+starts a Store app in a job of its own, outside the job `wsmp` ends a command, runtime or
+terminal with, so what it started would keep running. Programs from the Store that a command
+names itself (Store Python, `winget`) run outside that job too: cancelling or timing out the
+command does not end them. Windows PowerShell 5.1 works, but it changes some
 arguments it passes to a program (an empty one, or one with a quote in it). An argv whose program
 is an `.exe` does not go through it; one that would (a `.cmd` shim, say) fails with such an
 argument there.

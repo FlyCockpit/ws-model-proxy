@@ -67,7 +67,9 @@ command and everything it started). A command lives at most its timeout
   `powershell` and `cmd` on Windows, when installed). Without `shell` it runs in
   `sh` on Linux and macOS, and in PowerShell on Windows: `pwsh` (PowerShell 7)
   when installed, else `powershell` (Windows PowerShell 5.1, on every Windows
-  11). It never runs in Git Bash's `sh`, even when that is on `PATH`. Name
+  11). A Microsoft Store `pwsh` is never used (it would run outside the job
+  that ends the command). It never runs in Git Bash's `sh`, even when that is
+  on `PATH`. Name
   `shell: "cmd"` for Command Prompt syntax (`dir /s`, `set X=1 && …`); `cmd` gets
   the text exactly as you sent it, but it expands `%VAR%` when it reads the
   whole line (a variable set earlier on the same line stays literal) and treats
@@ -81,7 +83,9 @@ command and everything it started). A command lives at most its timeout
   (`spawn_failed`) rather than run differently. Anything else (a PowerShell
   command) runs in `shell` (default as for text; never `cmd`), which reads it
   as PowerShell does. To reach WSL, use an argv:
-  `["wsl.exe", "-e", "bash", "-c", "…"]`.
+  `["wsl.exe", "-e", "bash", "-c", "…"]`. A Microsoft Store app (Store Python,
+  `winget`) runs outside the command's job: `cancel` and the timeout do not end
+  it or what it started.
 
 A shell the node does not report is refused with `shell_unavailable`. A node
 whose wsmp predates argv commands and `shell` refuses them (`upgrade_wsmp`);

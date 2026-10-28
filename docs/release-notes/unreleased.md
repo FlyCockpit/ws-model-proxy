@@ -20,7 +20,9 @@ Windows section lists the limits, and the WSL2 alternative.
 node reports), or take an argv (`command: ["curl", "-d", "…"]`) whose arguments reach the program
 without a shell reading them; on Windows a `.cmd` shim such as `npm` gets them escaped for cmd.
 Command text is at most 4096 bytes, what nodes accept. On Windows, a command without `shell` runs
-in PowerShell (`pwsh`, else Windows PowerShell), never in Git Bash's `sh`; name `shell: "cmd"`
+in PowerShell (`pwsh`, else Windows PowerShell; never a Microsoft Store `pwsh`, which Windows runs
+outside the job that ends a command, so install PowerShell 7 with its MSI or winget), never in
+Git Bash's `sh`; name `shell: "cmd"`
 for Command Prompt, which now gets the text exactly as sent. A node must run this release's
 `wsmp` for `shell` or an argv: an older one refuses the command, and the server says to upgrade
 it.
