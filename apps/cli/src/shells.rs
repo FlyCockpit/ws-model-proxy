@@ -282,6 +282,8 @@ mod tests {
         assert!(distribution_names(b"").is_empty());
     }
 
+    // Windows paths: elsewhere `\` is not a separator, so the folder is never a component.
+    #[cfg(windows)]
     #[test]
     fn store_app_folders_are_recognised() {
         for path in [
