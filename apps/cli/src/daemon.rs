@@ -3893,9 +3893,9 @@ fn hello_rejection(
             crate::exit::ExitCode::CredentialRejected,
             stop.credential,
         ),
-        Some(ProtocolErrorCode::Malformed | ProtocolErrorCode::Internal) => {
-            RelaySessionError::Fatal(anyhow::anyhow!(text))
-        }
+        Some(
+            ProtocolErrorCode::Malformed | ProtocolErrorCode::Internal | ProtocolErrorCode::Unknown,
+        ) => RelaySessionError::Fatal(anyhow::anyhow!(text)),
     }
 }
 

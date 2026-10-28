@@ -91,10 +91,12 @@ pub fn encode_control(frame: &NodeFrame) -> Result<String> {
     Ok(text)
 }
 
-/// The frames a session and a self-update depend on, with the fields this
-/// build reads. A later server may add a field to them; this build drops it
-/// and goes on, so it can still connect and take the update that knows it.
-/// Every other frame keeps refusing unknown fields.
+/// The frames a session, a trust lowering and a self-update depend on, with
+/// the fields this build reads. A later server may add a field to them; this
+/// build drops it and goes on, so it can still connect and take the update
+/// that knows it. Every other frame keeps refusing unknown fields. A new
+/// value in an existing field is not covered (except `protocol.error`'s
+/// `code`, read as [`ProtocolErrorCode::Unknown`]): add a field instead.
 pub const OPEN_FRAMES: &[(&str, &[&str])] = &[
     ("hello.challenge", &["type", "nonce", "origin"]),
     (
@@ -116,6 +118,20 @@ pub const OPEN_FRAMES: &[(&str, &[&str])] = &[
         ],
     ),
     ("agent.update.ack", &["type", "updateId"]),
+    // A node that cannot read a lowering would keep its own Full control.
+    ("trust.lower", &["type", "id", "requestedAt"]),
+    // How the server's upgrade message reaches the node.
+    (
+        "protocol.error",
+        &[
+            "type",
+            "failure",
+            "code",
+            "message",
+            "supportedVersions",
+            "requestId",
+        ],
+    ),
 ];
 
 /// Parses one server control frame strictly (shape, then cross-field rules).
@@ -635,6 +651,21 @@ mod tests {
             let later = parse_server_control(&json.to_string()).expect("a later field is dropped");
             assert_eq!(later, today, "{name}");
         }
+    }
+
+    #[test]
+    fn a_protocol_error_code_from_a_later_server_is_read_as_unknown() {
+        let frame = parse_server_control(
+            r#"{"type":"protocol.error","failure":"protocol_error","code":"brand_new","message":"m","supportedVersions":["3.0"]}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            frame,
+            ServerFrame::ProtocolError {
+                code: ProtocolErrorCode::Unknown,
+                ..
+            }
+        ));
     }
 
     #[test]

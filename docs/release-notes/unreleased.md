@@ -40,7 +40,9 @@ This release removes both halves of that:
 - A frame the agent cannot read closes the connection and reconnects with backoff (5 s,
   doubling, up to 5 minutes) instead of exiting. Its log names the frame type and the field that
   failed. The agent exits only for a rejected credential (exit 4) or a refused protocol (exit 5),
-  and the service no longer restarts it after either, on Linux, macOS and Windows.
+  and only under its systemd unit (which does not restart it after either) or in a terminal. Under
+  launchd or Task Scheduler it does not exit: it keeps retrying in-process, at most every 5
+  minutes, and picks up a new `wsmp login` or upgrade by itself.
 
 **Windows behaviour change.** A `node_command_run` without `shell` now runs in PowerShell, not
 `cmd`. Commands written for Command Prompt need `shell: "cmd"`.
@@ -126,8 +128,10 @@ the new `agent.update` frame).
 - The rollback window is 180 s by default and counts from the new build's start, so a slow
   restart or reconnect does not roll back a good build. A reboot during the trial gives the new
   build a full window after the boot, on every platform.
-- wsmp now ignores fields it does not know in `hello.challenge`, `hello.ok`, `heartbeat.pong`
-  and `agent.update`, so a later server can add one without cutting this release off.
+- wsmp now ignores fields it does not know in `hello.challenge`, `hello.ok`, `heartbeat.pong`,
+  `agent.update`, `agent.update.ack`, `trust.lower` and `protocol.error`, and reads a
+  `protocol.error` code it does not know as a generic error, so a later server can add a field
+  (or an error code) without cutting this release off.
 - New procedures `nodes.agentUpdate.{overview,start,startAll,stopAll,setPolicy}`: people only
   (the owner's own browser session; never agents, MCP or an admin), not MCP tools.
   "Update all" updates a canary first, then the rest one at a time, and stops at the first

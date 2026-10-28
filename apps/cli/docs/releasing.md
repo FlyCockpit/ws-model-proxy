@@ -53,9 +53,13 @@ Self-update only works while a node can still connect and take the next update, 
   and even then the server keeps accepting the older protocol from a node that can update
   itself, long enough to send it `agent.update` first.
 - **Hello fields added later stay optional** for such a node, and the server keeps sending
-  `hello.challenge`, `hello.ok`, `heartbeat.pong` and `agent.update` in a shape it reads. wsmp
-  drops fields it does not know in those four frames (`OPEN_FRAMES` in
-  `apps/cli/src/protocol.rs`), so adding one is safe; removing or retyping one is not.
+  `hello.challenge`, `hello.ok`, `heartbeat.pong`, `agent.update`, `agent.update.ack`,
+  `trust.lower` and `protocol.error` in a shape it reads. wsmp drops fields it does not know in
+  those frames (`OPEN_FRAMES` in `apps/cli/src/protocol.rs`), so adding one is safe; removing or
+  retyping one is not.
+- **Never add a value to an enum field of those frames** (`hello.ok`'s `definitionSync`, say):
+  an older wsmp cannot read the frame. Add a new field instead. `protocol.error`'s `code` is the
+  one exception: wsmp reads a code it does not know as a generic error and reconnects.
 - The browser update is offered only where it has been verified on a real machine
   (`AGENT_UPDATE_OFFERED` in `packages/api/src/lib/agent-updates.ts`): add a platform there,
   with a server deploy, once its dead-man, restart and confirmation pass on it.

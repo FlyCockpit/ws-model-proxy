@@ -1223,6 +1223,10 @@ pub enum ProtocolErrorCode {
     AccessDenied,
     Malformed,
     Internal,
+    /// A code a later server added: the node prints the server's message and
+    /// reconnects with backoff, rather than failing to read the frame.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
