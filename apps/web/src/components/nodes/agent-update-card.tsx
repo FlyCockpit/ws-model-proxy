@@ -52,7 +52,7 @@ const K = "dashboard:nodes.agentUpdate";
 const POLICIES: readonly AgentUpdatePolicy[] = ["ALLOWED", "OFF"];
 
 /** Copy for a refusal code the server puts in `blockedReason` (or a generic line). */
-export function blockedReasonText(t: TFunction, reason: string | null): string {
+function blockedReasonText(t: TFunction, reason: string | null): string {
   if (!reason) return t(`${K}.blocked.generic`);
   return t([...refusalKeys(reason), `${K}.blocked.generic`]);
 }
