@@ -29,9 +29,10 @@ use serde_json::Value;
 
 #[cfg(unix)]
 pub(crate) mod atomic;
-#[cfg(unix)]
+#[cfg(windows)]
+#[path = "atomic_windows.rs"]
+pub(crate) mod atomic;
 pub(crate) mod diff;
-#[cfg(unix)]
 pub mod edit;
 pub mod error;
 pub mod etag;
@@ -44,6 +45,10 @@ mod intent;
 pub mod list;
 #[cfg(unix)]
 pub mod mutate;
+#[cfg(windows)]
+#[path = "mutate_windows.rs"]
+pub mod mutate;
+mod mutate_args;
 pub mod policy;
 pub mod pool;
 pub mod read;
@@ -73,7 +78,6 @@ pub(crate) mod walk;
 #[cfg(windows)]
 #[path = "walk_windows.rs"]
 pub(crate) mod walk;
-#[cfg(unix)]
 pub mod write;
 
 pub use error::{ErrorCode, FileError, FileResult};
@@ -418,13 +422,11 @@ impl FileOps {
         search::search(self, args, cancel)
     }
 
-    #[cfg(unix)]
     pub fn edit(&self, args: &edit::EditArgs, cancel: &Cancel) -> FileResult<edit::EditResult> {
         self.policy.check_process()?;
         edit::edit(self, args, cancel)
     }
 
-    #[cfg(unix)]
     pub fn write(
         &self,
         args: &write::WriteArgs,
@@ -434,7 +436,6 @@ impl FileOps {
         write::write(self, args, cancel)
     }
 
-    #[cfg(unix)]
     pub fn rename(
         &self,
         args: &mutate::RenameArgs,
@@ -444,7 +445,6 @@ impl FileOps {
         mutate::rename(self, args, cancel)
     }
 
-    #[cfg(unix)]
     pub fn dir_create(
         &self,
         args: &mutate::MkdirArgs,
@@ -454,7 +454,6 @@ impl FileOps {
         mutate::mkdir(self, args, cancel)
     }
 
-    #[cfg(unix)]
     pub fn delete(
         &self,
         args: &mutate::DeleteArgs,
@@ -482,24 +481,11 @@ impl FileOps {
             "stat" => out(self.stat(&parse(args)?, cancel)?),
             "list" => out(self.dir_list(&parse(args)?, cancel)?),
             "search" => out(self.search(&parse(args)?, cancel)?),
-            #[cfg(unix)]
             "edit" => out(self.edit(&parse(args)?, cancel)?),
-            #[cfg(unix)]
             "write" => out(self.write(&parse(args)?, cancel)?),
-            #[cfg(unix)]
             "rename" => out(self.rename(&parse(args)?, cancel)?),
-            #[cfg(unix)]
             "mkdir" => out(self.dir_create(&parse(args)?, cancel)?),
-            #[cfg(unix)]
             "delete" => out(self.delete(&parse(args)?, cancel)?),
-            #[cfg(not(unix))]
-            "edit" | "write" | "rename" | "mkdir" | "delete" => {
-                drop(args);
-                Err(FileError::new(
-                    ErrorCode::Unsupported,
-                    "this node serves the read file tools only (Windows)",
-                ))
-            }
             other => Err(FileError::invalid(format!("unknown file op `{other}`"))),
         }
     }
@@ -507,7 +493,6 @@ impl FileOps {
 
 /// Validate the optional `reason` carried by write-class tools (it goes to the
 /// audit log in a later phase).
-#[cfg(unix)]
 pub(crate) fn check_reason(reason: &Option<String>) -> FileResult<()> {
     match reason {
         Some(reason) if reason.chars().count() > 500 => {

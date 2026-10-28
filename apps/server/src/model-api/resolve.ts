@@ -20,6 +20,7 @@ import type {
   TargetHealthStatus,
 } from "@ws-model-proxy/api/lib/pool-routing";
 import { type RequestCompat, storedRequestCompat } from "@ws-model-proxy/api/lib/request-compat";
+import { effectiveModelCapabilities } from "@ws-model-proxy/api/lib/runtime-model-capabilities";
 import {
   POOL_ADVANCED_COLUMNS,
   POOL_ADVANCED_OVERRIDES,
@@ -714,7 +715,7 @@ function routeParts(row: TargetSelected, now: Date): TestRoute | null {
       id: model.id,
       userId: model.userId,
       upstreamModelId: model.upstreamModelId,
-      capabilities: model.capabilitiesOverridden ? model.capabilities : model.detectedCapabilities,
+      capabilities: effectiveModelCapabilities(model),
       type: model.type,
       transcriptionProfile: model.transcriptionProfile,
       embeddingContract: model.embeddingContract,

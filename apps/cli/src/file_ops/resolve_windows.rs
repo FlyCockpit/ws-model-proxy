@@ -159,18 +159,20 @@ pub struct Resolved {
     pub dir: DirHandle,
     pub dir_path: PathBuf,
     pub name: OsString,
+    /// Parents `make_parents` created, outermost first (removed again when a
+    /// write fails: [`Self::rollback_created`]).
+    pub created: Vec<PathBuf>,
 }
 
 pub struct ResolveOpts<'a> {
-    /// Follow a link in the last component. `false` for stat, which acts on
-    /// the link itself.
+    /// Follow a link in the last component. `false` for stat, rename source and
+    /// delete, which act on the link itself.
     pub follow_last: bool,
-    /// Unix only (the write tools create missing parents); always `None` here.
-    #[allow(dead_code)]
+    /// Create missing parents (the mode has no meaning on Windows).
     pub make_parents: Option<u32>,
     pub policy: &'a Policy,
     pub access: Access,
-    #[allow(dead_code)]
+    /// Checked before every parent creation.
     pub cancel: Option<&'a super::Cancel>,
 }
 
@@ -181,7 +183,16 @@ impl Resolved {
             dir: parent.clone(),
             dir_path,
             name,
+            created: Vec::new(),
         })
+    }
+
+    /// Remove the parents this resolution created, innermost first, each only
+    /// while it is empty (a directory that is not is left as it is).
+    pub fn rollback_created(&mut self) {
+        while let Some(created) = self.created.pop() {
+            let _ = std::fs::remove_dir(&created);
+        }
     }
 
     pub fn is_self(&self) -> bool {
@@ -389,7 +400,7 @@ pub fn posix_view(path: &Path) -> Option<String> {
 
 /// Whether two physical paths name the same place (case-insensitively, as
 /// NTFS compares names; `\\?\C:\` and `C:\` alike).
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     match (posix_view(a), posix_view(b)) {
         (Some(a), Some(b)) => a.to_lowercase() == b.to_lowercase(),
         _ => false,
@@ -406,10 +417,75 @@ fn physical(path: &Path) -> FileResult<PathBuf> {
     Ok(real)
 }
 
+/// `parent` as a physical path. With `make_parents` the missing directories
+/// are created under the deepest one that exists, each checked by the policy
+/// first; they are recorded in `created` (and removed again when a later one
+/// fails).
+fn physical_parent(
+    parent: &Path,
+    opts: &ResolveOpts<'_>,
+    created: &mut Vec<PathBuf>,
+) -> FileResult<PathBuf> {
+    match physical(parent) {
+        Err(error) if error.code == ErrorCode::NotFound && opts.make_parents.is_some() => {}
+        found => return found,
+    }
+    let mut missing = Vec::new();
+    let mut base = parent;
+    let existing = loop {
+        let (Some(name), Some(up)) = (base.file_name(), base.parent()) else {
+            return Err(FileError::new(
+                ErrorCode::NotFound,
+                "the drive does not exist",
+            ));
+        };
+        missing.push(name.to_os_string());
+        base = up;
+        match physical(base) {
+            Ok(real) => break real,
+            Err(error) if error.code == ErrorCode::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    };
+    let mut made = Vec::new();
+    let result = (|| -> FileResult<PathBuf> {
+        let mut dir = existing;
+        for name in missing.into_iter().rev() {
+            if let Some(cancel) = opts.cancel {
+                cancel.check()?;
+            }
+            dir.push(name);
+            opts.policy.check_path(Access::Write, &dir)?;
+            match std::fs::create_dir(&dir) {
+                Ok(()) => made.push(dir.clone()),
+                // Made meanwhile by someone else: go on from where it really is.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    dir = physical(&dir)?;
+                }
+                Err(error) => return Err(FileError::io(&error)),
+            }
+        }
+        Ok(dir)
+    })();
+    match result {
+        Ok(dir) => {
+            created.extend(made);
+            Ok(dir)
+        }
+        Err(error) => {
+            while let Some(dir) = made.pop() {
+                let _ = std::fs::remove_dir(&dir);
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Resolve `input` and apply the policy to the result. This is the one
 /// enforcement point for every file tool path.
 pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
     let expanded = expand(input)?;
+    let mut created = Vec::new();
     let resolved = match (expanded.parent(), expanded.file_name()) {
         // A drive root.
         (None, _) | (_, None) => {
@@ -420,6 +496,7 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
                 },
                 dir_path,
                 name: OsString::from("."),
+                created: Vec::new(),
             }
         }
         (Some(parent), Some(leaf)) => {
@@ -438,7 +515,10 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
                     // A link to a drive root.
                     _ => (real.clone(), OsString::from(".")),
                 },
-                None => (physical(parent)?, leaf.to_os_string()),
+                None => (
+                    physical_parent(parent, opts, &mut created)?,
+                    leaf.to_os_string(),
+                ),
             };
             Resolved {
                 dir: DirHandle {
@@ -446,10 +526,15 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
                 },
                 dir_path,
                 name,
+                created,
             }
         }
     };
-    opts.policy.check_path(opts.access, &resolved.full_path())?;
+    if let Err(error) = opts.policy.check_path(opts.access, &resolved.full_path()) {
+        let mut resolved = resolved;
+        resolved.rollback_created();
+        return Err(error);
+    }
     Ok(resolved)
 }
 

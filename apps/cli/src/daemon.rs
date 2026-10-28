@@ -59,7 +59,7 @@ use crate::runtime_store::{Defines, Store};
 use crate::runtimes::endpoints::Target;
 use crate::runtimes::executor::Job;
 use crate::sessions::{
-    DEFAULT_COMMAND_MAX, ExecRegistry, OutboundFrame, TermHandshake, TerminalRegistry,
+    DEFAULT_COMMAND_MAX, ExecLine, ExecRegistry, OutboundFrame, TermHandshake, TerminalRegistry,
 };
 use crate::slug::generated_slug;
 use crate::startup::TerminalStartup;
@@ -1719,14 +1719,27 @@ where
         ServerFrame::ExecStart {
             command_id,
             command,
+            argv,
+            shell,
             cwd,
             timeout_ms,
         } => {
+            // The frame rules let exactly one of `command` and `argv` through.
+            let line = match (&command, &argv) {
+                (Some(text), _) => ExecLine::Text(text),
+                (None, Some(argv)) => ExecLine::Argv(argv),
+                (None, None) => ExecLine::Argv(&[]),
+            };
             send_outbound_frames(
                 socket,
-                session
-                    .execs
-                    .start(startup, &command_id, &command, cwd.as_deref(), timeout_ms),
+                session.execs.start(
+                    startup,
+                    &command_id,
+                    &line,
+                    shell,
+                    cwd.as_deref(),
+                    timeout_ms,
+                ),
             )?;
         }
         ServerFrame::ExecPoll {

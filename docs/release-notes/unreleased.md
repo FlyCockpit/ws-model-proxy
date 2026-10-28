@@ -11,8 +11,16 @@ Install it from the server with `irm <server>/install.ps1 | iex`, or with the Wi
 runtime only on nodes whose management modes and shells can run it (a Windows node has no `sh`,
 so no `sh` launch lands there). Image paste works in
 Windows terminals once the web app is upgraded too: the node quotes the path for the terminal's
-shell. Interactive runtime steps open operator terminals there as on Linux. On Windows the node file tools serve reads only (read, stat, list and search), with paths in a POSIX view (`/c/Users/...`). The tools that change files are refused there. The CLI README's Windows
-section lists the limits, and the WSL2 alternative.
+shell. Interactive runtime steps open operator terminals there as on Linux. On Windows the node
+file tools take paths in a POSIX view (`/c/Users/...`). Writes, edits, renames, mkdir and delete
+work there too, with atomic replace but without the Unix recovery journal. The CLI README's
+Windows section lists the limits, and the WSL2 alternative.
+
+`node_command_run` can now name its shell (`shell`: `sh`, `pwsh`, `powershell` or `cmd`, one the
+node reports), or take an argv (`command: ["curl", "-d", "…"]`) whose arguments reach the program
+exactly. Without either, a command runs as before, except that on Windows `cmd` now gets the text
+exactly as sent (before, every `"` reached it as `\"`). A node must run this release's `wsmp` for
+`shell` or an argv: an older one refuses the command, and the server says to upgrade it.
 
 Runtime commands can now be argv lists, which every node quotes for its own shell, and a launch
 can name its shell (`launch.shell`: `sh`, `pwsh`, `powershell` or `cmd`). On Windows an argv whose

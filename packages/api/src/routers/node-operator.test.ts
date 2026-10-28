@@ -86,6 +86,20 @@ const fullNode = {
   commandMaxMs: 3_600_000,
 };
 
+/** What a node reports (`features`), with the shells its commands can run in. */
+function featuresWith(platform: "linux" | "windows", shells: string[]) {
+  return {
+    terminals: { supported: true, max: 4, approvalRequired: false },
+    operatorTerminals: false,
+    files: { roots: null, asRoot: false, source: "default" },
+    runtimeHosts: [],
+    mediaExpand: true,
+    liveStt: true,
+    secrets: [],
+    launch: { platform, management: ["process", "service"], shells },
+  };
+}
+
 const startedAt = new Date("2026-10-06T12:00:00Z");
 const commandRow = {
   id: "AAAAAAAAAAAAAAAAAAAAAA",
@@ -282,6 +296,69 @@ describe("node commands", () => {
       command: "ls -la",
       timeoutMs: 60_000,
     });
+  });
+
+  it("passes an argv and a shell to the node as they are, and audits the argv as read", async () => {
+    const ops = operator();
+    const windows = {
+      ...fullNode,
+      features: featuresWith("windows", ["pwsh", "cmd"]),
+    };
+    db.node.findFirst.mockResolvedValue(windows as never);
+    db.nodeCommand.create.mockResolvedValue(commandRow as never);
+    const argv = ["curl", "-d", '{"input": "a | b"}', "http://127.0.0.1:8080/v1/embeddings"];
+    await client(FULL_AGENT, ops).commands.run({ ...runInput, command: argv });
+    expect(ops.startCommand.mock.calls[0]?.[0]).toMatchObject({ command: argv });
+    expect(ops.startCommand.mock.calls[0]?.[0]).not.toHaveProperty("shell");
+    expect(db.nodeCommand.create.mock.calls[0]?.[0].data.subject).toMatch(
+      /^hmac-sha256:[0-9a-f]{64} curl$/,
+    );
+    await client(FULL_AGENT, ops).commands.run({ ...runInput, command: "$r = 1", shell: "pwsh" });
+    expect(ops.startCommand.mock.calls[1]?.[0]).toMatchObject({
+      command: "$r = 1",
+      shell: "pwsh",
+    });
+  });
+
+  it("refuses a shell the node does not have, and an argv for cmd, before anything runs", async () => {
+    const linux = {
+      ...fullNode,
+      features: featuresWith("linux", ["sh"]),
+    };
+    db.node.findFirst.mockResolvedValue(linux as never);
+    await expect(
+      client(FULL_AGENT, operator()).commands.run({ ...runInput, shell: "pwsh" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { reason: "shell_unavailable" } });
+    await expect(
+      client(FULL_AGENT, operator()).commands.run({ ...runInput, command: ["dir"], shell: "cmd" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      client(FULL_AGENT, operator()).commands.run({ ...runInput, command: [" ", "x"] }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.nodeCommand.create).not.toHaveBeenCalled();
+  });
+
+  it("says which shell the node could not use, and when its wsmp is too old for one", async () => {
+    db.node.findFirst.mockResolvedValue(fullNode as never);
+    db.nodeCommand.create.mockResolvedValue(commandRow as never);
+    db.nodeCommand.updateMany.mockResolvedValue({ count: 1 });
+    const refusedWith = (nodeReason: string) => {
+      const ops = operator();
+      ops.startCommand.mockRejectedValue(Object.assign(new Error("rejected"), { nodeReason }));
+      return ops;
+    };
+    await expect(
+      client(FULL_AGENT, refusedWith("shell_unavailable")).commands.run({
+        ...runInput,
+        shell: "powershell",
+      }),
+    ).rejects.toMatchObject({ data: { reason: "shell_unavailable" } });
+    await expect(
+      client(FULL_AGENT, refusedWith("bad_command")).commands.run({ ...runInput, command: ["ls"] }),
+    ).rejects.toMatchObject({ data: { reason: "upgrade_wsmp" } });
+    await expect(
+      client(FULL_AGENT, refusedWith("bad_command")).commands.run(runInput),
+    ).rejects.toMatchObject({ data: { reason: "node_offline" } });
   });
 
   it("refuses hidden characters in the command", async () => {

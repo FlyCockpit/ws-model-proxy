@@ -166,13 +166,13 @@ pub fn endpoint_for(handle: &str, spec: &RuntimeSpec, base_url: String) -> Endpo
     }
 }
 
-/// The capabilities a served model has on the wire: as declared, else the
-/// model type's default.
+/// The capabilities a served model has on the wire: as declared, else (none
+/// declared, or an empty list) the model type's default, as the server stores it.
 pub fn model_capabilities(
     spec: &RuntimeSpec,
     declared: Option<&[ModelCapability]>,
 ) -> Vec<ModelCapability> {
-    if let Some(declared) = declared {
+    if let Some(declared) = declared.filter(|declared| !declared.is_empty()) {
         return declared.to_vec();
     }
     match spec.model_type {
@@ -228,5 +228,42 @@ pub fn always_on_entry(
         models: inventory_models(spec, discovered),
         engine_facts: None,
         truncated: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_model_without_declared_capabilities_has_its_type_s() {
+        let spec: RuntimeSpec = serde_json::from_value(serde_json::json!({
+            "api": "openai", "engine": "llama_cpp", "modelType": "embeddings",
+            "models": [
+                { "id": "bare" },
+                { "id": "empty", "capabilities": [] },
+                { "id": "declared", "capabilities": ["embedding", "text_generation"] },
+            ],
+            "address": { "baseUrl": "http://127.0.0.1:8080" },
+        }))
+        .expect("spec");
+        let models = inventory_models(&spec, &[]);
+        let capabilities: Vec<_> = models
+            .iter()
+            .map(|model| model.capabilities.clone())
+            .collect();
+        assert_eq!(
+            capabilities,
+            [
+                vec![ModelCapability::Embedding],
+                vec![ModelCapability::Embedding],
+                vec![ModelCapability::Embedding, ModelCapability::TextGeneration],
+            ]
+        );
+        // Discovered models take the type's too.
+        let mut discovered = spec.clone();
+        discovered.models = None;
+        let models = inventory_models(&discovered, &["found".to_string()]);
+        assert_eq!(models[0].capabilities, [ModelCapability::Embedding]);
     }
 }

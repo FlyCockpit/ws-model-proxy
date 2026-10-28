@@ -1,14 +1,14 @@
-//! What the read-only node file tools need about an open file and the
-//! process: the file's identity and final path from its handle (so a check
-//! is made on the object actually opened, not on a name that may have been
-//! swapped), and whether this process is elevated (the Windows stand-in for
-//! running as root).
+//! What the node file tools need about an open file and the process: the
+//! file's identity and final path from its handle (so a check is made on the
+//! object actually opened, not on a name that may have been swapped), a rename
+//! that never replaces its destination, and whether this process is elevated
+//! (the Windows stand-in for running as root).
 
 use std::fs::File;
 use std::io;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsHandle, AsRawHandle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::HANDLE;
@@ -17,7 +17,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_NAME_NORMALIZED, GetFileInformationByHandle,
-    GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    GetFinalPathNameByHandleW, MoveFileExW, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::Threading::OpenProcessToken;
 
@@ -88,6 +88,16 @@ pub fn final_path(file: &File) -> io::Result<PathBuf> {
     }
 }
 
+/// Rename `from` to `to` on one volume, failing with `AlreadyExists` when `to`
+/// exists (std's `rename` replaces it). A directory moves with its contents.
+pub fn move_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    let wide = |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain([0]).collect() };
+    let (from, to) = (wide(from), wide(to));
+    // SAFETY: both are NUL-terminated UTF-16 paths that outlive the call; no
+    // flags: the move fails rather than replace `to` or copy across volumes.
+    check(unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) })
+}
+
 /// Whether this process runs elevated (an administrator's full token): the
 /// node file tools treat it as running as root.
 pub fn process_is_elevated() -> io::Result<bool> {
@@ -138,5 +148,21 @@ mod tests {
         drop((a, b));
         let _ = std::fs::remove_dir_all(&dir);
         process_is_elevated().expect("elevation is readable");
+    }
+
+    #[test]
+    fn a_move_never_replaces_its_destination() {
+        let dir = std::env::temp_dir().join(format!("wsmp-move-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (a, b, c) = (dir.join("a"), dir.join("b"), dir.join("c"));
+        std::fs::write(&a, b"a").expect("a");
+        std::fs::write(&b, b"b").expect("b");
+        let error = move_no_replace(&a, &b).expect_err("b exists");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&b).expect("b"), b"b");
+        move_no_replace(&a, &c).expect("c is free");
+        assert_eq!(std::fs::read(&c).expect("c"), b"a");
+        assert!(!a.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -566,7 +566,7 @@ pub fn invocation(
 /// `name` as PowerShell would find it, when that is an `.exe` or `.com`: an absolute path as it
 /// is, a bare name in each absolute `PATH` directory in turn; either with each `PATHEXT`
 /// extension unless it already ends in one. A relative path is left to the shell.
-fn find_exe(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
+pub fn find_exe(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
     let var = |key: &str| {
         env.iter()
             .rev()

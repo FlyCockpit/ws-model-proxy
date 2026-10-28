@@ -60,6 +60,27 @@ command and everything it started). A command lives at most its timeout
 (default 1 hour) and never longer than the node's command lifetime (1 minute to
 24 hours). Each poll returns at most a 64 KiB output tail.
 
+`command` is text or an argv, as in a runtime's commands:
+
+- **Text** runs in `shell`, one of the shells the node reports
+  (`features.launch.shells` in `nodes_get`: `sh` on Linux and macOS; `pwsh`,
+  `powershell` and `cmd` on Windows, when installed). Without `shell` it runs in
+  `sh`, and on Windows in `sh` when one is on `PATH` (Git Bash), else `cmd`. On
+  Windows prefer `shell: "pwsh"` (or `"powershell"`): `cmd` expands `%VAR%` when
+  it reads the whole line, so a variable set earlier on the same line stays
+  literal, and it treats `|`, `&` and `>` as operators unless you escape them
+  with `^`. `cmd` gets the text exactly as you sent it.
+- **An argv** (`["curl", "-d", "{\"a\": 1}", "http://…"]`) passes each argument
+  to the program exactly; no shell reads quotes, variables or pipes. On Windows
+  an `.exe` on `PATH` starts directly; anything else (a `.cmd` shim such as
+  `npm`, a PowerShell command) runs in `shell` (`pwsh` or `powershell`, default
+  `pwsh` when installed). `cmd` cannot run an argv. To reach WSL, use an argv:
+  `["wsl.exe", "-e", "bash", "-c", "…"]`.
+
+A shell the node does not report is refused with `shell_unavailable`. A node
+whose wsmp predates argv commands and `shell` refuses them (`upgrade_wsmp`);
+plain text without `shell` still works there.
+
 Anything that should keep running or serve traffic must be a runtime. A server
 started with a command is invisible to the proxy and dies with the command. When
 a step needs a person (for example a `sudo` password), queue it with

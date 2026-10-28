@@ -339,6 +339,23 @@ pub fn validate_command(command: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// [`validate_command`] for an argv: a program, and arguments that fit the same bound.
+pub fn validate_argv(argv: &[String]) -> Result<(), &'static str> {
+    if argv.first().is_none_or(|program| program.trim().is_empty()) {
+        return Err("the argv has no program");
+    }
+    if argv.len() > crate::protocol::runtime_spec::RUNTIME_ARGV_MAX {
+        return Err("the argv has too many arguments");
+    }
+    if argv.iter().map(|arg| arg.len() + 1).sum::<usize>() > 4097 {
+        return Err("command is longer than 4096 bytes");
+    }
+    if argv.iter().any(|arg| arg.as_bytes().contains(&0)) {
+        return Err("command contains NUL");
+    }
+    Ok(())
+}
+
 pub fn resolve_cwd(cwd: Option<&str>, home: &Path) -> Result<PathBuf, &'static str> {
     let path = match cwd {
         None => home.to_path_buf(),

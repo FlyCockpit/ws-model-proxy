@@ -141,7 +141,10 @@ export const REFUSAL_REASONS = [
    */
   "definition_slots_full",
   // Windows terminals.
-  /** A browser terminal named a shell the node did not advertise (or no longer does). */
+  /**
+   * A browser terminal or a node command named a shell the node did not advertise (or no longer
+   * does).
+   */
   "shell_unavailable",
   // Runtimes on every platform.
   /**

@@ -120,6 +120,11 @@ pub(crate) fn validate_args(args: &WriteArgs) -> FileResult<(Vec<u8>, Option<u32
     check_reason(&args.reason)?;
     let content = decode_content(args)?;
     let if_exists = args.if_exists.unwrap_or_default();
+    if cfg!(windows) && args.mode.is_some() {
+        return Err(FileError::invalid(
+            "mode is not supported on Windows; leave it out",
+        ));
+    }
     let mode = args.mode.as_deref().map(parse_mode).transpose()?;
     if if_exists == IfExists::Replace {
         if args.expected_etag.is_none() {

@@ -33,6 +33,7 @@ import {
 import { jsonObject } from "../lib/registry-view";
 import { type RequestCompat, storedRequestCompat } from "../lib/request-compat";
 import { launchIdentity, reservationsKey } from "../lib/reservations";
+import { effectiveModelCapabilities } from "../lib/runtime-model-capabilities";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
 import {
   authoredRuntimeSpecSchema,
@@ -270,7 +271,7 @@ function runtimeModelView(model: RuntimeModelRow) {
     upstreamModelId: model.upstreamModelId,
     type: model.type,
     detectedCapabilities: model.detectedCapabilities,
-    capabilities: model.capabilitiesOverridden ? model.capabilities : model.detectedCapabilities,
+    capabilities: effectiveModelCapabilities(model),
     capabilitiesOverridden: model.capabilitiesOverridden,
     retired: model.retired,
     pools: model.Members.map((member) => ({

@@ -15,6 +15,7 @@ import { applyJsonPatch } from "./registry-view";
 import type { RequestCompat } from "./request-compat";
 import { retakeInstanceClaims } from "./reservations";
 import { runtimeContentHash, runtimeLaunchHash } from "./runtime-launch-hash";
+import { typeDefaultCapabilities } from "./runtime-model-capabilities";
 import type { RuntimeSpec } from "./runtime-spec";
 
 export type Tx = Prisma.TransactionClient;
@@ -158,8 +159,8 @@ export async function createVersion(
 
 /**
  * Served models follow the spec: listed ids are (re)activated with the spec's type and declared
- * capabilities; others are retired (kept while pools reference them). An always-on runtime
- * without `models` keeps what discovery found.
+ * capabilities (none declared: the type's, as the node serves it); others are retired (kept
+ * while pools reference them). An always-on runtime without `models` keeps what discovery found.
  */
 export async function syncRuntimeModels(
   tx: Tx,
@@ -171,9 +172,8 @@ export async function syncRuntimeModels(
   const listed = spec.models ?? [];
   for (const model of listed) {
     if (!type) break;
-    const detectedCapabilities = (model.capabilities ?? []).map(
-      (capability) => CAPABILITY[capability],
-    );
+    const declared = (model.capabilities ?? []).map((capability) => CAPABILITY[capability]);
+    const detectedCapabilities = declared.length > 0 ? declared : typeDefaultCapabilities(type);
     await tx.runtimeModel.upsert({
       where: {
         runtimeId_upstreamModelId: { runtimeId: input.runtimeId, upstreamModelId: model.id },

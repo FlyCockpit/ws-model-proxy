@@ -1,0 +1,6 @@
+{
+  "type": "exec.start",
+  "commandId": "UnecweYLMFV6n8TpDjNYfQ",
+  "argv": ["curl", "-s", "-d", "{\"input\": \"a | b\"}", "http://127.0.0.1:8080/v1/embeddings"],
+  "timeoutMs": 60000
+}

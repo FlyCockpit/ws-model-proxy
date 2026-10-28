@@ -306,8 +306,9 @@ impl Policy {
 /// Match EVERY component with the same normalization as staging names, including
 /// case folding and trailing dots/spaces. Reads and recursive discovery stay allowed.
 fn is_recovery_path(path: &Path) -> bool {
+    // Either separator: on Windows a path's names are split by `\`.
     super::redact::fold(&path.to_string_lossy())
-        .split('/')
+        .split(['/', std::path::MAIN_SEPARATOR])
         .any(|name| {
             let name = name.strip_prefix(".wsmp-lock-").unwrap_or(name);
             name.strip_prefix(".wsmp-recover-").is_some_and(|suffix| {
@@ -323,7 +324,10 @@ fn is_staging_name(path: &Path) -> bool {
     // folded like every path classification: Unicode case variants (`.wſmp-`) and
     // trailing dots or spaces name the same staged object on a casefold volume
     let folded = super::redact::fold(&path.to_string_lossy());
-    let name = folded.rsplit('/').next().unwrap_or_default();
+    let name = folded
+        .rsplit(['/', std::path::MAIN_SEPARATOR])
+        .next()
+        .unwrap_or_default();
     let Some(rest) = name.strip_prefix('.') else {
         return false;
     };

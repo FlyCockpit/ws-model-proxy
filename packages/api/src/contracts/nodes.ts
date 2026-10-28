@@ -12,6 +12,9 @@ import {
   nodeMetricCommandsSchema,
   nodeSecretNameSchema,
   portRangeSchema,
+  RUNTIME_ARGV_MAX,
+  RUNTIME_COMMAND_MAX_BYTES,
+  RUNTIME_SHELLS,
   runtimeLabelsSchema,
   terminalShellIdSchema,
 } from "../lib/runtime-spec";
@@ -376,6 +379,18 @@ const commandTextSchema = z
   .string()
   .min(1)
   .refine((value) => new TextEncoder().encode(value).byteLength <= 16_384, "At most 16 KiB.");
+
+/** A program and its arguments, each passed to it exactly: no shell parses them. */
+const commandArgvSchema = z
+  .array(z.string())
+  .min(1)
+  .max(RUNTIME_ARGV_MAX)
+  .refine((argv) => (argv[0] ?? "").trim().length > 0, "The first item is the program.")
+  .refine(
+    (argv) => new TextEncoder().encode(argv.join(" ")).byteLength <= RUNTIME_COMMAND_MAX_BYTES,
+    `At most ${RUNTIME_COMMAND_MAX_BYTES} bytes in all.`,
+  )
+  .refine((argv) => argv.every((arg) => !arg.includes("\0")), "No NUL characters.");
 
 // ── File tool shapes (relay `file.op` args plus the node) ──
 
@@ -809,7 +824,15 @@ export const nodesContract = {
       z
         .object({
           nodeId: idSchema,
-          command: commandTextSchema,
+          /** Text run in `shell`, or an argv: a program and its arguments, passed exactly. */
+          command: z.union([commandTextSchema, commandArgvSchema]),
+          /**
+           * The text command's interpreter, one the node has (`features.launch.shells`). Absent:
+           * `sh`; on Windows `sh` when it is on PATH, else `cmd`. An argv needs no shell; on
+           * Windows one that is not an `.exe` runs in PowerShell (`pwsh` or `powershell`, never
+           * `cmd`).
+           */
+          shell: z.enum(RUNTIME_SHELLS).optional(),
           cwd: z.string().min(1).max(4_096).optional(),
           /** Default 1 h; capped by the node's commandMaxMs (at most 24 h). */
           timeoutMs: z

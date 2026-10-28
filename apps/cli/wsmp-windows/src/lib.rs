@@ -28,7 +28,9 @@ mod imp;
 #[cfg(windows)]
 pub use conpty::{ConPty, ConsoleChild, PseudoConsole};
 #[cfg(windows)]
-pub use file_info::{FileIdentity, file_identity, final_path, process_is_elevated};
+pub use file_info::{
+    FileIdentity, file_identity, final_path, move_no_replace, process_is_elevated,
+};
 #[cfg(windows)]
 pub use host_job::{HOST_JOB_SLOTS, HostJob, in_host_job, send_ctrl_break};
 
