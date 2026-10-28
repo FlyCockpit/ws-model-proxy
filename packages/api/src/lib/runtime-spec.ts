@@ -854,6 +854,21 @@ export const nodeMetricCommandSchema = z
   });
 export type NodeMetricCommand = z.infer<typeof nodeMetricCommandSchema>;
 
+/**
+ * Whether a metric command has a shape only a node that reports `features.launch` can read: an
+ * argv or a `shell`. A released CLI without it reads `command` as text and refuses unknown
+ * fields, and a `runtime.define` it cannot parse ends its session, so it is never sent one.
+ */
+export function metricCommandNeedsLaunch(command: NodeMetricCommand): boolean {
+  return typeof command.command !== "string" || command.shell !== undefined;
+}
+
+/** Whether the node reports `features.launch` (it reads argv and `shell` metric commands). */
+export function reportsLaunchFeatures(features: unknown): boolean {
+  const parsed = nodeFeaturesSchema.safeParse(features);
+  return parsed.success && parsed.data.launch !== undefined;
+}
+
 /** Canonical UTF-8 size, or null when the value cannot be hashed (other issues report why). */
 export function canonicalBytes(value: unknown): number | null {
   try {

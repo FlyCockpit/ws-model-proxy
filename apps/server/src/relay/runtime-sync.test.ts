@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 const db = vi.hoisted(() => ({
   node: { findUnique: vi.fn(), findMany: vi.fn(), updateMany: vi.fn(async () => ({ count: 1 })) },
@@ -40,7 +41,9 @@ vi.mock("@ws-model-proxy/api/lib/graph-write", () => ({
 const { buildCompleteOperation, capDesired, createRuntimeSync, loadNodeDefinitionState } =
   await import("./runtime-sync.js");
 const { CHUNK_BUDGET_BYTES, runtimeDefineFrameSchema } = await import("./frames.js");
-const { runtimeLaunchHash } = await import("@ws-model-proxy/api/lib/runtime-launch-hash");
+const { nodeMetricCommandsHash, runtimeLaunchHash } = await import(
+  "@ws-model-proxy/api/lib/runtime-launch-hash"
+);
 const { RUNTIME_DEFINITIONS_MAX, runtimeSpecSchema } = await import(
   "@ws-model-proxy/api/lib/runtime-spec"
 );
@@ -698,6 +701,77 @@ describe("loadNodeDefinitionState", () => {
       RUNTIME_DEFINITIONS_MAX + 2,
     );
     errors.mockRestore();
+  });
+
+  describe("metric commands a released node cannot parse", () => {
+    const metric = { intervalSecs: 30, timeoutSecs: 5, format: "lines" as const };
+    const stored = [
+      { ...metric, name: "text", command: "nvidia-smi --query" },
+      { ...metric, name: "argv", command: ["nvidia-smi", "--query"] },
+      { ...metric, name: "shell", command: "Get-Counter", shell: "pwsh" },
+      { ...metric, name: "sh", command: "uptime", shell: "sh" },
+    ];
+    /** v0.4.2's `NodeMetricCommand`: text alone, unknown fields refused (a fatal frame fault). */
+    const released = z
+      .object({
+        name: z.string(),
+        command: z.string(),
+        intervalSecs: z.number(),
+        timeoutSecs: z.number(),
+        format: z.enum(["json", "prometheus", "lines"]),
+        map: z.record(z.string(), z.unknown()).optional(),
+      })
+      .strict();
+
+    function mockNodeWith(features: unknown) {
+      db.node.findUnique.mockResolvedValueOnce({
+        userId: "user-1",
+        trust: "FULL",
+        trustLowerRequestedAt: null,
+        heldDefinitions: [],
+        portStart: 30000,
+        portEnd: 30999,
+        metricCommands: stored,
+        features,
+        commandMaxMs: 86_400_000,
+        FabricMembers: [],
+      });
+      mockRestartedInstance([]);
+    }
+
+    /** What v0.4.2 reports: no `launch`. */
+    const releasedFeatures = {
+      terminals: { supported: true, max: 4, approvalRequired: false },
+      operatorTerminals: false,
+      files: { roots: null, asRoot: false, source: "default" },
+      runtimeHosts: [],
+      mediaExpand: true,
+      liveStt: true,
+      secrets: [],
+    };
+
+    it("sends a node without features.launch only what v0.4.2 parses, hashed as sent", async () => {
+      mockNodeWith(releasedFeatures);
+      const state = await loadNodeDefinitionState("node-1");
+      const sent = state?.node?.metricCommands;
+      expect(sent?.commands.map((command) => command.name)).toEqual(["text"]);
+      for (const command of sent?.commands ?? []) released.parse(command);
+      expect(sent?.hash).toBe(nodeMetricCommandsHash(sent?.commands ?? []));
+    });
+
+    it("sends everything to a node that reports features.launch", async () => {
+      mockNodeWith({
+        ...releasedFeatures,
+        launch: { platform: "windows", management: ["process"], shells: ["pwsh", "cmd"] },
+      });
+      const state = await loadNodeDefinitionState("node-1");
+      expect(state?.node?.metricCommands.commands.map((command) => command.name)).toEqual([
+        "text",
+        "argv",
+        "shell",
+        "sh",
+      ]);
+    });
   });
 
   it("drops the earlier version once nothing on the node names it", async () => {

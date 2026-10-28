@@ -1138,8 +1138,10 @@ escaped{v="a\"b"} 1
     #[cfg(unix)]
     #[test]
     fn runs_a_command_and_never_captures_stderr() {
+        let text_line = |text: &str| CommandLine::Text(text.to_string());
         let output = run_command(
-            "echo 42; echo super-secret-stderr >&2",
+            &text_line("echo 42; echo super-secret-stderr >&2"),
+            None,
             Duration::from_secs(5),
             None,
         )
@@ -1148,7 +1150,7 @@ escaped{v="a\"b"} 1
         assert_eq!(text.trim(), "42");
         assert!(!text.contains("super-secret-stderr"));
         assert_eq!(
-            run_command("exit 3", Duration::from_secs(5), None),
+            run_command(&text_line("exit 3"), None, Duration::from_secs(5), None),
             Err(MetricCommandError::ExitStatus)
         );
     }
@@ -1156,13 +1158,19 @@ escaped{v="a\"b"} 1
     #[cfg(unix)]
     #[test]
     fn oversized_output_is_dropped() {
+        let text_line = |text: &str| CommandLine::Text(text.to_string());
         assert_eq!(
-            run_command("head -c 70000 /dev/zero", Duration::from_secs(5), None),
+            run_command(
+                &text_line("head -c 70000 /dev/zero"),
+                None,
+                Duration::from_secs(5),
+                None
+            ),
             Err(MetricCommandError::OutputTooLarge)
         );
         let started = Instant::now();
         assert_eq!(
-            run_command("yes 1", Duration::from_secs(20), None),
+            run_command(&text_line("yes 1"), None, Duration::from_secs(20), None),
             Err(MetricCommandError::OutputTooLarge)
         );
         assert!(started.elapsed() < Duration::from_secs(10));

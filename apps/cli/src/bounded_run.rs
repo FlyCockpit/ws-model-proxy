@@ -578,7 +578,7 @@ fn run_inner(
         }
     };
     #[cfg(windows)]
-    let mut child = match crate::job_tree::spawn(command) {
+    let mut child = match crate::job_tree::spawn_hidden(command) {
         Ok(child) => child,
         Err(_) => {
             spawn_failed();

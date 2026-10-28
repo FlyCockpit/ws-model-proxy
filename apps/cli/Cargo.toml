@@ -144,7 +144,11 @@ rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 # Pipes become std ChildStdout/ChildStderr via into_owned_handle before reading;
 # that conversion needs no extra Tokio feature. Windows kill-on-drop is also
 # synchronous and does not wait (ChildDropGuard delegates to std Child::kill).
-process-wrap = { version = "10", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }
+process-wrap = { version = "10", default-features = false, features = ["tokio1", "job-object", "kill-on-drop", "creation-flags"] }
+# Only for process-wrap's `CreationFlags` type (the one way to add creation flags to its job
+# spawn): commands get a hidden console of their own (`job_tree::spawn_hidden`). Already in the
+# tree as process-wrap's dependency; keep the versions matched.
+windows = { version = "0.62", default-features = false, features = ["Win32_System_Threading"] }
 # The audited Win32 calls this crate cannot make without unsafe (owner
 # decision 2026-10-23): the control pipe's owner-only DACL and peer checks,
 # and the relay job used by `trust::started_by_wsmp`. See wsmp-windows/.

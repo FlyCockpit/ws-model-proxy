@@ -3833,7 +3833,7 @@ fn spawn_exec(
     #[cfg(not(windows))]
     let mut child = crate::subreaper::spawn(|| process.spawn(), |child| Some(child.id()))?;
     #[cfg(windows)]
-    let mut child = crate::job_tree::spawn(process)?;
+    let mut child = crate::job_tree::spawn_hidden(process)?;
     let pid = child.id();
     #[cfg(not(windows))]
     let tracked = LiveChildGuard::track(LiveChild::ExecGroup(pid));

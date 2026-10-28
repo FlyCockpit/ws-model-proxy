@@ -546,7 +546,7 @@ an argv when it is one program (`["nvidia-smi", "--query-gpu=power.draw",
 hundred milliseconds of CPU, where an `.exe` starts at once. Name
 `shell: "cmd"` for Command Prompt text. A shell the node does not report is
 refused (`shell_unavailable`); the node must run this release's wsmp for
-`shell` or an argv.
+`shell` or an argv, even `shell: "sh"` (older: `upgrade_wsmp`).
 `format` is `lines` (`<metric> <value>` per line), `json` or `prometheus`.
 Without `map`, `json` reads a top-level number and `prometheus` the first sample,
 recorded as `name`. `map` names up to 16 metrics, each `{ series, labels?,
