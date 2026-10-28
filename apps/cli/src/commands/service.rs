@@ -181,6 +181,16 @@ pub fn restart_quietly() -> Result<()> {
     {
         require_installed()?;
         let domain = launchd_domain()?;
+        // An installed agent that is not loaded (booted out) is loaded first:
+        // `kickstart` fails on it (exit 113), where systemd and Task Scheduler
+        // start a stopped service.
+        if !agent_loaded(&domain) {
+            let file = service_file()?;
+            run_command(
+                "launchctl",
+                &["bootstrap", &domain, &file.display().to_string()],
+            )?;
+        }
         run_command(
             "launchctl",
             &["kickstart", "-k", &format!("{domain}/{MACOS_LABEL}")],
@@ -809,19 +819,24 @@ fn run_command(program: &str, args: &[&str]) -> Result<()> {
 /// that is not loaded, which is every first install.
 #[cfg(target_os = "macos")]
 fn bootout_if_loaded(domain: &str, file: &Path) {
-    let loaded = Command::new("launchctl")
-        .args(["print", &format!("{domain}/{MACOS_LABEL}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if loaded {
+    if agent_loaded(domain) {
         let _ = Command::new("launchctl")
             .args(["bootout", domain, &file.display().to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// Whether launchd has the relay agent loaded in `domain`.
+#[cfg(target_os = "macos")]
+fn agent_loaded(domain: &str) -> bool {
+    Command::new("launchctl")
+        .args(["print", &format!("{domain}/{MACOS_LABEL}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(target_os = "macos")]

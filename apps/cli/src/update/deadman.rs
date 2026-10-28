@@ -445,7 +445,14 @@ impl Scheduler for LaunchAgent {
         Ok(())
     }
     fn remove(&self) -> Result<()> {
+        // The plist first: when the dead-man removes itself, the bootout ends
+        // its own process, and nothing after it runs. Bootout by label needs no
+        // file.
         let plist = Self::plist_path()?;
+        if plist.exists() {
+            std::fs::remove_file(&plist)
+                .with_context(|| format!("removing `{}`", plist.display()))?;
+        }
         let _ = run_bounded(
             "launchctl",
             &[
@@ -455,10 +462,6 @@ impl Scheduler for LaunchAgent {
             &[],
             Duration::from_secs(15),
         );
-        if plist.exists() {
-            std::fs::remove_file(&plist)
-                .with_context(|| format!("removing `{}`", plist.display()))?;
-        }
         Ok(())
     }
 }
