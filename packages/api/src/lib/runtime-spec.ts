@@ -225,8 +225,11 @@ export type RuntimeManagement = (typeof RUNTIME_MANAGEMENTS)[number];
 export const RUNTIME_SHELLS = ["sh", "pwsh", "powershell", "cmd"] as const;
 export type RuntimeShell = (typeof RUNTIME_SHELLS)[number];
 /**
- * How a node command ran (`exec.started`'s `ranWith`): `shell` read text (or an argv the node
- * rendered as a script), or `direct`: an argv started as a program, each argument exact.
+ * How a node command ran (`exec.started`'s `ranWith`). `mode` is what happened to what the caller
+ * sent: `shell` read it as a script (text, or an argv the node rendered as one), so its quoting
+ * mattered; `direct`: an argv started as a program, each argument exact. `shell` names what ran
+ * the program, if anything: a direct `.bat` / `.cmd` names `cmd` (exact arguments, but cmd runs
+ * the file). Frozen once released: an older server refuses a mode it does not know.
  */
 export const NODE_COMMAND_RAN_MODES = ["shell", "direct"] as const;
 export type NodeCommandRanMode = (typeof NODE_COMMAND_RAN_MODES)[number];
