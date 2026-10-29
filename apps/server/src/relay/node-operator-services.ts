@@ -80,7 +80,7 @@ type PendingStart = {
   nodeId: string;
   userId: string;
   connectionGeneration: number;
-  resolve: (value: { startedAt: Date; endsBy: Date }) => void;
+  resolve: (value: Awaited<ReturnType<NodeOperatorServices["startCommand"]>>) => void;
   reject: (error: NodeCommandStartError) => void;
   timer: ReturnType<typeof setTimeout>;
 };
@@ -357,7 +357,7 @@ export function createNodeOperatorServices(
   };
 
   const handlers: NodeOperatorHandlers = {
-    "exec.started": (node, frame) => {
+    "exec.started": async (node, frame) => {
       const entry = pendingStarts.get(frame.commandId);
       if (!entry) {
         // A start that answered after its timeout: the row is already failed and a cancel
@@ -396,7 +396,29 @@ export function createNodeOperatorServices(
           },
         );
       }
-      entry.resolve({ startedAt: new Date(frame.startedAt), endsBy });
+      const started = { startedAt: new Date(frame.startedAt), endsBy };
+      const { ranWith } = frame;
+      if (!ranWith) {
+        entry.resolve(started);
+        return;
+      }
+      // Recorded once, on the row of this node's running command (the hardening keeps it).
+      try {
+        const recorded = await prisma.nodeCommand.updateMany({
+          where: {
+            id: frame.commandId,
+            nodeId: node.nodeId,
+            userId: node.userId,
+            state: "RUNNING",
+            ranMode: null,
+          },
+          data: { ranMode: ranWith.mode, ranShell: ranWith.shell },
+        });
+        entry.resolve(recorded.count === 1 ? { ...started, ranWith } : started);
+      } catch (error) {
+        console.error("[relay] recording how a node command ran failed", errorName(error));
+        entry.resolve(started);
+      }
     },
     "exec.rejected": (node, frame) => {
       const entry = pendingStarts.get(frame.commandId);

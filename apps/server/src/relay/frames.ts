@@ -40,6 +40,7 @@ import {
   NODE_COMMAND_STATES,
   NODE_COMMAND_TAIL_MAX_BYTES,
   NODE_SECRET_VALUE_MAX_BYTES,
+  nodeCommandRanWithSchema,
   nodeDeclaredHardwareSchema,
   nodeFabricSetsSchema,
   nodeFeaturesSchema,
@@ -1313,6 +1314,11 @@ export const nodeToServerControlFrameSchema = z.discriminatedUnion("type", [
       startedAt: isoTimeSchema,
       /** startedAt + min(timeoutMs, the node's commandMaxMs). */
       endsBy: isoTimeSchema,
+      /**
+       * Which shell ran it and how. Sent only after a `hello.ok` with `features.execRanWith`
+       * (a released 0.4.3 server refuses the field); released wsmp never sends it.
+       */
+      ranWith: nodeCommandRanWithSchema.optional(),
     })
     .strict(),
   z
@@ -1361,6 +1367,17 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
        * missing definitions yet. `none`: the node is Relay only, or nothing differs.
        */
       definitionSync: z.enum(["expect", "none"]),
+      /**
+       * Optional node frame fields this server accepts. A node sends one only when it is
+       * here (wsmp 0.4.3 ignores this field; an older server leaves it out).
+       */
+      features: z
+        .object({
+          /** `exec.started` may carry `ranWith`. */
+          execRanWith: z.literal(true).optional(),
+        })
+        .strict()
+        .optional(),
     })
     .strict(),
   z

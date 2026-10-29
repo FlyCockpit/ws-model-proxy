@@ -24,6 +24,8 @@ export const nodeCommandSelect = {
   startedAt: true,
   endsBy: true,
   finishedAt: true,
+  ranMode: true,
+  ranShell: true,
 } as const;
 
 export type NodeCommandRow = {
@@ -39,6 +41,9 @@ export type NodeCommandRow = {
   startedAt: Date;
   endsBy: Date;
   finishedAt: Date | null;
+  /** How the node ran it (`exec.started`'s `ranWith`); null when it did not say. */
+  ranMode: string | null;
+  ranShell: string | null;
 };
 
 const WIRE_STATE: Record<NodeCommandStateWire, NodeCommandState> = {

@@ -224,6 +224,32 @@ export type RuntimeManagement = (typeof RUNTIME_MANAGEMENTS)[number];
 /** Interpreters of a launch's text commands (`launch.shell`; `sh` when absent). */
 export const RUNTIME_SHELLS = ["sh", "pwsh", "powershell", "cmd"] as const;
 export type RuntimeShell = (typeof RUNTIME_SHELLS)[number];
+/**
+ * How a node command ran (`exec.started`'s `ranWith`). `mode` is what happened to what the caller
+ * sent: `shell` read it as a script (text, or an argv the node rendered as one), so its quoting
+ * mattered; `direct`: an argv started as a program, each argument exact. `shell` names what ran
+ * the program, if anything: a direct `.bat` / `.cmd` names `cmd` (exact arguments, but cmd runs
+ * the file). Frozen once released: an older server refuses a mode it does not know.
+ */
+export const NODE_COMMAND_RAN_MODES = ["shell", "direct"] as const;
+export type NodeCommandRanMode = (typeof NODE_COMMAND_RAN_MODES)[number];
+/**
+ * The shell that read a node command (`sh`, `pwsh`, `powershell`, `cmd`; `cmd` also for a
+ * Windows `.bat` / `.cmd` argv). A pattern, not `RUNTIME_SHELLS`: a later wsmp naming another
+ * shell must not break a strict server. The `node_command_shape` check has the same pattern.
+ */
+export const nodeCommandRanShellSchema = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/);
+export const nodeCommandRanWithSchema = z
+  .object({
+    /** Null: no shell (a program started directly). */
+    shell: nodeCommandRanShellSchema.nullable(),
+    mode: z.enum(NODE_COMMAND_RAN_MODES),
+  })
+  .strict()
+  .refine((ran) => ran.mode === "direct" || ran.shell !== null, {
+    message: "a command a shell ran names the shell",
+  });
+export type NodeCommandRanWith = z.infer<typeof nodeCommandRanWithSchema>;
 /** The operating systems a node reports for runtime launches (`features.launch.platform`). */
 export const NODE_PLATFORMS = ["linux", "macos", "windows"] as const;
 export type NodePlatform = (typeof NODE_PLATFORMS)[number];

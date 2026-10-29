@@ -1217,6 +1217,36 @@ pub struct DetectedServer {
     pub version: Option<String>,
 }
 
+/// `hello.ok`'s `features`: optional node frame fields this server accepts.
+/// Fields a later server adds here are ignored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerFeatures {
+    /// `exec.started` may carry `ranWith`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exec_ran_with: bool,
+}
+
+/// How a node command ran (`exec.started`'s `ranWith`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RanWith {
+    /// The shell that read the command: `sh`, `pwsh`, `powershell` or `cmd`
+    /// (`cmd` also for a `.bat` or `.cmd` argv on Windows, which cmd runs).
+    /// Null for a program started directly.
+    pub shell: Option<super::runtime_spec::CommandShell>,
+    pub mode: RanMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RanMode {
+    /// Text, or an argv rendered as a script, read by `shell`.
+    Shell,
+    /// An argv started as a program, each argument passed exactly.
+    Direct,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DefinitionSync {
@@ -1518,6 +1548,10 @@ pub enum NodeFrame {
         started_at: String,
         /// started_at + min(timeout_ms, the node's command_max_ms).
         ends_by: String,
+        /// How the node ran it. Sent only to a server whose `hello.ok` had
+        /// `features.execRanWith`: an older server's strict schema refuses it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ran_with: Option<RanWith>,
     },
     #[serde(rename = "exec.rejected")]
     ExecRejected { command_id: String, reason: String },
@@ -1585,6 +1619,10 @@ pub enum ServerFrame {
         protocol_version: String,
         node_id: String,
         definition_sync: DefinitionSync,
+        /// What this server accepts beyond protocol 3.0 as first released.
+        /// Absent from an older server: it accepts none of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        features: Option<ServerFeatures>,
     },
     #[serde(rename = "protocol.error")]
     ProtocolError {
@@ -2593,6 +2631,69 @@ mod tests {
         "job-reservation-unknown-field.json",
         "job-server-sent-interface-name.json",
     ];
+
+    #[test]
+    fn hello_ok_features_are_optional_and_lenient() {
+        let features = |json: Value| match serde_json::from_value::<ServerFrame>(json) {
+            Ok(ServerFrame::HelloOk { features, .. }) => features,
+            other => panic!("expected hello.ok, got {other:?}"),
+        };
+        let hello = |extra: Value| {
+            let mut json = serde_json::json!({
+                "type": "hello.ok",
+                "id": "h-1",
+                "protocolVersion": "3.0",
+                "nodeId": "nd5q6w7e8r9t0y1u2i3o4p5a6",
+                "definitionSync": "none",
+            });
+            if let (Some(object), Value::Object(extra)) = (json.as_object_mut(), extra) {
+                object.extend(extra);
+            }
+            json
+        };
+        // An older server: none of it.
+        assert_eq!(features(hello(serde_json::json!({}))), None);
+        assert!(
+            !features(hello(serde_json::json!({ "features": {} })))
+                .unwrap_or_default()
+                .exec_ran_with
+        );
+        // A later server's features this build does not know are ignored.
+        assert_eq!(
+            features(hello(serde_json::json!({
+                "features": { "execRanWith": true, "laterThing": { "x": 1 } }
+            }))),
+            Some(ServerFeatures {
+                exec_ran_with: true
+            })
+        );
+    }
+
+    #[test]
+    fn ran_with_has_its_wire_shape() {
+        let frame = NodeFrame::ExecStarted {
+            command_id: "UnecweYLMFV6n8TpDjNYfQ".into(),
+            started_at: "2026-10-06T12:00:00.000Z".into(),
+            ends_by: "2026-10-06T13:00:00.000Z".into(),
+            ran_with: Some(RanWith {
+                shell: None,
+                mode: RanMode::Direct,
+            }),
+        };
+        let json = serde_json::to_value(&frame).expect("serializes");
+        assert_eq!(
+            json["ranWith"],
+            serde_json::json!({ "shell": null, "mode": "direct" })
+        );
+        let without = NodeFrame::ExecStarted {
+            command_id: "UnecweYLMFV6n8TpDjNYfQ".into(),
+            started_at: "2026-10-06T12:00:00.000Z".into(),
+            ends_by: "2026-10-06T13:00:00.000Z".into(),
+            ran_with: None,
+        };
+        let json = serde_json::to_value(&without).expect("serializes");
+        assert!(json.get("ranWith").is_none(), "{json}");
+    }
 
     #[test]
     fn invalid_frames_are_refused() {

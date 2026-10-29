@@ -7,7 +7,7 @@ import type { modelsContract } from "./contracts/models";
 import type { AgentUpdatePort } from "./lib/agent-updates";
 import type { LiveLoadReader } from "./lib/live-load";
 import type { NodeRelayServices } from "./lib/node-relay-services";
-import type { RuntimeShell } from "./lib/runtime-spec";
+import type { NodeCommandRanWith, RuntimeShell } from "./lib/runtime-spec";
 
 export type CreateContextOptions = {
   context: HonoContext;
@@ -229,7 +229,12 @@ export type NodeOperatorServices = {
     shell?: RuntimeShell;
     cwd?: string;
     timeoutMs: number;
-  }): Promise<{ startedAt: Date; endsBy: Date }>;
+  }): Promise<{
+    startedAt: Date;
+    endsBy: Date;
+    /** How the node ran it, once recorded on the command's row; absent when it did not say. */
+    ranWith?: NodeCommandRanWith;
+  }>;
   /**
    * `exec.poll` (or `exec.cancel` when `cancel`): the node's view of a command, waiting up to
    * `waitMs` for it to finish. Null when the node is offline.

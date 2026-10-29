@@ -113,6 +113,8 @@ const commandRow = {
   startedAt,
   endsBy: new Date(startedAt.getTime() + 3_600_000),
   finishedAt: null,
+  ranMode: null,
+  ranShell: null,
 };
 
 const queuedRow = {
@@ -452,6 +454,30 @@ describe("node commands", () => {
     await expect(
       client(PERSON, ops).commands.get({ commandId: commandRow.id }),
     ).resolves.toMatchObject({ state: "RUNNING", output: null });
+  });
+
+  it("says how the node ran a command, and nothing when its wsmp did not say", async () => {
+    const ops = operator();
+    db.node.findFirst.mockResolvedValue(fullNode as never);
+    db.nodeCommand.create.mockResolvedValue(commandRow as never);
+    const unknown = await client(FULL_AGENT, ops).commands.run(runInput);
+    expect(unknown).not.toHaveProperty("ranWith");
+    ops.startCommand.mockResolvedValueOnce({
+      startedAt,
+      endsBy: commandRow.endsBy,
+      ranWith: { shell: "pwsh", mode: "shell" },
+    });
+    await expect(client(FULL_AGENT, ops).commands.run(runInput)).resolves.toMatchObject({
+      ranWith: { shell: "pwsh", mode: "shell" },
+    });
+    db.nodeCommand.findFirst.mockResolvedValue({
+      ...commandRow,
+      ranMode: "direct",
+      ranShell: null,
+    } as never);
+    await expect(
+      client(PERSON, ops).commands.get({ commandId: commandRow.id }),
+    ).resolves.toMatchObject({ ranWith: { shell: null, mode: "direct" } });
   });
 
   it("refuses to cancel a finished command and a Read-only agent's cancel", async () => {

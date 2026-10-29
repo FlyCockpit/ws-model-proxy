@@ -144,7 +144,14 @@ function commandView(
     startedAt: row.startedAt.toISOString(),
     endsBy: row.endsBy.toISOString(),
     ...(finishedAt ? { finishedAt: finishedAt.toISOString() } : {}),
+    ...ranWithView(row),
   };
+}
+
+/** `ranWith` as stored; nothing when the node did not report it. */
+function ranWithView(row: NodeCommandRow): Pick<NodeCommandView, "ranWith"> {
+  if (row.ranMode !== "shell" && row.ranMode !== "direct") return {};
+  return { ranWith: { shell: row.ranShell, mode: row.ranMode } };
 }
 
 async function pollAndSettle(
@@ -272,8 +279,9 @@ const commands = {
         message: "This credential was revoked or expired, or its account is blocked.",
       });
     }
+    let started: Awaited<ReturnType<NodeOperatorServices["startCommand"]>>;
     try {
-      await operator.startCommand({
+      started = await operator.startCommand({
         userId,
         nodeId: node.id,
         commandId,
@@ -323,7 +331,11 @@ const commands = {
         "CONFLICT",
       );
     }
-    return pollAndSettle(operator, row, COMMAND_RUN_ANSWER_MS, false);
+    // The relay recorded how it ran on the row when the node answered.
+    const ran = started.ranWith
+      ? { ranMode: started.ranWith.mode, ranShell: started.ranWith.shell }
+      : {};
+    return pollAndSettle(operator, { ...row, ...ran }, COMMAND_RUN_ANSWER_MS, false);
   }),
 
   get: contractProcedure(c.commands.get).handler(async ({ context, input }) => {

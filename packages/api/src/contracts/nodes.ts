@@ -7,6 +7,7 @@ import {
   NODE_COMMAND_GET_WAIT_MAX_MS,
   NODE_COMMAND_MAX_MS,
   NODE_COMMAND_MIN_MS,
+  NODE_COMMAND_RAN_MODES,
   NODE_SECRET_VALUE_MAX_BYTES,
   nodeFabricMembershipsSchema,
   nodeFeaturesSchema,
@@ -346,6 +347,14 @@ export const nodeCommandViewSchema = z
     startedAt: isoDateSchema,
     endsBy: isoDateSchema,
     finishedAt: isoDateSchema.optional(),
+    /**
+     * How the node ran it: the shell that read it (null: none), and `direct` for an argv
+     * started as a program. Absent when the node's wsmp does not report it.
+     */
+    ranWith: z
+      .object({ shell: z.string().nullable(), mode: z.enum(NODE_COMMAND_RAN_MODES) })
+      .strict()
+      .optional(),
   })
   .strict();
 
