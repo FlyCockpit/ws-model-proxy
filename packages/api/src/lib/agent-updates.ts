@@ -249,7 +249,10 @@ function storedSelfUpdate(features: unknown): NodeSelfUpdate | null {
 export const AGENT_UPDATE_OFFERED: ReadonlyArray<{
   os: "linux" | "macos" | "windows";
   strategy: AgentUpdateStrategy;
-}> = [{ os: "linux", strategy: "self-replace" }];
+}> = [
+  { os: "linux", strategy: "self-replace" },
+  { os: "macos", strategy: "self-replace" },
+];
 
 function osOf(target: string): "linux" | "macos" | "windows" | null {
   if (target.includes("-linux-")) return "linux";
