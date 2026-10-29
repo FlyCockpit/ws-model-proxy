@@ -66,6 +66,21 @@ describe("install.ps1 rendering", () => {
     expect(text).not.toMatch(/^\s*exit\b/m);
   });
 
+  it("writes the install receipt into the state directory wsmp uses", () => {
+    const text = windowsInstallScript(ORIGIN, { kind: "release", baseUrl: RELEASE });
+    // apps/cli/src/paths.rs state_dir: WSMP_STATE_DIR, XDG_STATE_HOME, then %LOCALAPPDATA%.
+    expect(text).toContain("$env:WSMP_STATE_DIR");
+    expect(text).toContain("Join-Path $env:XDG_STATE_HOME 'ws-model-proxy'");
+    expect(text).toContain("[Environment]::GetFolderPath('LocalApplicationData')");
+    expect(text).toContain("$receiptMethod = 'script-ps1'");
+    expect(text).toContain("Join-Path $state 'install.json'");
+    expect(text).toContain("Write-WsmpReceipt $receiptMethod $receiptTarget $installed");
+    const rev = "0123456789abcdef0123456789abcdef01234567";
+    expect(windowsInstallScript(ORIGIN, { kind: "source", rev })).toContain(
+      `$WsmpSourceRev = '${rev}'`,
+    );
+  });
+
   it("builds from source without a release", () => {
     expect(windowsInstallScript(ORIGIN, { kind: "source" })).toContain(
       `$WsmpSourceArgs = @('--branch', '${CLI_PREVIEW_BRANCH}')`,

@@ -129,14 +129,7 @@ pub(crate) fn rename(
             "source and destination are the same path",
         ));
     }
-    // Lock in path order so two renames cannot deadlock each other.
-    let (first, second) = if from_path <= to_path {
-        (from_path.clone(), to_path.clone())
-    } else {
-        (to_path.clone(), from_path.clone())
-    };
-    let _lock_a = ops.lock_path(first, cancel)?;
-    let _lock_b = ops.lock_path(second, cancel)?;
+    let _locks = ops.lock_pair(from_path.clone(), to_path.clone(), cancel)?;
 
     let src = from
         .lstat()?
@@ -171,6 +164,22 @@ pub(crate) fn rename(
         .lstat()?
         .map(|stat| Held::open(&to.dir, &to.name, stat))
         .transpose()?;
+    // On a volume where names are not case-sensitive (macOS by default) the
+    // destination of `notes.txt` -> `Notes.txt` is the source itself: one entry,
+    // renamed in place, as on Windows. Its identity and etag were checked as the
+    // source; `overwrite` is not needed for it.
+    if !overwrite
+        && let Some(dst) = &dst
+        && case_only_alias(&from, &to, &src.stat, &dst.stat)?
+    {
+        ops.step(Step::EtagRechecked)?;
+        cancel.check()?;
+        case_only_rename(&from, &to)?;
+        return Ok(RenameResult {
+            etag: src_etag,
+            recovered: Vec::new(),
+        });
+    }
     if let Some(dst) = &dst {
         if !overwrite {
             return Err(FileError::new(
@@ -533,6 +542,33 @@ mod same_object_rename_tests {
     }
 }
 
+/// Whether `to` names the same single entry as `from` under another spelling.
+fn case_only_alias(from: &Resolved, to: &Resolved, src: &Stat, dst: &Stat) -> FileResult<bool> {
+    let from_dir = Stat::from_raw(&fstat(from.dir.as_fd()).map_err(FileError::errno)?);
+    let to_dir = Stat::from_raw(&fstat(to.dir.as_fd()).map_err(FileError::errno)?);
+    Ok(
+        same_object_rename(src, dst, &from_dir, &from.name, &to_dir, &to.name)
+            == SameObjectRename::CaseOnlyRename,
+    )
+}
+
+/// Change one entry's spelling with a plain `renameat` (see `same_object_rename`
+/// for when that is the case and its residual), then sync both directories.
+fn case_only_rename(from: &Resolved, to: &Resolved) -> FileResult<()> {
+    super::recovery::probe_dir_barrier(&from.dir)?;
+    super::recovery::probe_dir_barrier(&to.dir)?;
+    renameat(
+        from.dir.as_fd(),
+        from.name.as_os_str(),
+        to.dir.as_fd(),
+        to.name.as_os_str(),
+    )
+    .map_err(FileError::errno)?;
+    nix::unistd::fsync(from.dir.as_fd()).map_err(|_| FileError::mutation_uncertain())?;
+    nix::unistd::fsync(to.dir.as_fd()).map_err(|_| FileError::mutation_uncertain())?;
+    Ok(())
+}
+
 /// Sole overwrite gate for rename: classify same-object pairs before allocating
 /// recovery. Case-only aliases use plain renameat with no recovery directory;
 /// other overwrites allocate one private recovery directory before mutation. Public
@@ -566,18 +602,7 @@ fn commit_rename(
                 ));
             }
             SameObjectRename::CaseOnlyRename => {
-                super::recovery::probe_dir_barrier(&from.dir)?;
-                super::recovery::probe_dir_barrier(&to.dir)?;
-                renameat(
-                    from.dir.as_fd(),
-                    from.name.as_os_str(),
-                    to.dir.as_fd(),
-                    to.name.as_os_str(),
-                )
-                .map_err(FileError::errno)?;
-                nix::unistd::fsync(from.dir.as_fd())
-                    .map_err(|_| FileError::mutation_uncertain())?;
-                nix::unistd::fsync(to.dir.as_fd()).map_err(|_| FileError::mutation_uncertain())?;
+                case_only_rename(from, to)?;
                 return Ok((Vec::new(), false));
             }
             SameObjectRename::NotSameObject => {}

@@ -12,7 +12,9 @@
 //! - runtime hosts: the kill-on-close job a host holds its runtime in, and
 //!   Ctrl+Break to the runtime's console process group;
 //! - the read-only node file tools: a file's identity and final path from its
-//!   handle, and whether the process is elevated.
+//!   handle, and whether the process is elevated;
+//! - hardware and telemetry: the machine's physical memory, total and
+//!   available.
 //!
 //! On other platforms the crate is empty.
 
@@ -24,6 +26,8 @@ mod file_info;
 mod host_job;
 #[cfg(windows)]
 mod imp;
+#[cfg(windows)]
+mod memory;
 
 #[cfg(windows)]
 pub use conpty::{ConPty, ConsoleChild, PseudoConsole};
@@ -33,6 +37,8 @@ pub use file_info::{
 };
 #[cfg(windows)]
 pub use host_job::{HOST_JOB_SLOTS, HostJob, in_host_job, send_ctrl_break};
+#[cfg(windows)]
+pub use memory::{MemoryStatus, memory_status, uptime_ms};
 
 #[cfg(windows)]
 pub use imp::{

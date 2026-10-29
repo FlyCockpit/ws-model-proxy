@@ -12,6 +12,7 @@
 //! Specs are stored exactly as received (raw JSON) so `launchHash` can be
 //! recomputed byte for byte; the typed form is parsed on use.
 
+pub mod repair;
 pub mod validate;
 
 use std::collections::{BTreeMap, BTreeSet};

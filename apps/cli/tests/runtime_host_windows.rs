@@ -472,13 +472,18 @@ fn an_exe_argv_gets_its_arguments_intact() {
     assert_eq!(seen, argv[1..]);
 }
 
-/// A program that is not there fails the unit: through PowerShell (a name it cannot find), and
+/// A program that is not there fails the unit: through PowerShell (a path it cannot find), and
 /// at once where Windows PowerShell 5.1 could not hand its arguments on anyway.
 #[test]
 fn a_missing_program_fails_its_unit() {
     let dir = tempfile::tempdir().expect("dir");
     for (unit, extra) in [("wsmp-test-r8", "x"), ("wsmp-test-r9", "")] {
-        let argv = vec!["wsmp-no-such-program".to_string(), extra.to_string()];
+        // By a full path: a bare name makes PowerShell search every installed module first,
+        // which can take longer than the wait on a CI runner.
+        let argv = vec![
+            r"C:\wsmp-no-such-dir\wsmp-no-such-program.exe".to_string(),
+            extra.to_string(),
+        ];
         launch_argv(dir.path(), unit, &argv, &[]);
         wait_for("the failed unit to go", Duration::from_secs(30), || {
             read_record(dir.path(), unit).expect("record").is_none()

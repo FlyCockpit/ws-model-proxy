@@ -1572,6 +1572,59 @@ fn rename_overwrite_refuses_case_differing_hard_link_alias() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn a_case_only_rename_needs_no_overwrite_on_a_case_insensitive_volume() {
+    use crate::file_ops::resolve::Stat;
+
+    let fx = Fx::new();
+    fx.put("Probe", "probe");
+    if std::fs::symlink_metadata(fx.root.join("probe")).is_err() {
+        writeln!(
+            std::io::stderr(),
+            "skipping case-only rename: temp directory volume is case-sensitive"
+        )
+        .expect("print skip reason");
+        return;
+    }
+    std::fs::remove_file(fx.root.join("Probe")).unwrap();
+    fx.put("Notes.txt", "keep these bytes\n");
+    let before =
+        Stat::from_metadata(&std::fs::symlink_metadata(fx.root.join("Notes.txt")).unwrap());
+    let etag = fx.etag("Notes.txt");
+    // One file under two spellings: renamed in place, as on Windows.
+    let result = rename(
+        &fx,
+        json!({ "from": fx.p("Notes.txt"), "to": fx.p("notes.txt") }),
+    )
+    .expect("a case-only rename");
+    assert_eq!(result.etag.as_deref(), Some(etag.as_str()));
+    let after = Stat::from_metadata(&std::fs::symlink_metadata(fx.root.join("notes.txt")).unwrap());
+    assert!(after.same_object(&before));
+    let names: Vec<_> = std::fs::read_dir(&fx.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["notes.txt"]);
+    // A stale source etag is still a conflict.
+    assert_eq!(
+        code(rename(
+            &fx,
+            json!({ "from": fx.p("notes.txt"), "to": fx.p("NOTES.txt"), "expectedEtag": "h:stale" })
+        )),
+        ErrorCode::Conflict,
+    );
+    // Two hard links are two entries: still refused.
+    std::fs::hard_link(fx.root.join("notes.txt"), fx.root.join("alias.txt")).unwrap();
+    assert_eq!(
+        code(rename(
+            &fx,
+            json!({ "from": fx.p("notes.txt"), "to": fx.p("NOTES.txt") })
+        )),
+        ErrorCode::Exists,
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn rename_overwrite_case_only_alias_changes_spelling_on_case_insensitive_volume() {
     use crate::file_ops::exchange::{FaultScope, Primitive};
     use crate::file_ops::resolve::Stat;
@@ -1600,13 +1653,6 @@ fn rename_overwrite_case_only_alias_changes_spelling_on_case_insensitive_volume(
     fx.put("Foo.txt", "keep these bytes\n");
     let before = Stat::from_metadata(&std::fs::symlink_metadata(fx.root.join("Foo.txt")).unwrap());
     let etag = fx.etag("foo.txt");
-    assert_eq!(
-        code(rename(
-            &fx,
-            json!({ "from": fx.p("Foo.txt"), "to": fx.p("foo.txt") })
-        )),
-        ErrorCode::Exists,
-    );
     assert_eq!(
         code(rename(
             &fx,

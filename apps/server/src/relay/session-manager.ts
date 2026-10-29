@@ -14,8 +14,9 @@
  *   `completeRelayRequest`.
  * - Live speech-to-text (../model-api/realtime): `createSttSession`.
  * - Lanes: `setNodeFrameHandlers(handlers)` routes runtime.inventory / runtime.define.result /
- *   runtime.detected / runtime.job.result / secret.result / exec.* to their owners (A1/A2/A4/D3;
- *   the defaults log at debug and do nothing, an inventory is acknowledged);
+ *   runtime.detected / runtime.job.result / secret.result / exec.* / agent.update.progress to
+ *   their owners (A1/A2/A4/D3; the defaults log at debug and do nothing, an inventory is
+ *   acknowledged);
  *   `sendToNode(nodeId, frame)` sends any server→node control frame to the live session;
  *   `requestTrustLower(nodeId)`; `setRelayAttemptStarter(start)` (recovery probes);
  *   `onPoolRoutingRulesChanged(poolId)`.
@@ -42,7 +43,7 @@ import {
   disconnectNodeAtGeneration,
   markTargetsDueAfterNodeReconnect,
 } from "@ws-model-proxy/api/lib/pool-routing";
-import type { NodeFeatures } from "@ws-model-proxy/api/lib/runtime-spec";
+import type { NodeFeatures, NodeSelfUpdate } from "@ws-model-proxy/api/lib/runtime-spec";
 import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import {
@@ -94,6 +95,7 @@ import {
   describeRelayControlParseError,
   encodeRelayBinaryFrame,
   encodeRelayServerControlMessage,
+  helloCanSelfUpdate,
   helloNeedsUpgrade,
   isCurrentProtocolHello,
   parseRelayBinaryFrame,
@@ -101,6 +103,7 @@ import {
   protocolErrorMessage,
   RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+  RELAY_SELF_UPDATE_REQUIRED_MESSAGE,
   RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
   RELAY_STALE_AFTER_MS,
   RELAY_UNREGISTERED_STALE_AFTER_MS,
@@ -461,7 +464,8 @@ type RoutedNodeFrameType =
   | "secret.result"
   | "exec.started"
   | "exec.status"
-  | "exec.rejected";
+  | "exec.rejected"
+  | "agent.update.progress";
 
 /**
  * The lane-owned handling of node frames (A1/A2/A4/D3). Every handler is optional; a frame
@@ -958,6 +962,8 @@ export class RelaySessionManager {
     terminalShells: readonly string[];
     jobReservations: boolean;
     rankIdle: boolean;
+    /** `features.selfUpdate` as the node last reported it (hello, `node.state`). */
+    selfUpdate: NodeSelfUpdate | null;
   } | null {
     const session = this.sessionsByNodeId.get(nodeId);
     if (!session?.registered || !session.helloAcked || session.connectionGeneration === null)
@@ -970,6 +976,7 @@ export class RelaySessionManager {
       terminalShells: session.features?.terminals.shells ?? [],
       jobReservations: session.features?.jobReservations === true,
       rankIdle: session.features?.rankIdle === true,
+      selfUpdate: session.features?.selfUpdate ?? null,
     };
   }
 
@@ -1581,6 +1588,18 @@ export class RelaySessionManager {
     }
 
     if (message.type === "hello") {
+      // A wsmp older than self-update: refused by capability (it could never take an update).
+      if (!session.registered && !helloCanSelfUpdate(message)) {
+        console.error("[relay] refused a hello without self-update", { code: "upgrade_cli" });
+        closeWithProtocolError(socket, "upgrade_cli", RELAY_SELF_UPDATE_REQUIRED_MESSAGE);
+        await recordRejectedNodeHello(session.identity, rejectedHelloFacts(frame), now).catch(
+          (recordError: unknown) => {
+            console.error("[relay] recording a refused hello failed", errorName(recordError));
+          },
+        );
+        await this.removeSession(socket, now);
+        return;
+      }
       await this.handleHello(session, message, now);
       return;
     }
@@ -1697,6 +1716,7 @@ export class RelaySessionManager {
       case "exec.started":
       case "exec.status":
       case "exec.rejected":
+      case "agent.update.progress":
         await this.routeToHandler(session, message);
         return;
       default:
@@ -1755,6 +1775,12 @@ export class RelaySessionManager {
         case "exec.rejected":
           if (handlers["exec.rejected"]) {
             await handlers["exec.rejected"](ref, message);
+            return true;
+          }
+          break;
+        case "agent.update.progress":
+          if (handlers["agent.update.progress"]) {
+            await handlers["agent.update.progress"](ref, message);
             return true;
           }
           break;
@@ -1900,6 +1926,8 @@ export class RelaySessionManager {
           identityPublicKey: message.node.identityPublicKey,
           trust: message.trust.value,
           features: message.features,
+          build: message.node.build,
+          environment: message.node.environment,
           definitions: message.definitions,
           heldMetricCommandsHash: message.heldMetricCommandsHash,
           heldFabricsHash: message.heldFabricsHash,
@@ -4049,6 +4077,12 @@ export class RelaySessionManager {
     const record = parsed as Record<string, unknown>;
     const type = record.type;
     if (typeof type !== "string") return false;
+    // A self-update report the server cannot read is dropped: the update times out instead of
+    // the node losing its connection (its detail is free node text).
+    if (type === "agent.update.progress") {
+      console.error("[relay] malformed agent update progress frame");
+      return true;
+    }
     if (type.startsWith("term.")) {
       const terminalId = typeof record.terminalId === "string" ? record.terminalId : null;
       const terminal = terminalId ? session.terminalsById.get(terminalId) : undefined;

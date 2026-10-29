@@ -10,6 +10,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
   kind: "STARTABLE" as "STARTABLE" | "ALWAYS_ON",
   extra: [] as Array<Record<string, unknown>>,
+  refusedOn: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
@@ -88,6 +89,7 @@ vi.mock("@/utils/orpc", () => ({
             service: false,
             origin: "SERVER",
             currentVersion: { id: "v-1", version: 1 },
+            refusedOn: state.refusedOn,
             current: { spec: { launch: { groupSize: 1 } } },
             servedModels: [],
             shares: [],
@@ -161,6 +163,7 @@ afterEach(() => {
   // Reset here, not at the end of a test: a failed test must not leak its kind.
   state.kind = "STARTABLE";
   state.extra = [];
+  state.refusedOn = [];
 });
 
 function mount() {
@@ -208,6 +211,35 @@ describe("runtime overview instances", () => {
       screen.getAllByRole("button", { name: "dashboard:runtime.markStopped.action" }),
     ).toHaveLength(1);
     expect(screen.queryAllByText("dashboard:runtime.needsOperator.MARK_STOPPED")).toHaveLength(1);
+  });
+});
+
+describe("runtime overview refused nodes", () => {
+  it("lists a node that refused a version as refused, with its reason, path and version", async () => {
+    state.refusedOn = [
+      {
+        nodeId: "n-1",
+        nodeSlug: "t420",
+        versionId: "v-1",
+        reason: "invalid",
+        detail: "launch.argv",
+      },
+      { nodeId: "n-2", nodeSlug: "t530", versionId: "v-0", reason: "weird_code", detail: null },
+    ];
+    mount();
+    await screen.findByText("t420");
+    expect(screen.getAllByText("dashboard:runtime.refusedOn.refused")).toHaveLength(2);
+    expect(screen.getByText("dashboard:runtime.refusedOn.currentVersion")).toBeTruthy();
+    expect(screen.getByText("dashboard:runtime.refusedOn.olderVersion")).toBeTruthy();
+    expect(screen.getByText("dashboard:runtime.defineReject.invalid")).toBeTruthy();
+    expect(screen.getByText("dashboard:runtime.defineReject.other")).toBeTruthy();
+    expect(screen.getByText("launch.argv").tagName).toBe("CODE");
+  });
+
+  it("shows nothing when no node refused", async () => {
+    mount();
+    await screen.findByText("i-stuck");
+    expect(screen.queryByText("dashboard:runtime.refusedOn.refused")).toBeNull();
   });
 });
 

@@ -58,8 +58,9 @@ packages/test-utils/ -> Shared test helpers
 
 ## Versions and Releases
 
-The owner decides versions when cutting a release. Unless the owner explicitly
-asks for it in the current task, do not change:
+Only the owner changes version numbers, and only in the commit that cuts a
+release. Agents and contributors never change them in a feature or fix PR,
+unless the owner explicitly asks for it in the current task. That covers:
 
 - The app/CLI version: `apps/cli/Cargo.toml` (and its `Cargo.lock` entry) and
   `SERVER_VERSION` in `apps/server/src/version.ts`.
@@ -69,12 +70,21 @@ asks for it in the current task, do not change:
 - The release switches in `apps/server/src/node-http.ts`
   (`CLI_RELEASE_BINARIES_BY_DEFAULT`, `CLI_PREVIEW_BRANCH`).
 
-Between releases, a protocol change extends the current, unreleased protocol
-version in place: add new frames or fields to it and update fixtures, but do
-not bump the number, add a version negotiation step, or gate behaviour on
-intermediate versions. If a change seems to need a bump (for example, it breaks
-compatibility with the last released CLI), say so in your summary and let the
-owner decide. Release mechanics are in `apps/cli/docs/releasing.md`.
+Relay protocol 3.0 is permanent: every server from 0.4.3 on must keep working
+with every released wsmp from 0.4.3 on, for all the features that wsmp has.
+
+- A new capability is new frames or optional fields on 3.0. The server uses it
+  only with nodes that report it (a hello `features` entry, as
+  `features.selfUpdate` does). A node that does not report it simply does not
+  get that feature; everything it did before keeps working.
+- Never bump the protocol, add version negotiation, or gate behaviour on
+  version numbers. Never remove, rename or retype a field, add a value to an
+  existing enum, or add a field that limits what a node may do.
+- The rules and the CI test that enforces them
+  (`apps/server/src/relay/released-compat.test.ts`) are in
+  `apps/cli/docs/releasing.md`, "Keeping old nodes updatable".
+- If a change cannot follow these rules, stop and tell the owner instead of
+  bumping anything.
 
 ## Data and Schema
 

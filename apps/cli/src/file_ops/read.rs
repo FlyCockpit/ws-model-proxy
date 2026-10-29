@@ -28,7 +28,7 @@ pub const DEFAULT_MAX_BYTES: u32 = 32 * 1024;
 pub const MAX_BYTES: u32 = 128 * 1024;
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ReadArgs {
     pub path: String,
     /// 1-based; negative counts from the end (-200 = the last 200 lines).

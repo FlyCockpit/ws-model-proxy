@@ -33,35 +33,36 @@ model User {
   /// Set when the onboarding checklist was dismissed or completed.
   onboardingDoneAt           DateTime?
 
-  sessions            Session[]
-  accounts            Account[]
-  twoFactors          TwoFactor[]
-  oauthClients        OauthClient[]
-  oauthRefreshTokens  OauthRefreshToken[]
-  oauthAccessTokens   OauthAccessToken[]
-  oauthConsents       OauthConsent[]
-  mcpGrants           McpGrant[]
-  agentTokens         AgentToken[]
-  nodes               Node[]
-  nodeCredentials     NodeCredential[]
-  nodeEnrollmentCodes NodeEnrollmentCode[]
-  fabrics             Fabric[]
-  runtimes            Runtime[]
-  runtimeSharesOut    RuntimeShare[]       @relation("RuntimeShareOwner")
-  runtimeSharesIn     RuntimeShare[]       @relation("RuntimeShareGrantee")
-  runtimeOperations   RuntimeOperation[]
-  profiles            Profile[]
-  pools               Pool[]
-  apiKeys             ApiKey[]
-  modelAliases        ModelAlias[]
-  sharesOut           Share[]              @relation("ShareOwner")
-  sharesIn            Share[]              @relation("ShareGrantee")
-  shareInvites        ShareInvite[]
-  providerAccounts    ProviderAccount[]
-  providerModels      ProviderModel[]
-  providerCredentials ProviderCredential[]
-  spendCaps           SpendCap[]
-  mediaAssets         MediaAsset[]
+  sessions               Session[]
+  accounts               Account[]
+  twoFactors             TwoFactor[]
+  oauthClients           OauthClient[]
+  oauthRefreshTokens     OauthRefreshToken[]
+  oauthAccessTokens      OauthAccessToken[]
+  oauthConsents          OauthConsent[]
+  mcpGrants              McpGrant[]
+  agentTokens            AgentToken[]
+  nodes                  Node[]
+  nodeCredentials        NodeCredential[]
+  nodeEnrollmentCodes    NodeEnrollmentCode[]
+  nodeAgentUpdateBatches NodeAgentUpdateBatch[]
+  fabrics                Fabric[]
+  runtimes               Runtime[]
+  runtimeSharesOut       RuntimeShare[]         @relation("RuntimeShareOwner")
+  runtimeSharesIn        RuntimeShare[]         @relation("RuntimeShareGrantee")
+  runtimeOperations      RuntimeOperation[]
+  profiles               Profile[]
+  pools                  Pool[]
+  apiKeys                ApiKey[]
+  modelAliases           ModelAlias[]
+  sharesOut              Share[]                @relation("ShareOwner")
+  sharesIn               Share[]                @relation("ShareGrantee")
+  shareInvites           ShareInvite[]
+  providerAccounts       ProviderAccount[]
+  providerModels         ProviderModel[]
+  providerCredentials    ProviderCredential[]
+  spendCaps              SpendCap[]
+  mediaAssets            MediaAsset[]
 
   @@unique([email])
   @@index([role])

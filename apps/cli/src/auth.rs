@@ -60,9 +60,9 @@ pub fn resolve_credential() -> Result<String> {
     Ok(credential.credential)
 }
 
-/// `GET /.well-known/wsmp` (strict: an unknown field is refused).
+/// `GET /.well-known/wsmp`. A field a later server adds is ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct WellKnown {
     pub server_version: String,
     pub protocol_version: String,
@@ -122,13 +122,13 @@ pub struct EnrollRequest<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ReplacedNode {
     pub slug: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Enrolled {
     pub ok: bool,
     pub node_id: String,
@@ -155,7 +155,7 @@ pub enum EnrollError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct EnrollRefusal {
     pub ok: bool,
     pub error: EnrollError,
@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn enroll_answers_parse_strictly() {
+    fn enroll_answers_parse_and_ignore_a_later_servers_fields() {
         let ok = parse_enroll_answer(
             200,
             &serde_json::json!({
@@ -319,7 +319,7 @@ mod tests {
         };
         assert_eq!(refusal.error, EnrollError::ReplaceConfirmationRequired);
         assert_eq!(refusal.replaces.map(|r| r.slug).as_deref(), Some("old-1"));
-        // A short credential, an unknown field or a missing `ok` is refused.
+        // A short credential or a missing `ok` is refused; a field a later server adds is not.
         assert!(
             parse_enroll_answer(
                 200,
@@ -327,7 +327,10 @@ mod tests {
             )
             .is_err()
         );
-        assert!(parse_enroll_answer(200, r#"{"ok":false,"error":"used","extra":1}"#).is_err());
+        assert!(matches!(
+            parse_enroll_answer(409, r#"{"ok":false,"error":"used","extra":1}"#),
+            Ok(EnrollOutcome::Refused(_))
+        ));
         assert!(parse_enroll_answer(500, "oops").is_err());
         assert!(parse_enroll_answer(500, "{}").is_err());
     }

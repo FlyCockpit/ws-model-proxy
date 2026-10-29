@@ -1,0 +1,13 @@
+{
+  "type": "runtime.define.result",
+  "opId": "def-1",
+  "chunkIndex": 0,
+  "final": false,
+  "results": [
+    {
+      "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
+      "versionId": "vr1a2b3c4d5e6f7g8h9i0j1k2",
+      "status": "applied"
+    }
+  ]
+}

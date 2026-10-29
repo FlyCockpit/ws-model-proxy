@@ -435,6 +435,27 @@ export const runtimesRouter = {
     const previous = summary.currentVersion.launchChanged
       ? await previousLaunchHashOf(input.runtimeId, current.version)
       : current.launchHash;
+    const refusing = await prisma.node.findMany({
+      where: { userId },
+      select: { id: true, slug: true, refusedDefinitions: true },
+    });
+    const refusedOn = refusing.flatMap((node) => {
+      const refused = Array.isArray(node.refusedDefinitions) ? node.refusedDefinitions : [];
+      return refused.flatMap((entry) => {
+        const record = jsonObject(entry);
+        return record.runtimeId === input.runtimeId && typeof record.versionId === "string"
+          ? [
+              {
+                nodeId: node.id,
+                nodeSlug: node.slug,
+                versionId: record.versionId,
+                reason: typeof record.reason === "string" ? record.reason : null,
+                detail: typeof record.detail === "string" ? record.detail : null,
+              },
+            ]
+          : [];
+      });
+    });
     const frozenOn = nodes.flatMap((node) => {
       const held = Array.isArray(node.heldDefinitions) ? node.heldDefinitions : [];
       return held.flatMap((entry) => {
@@ -461,6 +482,7 @@ export const runtimesRouter = {
         })),
       ),
       frozenOn,
+      refusedOn,
     };
   }),
 

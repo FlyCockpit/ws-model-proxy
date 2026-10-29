@@ -56,6 +56,7 @@ pub mod terminal_parse;
 pub mod tls;
 pub mod tokens;
 pub mod trust;
+pub mod update;
 
 #[cfg(all(test, windows))]
 #[path = "../tests/support/windows_tree.rs"]

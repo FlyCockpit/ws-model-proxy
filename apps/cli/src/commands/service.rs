@@ -120,13 +120,105 @@ pub(crate) fn service_file() -> Result<PathBuf> {
     anyhow::bail!("service installation is only supported on Linux, macOS and Windows")
 }
 
+/// The binary the service runs: this one, except that a Homebrew keg's
+/// versioned `Cellar/wsmp/<version>/bin/wsmp` becomes the stable
+/// `<prefix>/opt/wsmp/bin/wsmp` link (`brew upgrade` and `brew cleanup`
+/// remove old kegs).
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn executable() -> Result<String> {
-    std::env::current_exe()
-        .context("resolving the wsmp executable")?
-        .into_os_string()
+    let exe = std::env::current_exe().context("resolving the wsmp executable")?;
+    let exe = std::fs::canonicalize(&exe)
+        .ok()
+        .and_then(|canonical| crate::update::homebrew::stable_path(&canonical))
+        .filter(|stable| stable.exists())
+        .unwrap_or(exe);
+    exe.into_os_string()
         .into_string()
         .map_err(|_| anyhow::anyhow!("wsmp executable path is not valid UTF-8"))
+}
+
+/// Before a Homebrew upgrade: a service written by an older wsmp that
+/// records a versioned `Cellar` path is written again with the stable `opt`
+/// path (same pinned environment), so the restart finds the new keg.
+pub fn ensure_stable_executable() -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        #[cfg(target_os = "linux")]
+        let file = service_file()?;
+        #[cfg(target_os = "macos")]
+        let file = macos_wrapper_path()?;
+        let Ok(current) = fs::read_to_string(&file) else {
+            return Ok(());
+        };
+        if !current.contains("/Cellar/wsmp/") {
+            return Ok(());
+        }
+        let executable = executable()?;
+        let pinned = pinned_service_env()?;
+        #[cfg(target_os = "linux")]
+        {
+            write_service_file(&file, &render_systemd_user_unit(&executable, &pinned))?;
+            run_command("systemctl", &["--user", "daemon-reload"])?;
+        }
+        #[cfg(target_os = "macos")]
+        write_private_script(
+            &file,
+            render_macos_service_wrapper(&executable, &pinned).as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Restart the relay service without printing (the update dead-man and
+/// `wsmp update`). An error when it is not installed.
+pub fn restart_quietly() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        require_installed()?;
+        run_command("systemctl", &["--user", "restart", LINUX_UNIT])
+    }
+    #[cfg(target_os = "macos")]
+    {
+        require_installed()?;
+        let domain = launchd_domain()?;
+        // An installed agent that is not loaded (booted out) is loaded first:
+        // `kickstart` fails on it (exit 113), where systemd and Task Scheduler
+        // start a stopped service.
+        if !agent_loaded(&domain) {
+            let file = service_file()?;
+            run_command(
+                "launchctl",
+                &["bootstrap", &domain, &file.display().to_string()],
+            )?;
+        }
+        run_command(
+            "launchctl",
+            &["kickstart", "-k", &format!("{domain}/{MACOS_LABEL}")],
+        )
+    }
+    #[cfg(windows)]
+    {
+        let file = service_file()?;
+        anyhow::ensure!(file.exists(), "the relay service is not installed");
+        let name = windows_task_name()?;
+        end_windows_task(&name);
+        schtasks(&["/Run", "/TN", &name]).map(|_| ())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        anyhow::bail!("service installation is only supported on Linux, macOS and Windows")
+    }
+}
+
+/// Whether `wsmp service install` installed the relay service here.
+pub fn installed() -> bool {
+    service_file().is_ok_and(|file| file.exists())
+}
+
+/// Windows: start the relay task (a no-op while it runs: `IgnoreNew`).
+#[cfg(windows)]
+pub fn kick_relay_task() -> Result<()> {
+    schtasks(&["/Run", "/TN", &windows_task_name()?]).map(|_| ())
 }
 
 /// After `wsmp login`, a relay service that stopped on a rejected credential
@@ -727,19 +819,24 @@ fn run_command(program: &str, args: &[&str]) -> Result<()> {
 /// that is not loaded, which is every first install.
 #[cfg(target_os = "macos")]
 fn bootout_if_loaded(domain: &str, file: &Path) {
-    let loaded = Command::new("launchctl")
-        .args(["print", &format!("{domain}/{MACOS_LABEL}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if loaded {
+    if agent_loaded(domain) {
         let _ = Command::new("launchctl")
             .args(["bootout", domain, &file.display().to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// Whether launchd has the relay agent loaded in `domain`.
+#[cfg(target_os = "macos")]
+fn agent_loaded(domain: &str) -> bool {
+    Command::new("launchctl")
+        .args(["print", &format!("{domain}/{MACOS_LABEL}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(target_os = "macos")]

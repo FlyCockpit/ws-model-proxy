@@ -677,6 +677,51 @@ pub struct NodeFeatures {
     pub launch: Option<LaunchFeatures>,
     /// The node's secrets: names and when they were last set (never values).
     pub secrets: Vec<SecretEntry>,
+    /// How this node can update itself (`agent.update`). Absent on older CLIs: the server
+    /// never sends them `agent.update` and shows the manual install command instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_update: Option<SelfUpdateFeatures>,
+}
+
+/// `features.selfUpdate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SelfUpdateFeatures {
+    /// Empty: this install cannot update itself (a source build, an unsupported method).
+    pub strategies: Vec<UpdateStrategy>,
+    /// Runtime instances keep running across an agent restart on this platform.
+    pub instances_survive: bool,
+    /// The node-local `remoteUpdates` setting.
+    pub remote: RemoteUpdates,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateStrategy {
+    /// Download the release archive and swap the binary (dead-man rollback).
+    SelfReplace,
+    /// `brew upgrade flycockpit/tap/wsmp` (no rollback).
+    Homebrew,
+}
+
+/// Whether the server may update this node (`wsmp config set-remote-updates`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteUpdates {
+    /// The node's owner may update it from their browser (the default).
+    #[default]
+    Allowed,
+    /// `agent.update` is refused (`opted_out`).
+    Off,
+}
+
+impl RemoteUpdates {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Off => "off",
+        }
+    }
 }
 
 /// The operating system a node runs, as runtime launches see it.

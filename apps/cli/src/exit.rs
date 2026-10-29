@@ -15,6 +15,10 @@
 //!      the server), then restart wsmp. The systemd unit lists this in
 //!      `RestartPreventExitStatus=` too and sets `WSMP_STOP_ON_PROTOCOL_MISMATCH`;
 //!      under an older unit without it, the relay retries every 5 minutes.
+//!  75  the relay installed an update and exits so its service manager starts
+//!      the new binary (`EX_TEMPFAIL`). systemd restarts it (`Restart=on-failure`;
+//!      75 is not in `RestartPreventExitStatus=`), launchd's `KeepAlive` does,
+//!      and on Windows the update's dead-man task starts the relay task again.
 //!
 //! A relay stopped by SIGHUP, SIGINT, or SIGTERM cleans up and then dies from
 //! that signal (shell status 128 + signal); see `crate::shutdown`.
@@ -43,6 +47,9 @@ pub enum ExitCode {
     /// The server refused this build's relay protocol. Restarting the same
     /// binary cannot fix it; install the matching wsmp (or upgrade the server).
     RelayProtocolMismatch = 5,
+    /// The relay swapped in an update and stops so the service manager starts
+    /// the new binary (see the module comment).
+    RestartForUpdate = 75,
 }
 
 /// Annotate an error to request a specific [`ExitCode`].

@@ -8,10 +8,12 @@ import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { AddNodeDialog } from "@/components/nodes/add-node-dialog";
+import { AgentUpdateAllCard } from "@/components/nodes/agent-update-all-card";
 import { EnrollmentCodesCard } from "@/components/nodes/enrollment-codes-card";
 import { FabricsCard } from "@/components/nodes/fabrics-card";
 import { NodeCard, NodeCardSkeleton } from "@/components/nodes/node-card";
 import { PageHeading } from "@/components/page-stub";
+import { useAgentUpdateOverview } from "@/hooks/use-agent-update-overview";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/nodes/")({
@@ -29,6 +31,9 @@ function NodesPage() {
     ...orpc.nodes.list.queryOptions(),
     refetchInterval: NODES_REFRESH_MS,
   });
+  const agentUpdates = useAgentUpdateOverview();
+  const updateOf = (nodeId: string) =>
+    agentUpdates.data?.nodes.find((view) => view.nodeId === nodeId);
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
@@ -39,6 +44,8 @@ function NodesPage() {
           {t("dashboard:nodes.list.addNode")}
         </Button>
       </div>
+
+      <AgentUpdateAllCard />
 
       {nodes.isPending ? (
         <div className="grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-3">
@@ -71,7 +78,7 @@ function NodesPage() {
         <ul className="grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {nodes.data.nodes.map((node) => (
             <li key={node.id} className="min-w-0">
-              <NodeCard node={node} lang={lang} />
+              <NodeCard node={node} lang={lang} agentUpdate={updateOf(node.id)} />
             </li>
           ))}
         </ul>

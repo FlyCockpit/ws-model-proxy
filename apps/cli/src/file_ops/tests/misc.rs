@@ -62,7 +62,7 @@ fn every_tool_refuses_as_root_unless_allowed() {
 }
 
 #[test]
-fn execute_round_trips_json_and_rejects_unknown_ops_and_fields() {
+fn execute_round_trips_json_and_rejects_unknown_ops_and_bad_args() {
     let fx = Fx::new();
     fx.put("f.txt", "a\nb\n");
     let read = fx
@@ -74,14 +74,13 @@ fn execute_round_trips_json_and_rejects_unknown_ops_and_fields() {
     assert_eq!(read["more"], serde_json::Value::Null);
     assert_eq!(read["secretFile"], false);
     let etag = read["etag"].clone();
+    // `confirm` belongs to the MCP layer: like any field the CLI does not
+    // know, it is ignored and grants nothing.
     let edit = fx
         .ops
-        .execute("edit", json!({ "path": fx.p("f.txt"), "expectedEtag": etag, "edits": [{ "startLine": 2, "endLine": 2, "newText": "B\n" }], "confirm": "RUN" }), &fx.cancel);
-    assert_eq!(
-        edit.unwrap_err().code,
-        ErrorCode::InvalidInput,
-        "confirm belongs to the MCP layer, not the CLI args"
-    );
+        .execute("edit", json!({ "path": fx.p("f.txt"), "expectedEtag": etag, "edits": [{ "startLine": 2, "endLine": 2, "newText": "B\n" }], "dryRun": true, "confirm": "RUN" }), &fx.cancel)
+        .unwrap();
+    assert_eq!(edit["applied"], false);
     let edit = fx
         .ops
         .execute("edit", json!({ "path": fx.p("f.txt"), "expectedEtag": etag, "edits": [{ "startLine": 2, "endLine": 2, "newText": "B\n" }], "reason": "test" }), &fx.cancel)
@@ -109,15 +108,10 @@ fn execute_round_trips_json_and_rejects_unknown_ops_and_fields() {
         .unwrap();
     assert_eq!(del, json!({ "deleted": true, "type": "file" }));
     for (op, bad) in [
-        ("read", json!({ "path": fx.p("f.txt"), "extra": 1 })),
         ("read", json!({ "startLine": 1 })),
         ("read", json!({ "path": 5 })),
         ("stat", json!({ "paths": "x" })),
         ("nope", json!({})),
-        (
-            "edit",
-            json!({ "path": fx.p("f.txt"), "edits": [{ "oldText": "a", "newText": "b", "bogus": true }] }),
-        ),
     ] {
         assert_eq!(
             fx.ops

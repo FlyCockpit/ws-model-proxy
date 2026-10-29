@@ -95,17 +95,24 @@ pub fn display_path(path: &std::path::Path) -> Option<String> {
         resolve::posix_view(path)
     }
 }
-/// The key a path is locked under: the path itself on Unix; on Windows its
-/// POSIX view lower-cased, as NTFS compares names (`Notes.txt` and `notes.txt`
-/// are one file, and `\\?\C:\` and `C:\` one drive).
+/// The key a path is locked under: on Windows its POSIX view lower-cased, as
+/// NTFS compares names (`Notes.txt` and `notes.txt` are one file, and `\\?\C:\`
+/// and `C:\` one drive); on Unix the path folded as the policy folds it, since
+/// a macOS (APFS, HFS+) volume, a casefold ext4 directory or an SMB share also
+/// resolves two spellings to one file. On a case-sensitive volume this only
+/// makes `A` and `a` wait for each other.
 fn lock_key(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
         if let Some(view) = resolve::posix_view(&path) {
             return PathBuf::from(view.to_lowercase());
         }
+        path
     }
-    path
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(redact::fold(&path.to_string_lossy()))
+    }
 }
 
 pub use etag::EtagKey;
@@ -139,6 +146,62 @@ mod windows_lock_tests {
             ops.lock_path(PathBuf::from(r"c:\work\notes.txt"), &cancel)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(windows))]
+mod unix_lock_tests {
+    use super::*;
+
+    fn ops() -> FileOps {
+        FileOps::new(
+            Policy::new(Vec::new(), Vec::new(), false),
+            EtagKey::random(),
+        )
+    }
+
+    #[test]
+    fn spellings_a_casefold_volume_merges_share_a_lock() {
+        let key = |path: &str| lock_key(PathBuf::from(path));
+        // APFS's default, a casefold ext4 directory, an SMB share: one file.
+        assert_eq!(key("/Users/ada/Notes.txt"), key("/users/ada/notes.TXT"));
+        assert_eq!(key("/srv/Straße.env"), key("/srv/STRASSE.env"));
+        assert_ne!(key("/srv/notes.txt"), key("/srv/notes2.txt"));
+        let ops = ops();
+        let cancel = Cancel::new();
+        let _held = ops
+            .lock_path(PathBuf::from("/Users/ada/Notes.txt"), &cancel)
+            .expect("first");
+        cancel.cancel();
+        // The other spelling waits for the same lock (here: cancelled while it waits).
+        assert!(
+            ops.lock_path(PathBuf::from("/Users/ada/notes.txt"), &cancel)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_rename_takes_one_lock_per_file() {
+        let ops = ops();
+        let cancel = Cancel::new();
+        // A case-only rename: one file, one lock, never a wait on itself.
+        let (_one, other) = ops
+            .lock_pair(
+                PathBuf::from("/srv/Foo.txt"),
+                PathBuf::from("/srv/foo.txt"),
+                &cancel,
+            )
+            .expect("case-only pair");
+        assert!(other.is_none());
+        let (_a, b) = ops
+            .lock_pair(
+                PathBuf::from("/srv/b.txt"),
+                PathBuf::from("/srv/a.txt"),
+                &cancel,
+            )
+            .expect("two files");
+        assert!(b.is_some());
     }
 }
 
@@ -439,6 +502,27 @@ impl FileOps {
             .lock(lock_key(path), cancel, self.limits.lock_wait)
     }
 
+    /// Lock both names of a rename: in key order, so two renames cannot
+    /// deadlock each other, and once when they share a key (a case-only rename
+    /// names one file, and taking its lock twice would wait on itself).
+    pub(crate) fn lock_pair(
+        &self,
+        a: PathBuf,
+        b: PathBuf,
+        cancel: &Cancel,
+    ) -> FileResult<(PathGuard<'_>, Option<PathGuard<'_>>)> {
+        let (a, b) = (lock_key(a), lock_key(b));
+        let (first, second) = if a <= b { (a, b) } else { (b, a) };
+        let wait = self.limits.lock_wait;
+        let held = self.locks.lock(first.clone(), cancel, wait)?;
+        let other = if second == first {
+            None
+        } else {
+            Some(self.locks.lock(second, cancel, wait)?)
+        };
+        Ok((held, other))
+    }
+
     pub fn read(&self, args: &read::ReadArgs, cancel: &Cancel) -> FileResult<read::ReadOutcome> {
         self.policy.check_process()?;
         read::read(self, args, cancel)
@@ -505,8 +589,9 @@ impl FileOps {
     }
 
     /// JSON dispatch for the relay layer: `op` is one of `read|stat|list|search|
-    /// edit|write|rename|mkdir|delete`, `args` the strict per-op object (the
-    /// MCP inputs minus `cliDeviceId`/`confirm`). Unknown fields are rejected.
+    /// edit|write|rename|mkdir|delete`, `args` the per-op object (the MCP
+    /// inputs minus `cliDeviceId`/`confirm`). A field this build does not know
+    /// is ignored: a later server may add one.
     pub fn execute(&self, op: &str, args: Value, cancel: &Cancel) -> FileResult<Value> {
         fn parse<T: serde::de::DeserializeOwned>(args: Value) -> FileResult<T> {
             serde_json::from_value(args)

@@ -1,3 +1,4 @@
+import { agentUpdateProcedures } from "../nodes/agent-update";
 import { credentialProcedures, enrollmentProcedures } from "../nodes/enrollment";
 import { fileProcedures } from "../nodes/files";
 import { nodeProcedures as n } from "../nodes/procedures";
@@ -22,6 +23,7 @@ export const nodesRouter = {
   deleteOffline: n.deleteOffline,
   lowerTrustPreview: n.lowerTrustPreview,
   lowerTrust: n.lowerTrust,
+  agentUpdate: agentUpdateProcedures,
   enrollmentCodes: enrollmentProcedures,
   credentials: credentialProcedures,
   activity: n.activity,

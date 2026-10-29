@@ -273,3 +273,151 @@ describe("runtime job results", () => {
     ).toBe(true);
   });
 });
+
+/**
+ * wsmp self-update (contract §1–§2). The CLI implementer adds the matching fixtures under
+ * `apps/cli/tests/fixtures/relay-3.0/frames/{server-to-node,node-to-server}/agent.update*.json`
+ * (the "fixture for every frame type" check above needs them); these are the contract's JSON.
+ */
+describe("self-update frames", () => {
+  const helloFixture = () =>
+    structuredClone(load("frames/node-to-server").find(([name]) => name === "hello.json")?.[1]) as {
+      node: Record<string, unknown>;
+      features: Record<string, unknown>;
+    };
+  const update = {
+    type: "agent.update",
+    updateId: "AAAAAAAAAAAAAAAAAAAAAA",
+    version: "0.4.3",
+    artifactUrl: "https://example.test/wsmp-x86_64-unknown-linux-gnu.tar.xz",
+    sha256: "a".repeat(64),
+    signature: null,
+    force: false,
+    rollbackAfterSecs: 90,
+  };
+  const progress = {
+    type: "agent.update.progress",
+    updateId: "AAAAAAAAAAAAAAAAAAAAAA",
+    phase: "refused",
+    reason: "opted_out",
+    detail: "wsmp config set remote-updates allowed",
+  };
+
+  it("accepts the new hello fields, and an older hello without them", () => {
+    const hello = helloFixture();
+    hello.node.build = {
+      commit: "0123456789abcdef0123456789abcdef01234567",
+      installMethod: "script",
+      target: "x86_64-unknown-linux-gnu",
+    };
+    hello.node.environment = { wsl: true };
+    hello.features.selfUpdate = {
+      strategies: ["self-replace"],
+      instancesSurvive: true,
+      remote: "allowed",
+    };
+    expectValid(nodeToServerControlFrameSchema, [["hello+self-update", hello]]);
+    const unknownCommit = helloFixture();
+    unknownCommit.node.build = {
+      commit: null,
+      installMethod: "unknown",
+      target: "aarch64-apple-darwin",
+    };
+    unknownCommit.features.selfUpdate = { strategies: [], instancesSurvive: false, remote: "off" };
+    expectValid(nodeToServerControlFrameSchema, [["hello+unknown commit", unknownCommit]]);
+    expectValid(nodeToServerControlFrameSchema, [["hello", helloFixture()]]);
+  });
+
+  it("refuses malformed hello additions", () => {
+    const cases: Array<(hello: ReturnType<typeof helloFixture>) => void> = [
+      (h) => {
+        h.node.build = { commit: "ABC", installMethod: "script", target: "x" };
+      },
+      (h) => {
+        h.node.build = { commit: null, installMethod: "pip", target: "x" };
+      },
+      (h) => {
+        h.node.build = { commit: null, installMethod: "script", target: "x", extra: 1 };
+      },
+      (h) => {
+        h.node.environment = { wsl: true, docker: true };
+      },
+      (h) => {
+        h.features.selfUpdate = {
+          strategies: ["a", "a"],
+          instancesSurvive: true,
+          remote: "allowed",
+        };
+      },
+      (h) => {
+        h.features.selfUpdate = { strategies: [], instancesSurvive: true, remote: "maybe" };
+      },
+    ];
+    for (const [index, edit] of cases.entries()) {
+      const hello = helloFixture();
+      edit(hello);
+      expect(nodeToServerControlFrameSchema.safeParse(hello).success, `case ${index}`).toBe(false);
+    }
+  });
+
+  it("parses agent.update and agent.update.progress exactly", () => {
+    expectValid(serverToNodeControlFrameSchema, [["agent.update", update]]);
+    expectValid(serverToNodeControlFrameSchema, [
+      [
+        "agent.update loopback",
+        { ...update, artifactUrl: "http://127.0.0.1:8080/a.tar.xz", force: true },
+      ],
+    ]);
+    expectValid(nodeToServerControlFrameSchema, [
+      ["progress refused", progress],
+      [
+        "progress phase",
+        { type: "agent.update.progress", updateId: progress.updateId, phase: "downloading" },
+      ],
+      [
+        "progress rolled back",
+        {
+          type: "agent.update.progress",
+          updateId: progress.updateId,
+          phase: "rolled_back",
+          detail: "log tail",
+        },
+      ],
+    ]);
+    expect(SERVER_TO_NODE_CONTROL_TYPES).toContain("agent.update");
+    expect(NODE_TO_SERVER_CONTROL_TYPES).toContain("agent.update.progress");
+  });
+
+  it("refuses malformed self-update frames", () => {
+    const badUpdates = [
+      { ...update, artifactUrl: "http://example.test/a.tar.xz" },
+      { ...update, artifactUrl: "https://user:pw@example.test/a.tar.xz" },
+      { ...update, rollbackAfterSecs: 10 },
+      { ...update, rollbackAfterSecs: 601 },
+      { ...update, sha256: "A".repeat(64) },
+      { ...update, version: "latest" },
+      { ...update, updateId: "short" },
+      { ...update, extra: true },
+      (({ signature: _, ...rest }) => rest)(update),
+    ];
+    for (const frame of badUpdates)
+      expect(serverToNodeControlFrameSchema.safeParse(frame).success, JSON.stringify(frame)).toBe(
+        false,
+      );
+    const badProgress = [
+      { ...progress, phase: "downloading" }, // a reason only with refused / failed
+      { ...progress, phase: "exploded" },
+      { ...progress, reason: "because" },
+      { ...progress, detail: "x".repeat(4001) },
+      { ...progress, extra: 1 },
+    ];
+    for (const frame of badProgress)
+      expect(nodeToServerControlFrameSchema.safeParse(frame).success, JSON.stringify(frame)).toBe(
+        false,
+      );
+    // 4000 characters as the node counts them (scalar values), not UTF-16 units.
+    expect(
+      nodeToServerControlFrameSchema.safeParse({ ...progress, detail: "😀".repeat(4000) }).success,
+    ).toBe(true);
+  });
+});

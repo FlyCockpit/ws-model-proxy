@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RenameArgs {
     pub from: String,
     pub to: String,
@@ -25,7 +25,7 @@ pub struct RenameResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct MkdirArgs {
     pub path: String,
     pub parents: Option<bool>,
@@ -39,7 +39,7 @@ pub struct MkdirResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteArgs {
     pub path: String,
     pub expected_etag: Option<String>,

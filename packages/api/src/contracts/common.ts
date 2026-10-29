@@ -190,8 +190,13 @@ export const ATTEMPT_KIND = ["LOCAL", "CLOUD"] as const;
 export const ATTEMPT_STATE = ["ACTIVE", "COMPLETED", "FAILED", "CANCELLED", "EXPIRED"] as const;
 
 /** The enums above keyed by their Prisma name (checked against the schema files). */
+export const NODE_AGENT_UPDATE_POLICY_VALUES = ["ALLOWED", "OFF"] as const;
+export const NODE_AGENT_UPDATE_BATCH_STATE = ["RUNNING", "DONE", "STOPPED"] as const;
+
 export const PRISMA_ENUM_MIRRORS = {
   Actor: ACTOR,
+  NodeAgentUpdatePolicy: NODE_AGENT_UPDATE_POLICY_VALUES,
+  NodeAgentUpdateBatchState: NODE_AGENT_UPDATE_BATCH_STATE,
   NodeTrust: NODE_TRUST,
   NodeConnection: NODE_CONNECTION,
   NodeAuditKind: NODE_AUDIT_KIND,

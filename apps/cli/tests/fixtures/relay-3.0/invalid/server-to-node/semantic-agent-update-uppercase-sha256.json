@@ -1,0 +1,10 @@
+{
+  "type": "agent.update",
+  "updateId": "q8Zr0T3vX1yB2nC4dE5fGw",
+  "version": "0.4.3",
+  "artifactUrl": "https://github.com/FlyCockpit/ws-model-proxy/releases/download/v0.4.3/wsmp-x86_64-unknown-linux-gnu.tar.xz",
+  "sha256": "5F70BF18A086007016E948B04AED3B82103A36BEA41755B6CDDFAF10ACE3C6EF",
+  "signature": null,
+  "force": false,
+  "rollbackAfterSecs": 90
+}

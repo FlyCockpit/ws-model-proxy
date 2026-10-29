@@ -204,6 +204,8 @@ impl TerminalStartup {
             rank_idle: true,
             launch: self.launch_features(),
             secrets: crate::secrets::entries(),
+            // The relay adds it (`daemon::node_features`).
+            self_update: None,
         }
     }
 
@@ -274,6 +276,8 @@ impl TerminalStartup {
             identity_signature,
             terminal_public_key: self.key.public_b64url().to_string(),
             terminal_identity,
+            build: Some(crate::update::build::node_build()),
+            environment: crate::update::build::node_environment(),
         }
     }
 }

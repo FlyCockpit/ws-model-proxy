@@ -1,0 +1,9 @@
+{
+  "type": "relay.complete",
+  "requestId": "req-1",
+  "usage": {
+    "promptTokens": 12,
+    "completionTokens": 34,
+    "totalTokens": 46
+  }
+}

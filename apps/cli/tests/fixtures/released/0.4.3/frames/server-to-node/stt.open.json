@@ -1,0 +1,13 @@
+{
+  "type": "stt.open",
+  "sessionId": "XYKnzPEWO2CFqs_0GT5jiA",
+  "handle": "whisper",
+  "upstreamModel": "whisper-large-v3",
+  "adapter": "segmented",
+  "config": {
+    "language": "en"
+  },
+  "maxItemSeconds": 30,
+  "maxSessionMs": 600000,
+  "audioWindowBytes": 262144
+}

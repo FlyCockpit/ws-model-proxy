@@ -1,0 +1,10 @@
+{
+  "type": "agent.update",
+  "updateId": "q8Zr0T3vX1yB2nC4dE5fGw",
+  "version": "0.4.3",
+  "artifactUrl": "http://example.com/wsmp.tar.xz",
+  "sha256": "5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+  "signature": null,
+  "force": false,
+  "rollbackAfterSecs": 90
+}

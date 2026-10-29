@@ -1,0 +1,88 @@
+{
+  "type": "runtime.inventory",
+  "snapshotId": "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS",
+  "chunkIndex": 0,
+  "final": true,
+  "alwaysOn": [
+    {
+      "slug": "bge",
+      "origin": "server",
+      "runtimeId": "rt2p9o8i7u6y5t4r3e2w1q0a9",
+      "versionId": "vr2z9y8x7w6v5u4t3s2r1q0p9",
+      "launchHash": "d8b3af4568eb3cc97e9e01b12efd48442772061d343ea5b7b98d3ecbc45a405f",
+      "status": "online",
+      "models": [
+        {
+          "id": "bge-m3",
+          "capabilities": ["embedding"],
+          "embeddingContract": {
+            "model": "BAAI/bge-m3",
+            "revision": "main",
+            "dimensions": 1024,
+            "normalization": "l2",
+            "vectorSpace": "bge-m3"
+          }
+        }
+      ]
+    },
+    {
+      "slug": "ollama",
+      "origin": "node",
+      "launchHash": "039468b1d34ebae0307929e4559fa1ef8ca76bc58ba72b569cf04ca192d51be2",
+      "spec": {
+        "api": "openai",
+        "engine": "ollama",
+        "modelType": "llm",
+        "address": {
+          "baseUrl": "http://127.0.0.1:11434/v1"
+        }
+      },
+      "status": "online",
+      "models": [
+        {
+          "id": "llama3.2:3b",
+          "capabilities": ["text_generation"]
+        }
+      ],
+      "engineFacts": {
+        "engine": {
+          "value": "ollama",
+          "source": "probe"
+        }
+      }
+    }
+  ],
+  "instances": [
+    {
+      "instanceId": "in3k4j5h6g7f8d9s0a1q2w3e4",
+      "launchVersionId": "vr1a2b3c4d5e6f7g8h9i0j1k2",
+      "launchHash": "c0c00e47e26769d58cf675d378acbd85b35d00a73c45ecee9a9aaa3327d99668",
+      "rank": 0,
+      "intentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "stepId": "st4m5n6b7v8c9x0z1l2k3j4h5",
+      "phase": "ready",
+      "unitName": "wsmp-i-in3k4j5h6g7f-r0",
+      "port": 30001,
+      "handle": "i-in3k4j5h6g7f",
+      "models": ["Qwen/Qwen3-32B"],
+      "engineFacts": {
+        "engine": {
+          "value": "vllm",
+          "source": "probe"
+        },
+        "kvTokens": {
+          "value": 262144,
+          "source": "probe"
+        },
+        "maxModelLen": {
+          "value": 32768,
+          "source": "probe"
+        },
+        "countContext": {
+          "value": "vllm_tokenize",
+          "source": "probe"
+        }
+      }
+    }
+  ]
+}

@@ -19,6 +19,7 @@ import { type EffectiveView, RegistryOverrideRow } from "@/components/registry-o
 import { MetricsReaderCard } from "@/components/runtimes/metrics-reader-card";
 import { RequestCompatCard } from "@/components/runtimes/request-compat-card";
 import { RequestProfileCard } from "@/components/runtimes/request-profile-card";
+import { rejectedDefinesWarning } from "@/lib/define-rejections";
 import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
@@ -123,6 +124,8 @@ function RuntimeRow({
               restart: result.needsRestart.length,
             }),
           );
+          const rejected = rejectedDefinesWarning(t, result.define);
+          if (rejected) toast.warning(rejected);
           return true;
         } catch (error) {
           toast.error(refusalText(error));

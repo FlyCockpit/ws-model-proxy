@@ -5,6 +5,7 @@
  */
 import { RuntimeLifecycle } from "../runtimes/lifecycle.js";
 import { createRuntimeStepServices } from "../runtimes/operator-steps.js";
+import { createAgentUpdates } from "./agent-updates.js";
 import { nodeCommandTracker } from "./node-commands.js";
 import { composeNodeFrameHandlers } from "./node-frame-handlers.js";
 import { createNodeOperatorServices } from "./node-operator-services.js";
@@ -73,6 +74,10 @@ const nodeRelay = createNodeRelayServices(
 );
 
 export const nodeServices = nodeRelay.services;
+
+/** wsmp self-update: `Context.services.agentUpdates` and its deadline/batch tick. */
+const agentUpdates = createAgentUpdates(relay);
+export const agentUpdateServices = agentUpdates.port;
 export const pushRuntimeDefinitions = runtimeSync.pushRuntimeDefinitions;
 export const dispatchRuntimeOperation = (input: { userId: string; operationId: string }) =>
   runtimeLifecycle.dispatchOperation(input);
@@ -84,6 +89,7 @@ export function installNodeFrameHandlers(): void {
     composeNodeFrameHandlers(
       nodeOperator.handlers,
       nodeRelay.handlers,
+      agentUpdates.handlers,
       runtimeSync.handlers,
       runtimeLifecycle.handlers(),
     ),
@@ -94,4 +100,10 @@ export function installNodeFrameHandlers(): void {
 export function startRuntimeLifecycle(): () => Promise<void> {
   runtimeLifecycle.start();
   return () => runtimeLifecycle.stop();
+}
+
+/** Starts the self-update tick (deadlines, Update all); the returned stop joins it. */
+export function startAgentUpdates(): () => Promise<void> {
+  agentUpdates.start();
+  return () => agentUpdates.stop();
 }

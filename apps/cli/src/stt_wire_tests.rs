@@ -309,11 +309,15 @@ fn current_stt_frames_match_shared_golden() {
             "{name}"
         );
     }
+    // The server's schema refuses these; wsmp reads what a later server may
+    // send: an unknown field is ignored and an unknown reason is `unknown`.
+    let tolerated = ["openUnknownKey", "clearUnknownKey", "closeUnknownReason"];
     for (name, wire) in golden["rejected"].as_object().expect("rejected") {
         let wire = wire.as_str().expect("wire text");
-        assert!(
-            parse_server_control(wire).is_err(),
-            "{name} must be refused"
+        assert_eq!(
+            parse_server_control(wire).is_ok(),
+            tolerated.contains(&name.as_str()),
+            "{name}"
         );
     }
     let audio_frame = |case: &serde_json::Value| {
@@ -334,9 +338,11 @@ fn current_stt_frames_match_shared_golden() {
         assert_eq!(body.len() as u64, case["bodyBytes"], "{name}");
     }
     for (name, case) in golden["audio"]["rejected"].as_object().expect("audio") {
-        assert!(
-            parse_binary_frame(&audio_frame(case)).is_err(),
-            "{name} must be refused"
+        // An unknown metadata field is ignored, as in every server frame.
+        assert_eq!(
+            parse_binary_frame(&audio_frame(case)).is_ok(),
+            name == "unknownKey",
+            "{name}"
         );
     }
 }

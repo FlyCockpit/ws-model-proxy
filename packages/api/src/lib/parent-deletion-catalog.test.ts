@@ -97,6 +97,8 @@ const GRAPH_TABLES: Record<string, string> = {
   node_enrollment_code: "short-lived codes",
   node_enrollment_use: "one row per enrolled node",
   node_command: "node command state, 30-day retention",
+  node_agent_update: "wsmp self-updates, at most one in flight per node, 30-day retention",
+  node_agent_update_batch: "Update all runs, at most one running per user, 30-day retention",
   queued_node_command: "commands queued for a person, expire",
   claim_release_request: "release requests for a person, at most one pending per claim, expire",
   fabric: "configuration",

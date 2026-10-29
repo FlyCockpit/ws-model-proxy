@@ -6,10 +6,21 @@ import { useTranslation } from "react-i18next";
 
 import { TimeAgo } from "@/components/time-ago";
 
-import { ConnectionBadge, formatGb, NodeFlags, TrustBadge } from "./node-badges";
-import type { NodeSummary } from "./node-types";
+import { isTerminalPhase } from "@/lib/agent-update";
 
-export function NodeCard({ node, lang }: { node: NodeSummary; lang: string }) {
+import { ConnectionBadge, formatGb, NodeFlags, StatusPill, TrustBadge } from "./node-badges";
+import type { NodeAgentUpdateView, NodeSummary } from "./node-types";
+
+export function NodeCard({
+  node,
+  lang,
+  agentUpdate,
+}: {
+  node: NodeSummary;
+  lang: string;
+  /** The node's wsmp update state, where the owner's update overview is loaded. */
+  agentUpdate?: Pick<NodeAgentUpdateView, "outdated" | "latest">;
+}) {
   const { t } = useTranslation(["dashboard"]);
   const free = formatGb(node.liveFreeMemoryGb, lang);
   return (
@@ -29,6 +40,11 @@ export function NodeCard({ node, lang }: { node: NodeSummary; lang: string }) {
           <ConnectionBadge connection={node.connection} />
           <TrustBadge trust={node.trust} />
           <NodeFlags node={node} />
+          {agentUpdate?.latest && !isTerminalPhase(agentUpdate.latest.phase) ? (
+            <StatusPill tone="info">{t("dashboard:nodes.agentUpdate.updatingBadge")}</StatusPill>
+          ) : agentUpdate?.outdated ? (
+            <StatusPill tone="warning">{t("dashboard:nodes.agentUpdate.outdated")}</StatusPill>
+          ) : null}
         </div>
       </CardHeader>
       <CardContent className="space-y-2 text-sm">

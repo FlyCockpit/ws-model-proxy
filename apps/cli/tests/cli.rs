@@ -2585,3 +2585,117 @@ fn the_conpty_host_runs_a_shell_on_a_console_and_exits_with_its_code() {
     assert!(text.contains("conpty-host-Windows_NT"), "{text:?}");
     assert_eq!(status.code(), Some(5), "{text:?}");
 }
+
+#[test]
+fn remote_updates_are_a_local_setting_and_update_status_reports_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(&config, json!({ "version": 3 }));
+    let mut status = cli(&config, &state);
+    status.args(["update", "status", "--json"]);
+    let value = json_stdout(status);
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(value["remoteUpdates"], "allowed");
+    // A `target/` build is a source build: it never replaces itself.
+    assert_eq!(value["installMethod"], "source");
+    assert_eq!(value["strategies"], json!([]));
+    assert_eq!(value["lastUpdate"], Value::Null);
+    assert!(value["target"].as_str().is_some_and(|t| !t.is_empty()));
+
+    cli(&config, &state)
+        .args(["config", "set-remote-updates", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("`remoteUpdates` to `off`"));
+    let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
+    assert_eq!(disk["remoteUpdates"], "off");
+    let mut show = cli(&config, &state);
+    show.args(["config", "--json", "show"]);
+    assert_eq!(json_stdout(show)["remoteUpdates"], "off");
+    cli(&config, &state)
+        .args(["config", "set-remote-updates", "allowed"])
+        .assert()
+        .success();
+    let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
+    assert!(
+        disk.get("remoteUpdates").is_none(),
+        "the default is not written"
+    );
+}
+
+#[test]
+fn update_reads_the_server_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let server = TestServer::start(vec![(
+        "/cli/manifest.json",
+        200,
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": null,
+            "releaseUrl": null,
+            "sourceBuild": false,
+            "artifacts": {}
+        }),
+    )]);
+    write_config(
+        &config,
+        json!({ "version": 3, "serverUrl": server.base_url, "trust": "full" }),
+    );
+    let mut current = cli(&config, &state);
+    current.args(["update", "--json"]);
+    let value = json_stdout(current);
+    assert_eq!(value["outcome"], "current");
+    assert!(!state.join("update").join("state.json").exists());
+
+    let source = TestServer::start(vec![(
+        "/cli/manifest.json",
+        200,
+        json!({
+            "version": "99.0.0",
+            "commit": "0123456789abcdef0123456789abcdef01234567",
+            "sourceBuild": true,
+            "artifacts": {}
+        }),
+    )]);
+    write_config(
+        &config,
+        json!({ "version": 3, "serverUrl": source.base_url, "trust": "full" }),
+    );
+    cli(&config, &state)
+        .args(["update"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cargo install"))
+        .stderr(predicate::str::contains("--rev 0123456789abcdef"));
+    assert!(!state.join("update").join("state.json").exists());
+}
+
+#[test]
+fn the_update_dead_man_leaves_other_updates_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    // No update state: nothing to roll back, nothing touched.
+    cli(&config, &state)
+        .args([
+            "update",
+            "rollback",
+            "--if-unconfirmed",
+            "AAAAAAAAAAAAAAAAAAAAAA",
+            "--state-dir",
+        ])
+        .arg(&state)
+        .assert()
+        .success();
+    assert!(!state.join("update").join("state.json").exists());
+    // Hidden from help.
+    cli(&config, &state)
+        .args(["update", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("rollback").not());
+}

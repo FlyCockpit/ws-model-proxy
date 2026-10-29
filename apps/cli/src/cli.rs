@@ -83,6 +83,10 @@ pub enum Command {
     /// Approve browser identities and show the CLI identity for terminals.
     Terminal(crate::commands::terminal::Args),
 
+    /// Install the server's wsmp here (verified, rolled back by itself if it
+    /// does not come up), or show the last update.
+    Update(crate::commands::update::Args),
+
     /// List or apply crash-safe file recovery from abandoned `.wsmp-recover-*` directories.
     Recover(crate::commands::recover::Args),
 

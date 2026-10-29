@@ -138,6 +138,7 @@ import { cancelNodeCommandsForCredentials } from "./relay/node-commands.js";
 import type { NodeIdentity } from "./relay/node-credential-auth.js";
 import { nodeFileServices } from "./relay/node-file-ops.js";
 import {
+  agentUpdateServices,
   dispatchRuntimeOperation,
   nodeOperatorServices,
   nodeServices,
@@ -315,6 +316,7 @@ function contextServices(request: HonoContext | null): ContextServices {
     onPoolRoutingRulesChanged: (poolId: string) =>
       relaySessionManager.onPoolRoutingRulesChanged(poolId),
     nodes: nodeServices,
+    agentUpdates: agentUpdateServices,
     pushRuntimeDefinitions,
     dispatchRuntimeOperation,
     nodeOperator: nodeOperatorServices,

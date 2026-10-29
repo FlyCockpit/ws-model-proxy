@@ -26,3 +26,4 @@ pub mod service;
 pub mod status;
 pub mod terminal;
 pub mod trust;
+pub mod update;

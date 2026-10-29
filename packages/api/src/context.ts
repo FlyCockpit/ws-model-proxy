@@ -4,6 +4,7 @@ import type { Context as HonoContext } from "hono";
 import type { z } from "zod";
 import type { AnonymousAuth, CallerAuth } from "./contracts/auth-context";
 import type { modelsContract } from "./contracts/models";
+import type { AgentUpdatePort } from "./lib/agent-updates";
 import type { LiveLoadReader } from "./lib/live-load";
 import type { NodeRelayServices } from "./lib/node-relay-services";
 import type { RuntimeShell } from "./lib/runtime-spec";
@@ -31,6 +32,12 @@ export type ContextServices = {
   /** Node and profile relay hooks (`lib/node-relay-services.ts`). */
   nodes?: NodeRelayServices;
   /**
+   * wsmp self-update (`nodes.agentUpdate.*`): the release manifest, the node's live session and
+   * the `agent.update` send (`lib/agent-updates.ts`). Absent: nothing can update from the
+   * browser (every node shows its manual command).
+   */
+  agentUpdates?: AgentUpdatePort;
+  /**
    * A runtime got a new version (create, update, fork). Push `runtime.define` to the nodes
    * that need it and answer per node. Absent (tests): the procedures answer `define: []` and
    * nodes pick the version up on their next definition sync.
@@ -40,6 +47,8 @@ export type ContextServices = {
       nodeId: string;
       status: "applied" | "unchanged" | "rejected" | "pending" | "skipped_trust_relay";
       reason: string | null;
+      /** `rejected` only: the JSON path the node could not parse or accept (never spec text). */
+      detail?: string | null;
     }>
   >;
   /**
