@@ -140,6 +140,7 @@ pub fn self_replace(
             );
         }
     };
+    install::clear_retired(&layout.live);
     let ended = install_files(machine, request, &layout, progress);
     if ended == Ended::Stopped {
         install::clean(&layout);
@@ -497,6 +498,7 @@ pub fn rollback_if_unconfirmed(
         state::save(update_dir, &current)?;
         return Ok(Rollback::NoCopy);
     }
+    install::clear_retired(&layout.live);
     current.advance(Phase::RolledBack)?;
     current.detail = log_tail().map(|tail| super::clip_detail(&tail));
     state::save(update_dir, &current)?;
@@ -565,11 +567,23 @@ pub fn confirm(
     {
         tracing::warn!(error = %format!("{error:#}"), "writing the install receipt failed");
     }
-    // The retired Windows binary is no longer running.
-    if let Ok(layout) = Layout::beside(&current.live_path, &current.update_id) {
-        let _ = std::fs::remove_file(layout.retired);
-    }
+    install::clear_retired(&current.live_path);
     Ok(Confirm::Confirmed(Box::new(current)))
+}
+
+/// Whether a start must arm the dead-man again: it went missing (removed by
+/// hand, or a task that expired), or its job's time passed while nothing ran
+/// it. A deadline missed while the machine was off is one: Windows' Task
+/// Scheduler may start the missed task only minutes after boot.
+fn deadman_lost(scheduler: &dyn Scheduler, deadman_at: Option<u64>, now: u64) -> bool {
+    match scheduler.present() {
+        Ok(false) => true,
+        Ok(true) => {
+            deadman_at.is_some_and(|at| at <= now)
+                && scheduler.running().is_ok_and(|running| !running)
+        }
+        Err(_) => false,
+    }
 }
 
 /// What a starting relay does about the update state.
@@ -660,6 +674,7 @@ pub fn on_start(
     if current.attempts > max_starts {
         let layout = layout_of(&current)?;
         if install::restore(&layout)? {
+            install::clear_retired(&layout.live);
             current.advance(Phase::RolledBack)?;
             current.detail = Some(format!(
                 "wsmp {} started {max_starts} times without confirming",
@@ -679,9 +694,8 @@ pub fn on_start(
         .max(now + u64::from(current.rollback_after_secs));
     if let Some(scheduler) = scheduler
         && current.attempts <= max_starts
-        && !scheduler.present().unwrap_or(true)
+        && deadman_lost(scheduler, current.deadman_at, now)
     {
-        // The dead-man went missing (removed by hand, or a task that expired).
         let spec = DeadmanSpec {
             update_id: current.update_id.clone(),
             prev: current.prev_path.clone(),
@@ -689,10 +703,10 @@ pub fn on_start(
                 .parent()
                 .context("the update directory has no parent")?
                 .to_path_buf(),
-            fire_in: Duration::from_secs(u64::from(current.rollback_after_secs)),
+            fire_in: Duration::from_secs(current.deadline.saturating_sub(now)),
         };
         match super::deadman::arm(scheduler, &spec, super::deadman::ARM_WAIT) {
-            Ok(()) => current.deadman_at = Some(now + u64::from(current.rollback_after_secs)),
+            Ok(()) => current.deadman_at = Some(current.deadline),
             Err(error) => tracing::warn!(
                 error = %format!("{error:#}"),
                 "re-arming the update dead-man failed"
@@ -1111,6 +1125,60 @@ mod tests {
             Rollback::Settled
         );
         assert!(node.live_text().contains("0.4.2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_man_whose_time_passed_unrun_is_armed_again() {
+        let (node, saved) = swapped_node();
+        let sha = node.live_sha();
+        let deadman_at = saved.deadman_at.expect("armed");
+        let before = *node.scheduler.registrations.borrow();
+        // A start before the dead-man's time: it will run, nothing to do.
+        on_start(
+            &node.update_dir(),
+            Some(&node.scheduler),
+            new_build(&sha),
+            3,
+            deadman_at - 1,
+        )
+        .expect("start");
+        assert_eq!(*node.scheduler.registrations.borrow(), before);
+        // After a reboot its time has passed and it is not running: armed for
+        // the moved deadline.
+        let late = deadman_at + 300;
+        on_start(
+            &node.update_dir(),
+            Some(&node.scheduler),
+            new_build(&sha),
+            3,
+            late,
+        )
+        .expect("start");
+        assert_eq!(*node.scheduler.registrations.borrow(), before + 1);
+        let rearmed = state::load(&node.update_dir())
+            .expect("load")
+            .expect("state");
+        assert_eq!(rearmed.deadman_at, Some(rearmed.deadline));
+        assert_eq!(
+            node.scheduler
+                .registered
+                .borrow()
+                .as_ref()
+                .map(|spec| spec.fire_in),
+            Some(Duration::from_secs(rearmed.deadline - late))
+        );
+        // Running now (waiting for the deadline): left alone.
+        *node.scheduler.running_for.borrow_mut() = 1;
+        on_start(
+            &node.update_dir(),
+            Some(&node.scheduler),
+            new_build(&sha),
+            3,
+            rearmed.deadline + 1,
+        )
+        .expect("start");
+        assert_eq!(*node.scheduler.registrations.borrow(), before + 1);
     }
 
     #[cfg(unix)]
