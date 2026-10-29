@@ -1,4 +1,4 @@
-import { useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 
 import {
@@ -36,142 +36,146 @@ export function useNodeLiveUpdates(sessionKey: string | null): void {
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    const store = useNodeLive.getState();
     if (!sessionKey || typeof window === "undefined" || typeof fetch !== "function") {
-      store.set({ status: "off" });
-      return;
-    }
-    let disposed = false;
-    let stopped = false;
-    let attempt = 0;
-    let controller: AbortController | null = null;
-    let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
-    let flushTimer: ReturnType<typeof setTimeout> | undefined;
-    let noticeTimer: ReturnType<typeof setTimeout> | undefined;
-
-    const refreshSoon = () => {
-      if (flushTimer !== undefined) return;
-      flushTimer = setTimeout(() => {
-        flushTimer = undefined;
-        if (!disposed) void invalidateNodeLiveQueries(queryClient);
-      }, NODE_LIVE_COALESCE_MS);
-    };
-
-    const markLive = () => {
-      clearTimeout(noticeTimer);
-      noticeTimer = undefined;
-      useNodeLive.getState().set({ status: "live" });
-    };
-
-    const markDown = () => {
-      const { notice } = useNodeLive.getState();
-      useNodeLive.getState().set({ status: "down", notice });
-      if (notice || noticeTimer !== undefined) return;
-      noticeTimer = setTimeout(() => {
-        noticeTimer = undefined;
-        if (!disposed && useNodeLive.getState().status === "down")
-          useNodeLive.getState().set({ status: "down", notice: true });
-      }, NODE_LIVE_NOTICE_MS);
-    };
-
-    const stop = () => {
-      stopped = true;
-      clearTimeout(noticeTimer);
-      noticeTimer = undefined;
-      useNodeLive.getState().set({ status: "unauthorized" });
-    };
-
-    const armWatchdog = (current: AbortController) => {
-      clearTimeout(watchdogTimer);
-      watchdogTimer = setTimeout(() => current.abort(), NODE_LIVE_WATCHDOG_MS);
-    };
-
-    const connect = async () => {
-      clearTimeout(retryTimer);
-      retryTimer = undefined;
-      if (disposed || stopped || controller) return;
-      const current = new AbortController();
-      controller = current;
-      if (useNodeLive.getState().status !== "down")
-        useNodeLive.getState().set({ status: "connecting" });
-      let openedAt: number | null = null;
-      // Also bounds a response whose headers never arrive (a buffering proxy).
-      armWatchdog(current);
-      try {
-        const response = await fetch(NODE_EVENTS_PATH, {
-          credentials: "same-origin",
-          cache: "no-store",
-          headers: { Accept: "text/event-stream" },
-          signal: current.signal,
-        });
-        if (response.status === 401 || response.status === 403) {
-          await response.body?.cancel().catch(() => undefined);
-          stop();
-          return;
-        }
-        if (!response.ok || !response.body) {
-          await response.body?.cancel().catch(() => undefined);
-          return;
-        }
-        openedAt = performance.now();
-        markLive();
-        refreshSoon();
-        armWatchdog(current);
-        const parser = createSseParser((event) => {
-          if (event.event === "unauthorized") {
-            stop();
-            current.abort();
-          } else if (event.event === "node" && parseNodeLiveEvent(event.data)) {
-            refreshSoon();
-          }
-        });
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          armWatchdog(current);
-          parser.push(decoder.decode(value, { stream: true }));
-        }
-      } catch {
-        // A network error, the watchdog or the cleanup (an abort): the finally decides.
-      } finally {
-        clearTimeout(watchdogTimer);
-        if (controller === current) controller = null;
-        if (!disposed && !stopped) {
-          markDown();
-          if (openedAt !== null && performance.now() - openedAt >= NODE_LIVE_STABLE_MS) attempt = 0;
-          retryTimer = setTimeout(() => void connect(), nodeLiveReconnectDelayMs(attempt));
-          attempt += 1;
-        }
-      }
-    };
-
-    // Back online, or back to the tab: no need to wait out the backoff.
-    const reconnectNow = () => {
-      if (disposed || stopped || controller) return;
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-      void connect();
-    };
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") reconnectNow();
-    };
-    window.addEventListener("online", reconnectNow);
-    document.addEventListener("visibilitychange", onVisibility);
-
-    void connect();
-    return () => {
-      disposed = true;
-      clearTimeout(retryTimer);
-      clearTimeout(watchdogTimer);
-      clearTimeout(flushTimer);
-      clearTimeout(noticeTimer);
-      window.removeEventListener("online", reconnectNow);
-      document.removeEventListener("visibilitychange", onVisibility);
-      controller?.abort();
-      controller = null;
       useNodeLive.getState().set({ status: "off" });
-    };
+      return undefined;
+    }
+    return openNodeEventStream(queryClient);
   }, [sessionKey, queryClient]);
+}
+
+/** Opens the stream and keeps it open (reconnecting) until the returned function ends it. */
+function openNodeEventStream(queryClient: QueryClient): () => void {
+  let disposed = false;
+  let stopped = false;
+  let attempt = 0;
+  let controller: AbortController | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const refreshSoon = () => {
+    if (flushTimer !== undefined) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = undefined;
+      if (!disposed) void invalidateNodeLiveQueries(queryClient);
+    }, NODE_LIVE_COALESCE_MS);
+  };
+
+  const markLive = () => {
+    clearTimeout(noticeTimer);
+    noticeTimer = undefined;
+    useNodeLive.getState().set({ status: "live" });
+  };
+
+  const markDown = () => {
+    const { notice } = useNodeLive.getState();
+    useNodeLive.getState().set({ status: "down", notice });
+    if (notice || noticeTimer !== undefined) return;
+    noticeTimer = setTimeout(() => {
+      noticeTimer = undefined;
+      if (!disposed && useNodeLive.getState().status === "down")
+        useNodeLive.getState().set({ status: "down", notice: true });
+    }, NODE_LIVE_NOTICE_MS);
+  };
+
+  const stop = () => {
+    stopped = true;
+    clearTimeout(noticeTimer);
+    noticeTimer = undefined;
+    useNodeLive.getState().set({ status: "unauthorized" });
+  };
+
+  const armWatchdog = (current: AbortController) => {
+    clearTimeout(watchdogTimer);
+    watchdogTimer = setTimeout(() => current.abort(), NODE_LIVE_WATCHDOG_MS);
+  };
+
+  const connect = async () => {
+    clearTimeout(retryTimer);
+    retryTimer = undefined;
+    if (disposed || stopped || controller) return;
+    const current = new AbortController();
+    controller = current;
+    if (useNodeLive.getState().status !== "down")
+      useNodeLive.getState().set({ status: "connecting" });
+    let openedAt: number | null = null;
+    // Also bounds a response whose headers never arrive (a buffering proxy).
+    armWatchdog(current);
+    try {
+      const response = await fetch(NODE_EVENTS_PATH, {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { Accept: "text/event-stream" },
+        signal: current.signal,
+      });
+      if (response.status === 401 || response.status === 403) {
+        await response.body?.cancel().catch(() => undefined);
+        stop();
+        return;
+      }
+      if (!response.ok || !response.body) {
+        await response.body?.cancel().catch(() => undefined);
+        return;
+      }
+      openedAt = performance.now();
+      markLive();
+      refreshSoon();
+      armWatchdog(current);
+      const parser = createSseParser((event) => {
+        if (event.event === "unauthorized") {
+          stop();
+          current.abort();
+        } else if (event.event === "node" && parseNodeLiveEvent(event.data)) {
+          refreshSoon();
+        }
+      });
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        armWatchdog(current);
+        parser.push(decoder.decode(value, { stream: true }));
+      }
+    } catch {
+      // A network error, the watchdog or the cleanup (an abort): the finally decides.
+    } finally {
+      clearTimeout(watchdogTimer);
+      if (controller === current) controller = null;
+      if (!disposed && !stopped) {
+        markDown();
+        if (openedAt !== null && performance.now() - openedAt >= NODE_LIVE_STABLE_MS) attempt = 0;
+        retryTimer = setTimeout(() => void connect(), nodeLiveReconnectDelayMs(attempt));
+        attempt += 1;
+      }
+    }
+  };
+
+  // Back online, or back to the tab: no need to wait out the backoff.
+  const reconnectNow = () => {
+    if (disposed || stopped || controller) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    void connect();
+  };
+  const onVisibility = () => {
+    if (document.visibilityState === "visible") reconnectNow();
+  };
+  window.addEventListener("online", reconnectNow);
+  document.addEventListener("visibilitychange", onVisibility);
+
+  void connect();
+  return () => {
+    disposed = true;
+    clearTimeout(retryTimer);
+    clearTimeout(watchdogTimer);
+    clearTimeout(flushTimer);
+    clearTimeout(noticeTimer);
+    window.removeEventListener("online", reconnectNow);
+    document.removeEventListener("visibilitychange", onVisibility);
+    controller?.abort();
+    controller = null;
+    useNodeLive.getState().set({ status: "off" });
+  };
 }
