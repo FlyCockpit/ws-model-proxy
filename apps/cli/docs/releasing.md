@@ -49,9 +49,9 @@ Self-update only works while a node can still connect and take the next update, 
 
 - **Never turn away a wsmp that reports `features.selfUpdate` at hello.** The server refuses
   wsmp builds older than self-update by capability (a hello without `features.selfUpdate` gets
-  `upgrade_cli`), not by bumping the relay protocol. A protocol bump is for a real wire change,
-  and even then the server keeps accepting the older protocol from a node that can update
-  itself, long enough to send it `agent.update` first.
+  `upgrade_cli`), not by bumping the relay protocol. Protocol 3.0 is permanent (`AGENTS.md`,
+  "Versions and Releases"): a new capability is new frames or optional fields, used only with
+  nodes that report it.
 - **Fields added later to what a node sends stay optional**, in the hello and every other
   frame: a released wsmp never sends them.
 - **A server may add optional fields to any frame.** wsmp (from 0.4.3) ignores fields it does
