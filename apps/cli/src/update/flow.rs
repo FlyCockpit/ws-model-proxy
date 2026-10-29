@@ -692,6 +692,7 @@ pub fn on_start(
     current.deadline = current
         .deadline
         .max(now + u64::from(current.rollback_after_secs));
+    current.updated_at = crate::file_ops::fmt::rfc3339_secs(now);
     if let Some(scheduler) = scheduler
         && current.attempts <= max_starts
         && deadman_lost(scheduler, current.deadman_at, now)

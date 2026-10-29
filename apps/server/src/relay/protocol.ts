@@ -60,7 +60,7 @@ export const RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE =
  * turned away at hello: the server sends it the update instead (`apps/cli/docs/releasing.md`).
  */
 export const RELAY_SELF_UPDATE_REQUIRED_MESSAGE =
-  "This server needs a newer wsmp, one that can update itself. Re-run the server's install.sh (install.ps1 on Windows), then restart wsmp.";
+  "This server needs a newer wsmp, one that can update itself. Re-run the server's install.sh (install.ps1 on Windows), or run `brew upgrade wsmp` if you installed it with Homebrew, then restart wsmp.";
 
 /** Whether a parsed hello may register: only a wsmp that can update itself is let in. */
 export function helloCanSelfUpdate(
