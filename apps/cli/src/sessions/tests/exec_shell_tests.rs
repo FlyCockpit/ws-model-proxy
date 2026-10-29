@@ -243,12 +243,14 @@ fn powershell_writes_utf8_in_a_console_with_the_oem_code_page() {
         let ExecProcess {
             mut process,
             script: _script,
+            ran_with,
         } = exec_process(
             &ExecLine::Text("Write-Output '\u{e9}t\u{e9} \u{2713}'; cmd /c echo \u{e9}t\u{e9}"),
             Some(shell),
             scripts.path(),
         )
         .expect("process");
+        assert_eq!(ran_with, in_shell(shell));
         process
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped());
@@ -279,6 +281,119 @@ fn an_argv_cannot_run_in_sh_on_windows() {
     assert_eq!(
         rejection(&ExecLine::Argv(&argv), Some(CommandShell::Sh)),
         REASON_SHELL_UNAVAILABLE
+    );
+}
+
+/// Start `line` and return its `exec.started`'s `ranWith`, with the server accepting it or not.
+fn started_ran_with(
+    line: &ExecLine<'_>,
+    shell: Option<CommandShell>,
+    report: bool,
+) -> Option<RanWith> {
+    let (tx, _rx) = channel();
+    let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
+    let scripts = tempfile::tempdir().expect("scripts");
+    execs.scripts = scripts.path().to_path_buf();
+    execs.set_report_ran_with(report);
+    let frames = execs.start(
+        &enabled_startup(false),
+        &fresh_id(),
+        line,
+        shell,
+        None,
+        TEST_TIMEOUT_MS,
+    );
+    let ran_with = match controls(&frames).as_slice() {
+        [NodeFrame::ExecStarted { ran_with, .. }] => *ran_with,
+        other => panic!("expected exec.started, got {other:?}"),
+    };
+    let _ = execs.kill_all();
+    ran_with
+}
+
+#[test]
+fn ran_with_is_sent_only_to_a_server_that_accepts_it() {
+    #[cfg(not(windows))]
+    let (text, program) = ("true", "true");
+    #[cfg(windows)]
+    let (text, program) = ("Write-Output hi", "whoami");
+    assert_eq!(started_ran_with(&ExecLine::Text(text), None, false), None);
+    let argv = vec![program.to_string()];
+    assert_eq!(started_ran_with(&ExecLine::Argv(&argv), None, false), None);
+    assert_eq!(
+        started_ran_with(&ExecLine::Argv(&argv), None, true),
+        Some(RanWith {
+            shell: None,
+            mode: RanMode::Direct
+        })
+    );
+    let text_ran = started_ran_with(&ExecLine::Text(text), None, true).expect("ran with");
+    assert_eq!(text_ran.mode, RanMode::Shell);
+    #[cfg(not(windows))]
+    assert_eq!(text_ran.shell, Some(CommandShell::Sh));
+    #[cfg(windows)]
+    assert!(
+        matches!(
+            text_ran.shell,
+            Some(CommandShell::Pwsh | CommandShell::Powershell)
+        ),
+        "{text_ran:?}"
+    );
+}
+
+#[test]
+fn a_batch_file_argv_runs_directly_in_cmd() {
+    let direct = |path: &str| direct_ran_with(Path::new(path));
+    for exe in [r"C:\Windows\System32\whoami.exe", r"C:\tools\x.COM"] {
+        assert_eq!(
+            direct(exe),
+            RanWith {
+                shell: None,
+                mode: RanMode::Direct
+            },
+            "{exe}"
+        );
+    }
+    for batch in [r"C:\nodejs\npm.cmd", r"C:\x\build.BAT"] {
+        assert_eq!(
+            direct(batch),
+            RanWith {
+                shell: Some(CommandShell::Cmd),
+                mode: RanMode::Direct
+            },
+            "{batch}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn ran_with_names_the_windows_shell_that_ran_it() {
+    let scripts = tempfile::tempdir().expect("scripts");
+    let ran = |line: &ExecLine<'_>, shell| {
+        exec_process(line, shell, scripts.path())
+            .map(|exec| exec.ran_with)
+            .ok()
+    };
+    assert_eq!(
+        ran(&ExecLine::Text("echo hi"), Some(CommandShell::Cmd)),
+        Some(in_shell(CommandShell::Cmd))
+    );
+    let default = crate::runtimes::executor::windows::default_shell().ok();
+    assert_eq!(
+        ran(&ExecLine::Text("Write-Output hi"), None),
+        default.map(in_shell)
+    );
+    // A PowerShell command (not a program on `PATH`) runs as a script in the default shell.
+    let argv = vec!["Get-Date".to_string()];
+    assert_eq!(ran(&ExecLine::Argv(&argv), None), default.map(in_shell));
+    let argv = vec!["whoami".to_string()];
+    assert_eq!(
+        ran(&ExecLine::Argv(&argv), None),
+        Some(RanWith {
+            shell: None,
+            mode: RanMode::Direct
+        })
     );
 }
 

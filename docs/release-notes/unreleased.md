@@ -38,3 +38,15 @@ and Terminals pages say "Live updates paused".
   copy of the tool.
 - A command's `finishedAt` is its server start plus the run time the node measured. Before,
   a node whose clock ran behind the server's showed fast commands as ending when they started.
+
+## New: node commands say which shell ran them
+
+`node_command_run` and `node_command_get` (and `nodes.commands.run` / `get`) now answer
+`ranWith: { shell, mode }`: the shell that read the command (`sh`, `pwsh`, `powershell` or `cmd`;
+null for a program started directly) and `mode`, `shell` or `direct` (an argv started as a
+program, each argument exact; a Windows `.bat` or `.cmd` is `direct` with `shell: "cmd"`).
+
+The field appears once a node runs a `wsmp` release that reports it; commands on nodes with an
+older `wsmp` have no `ranWith`, and keep working as before. It is stored in two new nullable
+`node_command` columns (`ranMode`, `ranShell`), so this deploy needs `APPLY_SCHEMA=safe` (already
+needed above).

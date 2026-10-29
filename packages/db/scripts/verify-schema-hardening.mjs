@@ -597,6 +597,37 @@ try {
     `UPDATE node_command SET state = 'RUNNING', "exitCode" = NULL, "finishedAt" = NULL WHERE id = 'AAAAAAAAAAAAAAAAAAAAAA'`,
     "55000",
   );
+  await client.query(`
+    INSERT INTO node_command (id, "userId", "nodeId", actor, subject, "startedAt", "endsBy")
+    VALUES ('EEEEEEEEEEEEEEEEEEEEEE', 'owner-a', 'node-a1', 'USER', 'hmac-sha256:00 ls', now(), now() + interval '1 hour')`);
+  await expectFailure(
+    "node_command_shape ran in a shell without naming it",
+    `UPDATE node_command SET "ranMode" = 'shell' WHERE id = 'EEEEEEEEEEEEEEEEEEEEEE'`,
+    "23514",
+  );
+  await expectFailure(
+    "node_command_shape unknown ran mode",
+    `UPDATE node_command SET "ranMode" = 'interpreted', "ranShell" = 'sh' WHERE id = 'EEEEEEEEEEEEEEEEEEEEEE'`,
+    "23514",
+  );
+  await expectFailure(
+    "node_command_shape ran shell without a mode",
+    `UPDATE node_command SET "ranShell" = 'sh' WHERE id = 'EEEEEEEEEEEEEEEEEEEEEE'`,
+    "23514",
+  );
+  await expectFailure(
+    "node_command_shape ran shell that is not an id",
+    `UPDATE node_command SET "ranMode" = 'shell', "ranShell" = 'C:\\Windows\\cmd.exe' WHERE id = 'EEEEEEEEEEEEEEEEEEEEEE'`,
+    "23514",
+  );
+  await client.query(
+    `UPDATE node_command SET "ranMode" = 'direct' WHERE id = 'EEEEEEEEEEEEEEEEEEEEEE'`,
+  );
+  await expectFailure(
+    "node_command_transition ran with is set once",
+    `UPDATE node_command SET "ranMode" = 'shell', "ranShell" = 'sh' WHERE id = 'EEEEEEEEEEEEEEEEEEEEEE'`,
+    "55000",
+  );
   await expectFailure(
     "node_command_shape agent without a credential",
     `INSERT INTO node_command (id, "userId", "nodeId", actor, subject, "startedAt", "endsBy")

@@ -13,6 +13,7 @@ const db = vi.hoisted(() => {
         findFirst: vi.fn(async (): Promise<unknown> => null),
         findUnique: vi.fn(async (): Promise<unknown> => null),
         findMany: vi.fn(async (): Promise<unknown[]> => []),
+        updateMany: vi.fn(async (): Promise<{ count: number }> => ({ count: 1 })),
       },
       agentToken: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
       mcpGrant: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
@@ -156,6 +157,46 @@ describe("node operator services: commands", () => {
       endsBy: new Date("2026-01-01T00:01:00.000Z"),
     });
     expect(s.tracker.get(COMMAND)?.endsBy).toBe(Date.parse("2026-01-01T00:01:00.000Z"));
+    // A released wsmp says nothing about how it ran: nothing is written.
+    expect(db.client.nodeCommand.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("records how the command ran on its own running row, once", async () => {
+    const s = setup();
+    const started = s.services.startCommand(startArgs);
+    await s.handlers["exec.started"]?.(ref(), {
+      type: "exec.started",
+      commandId: COMMAND,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endsBy: "2026-01-01T00:01:00.000Z",
+      ranWith: { shell: "pwsh", mode: "shell" },
+    });
+    await expect(started).resolves.toEqual({
+      startedAt: new Date("2026-01-01T00:00:00.000Z"),
+      endsBy: new Date("2026-01-01T00:01:00.000Z"),
+      ranWith: { shell: "pwsh", mode: "shell" },
+    });
+    expect(db.client.nodeCommand.updateMany).toHaveBeenCalledWith({
+      where: { id: COMMAND, nodeId: "node-1", userId: "user-1", state: "RUNNING", ranMode: null },
+      data: { ranMode: "shell", ranShell: "pwsh" },
+    });
+  });
+
+  it("answers without ranWith when it could not be recorded", async () => {
+    const s = setup();
+    db.client.nodeCommand.updateMany.mockResolvedValueOnce({ count: 0 });
+    const started = s.services.startCommand(startArgs);
+    await s.handlers["exec.started"]?.(ref(), {
+      type: "exec.started",
+      commandId: COMMAND,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endsBy: "2026-01-01T00:01:00.000Z",
+      ranWith: { shell: null, mode: "direct" },
+    });
+    await expect(started).resolves.toEqual({
+      startedAt: new Date("2026-01-01T00:00:00.000Z"),
+      endsBy: new Date("2026-01-01T00:01:00.000Z"),
+    });
   });
 
   it("throws a fixed message on exec.rejected and when the node is offline or at Relay", async () => {

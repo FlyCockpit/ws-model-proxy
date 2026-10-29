@@ -2035,6 +2035,8 @@ export class RelaySessionManager {
       protocolVersion: message.protocolVersion,
       nodeId: registration.nodeId,
       definitionSync,
+      // What this server accepts on top of the released 3.0 node frames.
+      features: { execRanWith: true },
     });
     session.helloAcked = true;
     // Again now it is acknowledged: a lowering pending (or one that came during the awaits

@@ -46,6 +46,50 @@ function expectValid(schema: z.ZodType, frames: Array<[string, Record<string, un
   }
 }
 
+describe("how a node command ran", () => {
+  const started = (ranWith?: unknown) => ({
+    type: "exec.started",
+    commandId: "AAAAAAAAAAAAAAAAAAAAAA",
+    startedAt: "2026-10-06T12:00:00.000Z",
+    endsBy: "2026-10-06T13:00:00.000Z",
+    ...(ranWith !== undefined ? { ranWith } : {}),
+  });
+  const accepts = (frame: unknown) => nodeToServerControlFrameSchema.safeParse(frame).success;
+
+  it("accepts exec.started with and without ranWith (released wsmp sends none)", () => {
+    expect(accepts(started())).toBe(true);
+    expect(accepts(started({ shell: "pwsh", mode: "shell" }))).toBe(true);
+    expect(accepts(started({ shell: null, mode: "direct" }))).toBe(true);
+    // A .bat or .cmd argv: started directly, in cmd.
+    expect(accepts(started({ shell: "cmd", mode: "direct" }))).toBe(true);
+    // A shell a later wsmp names is still read.
+    expect(accepts(started({ shell: "bash", mode: "shell" }))).toBe(true);
+  });
+
+  it("refuses a ranWith that does not say how it ran", () => {
+    expect(accepts(started({ shell: null, mode: "shell" }))).toBe(false);
+    expect(accepts(started({ shell: "sh", mode: "interpreted" }))).toBe(false);
+    expect(accepts(started({ shell: "C:\\Windows\\cmd.exe", mode: "shell" }))).toBe(false);
+    expect(accepts(started({ shell: "sh", mode: "shell", extra: 1 }))).toBe(false);
+    expect(accepts(started({ mode: "direct" }))).toBe(false);
+  });
+
+  it("hello.ok may carry features, or not", () => {
+    const hello = {
+      type: "hello.ok",
+      id: "h-1",
+      protocolVersion: "3.0",
+      nodeId: "nd5q6w7e8r9t0y1u2i3o4p5a6",
+      definitionSync: "none",
+    };
+    expect(serverToNodeControlFrameSchema.safeParse(hello).success).toBe(true);
+    expect(
+      serverToNodeControlFrameSchema.safeParse({ ...hello, features: { execRanWith: true } })
+        .success,
+    ).toBe(true);
+  });
+});
+
 describe("relay 3.0 frames", () => {
   const nodeToServer = load("frames/node-to-server");
   const serverToNode = load("frames/server-to-node");

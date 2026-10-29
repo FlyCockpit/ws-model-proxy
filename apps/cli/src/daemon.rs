@@ -1155,6 +1155,8 @@ fn run_relay_session(
     let worker_rx = &link.worker_rx;
     // The watch starts before the pre-hello reload: no edit falls between.
     let mut config_watch = ConfigWatch::new();
+    // This connection's server says at `hello.ok` what it accepts; until then, nothing new.
+    link.execs.set_report_ran_with(false);
     let mut session = Session {
         worker_tx: worker_tx.clone(),
         workers: BTreeMap::new(),
@@ -1596,6 +1598,7 @@ where
             id,
             node_id,
             definition_sync,
+            features,
             ..
         } => {
             if session.registered {
@@ -1604,6 +1607,10 @@ where
                 )));
             }
             session.registered = true;
+            // Optional node frame fields go only to a server that said it accepts them.
+            session
+                .execs
+                .set_report_ran_with(features.unwrap_or_default().exec_ran_with);
             tracing::info!(id, node_id, ?definition_sync, "relay registration accepted");
             session.update.on_hello_ok(definition_sync);
             send_inventory(session);

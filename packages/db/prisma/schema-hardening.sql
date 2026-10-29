@@ -193,13 +193,22 @@ ALTER TABLE node_command ADD CONSTRAINT node_command_shape CHECK (
   AND ("finishedAt" IS NULL OR "finishedAt" >= "startedAt")
   AND ("exitCode" IS NULL OR ("exitCode" BETWEEN 0 AND 255 AND state IN ('SUCCEEDED', 'FAILED')))
   AND (signal IS NULL OR signal ~ '^[A-Za-z0-9_+.-]{1,32}$')
+  -- How it ran: a shell names itself; a program started directly may still name cmd (a .bat).
+  AND ("ranMode" IS NULL OR "ranMode" IN ('shell', 'direct'))
+  AND ("ranShell" IS NULL OR ("ranMode" IS NOT NULL AND "ranShell" ~ '^[a-z][a-z0-9_-]{0,31}$'))
+  AND ("ranMode" IS DISTINCT FROM 'shell' OR "ranShell" IS NOT NULL)
 );
 CREATE OR REPLACE FUNCTION enforce_node_command_transition()
 RETURNS trigger LANGUAGE plpgsql AS $node_command_transition$
 BEGIN
-  IF (to_jsonb(NEW) - ARRAY['state', 'exitCode', 'signal', 'finishedAt', 'updatedAt']::text[])
-      IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['state', 'exitCode', 'signal', 'finishedAt', 'updatedAt']::text[]) THEN
+  IF (to_jsonb(NEW) - ARRAY['state', 'exitCode', 'signal', 'finishedAt', 'updatedAt', 'ranMode', 'ranShell']::text[])
+      IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['state', 'exitCode', 'signal', 'finishedAt', 'updatedAt', 'ranMode', 'ranShell']::text[]) THEN
     RAISE EXCEPTION 'a node command keeps its identity' USING ERRCODE = '55000';
+  END IF;
+  -- How it ran is recorded once, when the node started it.
+  IF OLD."ranMode" IS NOT NULL AND (NEW."ranMode", NEW."ranShell")
+      IS DISTINCT FROM (OLD."ranMode", OLD."ranShell") THEN
+    RAISE EXCEPTION 'a node command keeps how it ran' USING ERRCODE = '55000';
   END IF;
   IF OLD.state <> 'RUNNING' AND (NEW.state, NEW."exitCode", NEW.signal, NEW."finishedAt")
       IS DISTINCT FROM (OLD.state, OLD."exitCode", OLD.signal, OLD."finishedAt") THEN

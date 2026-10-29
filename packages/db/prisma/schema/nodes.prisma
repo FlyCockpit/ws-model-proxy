@@ -284,6 +284,13 @@ model NodeCommand {
   /// startedAt + min(timeoutMs, Node.commandMaxMs).
   endsBy       DateTime
   finishedAt   DateTime?
+  /// How the node ran it (`exec.started`'s `ranWith`), set once when it started: `shell` or
+  /// `direct` (an argv started as a program). Null when the node did not say (a wsmp before
+  /// it). A string the hardening checks, not an enum: the node's values, like `signal`.
+  ranMode      String?
+  /// The shell that read it (`sh`, `pwsh`, `powershell`, `cmd`); null for a program started
+  /// directly, or when `ranMode` is null.
+  ranShell     String?
 
   Node Node @relation(fields: [nodeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
 
