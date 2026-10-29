@@ -37,7 +37,7 @@ pub enum IfExists {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct WriteArgs {
     pub path: String,
     pub content: String,

@@ -2,12 +2,16 @@
 //! shape (`runtime_spec`), canonical JSON for `launchHash` (`canonical`), and
 //! the codec the daemon uses on top of them.
 //!
-//! The server accepts exactly protocol 3.0 and so does this CLI. Server
-//! frames are parsed strictly (`deny_unknown_fields`) and then checked for
-//! the cross-field rules serde cannot express (`ServerFrame::validate`),
-//! except the fields of [`OPEN_FRAMES`] this build does not know, which are
-//! dropped: the frames an update needs keep working for this build when a
-//! later server adds a field to them. A
+//! The server accepts exactly protocol 3.0 and so does this CLI. Between
+//! releases a server extends 3.0 in place, so a field this build does not
+//! know in a server frame or binary metadata is ignored, at any depth, except
+//! in runtime definitions (`runtime.define`'s `put` entries and `node` part,
+//! and the `runtime_spec` types), which stay strict and are refused part by
+//! part (`runtime_store::repair`). Frames are then checked for the
+//! cross-field rules serde cannot express (`ServerFrame::validate`). A new
+//! value in an existing enum field is still refused, except `protocol.error`'s
+//! `code` ([`ProtocolErrorCode::Unknown`]), a `RelayFailure` reason
+//! ([`RelayFailure::Unknown`]) and a job's `commandAuthor`. A
 //! frame that fails either is classified by [`control_frame_fault`] or
 //! [`binary_frame_fault`]: it ends at most the request, terminal, command,
 //! file op or speech session it names, except a malformed model-relay frame,
@@ -91,67 +95,18 @@ pub fn encode_control(frame: &NodeFrame) -> Result<String> {
     Ok(text)
 }
 
-/// The frames a session, a trust lowering and a self-update depend on, with
-/// the fields this build reads. A later server may add a field to them; this
-/// build drops it and goes on, so it can still connect and take the update
-/// that knows it. Every other frame keeps refusing unknown fields. A new
-/// value in an existing field is not covered (except `protocol.error`'s
-/// `code`, read as [`ProtocolErrorCode::Unknown`]): add a field instead.
-pub const OPEN_FRAMES: &[(&str, &[&str])] = &[
-    ("hello.challenge", &["type", "nonce", "origin"]),
-    (
-        "hello.ok",
-        &["type", "id", "protocolVersion", "nodeId", "definitionSync"],
-    ),
-    ("heartbeat.pong", &["type", "id", "receivedAt"]),
-    (
-        "agent.update",
-        &[
-            "type",
-            "updateId",
-            "version",
-            "artifactUrl",
-            "sha256",
-            "signature",
-            "force",
-            "rollbackAfterSecs",
-        ],
-    ),
-    ("agent.update.ack", &["type", "updateId"]),
-    // A node that cannot read a lowering would keep its own Full control.
-    ("trust.lower", &["type", "id", "requestedAt"]),
-    // How the server's upgrade message reaches the node.
-    (
-        "protocol.error",
-        &[
-            "type",
-            "failure",
-            "code",
-            "message",
-            "supportedVersions",
-            "requestId",
-        ],
-    ),
-];
-
-/// Parses one server control frame strictly (shape, then cross-field rules).
+/// Parses one server control frame (shape, then cross-field rules). Fields
+/// this build does not know are ignored, except in runtime definitions.
 pub fn parse_server_control(text: &str) -> Result<ServerFrame> {
     anyhow::ensure!(
         text.len() <= RELAY_JSON_CONTROL_MAX_BYTES,
         "JSON control frame exceeds 64 KiB"
     );
-    let mut value: Value =
-        serde_json::from_str(text).context("parsing relay server control frame")?;
+    let value: Value = serde_json::from_str(text).context("parsing relay server control frame")?;
     let type_name = value
         .get("type")
         .and_then(Value::as_str)
-        .context("relay server control frame has no type")?
-        .to_string();
-    if let Some((_, known)) = OPEN_FRAMES.iter().find(|(name, _)| *name == type_name)
-        && let Some(fields) = value.as_object_mut()
-    {
-        fields.retain(|field, _| known.contains(&field.as_str()));
-    }
+        .context("relay server control frame has no type")?;
     if type_name.starts_with("stt.")
         && let Some(config) = value.get("config")
     {
@@ -190,7 +145,7 @@ pub fn encode_binary_frame<M: Serialize>(metadata: &M, body: &[u8]) -> Result<Ve
     Ok(frame)
 }
 
-/// Splits a binary frame and parses its metadata as `M` (strict serde).
+/// Splits a binary frame and parses its metadata as `M`.
 pub fn decode_binary_frame<M: DeserializeOwned>(frame: &[u8]) -> Result<(M, Vec<u8>)> {
     anyhow::ensure!(frame.len() >= 4, "binary frame is missing metadata length");
     let metadata_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
@@ -631,26 +586,182 @@ mod tests {
         );
     }
 
-    #[test]
-    fn frames_an_update_needs_take_a_later_servers_fields() {
+    /// The field a later server adds, as these tests inject it.
+    const LATER_FIELD: &str = "zzFutureField";
+
+    fn server_fixtures(dir: &str) -> Vec<(String, String)> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/relay-3.0/frames/server-to-node");
-        for (name, known) in OPEN_FRAMES {
-            let text = std::fs::read_to_string(dir.join(format!("{name}.json"))).expect("fixture");
-            let mut json: Value = serde_json::from_str(&text).expect("json");
-            // The list names every field this build has (the fixture has them all).
-            let fields: Vec<String> = json.as_object().expect("object").keys().cloned().collect();
-            for field in &fields {
-                assert!(
-                    known.contains(&field.as_str()),
-                    "{name}: {field} is not listed"
-                );
+            .join("tests/fixtures/relay-3.0")
+            .join(dir);
+        let mut fixtures: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .expect("fixture dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                (name, std::fs::read_to_string(&path).expect("fixture"))
+            })
+            .collect();
+        fixtures.sort();
+        assert!(!fixtures.is_empty(), "no fixtures in {}", dir.display());
+        fixtures
+    }
+
+    fn binary_with_body(metadata: &Value) -> Vec<u8> {
+        let mut frame = binary(metadata.to_string().as_bytes());
+        // `stt.audio` needs an even, non-empty body.
+        frame.extend_from_slice(&[0, 0]);
+        frame
+    }
+
+    /// Adds `LATER_FIELD` (a string, so it also fits a struct of strings like
+    /// the stt `config`) to every object below the top level, and returns how
+    /// many it changed. Left alone: runtime definitions (`runtime.define`'s
+    /// `put` and `node`, strict by design), and the fields that are maps or
+    /// raw JSON, where a new key is data rather than a later server's field:
+    /// `relay.request`'s `headers` and `file.op`'s `args` (each op's
+    /// arguments are covered by `file_ops`' own test).
+    fn inject_nested(frame: &mut Value) -> usize {
+        fn walk(value: &mut Value, skip: &[&str], top: bool) -> usize {
+            match value {
+                Value::Object(fields) => {
+                    let mut count = 0;
+                    for (key, child) in fields.iter_mut() {
+                        if !(top && skip.contains(&key.as_str())) {
+                            count += walk(child, skip, false);
+                        }
+                    }
+                    if !top {
+                        fields.insert(LATER_FIELD.to_string(), Value::from("later"));
+                        count += 1;
+                    }
+                    count
+                }
+                Value::Array(items) => items.iter_mut().map(|item| walk(item, skip, false)).sum(),
+                _ => 0,
             }
-            let today = parse_server_control(&text).expect("parses");
-            json["addedLater"] = serde_json::json!({ "any": ["shape"] });
-            let later = parse_server_control(&json.to_string()).expect("a later field is dropped");
+        }
+        let skip: &[&str] = match frame.get("type").and_then(Value::as_str) {
+            Some("runtime.define") => &["put", "node"],
+            Some("relay.request") => &["headers"],
+            Some("file.op") => &["args"],
+            _ => &[],
+        };
+        walk(frame, skip, true)
+    }
+
+    #[test]
+    fn every_server_frame_ignores_a_later_servers_top_level_field() {
+        for (name, text) in server_fixtures("frames/server-to-node") {
+            let today = parse_server_control(&text).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            let mut json: Value = serde_json::from_str(&text).expect("json");
+            json[LATER_FIELD] = serde_json::json!({ "nested": [1, "x"] });
+            let later = parse_server_control(&json.to_string())
+                .unwrap_or_else(|e| panic!("{name} with a later field: {e:#}"));
             assert_eq!(later, today, "{name}");
         }
+        for (name, text) in server_fixtures("binary/server-to-node") {
+            let mut json: Value = serde_json::from_str(&text).expect("json");
+            let (today, _) = parse_binary_frame(&binary_with_body(&json))
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            json[LATER_FIELD] = serde_json::json!({ "nested": [1, "x"] });
+            let (later, _) = parse_binary_frame(&binary_with_body(&json))
+                .unwrap_or_else(|e| panic!("{name} with a later field: {e:#}"));
+            assert_eq!(later, today, "{name}");
+        }
+    }
+
+    #[test]
+    fn every_server_frame_ignores_a_later_servers_nested_fields() {
+        let mut injected = 0;
+        for (name, text) in server_fixtures("frames/server-to-node") {
+            let today = parse_server_control(&text).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            let mut json: Value = serde_json::from_str(&text).expect("json");
+            injected += inject_nested(&mut json);
+            let later = parse_server_control(&json.to_string())
+                .unwrap_or_else(|e| panic!("{name} with later fields: {e:#}"));
+            assert_eq!(later, today, "{name}");
+        }
+        // Binary metadata is flat today: nothing nested to inject into.
+        for (name, text) in server_fixtures("binary/server-to-node") {
+            let mut json: Value = serde_json::from_str(&text).expect("json");
+            assert_eq!(inject_nested(&mut json), 0, "{name} has nested objects now");
+        }
+        // Placeholders, reservations, operator, identity, stt config, ...
+        assert!(injected >= 10, "only {injected} nested objects");
+    }
+
+    #[test]
+    fn runtime_definitions_stay_strict() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/relay-3.0/frames/server-to-node/runtime.define.json"),
+        )
+        .expect("fixture");
+        let json: Value = serde_json::from_str(&text).expect("json");
+        for pointer in ["/put/0", "/put/0/spec", "/node", "/node/fabrics"] {
+            let mut later = json.clone();
+            later
+                .pointer_mut(pointer)
+                .and_then(Value::as_object_mut)
+                .expect("an object")
+                .insert(LATER_FIELD.to_string(), Value::from("later"));
+            assert!(
+                parse_server_control(&later.to_string()).is_err(),
+                "{pointer} must stay strict"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relay_failure_from_a_later_server_is_read_as_unknown() {
+        let cancel = parse_server_control(
+            r#"{"type":"relay.cancel","requestId":"req-1","reason":"brand_new"}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            cancel,
+            ServerFrame::RelayCancel {
+                reason: RelayFailure::Unknown,
+                ..
+            }
+        ));
+        let close = parse_server_control(
+            r#"{"type":"stt.close","sessionId":"AAECAwQFBgcICQoLDA0ODw","reason":"brand_new"}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            close,
+            ServerFrame::SttClose {
+                reason: RelayFailure::Unknown,
+                ..
+            }
+        ));
+        // It is still written `unknown`, and a known reason stays itself.
+        assert_eq!(
+            serde_json::to_value(RelayFailure::Unknown).expect("serializes"),
+            "unknown"
+        );
+        assert_eq!(
+            serde_json::from_value::<RelayFailure>(Value::from("timeout")).expect("reads"),
+            RelayFailure::Timeout
+        );
+    }
+
+    #[test]
+    fn a_command_author_from_a_later_server_is_read_as_unknown() {
+        assert_eq!(
+            serde_json::from_value::<frames::CommandAuthor>(Value::from("robot")).expect("reads"),
+            frames::CommandAuthor::Unknown
+        );
+        assert_eq!(
+            serde_json::to_value(frames::CommandAuthor::Unknown).expect("serializes"),
+            "unknown"
+        );
     }
 
     #[test]
@@ -669,23 +780,23 @@ mod tests {
     }
 
     #[test]
-    fn server_frames_are_parsed_strictly() {
+    fn server_frames_ignore_unknown_fields_but_not_unknown_types() {
         assert!(matches!(
             parse_server_control(r#"{"type":"heartbeat.pong","id":"1","receivedAt":"now"}"#),
             Ok(ServerFrame::HeartbeatPong { .. })
         ));
-        // A later server's new field in a frame an update needs is dropped.
+        // A later server's new field is ignored, in any frame.
         assert!(matches!(
             parse_server_control(r#"{"type":"heartbeat.pong","id":"1","receivedAt":"now","x":1}"#),
             Ok(ServerFrame::HeartbeatPong { .. })
         ));
-        // Unknown fields elsewhere, and 2.x frames, are refused.
-        assert!(
+        assert!(matches!(
             parse_server_control(
                 r#"{"type":"term.close","terminalId":"AAAAAAAAAAAAAAAAAAAAAA","x":1}"#
-            )
-            .is_err()
-        );
+            ),
+            Ok(ServerFrame::TermClose { .. })
+        ));
+        // 2.x frames are refused.
         assert!(parse_server_control(r#"{"type":"inventory.ok","id":"1"}"#).is_err());
         // A hello.challenge without an origin (a 2.x server) is refused.
         assert!(parse_server_control(r#"{"type":"hello.challenge","nonce":"n"}"#).is_err());
@@ -893,14 +1004,14 @@ mod tests {
             control_frame_fault(&missing),
             FrameFault::RejectFile { op_id } if op_id == id
         ));
-        // 2.x consent fields are refused too, by name.
+        // 2.x consent fields grant nothing: they are ignored like any other
+        // field this build does not know (the node's trust decides).
         let with_mode = format!(
             r#"{{"type":"file.op","opId":"{id}","op":"read","args":{{}},"mode":"unsupervised","readGrant":true}}"#
         );
-        assert!(parse_server_control(&with_mode).is_err());
         assert!(matches!(
-            control_frame_fault(&with_mode),
-            FrameFault::RejectFile { .. }
+            parse_server_control(&with_mode),
+            Ok(ServerFrame::FileOp { .. })
         ));
         for text in [
             r#"{"type":"file.op","op":"read"}"#,

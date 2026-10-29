@@ -1,0 +1,5 @@
+{
+  "type": "relay.cancel",
+  "requestId": "req-1",
+  "reason": "cancelled"
+}

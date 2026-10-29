@@ -1,8 +1,10 @@
 //! A `runtime.define` this build cannot read whole: one definition (or the
 //! node part) with a field it does not know, or a shape it cannot read.
 //!
-//! The frame itself stays strict (`deny_unknown_fields`); what changes is what
-//! a failure costs. Each `put` entry and the node part are read on their own.
+//! A field this build does not know elsewhere in the frame is ignored, but
+//! definitions stay strict (`deny_unknown_fields`): a runtime never launches
+//! from a definition read only in part. What changes is what a failure costs.
+//! Each `put` entry and the node part are read on their own.
 //! Those that fail are taken out of the frame and answered `rejected` /
 //! `invalid` with the JSON path that failed; the rest of the frame is handled
 //! as usual, and the session stays up. A node part that fails is refused and

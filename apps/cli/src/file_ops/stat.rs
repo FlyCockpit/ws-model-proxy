@@ -13,7 +13,7 @@ use super::{Cancel, FileOps, fmt};
 pub const MAX_STAT_PATHS: usize = 50;
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct StatArgs {
     pub paths: Vec<String>,
     /// Compute a strong etag for files of 64 MiB or less.

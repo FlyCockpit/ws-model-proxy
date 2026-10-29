@@ -33,8 +33,6 @@
       "strategies": ["self-replace"],
       "instancesSurvive": true,
       "remote": "allowed"
-    },
-    "jobReservations": true,
-    "rankIdle": true
+    }
   }
 }

@@ -1,0 +1,7 @@
+{
+  "type": "exec.start",
+  "commandId": "UnecweYLMFV6n8TpDjNYfQ",
+  "command": "$r = 'models'; Get-ChildItem \"$HOME\\$r\"",
+  "shell": "pwsh",
+  "timeoutMs": 60000
+}

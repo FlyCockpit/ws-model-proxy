@@ -37,6 +37,9 @@ This release removes both halves of that:
   way, and the node keeps the one it held.
 - The result of `runtime_create` and `runtime_update`, and the runtime's page, show a node that
   refused a definition as refused, with the reason and the path, instead of "pending".
+- wsmp now ignores fields it does not know in what the server sends (except runtime
+  definitions, which it refuses one by one as above), so a newer server's additions do not
+  break it.
 - A frame the agent cannot read closes the connection and reconnects with backoff (5 s,
   doubling, up to 5 minutes) instead of exiting. Its log names the frame type and the field that
   failed. The agent exits only for a rejected credential (exit 4) or a refused protocol (exit 5),
@@ -130,10 +133,8 @@ the new `agent.update` frame).
 - The rollback window is 180 s by default and counts from the new build's start, so a slow
   restart or reconnect does not roll back a good build. A reboot during the trial gives the new
   build a full window after the boot, on every platform.
-- wsmp now ignores fields it does not know in `hello.challenge`, `hello.ok`, `heartbeat.pong`,
-  `agent.update`, `agent.update.ack`, `trust.lower` and `protocol.error`, and reads a
-  `protocol.error` code it does not know as a generic error, so a later server can add a field
-  (or an error code) without cutting this release off.
+- wsmp reads a `protocol.error` code, a failure reason or a command author it does not know
+  as a generic value, so a later server can add one without cutting this release off.
 - New procedures `nodes.agentUpdate.{overview,start,startAll,stopAll,setPolicy}`: people only
   (the owner's own browser session; never agents, MCP or an admin), not MCP tools.
   "Update all" updates a canary first, then the rest one at a time, and stops at the first

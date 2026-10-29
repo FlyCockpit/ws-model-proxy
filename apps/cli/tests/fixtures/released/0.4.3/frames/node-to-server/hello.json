@@ -22,10 +22,9 @@
     "terminals": {
       "supported": true,
       "max": 4,
-      "approvalRequired": false,
-      "shells": ["pwsh", "powershell", "cmd", "wsl:Ubuntu-24.04"]
+      "approvalRequired": false
     },
-    "operatorTerminals": false,
+    "operatorTerminals": true,
     "files": {
       "roots": ["/home/me/models"],
       "asRoot": false,
@@ -37,9 +36,9 @@
     "jobReservations": true,
     "rankIdle": true,
     "launch": {
-      "platform": "windows",
+      "platform": "linux",
       "management": ["process", "service"],
-      "shells": ["pwsh", "powershell", "cmd"]
+      "shells": ["sh"]
     },
     "secrets": [
       {
@@ -53,7 +52,7 @@
     ],
     "selfUpdate": {
       "strategies": ["self-replace"],
-      "instancesSurvive": false,
+      "instancesSurvive": true,
       "remote": "allowed"
     }
   },

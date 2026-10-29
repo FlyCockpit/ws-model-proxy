@@ -40,7 +40,7 @@ pub enum SearchMode {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchArgs {
     pub root: String,
     pub pattern: String,

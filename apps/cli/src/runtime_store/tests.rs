@@ -510,6 +510,65 @@ fn an_unreadable_node_part_is_refused_and_the_held_one_stays() {
 }
 
 #[test]
+fn a_later_servers_field_beside_the_definitions_is_ignored() {
+    let put = |version: &str, runtime: &str, slug: &str, base: &str| -> Value {
+        serde_json::from_str::<Value>(&define("x", version, runtime, slug, always_on(base)))
+            .expect("json")["put"][0]
+            .clone()
+    };
+    let mut frame = serde_json::json!({
+        "type": "runtime.define", "opId": "op-later", "chunkIndex": 0, "final": true,
+        "put": [
+            put("vr1", "rt1", "bge", "http://127.0.0.1:8080/v1"),
+            put("vr2", "rt2", "chat", "http://127.0.0.1:9090/v1"),
+        ],
+        "zzFutureField": { "nested": [1, "x"] },
+    });
+    // A field beside the definitions: the frame reads whole and applies.
+    let mut fx = Fx::new();
+    let outcome = fx.send(&frame.to_string(), TrustValue::Full);
+    assert_eq!(
+        results(&outcome.answer),
+        vec![
+            ("vr1".to_string(), DefineStatus::Applied, None),
+            ("vr2".to_string(), DefineStatus::Applied, None),
+        ]
+    );
+    // A field in one definition: that one is refused by its path, the other
+    // applies.
+    frame["opId"] = Value::from("op-later-2");
+    frame["put"][1]["zzFutureField"] = Value::from("later");
+    let mut fx = Fx::new();
+    let outcome = fx.send_partial(&frame.to_string());
+    let NodeFrame::RuntimeDefineResult { results, .. } = &outcome.answer else {
+        panic!("result");
+    };
+    let by_version: Vec<_> = results
+        .iter()
+        .map(|r| (r.version_id.as_str(), r.status, r.detail.as_deref()))
+        .collect();
+    assert_eq!(
+        by_version,
+        [
+            ("vr1", DefineStatus::Applied, None),
+            ("vr2", DefineStatus::Rejected, Some("zzFutureField")),
+        ]
+    );
+    assert_eq!(
+        results[1].reason,
+        Some(DefineRejectReason::Invalid),
+        "{results:?}"
+    );
+    let held: Vec<_> = fx
+        .store()
+        .held
+        .iter()
+        .map(|h| h.version_id.clone())
+        .collect();
+    assert_eq!(held, ["vr1"]);
+}
+
+#[test]
 fn a_frame_with_nothing_to_take_out_is_not_repaired() {
     // A broken envelope (no `opId`) stays malformed: the caller's fault rules apply.
     let text = r#"{"type":"runtime.define","chunkIndex":0,"final":true,"put":[]}"#;

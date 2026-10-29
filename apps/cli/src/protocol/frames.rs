@@ -2,8 +2,12 @@
 //!
 //! Serde mirror of `apps/server/src/relay/frames.ts`. Every fixture under
 //! `tests/fixtures/relay-3.0/` must deserialize here and serialize back to the
-//! same JSON (tests below). Unknown fields and frame types are refused
-//! (`deny_unknown_fields`); the server accepts exactly protocol `3.0`.
+//! same JSON (tests below). Fields this build does not know in what the server
+//! sends are ignored, so a later server may add some, except in runtime
+//! definitions (`DefinitionEnvelope`, `NodeDefinition` and the `runtime_spec`
+//! types), which stay strict (`deny_unknown_fields`) and are refused part by
+//! part (`runtime_store::repair`). Node frames are strict too. Unknown frame
+//! types are refused; the server accepts exactly protocol `3.0`.
 //!
 //! These types fix the wire shape. Value rules the node enforces on top of
 //! them (placeholder typing §4.6, define validation §4.3, path allowlist §4.8)
@@ -64,7 +68,9 @@ pub enum RelayFailure {
     Cancelled,
     #[serde(rename = "protocol_error")]
     ProtocolError,
-    #[serde(rename = "unknown")]
+    /// Also how a reason a later server added reads (`relay.cancel`,
+    /// `stt.close`): the request or session still ends.
+    #[serde(rename = "unknown", other)]
     Unknown,
 }
 
@@ -600,6 +606,9 @@ pub struct RuntimeLoad {
 
 // ── runtime.define ──
 
+/// Strict, like the spec it carries and [`NodeDefinition`]: a runtime never
+/// launches from a definition this build reads only in part. One it cannot
+/// read is refused on its own (`runtime_store::repair`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionEnvelope {
@@ -710,7 +719,7 @@ pub const NODE_SECRET_VALUE_MAX_BYTES: usize = 16 * 1024;
 
 /// `secret.set`. `Debug` never prints the value.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SecretSet {
     pub id: String,
     pub name: String,
@@ -895,7 +904,6 @@ pub enum JobPhase {
 /// Placeholder values (template names, snake_case). Decimals are canonical
 /// strings substituted verbatim; the node types every value before rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct JobPlaceholders {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -917,11 +925,13 @@ pub struct JobPlaceholders {
 pub enum CommandAuthor {
     User,
     Agent,
+    /// Also an author a later server added: it only labels the screen.
+    #[serde(other)]
     Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct JobOperator {
     pub terminal_id: String,
     pub command_author: CommandAuthor,
@@ -936,7 +946,7 @@ pub const JOB_RESERVATIONS_MAX: usize = 8;
 /// `WSMP_RESERVATION_<index>_GPUS` (the worker's GPU indices, like the rank's
 /// own `gpu_ids`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct JobReservation {
     pub index: u8,
     pub node_id: String,
@@ -950,7 +960,7 @@ pub struct JobReservation {
 /// No command text: the node renders from the held/frozen definition whose
 /// `launchHash` matches (§4.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeJob {
     pub step_id: String,
     pub instance_id: String,
@@ -1066,7 +1076,7 @@ pub enum CountMethod {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct TerminalIdentity {
     pub public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1273,7 +1283,7 @@ pub enum HttpMethod {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SttConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
@@ -1565,7 +1575,7 @@ pub enum NodeFrame {
 // ── Server → node control frames ──
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all_fields = "camelCase", deny_unknown_fields)]
+#[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum ServerFrame {
     #[serde(rename = "hello.challenge")]
     HelloChallenge { nonce: String, origin: String },
@@ -1777,7 +1787,7 @@ pub enum ServerFrame {
 // ── Binary frame metadata ──
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all_fields = "camelCase", deny_unknown_fields)]
+#[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum ServerBinaryMetadata {
     #[serde(rename = "relay.request.body")]
     RelayRequestBody {
@@ -2573,12 +2583,30 @@ mod tests {
         round_trip::<NodeBinaryMetadata>("binary/node-to-server");
     }
 
+    /// Shared vectors the server's schema refuses only for a field it does
+    /// not have. wsmp ignores such a field (a later server may add one), and
+    /// none of these grants anything: the node renders from its own held
+    /// definition and resolves its own interface.
+    const IGNORED_FIELD_VECTORS: &[&str] = &[
+        "file-op-with-2.4-mode.json",
+        "job-carries-command-text.json",
+        "job-reservation-unknown-field.json",
+        "job-server-sent-interface-name.json",
+    ];
+
     #[test]
     fn invalid_frames_are_refused() {
         for (name, json) in load("invalid/server-to-node") {
-            let refused = serde_json::from_value::<ServerFrame>(json)
-                .map_or(true, |frame| frame.validate().is_err());
-            assert!(refused, "server-to-node/{name} must be refused");
+            let parsed = serde_json::from_value::<ServerFrame>(json.clone())
+                .ok()
+                .filter(|frame| frame.validate().is_ok());
+            if IGNORED_FIELD_VECTORS.contains(&name.as_str()) {
+                let frame = parsed.unwrap_or_else(|| panic!("server-to-node/{name} must parse"));
+                let back = serde_json::to_value(&frame).expect("serializes");
+                assert!(!same(&back, &json), "{name}: the extra field is dropped");
+                continue;
+            }
+            assert!(parsed.is_none(), "server-to-node/{name} must be refused");
         }
         for (name, json) in load("invalid/node-to-server") {
             let refused = serde_json::from_value::<NodeFrame>(json)
@@ -2776,7 +2804,8 @@ mod tests {
         assert!(!broken(&|json| json["version"] = "0.5.0-rc.1".into()));
         assert!(broken(&|json| json["signature"] = "".into()));
         assert!(!broken(&|json| json["signature"] = "RWQ...".into()));
-        assert!(broken(&|json| json["unknown"] = true.into()));
+        // A field a later server adds is ignored.
+        assert!(!broken(&|json| json["unknown"] = true.into()));
     }
 
     #[test]

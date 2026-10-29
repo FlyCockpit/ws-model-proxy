@@ -52,21 +52,31 @@ Self-update only works while a node can still connect and take the next update, 
   `upgrade_cli`), not by bumping the relay protocol. A protocol bump is for a real wire change,
   and even then the server keeps accepting the older protocol from a node that can update
   itself, long enough to send it `agent.update` first.
-- **Hello fields added later stay optional** for such a node, and the server keeps sending
-  `hello.challenge`, `hello.ok`, `heartbeat.pong`, `agent.update`, `agent.update.ack`,
-  `trust.lower` and `protocol.error` in a shape it reads. wsmp drops fields it does not know in
-  those frames (`OPEN_FRAMES` in `apps/cli/src/protocol.rs`), so adding one is safe; removing or
-  retyping one is not.
-- **Never add a value to an enum field of those frames** (`hello.ok`'s `definitionSync`, say):
-  an older wsmp cannot read the frame. Add a new field instead. `protocol.error`'s `code` is the
-  one exception: wsmp reads a code it does not know as a generic error and reconnects.
+- **Fields added later to what a node sends stay optional**, in the hello and every other
+  frame: a released wsmp never sends them.
+- **A server may add optional fields to any frame.** wsmp (from 0.4.3) ignores fields it does
+  not know in every frame and binary metadata the server sends, at any depth, except runtime
+  definitions (`runtime.define`'s `put` entries and `node` part): a wsmp refuses a definition it
+  cannot fully read on its own (`invalid`, with the path) and applies the rest.
+- **Never remove, rename or retype a field** the server sends: an older wsmp cannot read the
+  frame.
+- **Never add a value to an existing enum field** (`hello.ok`'s `definitionSync`, say): an
+  older wsmp cannot read the frame. Add a new field instead. The exceptions, which wsmp reads
+  as a generic value: `protocol.error`'s `code` (a generic error, then it reconnects), a
+  failure `reason` (`relay.cancel`, `stt.close`: read as `unknown`), and a job's
+  `operator.commandAuthor` (read as `unknown`).
+- **Never add a field that limits what a node may do**: an older wsmp ignores it and does the
+  thing anyway. Such a limit needs a new frame, or the server checks a feature the node reports
+  at hello first (as with `features.selfUpdate`). The same rules hold for the answers `wsmp
+  login` reads (`/.well-known/wsmp` and enrollment), which wsmp also reads leniently.
 - **CI holds the server to these rules.** `apps/cli/tests/fixtures/released/<version>/` keeps
-  what a released wsmp sends while idle and during an update, and the frames above it reads;
-  `apps/server/src/relay/released-compat.test.ts` checks that today's server accepts the first
-  and still sends fields and values the release reads. When you cut a release, copy those files
-  into a new `released/<version>/` from `relay-3.0/` (with `node.version` set to the release).
-  Never edit a released copy to make the test pass; change the server instead. The `0.4.3` copy
-  may still follow protocol changes until `v0.4.3` is tagged.
+  every frame and binary metadata a released wsmp sends and reads, and the fixed values (enum
+  and literal fields) the server sent then. `apps/server/src/relay/released-compat.test.ts`
+  checks that today's server accepts the first, still sends every field the release reads with
+  the same type, and sends no fixed value the release cannot read. When you cut a release, run
+  `pnpm --filter server exec tsx scripts/freeze-relay-release.ts <version>`. Never edit a
+  released copy to make the test pass; change the server instead. The `0.4.3` copy may still
+  follow protocol changes until `v0.4.3` is tagged: delete it and run the script again.
 - The browser update is offered only where it has been verified on a real machine
   (`AGENT_UPDATE_OFFERED` in `packages/api/src/lib/agent-updates.ts`): add a platform there,
   with a server deploy, once its dead-man, restart and confirmation pass on it. Windows is

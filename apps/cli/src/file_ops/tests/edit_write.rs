@@ -1147,3 +1147,36 @@ fn write_replace_keeps_mode_and_uses_the_atomic_sequence() {
     );
     assert_eq!(*fx.steps.lock().unwrap(), ORDER);
 }
+
+#[test]
+fn every_op_ignores_an_argument_a_later_server_adds() {
+    let fx = Fx::new();
+    fx.put("a.txt", "one\n");
+    fx.put("gone.txt", "x\n");
+    let later = |mut value: Value| {
+        value["zzFutureField"] = json!({ "nested": [1, "x"] });
+        value
+    };
+    for (op, value) in [
+        ("read", json!({ "path": fx.p("a.txt") })),
+        ("stat", json!({ "paths": [fx.p("a.txt")] })),
+        ("list", json!({ "path": fx.p("") })),
+        ("search", json!({ "root": fx.p(""), "pattern": "one" })),
+        (
+            "edit",
+            json!({ "path": fx.p("a.txt"), "edits": [later(json!({ "oldText": "one", "newText": "two" }))] }),
+        ),
+        ("write", json!({ "path": fx.p("b.txt"), "content": "b\n" })),
+        (
+            "rename",
+            json!({ "from": fx.p("b.txt"), "to": fx.p("c.txt") }),
+        ),
+        ("mkdir", json!({ "path": fx.p("d") })),
+        ("delete", json!({ "path": fx.p("gone.txt") })),
+    ] {
+        let result = fx.ops.execute(op, later(value), &fx.cancel);
+        assert!(result.is_ok(), "{op}: {result:?}");
+    }
+    assert_eq!(fx.get("a.txt"), "two\n");
+    assert_eq!(fx.get("c.txt"), "b\n");
+}

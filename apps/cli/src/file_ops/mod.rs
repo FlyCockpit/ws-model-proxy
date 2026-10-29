@@ -589,8 +589,9 @@ impl FileOps {
     }
 
     /// JSON dispatch for the relay layer: `op` is one of `read|stat|list|search|
-    /// edit|write|rename|mkdir|delete`, `args` the strict per-op object (the
-    /// MCP inputs minus `cliDeviceId`/`confirm`). Unknown fields are rejected.
+    /// edit|write|rename|mkdir|delete`, `args` the per-op object (the MCP
+    /// inputs minus `cliDeviceId`/`confirm`). A field this build does not know
+    /// is ignored: a later server may add one.
     pub fn execute(&self, op: &str, args: Value, cancel: &Cancel) -> FileResult<Value> {
         fn parse<T: serde::de::DeserializeOwned>(args: Value) -> FileResult<T> {
             serde_json::from_value(args)

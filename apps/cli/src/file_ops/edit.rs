@@ -38,7 +38,7 @@ pub enum ExpectedMatches {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct EditOp {
     pub old_text: Option<String>,
     pub new_text: String,
@@ -48,7 +48,7 @@ pub struct EditOp {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct EditArgs {
     pub path: String,
     /// Required when any edit is a line-range edit; recommended always.

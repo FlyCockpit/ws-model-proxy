@@ -1,0 +1,10 @@
+{
+  "type": "file.op",
+  "opId": "aI2y1_whRmuQtdr_JElukw",
+  "op": "write",
+  "args": {
+    "path": "/home/me/models/notes.txt",
+    "ifExists": "replace"
+  },
+  "bodyBytes": 12
+}

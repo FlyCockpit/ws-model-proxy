@@ -3973,7 +3973,7 @@ fn check_hello_origin(
     )))
 }
 
-/// A reply to the hello wait that strict 3.0 parsing refused, read loosely:
+/// A reply to the hello wait that 3.0 parsing refused, read loosely:
 /// an older server sends `protocol.error` without a code, or a challenge
 /// without an origin. Both mean "upgrade the server".
 fn older_server_reply(text: &str, stop: StopOn) -> Option<RelaySessionError> {

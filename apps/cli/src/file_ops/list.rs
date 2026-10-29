@@ -17,7 +17,7 @@ pub const MAX_ENTRIES: u32 = 2000;
 pub const MAX_DEPTH: u32 = 4;
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ListArgs {
     pub path: String,
     /// 1..4; 1 lists the direct children.
