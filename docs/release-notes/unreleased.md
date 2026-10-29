@@ -26,3 +26,15 @@ that session's terminals at once, not within a minute.
 A reverse proxy must not buffer that path: Traefik (Dokploy) and Caddy stream it as they are.
 If something in front does buffer it, the pages fall back to their old polling, and the Nodes
 and Terminals pages say "Live updates paused".
+
+## MCP tool results
+
+- A refusal's text now starts with its reason (`shell_unavailable: Node … has no pwsh …`), for
+  MCP clients that show agents only the text. The structured result is unchanged.
+- "The relay is not available" and "the node did not answer" keep their code
+  (`SERVICE_UNAVAILABLE`, `BAD_GATEWAY`) and message instead of `INTERNAL_ERROR`.
+- Each tool's description ends with `(schema <6 hex>)`, a digest of its input schema. It
+  changes only when that tool's input changes, so an agent can tell its client holds an old
+  copy of the tool.
+- A command's `finishedAt` is its server start plus the run time the node measured. Before,
+  a node whose clock ran behind the server's showed fast commands as ending when they started.

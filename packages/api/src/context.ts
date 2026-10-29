@@ -151,7 +151,13 @@ export type NodeCommandLiveStatus = {
   /** Masked end of the output. */
   output: string;
   truncated?: boolean;
+  /**
+   * When the end reached the server. Prefer `runMs`: `commandFinishedAt` (lib/node-command-settle)
+   * puts the end on the server's clock from the command's own start.
+   */
   finishedAt?: Date;
+  /** How long the command ran, as the node measured it (its start to its end, its own clock). */
+  runMs?: number;
 };
 
 /** Why `runtimes.steps.*` refused a step. */

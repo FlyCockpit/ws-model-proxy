@@ -24,6 +24,7 @@ const {
   resetMcpToolRateLimitsForTests,
   routeToolCall,
   runMcpTool,
+  toolSchemaTag,
 } = await import("./tools");
 const { testDispatch, testOAuthDispatch } = await import("./tools.test-helper");
 
@@ -479,6 +480,56 @@ describe("errors and output", () => {
       },
     });
     expect(structured(result).error).not.toHaveProperty("reservation");
+  });
+
+  it("leads a refusal's text with its reason, for clients that show agents the text only", async () => {
+    const result = await runMcpTool(tool("node_command_run"), {
+      dispatch: testDispatch("FULL"),
+      args: { nodeId: "node-1", command: "Get-Date", shell: "pwsh", confirm: "RUN" },
+      invoke: async () => {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Node laptop has no pwsh for commands. It has: powershell, cmd.",
+          data: { reason: "shell_unavailable", subjectId: "node-1" },
+        });
+      },
+    });
+    expect(result.content).toEqual([
+      {
+        type: "text",
+        text: "shell_unavailable: Node laptop has no pwsh for commands. It has: powershell, cmd.",
+      },
+    ]);
+    // The structured message stays the procedure's own.
+    expect(structured(result).error).toMatchObject({
+      code: "BAD_REQUEST",
+      reason: "shell_unavailable",
+      message: "Node laptop has no pwsh for commands. It has: powershell, cmd.",
+    });
+  });
+
+  it("keeps the code and message of a relay or node that did not answer", async () => {
+    for (const [code, message] of [
+      ["SERVICE_UNAVAILABLE", "The relay is not available."],
+      ["BAD_GATEWAY", "The node did not answer the secret write."],
+    ] as const) {
+      const result = await runMcpTool(tool("node_command_run"), {
+        dispatch: testDispatch("FULL"),
+        args: { nodeId: "node-1", command: "uptime", confirm: "RUN" },
+        invoke: async () => {
+          throw new ORPCError(code, { message });
+        },
+      });
+      expect(result.content).toEqual([{ type: "text", text: message }]);
+      expect(structured(result).error).toEqual({ code, message });
+    }
+  });
+
+  it("tags each tool with a short digest of its advertised input schema", () => {
+    const tags = MCP_TOOLS.map((contract) => toolSchemaTag(contract));
+    for (const tag of tags) expect(tag).toMatch(/^[0-9a-f]{6}$/);
+    // Stable for the same schema, and distinct across these tools' different inputs.
+    expect(MCP_TOOLS.map((contract) => toolSchemaTag(contract))).toEqual(tags);
+    expect(new Set(tags).size).toBe(tags.length);
   });
 
   it("keeps a procedure's own message on a BAD_REQUEST without issues or reason", async () => {

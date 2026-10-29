@@ -31,9 +31,12 @@
  *
  * tools/list advertises the name, the contract description and the compact input schema
  * (`advertisedInputSchema`), nothing else (no titles, annotations or output schemas): the
- * token budget is pinned by mcp/tools-budget.test.ts.
+ * token budget is pinned by mcp/tools-budget.test.ts. The description ends with
+ * `(schema <6 hex>)`, a digest of the advertised input schema (`toolSchemaTag`): it changes
+ * only when that tool's input does, so an agent can tell its client holds an old copy.
  */
 
+import { createHash } from "node:crypto";
 import type {
   CallToolResult,
   McpRequestContext,
@@ -49,6 +52,7 @@ import {
   refusalReservationSchema,
   SENSITIVE_INPUT_PROCEDURES,
 } from "@ws-model-proxy/api/contracts";
+import { canonicalJson } from "@ws-model-proxy/api/lib/canonical-json";
 import { appRouter } from "@ws-model-proxy/api/routers/index";
 import { runWithDbAbortFence } from "@ws-model-proxy/db/shutdown-fence";
 import { RateLimiterMemory, RateLimiterRes } from "rate-limiter-flexible";
@@ -89,6 +93,20 @@ function advertisedSchema(contract: McpToolContract): StandardSchemaWithJSON {
   };
 }
 
+const schemaTags = new Map<string, string>();
+
+/** The first 6 hex of the SHA-256 of the tool's advertised input schema (canonical JSON). */
+export function toolSchemaTag(contract: McpToolContract): string {
+  const known = schemaTags.get(contract.name);
+  if (known) return known;
+  const tag = createHash("sha256")
+    .update(canonicalJson(advertisedInputSchema(contract)))
+    .digest("hex")
+    .slice(0, 6);
+  schemaTags.set(contract.name, tag);
+  return tag;
+}
+
 /** Whether a credential of this level may see and call the tool. */
 export function mcpToolAllowed(name: string, level: "READ" | "FULL"): boolean {
   return level === "FULL" || READ_TOOL_NAMES.has(name);
@@ -105,7 +123,10 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
     if (!mcpToolAllowed(contract.name, level)) continue;
     server.registerTool<StandardSchemaWithJSON, StandardSchemaWithJSON>(
       contract.name,
-      { description: contract.description, inputSchema: advertisedSchema(contract) },
+      {
+        description: `${contract.description} (schema ${toolSchemaTag(contract)})`,
+        inputSchema: advertisedSchema(contract),
+      },
       async (args: unknown): Promise<ToolResult> => runMcpTool(contract, { dispatch, args }),
     );
   }
@@ -567,6 +588,9 @@ const STATIC_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   CONFLICT: "Conflict",
   PRECONDITION_FAILED: "Precondition failed",
   TOO_MANY_REQUESTS: "Too many requests",
+  // The relay or a node did not answer: worth a retry, unlike an internal error.
+  BAD_GATEWAY: "The node did not answer",
+  SERVICE_UNAVAILABLE: "Service unavailable",
 });
 
 const REFUSAL_REASON_SHAPE = /^[a-z][a-z0-9_]{1,63}$/;
@@ -672,7 +696,8 @@ function mapError(
       const message = sensitive ? `Refused: ${reason}.` : sanitizeMessage(error.message);
       // A reservation that cannot be placed: which one, structured (the text is bounded).
       const reservation = sensitive ? null : reservationOf(data.reservation);
-      return toolError(message, {
+      // The reason leads the text too (bounded again): some clients show agents the text only.
+      return toolError(sensitive ? message : sanitizeMessage(`${reason}: ${error.message}`), {
         error: {
           code: error.code,
           reason,

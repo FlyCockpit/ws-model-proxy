@@ -262,6 +262,7 @@ describe("node operator services: commands", () => {
 
   it("waits for the end, answering at once when it arrives before waitMs", async () => {
     vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-01T12:00:00.000Z"));
     const s = setup();
     const polled = s.services.pollCommand({ ...startArgs, waitMs: 30_000, cancel: false });
     await s.handlers["exec.status"]?.(ref(), status("running", "1"));
@@ -271,7 +272,8 @@ describe("node operator services: commands", () => {
       state: "SUCCEEDED",
       exitCode: 0,
       output: "done\n",
-      finishedAt: new Date("2026-01-01T00:00:05.000Z"),
+      // When the end reached the server, not the node's own clock.
+      finishedAt: new Date("2026-03-01T12:00:10.000Z"),
     });
     // A poll answered the end: the procedure records it, not the handler.
     expect(db.client.nodeCommand.findFirst).not.toHaveBeenCalled();
@@ -364,6 +366,35 @@ describe("node operator services: commands", () => {
     s.handlers.nodeDisconnected?.(ref({ connectionGeneration: 2 }));
     s.handlers.nodeDisconnected?.(ref());
     await expect(polled).resolves.toMatchObject({ state: "RUNNING", output: "so far" });
+  });
+
+  it("puts the end on the server's clock: its start plus the run time the node measured", async () => {
+    const s = setup();
+    s.tracker.track({ commandId: COMMAND, nodeId: "node-1", userId: "user-1", endsBy: 0 });
+    // The server started it at 10:00:00; the node's clock is an hour behind.
+    db.client.nodeCommand.findFirst.mockResolvedValueOnce({
+      id: COMMAND,
+      nodeId: "node-1",
+      userId: "user-1",
+      actor: "AGENT",
+      agentTokenId: "token-1",
+      mcpGrantId: null,
+      subject: "hmac-sha256:00 cmd",
+      state: "RUNNING",
+      exitCode: null,
+      startedAt: new Date("2026-01-01T10:00:00.000Z"),
+      endsBy: new Date("2026-01-01T10:01:00.000Z"),
+      finishedAt: null,
+    });
+    await s.handlers["exec.status"]?.(ref(), {
+      ...status("succeeded"),
+      startedAt: "2026-01-01T09:00:00.100Z",
+      finishedAt: "2026-01-01T09:00:00.340Z",
+    });
+    expect(db.tx.nodeCommand.updateMany).toHaveBeenCalledWith({
+      where: { id: COMMAND, state: "RUNNING" },
+      data: expect.objectContaining({ finishedAt: new Date("2026-01-01T10:00:00.240Z") }),
+    });
   });
 
   it("records an end nobody polled for, on the reporting node's own row", async () => {

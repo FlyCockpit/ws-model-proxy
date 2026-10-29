@@ -73,6 +73,19 @@ const AUDIT_OUTCOME: Record<
  * record it exactly once) and the audit event is appended by whoever settled it. Answers the
  * row as stored afterwards.
  */
+/**
+ * A command's end on the server's clock: its stored start plus the run time the node measured.
+ * The node's own end time is on its clock, which can be behind the server's (a laptop): the
+ * end would then read as the start. Without a measured run time, when the end reached us.
+ */
+export function commandFinishedAt(
+  startedAt: Date,
+  live: { finishedAt?: Date; runMs?: number },
+): Date | undefined {
+  if (live.runMs !== undefined) return new Date(startedAt.getTime() + live.runMs);
+  return live.finishedAt;
+}
+
 export async function settleNodeCommand(
   row: NodeCommandRow,
   state: NodeCommandEndState,
