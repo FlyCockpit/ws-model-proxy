@@ -4,7 +4,7 @@
  * hellos with the release's version, and records the fixed values the server sends
  * (`server-to-node-values.json`). Run it when cutting a release (`apps/cli/docs/releasing.md`):
  *
- *   pnpm --filter server exec tsx scripts/freeze-relay-release.ts 0.4.3
+ *   pnpm --filter server freeze-relay-release 0.4.3
  */
 import { cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

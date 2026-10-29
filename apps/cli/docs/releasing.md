@@ -74,7 +74,7 @@ Self-update only works while a node can still connect and take the next update, 
   and literal fields) the server sent then. `apps/server/src/relay/released-compat.test.ts`
   checks that today's server accepts the first, still sends every field the release reads with
   the same type, and sends no fixed value the release cannot read. When you cut a release, run
-  `pnpm --filter server exec tsx scripts/freeze-relay-release.ts <version>`. Never edit a
+  `pnpm --filter server freeze-relay-release <version>`. Never edit a
   released copy to make the test pass; change the server instead. The `0.4.3` copy may still
   follow protocol changes until `v0.4.3` is tagged: delete it and run the script again.
 - The browser update is offered only where it has been verified on a real machine
