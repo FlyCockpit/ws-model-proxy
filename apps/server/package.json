@@ -15,7 +15,7 @@
   "dependencies": {
     "@better-auth/mcp": "catalog:",
     "@fastify/busboy": "catalog:",
-    "@hono/node-server": "^2.1.4",
+    "@hono/node-server": "^2.1.5",
     "@modelcontextprotocol/server": "catalog:",
     "@orpc/openapi": "catalog:",
     "@orpc/server": "catalog:",
