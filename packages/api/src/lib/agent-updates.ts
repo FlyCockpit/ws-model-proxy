@@ -255,6 +255,7 @@ export const AGENT_UPDATE_OFFERED: ReadonlyArray<{
 }> = [
   { os: "linux", strategy: "self-replace" },
   { os: "macos", strategy: "self-replace" },
+  { os: "macos", strategy: "homebrew" },
   // Verified, but Defender flags the unsigned wsmp.exe run as a scheduled task (issue #254):
   // off until Windows releases are signed.
   { os: "windows", strategy: "self-replace", optIn: "windowsUpdates" },
