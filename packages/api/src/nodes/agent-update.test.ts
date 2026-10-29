@@ -60,6 +60,7 @@ function makePort(
       commit: null,
       sourceBuild: options.sourceBuild ?? false,
       cargoInstall: "cargo install --git R --tag v0.4.3 --locked --force wsmp",
+      windowsUpdates: false,
     }),
     release: async () => options.release ?? RELEASE,
     liveNode: (nodeId) => {

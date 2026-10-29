@@ -56,7 +56,7 @@ impl Layout {
             prev: dir.join(exe_name("wsmp.prev")),
             failed: dir.join(exe_name("wsmp.failed")),
             staging: dir.join(format!(".wsmp-update-{update_id}")),
-            retired: dir.join(exe_name(&format!(".wsmp-retired-{update_id}"))),
+            retired: dir.join(exe_name(&format!("{RETIRED_PREFIX}{update_id}"))),
         })
     }
 }
@@ -334,6 +334,28 @@ pub fn restore(layout: &Layout) -> Result<bool> {
     Ok(true)
 }
 
+/// The prefix of a binary the Windows swap moved aside (`.wsmp-retired-<id>`).
+const RETIRED_PREFIX: &str = ".wsmp-retired-";
+
+/// Remove every binary a Windows swap moved aside beside `live`, of any
+/// update. None runs once the relay has restarted; one still running stays
+/// (Windows refuses to delete it) and goes on a later call.
+pub fn clear_retired(live: &Path) {
+    let Some(dir) = live.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(RETIRED_PREFIX))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Remove what an update left that nothing needs: the staging directory, a
 /// `wsmp.new` that was never swapped in, and (Windows) retired binaries no
 /// longer running.
@@ -352,6 +374,32 @@ mod tests {
         std::fs::write(path, body).expect("write");
         #[cfg(unix)]
         make_executable(path).expect("chmod");
+    }
+
+    #[test]
+    fn retired_binaries_of_every_update_are_cleared() {
+        let dir = tempfile::tempdir().expect("dir");
+        for name in [
+            ".wsmp-retired-a.exe",
+            ".wsmp-retired-b",
+            "wsmp",
+            "wsmp.prev",
+        ] {
+            std::fs::write(dir.path().join(name), "x").expect("write");
+        }
+        clear_retired(&dir.path().join("wsmp"));
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        left.sort();
+        assert_eq!(left, ["wsmp", "wsmp.prev"]);
     }
 
     #[test]

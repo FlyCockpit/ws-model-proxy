@@ -49,14 +49,19 @@ fn main() {
             }
             // Identifiers in error messages are wrapped in `backticks`, never
             // 'single quotes' — see AGENTS.md.
-            let message = exit::message_for(&err);
-            // A service relay's stderr may go nowhere (a headless Windows
-            // task): its log file gets why it stopped too.
-            if log_file.is_some() {
-                tracing::error!(error = %message, "the relay stopped");
+            let code = exit::code_for(&err);
+            // A restart into an installed update is not an error; the relay
+            // already logged it.
+            if code != ExitCode::RestartForUpdate {
+                let message = exit::message_for(&err);
+                // A service relay's stderr may go nowhere (a headless Windows
+                // task): its log file gets why it stopped too.
+                if log_file.is_some() {
+                    tracing::error!(error = %message, "the relay stopped");
+                }
+                let _ = output::diagnostic(format!("error: {message}"));
             }
-            let _ = output::diagnostic(format!("error: {message}"));
-            exit::code_for(&err)
+            code
         }
     };
 

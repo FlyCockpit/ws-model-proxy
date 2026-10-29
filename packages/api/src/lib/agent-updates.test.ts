@@ -110,6 +110,7 @@ describe("eligibility", () => {
     commit: null,
     sourceBuild: false,
     cargoInstall: "cargo install --git R --tag v0.4.3 --locked --force wsmp",
+    windowsUpdates: false,
   };
   const release = {
     kind: "release" as const,
@@ -185,22 +186,36 @@ describe("eligibility", () => {
     );
   });
 
-  it("offers the update only on platforms it was verified on (Linux, WSL included)", () => {
-    const on = (target: string, strategies: string[] = ["self-replace"]) =>
+  it("offers the update only on platforms it was verified on; Windows only when turned on", () => {
+    const WINDOWS = "x86_64-pc-windows-msvc";
+    const MAC = "aarch64-apple-darwin";
+    const everywhere = {
+      ...release,
+      artifacts: {
+        ...release.artifacts,
+        [WINDOWS]: { url: "https://u/w", sha256: "b".repeat(64) },
+        [MAC]: { url: "https://u/m", sha256: "c".repeat(64) },
+      },
+    };
+    const on = (target: string, strategies: string[] = ["self-replace"], windowsUpdates = false) =>
       check(
         { cliBuild: { commit: null, installMethod: "script", target } },
-        { live: { ...live, selfUpdate: { ...SELF_UPDATE, strategies } } },
+        {
+          live: { ...live, selfUpdate: { ...SELF_UPDATE, strategies } },
+          release: everywhere,
+          server: { ...server, windowsUpdates },
+        },
       );
     expect(on(TARGET).canUpdate).toBe(true);
-    for (const target of ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]) {
-      expect(on(target)).toMatchObject({
-        canUpdate: false,
-        blockedReason: "agent_update_platform",
-      });
-      expect(on(target).manualCommand).not.toBeNull();
-    }
-    expect(on("aarch64-apple-darwin", ["homebrew"]).blockedReason).toBe("agent_update_platform");
-    // Homebrew on Linux has not been verified either.
+    expect(on(MAC).canUpdate).toBe(true);
+    expect(on(WINDOWS)).toMatchObject({
+      canUpdate: false,
+      blockedReason: "agent_update_platform",
+    });
+    expect(on(WINDOWS).manualCommand).not.toBeNull();
+    expect(on(WINDOWS, ["self-replace"], true).canUpdate).toBe(true);
+    // Homebrew has not been verified against a server yet, on macOS or Linux.
+    expect(on(MAC, ["homebrew"]).blockedReason).toBe("agent_update_platform");
     expect(on(TARGET, ["homebrew"]).blockedReason).toBe("agent_update_platform");
   });
 

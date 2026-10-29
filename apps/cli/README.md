@@ -396,7 +396,8 @@ start the distribution at log on if it does not.
 
 The node's owner can update a Full-control node from the Nodes page (**Update**), or run `wsmp
 update` on the node. Either way wsmp installs the server's version. The server offers **Update**
-only on platforms where it has been verified (Linux and WSL for now); elsewhere the Nodes page
+only where it has been verified (Linux and WSL, and macOS script installs; Windows when the server
+sets `WMP_AGENT_UPDATE_WINDOWS`); elsewhere the Nodes page
 shows the command to run on the node, and `wsmp update` there still works.
 
 1. It downloads the release archive beside the binary (never in `/tmp`), checks its SHA-256, and

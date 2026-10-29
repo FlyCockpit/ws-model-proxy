@@ -204,6 +204,13 @@ struct Sink {
 
 impl Progress for Sink {
     fn report(&mut self, phase: UpdatePhase, reason: Option<UpdateReason>, detail: Option<String>) {
+        tracing::info!(
+            update_id = %self.update_id,
+            ?phase,
+            ?reason,
+            detail = detail.as_deref().unwrap_or_default(),
+            "update progress"
+        );
         let _ = self.tx.send(Event::Frame(Box::new(progress_frame(
             &self.update_id,
             phase,
@@ -570,6 +577,7 @@ impl DaemonUpdate {
         {
             current.reported = true;
             let _ = state::save(&update_dir, &current);
+            tracing::info!(update_id, "the server stored how the update ended");
         }
     }
 }

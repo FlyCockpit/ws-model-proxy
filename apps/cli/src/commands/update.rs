@@ -115,10 +115,28 @@ fn fetch_manifest(server_url: &str) -> Result<Manifest> {
 }
 
 /// Progress on stderr (stdout carries the result).
-struct Printer;
+/// Prints the update's steps to stderr. Why it stopped is kept for the
+/// command's error instead, so it is said once.
+#[derive(Default)]
+struct Printer {
+    stopped: Option<String>,
+}
+
+impl Printer {
+    /// The command's error after [`Ended::Stopped`].
+    fn stopped(self, fallback: String) -> anyhow::Error {
+        anyhow::anyhow!(self.stopped.unwrap_or(fallback))
+    }
+}
 
 impl Progress for Printer {
     fn report(&mut self, phase: UpdatePhase, reason: Option<UpdateReason>, detail: Option<String>) {
+        if matches!(phase, UpdatePhase::Refused | UpdatePhase::Failed)
+            && let Some(detail) = detail.as_deref().filter(|detail| !detail.is_empty())
+        {
+            self.stopped = Some(detail.to_string());
+            return;
+        }
         let text = match phase {
             UpdatePhase::Downloading => "downloading".to_string(),
             UpdatePhase::Verifying => "verifying the checksum and the new build".to_string(),
@@ -253,12 +271,14 @@ fn update(args: &Args) -> Result<()> {
             rollback_after_secs: CLI_ROLLBACK_SECS,
             origin: Origin::Cli,
         };
-        let ended = crate::update::agent::homebrew(&machine, &request, &mut Printer);
-        anyhow::ensure!(
-            ended == Ended::Swapped,
-            "the Homebrew upgrade did not install wsmp {}",
-            manifest.version
-        );
+        let mut printer = Printer::default();
+        let ended = crate::update::agent::homebrew(&machine, &request, &mut printer);
+        if ended != Ended::Swapped {
+            return Err(printer.stopped(format!(
+                "the Homebrew upgrade did not install wsmp {}",
+                manifest.version
+            )));
+        }
         if !service {
             settle_without_service(&update_dir)?;
         }
@@ -290,12 +310,14 @@ fn update(args: &Args) -> Result<()> {
         rollback_after_secs: CLI_ROLLBACK_SECS,
         origin: Origin::Cli,
     };
-    let ended = flow::self_replace(&machine, &request, &mut Printer);
-    anyhow::ensure!(
-        ended == Ended::Swapped,
-        "wsmp {} was not installed; nothing was changed",
-        manifest.version
-    );
+    let mut printer = Printer::default();
+    let ended = flow::self_replace(&machine, &request, &mut printer);
+    if ended != Ended::Swapped {
+        return Err(printer.stopped(format!(
+            "wsmp {} was not installed; nothing was changed",
+            manifest.version
+        )));
+    }
     if !service {
         settle_without_service(&update_dir)?;
         crate::update::receipt::write(

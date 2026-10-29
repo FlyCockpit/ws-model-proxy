@@ -362,6 +362,7 @@ function servicesSpy() {
       commit: null,
       sourceBuild: false,
       cargoInstall: "cargo install wsmp",
+      windowsUpdates: false,
     })),
     release: vi.fn(async () => ({
       kind: "release" as const,
