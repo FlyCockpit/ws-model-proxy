@@ -164,9 +164,11 @@ export function agentUpdateDeadline(
 }
 
 /**
- * Whether a report of `next` may follow the stored `current`. Phases only move forward; an
- * ended update stays ended, except that the node's own final word (`confirmed`, `rolled_back`,
- * `failed`, from the binary after the restart) replaces the server's `timed_out` guess.
+ * Whether a report of `next` may follow the stored `current`. Phases only move forward, with one
+ * step back: a node that got busy during the download waits for idle again before it swaps
+ * (`waiting_idle` after `downloading` or `verifying`). An ended update stays ended, except that
+ * the node's own final word (`confirmed`, `rolled_back`, `failed`, from the binary after the
+ * restart) replaces the server's `timed_out` guess.
  */
 export function progressAllowed(current: AgentUpdatePhase, next: AgentUpdateNodePhase): boolean {
   if (AGENT_UPDATE_TERMINAL_PHASES.has(current))
@@ -174,6 +176,8 @@ export function progressAllowed(current: AgentUpdatePhase, next: AgentUpdateNode
       current === "timed_out" &&
       (next === "confirmed" || next === "rolled_back" || next === "failed")
     );
+  if (next === "waiting_idle" && (current === "downloading" || current === "verifying"))
+    return true;
   return PHASE_ORDER[next] >= PHASE_ORDER[current];
 }
 

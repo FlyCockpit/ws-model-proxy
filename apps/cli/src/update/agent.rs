@@ -773,6 +773,13 @@ pub fn homebrew(machine: &Machine<'_>, request: &Request, progress: &mut dyn Pro
             );
         }
     }
+    // brew installs and switches the keg in one step, so the last idle check
+    // and the work hold come before it, as before a self-replace swap.
+    if let Some(before_swap) = machine.before_swap
+        && let Err(why) = before_swap(progress)
+    {
+        return fail(progress, UpdatePhase::Refused, UpdateReason::Busy, why);
+    }
     if let Err(error) = crate::commands::service::ensure_stable_executable() {
         tracing::warn!(error = %format!("{error:#}"), "the service could not be moved to the stable Homebrew path");
     }
@@ -860,6 +867,75 @@ mod tests {
             force,
             rollback_after_secs: 90,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_homebrew_update_checks_idle_before_brew_changes_anything() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        #[derive(Default)]
+        struct Seen(Vec<(UpdatePhase, Option<UpdateReason>)>);
+        impl Progress for Seen {
+            fn report(
+                &mut self,
+                phase: UpdatePhase,
+                reason: Option<UpdateReason>,
+                _: Option<String>,
+            ) {
+                self.0.push((phase, reason));
+            }
+        }
+
+        let root = tempfile::tempdir().expect("dir");
+        let prefix = root.path().join("homebrew");
+        let keg = prefix.join("Cellar/wsmp/0.4.2");
+        std::fs::create_dir_all(keg.join("bin")).expect("keg");
+        std::fs::write(keg.join("bin/wsmp"), "").expect("wsmp");
+        std::fs::write(
+            keg.join("INSTALL_RECEIPT.json"),
+            r#"{"source":{"tap":"flycockpit/tap"}}"#,
+        )
+        .expect("receipt");
+        // A brew that pins nothing and records an upgrade.
+        let upgraded = root.path().join("upgraded");
+        let brew = prefix.join("bin/brew");
+        std::fs::create_dir_all(prefix.join("bin")).expect("bin");
+        std::fs::write(
+            &brew,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in upgrade) touch '{}';; esac\nexit 0\n",
+                upgraded.display()
+            ),
+        )
+        .expect("brew");
+        std::fs::set_permissions(&brew, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let busy = |_: &mut dyn Progress| -> Result<(), String> { Err("busy".into()) };
+        let machine = Machine {
+            state_dir: root.path().join("state"),
+            live: keg.join("bin/wsmp"),
+            target: "test-target".into(),
+            scheduler: None,
+            tar: super::super::install::system_tar(),
+            current_version: "0.4.2".into(),
+            before_swap: Some(&busy),
+            proceed: None,
+        };
+        let request = Request {
+            update_id: "u-1".into(),
+            version: "0.4.3".into(),
+            artifact_url: String::new(),
+            sha256: String::new(),
+            signature: None,
+            rollback_after_secs: 90,
+            origin: Origin::Server,
+        };
+        let mut seen = Seen::default();
+        assert_eq!(homebrew(&machine, &request, &mut seen), Ended::Stopped);
+        assert_eq!(seen.0, [(UpdatePhase::Refused, Some(UpdateReason::Busy))]);
+        assert!(!upgraded.exists(), "brew upgrade must not run while busy");
+        assert!(state::load(&machine.update_dir()).expect("load").is_none());
     }
 
     #[test]

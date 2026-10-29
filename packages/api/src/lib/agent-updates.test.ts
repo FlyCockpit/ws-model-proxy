@@ -81,6 +81,10 @@ describe("phases", () => {
   it("only moves forward, and lets the node's final word replace timed_out", () => {
     expect(progressAllowed("requested", "downloading")).toBe(true);
     expect(progressAllowed("verifying", "downloading")).toBe(false);
+    // Busy again after the download: the node waits for idle once more.
+    expect(progressAllowed("downloading", "waiting_idle")).toBe(true);
+    expect(progressAllowed("verifying", "waiting_idle")).toBe(true);
+    expect(progressAllowed("armed", "waiting_idle")).toBe(false);
     expect(progressAllowed("restarting", "confirmed")).toBe(true);
     expect(progressAllowed("confirmed", "failed")).toBe(false);
     expect(progressAllowed("refused", "downloading")).toBe(false);
