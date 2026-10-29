@@ -119,11 +119,11 @@ the new `agent.update` frame).
 - `/install.sh` and `/install.ps1` now write an install receipt, `install.json` in the node's
   state directory (`~/.local/state/ws-model-proxy`, `%LOCALAPPDATA%\ws-model-proxy`, or
   `WSMP_STATE_DIR`), so the node knows how it was installed.
-- **Update** is offered for Linux nodes (WSL included) and macOS nodes installed by the install
-  script. Homebrew installs and Windows nodes show the command to run on the node, and `wsmp
-  update` works there. Windows has been verified but stays off until its releases are signed
-  (Microsoft Defender can quarantine an unsigned `wsmp.exe` run as a scheduled task); set
-  `WMP_AGENT_UPDATE_WINDOWS=true` to offer it anyway.
+- **Update** is offered for Linux nodes (WSL included) and macOS nodes (install script or
+  Homebrew). Windows nodes show the command to run on the node, and `wsmp update` works there.
+  Windows has been verified but stays off until its releases are signed (Microsoft Defender can
+  quarantine an unsigned `wsmp.exe` run as a scheduled task); set `WMP_AGENT_UPDATE_WINDOWS=true`
+  to offer it anyway.
 - wsmp updates itself only where it knows how it was installed: this release's install receipt,
   a Homebrew `Cellar` path, or a cargo install. A binary without one (installed by an older
   script, a package or a copy) is never overwritten.

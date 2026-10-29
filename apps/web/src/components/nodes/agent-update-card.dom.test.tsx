@@ -218,6 +218,58 @@ describe("AgentUpdatePanel", () => {
     expect(screen.queryByRole("button", { name: `${K}.update` })).toBeNull();
   });
 
+  it("says Updating, not Up to date, while the new build has not confirmed", () => {
+    wrap(
+      <AgentUpdatePanel
+        server={server}
+        view={nodeView({
+          version: "0.4.3",
+          outdated: false,
+          latest: {
+            id: "u-1",
+            phase: "restarting",
+            reason: null,
+            detail: null,
+            fromVersion: "0.4.2",
+            toVersion: "0.4.3",
+            force: false,
+            createdAt: "2026-10-28T10:00:00.000Z",
+            updatedAt: "2026-10-28T10:00:05.000Z",
+            endedAt: null,
+          },
+        })}
+      />,
+    );
+    expect(screen.getByText(`${K}.updatingBadge`)).toBeTruthy();
+    expect(screen.queryByText(`${K}.current`)).toBeNull();
+  });
+
+  it("drops an old success once the node runs another version", () => {
+    const confirmed = {
+      id: "u-1",
+      phase: "confirmed" as const,
+      reason: null,
+      detail: null,
+      fromVersion: "0.4.2",
+      toVersion: "0.4.3",
+      force: false,
+      createdAt: "2026-10-28T10:00:00.000Z",
+      updatedAt: "2026-10-28T10:01:00.000Z",
+      endedAt: "2026-10-28T10:01:00.000Z",
+    };
+    const { unmount } = wrap(
+      <AgentUpdatePanel
+        server={server}
+        view={nodeView({ version: "0.4.3", outdated: false, latest: confirmed })}
+      />,
+    );
+    expect(screen.getByText(`${K}.confirmed`, { exact: false })).toBeTruthy();
+    unmount();
+    wrap(<AgentUpdatePanel server={server} view={nodeView({ latest: confirmed })} />);
+    expect(screen.queryByText(`${K}.confirmed`, { exact: false })).toBeNull();
+    expect(screen.getByText(`${K}.outdated`)).toBeTruthy();
+  });
+
   it("offers Force while the node waits for idle, forcing that update", async () => {
     wrap(
       <AgentUpdatePanel

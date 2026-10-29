@@ -109,7 +109,9 @@ export function AgentUpdatePanel({
       <CardHeader>
         <CardTitle className="flex flex-wrap items-center gap-2 text-base">
           {t(`${K}.title`)}
-          {view.version === null ? null : view.outdated ? (
+          {view.latest !== null && !isTerminalPhase(view.latest.phase) ? (
+            <StatusPill tone="info">{t(`${K}.updatingBadge`)}</StatusPill>
+          ) : view.version === null ? null : view.outdated ? (
             <StatusPill tone="warning">{t(`${K}.outdated`)}</StatusPill>
           ) : (
             <StatusPill tone="success">{t(`${K}.current`)}</StatusPill>
@@ -220,6 +222,8 @@ function LatestUpdate({ view, latest }: { view: NodeAgentUpdateView; latest: Age
 
   switch (latest.phase) {
     case "confirmed":
+      // The node has run something else since (reinstalled by hand, say): old news.
+      if (view.version !== latest.toVersion) return null;
       return (
         <Notice tone="success">
           <p>

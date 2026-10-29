@@ -244,9 +244,8 @@ function storedSelfUpdate(features: unknown): NodeSelfUpdate | null {
 
 /**
  * Where the browser update is offered: each operating system with the strategy verified on a
- * real machine there (the dead-man, the restart, the confirmation). Linux covers WSL. Add macOS
- * `homebrew` once it passes there: a server deploy, no new wsmp. `optIn` entries are offered only
- * when the server turns them on.
+ * real machine there (the dead-man, the restart, the confirmation). Linux covers WSL. Adding one
+ * is a server deploy, no new wsmp. `optIn` entries are offered only when the server turns them on.
  */
 export const AGENT_UPDATE_OFFERED: ReadonlyArray<{
   os: "linux" | "macos" | "windows";
@@ -255,6 +254,7 @@ export const AGENT_UPDATE_OFFERED: ReadonlyArray<{
 }> = [
   { os: "linux", strategy: "self-replace" },
   { os: "macos", strategy: "self-replace" },
+  { os: "macos", strategy: "homebrew" },
   // Verified, but Defender flags the unsigned wsmp.exe run as a scheduled task (issue #254):
   // off until Windows releases are signed.
   { os: "windows", strategy: "self-replace", optIn: "windowsUpdates" },

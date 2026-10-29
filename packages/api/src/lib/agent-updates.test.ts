@@ -214,8 +214,8 @@ describe("eligibility", () => {
     });
     expect(on(WINDOWS).manualCommand).not.toBeNull();
     expect(on(WINDOWS, ["self-replace"], true).canUpdate).toBe(true);
-    // Homebrew has not been verified against a server yet, on macOS or Linux.
-    expect(on(MAC, ["homebrew"]).blockedReason).toBe("agent_update_platform");
+    expect(on(MAC, ["homebrew"]).canUpdate).toBe(true);
+    // Homebrew on Linux has not been verified.
     expect(on(TARGET, ["homebrew"]).blockedReason).toBe("agent_update_platform");
   });
 
