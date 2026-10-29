@@ -46,12 +46,13 @@ overrides:
   "ip-address@>=10 <10.7.2": 10.7.2
   "source-map-js@<1.2.2": 1.2.2 # GHSA-68fv-2mgg-jv7q / CVE-2026-93749 (high); see minimumReleaseAgeExclude
   # GHSA-p6vx-979v-rg4c (critical, <=1.6.0) / GHSA-jp82-f5mq-hwhp (high,
-  # <=1.6.2). @tanstack/query-devtools 5.103+ depends on solid-js at runtime,
-  # and solid-js 1.9.15 (newest 1.x) pins seroval ~1.5.4 with no patched 1.5
-  # release. Only solid-js's SSR build imports seroval, and 1.6.7 is the copy
-  # TanStack Router already uses. Drop once solid-js accepts seroval >=1.6.3.
-  "seroval@<1.6.3": 1.6.7
-  "seroval-plugins@<1.6.3": 1.6.7
+  # <=1.6.2) / GHSA-97r2-qh9m-474h and CVE-2026-116580 (high, <=1.6.7).
+  # @tanstack/query-devtools 5.103+ depends on solid-js at runtime, and
+  # solid-js 1.9.15 (newest 1.x) pins seroval ~1.5.4 with no patched 1.5
+  # release; TanStack Router resolved 1.6.7. Only solid-js's SSR build and the
+  # router import seroval. Drop once both accept seroval >=1.6.8.
+  "seroval@<1.6.8": 1.6.9
+  "seroval-plugins@<1.6.8": 1.6.9
   "postcss@>=8 <8.5.23": ">=8.5.23" # GHSA-r28c-9q8g-f849 / GHSA-fxqj-rqcc-2cmp (path traversal / source map disclosure)
   # 0.35.0 is still inside GHSA-rgj7-g3m4-5g8c (libheif, patched in 0.35.4).
   # 0.35.5 is the newest release that clears the 7-day gate.
