@@ -29,6 +29,7 @@ import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-ac
 import type { z } from "zod";
 import type { nodeEnrollRequestSchema, nodeEnrollResponseSchema } from "../contracts/http";
 import { graphWrite } from "../lib/graph-write";
+import { publishNodeEvent } from "../lib/node-events";
 import { isUniqueViolation } from "../lib/refuse";
 
 export type NodeEnrollRequest = z.infer<typeof nodeEnrollRequestSchema>;
@@ -200,6 +201,8 @@ export async function exchangeEnrollmentCode(
         revokedCredentialIds: previous.map((row) => row.id),
       };
     });
+    // A new node, or a replacement that reuses the row (its code's use count changed either way).
+    publishNodeEvent({ type: "node.added", userId, nodeId: result.nodeId });
     return {
       response: {
         ok: true,

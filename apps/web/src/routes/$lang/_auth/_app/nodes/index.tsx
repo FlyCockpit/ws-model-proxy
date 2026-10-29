@@ -7,6 +7,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
+import { LiveUpdatesNotice } from "@/components/live-updates-notice";
 import { AddNodeDialog } from "@/components/nodes/add-node-dialog";
 import { AgentUpdateAllCard } from "@/components/nodes/agent-update-all-card";
 import { EnrollmentCodesCard } from "@/components/nodes/enrollment-codes-card";
@@ -14,22 +15,29 @@ import { FabricsCard } from "@/components/nodes/fabrics-card";
 import { NodeCard, NodeCardSkeleton } from "@/components/nodes/node-card";
 import { PageHeading } from "@/components/page-stub";
 import { useAgentUpdateOverview } from "@/hooks/use-agent-update-overview";
+import { nodeLiveInterval } from "@/lib/node-live-updates";
+import { useNodeLive } from "@/stores/node-live";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/nodes/")({
   component: NodesPage,
 });
 
-/** Node list refresh: a node that enrolls shows up without a reload. */
+/**
+ * Node list refresh without live updates (a node that enrolls shows up without a reload); with
+ * them, slowly for the heartbeat's free memory and last seen.
+ */
 const NODES_REFRESH_MS = 10_000;
+const NODES_LIVE_REFRESH_MS = 60_000;
 
 function NodesPage() {
   const { lang } = Route.useParams();
   const { t } = useTranslation(["dashboard"]);
   const [adding, setAdding] = useState(false);
+  const liveStatus = useNodeLive((state) => state.status);
   const nodes = useQuery({
     ...orpc.nodes.list.queryOptions(),
-    refetchInterval: NODES_REFRESH_MS,
+    refetchInterval: nodeLiveInterval(liveStatus, NODES_REFRESH_MS, NODES_LIVE_REFRESH_MS),
   });
   const agentUpdates = useAgentUpdateOverview();
   const updateOf = (nodeId: string) =>
@@ -44,6 +52,8 @@ function NodesPage() {
           {t("dashboard:nodes.list.addNode")}
         </Button>
       </div>
+
+      <LiveUpdatesNotice />
 
       <AgentUpdateAllCard />
 

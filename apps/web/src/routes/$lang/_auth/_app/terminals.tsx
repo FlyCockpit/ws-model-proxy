@@ -27,6 +27,7 @@ import { useTranslation } from "react-i18next";
 
 import { CodeSnippet } from "@/components/code-snippet";
 import { InlineRetry } from "@/components/inline-retry";
+import { LiveUpdatesNotice } from "@/components/live-updates-notice";
 import { PageHeading } from "@/components/page-stub";
 import { OperatorStepItem } from "@/components/runtimes/operator-step-item";
 import { TerminalNodeRow } from "@/components/terminal-node-row";
@@ -39,6 +40,7 @@ import {
   type TerminalTab,
   useTerminalSessions,
 } from "@/hooks/use-terminal-sessions";
+import { nodeLiveInterval } from "@/lib/node-live-updates";
 import { refusalText } from "@/lib/refusal-text";
 import type { CliTrust } from "@/lib/terminal-cli-identity";
 import { typableCommand } from "@/lib/terminal-protocol";
@@ -50,6 +52,7 @@ import {
 } from "@/lib/terminal-settings";
 import { TERMINAL_CHROME_VARS } from "@/lib/terminal-theme";
 import { followSize, writerStatusKey } from "@/lib/terminal-writer";
+import { useNodeLive } from "@/stores/node-live";
 import { useUiPreferences } from "@/stores/ui-preferences";
 import { orpc } from "@/utils/orpc";
 
@@ -82,7 +85,10 @@ const KNOWN_REJECTIONS: ReadonlySet<string> = new Set([
   "step_detached",
 ]);
 
-/** How often the node list refreshes, so a node going offline or coming back shows without a reload. */
+/**
+ * How often the node list refreshes while the node live updates are down, so a node going
+ * offline or coming back shows without a reload. While they are live, their events refresh it.
+ */
 const NODES_REFRESH_MS = 5_000;
 
 type Sessions = ReturnType<typeof useTerminalSessions>;
@@ -91,7 +97,11 @@ type OpenTerminal = (input: OpenTicketInput) => void;
 function TerminalsPage() {
   const { t } = useTranslation(["terminals"]);
   const sessions = useTerminalSessions();
-  const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), refetchInterval: NODES_REFRESH_MS });
+  const liveStatus = useNodeLive((state) => state.status);
+  const nodes = useQuery({
+    ...orpc.nodes.list.queryOptions(),
+    refetchInterval: nodeLiveInterval(liveStatus, NODES_REFRESH_MS),
+  });
   const slugOf = (nodeId: string) => nodes.data?.nodes.find((node) => node.id === nodeId)?.slug;
   // A ticket is used up by its open: take one only once the socket and identity are ready, so
   // the open goes out at once (and a queued command is never decided for nothing).
@@ -497,7 +507,11 @@ function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) 
 
 function TerminalNodes({ ready, openTerminal }: { ready: boolean; openTerminal: OpenTerminal }) {
   const { t } = useTranslation(["terminals"]);
-  const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), refetchInterval: NODES_REFRESH_MS });
+  const liveStatus = useNodeLive((state) => state.status);
+  const nodes = useQuery({
+    ...orpc.nodes.list.queryOptions(),
+    refetchInterval: nodeLiveInterval(liveStatus, NODES_REFRESH_MS),
+  });
   const openTicket = useMutation(
     orpc.nodes.terminals.openTicket.mutationOptions({
       onSuccess: (data, input) => openTerminal({ cliDeviceId: input.nodeId, ticket: data.ticket }),
@@ -516,6 +530,7 @@ function TerminalNodes({ ready, openTerminal }: { ready: boolean; openTerminal: 
         <CardDescription>{t("terminals:nodesDescription")}</CardDescription>
       </CardHeader>
       <CardContent className="flex min-w-0 flex-col divide-y">
+        <LiveUpdatesNotice className="pb-2 text-sm text-muted-foreground" />
         {nodes.isPending ? (
           <Skeleton aria-hidden="true" className="h-11 w-full" />
         ) : nodes.isError ? (

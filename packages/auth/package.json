@@ -41,6 +41,9 @@
     "./user-deletion-listeners": {
       "default": "./src/user-deletion-listeners.ts"
     },
+    "./session-ended-listeners": {
+      "default": "./src/session-ended-listeners.ts"
+    },
     "./user-ban-listeners": {
       "default": "./src/user-ban-listeners.ts"
     },

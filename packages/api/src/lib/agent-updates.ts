@@ -23,6 +23,7 @@ import {
   nodeBuildSchema,
   nodeEnvironmentSchema,
 } from "./agent-update-wire";
+import { publishNodeEvent } from "./node-events";
 import { isUniqueViolation } from "./refuse";
 import {
   AGENT_UPDATE_STRATEGIES,
@@ -608,6 +609,7 @@ export async function startAgentUpdate(
     });
     return refused("node_offline");
   }
+  publishNodeEvent({ type: "node.agentUpdate", userId: input.userId, nodeId: row.id });
   return { kind: "started", updateId: update.id };
 }
 
@@ -646,6 +648,7 @@ async function forceWaitingUpdate(
     });
     return refused("node_offline");
   }
+  publishNodeEvent({ type: "node.agentUpdate", userId: input.userId, nodeId: row.id });
   return { kind: "started", updateId: active.id };
 }
 
@@ -697,7 +700,10 @@ export async function applyAgentUpdateProgress(
         endedAt: ended ? now : null,
       },
     });
-    if (written.count === 1) return { applied: true, ended, settled: ended };
+    if (written.count === 1) {
+      publishNodeEvent({ type: "node.agentUpdate", userId: node.userId, nodeId: node.nodeId });
+      return { applied: true, ended, settled: ended };
+    }
   }
   return { applied: false, ended: false, settled: false };
 }
@@ -713,7 +719,7 @@ const AGENT_UPDATE_PROGRESS_ATTEMPTS = 5;
 export async function expireAgentUpdates(now: Date = new Date()): Promise<number> {
   const due = await prisma.nodeAgentUpdate.findMany({
     where: { endedAt: null, deadlineAt: { lte: now } },
-    select: { id: true, phase: true },
+    select: { id: true, phase: true, userId: true, nodeId: true },
     take: 200,
   });
   let ended = 0;
@@ -727,6 +733,8 @@ export async function expireAgentUpdates(now: Date = new Date()): Promise<number
         endedAt: now,
       },
     });
+    if (written.count === 1)
+      publishNodeEvent({ type: "node.agentUpdate", userId: update.userId, nodeId: update.nodeId });
     ended += written.count;
   }
   return ended;

@@ -24,6 +24,7 @@ import {
   startAgentUpdate,
   untouchedNodeIds,
 } from "./agent-updates";
+import { type NodeEvent, onNodeEvent } from "./node-events";
 
 const OWNER = "owner-1";
 const ORIGIN = "https://proxy.example.com";
@@ -441,6 +442,27 @@ describe("progress and the deadline", () => {
       detail: "wsmp update --force",
       deadlineAt: null,
     });
+  });
+
+  it("tells the owner's open tabs about a start, each stored report and a timeout (#255)", async () => {
+    const events: NodeEvent[] = [];
+    const unsubscribe = onNodeEvent((event) => events.push(event));
+    const id = await started();
+    const node = { nodeId: "node-1", userId: OWNER };
+    const t0 = new Date();
+    await applyAgentUpdateProgress(node, { updateId: id, phase: "swapped" }, t0);
+    // Not stored (another node's update): nothing to tell.
+    await applyAgentUpdateProgress(
+      { nodeId: "node-2", userId: OWNER },
+      { updateId: id, phase: "failed" },
+    );
+    await expireAgentUpdates(new Date(t0.getTime() + 301_000));
+    unsubscribe();
+    expect(events).toEqual([
+      { type: "node.agentUpdate", userId: OWNER, nodeId: "node-1" },
+      { type: "node.agentUpdate", userId: OWNER, nodeId: "node-1" },
+      { type: "node.agentUpdate", userId: OWNER, nodeId: "node-1" },
+    ]);
   });
 
   it("times an update out at its deadline; a later confirmed still lands", async () => {

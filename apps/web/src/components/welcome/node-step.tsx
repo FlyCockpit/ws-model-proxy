@@ -9,9 +9,14 @@ import { EnrollmentPanel } from "@/components/nodes/enrollment-panel";
 import { NodeCard } from "@/components/nodes/node-card";
 import type { EnrollmentResult } from "@/components/nodes/node-types";
 import { refusalToastOptions } from "@/components/nodes/refusal";
+import { nodeLiveInterval } from "@/lib/node-live-updates";
+import { useNodeLive } from "@/stores/node-live";
 import { orpc } from "@/utils/orpc";
 
-/** Node list refresh while the step is open: a node that enrolls shows up without a reload. */
+/**
+ * Node list refresh while the step is open and the node live updates are down: a node that
+ * enrolls shows up without a reload. While they are live, its enrollment refreshes the list.
+ */
 const NODES_REFRESH_MS = 10_000;
 
 /**
@@ -30,7 +35,11 @@ export function NodeStep({
 }) {
   const { t } = useTranslation(["dashboard"]);
   const queryClient = useQueryClient();
-  const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), refetchInterval: NODES_REFRESH_MS });
+  const liveStatus = useNodeLive((state) => state.status);
+  const nodes = useQuery({
+    ...orpc.nodes.list.queryOptions(),
+    refetchInterval: nodeLiveInterval(liveStatus, NODES_REFRESH_MS),
+  });
   const mint = useMutation({
     ...orpc.nodes.enrollmentCodes.create.mutationOptions(),
     // Owned here: the secret is shown once and never kept in the mutation cache.

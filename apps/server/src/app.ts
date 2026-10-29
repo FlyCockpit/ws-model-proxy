@@ -15,6 +15,7 @@ import {
   CSRF_REQUIRED_PROCEDURES,
   SENSITIVE_INPUT_PROCEDURES,
 } from "@ws-model-proxy/api/contracts";
+import { onNodeEvent } from "@ws-model-proxy/api/lib/node-events";
 import { appRouter } from "@ws-model-proxy/api/routers/index";
 import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
@@ -27,6 +28,7 @@ import {
   PASSWORD_RESET_REQUEST_PATH,
   type PasswordResetRequestAuth,
 } from "@ws-model-proxy/auth/password-reset-request";
+import { onSessionEnded } from "@ws-model-proxy/auth/session-ended-listeners";
 import { onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import { onUserDeleted, onUserDeletionMarked } from "@ws-model-proxy/auth/user-deletion-listeners";
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
@@ -118,6 +120,8 @@ import {
 } from "./model-api/realtime/websocket.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
 import { transcriptionContentLengthGuard } from "./model-api/transcription-body-guard.js";
+import { nodeEventHub } from "./node-events/hub.js";
+import { createNodeEventsHandler, NODE_EVENTS_PATH } from "./node-events/route.js";
 import { registerNodeHttpRoutes } from "./node-http.js";
 import { logOrpcError, sensitiveProcedureErrors } from "./orpc-error-log.js";
 import {
@@ -274,6 +278,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  */
 const closeRelaySessionsForDeletedUser = async (userId: string): Promise<void> => {
   terminalBrowserHub.revokeTerminalAccessForUser(userId);
+  nodeEventHub.closeUser(userId);
   realtimeSessionRegistry.terminateForUser(userId);
   await relaySessionManager.closeSessionsForUser(userId);
 };
@@ -285,6 +290,15 @@ onUserBanned(cancelRelayWorkForBannedUser);
 // A ban ends the user's live transcription sessions, and those their engines
 // or pools serve, at once (not at the next 60 s recheck).
 onUserBanned((userId) => realtimeSessionRegistry.terminateForUser(userId));
+onUserBanned((userId) => nodeEventHub.closeUser(userId, "access_blocked"));
+
+// Committed node changes reach their owner's browser event streams (#255; ./node-events/).
+onNodeEvent((event) => nodeEventHub.publish(event));
+// A signed-out or revoked session's browser sockets close now, not at the 60 s recheck.
+onSessionEnded((session) => {
+  nodeEventHub.endSession(session.id);
+  terminalBrowserHub.endSession(session.id);
+});
 
 /**
  * A grant lowered from Full to Read-only (committed): its Full work ends now
@@ -769,6 +783,14 @@ export async function createApp(options: CreateAppOptions = {}) {
   // returns false when the client offers none. maxPayload is set on that server.
   app.use("/api/dashboard/terminal/ws", createTerminalWebsocketMiddleware());
   app.get("/api/dashboard/terminal/ws", terminalUpgradeHandler());
+  // Browser node event stream (server-sent events, ./node-events/route.ts).
+  app.get(
+    NODE_EVENTS_PATH,
+    createNodeEventsHandler({
+      allowedOrigins: dashboardOrigins,
+      isDraining: () => relaySessionManager.isDraining(),
+    }),
+  );
 
   // Signup-specific rate limiter — stricter than the general auth limiter.
   // Must be mounted BEFORE the general authLimiter so signup traffic is throttled

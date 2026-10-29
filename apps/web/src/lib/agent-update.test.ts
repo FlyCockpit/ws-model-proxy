@@ -29,6 +29,17 @@ describe("overviewRefetchInterval", () => {
     expect(overviewRefetchInterval({ nodes: [], batch: { state: "running" } })).toBe(3_000);
     expect(overviewRefetchInterval({ nodes: [], batch: { state: "stopped" } })).toBe(30_000);
   });
+
+  it("leaves an idle overview to the node live updates while they are live", () => {
+    expect(overviewRefetchInterval(undefined, true)).toBe(false);
+    expect(
+      overviewRefetchInterval({ nodes: [{ latest: { phase: "confirmed" } }], batch: null }, true),
+    ).toBe(false);
+    // Phases in flight still poll: a missed push must not freeze the progress.
+    expect(
+      overviewRefetchInterval({ nodes: [{ latest: { phase: "downloading" } }], batch: null }, true),
+    ).toBe(3_000);
+  });
 });
 
 describe("nodeUpdateMode", () => {

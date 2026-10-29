@@ -14,8 +14,9 @@ const TERMINAL_PHASES: ReadonlySet<string> = new Set([
 /** Follow an update this often while one is in flight. */
 export const AGENT_UPDATE_POLL_MS = 3_000;
 /**
- * With nothing in flight, still refresh this often: a node that reconnects, or is upgraded by
- * hand, changes what Update and Update all may do.
+ * With nothing in flight, still refresh this often while the node live updates stream is down:
+ * a node that reconnects, or is upgraded by hand (a reconnect too), changes what Update and
+ * Update all may do. While it is live, its events refresh the overview instead.
  */
 export const AGENT_UPDATE_IDLE_POLL_MS = 30_000;
 
@@ -73,8 +74,14 @@ export function overviewInFlight(overview: OverviewLike): boolean {
 }
 
 /** The overview's refetch interval: fast while something is in flight, slow otherwise. */
-export function overviewRefetchInterval(overview: OverviewLike | undefined): number {
-  return overview && overviewInFlight(overview) ? AGENT_UPDATE_POLL_MS : AGENT_UPDATE_IDLE_POLL_MS;
+export function overviewRefetchInterval(
+  overview: OverviewLike | undefined,
+  live = false,
+): number | false {
+  // Phases in flight are polled even while live: the push follows each stored report, but a
+  // missed one must not leave the progress frozen.
+  if (overview && overviewInFlight(overview)) return AGENT_UPDATE_POLL_MS;
+  return live ? false : AGENT_UPDATE_IDLE_POLL_MS;
 }
 
 /** First 7 characters of a 40-hex commit, or null. */

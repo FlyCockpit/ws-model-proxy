@@ -349,6 +349,8 @@ describe("built-in limits and WMP_RATE_LIMIT_SCALE", () => {
       inviteInfo: { points: 10, duration: 60, blockDuration: 900 },
       relayUpgradeIp: { points: 30, duration: 60, blockDuration: 300 },
       relayUpgradeNode: { points: 10, duration: 60, blockDuration: 300 },
+      nodeEventsIp: { points: 60, duration: 60 },
+      nodeEventsUser: { points: 40, duration: 60 },
       passwordResetRequest: { points: 3, duration: 60 },
     });
   });

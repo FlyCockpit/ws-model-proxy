@@ -17,6 +17,7 @@
     "test:e2e:transcription": "pnpm --filter server build && cargo build --quiet --manifest-path apps/cli/Cargo.toml && node scripts/e2e/transcription-relay.mjs",
     "test:e2e:realtime-transcription": "pnpm --filter server build && cargo build --quiet --manifest-path apps/cli/Cargo.toml && node scripts/e2e/realtime-transcription-relay.mjs",
     "test:e2e:file-tools": "pnpm --filter server build && cargo build --quiet --manifest-path apps/cli/Cargo.toml && node scripts/e2e/file-tools-relay.mjs",
+    "test:e2e:node-presence": "pnpm --filter server build && cargo build --quiet --manifest-path apps/cli/Cargo.toml && node scripts/e2e/node-presence.mjs",
     "check-types": "turbo check-types",
     "lint": "biome lint .",
     "policy:auth-session": "tsx scripts/check-auth-session-contract.ts",

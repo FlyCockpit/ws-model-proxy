@@ -26,9 +26,11 @@ import Header from "@/components/header";
 import { ThemeColorSync } from "@/components/theme-color-sync";
 import { ThemeProvider } from "@/components/theme-provider";
 import { useAppUpdate } from "@/hooks/use-app-update";
+import { useAuthSession } from "@/hooks/use-auth-session";
 import { useDocumentLang } from "@/hooks/use-document-lang";
 import { useHashTargetScroll } from "@/hooks/use-hash-target-scroll";
 import { useMobileKeyboard } from "@/hooks/use-mobile-keyboard";
+import { useNodeLiveUpdates } from "@/hooks/use-node-live-updates";
 import { useStaleBuildRecovery } from "@/hooks/use-stale-build-recovery";
 import { useUserLocaleSync } from "@/hooks/use-user-locale-sync";
 import i18n from "@/i18n";
@@ -143,6 +145,11 @@ function RootComponent() {
   useDocumentLang();
   useHashTargetScroll();
   useUserLocaleSync();
+  // One node event stream per signed-in tab; it survives navigation (app and admin pages alike).
+  const { state: authState } = useAuthSession();
+  // Keyed by the session, so signing in again (or impersonating) opens a fresh stream.
+  const liveSession = authState.session;
+  useNodeLiveUpdates(liveSession ? (liveSession.session?.id ?? liveSession.user.id) : null);
   const mobileKeyboardOpen = useMobileKeyboard();
   // A page that took the whole viewport (the maximized terminal) hides the chrome; safe areas and
   // the keyboard inset still apply.

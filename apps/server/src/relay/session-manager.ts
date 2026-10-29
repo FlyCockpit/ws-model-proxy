@@ -39,6 +39,7 @@ import {
   type NodeMetricsSample,
   parseNodeMetricsSample,
 } from "@ws-model-proxy/api/lib/metric-routing";
+import { publishNodeEvent } from "@ws-model-proxy/api/lib/node-events";
 import {
   disconnectNodeAtGeneration,
   markTargetsDueAfterNodeReconnect,
@@ -1365,6 +1366,7 @@ export class RelaySessionManager {
     if (before !== next) {
       this.reconcileTrust(session);
       this.notifyTerminalListChanged(session.identity.userId);
+      publishNodeEvent({ type: "node.trust", userId: session.identity.userId, nodeId });
     }
     const requestedAt = row.trustLowerRequestedAt?.toISOString() ?? null;
     if (
@@ -1997,6 +1999,15 @@ export class RelaySessionManager {
     clearTimeout(session.unauthenticatedTimer);
     this.replaceDuplicateSession(session);
     this.notifyTerminalListChanged(session.identity.userId);
+    // A replaced session publishes nothing (its detach finds the new one installed): one ONLINE
+    // event per accepted hello.
+    publishNodeEvent({
+      type: "node.connection",
+      userId: session.identity.userId,
+      nodeId: registration.nodeId,
+      connection: "ONLINE",
+      generation: registration.connectionGeneration,
+    });
 
     // Targets opened only by this node's disconnect are probed now, not after the cooldown.
     await markTargetsDueAfterNodeReconnect({ nodeId: registration.nodeId, now: new Date() }).catch(
@@ -2058,6 +2069,8 @@ export class RelaySessionManager {
     } catch (error) {
       console.error("[relay] node state write failed", errorName(error));
     }
+    // The stored trust and features changed (the node's view shows both).
+    if (written) publishNodeEvent({ type: "node.trust", userId: session.identity.userId, nodeId });
     if (!this.isCurrent(session)) return;
     session.features = message.features;
     // Fail closed: what was not written (or not for this connection) raises nothing.
@@ -2066,6 +2079,7 @@ export class RelaySessionManager {
       session.trust = "relay";
       this.reconcileTrust(session);
       this.notifyTerminalListChanged(session.identity.userId);
+      publishNodeEvent({ type: "node.trust", userId: session.identity.userId, nodeId });
     }
     await this.syncTrust(nodeId);
   }
@@ -2318,8 +2332,21 @@ export class RelaySessionManager {
     this.notifyTerminalListChanged(session.identity.userId);
     const ref = this.sessionRef(session);
     const connectionGeneration = session.connectionGeneration;
+    const userId = session.identity.userId;
     return async () => {
-      await this.writeNodeDisconnected(nodeId, { now, failureClass, connectionGeneration });
+      try {
+        await this.writeNodeDisconnected(nodeId, { now, failureClass, connectionGeneration });
+      } finally {
+        // After the write, so a browser that refetches on it reads OFFLINE; even when the write
+        // failed, because this process no longer serves the node.
+        publishNodeEvent({
+          type: "node.connection",
+          userId,
+          nodeId,
+          connection: "OFFLINE",
+          generation: connectionGeneration,
+        });
+      }
       if (ref) {
         try {
           this.frameHandlers.nodeDisconnected?.(ref);

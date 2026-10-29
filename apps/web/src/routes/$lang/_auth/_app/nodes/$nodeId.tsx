@@ -20,6 +20,8 @@ import {
   RunsHereCard,
   SecretsCard,
 } from "@/components/nodes/node-info-cards";
+import { nodeLiveInterval } from "@/lib/node-live-updates";
+import { useNodeLive } from "@/stores/node-live";
 import { isNotFound } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
@@ -27,7 +29,9 @@ export const Route = createFileRoute("/$lang/_auth/_app/nodes/$nodeId")({
   component: NodeDetailPage,
 });
 
+/** Without live updates; with them, slowly for the heartbeat's free memory and last seen. */
 const NODE_REFRESH_MS = 15_000;
+const NODE_LIVE_REFRESH_MS = 60_000;
 
 function serverKey(...values: unknown[]): string {
   return JSON.stringify(values);
@@ -36,9 +40,10 @@ function serverKey(...values: unknown[]): string {
 function NodeDetailPage() {
   const { lang, nodeId } = Route.useParams();
   const { t } = useTranslation(["dashboard"]);
+  const liveStatus = useNodeLive((state) => state.status);
   const node = useQuery({
     ...orpc.nodes.get.queryOptions({ input: { nodeId } }),
-    refetchInterval: NODE_REFRESH_MS,
+    refetchInterval: nodeLiveInterval(liveStatus, NODE_REFRESH_MS, NODE_LIVE_REFRESH_MS),
   });
 
   return (

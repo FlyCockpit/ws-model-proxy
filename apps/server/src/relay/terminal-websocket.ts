@@ -411,6 +411,17 @@ export class TerminalBrowserHub {
   }
 
   /**
+   * A dashboard session ended (sign-out or a revoked session; its row was deleted): close the
+   * sockets opened with it now instead of at the next recheck. Pending ones too: their
+   * admission read would find the row gone anyway.
+   */
+  endSession(sessionId: string) {
+    for (const conn of [...this.bySocket.values()]) {
+      if (conn.sessionId === sessionId) this.expire(conn);
+    }
+  }
+
+  /**
    * Registers a socket in the pending admission state. Synchronous, before any
    * database read, so a revocation that runs from here on finds it. Text
    * frames received while pending queue behind admission (same rate, size and
