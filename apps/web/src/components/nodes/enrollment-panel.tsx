@@ -7,12 +7,17 @@ import { CircleCheck, LoaderCircle, RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { useNow } from "@/hooks/use-now";
+import { nodeLiveInterval } from "@/lib/node-live-updates";
+import { useNodeLive } from "@/stores/node-live";
 import { orpc } from "@/utils/orpc";
 
 import { CommandBlock, ConnectionBadge, formatGb } from "./node-badges";
 import type { EnrollmentCode, EnrollmentResult } from "./node-types";
 
-/** How often the panel looks for nodes that used the code. */
+/**
+ * How often the panel looks for nodes that used the code while the node live updates are down.
+ * While they are live, the node's enrollment and its connect refresh both queries.
+ */
 const POLL_MS = 3_000;
 
 /** `m:ss` (or `h:mm:ss`) left until `expiresAt`; null once it passed. */
@@ -44,9 +49,10 @@ export function EnrollmentPanel({
   newCodePending?: boolean;
 }) {
   const { t } = useTranslation(["dashboard"]);
+  const liveStatus = useNodeLive((state) => state.status);
   const codes = useQuery({
     ...orpc.nodes.enrollmentCodes.list.queryOptions(),
-    refetchInterval: POLL_MS,
+    refetchInterval: nodeLiveInterval(liveStatus, POLL_MS),
   });
   const code: EnrollmentCode =
     codes.data?.codes.find((candidate) => candidate.id === result.code.id) ?? result.code;
@@ -128,7 +134,11 @@ export function EnrollmentPanel({
 /** Nodes that used the code: green with name and hardware once connected. */
 function JoinedNodes({ enrolled, lang }: { enrolled: EnrollmentCode["enrolled"]; lang: string }) {
   const { t } = useTranslation(["dashboard"]);
-  const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), refetchInterval: POLL_MS });
+  const liveStatus = useNodeLive((state) => state.status);
+  const nodes = useQuery({
+    ...orpc.nodes.list.queryOptions(),
+    refetchInterval: nodeLiveInterval(liveStatus, POLL_MS),
+  });
   return (
     <ul className="space-y-2" role="status">
       {enrolled.map((use) => {

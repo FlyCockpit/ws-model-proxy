@@ -22,12 +22,14 @@ import {
   startProviderAttemptExpiry,
 } from "./model-api/provider-attempt-lifecycle.js";
 import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
+import { checkDashboardSession } from "./model-api/realtime/dashboard-session.js";
 import { flushRealtimeMetering } from "./model-api/realtime/metering.js";
 import { realtimeSessionRegistry } from "./model-api/realtime/registry.js";
 import { startRelayAttempt } from "./model-api/relay-executor.js";
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
 import { startUsageRetention } from "./model-api/usage-retention.js";
 import { startNeedsYouMail } from "./needs-you-mail.js";
+import { nodeEventHub } from "./node-events/hub.js";
 import { warnMissingProviderCredentialKeyring } from "./provider-keyring-startup.js";
 import { flushNodeAudit, stopNodeAuditWriter } from "./relay/node-audit.js";
 import { sweepExpiredNodeCommands } from "./relay/node-commands.js";
@@ -209,6 +211,7 @@ const stopRelayMaintenance = startRelayMaintenance({
   sweepExpiredFileOps,
   terminalHub: terminalBrowserHub,
   realtimeSessions: realtimeSessionRegistry,
+  nodeEvents: { recheckSessions: () => nodeEventHub.recheckSessions(checkDashboardSession) },
   stopNodeAudit: stopNodeAuditWriter,
   flushRollups: [flushRuntimeLoadRollup, flushNodeMetricsRollup],
 });
@@ -248,6 +251,7 @@ installServerShutdown({
   flushAgentAudit: flushNodeAudit,
   terminalHub: terminalBrowserHub,
   realtimeSessions: realtimeSessionRegistry,
+  nodeEvents: nodeEventHub,
   flushRealtimeMetering,
   server,
   capacityLifecycle,

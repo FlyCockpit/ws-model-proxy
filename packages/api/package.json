@@ -32,6 +32,9 @@
     "./lib/agent-update-wire": {
       "default": "./src/lib/agent-update-wire.ts"
     },
+    "./lib/node-events": {
+      "default": "./src/lib/node-events.ts"
+    },
     "./lib/agent-updates": {
       "default": "./src/lib/agent-updates.ts"
     },

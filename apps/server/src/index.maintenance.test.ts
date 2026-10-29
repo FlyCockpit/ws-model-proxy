@@ -52,6 +52,14 @@ describe("relay maintenance", () => {
     await stop();
   });
 
+  it("rechecks browser node event streams on the terminal recheck interval", async () => {
+    const nodeEvents = { recheckSessions: vi.fn(async () => undefined) };
+    const stop = startRelayMaintenance({ ...fakes(), nodeEvents });
+    await vi.advanceTimersByTimeAsync(TERMINAL_SESSION_RECHECK_INTERVAL_MS);
+    expect(nodeEvents.recheckSessions).toHaveBeenCalledTimes(1);
+    await stop();
+  });
+
   it("stop clears every timer", async () => {
     const deps = fakes();
     await startRelayMaintenance(deps)();

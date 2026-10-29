@@ -55,6 +55,13 @@ export const DEFAULTS = {
   relayUpgradeIp: { points: 30, duration: 60, blockDuration: 5 * 60 },
   /** Authenticated relay upgrades, per node: bounds one node's reconnect storm. */
   relayUpgradeNode: { points: 10, duration: 60, blockDuration: 5 * 60 },
+  /**
+   * Browser node event streams (`/api/dashboard/events`), per client IP before the session is
+   * read, then per user. Their own buckets, never `rpcLimiter`: every tab reconnecting after a
+   * deploy must not use up the budget of the requests the pages make next.
+   */
+  nodeEventsIp: { points: 60, duration: 60 },
+  nodeEventsUser: { points: 40, duration: 60 },
 } as const;
 
 /** A built-in points budget times `WMP_RATE_LIMIT_SCALE`, rounded, never below 1. */
@@ -152,6 +159,18 @@ export const relayUpgradeIpLimiter = new RateLimiterMemory({
   points: scaledPoints(DEFAULTS.relayUpgradeIp.points),
   duration: DEFAULTS.relayUpgradeIp.duration,
   blockDuration: DEFAULTS.relayUpgradeIp.blockDuration,
+});
+
+export const nodeEventsIpLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:node-events-ip",
+  points: scaledPoints(DEFAULTS.nodeEventsIp.points),
+  duration: DEFAULTS.nodeEventsIp.duration,
+});
+
+export const nodeEventsUserLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:node-events-user",
+  points: scaledPoints(DEFAULTS.nodeEventsUser.points),
+  duration: DEFAULTS.nodeEventsUser.duration,
 });
 
 export const relayUpgradeNodeLimiter = new RateLimiterMemory({

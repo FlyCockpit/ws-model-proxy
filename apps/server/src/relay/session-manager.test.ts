@@ -45,6 +45,8 @@ vi.mock("./node-metrics-rollup.js", () => ({ observeNodeMetricsRollup: vi.fn() }
 
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { RelaySessionManager, OPERATOR_ACCEPT_RETRIES } = await import("./session-manager.js");
+const { onNodeEvent } = await import("@ws-model-proxy/api/lib/node-events");
+type NodeEvent = import("@ws-model-proxy/api/lib/node-events").NodeEvent;
 const { startsEndedBy } = await import("../runtimes/lifecycle.js");
 const { observeRuntimeLoadRollup } = await import("./runtime-load-rollup.js");
 const { observeNodeMetricsRollup } = await import("./node-metrics-rollup.js");
@@ -1461,6 +1463,112 @@ describe("RelaySessionManager (relay 3.0)", () => {
         failureClass: "WEBSOCKET_DISCONNECTED",
       }),
     );
+  });
+
+  describe("node events for the browser (#255)", () => {
+    let events: NodeEvent[];
+    let unsubscribe: () => void;
+    beforeEach(() => {
+      events = [];
+      unsubscribe = onNodeEvent((event) => events.push(event));
+    });
+    afterEach(() => unsubscribe());
+
+    const connections = () => events.filter((event) => event.type === "node.connection");
+
+    it("publishes ONLINE once per accepted hello, and nothing for the replaced session", async () => {
+      await connect();
+      expect(connections()).toEqual([
+        {
+          type: "node.connection",
+          userId: "user-1",
+          nodeId: "node-1",
+          connection: "ONLINE",
+          generation,
+        },
+      ]);
+      const first = generation;
+      const replaced = await connect();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(
+        connections().map((event) => event.type === "node.connection" && event.connection),
+      ).toEqual(["ONLINE", "ONLINE"]);
+      expect(connections()[1]).toMatchObject({ generation });
+      expect(generation).toBeGreaterThan(first);
+      expect(manager.getOnlineNodeIds()).toEqual(["node-1"]);
+      expect(replaced.closes).toEqual([]);
+    });
+
+    it("publishes OFFLINE after the fenced disconnect write", async () => {
+      const socket = await connect();
+      events.length = 0;
+      let seenAtWrite: number | null = null;
+      routing.disconnectNodeAtGeneration.mockImplementationOnce(async () => {
+        seenAtWrite = events.length;
+        return true;
+      });
+      await manager.removeSession(socket as never);
+      expect(seenAtWrite).toBe(0);
+      expect(events).toEqual([
+        {
+          type: "node.connection",
+          userId: "user-1",
+          nodeId: "node-1",
+          connection: "OFFLINE",
+          generation,
+        },
+      ]);
+    });
+
+    it("publishes OFFLINE even when the disconnect write fails", async () => {
+      const socket = await connect();
+      events.length = 0;
+      routing.disconnectNodeAtGeneration.mockRejectedValueOnce(new Error("db down"));
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await manager.removeSession(socket as never).catch(() => undefined);
+      error.mockRestore();
+      expect(events).toMatchObject([{ type: "node.connection", connection: "OFFLINE" }]);
+    });
+
+    it("publishes OFFLINE when a revoked credential closes the session", async () => {
+      await connect();
+      events.length = 0;
+      await manager.closeSessionsForRevokedCredentials({ ids: ["cred-1"] });
+      expect(events).toMatchObject([{ type: "node.connection", connection: "OFFLINE" }]);
+    });
+
+    it("publishes node.trust when the node's report is written", async () => {
+      const socket = await connect({ trust: "relay" });
+      events.length = 0;
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "node.state",
+          trust: { value: "relay", frozen: true },
+          features: STATE_FEATURES,
+        }),
+      );
+      expect(events).toEqual([{ type: "node.trust", userId: "user-1", nodeId: "node-1" }]);
+    });
+
+    it("publishes node.trust when the node lowers itself from Full control", async () => {
+      const socket = await connect();
+      events.length = 0;
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "node.state",
+          trust: { value: "relay", frozen: true },
+          features: STATE_FEATURES,
+        }),
+      );
+      expect(manager.getLiveNodeState("node-1")?.trust).toBe("relay");
+      // Its write and the effective trust change each say so; the browser coalesces them.
+      expect(events.length).toBeGreaterThan(0);
+      expect(events).toEqual(
+        events.map(() => ({ type: "node.trust", userId: "user-1", nodeId: "node-1" })),
+      );
+    });
   });
 
   it("closes sessions of a revoked credential", async () => {

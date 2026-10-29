@@ -76,6 +76,8 @@ export type ServerShutdownDeps = {
   terminalHub: { closeAll(): void };
   /** Live transcription client sessions, including those still waiting for a model. */
   realtimeSessions?: { closeAll(): void };
+  /** Browser node event streams (./node-events/hub.ts): an open one would hold the drain. */
+  nodeEvents?: { closeAll(): void };
   /**
    * Waits for live transcription usage writes already started (sessions
    * ended by `realtimeSessions.closeAll`). Runs with the relay close, before
@@ -150,6 +152,7 @@ export function installServerShutdown(deps: ServerShutdownDeps): ServerShutdown 
         relaySessions.beginDrain();
         deps.terminalHub.closeAll();
         deps.realtimeSessions?.closeAll();
+        deps.nodeEvents?.closeAll();
       },
       closeRelaySessions: async () => {
         await relaySessions.closeRelaySessions();

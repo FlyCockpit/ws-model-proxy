@@ -40,6 +40,7 @@ vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
 }));
 
 import prisma from "@ws-model-proxy/db";
+import { type NodeEvent, onNodeEvent } from "../lib/node-events";
 import { nodesRouter } from "../routers/nodes";
 import {
   contextFor,
@@ -625,6 +626,8 @@ describe("delete", () => {
 
   it("lists the instances that stop and tells the relay", async () => {
     const disconnect = vi.fn(async () => undefined);
+    const events: NodeEvent[] = [];
+    const unsubscribe = onNodeEvent((event) => events.push(event));
     db.node.findFirst.mockResolvedValueOnce({ id: "node-1" } as never);
     db.instanceRank.findMany.mockResolvedValueOnce([
       { instanceId: "i-1" },
@@ -638,6 +641,9 @@ describe("delete", () => {
     expect(out).toEqual({ deleted: true, stoppedInstances: ["i-1", "i-2", "i-3"] });
     expect(db.node.delete).toHaveBeenCalledWith({ where: { id: "node-1" } });
     expect(disconnect).toHaveBeenCalledWith("node-1", "node_deleted");
+    // After the commit, the owner's open tabs refetch (#255).
+    expect(events).toEqual([{ type: "node.removed", userId: "owner-1", nodeId: "node-1" }]);
+    unsubscribe();
     // A parent delete: the node's whole fence set (fenceParentDelete) before any row.
     expect(fenceLog.deletes.at(-1)).toMatchObject({ nodeIds: ["node-1"] });
   });
@@ -646,6 +652,8 @@ describe("delete", () => {
 describe("trust lowering", () => {
   it("records the request, refuses queued commands and audits", async () => {
     const lowerTrust = vi.fn(async () => undefined);
+    const events: NodeEvent[] = [];
+    const unsubscribe = onNodeEvent((event) => events.push(event));
     db.node.findFirst.mockResolvedValueOnce({
       id: "node-1",
       userId: "owner-1",
@@ -683,6 +691,8 @@ describe("trust lowering", () => {
     });
     expect(out.frozenAgentWritten).toEqual([{ kind: "runtime", id: "rt-1@v-1", label: "Qwen" }]);
     expect(lowerTrust).toHaveBeenCalledWith("node-1");
+    expect(events).toEqual([{ type: "node.trust", userId: "owner-1", nodeId: "node-1" }]);
+    unsubscribe();
   });
 
   it("does nothing new when the node is already Relay only", async () => {

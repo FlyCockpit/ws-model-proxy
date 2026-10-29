@@ -39,6 +39,8 @@ export type RelayMaintenanceDeps = {
   terminalHub: { recheckSessions(): Promise<unknown> };
   /** Live transcription sessions: credential, model access and member (60 s). */
   realtimeSessions?: { recheckSessions(): Promise<unknown> };
+  /** Browser node event streams: their session rows (60 s; ./node-events/hub.ts). */
+  nodeEvents?: { recheckSessions(): Promise<unknown> };
   /** Flushes the node audit queue at stop (see ./relay/node-audit.ts). */
   stopNodeAudit?: () => Promise<void>;
   /**
@@ -105,6 +107,10 @@ export function startRelayMaintenance(deps: RelayMaintenanceDeps): () => Promise
       const realtime = deps.realtimeSessions;
       if (realtime) {
         track(() => realtime.recheckSessions(), "[server] realtime session recheck failed");
+      }
+      const nodeEvents = deps.nodeEvents;
+      if (nodeEvents) {
+        track(() => nodeEvents.recheckSessions(), "[server] node event session recheck failed");
       }
     }, TERMINAL_SESSION_RECHECK_INTERVAL_MS),
   ];

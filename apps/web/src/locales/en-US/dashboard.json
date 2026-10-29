@@ -2591,5 +2591,8 @@
       },
       "unsupported": "Live transcription isn't available for this target: none of its served models declares live sessions."
     }
+  },
+  "liveUpdates": {
+    "paused": "Live updates paused. This page refreshes every few seconds until they reconnect."
   }
 }

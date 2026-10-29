@@ -1033,6 +1033,22 @@ describe("terminal browser hub", () => {
     expect(browser.sends).toHaveLength(0);
   });
 
+  it("closes the sockets of a session that ended (sign-out) and keeps the user's others", async () => {
+    const signedOut = new FakeSocket();
+    const other = new FakeSocket();
+    db.session.findUnique.mockResolvedValue(admissionRow());
+    await admitBrowserConnection({ socket: signedOut, userId: "user-id", sessionId: "session-id" });
+    await admitBrowserConnection({ socket: other, userId: "user-id", sessionId: "session-2" });
+
+    terminalBrowserHub.endSession("session-id");
+
+    expect(signedOut.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
+    expect(registered(signedOut)).toBe(false);
+    expect(other.closes).toEqual([]);
+    expect(registered(other)).toBe(true);
+    terminalBrowserHub.handleClose(other);
+  });
+
   it("admits after an abandoned mark: no revocation state outlives the listener", async () => {
     terminalBrowserHub.revokeTerminalAccessForUser("user-id");
     const browser = new FakeSocket();

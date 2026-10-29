@@ -18,6 +18,7 @@ import {
   placedOnNodesWhere,
 } from "../lib/instance-occupancy";
 import { launchCapabilities } from "../lib/launch-capabilities";
+import { publishNodeEvent } from "../lib/node-events";
 import {
   isForeignKeyViolation,
   isUniqueViolation,
@@ -358,6 +359,7 @@ export const nodeProcedures = {
       }
       return { node, trust: nodeTrustView(trustColumns) };
     });
+    publishNodeEvent({ type: "node.trust", userId, nodeId: result.node.id });
     const lowerTrust = relay(context)?.lowerTrust;
     await afterCommit(lowerTrust && (() => lowerTrust(result.node.id)));
     const frozen = await frozenParts(
@@ -654,6 +656,7 @@ async function deleteNode(
   const services = relay(context);
   const disconnect = services?.disconnect;
   await afterCommit(disconnect && (() => disconnect(nodeId, "node_deleted")));
+  publishNodeEvent({ type: "node.removed", userId, nodeId });
   const definitionChanged = services?.definitionChanged;
   if (stopped.peers.length > 0)
     await afterCommit(definitionChanged && (() => definitionChanged(stopped.peers)));

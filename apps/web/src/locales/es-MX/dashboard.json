@@ -2591,5 +2591,8 @@
       },
       "unsupported": "La transcripción en vivo no está disponible para este destino: ninguno de sus modelos servidos declara sesiones en vivo."
     }
+  },
+  "liveUpdates": {
+    "paused": "Las actualizaciones en vivo están en pausa. Esta página se actualiza cada pocos segundos hasta que se reconecten."
   }
 }

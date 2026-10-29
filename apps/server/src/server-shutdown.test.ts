@@ -62,6 +62,7 @@ function harness(overrides: Partial<ServerShutdownDeps> = {}): Harness {
     },
     terminalHub: { closeAll: record("terminals:closeAll") },
     realtimeSessions: { closeAll: record("realtime:closeAll") },
+    nodeEvents: { closeAll: record("nodeEvents:closeAll") },
     flushRealtimeMetering: async () => {
       events.push("realtime:flushMetering");
     },
@@ -141,6 +142,7 @@ describe("installServerShutdown", () => {
       "relay:beginDrain",
       "terminals:closeAll",
       "realtime:closeAll",
+      "nodeEvents:closeAll",
       // 3. drain: admission stops first, then idle CLI sockets close.
       "relay:beginDrain",
       "http:close",
