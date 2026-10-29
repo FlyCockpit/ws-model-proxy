@@ -16,7 +16,7 @@
     "@better-auth/oauth-provider": "catalog:",
     "@fontsource-variable/inter": "catalog:",
     "@orpc/client": "catalog:",
-    "@orpc/tanstack-query": "^1.15.5",
+    "@orpc/tanstack-query": "^1.16.1",
     "@prisma/client": "catalog:",
     "@tanstack/react-form": "catalog:",
     "@tanstack/react-query": "catalog:",
@@ -47,7 +47,7 @@
     "vite-plugin-pwa": "^1.3.0",
     "web-haptics": "^0.0.6",
     "zod": "catalog:",
-    "zustand": "^5.0.15"
+    "zustand": "^5.0.16"
   },
   "devDependencies": {
     "@orpc/server": "catalog:",
