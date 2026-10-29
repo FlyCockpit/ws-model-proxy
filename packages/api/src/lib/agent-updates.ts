@@ -68,6 +68,8 @@ export type AgentUpdateServerInfo = {
   sourceBuild: boolean;
   /** The `cargo install --git … --locked --force wsmp` line `/install.sh` would run. */
   cargoInstall: string;
+  /** `WMP_AGENT_UPDATE_WINDOWS`: offer the browser update on Windows (off until it is signed). */
+  windowsUpdates: boolean;
 };
 
 export type AgentUpdateLiveNode = {
@@ -242,14 +244,21 @@ function storedSelfUpdate(features: unknown): NodeSelfUpdate | null {
 
 /**
  * Where the browser update is offered: each operating system with the strategy verified on a
- * real machine there (the dead-man, the restart, the confirmation). Linux covers WSL. Add
- * Windows (`self-replace`) and macOS (`self-replace`, `homebrew`) once they pass there: a server
- * deploy, no new wsmp.
+ * real machine there (the dead-man, the restart, the confirmation). Linux covers WSL. Add macOS
+ * `homebrew` once it passes there: a server deploy, no new wsmp. `optIn` entries are offered only
+ * when the server turns them on.
  */
 export const AGENT_UPDATE_OFFERED: ReadonlyArray<{
   os: "linux" | "macos" | "windows";
   strategy: AgentUpdateStrategy;
-}> = [{ os: "linux", strategy: "self-replace" }];
+  optIn?: "windowsUpdates";
+}> = [
+  { os: "linux", strategy: "self-replace" },
+  { os: "macos", strategy: "self-replace" },
+  // Verified, but Defender flags the unsigned wsmp.exe run as a scheduled task (issue #254):
+  // off until Windows releases are signed.
+  { os: "windows", strategy: "self-replace", optIn: "windowsUpdates" },
+];
 
 function osOf(target: string): "linux" | "macos" | "windows" | null {
   if (target.includes("-linux-")) return "linux";
@@ -262,9 +271,15 @@ function osOf(target: string): "linux" | "macos" | "windows" | null {
 export function agentUpdateOffered(
   build: NodeBuild | null,
   strategy: AgentUpdateStrategy,
+  server: Pick<AgentUpdateServerInfo, "windowsUpdates">,
 ): boolean {
   const os = build ? osOf(build.target) : null;
-  return AGENT_UPDATE_OFFERED.some((entry) => entry.os === os && entry.strategy === strategy);
+  return AGENT_UPDATE_OFFERED.some(
+    (entry) =>
+      entry.os === os &&
+      entry.strategy === strategy &&
+      (entry.optIn === undefined || server[entry.optIn]),
+  );
 }
 
 function isWindows(row: AgentUpdateNodeRow, build: NodeBuild | null): boolean {
@@ -361,7 +376,7 @@ export function agentUpdateEligibility(input: {
               ? "upgrade_wsmp"
               : !strategy
                 ? "agent_update_unsupported"
-                : !agentUpdateOffered(build, strategy)
+                : !agentUpdateOffered(build, strategy, server)
                   ? "agent_update_platform"
                   : selfUpdate.remote === "off"
                     ? "agent_update_opted_out"

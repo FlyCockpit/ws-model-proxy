@@ -8,6 +8,7 @@ const FLAGS = [
   "WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY",
   "SIGNUP_ENABLED",
   "WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS",
+  "WMP_AGENT_UPDATE_WINDOWS",
 ] as const;
 process.env.DATABASE_URL ||= "postgresql://env-default-test@127.0.0.1:5432/env_default_test";
 process.env.BETTER_AUTH_SECRET = "w7Qp9Lm2Nx4Rv6Tk8Yc3Hu5Jd1Fs0ZaB";
@@ -36,11 +37,13 @@ describe("egress and MCP kill-switch defaults", () => {
     expect(env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY).toBe(true);
     expect(env.SIGNUP_ENABLED).toBe(false);
     expect(env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS).toBe(false);
+    expect(env.WMP_AGENT_UPDATE_WINDOWS).toBe(false);
 
     expect(manifestDefault("WMP_PUBLIC_PROVIDER_EGRESS_ENABLED")).toBe("true");
     expect(manifestDefault("WMP_MCP_ENABLED")).toBe("true");
     expect(manifestDefault("WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY")).toBe("true");
     expect(manifestDefault("SIGNUP_ENABLED")).toBe("false");
     expect(manifestDefault("WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS")).toBe("false");
+    expect(manifestDefault("WMP_AGENT_UPDATE_WINDOWS")).toBe("false");
   });
 });

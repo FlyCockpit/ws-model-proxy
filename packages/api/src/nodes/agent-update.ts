@@ -42,7 +42,13 @@ type BatchView = z.infer<typeof agentUpdateBatchViewSchema>;
 
 /** Without the relay (tests, a server without it): nothing updates from the browser. */
 const NO_PORT: AgentUpdatePort = {
-  server: async () => ({ version: "", commit: null, sourceBuild: false, cargoInstall: "" }),
+  server: async () => ({
+    version: "",
+    commit: null,
+    sourceBuild: false,
+    cargoInstall: "",
+    windowsUpdates: false,
+  }),
   release: async () => ({ kind: "unavailable", version: "", commit: null }),
   liveNode: () => null,
   send: () => false,

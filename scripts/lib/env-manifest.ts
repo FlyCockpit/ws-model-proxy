@@ -345,6 +345,17 @@ export const ENV_VARS: EnvVar[] = [
     ],
   },
   {
+    key: "WMP_AGENT_UPDATE_WINDOWS",
+    group: "runtime",
+    source: "default",
+    default: "false",
+    comment: [
+      "Offer the browser update of wsmp on Windows nodes. Off by default until Windows releases",
+      "are signed: Microsoft Defender can quarantine an unsigned wsmp.exe that runs as a",
+      "scheduled task. Linux and macOS nodes are offered it regardless.",
+    ],
+  },
+  {
     key: "WMP_CLI_SOURCE_REV",
     group: "runtime",
     source: "manual",

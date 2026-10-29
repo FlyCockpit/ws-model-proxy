@@ -138,6 +138,9 @@ export const env = createEnv({
     // to omit those plugins and answer the MCP surface with real 404s. Human
     // grant listing/revocation stays available while disabled.
     WMP_MCP_ENABLED: strictBooleanFlag(true),
+    // Offer the browser update of wsmp on Windows. Off until Windows releases are signed:
+    // Defender can quarantine an unsigned wsmp.exe run as a scheduled task.
+    WMP_AGENT_UPDATE_WINDOWS: strictBooleanFlag(false),
     // The build identifier the image was built with (the release workflow passes the git SHA).
     // A 40-hex value is this server's commit: the commit of the wsmp release it serves, so the
     // Nodes page can tell two builds of one version apart. Anything else is ignored here.

@@ -91,6 +91,7 @@ export function createAgentUpdates(relay: RelayPort, deps: AgentUpdateDeps = {})
         commit: (await nodeHttp()).cliInstallCommit(current),
         sourceBuild: current.kind === "source",
         cargoInstall: (await nodeHttp()).cargoInstallCommand(current),
+        windowsUpdates: env.WMP_AGENT_UPDATE_WINDOWS,
       };
     },
     release: async () => {
