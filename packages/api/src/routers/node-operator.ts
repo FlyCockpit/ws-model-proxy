@@ -30,6 +30,7 @@ import { displayCommand } from "../lib/command-render";
 import { launchCapabilities } from "../lib/launch-capabilities";
 import { notifyQueuedCommand } from "../lib/needs-you-mail";
 import {
+  commandFinishedAt,
   type NodeCommandRow,
   nodeCommandSelect,
   settleNodeCommand,
@@ -131,7 +132,8 @@ function commandView(
   cancelRequested = false,
 ): NodeCommandView {
   const exitCode = live?.exitCode ?? row.exitCode;
-  const finishedAt = row.finishedAt ?? live?.finishedAt ?? null;
+  const finishedAt =
+    row.finishedAt ?? (live ? commandFinishedAt(row.startedAt, live) : null) ?? null;
   return {
     commandId: row.id,
     ...(cancelRequested ? { cancelRequested: true } : {}),
@@ -160,7 +162,12 @@ async function pollAndSettle(
     endsBy: row.endsBy,
   });
   if (live && live.state !== "RUNNING" && row.state === "RUNNING") {
-    const settled = await settleNodeCommand(row, live.state, live.exitCode, live.finishedAt);
+    const settled = await settleNodeCommand(
+      row,
+      live.state,
+      live.exitCode,
+      commandFinishedAt(row.startedAt, live),
+    );
     return commandView(settled, live);
   }
   // The node has not reported the end yet (or is offline: it gets the cancel when it is back).

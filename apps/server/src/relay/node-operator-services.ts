@@ -17,6 +17,7 @@
 import { ORPCError } from "@orpc/server";
 import type { NodeCommandLiveStatus, NodeOperatorServices } from "@ws-model-proxy/api/context";
 import {
+  commandFinishedAt,
   nodeCommandSelect,
   nodeCommandStateFromWire,
   settleNodeCommand,
@@ -96,7 +97,15 @@ type PollWaiter = {
   finish: () => void;
 };
 
-function liveStatus(frame: ExecStatusFrame): NodeCommandLiveStatus {
+/** The run time the node measured (its own start to its own end), or undefined. */
+function nodeRunMs(frame: ExecStatusFrame): number | undefined {
+  if (frame.startedAt === undefined || frame.finishedAt === undefined) return undefined;
+  const ms = Date.parse(frame.finishedAt) - Date.parse(frame.startedAt);
+  return Number.isFinite(ms) && ms >= 0 ? ms : undefined;
+}
+
+function liveStatus(frame: ExecStatusFrame, receivedAt: Date): NodeCommandLiveStatus {
+  const runMs = nodeRunMs(frame);
   return {
     state: nodeCommandStateFromWire(frame.state),
     ...(frame.exitCode !== undefined ? { exitCode: frame.exitCode } : {}),
@@ -104,7 +113,9 @@ function liveStatus(frame: ExecStatusFrame): NodeCommandLiveStatus {
     // removes product credentials (`CLI_OUTPUT_CREDENTIAL_PREFIXES`) before anyone sees it.
     output: cleanText(frame.tail ?? ""),
     ...(frame.truncated !== undefined ? { truncated: frame.truncated } : {}),
-    ...(frame.finishedAt !== undefined ? { finishedAt: new Date(frame.finishedAt) } : {}),
+    // The node's end time is on its clock; ours is when it reached us (`commandFinishedAt`).
+    ...(frame.finishedAt !== undefined ? { finishedAt: receivedAt } : {}),
+    ...(runMs !== undefined ? { runMs } : {}),
   };
 }
 
@@ -245,7 +256,7 @@ export function createNodeOperatorServices(
         if (set.size === 0) pollWaiters.delete(args.commandId);
         if (endTimer) clearTimeout(endTimer);
         if (answerTimer) clearTimeout(answerTimer);
-        resolve(status ? liveStatus(status) : null);
+        resolve(status ? liveStatus(status, new Date()) : null);
       };
       /** One `exec.poll` sent: its answer is due within the answer timeout. */
       const armAnswerTimer = () => {
@@ -341,7 +352,7 @@ export function createNodeOperatorServices(
       row,
       state,
       frame.exitCode,
-      frame.finishedAt !== undefined ? new Date(frame.finishedAt) : undefined,
+      commandFinishedAt(row.startedAt, liveStatus(frame, new Date())),
     );
   };
 
