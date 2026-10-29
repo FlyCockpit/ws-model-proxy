@@ -160,8 +160,11 @@ ALTER TABLE node ADD CONSTRAINT node_port_range_check CHECK (
   1024 <= "portStart" AND "portStart" <= "portEnd" AND "portEnd" <= 65535
 );
 ALTER TABLE node DROP CONSTRAINT IF EXISTS node_trust_lower_shape;
+-- A pending lowering names who asked. Once the node confirms it, the request time clears and who
+-- asked stays, so the node's page can say who lowered it (`nodeTrustView`); the relay clears it
+-- on any other trust change (`trustLowerColumns`, apps/server/src/relay/registration.ts).
 ALTER TABLE node ADD CONSTRAINT node_trust_lower_shape CHECK (
-  ("trustLowerRequestedAt" IS NULL) = ("trustLowerRequestedBy" IS NULL)
+  "trustLowerRequestedAt" IS NULL OR "trustLowerRequestedBy" IS NOT NULL
 );
 -- Fabrics (owner decision round 3): the frozen fabric memberships exist only at RELAY.
 ALTER TABLE node DROP CONSTRAINT IF EXISTS node_frozen_fabrics_shape;

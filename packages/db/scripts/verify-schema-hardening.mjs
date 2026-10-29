@@ -720,6 +720,17 @@ try {
     `UPDATE node SET "trustLowerRequestedAt" = now() WHERE id = 'node-a1'`,
     "23514",
   );
+  // A person's lowering, then the node's confirmation: the request time clears, who asked stays
+  // (the shape every report and hello after a lowering writes).
+  await client.query(
+    `UPDATE node SET "trustLowerRequestedAt" = now(), "trustLowerRequestedBy" = 'owner-a' WHERE id = 'node-a1'`,
+  );
+  await client.query(
+    `UPDATE node SET trust = 'RELAY', "trustLowerRequestedAt" = NULL WHERE id = 'node-a1'`,
+  );
+  await client.query(
+    `UPDATE node SET trust = 'FULL', "trustLowerRequestedBy" = NULL WHERE id = 'node-a1'`,
+  );
   await client.query(`
     INSERT INTO node_enrollment_code (id, "userId", "codePrefix", "codeDigest", "expiresAt") VALUES
       ('code-1', 'owner-a', 'ABCDEFGH', ${HEX("e")}, now() + interval '1 hour')`);
