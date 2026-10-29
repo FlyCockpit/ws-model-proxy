@@ -82,13 +82,16 @@ const KNOWN_REJECTIONS: ReadonlySet<string> = new Set([
   "step_detached",
 ]);
 
+/** How often the node list refreshes, so a node going offline or coming back shows without a reload. */
+const NODES_REFRESH_MS = 5_000;
+
 type Sessions = ReturnType<typeof useTerminalSessions>;
 type OpenTerminal = (input: OpenTicketInput) => void;
 
 function TerminalsPage() {
   const { t } = useTranslation(["terminals"]);
   const sessions = useTerminalSessions();
-  const nodes = useQuery(orpc.nodes.list.queryOptions());
+  const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), refetchInterval: NODES_REFRESH_MS });
   const slugOf = (nodeId: string) => nodes.data?.nodes.find((node) => node.id === nodeId)?.slug;
   // A ticket is used up by its open: take one only once the socket and identity are ready, so
   // the open goes out at once (and a queued command is never decided for nothing).
@@ -494,7 +497,7 @@ function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) 
 
 function TerminalNodes({ ready, openTerminal }: { ready: boolean; openTerminal: OpenTerminal }) {
   const { t } = useTranslation(["terminals"]);
-  const nodes = useQuery(orpc.nodes.list.queryOptions());
+  const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), refetchInterval: NODES_REFRESH_MS });
   const openTicket = useMutation(
     orpc.nodes.terminals.openTicket.mutationOptions({
       onSuccess: (data, input) => openTerminal({ cliDeviceId: input.nodeId, ticket: data.ticket }),
