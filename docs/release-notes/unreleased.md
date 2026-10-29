@@ -15,3 +15,14 @@ check did not allow that. The check now allows it.
 
 No `wsmp` upgrade is needed. A node stuck this way comes back online by itself after the
 deploy, at its next reconnect.
+
+## Live updates for nodes
+
+Pages now update as soon as one of your nodes connects, disconnects, changes trust, reports
+update progress, enrolls or is deleted, instead of polling every few seconds. Each signed-in
+tab holds one server-sent events stream, `GET /api/dashboard/events`. Signing out also closes
+that session's terminals at once, not within a minute.
+
+A reverse proxy must not buffer that path: Traefik (Dokploy) and Caddy stream it as they are.
+If something in front does buffer it, the pages fall back to their old polling, and the Nodes
+and Terminals pages say "Live updates paused".
