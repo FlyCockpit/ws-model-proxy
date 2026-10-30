@@ -420,8 +420,34 @@ shows the command to run on the node, and `wsmp update` there still works.
    (with the end of the failed build's log).
 
 - **Homebrew** installs are updated with `brew upgrade flycockpit/tap/wsmp`, with no automatic
-  rollback; a pinned formula or one from another tap is refused. Recover by hand with `brew
-  reinstall flycockpit/tap/wsmp && wsmp service restart`.
+  rollback; a pinned formula or one from another tap is refused. The node first refreshes the tap
+  (`brew update`) and installs nothing unless the tap has exactly the server's version: when the
+  tap is ahead of (or behind) the server, the update is refused, naming the tap's version. When
+  the tap's version is newer than the node's own and the node runs a wsmp that reports it (this
+  release on), the node's page then offers **Install anyway** to install the tap's version
+  without upgrading the server; a tap that is not ahead of the node gets the refusal alone.
+  `wsmp update` on the node refuses the same way. The last version check and `brew
+  upgrade` run while wsmp holds Homebrew's update lock, so an ordinary `brew update` elsewhere
+  fails at once until the upgrade is done ("Another `brew update` process is already running")
+  and has to be run again. A `brew update` that was already starting when a `brew
+  cleanup` replaced the lock file can still move the tap during the update (a gap in Homebrew's
+  own locking that wsmp cannot close); the version check after the upgrade then reports a failed
+  update (version mismatch). The lock lasts as long as that wsmp:
+  if wsmp dies while `brew upgrade` keeps running, it is let go early, and a `brew update` in that
+  window could make the upgrade install another version (the version wsmp reports when it starts
+  again shows it). Before the upgrade, the service files `wsmp service install` wrote are written
+  again as it writes them now, on Homebrew's stable `opt/wsmp/bin/wsmp` path (hand edits to them
+  are replaced); a service file written by hand is left alone, unless it runs a versioned `Cellar`
+  path, which stops the update. After the upgrade the node runs that path with `--version`, and
+  only a build that runs and is the version asked for is restarted into. On macOS, `wsmp update`
+  reloads the LaunchAgent (`bootout`, waits until launchd has unloaded it, then `bootstrap`,
+  tried again while it fails, within 3 minutes; if launchd does not load it again, the error says
+  to run `wsmp service install`). An update from the browser does not reload it: the relay exits
+  and launchd starts the definition it loaded. So after an update from the browser, a LaunchAgent
+  plist that was edited by hand and is loaded keeps running what launchd loaded: the update may
+  not confirm, or the relay may go offline. Run `wsmp service install` to load the rewritten
+  plist (`wsmp update` returns early when wsmp is already current, so it does not reload it).
+  `brew upgrade` is stopped after 10 minutes. Recover by hand with `brew reinstall flycockpit/tap/wsmp && wsmp service restart`.
 - **Source builds** (`cargo install --git`, or a server that pins `WMP_CLI_SOURCE_REV`) are never
   replaced; the Nodes page shows the `cargo install` command to run.
 - The relay must run as its installed service (`wsmp service install`) for an update from the

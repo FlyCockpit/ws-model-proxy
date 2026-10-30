@@ -1225,6 +1225,9 @@ pub struct ServerFeatures {
     /// `exec.started` may carry `ranWith`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub exec_ran_with: bool,
+    /// A `version_mismatch` refusal in `agent.update.progress` may carry `availableVersion`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub agent_update_available_version: bool,
 }
 
 /// How a node command ran (`exec.started`'s `ranWith`).
@@ -1588,6 +1591,12 @@ pub enum NodeFrame {
         reason: Option<UpdateReason>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// The version the node could install instead (Homebrew: its tap's), sent only with
+        /// `refused` / `version_mismatch`, and only to a server whose `hello.ok` said it accepts
+        /// it (`features.agentUpdateAvailableVersion`; an older server's strict schema refuses
+        /// it). The owner may then install it anyway (`agent.update` naming it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        available_version: Option<String>,
     },
     #[serde(rename = "stt.opened")]
     SttOpened { session_id: String },
@@ -2162,6 +2171,7 @@ impl NodeFrame {
                 phase,
                 reason,
                 detail,
+                available_version,
             } => {
                 rule(
                     is_op_id_shaped(update_id),
@@ -2170,6 +2180,14 @@ impl NodeFrame {
                 rule(
                     matches!(phase, UpdatePhase::Refused | UpdatePhase::Failed) == reason.is_some(),
                     "reason exactly for refused and failed updates",
+                )?;
+                rule(
+                    available_version.as_deref().is_none_or(|version| {
+                        is_release_version(version)
+                            && *phase == UpdatePhase::Refused
+                            && *reason == Some(UpdateReason::VersionMismatch)
+                    }),
+                    "an available version is a release version, only with a version_mismatch refusal",
                 )?;
                 rule(
                     detail
@@ -2664,8 +2682,16 @@ mod tests {
                 "features": { "execRanWith": true, "laterThing": { "x": 1 } }
             }))),
             Some(ServerFeatures {
-                exec_ran_with: true
+                exec_ran_with: true,
+                agent_update_available_version: false,
             })
+        );
+        assert!(
+            features(hello(serde_json::json!({
+                "features": { "agentUpdateAvailableVersion": true }
+            })))
+            .unwrap_or_default()
+            .agent_update_available_version
         );
     }
 
@@ -2917,6 +2943,7 @@ mod tests {
                 phase,
                 reason,
                 detail,
+                available_version: None,
             }
         };
         assert!(
@@ -2944,6 +2971,42 @@ mod tests {
             frame(UpdatePhase::RolledBack, None, Some("x".repeat(4001)))
                 .validate()
                 .is_err()
+        );
+        let available = |phase, reason, version: &str| NodeFrame::AgentUpdateProgress {
+            update_id: "q8Zr0T3vX1yB2nC4dE5fGw".into(),
+            phase,
+            reason,
+            detail: None,
+            available_version: Some(version.into()),
+        };
+        let refused = Some(UpdateReason::VersionMismatch);
+        let ok = available(UpdatePhase::Refused, refused, "0.4.4");
+        assert!(ok.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(&ok).expect("serializes")["availableVersion"],
+            "0.4.4"
+        );
+        assert!(
+            available(UpdatePhase::Refused, refused, "latest")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            available(UpdatePhase::Refused, Some(UpdateReason::Busy), "0.4.4")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            available(UpdatePhase::Failed, refused, "0.4.4")
+                .validate()
+                .is_err()
+        );
+        // Absent unless there is a version to offer.
+        assert!(
+            serde_json::to_value(frame(UpdatePhase::Refused, refused, None))
+                .expect("serializes")
+                .get("availableVersion")
+                .is_none()
         );
     }
 

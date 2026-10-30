@@ -19,6 +19,7 @@ import {
   type AgentUpdateNodePhase,
   type AgentUpdatePhase,
   type AgentUpdateReason,
+  compareReleaseVersions,
   type NodeBuild,
   nodeBuildSchema,
   nodeEnvironmentSchema,
@@ -293,28 +294,39 @@ function isWindows(row: AgentUpdateNodeRow, build: NodeBuild | null): boolean {
   return parsed.success && parsed.data.launch?.platform === "windows";
 }
 
+/**
+ * Whether the node's wsmp is behind the server's: another version (but not a newer one: a wsmp
+ * installed anyway from its Homebrew tap, or by hand, is not behind), or the same version built
+ * from another commit.
+ */
 export function isOutdated(
   version: string | null,
   build: NodeBuild | null,
   server: { version: string; commit: string | null },
 ): boolean {
-  if (version !== server.version) return true;
+  if (version !== server.version) return !isNewerThanServer(version, server);
   return build?.commit != null && server.commit !== null && build.commit !== server.commit;
 }
 
-/** The exact command to run on the node when it cannot update itself (or a recovery). */
+/** The node's wsmp is a newer release than the server's. */
+export function isNewerThanServer(version: string | null, server: { version: string }): boolean {
+  return version !== null && (compareReleaseVersions(version, server.version) ?? 0) > 0;
+}
+
+/**
+ * The exact command to run on the node when it cannot update itself (or a recovery). It follows
+ * how the node is installed now (`build`), not how an earlier update ran: a node reinstalled
+ * another way since is repaired the new way.
+ */
 export function manualCommandFor(input: {
   origin: string;
   build: NodeBuild | null;
   windows: boolean;
   server: AgentUpdateServerInfo;
-  /** The latest update was a Homebrew one that did not confirm (D10: no rollback). */
-  homebrewFailed?: boolean;
 }): string {
   const base = input.origin.replace(/\/+$/, "");
   const method = input.build?.installMethod;
-  if (method === "homebrew" || input.homebrewFailed)
-    return "brew reinstall flycockpit/tap/wsmp && wsmp service restart";
+  if (method === "homebrew") return "brew reinstall flycockpit/tap/wsmp && wsmp service restart";
   if (method === "source" || method === "cargo")
     return input.windows
       ? `${input.server.cargoInstall}; wsmp service restart`
@@ -328,6 +340,18 @@ export type AgentUpdateEligibility = {
   canUpdate: boolean;
   blockedReason: RefusalReason | null;
   outdated: boolean;
+  /** The node runs a newer wsmp release than the server (installed anyway, or by hand). */
+  newerThanServer: boolean;
+  /**
+   * "Install anyway": the version the node's Homebrew tap offered when it refused the server's
+   * (see {@link installAnywayVersion}), or null.
+   */
+  availableVersion: string | null;
+  /**
+   * `availableVersion` is newer than the server's version (the tap is ahead; upgrading the
+   * server is the usual fix). False when it is older (the tap does not have the server's yet).
+   */
+  availableVersionAhead: boolean;
   manualCommand: string | null;
   strategy: AgentUpdateStrategy | null;
   artifact: { url: string; sha256: string } | null;
@@ -336,6 +360,60 @@ export type AgentUpdateEligibility = {
 };
 
 export type AgentUpdateActive = { phase: AgentUpdatePhase; strategy: string } | null;
+
+/** The node's latest update, as eligibility reads it. */
+export type AgentUpdateLatest = {
+  phase: AgentUpdatePhase;
+  strategy: string;
+  reason?: string | null;
+  fromVersion?: string | null;
+  fromCommit?: string | null;
+  availableVersion?: string | null;
+} | null;
+
+/**
+ * The wsmp that answered an update is still the one the node runs: the same release version and
+ * (when either is known) the same commit. A release is one build of one source, so a property the
+ * answer proved (a refusal carrying `availableVersion`) still holds.
+ */
+function sameWsmp(
+  from: { fromVersion?: string | null; fromCommit?: string | null },
+  now: { cliVersion: string | null; commit: string | null },
+): boolean {
+  return (
+    now.cliVersion !== null &&
+    from.fromVersion === now.cliVersion &&
+    (from.fromCommit ?? null) === now.commit
+  );
+}
+
+/**
+ * The version an owner may install anyway, or null.
+ *
+ * The capability is proved by the node's own answer, never by its hello (a hello field would be
+ * refused by a 0.4.3 server): only a wsmp that checks its tap's version before installing sends
+ * `availableVersion`, so the node's latest update must have been refused `version_mismatch`
+ * carrying it, by the wsmp it still runs ({@link sameWsmp}; an older wsmp, which would
+ * `brew upgrade` blindly, never sent one). Also: the tap's version is newer than the node's
+ * (`brew upgrade` never goes back), the node updates with Homebrew, and it is still outdated and
+ * otherwise free to update ({@link agentUpdateEligibility}'s gates).
+ */
+function installAnywayVersion(input: {
+  latest: AgentUpdateLatest | undefined;
+  cliVersion: string | null;
+  commit: string | null;
+  outdated: boolean;
+  free: boolean;
+  strategy: AgentUpdateStrategy | null;
+}): string | null {
+  const { latest, cliVersion } = input;
+  if (!input.outdated || !input.free || input.strategy !== "homebrew") return null;
+  if (latest?.phase !== "refused" || latest.reason !== "version_mismatch") return null;
+  if (latest.strategy !== "homebrew" || !sameWsmp(latest, input)) return null;
+  const available = latest.availableVersion ?? null;
+  if (available === null || cliVersion === null) return null;
+  return (compareReleaseVersions(available, cliVersion) ?? 0) > 0 ? available : null;
+}
 
 /**
  * Whether the owner may update this node now, and if not why (the first that applies):
@@ -352,8 +430,8 @@ export function agentUpdateEligibility(input: {
   server: AgentUpdateServerInfo;
   origin: string;
   active: AgentUpdateActive;
-  /** The latest ended update, for the Homebrew recovery command. */
-  latest?: { phase: AgentUpdatePhase; strategy: string } | null;
+  /** The latest update: the Homebrew recovery command, and "Install anyway". */
+  latest?: AgentUpdateLatest;
 }): AgentUpdateEligibility {
   const { row, release, server } = input;
   const live = input.live && input.live.userId === row.userId ? input.live : null;
@@ -367,27 +445,31 @@ export function agentUpdateEligibility(input: {
   const artifact =
     release.kind === "release" && build ? (release.artifacts[build.target] ?? null) : null;
   const full = live !== null && live.trust === "full" && effectiveTrust(row) === "FULL";
+  // What keeps the server from sending this node an update at all, whatever its version.
+  const gate: RefusalReason | null = !live
+    ? "node_offline"
+    : !full
+      ? "trust_relay"
+      : row.agentUpdatePolicy === "OFF"
+        ? "agent_update_off"
+        : !selfUpdate
+          ? "upgrade_wsmp"
+          : !strategy
+            ? "agent_update_unsupported"
+            : !agentUpdateOffered(build, strategy, server)
+              ? "agent_update_platform"
+              : selfUpdate.remote === "off"
+                ? "agent_update_opted_out"
+                : !artifact
+                  ? "agent_update_unavailable"
+                  : null;
   const blockedReason: RefusalReason | null = input.active
     ? "agent_update_in_progress"
     : !outdated
       ? "agent_update_current"
-      : !live
-        ? "node_offline"
-        : !full
-          ? "trust_relay"
-          : row.agentUpdatePolicy === "OFF"
-            ? "agent_update_off"
-            : !selfUpdate
-              ? "upgrade_wsmp"
-              : !strategy
-                ? "agent_update_unsupported"
-                : !agentUpdateOffered(build, strategy, server)
-                  ? "agent_update_platform"
-                  : selfUpdate.remote === "off"
-                    ? "agent_update_opted_out"
-                    : !artifact
-                      ? "agent_update_unavailable"
-                      : null;
+      : gate;
+  // A Homebrew update has no rollback (D10): one that did not confirm needs a hand repair, by
+  // the node's current install method (manualCommandFor).
   const homebrewFailed =
     input.latest?.strategy === "homebrew" &&
     (input.latest.phase === "timed_out" || input.latest.phase === "failed");
@@ -396,17 +478,29 @@ export function agentUpdateEligibility(input: {
       blockedReason !== "agent_update_in_progress" &&
       blockedReason !== "agent_update_current") ||
     homebrewFailed;
+  const availableVersion = installAnywayVersion({
+    latest: input.latest,
+    cliVersion: row.cliVersion,
+    commit: build?.commit ?? null,
+    outdated,
+    free: blockedReason === null,
+    strategy,
+  });
   return {
     canUpdate: blockedReason === null,
     blockedReason,
     outdated,
+    newerThanServer: isNewerThanServer(row.cliVersion, server),
+    availableVersion,
+    availableVersionAhead:
+      availableVersion !== null &&
+      (compareReleaseVersions(availableVersion, server.version) ?? 0) > 0,
     manualCommand: needsHand
       ? manualCommandFor({
           origin: input.origin,
           build,
           windows: isWindows(row, build),
           server,
-          homebrewFailed,
         })
       : null,
     strategy,
@@ -422,7 +516,7 @@ export function agentUpdateRefusalMessage(reason: RefusalReason, slug: string): 
     case "agent_update_in_progress":
       return `An update of ${slug} is already in progress.`;
     case "agent_update_current":
-      return `${slug} already runs this server's wsmp.`;
+      return `${slug} already runs this server's wsmp (or a newer one).`;
     case "node_offline":
       return `${slug} is offline. Run the install command on the node instead.`;
     case "trust_relay":
@@ -484,14 +578,37 @@ async function activeUpdate(userId: string, nodeId: string) {
       toVersion: true,
       force: true,
       rollbackAfterSecs: true,
+      artifactSha256: true,
+      fromVersion: true,
+      fromCommit: true,
     },
   });
+}
+
+/** The node's latest update, ended or not (owner-scoped): what "Install anyway" checks. */
+async function latestUpdate(userId: string, nodeId: string): Promise<AgentUpdateLatest> {
+  const latest = await prisma.nodeAgentUpdate.findFirst({
+    where: { userId, nodeId },
+    orderBy: { createdAt: "desc" },
+    select: {
+      phase: true,
+      strategy: true,
+      reason: true,
+      fromVersion: true,
+      fromCommit: true,
+      availableVersion: true,
+    },
+  });
+  return latest ? { ...latest, phase: phaseFromDb(latest.phase) } : null;
 }
 
 /**
  * Starts one update of the owner's node: checks everything {@link agentUpdateEligibility}
  * checks against the live session, writes the `requested` row (with `batch`, advancing that
  * run atomically), then sends `agent.update`. A send that does not go out undoes both.
+ *
+ * `version` ("Install anyway"): the version the node's Homebrew tap offered instead of the
+ * server's, exactly as eligibility offers it now (`availableVersion`); never in a batch.
  *
  * `force` on a node whose update waits for idle (`waiting_idle`) is not a second update: it
  * marks that update forced and sends the same `agent.update` again with `force: true` (the
@@ -504,6 +621,8 @@ export async function startAgentUpdate(
     nodeId: string;
     force: boolean;
     origin: string;
+    /** Install this version instead of the server's (only `availableVersion`; never a batch). */
+    version?: string;
     batch?: {
       id: string;
       position: number;
@@ -530,6 +649,8 @@ export async function startAgentUpdate(
   if (active && input.force && !input.batch && phaseFromDb(active.phase) === "waiting_idle")
     return forceWaitingUpdate(port, { ...input, now }, row, active, live, refused);
 
+  // "Update all" never installs anything but the server's release.
+  if (input.version !== undefined && input.batch) return refused("agent_update_unavailable");
   const release = await port.release();
   // An "Update all" run installs only the release its canary validated.
   if (input.batch?.targetVersion && release.version !== input.batch.targetVersion)
@@ -549,9 +670,16 @@ export async function startAgentUpdate(
     server,
     origin: input.origin,
     active: active ? { phase: phaseFromDb(active.phase), strategy: active.strategy } : null,
+    latest: input.version !== undefined ? await latestUpdate(input.userId, row.id) : undefined,
   });
   if (!eligibility.canUpdate || !eligibility.strategy || !eligibility.artifact || !live)
     return refused(eligibility.blockedReason ?? "agent_update_unavailable");
+  if (input.version !== undefined && eligibility.availableVersion !== input.version)
+    return {
+      kind: "refused",
+      reason: "agent_update_unavailable",
+      message: `wsmp ${input.version} is not what ${row.slug}'s Homebrew tap offered for the wsmp it runs. Press Update to check the tap again.`,
+    };
 
   const update = {
     id: newUpdateId(),
@@ -560,8 +688,10 @@ export async function startAgentUpdate(
     batchId: input.batch?.id ?? null,
     fromVersion: row.cliVersion,
     fromCommit: eligibility.build?.commit ?? null,
-    toVersion: release.version,
+    toVersion: input.version ?? release.version,
     strategy: eligibility.strategy,
+    // What the frame carries: a forced resend goes out only while the server still offers it.
+    artifactSha256: eligibility.artifact.sha256,
     force: input.force,
     rollbackAfterSecs: AGENT_UPDATE_ROLLBACK_SECS_DEFAULT,
     phase: "REQUESTED" as const,
@@ -570,6 +700,7 @@ export async function startAgentUpdate(
   const batch = input.batch;
   try {
     await prisma.$transaction(async (tx) => {
+      await lockClaimGates(tx, input.userId, row.id);
       await tx.nodeAgentUpdate.create({ data: update, select: { id: true } });
       if (batch) {
         const moved = await tx.nodeAgentUpdateBatch.updateMany({
@@ -586,6 +717,7 @@ export async function startAgentUpdate(
       }
     });
   } catch (error) {
+    if (error instanceof NoLongerAllowed) return refused(error.reason);
     if (error instanceof BatchMoved) return refused("agent_update_in_progress");
     // Another start won the race for this node (`node_agent_update_one_active`).
     if (isUniqueViolation(error)) return refused("agent_update_in_progress");
@@ -615,6 +747,38 @@ export async function startAgentUpdate(
 
 class BatchMoved extends Error {}
 
+/** The node's policy or trust, re-read under its row lock, no longer allows an update. */
+class NoLongerAllowed extends Error {
+  constructor(readonly reason: "agent_update_off" | "trust_relay") {
+    super(reason);
+  }
+}
+
+/**
+ * Inside the transaction that claims an update (creates its row, or marks a waiting one
+ * forced): locks the owner's node row (`FOR UPDATE`) and reads its update policy and trust
+ * again. Turning updates off (`setPolicy`) and lowering trust write that row, so either one
+ * committed before this lock is seen here (the claim is refused and rolled back), and either
+ * one that comes later waits for the claim to commit. The checks before the transaction are a
+ * snapshot; this is the one that orders the claim against them. Lock order: the node row first,
+ * then the update and batch rows.
+ */
+async function lockClaimGates(
+  tx: Pick<typeof prisma, "$queryRaw">,
+  userId: string,
+  nodeId: string,
+): Promise<void> {
+  const [node] = await tx.$queryRaw<
+    Array<{
+      agentUpdatePolicy: "ALLOWED" | "OFF";
+      trust: "FULL" | "RELAY" | null;
+      trustLowerRequestedAt: Date | null;
+    }>
+  >`SELECT "agentUpdatePolicy", trust, "trustLowerRequestedAt" FROM node WHERE id = ${nodeId} AND "userId" = ${userId} FOR UPDATE`;
+  if (!node || effectiveTrust(node) !== "FULL") throw new NoLongerAllowed("trust_relay");
+  if (node.agentUpdatePolicy === "OFF") throw new NoLongerAllowed("agent_update_off");
+}
+
 async function forceWaitingUpdate(
   port: AgentUpdatePort,
   input: { userId: string; nodeId: string; now: Date },
@@ -630,12 +794,30 @@ async function forceWaitingUpdate(
   const build = parseBuild(row.cliBuild);
   const artifact =
     release.kind === "release" && build ? (release.artifacts[build.target] ?? null) : null;
-  // The same release as the waiting update, or nothing to resend.
-  if (!artifact || release.version !== active.toVersion) return refused("agent_update_unavailable");
-  const marked = await prisma.nodeAgentUpdate.updateMany({
-    where: { id: active.id, userId: input.userId, nodeId: row.id, phase: "WAITING_IDLE" },
-    data: { force: true },
-  });
+  // The archive the waiting update was sent, or nothing to resend: a rebuild of the release
+  // since (a redeploy, the same version) is not what the owner asked for. A row stored before
+  // the checksum was kept is never resent; it keeps waiting until the node goes idle or gives up.
+  if (!artifact || !active.artifactSha256 || artifact.sha256 !== active.artifactSha256)
+    return refused("agent_update_unavailable");
+  // Its version: the server's release, or the tap's version the owner chose to install anyway.
+  // That was granted to the wsmp that offered it; resend it only while that wsmp still runs.
+  const anyway =
+    active.strategy === "homebrew" &&
+    sameWsmp(active, { cliVersion: row.cliVersion, commit: build?.commit ?? null });
+  if (release.version !== active.toVersion && !anyway) return refused("agent_update_unavailable");
+  let marked: { count: number };
+  try {
+    marked = await prisma.$transaction(async (tx) => {
+      await lockClaimGates(tx, input.userId, row.id);
+      return tx.nodeAgentUpdate.updateMany({
+        where: { id: active.id, userId: input.userId, nodeId: row.id, phase: "WAITING_IDLE" },
+        data: { force: true },
+      });
+    });
+  } catch (error) {
+    if (error instanceof NoLongerAllowed) return refused(error.reason);
+    throw error;
+  }
   if (marked.count !== 1) return refused("agent_update_in_progress");
   const sent = port.send(row.id, frameFor({ ...active, force: true }, artifact), {
     connectionGeneration: live.connectionGeneration,
@@ -666,6 +848,7 @@ export async function applyAgentUpdateProgress(
     phase: AgentUpdateNodePhase;
     reason?: AgentUpdateReason;
     detail?: string;
+    availableVersion?: string;
   },
   now: Date = new Date(),
 ): Promise<{ applied: boolean; ended: boolean; settled: boolean }> {
@@ -696,6 +879,12 @@ export async function applyAgentUpdateProgress(
         reason:
           frame.phase === "refused" || frame.phase === "failed" ? (frame.reason ?? null) : null,
         ...(frame.detail !== undefined ? { detail: cleanAgentUpdateDetail(frame.detail) } : {}),
+        // What the node's Homebrew tap has instead: the owner may install it anyway.
+        ...(frame.availableVersion !== undefined &&
+        frame.phase === "refused" &&
+        frame.reason === "version_mismatch"
+          ? { availableVersion: frame.availableVersion }
+          : {}),
         deadlineAt: agentUpdateDeadline(frame.phase, row.rollbackAfterSecs, now),
         endedAt: ended ? now : null,
       },

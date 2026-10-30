@@ -259,6 +259,7 @@ fn update(args: &Args) -> Result<()> {
         current_version: current.clone(),
         before_swap: None,
         proceed: None,
+        stable_service: crate::commands::service::ensure_stable_executable,
     };
 
     if identity.method == InstallMethod::Homebrew {
@@ -283,7 +284,14 @@ fn update(args: &Args) -> Result<()> {
             settle_without_service(&update_dir)?;
         }
         drop(lock);
-        return finish(args.json, service, &current, &manifest.version, None);
+        return finish(
+            args.json,
+            service,
+            &current,
+            &manifest.version,
+            None,
+            crate::commands::service::Restart::Reloaded,
+        );
     }
 
     let artifact = manifest.artifacts.get(&identity.target).with_context(|| {
@@ -339,6 +347,7 @@ fn update(args: &Args) -> Result<()> {
         &current,
         &manifest.version,
         Some(CLI_ROLLBACK_SECS),
+        crate::commands::service::Restart::Loaded,
     )
 }
 
@@ -354,9 +363,17 @@ fn settle_without_service(update_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn finish(json: bool, service: bool, from: &str, to: &str, rollback: Option<u32>) -> Result<()> {
+fn finish(
+    json: bool,
+    service: bool,
+    from: &str,
+    to: &str,
+    rollback: Option<u32>,
+    restart: crate::commands::service::Restart,
+) -> Result<()> {
     if service {
-        crate::commands::service::restart_quietly().context("restarting the relay service")?;
+        crate::commands::service::restart_quietly(restart)
+            .context("restarting the relay service")?;
         let text = match rollback {
             Some(secs) => format!(
                 "updated wsmp {from} to {to} and restarted the service; it rolls back by itself unless the new build connects within {secs} s (`wsmp update status`)"
@@ -499,7 +516,9 @@ fn rollback(update_id: &str) -> Result<()> {
                 std::thread::sleep(wait.min(DEADMAN_LOOK_EVERY));
             }
             Rollback::RolledBack => {
-                if let Err(error) = crate::commands::service::restart_quietly() {
+                if let Err(error) = crate::commands::service::restart_quietly(
+                    crate::commands::service::Restart::Loaded,
+                ) {
                     tracing::warn!(error = %format!("{error:#}"), "restarting the relay after the rollback failed");
                 }
                 break;

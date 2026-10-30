@@ -46,6 +46,9 @@ vi.mock("@/utils/orpc", () => {
   };
 });
 
+import enDashboard from "@/locales/en-US/dashboard.json";
+import esDashboard from "@/locales/es-MX/dashboard.json";
+
 import { AgentUpdateAllPanel } from "./agent-update-all-card";
 import { AgentUpdatePanel } from "./agent-update-card";
 import type { AgentUpdateOverview, NodeAgentUpdateView } from "./node-types";
@@ -81,6 +84,9 @@ function nodeView(overrides: Partial<NodeAgentUpdateView> = {}): NodeAgentUpdate
     canUpdate: true,
     blockedReason: null,
     manualCommand: null,
+    availableVersion: null,
+    availableVersionAhead: false,
+    newerThanServer: false,
     runningInstances: [],
     latest: null,
   };
@@ -180,6 +186,7 @@ describe("AgentUpdatePanel", () => {
             fromVersion: "0.4.2",
             toVersion: "0.4.3",
             force: false,
+            strategy: "self-replace",
             createdAt: "2026-10-28T10:00:00.000Z",
             updatedAt: "2026-10-28T10:02:00.000Z",
             endedAt: "2026-10-28T10:02:00.000Z",
@@ -206,6 +213,7 @@ describe("AgentUpdatePanel", () => {
             fromVersion: "0.4.2",
             toVersion: "0.4.3",
             force: false,
+            strategy: "self-replace",
             createdAt: "2026-10-28T10:00:00.000Z",
             updatedAt: "2026-10-28T10:00:05.000Z",
             endedAt: null,
@@ -233,6 +241,7 @@ describe("AgentUpdatePanel", () => {
             fromVersion: "0.4.2",
             toVersion: "0.4.3",
             force: false,
+            strategy: "self-replace",
             createdAt: "2026-10-28T10:00:00.000Z",
             updatedAt: "2026-10-28T10:00:05.000Z",
             endedAt: null,
@@ -253,6 +262,7 @@ describe("AgentUpdatePanel", () => {
       fromVersion: "0.4.2",
       toVersion: "0.4.3",
       force: false,
+      strategy: "self-replace",
       createdAt: "2026-10-28T10:00:00.000Z",
       updatedAt: "2026-10-28T10:01:00.000Z",
       endedAt: "2026-10-28T10:01:00.000Z",
@@ -285,6 +295,7 @@ describe("AgentUpdatePanel", () => {
             fromVersion: "0.4.2",
             toVersion: "0.4.3",
             force: false,
+            strategy: "self-replace",
             createdAt: "2026-10-28T10:00:00.000Z",
             updatedAt: "2026-10-28T10:00:05.000Z",
             endedAt: null,
@@ -311,6 +322,7 @@ describe("AgentUpdatePanel", () => {
             fromVersion: null,
             toVersion: "0.4.3",
             force: false,
+            strategy: "self-replace",
             createdAt: "2026-10-28T10:00:00.000Z",
             updatedAt: "2026-10-28T10:05:00.000Z",
             endedAt: "2026-10-28T10:05:00.000Z",
@@ -319,6 +331,218 @@ describe("AgentUpdatePanel", () => {
       />,
     );
     expect(screen.getByText(new RegExp(`"phase":"${K}.stuck.restarting"`))).toBeTruthy();
+  });
+
+  it("offers Install anyway after a Homebrew tap refusal, sending that version", async () => {
+    const refused = {
+      id: "u-1",
+      phase: "refused",
+      reason: "version_mismatch",
+      detail: "the Homebrew tap `flycockpit/tap` has wsmp 0.4.4, not 0.4.3",
+      fromVersion: "0.4.2",
+      toVersion: "0.4.3",
+      force: false,
+      strategy: "homebrew",
+      createdAt: "2026-10-29T10:00:00.000Z",
+      updatedAt: "2026-10-29T10:00:05.000Z",
+      endedAt: "2026-10-29T10:00:05.000Z",
+    } as const;
+    const homebrew = {
+      build: {
+        commit: "2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        installMethod: "homebrew",
+        target: "aarch64-apple-darwin",
+      },
+      selfUpdate: {
+        strategies: ["homebrew"],
+        instancesSurvive: false,
+        remote: "allowed",
+      },
+      latest: refused,
+    } as unknown as Partial<NodeAgentUpdateView>;
+    // Not offered by the server (an older wsmp, say): no button.
+    const { unmount } = wrap(<AgentUpdatePanel server={server} view={nodeView(homebrew)} />);
+    // The tap's version, before anything is installed: not "a downloaded binary".
+    expect(screen.getByText(`${K}.homebrewReason.version_mismatch_refused`)).toBeTruthy();
+    expect(screen.queryByText(`${K}.reason.version_mismatch`)).toBeNull();
+    expect(screen.queryByRole("button", { name: /anyway\.button/ })).toBeNull();
+    unmount();
+
+    // After `brew upgrade` switched the keg: never "nothing was installed".
+    const failed = wrap(
+      <AgentUpdatePanel
+        server={server}
+        view={nodeView({ ...homebrew, latest: { ...refused, phase: "failed" } })}
+      />,
+    );
+    expect(screen.getByText(`${K}.homebrewReason.version_mismatch_failed`)).toBeTruthy();
+    expect(screen.queryByText(`${K}.reason.version_mismatch`)).toBeNull();
+    failed.unmount();
+
+    // A self-replace mismatch is the downloaded binary's (checked before the swap).
+    const selfReplace = wrap(
+      <AgentUpdatePanel
+        server={server}
+        view={nodeView({
+          latest: { ...refused, phase: "failed", strategy: "self-replace" },
+        } as Partial<NodeAgentUpdateView>)}
+      />,
+    );
+    expect(screen.getByText(`${K}.reason.version_mismatch`)).toBeTruthy();
+    selfReplace.unmount();
+
+    wrap(
+      <AgentUpdatePanel
+        server={server}
+        view={nodeView({ ...homebrew, availableVersion: "0.4.4", availableVersionAhead: true })}
+      />,
+    );
+    const values = JSON.stringify({ version: "0.4.4", server: "0.4.3", slug: "spark-1" });
+    // The tap is ahead of the server: upgrading the server is the advice.
+    expect(screen.getByText(`${K}.anyway.offer(${values})`)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: `${K}.anyway.button(${values})` }));
+    expect(await screen.findByText(`${K}.anyway.risk(${values})`)).toBeTruthy();
+    expect(screen.getByText(`${K}.anyway.description(${values})`)).toBeTruthy();
+    expect(startFn).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: `${K}.anyway.confirm(${values})` }));
+    await vi.waitFor(() =>
+      expect(startFn).toHaveBeenCalledWith({ nodeId: "node-1", version: "0.4.4" }),
+    );
+  });
+
+  it("words a past attempt by the strategy it used, not by how the node is installed now", () => {
+    const failed = {
+      id: "u-1",
+      phase: "failed",
+      reason: "version_mismatch",
+      detail: null,
+      fromVersion: "0.4.2",
+      toVersion: "0.4.3",
+      force: false,
+      createdAt: "2026-10-29T10:00:00.000Z",
+      updatedAt: "2026-10-29T10:00:05.000Z",
+      endedAt: "2026-10-29T10:00:05.000Z",
+    } as const;
+    const homebrewNow = {
+      build: { commit: null, installMethod: "homebrew", target: "aarch64-apple-darwin" },
+      selfUpdate: { strategies: ["homebrew"], instancesSurvive: false, remote: "allowed" },
+    } as const;
+    // A Homebrew attempt, then reinstalled with the install script: still Homebrew's copy.
+    // The repair the server gives follows the current install (the script's), next to it.
+    const scriptRepair = "curl -fsSL https://example.test/install.sh | sh";
+    const reinstalledByScript = wrap(
+      <AgentUpdatePanel
+        server={server}
+        view={nodeView({
+          latest: { ...failed, strategy: "homebrew" },
+          manualCommand: scriptRepair,
+        })}
+      />,
+    );
+    expect(screen.getByText(`${K}.homebrewReason.version_mismatch_failed`)).toBeTruthy();
+    expect(screen.queryByText(`${K}.reason.version_mismatch`)).toBeNull();
+    expect(screen.getByText(scriptRepair)).toBeTruthy();
+    expect(screen.queryByText(/brew reinstall/)).toBeNull();
+    reinstalledByScript.unmount();
+    // A self-replace attempt, then reinstalled with Homebrew: still the downloaded binary's.
+    const reinstalledByBrew = wrap(
+      <AgentUpdatePanel
+        server={server}
+        view={nodeView({
+          ...homebrewNow,
+          latest: { ...failed, strategy: "self-replace" },
+        } as unknown as Partial<NodeAgentUpdateView>)}
+      />,
+    );
+    expect(screen.getByText(`${K}.reason.version_mismatch`)).toBeTruthy();
+    expect(screen.queryByText(`${K}.homebrewReason.version_mismatch_failed`)).toBeNull();
+    reinstalledByBrew.unmount();
+    // A timed-out Homebrew attempt on a node installed by script now: no rollback.
+    const timedOut = wrap(
+      <AgentUpdatePanel
+        server={server}
+        view={nodeView({
+          latest: { ...failed, phase: "timed_out", reason: "restarting", strategy: "homebrew" },
+        })}
+      />,
+    );
+    expect(screen.getByText(`${K}.timedOutHomebrew`)).toBeTruthy();
+    timedOut.unmount();
+    wrap(
+      <AgentUpdatePanel
+        server={server}
+        view={nodeView({
+          ...homebrewNow,
+          latest: { ...failed, phase: "timed_out", reason: "restarting", strategy: "self-replace" },
+        } as unknown as Partial<NodeAgentUpdateView>)}
+      />,
+    );
+    expect(screen.getByText(`${K}.timedOut`)).toBeTruthy();
+  });
+
+  it("words a Homebrew failure without claiming which version is installed", () => {
+    const en = enDashboard.nodes.agentUpdate;
+    const es = esDashboard.nodes.agentUpdate;
+    // The node also reports it when the installed version could not be read back.
+    expect(en.homebrewReason.version_mismatch_failed).toMatch(/could not be checked/);
+    expect(en.homebrewReason.version_mismatch_failed).not.toMatch(/installed a different/);
+    expect(es.homebrewReason.version_mismatch_failed).toMatch(/no se pudo comprobar/);
+    // Install anyway installs the tap's version; Homebrew cannot roll back.
+    expect(en.policy.help.ALLOWED).not.toMatch(/only ever/);
+    expect(en.policy.help.ALLOWED).toMatch(/Install anyway/);
+    expect(es.policy.help.ALLOWED).toMatch(/Instalar de todos modos/);
+    expect(en.description).toMatch(/except for a Homebrew install/);
+    expect(es.description).toMatch(/salvo una instalación de Homebrew/);
+  });
+
+  it("does not tell the owner to upgrade the server to a tap that is behind it", async () => {
+    const homebrew = {
+      version: "0.4.1",
+      build: { commit: null, installMethod: "homebrew", target: "aarch64-apple-darwin" },
+      selfUpdate: { strategies: ["homebrew"], instancesSurvive: false, remote: "allowed" },
+      availableVersion: "0.4.2",
+      availableVersionAhead: false,
+      latest: {
+        id: "u-1",
+        phase: "refused",
+        reason: "version_mismatch",
+        detail: "the Homebrew tap `flycockpit/tap` has wsmp 0.4.2, not 0.4.3 yet",
+        fromVersion: "0.4.1",
+        toVersion: "0.4.3",
+        force: false,
+        strategy: "homebrew",
+        createdAt: "2026-10-29T10:00:00.000Z",
+        updatedAt: "2026-10-29T10:00:05.000Z",
+        endedAt: "2026-10-29T10:00:05.000Z",
+      },
+    } as unknown as Partial<NodeAgentUpdateView>;
+    wrap(<AgentUpdatePanel server={server} view={nodeView(homebrew)} />);
+    const values = JSON.stringify({ version: "0.4.2", server: "0.4.3", slug: "spark-1" });
+    expect(screen.getByText(`${K}.anyway.offerBehind(${values})`)).toBeTruthy();
+    expect(screen.queryByText(`${K}.anyway.offer(${values})`)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: `${K}.anyway.button(${values})` }));
+    expect(await screen.findByText(`${K}.anyway.riskBehind(${values})`)).toBeTruthy();
+    expect(screen.getByText(`${K}.anyway.descriptionBehind(${values})`)).toBeTruthy();
+    expect(screen.queryByText(`${K}.anyway.risk(${values})`)).toBeNull();
+  });
+
+  it("says a node newer than the server is newer, not outdated", () => {
+    wrap(
+      <AgentUpdatePanel
+        server={server}
+        view={nodeView({
+          version: "0.4.4",
+          outdated: false,
+          newerThanServer: true,
+          canUpdate: false,
+          blockedReason: "agent_update_current",
+        })}
+      />,
+    );
+    expect(screen.getByText(`${K}.newerThanServer`)).toBeTruthy();
+    expect(screen.queryByText(`${K}.current`)).toBeNull();
+    expect(screen.queryByText(`${K}.outdated`)).toBeNull();
+    expect(screen.queryByRole("button", { name: `${K}.update` })).toBeNull();
   });
 
   it("warns on WSL", () => {

@@ -28,6 +28,18 @@ pub struct Request {
 /// Where progress goes: `agent.update.progress` frames, or a person's terminal.
 pub trait Progress {
     fn report(&mut self, phase: UpdatePhase, reason: Option<UpdateReason>, detail: Option<String>);
+
+    /// Refuse with `version_mismatch`, naming the version this node could install instead
+    /// (the progress frame's `availableVersion`). A reporter that cannot carry it reports the
+    /// refusal alone.
+    fn refuse_version(&mut self, available: String, detail: String) {
+        let _ = available;
+        self.report(
+            UpdatePhase::Refused,
+            Some(UpdateReason::VersionMismatch),
+            Some(detail),
+        );
+    }
 }
 
 /// The last check before the swap: `Err` with why it must not happen now.
@@ -57,6 +69,11 @@ pub struct Machine<'a> {
     /// Asked after the download, before the new build runs, and before the
     /// swap.
     pub proceed: Option<&'a Proceed<'a>>,
+    /// Homebrew only, before the keg changes: make the installed service
+    /// start the stable `opt` path it is given (the path the update probes
+    /// after `brew upgrade`), or say why it cannot (the update stops).
+    /// [`crate::commands::service::ensure_stable_executable`] outside tests.
+    pub stable_service: fn(&Path) -> anyhow::Result<()>,
 }
 
 impl Machine<'_> {
@@ -81,7 +98,11 @@ impl Machine<'_> {
 pub enum Ended {
     /// The new binary is in place (state `swapped`): restart into it.
     Swapped,
-    /// Refused or failed; the progress already says why. Nothing was changed.
+    /// Refused or failed; the progress already says why. No new build was
+    /// recorded as installed. Steps already done stay done: a self-replace
+    /// puts the previous binary back, but a Homebrew update may have
+    /// refreshed the tap, rewritten the service or run `brew upgrade`
+    /// (Homebrew has no rollback).
     Stopped,
 }
 
@@ -833,6 +854,7 @@ mod tests {
                 current_version: "0.4.2".into(),
                 before_swap: None,
                 proceed: None,
+                stable_service: |_| Ok(()),
             }
         }
         fn live_text(&self) -> String {

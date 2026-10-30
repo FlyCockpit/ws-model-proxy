@@ -7,6 +7,12 @@
 //! discarded (never read), stdout capped, its own process group, killed at
 //! the deadline, and a bounded reap (see below).
 //!
+//! Management commands (an update's archive and version probes, the service
+//! managers, Homebrew) go through [`run_managed`]: the same group, deadline,
+//! reap, budget and shutdown, but the parent's environment, and stderr read
+//! as well, both pipes drained at once so a program never blocks on a full
+//! one; output past the limit is dropped, never a reason to kill.
+//!
 //! # State table
 //! E = stdout closed (every writer let go of the pipe), X = the program
 //! exited, D = the deadline, C = the caller cancelled or the daemon is
@@ -74,7 +80,7 @@ use std::collections::BTreeMap;
 /// Registered with the subreaper, so its scan never reaps the run's child.
 #[cfg(not(windows))]
 type Child = crate::subreaper::Owned<std::process::Child>;
-use std::process::{ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::thread;
@@ -385,6 +391,71 @@ enum Args<'a> {
     Raw(&'a str),
 }
 
+/// How a run treats the environment, stderr and output past the limit.
+#[derive(Clone, Copy)]
+enum Mode<'a> {
+    /// Telemetry and node commands: the scrubbed environment plus `extra_env`,
+    /// stderr discarded, stdout past the limit ends the run
+    /// (`OutputTooLarge`). `any_status`: stdout whatever the exit status.
+    Scrubbed {
+        extra_env: &'a [(String, String)],
+        any_status: bool,
+    },
+    /// [`run_managed`]: the parent's environment plus `env`, stdout and stderr
+    /// both read (concurrently), each kept up to the limit and the rest
+    /// drained and dropped, every exit status returned.
+    Managed { env: &'a [(&'a str, String)] },
+}
+
+/// What a run produced.
+struct Ran {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    success: bool,
+}
+
+/// What a [`run_managed`] program left: its exit status (a nonzero one is a
+/// result here, not an error) and up to `limit` bytes of each stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Managed {
+    pub success: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Run a management command with the limits above: its own process group
+/// (a Windows job), everything it started killed at `timeout`, a bounded
+/// reap, the shared budget and the daemon's shutdown. Unlike [`run`] it
+/// inherits the parent's environment (plus `env`) and reads stderr too.
+/// stdout and stderr are drained at the same time, so a program that fills
+/// one while the other is open never blocks; each keeps its first `limit`
+/// bytes and the rest is read and dropped (never a reason to kill). A helper
+/// that still holds a pipe after the program exited cannot hold the call
+/// past `timeout`: the run is then a `Timeout` and the group is killed.
+pub fn run_managed(
+    program: &str,
+    args: &[String],
+    env: &[(&str, String)],
+    timeout: Duration,
+    limit: usize,
+) -> Result<Managed, RunError> {
+    let deadline = Instant::now() + timeout;
+    run_inner(
+        program,
+        Args::List(args),
+        deadline,
+        limit,
+        None,
+        None,
+        Mode::Managed { env },
+    )
+    .map(|ran| Managed {
+        success: ran.success,
+        stdout: ran.stdout,
+        stderr: ran.stderr,
+    })
+}
+
 /// Run `program` with the limits above and return its stdout.
 ///
 /// `cancel`, when set, ends the run at the next poll (a few milliseconds),
@@ -404,9 +475,12 @@ pub fn run(
         limit,
         cancel,
         None,
-        false,
-        &[],
+        Mode::Scrubbed {
+            extra_env: &[],
+            any_status: false,
+        },
     )
+    .map(|ran| ran.stdout)
 }
 
 /// Total budget variant: settlement shares the caller's absolute deadline.
@@ -425,9 +499,12 @@ pub fn run_until(
         limit,
         cancel,
         Some(deadline),
-        false,
-        &[],
+        Mode::Scrubbed {
+            extra_env: &[],
+            any_status: false,
+        },
     )
+    .map(|ran| ran.stdout)
 }
 
 /// [`run_until`] with extra environment on top of the scrubbed parent
@@ -447,9 +524,12 @@ pub fn run_until_env(
         limit,
         cancel,
         Some(deadline),
-        false,
-        env,
+        Mode::Scrubbed {
+            extra_env: env,
+            any_status: false,
+        },
     )
+    .map(|ran| ran.stdout)
 }
 
 /// [`run_until`] for programs that report through stdout and their exit
@@ -470,9 +550,12 @@ pub fn run_until_any_status(
         limit,
         cancel,
         Some(deadline),
-        true,
-        &[],
+        Mode::Scrubbed {
+            extra_env: &[],
+            any_status: true,
+        },
     )
+    .map(|ran| ran.stdout)
 }
 
 /// [`run_until_env`] with the command line after `program` passed as is: `cmd.exe /d /s /c
@@ -493,12 +576,14 @@ pub fn run_raw_until_env(
         limit,
         cancel,
         Some(deadline),
-        false,
-        env,
+        Mode::Scrubbed {
+            extra_env: env,
+            any_status: false,
+        },
     )
+    .map(|ran| ran.stdout)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_inner(
     program: &str,
     args: Args<'_>,
@@ -506,9 +591,8 @@ fn run_inner(
     limit: usize,
     cancel: Option<&AtomicBool>,
     settlement: Option<Instant>,
-    any_status: bool,
-    extra_env: &[(String, String)],
-) -> Result<Vec<u8>, RunError> {
+    mode: Mode<'_>,
+) -> Result<Ran, RunError> {
     let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
     if cancelled() {
         return Err(RunError::Cancelled);
@@ -535,18 +619,31 @@ fn run_inner(
             command.raw_arg(raw);
         }
     }
-    command
-        .env_clear()
-        .envs(crate::child_env::scrub_parent_env(&[]))
-        .envs(
-            extra_env
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str())),
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        // Never read, never uploaded.
-        .stderr(Stdio::null());
+    let (drain, any_status) = match mode {
+        Mode::Scrubbed {
+            extra_env,
+            any_status,
+        } => {
+            command
+                .env_clear()
+                .envs(crate::child_env::scrub_parent_env(&[]))
+                .envs(
+                    extra_env
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str())),
+                )
+                // Never read, never uploaded.
+                .stderr(Stdio::null());
+            (false, any_status)
+        }
+        Mode::Managed { env } => {
+            command
+                .envs(env.iter().map(|(name, value)| (*name, value.as_str())))
+                .stderr(Stdio::piped());
+            (true, true)
+        }
+    };
+    command.stdin(Stdio::null()).stdout(Stdio::piped());
     // A launch guard starts a session of its own (a group leader cannot), and its session is
     // what is killed when it did not end on its own.
     #[cfg(unix)]
@@ -613,16 +710,25 @@ fn run_inner(
         finish(child, Instant::now(), permit, &|| true);
         return Err(RunError::Resources);
     };
-    // The pipe is dropped inside `collect`, so nothing holds it after this.
-    let output = match collect(stdout, deadline, limit, &cancelled) {
-        Collected::Output(buffer) => Some(buffer),
+    // Piped only for a managed run, and then required.
+    let stderr = child.stderr.take();
+    if drain && stderr.is_none() {
+        finish(child, Instant::now(), permit, &|| true);
+        return Err(RunError::Resources);
+    }
+    // The pipes are dropped inside `collect`, so nothing holds them after this.
+    let output = match collect(stdout, stderr, deadline, limit, drain, &cancelled) {
+        Collected::Output(stdout, stderr) => Some((stdout, stderr)),
         Collected::Unfinished => None,
         Collected::Resources => {
             finish(child, Instant::now(), permit, &|| true);
             return Err(RunError::Resources);
         }
     };
-    let over_limit = output.as_ref().is_some_and(|buffer| buffer.len() > limit);
+    // A managed run keeps at most `limit` bytes and is never over it.
+    let over_limit = output
+        .as_ref()
+        .is_some_and(|(stdout, _)| stdout.len() > limit);
     // Refused output, a missing pipe result or a cancel: do not wait for exit.
     let wait_until = if output.is_some() && !over_limit && !cancelled() {
         deadline
@@ -636,7 +742,7 @@ fn run_inner(
     if settlement.is_some() && Instant::now() >= deadline {
         return Err(RunError::Timeout);
     }
-    let Some(buffer) = output else {
+    let Some((stdout, stderr)) = output else {
         return Err(RunError::Timeout);
     };
     if over_limit {
@@ -646,34 +752,66 @@ fn run_inner(
         return Err(RunError::Timeout);
     }
     match finished.status {
-        Some(status) if status.success() || any_status => Ok(buffer),
+        Some(status) if status.success() || any_status => Ok(Ran {
+            stdout,
+            stderr,
+            success: status.success(),
+        }),
         Some(status) => Err(RunError::ExitStatus(status.code())),
         // Exited but never reaped in the grace: no verdict on its status.
         None => Err(RunError::Timeout),
     }
 }
 
-/// How reading stdout ended.
+/// How reading the output ended.
 enum Collected {
-    /// The pipe closed (or more than `limit` bytes arrived: the buffer is
-    /// then longer than `limit`).
-    Output(Vec<u8>),
+    /// Every pipe closed (or, not draining, more than `limit` bytes arrived
+    /// on stdout: that buffer is then longer than `limit`). stdout, stderr
+    /// (empty when stderr was not piped).
+    Output(Vec<u8>, Vec<u8>),
     /// The deadline passed or the caller cancelled first.
     Unfinished,
     /// The pipe could not be read (no thread, no polling).
     Resources,
 }
 
-/// Read stdout until it closes, exceeds `limit`, the deadline passes or the
-/// caller cancels. Consumes the pipe, so it is closed when this returns.
+/// Read stdout (and stderr, when piped) until every pipe closes, stdout
+/// exceeds `limit` (not draining), the deadline passes or the caller
+/// cancels. Draining keeps the first `limit` bytes of each and reads the rest
+/// away, so the program never blocks on a full pipe. Consumes the pipes, so
+/// they are closed when this returns.
 ///
-/// Unix: the calling thread polls a non-blocking descriptor; there is no
-/// reader thread that a helper holding the pipe could pin.
+/// Unix: the calling thread polls non-blocking descriptors; there is no
+/// reader thread that a helper holding a pipe could pin.
 #[cfg(unix)]
 fn collect(
-    mut stdout: ChildStdout,
+    stdout: ChildStdout,
+    stderr: Option<ChildStderr>,
     deadline: Instant,
     limit: usize,
+    drain: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Collected {
+    use std::os::fd::OwnedFd;
+    let pipes = std::iter::once(OwnedFd::from(stdout))
+        .chain(stderr.map(OwnedFd::from))
+        .collect();
+    collect_fds(pipes, deadline, limit, drain, cancelled)
+}
+
+/// Bytes read from one pipe before the others (and the deadline and a cancel)
+/// get their turn: a pipe that never runs dry cannot keep the drain away from
+/// them.
+#[cfg(unix)]
+const READ_PER_TURN: usize = 64 * 1024;
+
+/// [`collect`] on the pipes' descriptors: stdout first, then stderr if piped.
+#[cfg(unix)]
+fn collect_fds(
+    pipes: Vec<std::os::fd::OwnedFd>,
+    deadline: Instant,
+    limit: usize,
+    drain: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Collected {
     use std::io::{ErrorKind, Read};
@@ -683,16 +821,42 @@ fn collect(
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
-    let Ok(flags) = fcntl(stdout.as_fd(), FcntlArg::F_GETFL) else {
-        return Collected::Resources;
-    };
-    let nonblocking = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
-    if fcntl(stdout.as_fd(), FcntlArg::F_SETFL(nonblocking)).is_err() {
-        return Collected::Resources;
+    /// One pipe: its reader, what was kept, and whether it is still open.
+    struct Stream {
+        pipe: std::fs::File,
+        buffer: Vec<u8>,
+        open: bool,
     }
-    let mut buffer = Vec::new();
+
+    let mut streams: Vec<Stream> = pipes
+        .into_iter()
+        .map(|fd| Stream {
+            pipe: std::fs::File::from(fd),
+            buffer: Vec::new(),
+            open: true,
+        })
+        .collect();
+    for stream in &streams {
+        let Ok(flags) = fcntl(stream.pipe.as_fd(), FcntlArg::F_GETFL) else {
+            return Collected::Resources;
+        };
+        let nonblocking = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
+        if fcntl(stream.pipe.as_fd(), FcntlArg::F_SETFL(nonblocking)).is_err() {
+            return Collected::Resources;
+        }
+    }
+    let output = |streams: &mut Vec<Stream>| {
+        let mut buffers = streams
+            .iter_mut()
+            .map(|stream| std::mem::take(&mut stream.buffer));
+        let stdout = buffers.next().unwrap_or_default();
+        Collected::Output(stdout, buffers.next().unwrap_or_default())
+    };
     let mut chunk = [0_u8; 8192];
     loop {
+        if streams.iter().all(|stream| !stream.open) {
+            return output(&mut streams);
+        }
         if cancelled() {
             return Collected::Unfinished;
         }
@@ -703,7 +867,11 @@ fn collect(
         let wait = remaining.min(POLL);
         let millis = u16::try_from(wait.as_millis()).unwrap_or(u16::MAX);
         let ready = {
-            let mut fds = [PollFd::new(stdout.as_fd(), PollFlags::POLLIN)];
+            let mut fds: Vec<PollFd<'_>> = streams
+                .iter()
+                .filter(|stream| stream.open)
+                .map(|stream| PollFd::new(stream.pipe.as_fd(), PollFlags::POLLIN))
+                .collect();
             poll(&mut fds, PollTimeout::from(millis))
         };
         match ready {
@@ -711,51 +879,84 @@ fn collect(
             Ok(_) => {}
             Err(_) => return Collected::Resources,
         }
-        loop {
-            match stdout.read(&mut chunk) {
-                Ok(0) => return Collected::Output(buffer),
-                Ok(read) => {
-                    buffer.extend_from_slice(&chunk[..read]);
-                    if buffer.len() > limit {
-                        return Collected::Output(buffer);
+        // Each open pipe in turn, at most `READ_PER_TURN` bytes each, then
+        // the deadline and a cancel are checked again (top of the loop).
+        for (index, stream) in streams.iter_mut().enumerate() {
+            let mut turn = 0_usize;
+            while stream.open && turn < READ_PER_TURN {
+                match stream.pipe.read(&mut chunk) {
+                    Ok(0) => stream.open = false,
+                    Ok(read) => {
+                        turn += read;
+                        if drain {
+                            let room = limit.saturating_sub(stream.buffer.len());
+                            stream.buffer.extend_from_slice(&chunk[..read.min(room)]);
+                        } else {
+                            stream.buffer.extend_from_slice(&chunk[..read]);
+                            if index == 0 && stream.buffer.len() > limit {
+                                return output(&mut streams);
+                            }
+                        }
                     }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    // A broken pipe end is the end of that output.
+                    Err(_) => stream.open = false,
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                // A broken pipe end is the end of the output.
-                Err(_) => return Collected::Output(buffer),
             }
         }
     }
 }
 
-/// Windows has no pollable pipe here: a reader thread owns the pipe and the
-/// result arrives on a channel, so a leaked pipe never blocks the caller
+/// Windows has no pollable pipe here: a reader thread owns each pipe and
+/// its result arrives on a channel, so a leaked pipe never blocks the caller
 /// (terminating the Windows job at the deadline closes every writer).
 #[cfg(not(unix))]
 fn collect(
     stdout: ChildStdout,
+    stderr: Option<ChildStderr>,
     deadline: Instant,
     limit: usize,
+    drain: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Collected {
     use std::io::Read;
     use std::sync::mpsc::{self, RecvTimeoutError};
 
-    let (done_tx, done_rx) = mpsc::channel();
-    let reader = thread::Builder::new()
-        .name("wsmp-bounded-read".to_string())
-        .spawn(move || {
-            let mut buffer = Vec::new();
-            let _ = stdout
-                .take((limit as u64).saturating_add(1))
-                .read_to_end(&mut buffer);
-            let _ = done_tx.send(buffer);
-        });
-    if reader.is_err() {
-        return Collected::Resources;
+    let (done_tx, done_rx) = mpsc::channel::<(usize, Vec<u8>)>();
+    let pipes: Vec<Box<dyn Read + Send>> =
+        std::iter::once(Box::new(stdout) as Box<dyn Read + Send>)
+            .chain(stderr.map(|pipe| Box::new(pipe) as Box<dyn Read + Send>))
+            .collect();
+    let expected = pipes.len();
+    for (index, mut pipe) in pipes.into_iter().enumerate() {
+        let done_tx = done_tx.clone();
+        let reader = thread::Builder::new()
+            .name("wsmp-bounded-read".to_string())
+            .spawn(move || {
+                let mut buffer = Vec::new();
+                if drain {
+                    let _ = pipe.by_ref().take(limit as u64).read_to_end(&mut buffer);
+                    let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+                } else {
+                    let _ = pipe
+                        .take((limit as u64).saturating_add(1))
+                        .read_to_end(&mut buffer);
+                }
+                let _ = done_tx.send((index, buffer));
+            });
+        if reader.is_err() {
+            return Collected::Resources;
+        }
     }
+    drop(done_tx);
+    let mut buffers: [Option<Vec<u8>>; 2] = [None, None];
+    let mut received = 0;
     loop {
+        if received == expected {
+            let [stdout, stderr] = buffers;
+            return Collected::Output(stdout.unwrap_or_default(), stderr.unwrap_or_default());
+        }
         if cancelled() {
             return Collected::Unfinished;
         }
@@ -764,7 +965,21 @@ fn collect(
             return Collected::Unfinished;
         }
         match done_rx.recv_timeout(remaining.min(POLL)) {
-            Ok(buffer) => return Collected::Output(buffer),
+            Ok((index, buffer)) => {
+                // Not draining, stdout over the limit settles the run at once.
+                let over = !drain && index == 0 && buffer.len() > limit;
+                if let Some(slot) = buffers.get_mut(index) {
+                    *slot = Some(buffer);
+                }
+                received += 1;
+                if over {
+                    let [stdout, stderr] = std::mem::take(&mut buffers);
+                    return Collected::Output(
+                        stdout.unwrap_or_default(),
+                        stderr.unwrap_or_default(),
+                    );
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Collected::Unfinished,
         }
@@ -1528,6 +1743,68 @@ mod tests {
         assert!(admit_in(shared).is_some());
         drop(permits);
         assert_eq!(lock(shared).held, 0);
+    }
+
+    /// `collect_fds` on its own thread; `None` when it has not returned within
+    /// `wait` (a drain that never ends would hang the test instead).
+    #[cfg(unix)]
+    fn collect_within(
+        pipes: Vec<std::os::fd::OwnedFd>,
+        deadline: Duration,
+        wait: Duration,
+    ) -> Option<(bool, Duration)> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        thread::spawn(move || {
+            let collected = collect_fds(pipes, started + deadline, 1 << 20, true, &|| false);
+            let _ = done_tx.send(matches!(collected, Collected::Unfinished));
+        });
+        done_rx
+            .recv_timeout(wait)
+            .ok()
+            .map(|unfinished| (unfinished, started.elapsed()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_that_never_runs_dry_cannot_hold_the_drain_past_its_deadline() {
+        // `/dev/zero` is always readable and never would block: the drain only
+        // returns if it checks the deadline between bounded reads.
+        let zero = std::fs::File::open("/dev/zero").expect("/dev/zero");
+        let (unfinished, elapsed) = collect_within(
+            vec![zero.into()],
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .expect("the drain returned at its deadline");
+        assert!(unfinished, "the deadline ended it");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_that_never_runs_dry_does_not_starve_the_other() {
+        // stdout never runs dry; 1 MiB on stderr fills its pipe many times
+        // over, so its writer only finishes if stderr gets turns too.
+        use std::io::Write;
+        let zero = std::fs::File::open("/dev/zero").expect("/dev/zero");
+        let (read, write) = nix::unistd::pipe().expect("pipe");
+        let (wrote_tx, wrote_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut write = std::fs::File::from(write);
+            let _ = wrote_tx.send(write.write_all(&[b'e'; 1 << 20]).is_ok());
+        });
+        let drained = collect_within(
+            vec![zero.into(), read],
+            Duration::from_secs(3),
+            Duration::from_secs(8),
+        );
+        assert_eq!(
+            wrote_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(true),
+            "stderr's writer finished while stdout never ran dry"
+        );
+        assert!(drained.is_some_and(|(unfinished, _)| unfinished));
     }
 
     #[cfg(unix)]

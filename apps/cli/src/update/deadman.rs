@@ -119,54 +119,54 @@ pub fn disarm(scheduler: &dyn Scheduler) -> Result<()> {
     Ok(())
 }
 
-/// Run a short management command with a deadline; its status and output.
+/// What a management command may print and is kept, per stream.
+const OUTPUT_LIMIT: usize = 1 << 20;
+
+/// Run a short management command with a deadline; its status, stdout and
+/// stderr. It goes through [`crate::bounded_run::run_managed`]: both pipes are
+/// drained at once (a program that fills stderr never blocks), everything it
+/// started is killed at the deadline, and a helper that holds a pipe after it
+/// exited cannot hold the call past it.
+pub(crate) fn run_bounded_split(
+    program: &str,
+    args: &[String],
+    env: &[(&str, String)],
+    timeout: Duration,
+) -> Result<(bool, String, String)> {
+    use crate::bounded_run::{RunError, run_managed};
+    match run_managed(program, args, env, timeout, OUTPUT_LIMIT) {
+        Ok(ran) => Ok((
+            ran.success,
+            String::from_utf8_lossy(&ran.stdout).into_owned(),
+            String::from_utf8_lossy(&ran.stderr).into_owned(),
+        )),
+        Err(RunError::Spawn) => Err(anyhow::anyhow!("running `{program}`: it could not start")),
+        Err(RunError::Timeout) => Err(anyhow::anyhow!(
+            "`{program}` did not finish within {} s",
+            timeout.as_secs()
+        )),
+        Err(RunError::Cancelled) => {
+            Err(anyhow::anyhow!("`{program}` was stopped: wsmp is exiting"))
+        }
+        Err(RunError::Resources) => Err(anyhow::anyhow!(
+            "running `{program}`: too many commands are running or stuck; try again later"
+        )),
+        // A managed run returns every exit status and drops output past the limit.
+        Err(RunError::ExitStatus(_) | RunError::OutputTooLarge) => {
+            Err(anyhow::anyhow!("running `{program}` failed unexpectedly"))
+        }
+    }
+}
+
+/// [`run_bounded_split`] with stdout and then stderr as one text.
 pub(crate) fn run_bounded(
     program: &str,
     args: &[String],
     env: &[(&str, String)],
     timeout: Duration,
 ) -> Result<(bool, String)> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (name, value) in env {
-        command.env(name, value);
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("running `{program}`"))?;
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let readers = std::thread::spawn(move || {
-        let mut out = String::new();
-        let mut err = String::new();
-        if let Some(pipe) = stdout.as_mut() {
-            let _ = pipe.take(1 << 20).read_to_string(&mut out);
-        }
-        if let Some(pipe) = stderr.as_mut() {
-            let _ = pipe.take(1 << 20).read_to_string(&mut err);
-        }
-        (out, err)
-    });
-    let until = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().context("waiting for a command")? {
-            break status;
-        }
-        if Instant::now() >= until {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("`{program}` did not finish within {} s", timeout.as_secs());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let (out, err) = readers.join().unwrap_or_default();
-    Ok((status.success(), format!("{out}{err}")))
+    let (ok, out, err) = run_bounded_split(program, args, env, timeout)?;
+    Ok((ok, format!("{out}{err}")))
 }
 
 // ── Linux / WSL ──
@@ -183,12 +183,21 @@ pub fn systemd_calendar_utc(unix_secs: u64) -> String {
 /// the rollback check, and a timer for the deadline. `Persistent=true` fires a
 /// deadline that passed while the machine was off at the next boot; the check
 /// then gives a build that came up after the reboot a full window of its own
-/// ([`super::flow::rollback_if_unconfirmed`]).
-pub fn systemd_units(spec: &DeadmanSpec, deadline_unix: u64) -> (String, String) {
-    let exec: Vec<String> = std::iter::once(spec.prev.display().to_string())
-        .chain(spec.rollback_args())
-        .map(|arg| crate::commands::service::systemd_quote_arg(&arg))
-        .collect();
+/// ([`super::flow::rollback_if_unconfirmed`]). An error, with nothing
+/// rendered, for a program or argument systemd would read differently
+/// ([`crate::commands::service::systemd_exec_path`]).
+pub fn systemd_units(spec: &DeadmanSpec, deadline_unix: u64) -> Result<(String, String)> {
+    let prev = spec
+        .prev
+        .to_str()
+        .with_context(|| format!("`{}` is not valid UTF-8", spec.prev.display()))?;
+    let exec: Vec<String> = std::iter::once(crate::commands::service::systemd_exec_path(prev))
+        .chain(
+            spec.rollback_args()
+                .iter()
+                .map(|arg| crate::commands::service::systemd_quote_arg(arg)),
+        )
+        .collect::<Result<_>>()?;
     let service = format!(
         "[Unit]\n\
          Description=wsmp update dead-man {id}\n\
@@ -215,7 +224,7 @@ pub fn systemd_units(spec: &DeadmanSpec, deadline_unix: u64) -> (String, String)
         id = spec.update_id,
         at = systemd_calendar_utc(deadline_unix),
     );
-    (service, timer)
+    Ok((service, timer))
 }
 
 /// From `systemctl --user show <unit> -p LoadState,ActiveState`: loaded, and
@@ -294,7 +303,7 @@ impl Scheduler for SystemdTimer {
     fn register(&self, spec: &DeadmanSpec) -> Result<()> {
         let (service_file, timer_file) = Self::files()?;
         let deadline = super::unix_now() + spec.fire_in.as_secs().max(1);
-        let (service, timer) = systemd_units(spec, deadline);
+        let (service, timer) = systemd_units(spec, deadline)?;
         if let Some(dir) = service_file.parent() {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("creating `{}`", dir.display()))?;
@@ -342,21 +351,26 @@ impl Scheduler for SystemdTimer {
 // ── macOS ──
 
 /// The one-shot LaunchAgent that runs the rollback command (which sleeps
-/// until the deadline itself).
-pub fn render_macos_plist(label: &str, program: &Path, args: &[String], log: &Path) -> String {
-    let escape = |value: &str| {
-        value
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;")
-    };
+/// until the deadline itself). Each value is plist text
+/// ([`crate::commands::service::plist_text`]): an error, with nothing
+/// rendered, for one XML cannot carry.
+pub fn render_macos_plist(
+    label: &str,
+    program: &Path,
+    args: &[String],
+    log: &Path,
+) -> Result<String> {
+    let escape = crate::commands::service::plist_text;
     let arguments: String = std::iter::once(program.display().to_string())
         .chain(args.iter().cloned())
-        .map(|arg| format!("\t\t<string>{}</string>\n", escape(&arg)))
-        .collect();
-    format!(
+        .map(|arg| {
+            Ok(format!(
+                "\t\t<string>{}</string>\n",
+                escape("the dead-man argument", &arg)?
+            ))
+        })
+        .collect::<Result<_>>()?;
+    Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\">\n\
@@ -379,9 +393,9 @@ pub fn render_macos_plist(label: &str, program: &Path, args: &[String], log: &Pa
          \t<string>{log}</string>\n\
          </dict>\n\
          </plist>\n",
-        label = escape(label),
-        log = escape(&log.display().to_string()),
-    )
+        label = escape("the LaunchAgent label", label)?,
+        log = escape("the dead-man log path", &log.display().to_string())?,
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -425,7 +439,7 @@ impl Scheduler for LaunchAgent {
                 .with_context(|| format!("creating `{}`", parent.display()))?;
         }
         let log = spec.state_dir.join("update").join("deadman.log");
-        let body = render_macos_plist(MACOS_LABEL, &spec.prev, &spec.rollback_args(), &log);
+        let body = render_macos_plist(MACOS_LABEL, &spec.prev, &spec.rollback_args(), &log)?;
         std::fs::write(&plist, body).with_context(|| format!("writing `{}`", plist.display()))?;
         let (ok, output) = run_bounded(
             "launchctl",
@@ -738,6 +752,121 @@ mod tests {
     use super::fake::FakeScheduler;
     use super::*;
 
+    #[cfg(unix)]
+    fn sh(script: &str) -> Vec<String> {
+        vec!["-c".into(), script.into()]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_fills_stderr_before_closing_stdout_is_not_blocked() {
+        // 256 KiB on stderr while stdout is still open, then a line on stdout:
+        // reading stdout to its end first would block the program on the full
+        // stderr pipe until the deadline.
+        let started = Instant::now();
+        let (ok, out, err) = run_bounded_split(
+            "sh",
+            &sh("head -c 262144 /dev/zero | tr '\\0' e >&2; echo done"),
+            &[],
+            Duration::from_secs(20),
+        )
+        .expect("finishes");
+        assert!(ok);
+        assert_eq!(out, "done\n");
+        assert_eq!(err.len(), 262_144);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_past_the_limit_is_drained_and_dropped_not_fatal() {
+        let (ok, out, err) = run_bounded_split(
+            "sh",
+            &sh("head -c 3145728 /dev/zero; echo end >&2; exit 3"),
+            &[],
+            Duration::from_secs(20),
+        )
+        .expect("finishes");
+        assert!(!ok, "the exit status is the program's");
+        assert_eq!(out.len(), OUTPUT_LIMIT);
+        assert_eq!(err, "end\n");
+        // stdout first, then stderr, as one text.
+        let (_, text) = run_bounded(
+            "sh",
+            &sh("echo err >&2; echo out"),
+            &[("WSMP_TEST_EXTRA", "x".into())],
+            Duration::from_secs(20),
+        )
+        .expect("finishes");
+        assert_eq!(text, "out\nerr\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn management_commands_inherit_the_environment_and_take_extra_values() {
+        let (ok, out, _) = run_bounded_split(
+            "sh",
+            &sh("printf '%s %s' \"$WSMP_TEST_EXTRA\" \"${HOME:+home}\""),
+            &[("WSMP_TEST_EXTRA", "extra".into())],
+            Duration::from_secs(20),
+        )
+        .expect("finishes");
+        assert!(ok);
+        assert_eq!(out, "extra home");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_helper_holding_the_pipes_cannot_hold_the_call_past_its_deadline() {
+        let dir = tempfile::tempdir().expect("dir");
+        let pid_file = dir.path().join("helper.pid");
+        // The program exits at once; the helper it started keeps stdout and
+        // stderr open for 60 s.
+        let script = format!(
+            "sleep 60 & echo $! > '{}'; echo started",
+            pid_file.display()
+        );
+        let started = Instant::now();
+        let result = run_bounded_split("sh", &sh(&script), &[], Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        let error = result.expect_err("the helper holds the pipes past the deadline");
+        assert!(
+            format!("{error:#}").contains("did not finish within 2 s"),
+            "{error:#}"
+        );
+        assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+        // The helper was in the program's group and was killed with it.
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("pid number");
+        let gone = (0..200).any(|_| {
+            let dead = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|stat| stat.contains(") Z "))
+                .unwrap_or(true);
+            if !dead {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            dead
+        });
+        assert!(gone, "the helper {pid} still runs");
+    }
+
+    #[test]
+    fn a_program_that_cannot_start_is_an_error() {
+        let error = run_bounded("wsmp-no-such-program", &[], &[], Duration::from_secs(5))
+            .expect_err("missing");
+        assert!(
+            format!("{error:#}").contains("could not start"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn task_names_are_quoted_for_powershell() {
         assert_eq!(
@@ -804,7 +933,7 @@ mod tests {
     #[test]
     fn the_linux_dead_man_is_a_persistent_timer_that_runs_the_previous_binary() {
         // 2026-10-28 12:01:30 UTC.
-        let (service, timer) = systemd_units(&spec("abc"), 1_793_188_890);
+        let (service, timer) = systemd_units(&spec("abc"), 1_793_188_890).expect("units");
         assert!(
             service.contains(
                 "ExecStart=/home/u/.cargo/bin/wsmp.prev update rollback --if-unconfirmed abc \
@@ -833,12 +962,38 @@ mod tests {
             Path::new("/Users/u/.cargo/bin/wsmp.prev"),
             &spec("abc").rollback_args(),
             Path::new("/tmp/log & more"),
-        );
+        )
+        .expect("plist");
         assert!(plist.contains("<string>com.flycockpit.wsmp.update-deadman</string>"));
         assert!(plist.contains("<string>/Users/u/.cargo/bin/wsmp.prev</string>"));
         assert!(plist.contains("<string>--if-unconfirmed</string>\n\t\t<string>abc</string>"));
         assert!(plist.contains("<key>KeepAlive</key>\n\t<false/>"));
         assert!(plist.contains("/tmp/log &amp; more"));
+    }
+
+    /// R5-A-1: a dead-man job is never written with a value its manager
+    /// would read differently: a control character in the state directory
+    /// or the previous binary, or a program systemd refuses (a quote).
+    #[test]
+    fn a_dead_man_job_refuses_a_value_its_manager_cannot_read() {
+        let mut bad = spec("abc");
+        bad.state_dir = PathBuf::from("/home/u/state\nExecStart=/bin/false");
+        let error = systemd_units(&bad, 1_793_188_890).expect_err("newline");
+        assert!(format!("{error:#}").contains("U+000A"), "{error:#}");
+        let error = render_macos_plist(
+            MACOS_LABEL,
+            &bad.prev,
+            &bad.rollback_args(),
+            Path::new("/tmp/log"),
+        )
+        .expect_err("newline");
+        assert!(format!("{error:#}").contains("U+000A"), "{error:#}");
+        let mut quoted = spec("abc");
+        quoted.prev = PathBuf::from("/home/u/a\"b/wsmp.prev");
+        assert!(systemd_units(&quoted, 1_793_188_890).is_err());
+        let mut nul = spec("abc");
+        nul.prev = PathBuf::from("/home/u/wsmp\0.prev");
+        assert!(systemd_units(&nul, 1_793_188_890).is_err());
     }
 
     #[test]

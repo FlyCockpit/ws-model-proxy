@@ -293,7 +293,7 @@ describe("RelaySessionManager (relay 3.0)", () => {
       nodeId: "node-1",
       definitionSync: "none",
       // The optional node frame fields this server accepts (released wsmp ignores it).
-      features: { execRanWith: true },
+      features: { execRanWith: true, agentUpdateAvailableVersion: true },
     });
     expect(manager.getOnlineNodeIds()).toEqual(["node-1"]);
     expect(manager.getLiveNodeState("node-1")).toMatchObject({ trust: "full", slug: "box" });

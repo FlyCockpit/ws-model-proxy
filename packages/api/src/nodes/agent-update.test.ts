@@ -44,7 +44,7 @@ const RELEASE: AgentUpdateRelease = {
 };
 
 let store: ReturnType<typeof createAgentUpdateDb>;
-let sent: Array<{ nodeId: string; force: boolean; updateId: string }>;
+let sent: Array<{ nodeId: string; force: boolean; updateId: string; version?: string }>;
 
 function makePort(
   options: {
@@ -74,7 +74,12 @@ function makePort(
       };
     },
     send: (nodeId, frame) => {
-      sent.push({ nodeId, force: frame.force, updateId: frame.updateId });
+      sent.push({
+        nodeId,
+        force: frame.force,
+        updateId: frame.updateId,
+        ...(frame.version !== "0.4.3" ? { version: frame.version } : {}),
+      });
       return true;
     },
   };
@@ -216,6 +221,111 @@ describe("nodes.agentUpdate.start", () => {
   });
 });
 
+describe("nodes.agentUpdate Install anyway (Homebrew tap)", () => {
+  const MAC = "aarch64-apple-darwin";
+  const HOMEBREW = {
+    strategies: ["homebrew"],
+    instancesSurvive: false,
+    remote: "allowed",
+  };
+  const macRelease: AgentUpdateRelease = {
+    ...RELEASE,
+    artifacts: { [MAC]: { url: "https://r.example/v0.4.3/m.tar.xz", sha256: "c".repeat(64) } },
+  };
+
+  it("lists the tap's version after its refusal and installs it on request", async () => {
+    Object.assign(store.tables.node[0] ?? {}, {
+      cliBuild: { commit: null, installMethod: "homebrew", target: MAC },
+    });
+    const api = client(makePort({ release: macRelease, selfUpdate: HOMEBREW }));
+    const first = await api.start({ nodeId: "node-1" });
+    Object.assign(store.tables.nodeAgentUpdate[0] ?? {}, {
+      phase: "REFUSED",
+      reason: "version_mismatch",
+      availableVersion: "0.4.4",
+      endedAt: new Date(),
+    });
+    const overview = await api.overview();
+    expect(overview.nodes[0]).toMatchObject({
+      canUpdate: true,
+      availableVersion: "0.4.4",
+      availableVersionAhead: true,
+      newerThanServer: false,
+      latest: { id: first.id, phase: "refused", reason: "version_mismatch" },
+    });
+    const anyway = await api.start({ nodeId: "node-1", version: "0.4.4" });
+    expect(anyway).toMatchObject({ toVersion: "0.4.4", fromVersion: "0.4.2" });
+    expect(sent.at(-1)).toMatchObject({ updateId: anyway.id, version: "0.4.4" });
+    await expect(api.start({ nodeId: "node-1", version: "0.4.4" })).rejects.toMatchObject({
+      data: { reason: "agent_update_in_progress" },
+    });
+  });
+
+  it("shows each attempt with the strategy it used, after a reinstall either way", async () => {
+    // A Homebrew attempt; the node is then reinstalled with the install script.
+    Object.assign(store.tables.node[0] ?? {}, {
+      cliBuild: { commit: null, installMethod: "homebrew", target: MAC },
+    });
+    const viaBrew = await client(makePort({ release: macRelease, selfUpdate: HOMEBREW })).start({
+      nodeId: "node-1",
+    });
+    expect(viaBrew.strategy).toBe("homebrew");
+    Object.assign(store.tables.nodeAgentUpdate[0] ?? {}, {
+      phase: "FAILED",
+      reason: "version_mismatch",
+      endedAt: new Date(),
+    });
+    Object.assign(store.tables.node[0] ?? {}, {
+      cliBuild: { commit: null, installMethod: "script", target: MAC },
+    });
+    const script = client(
+      makePort({ release: macRelease, selfUpdate: { ...HOMEBREW, strategies: ["self-replace"] } }),
+    );
+    const afterBrew = (await script.overview()).nodes[0];
+    expect(afterBrew?.latest).toMatchObject({
+      id: viaBrew.id,
+      strategy: "homebrew",
+    });
+    // The explanation is Homebrew's; the repair is the script's, how the node is installed now.
+    expect(afterBrew?.manualCommand).toBe(
+      "curl -fsSL https://proxy.example.com/install.sh | sh && ~/.cargo/bin/wsmp service restart",
+    );
+    // A self-replace attempt; the node is then reinstalled with Homebrew.
+    const viaSwap = await script.start({ nodeId: "node-1" });
+    expect(viaSwap.strategy).toBe("self-replace");
+    const swapRow = store.tables.nodeAgentUpdate.find((row) => row.id === viaSwap.id);
+    Object.assign(swapRow ?? {}, {
+      phase: "FAILED",
+      reason: "version_mismatch",
+      endedAt: new Date(),
+    });
+    Object.assign(store.tables.node[0] ?? {}, {
+      cliBuild: { commit: null, installMethod: "homebrew", target: MAC },
+    });
+    const brew = client(makePort({ release: macRelease, selfUpdate: HOMEBREW }));
+    expect((await brew.overview()).nodes[0]?.latest).toMatchObject({
+      id: viaSwap.id,
+      strategy: "self-replace",
+    });
+    // Offline, it needs a hand update: Homebrew's command, how the node is installed now.
+    Object.assign(store.tables.node[0] ?? {}, { connection: "OFFLINE" });
+    expect((await brew.overview()).nodes[0]?.manualCommand).toBe(
+      "brew reinstall flycockpit/tap/wsmp && wsmp service restart",
+    );
+  });
+
+  it("refuses a version the node did not offer", async () => {
+    Object.assign(store.tables.node[0] ?? {}, {
+      cliBuild: { commit: null, installMethod: "homebrew", target: MAC },
+    });
+    const api = client(makePort({ release: macRelease, selfUpdate: HOMEBREW }));
+    await expect(api.start({ nodeId: "node-1", version: "0.4.4" })).rejects.toMatchObject({
+      data: { reason: "agent_update_unavailable", subjectId: "node-1" },
+    });
+    expect(sent).toEqual([]);
+  });
+});
+
 describe("nodes.agentUpdate.overview", () => {
   it("explains a node that cannot update itself, with its command", async () => {
     Object.assign(store.tables.node[0] ?? {}, {
@@ -310,5 +420,158 @@ describe("nodes.agentUpdate.startAll / stopAll / setPolicy", () => {
       policy: "OFF",
     });
     expect(store.tables.node[0]?.agentUpdatePolicy).toBe("OFF");
+  });
+});
+
+describe("nodes.agentUpdate claims against a concurrent policy or trust change", () => {
+  // `setPolicy` (or a trust lowering) commits while the start awaits the release lookup, after
+  // the start's own checks: the claim re-reads both under the node's row lock and is refused.
+  function offDuringLookup(port: AgentUpdatePort, change: () => Promise<unknown>) {
+    const release = port.release;
+    port.release = async () => {
+      await change();
+      return release();
+    };
+  }
+  const turnOff = () => client().setPolicy({ nodeId: "node-1", policy: "OFF" });
+  const lowerTrust = async () => {
+    Object.assign(store.tables.node[0] ?? {}, { trustLowerRequestedAt: new Date() });
+  };
+
+  it.each([
+    ["policy off", turnOff, "agent_update_off"],
+    ["a trust lowering", lowerTrust, "trust_relay"],
+  ] as const)("refuses a start when %s commits during it", async (_label, change, reason) => {
+    const port = makePort();
+    offDuringLookup(port, change);
+    await expect(client(port).start({ nodeId: "node-1" })).rejects.toMatchObject({
+      data: { reason, subjectId: "node-1" },
+    });
+    expect(store.tables.nodeAgentUpdate).toEqual([]);
+    expect(sent).toEqual([]);
+  });
+
+  /** The operations of the transaction that ran `claim`: the lock must come first, in it. */
+  function claimTransaction(claim: string) {
+    const write = store.operations.find((entry) => entry.op === claim);
+    expect(write, claim).toBeDefined();
+    expect(write?.tx, `${claim} runs in a transaction`).not.toBeNull();
+    return store.operations.filter((entry) => entry.tx === write?.tx).map((entry) => entry.op);
+  }
+
+  it("locks the node row in the claim's transaction before it writes the update", async () => {
+    await client().start({ nodeId: "node-1" });
+    expect(store.rawQueries).toEqual([
+      {
+        sql: 'SELECT "agentUpdatePolicy", trust, "trustLowerRequestedAt" FROM node WHERE id = ? AND "userId" = ? FOR UPDATE',
+        values: ["node-1", OWNER],
+      },
+    ]);
+    // In the same transaction as the create, and before it; never outside a transaction.
+    expect(claimTransaction("nodeAgentUpdate.create")).toEqual([
+      "lockNode",
+      "nodeAgentUpdate.create",
+    ]);
+    expect(
+      store.operations.filter((entry) => entry.tx === null && entry.op === "lockNode"),
+    ).toEqual([]);
+  });
+
+  it("locks the node row in the transaction that marks a waiting update forced", async () => {
+    const port = makePort();
+    await client(port).start({ nodeId: "node-1" });
+    Object.assign(store.tables.nodeAgentUpdate[0] ?? {}, { phase: "WAITING_IDLE" });
+    store.operations.length = 0;
+    await client(port).start({ nodeId: "node-1", force: true });
+    expect(claimTransaction("nodeAgentUpdate.updateMany")).toEqual([
+      "lockNode",
+      "nodeAgentUpdate.updateMany",
+    ]);
+  });
+
+  it("locks the node row in the transaction that claims a batch's node", async () => {
+    const port = makePort();
+    store.tables.nodeAgentUpdateBatch.push({
+      id: "batch-1",
+      userId: OWNER,
+      nodeIds: ["node-1"],
+      position: 0,
+      currentUpdateId: null,
+      currentNodeId: null,
+      skippedNodeIds: [],
+      targetVersion: "0.4.3",
+      targetDigest: null,
+      updatedAt: new Date(),
+      state: "RUNNING",
+    });
+    const { advanceAgentUpdateBatch } = await import("../lib/agent-updates");
+    await advanceAgentUpdateBatch(port, "batch-1", "https://proxy.example.com");
+    expect(store.tables.nodeAgentUpdate).toHaveLength(1);
+    expect(claimTransaction("nodeAgentUpdate.create")).toEqual([
+      "lockNode",
+      "nodeAgentUpdate.create",
+      "nodeAgentUpdateBatch.updateMany",
+    ]);
+  });
+
+  it("refuses Install anyway when policy off commits during it", async () => {
+    const MAC = "aarch64-apple-darwin";
+    Object.assign(store.tables.node[0] ?? {}, {
+      cliBuild: { commit: null, installMethod: "homebrew", target: MAC },
+    });
+    const port = makePort({
+      release: {
+        ...RELEASE,
+        artifacts: { [MAC]: { url: "https://r.example/m.tar.xz", sha256: "c".repeat(64) } },
+      },
+      selfUpdate: { strategies: ["homebrew"], instancesSurvive: false, remote: "allowed" },
+    });
+    await client(port).start({ nodeId: "node-1" });
+    Object.assign(store.tables.nodeAgentUpdate[0] ?? {}, {
+      phase: "REFUSED",
+      reason: "version_mismatch",
+      availableVersion: "0.4.4",
+      endedAt: new Date(),
+    });
+    offDuringLookup(port, turnOff);
+    await expect(client(port).start({ nodeId: "node-1", version: "0.4.4" })).rejects.toMatchObject({
+      data: { reason: "agent_update_off" },
+    });
+    expect(store.tables.nodeAgentUpdate).toHaveLength(1);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("does not force a waiting update when policy off commits during it", async () => {
+    const port = makePort();
+    const first = await client(port).start({ nodeId: "node-1" });
+    Object.assign(store.tables.nodeAgentUpdate[0] ?? {}, { phase: "WAITING_IDLE" });
+    offDuringLookup(port, turnOff);
+    await expect(client(port).start({ nodeId: "node-1", force: true })).rejects.toMatchObject({
+      data: { reason: "agent_update_off" },
+    });
+    expect(store.tables.nodeAgentUpdate[0]).toMatchObject({ id: first.id, force: false });
+    expect(sent.map((frame) => frame.force)).toEqual([false]);
+  });
+
+  it("does not start a batch's node when policy off commits during it", async () => {
+    const port = makePort();
+    offDuringLookup(port, turnOff);
+    store.tables.nodeAgentUpdateBatch.push({
+      id: "batch-1",
+      userId: OWNER,
+      nodeIds: ["node-1"],
+      position: 0,
+      currentUpdateId: null,
+      currentNodeId: null,
+      skippedNodeIds: [],
+      targetVersion: "0.4.3",
+      targetDigest: null,
+      updatedAt: new Date(),
+      state: "RUNNING",
+    });
+    const { advanceAgentUpdateBatch } = await import("../lib/agent-updates");
+    await advanceAgentUpdateBatch(port, "batch-1", "https://proxy.example.com");
+    expect(store.tables.nodeAgentUpdate).toEqual([]);
+    expect(sent).toEqual([]);
   });
 });

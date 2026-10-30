@@ -1612,7 +1612,10 @@ where
                 .execs
                 .set_report_ran_with(features.unwrap_or_default().exec_ran_with);
             tracing::info!(id, node_id, ?definition_sync, "relay registration accepted");
-            session.update.on_hello_ok(definition_sync);
+            session.update.on_hello_ok(
+                definition_sync,
+                features.unwrap_or_default().agent_update_available_version,
+            );
             send_inventory(session);
         }
         ServerFrame::HelloChallenge { .. } => {
@@ -2761,6 +2764,7 @@ where
                     phase: crate::protocol::frames::UpdatePhase::Failed,
                     reason: Some(crate::protocol::frames::UpdateReason::Internal),
                     detail: Some("the node could not read this `agent.update`".into()),
+                    available_version: None,
                 },
                 "refusing an update",
             )

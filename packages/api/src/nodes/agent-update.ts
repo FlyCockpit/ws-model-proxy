@@ -85,6 +85,8 @@ const UPDATE_SELECT = {
   toVersion: true,
   force: true,
   strategy: true,
+  fromCommit: true,
+  availableVersion: true,
   createdAt: true,
   updatedAt: true,
   endedAt: true,
@@ -98,6 +100,7 @@ type UpdateRow = {
   fromVersion: string | null;
   toVersion: string;
   force: boolean;
+  strategy: string;
   createdAt: Date;
   updatedAt: Date;
   endedAt: Date | null;
@@ -112,6 +115,7 @@ function toUpdateView(row: UpdateRow): UpdateView {
     fromVersion: row.fromVersion,
     toVersion: row.toVersion,
     force: row.force,
+    strategy: row.strategy,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     endedAt: row.endedAt?.toISOString() ?? null,
@@ -222,7 +226,17 @@ async function loadOverview(userId: string, port: AgentUpdatePort, now: Date) {
         latest && latest.endedAt === null && latestPhase
           ? { phase: latestPhase, strategy: latest.strategy }
           : null,
-      latest: latest && latestPhase ? { phase: latestPhase, strategy: latest.strategy } : null,
+      latest:
+        latest && latestPhase
+          ? {
+              phase: latestPhase,
+              strategy: latest.strategy,
+              reason: latest.reason,
+              fromVersion: latest.fromVersion,
+              fromCommit: latest.fromCommit,
+              availableVersion: latest.availableVersion,
+            }
+          : null,
     });
     return {
       nodeId: node.id,
@@ -233,11 +247,14 @@ async function loadOverview(userId: string, port: AgentUpdatePort, now: Date) {
       build: eligibility.build,
       wsl: parseWsl(node.environment),
       outdated: eligibility.outdated,
+      newerThanServer: eligibility.newerThanServer,
       policy: node.agentUpdatePolicy,
       selfUpdate: eligibility.selfUpdate,
       canUpdate: eligibility.canUpdate,
       blockedReason: eligibility.blockedReason,
       manualCommand: eligibility.manualCommand,
+      availableVersion: eligibility.availableVersion,
+      availableVersionAhead: eligibility.availableVersionAhead,
       runningInstances: [...(runningByNode.get(node.id) ?? new Map()).entries()].map(
         ([id, name]) => ({ id, name }),
       ),
@@ -301,6 +318,7 @@ export const agentUpdateProcedures = {
       nodeId: input.nodeId,
       force: input.force ?? false,
       origin: origin(),
+      ...(input.version !== undefined ? { version: input.version } : {}),
     });
     if (outcome.kind === "not_found") throw notFound("That node does not exist.");
     if (outcome.kind === "refused")

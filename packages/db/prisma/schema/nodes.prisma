@@ -324,6 +324,13 @@ model NodeAgentUpdate {
   reason            String?
   /// Node text (a manual command or a log tail), at most 4000 characters. Shown as plain text.
   detail            String?
+  /// The SHA-256 of the archive `agent.update` sent (the node's target). A forced resend of a
+  /// waiting update goes out only while the server still offers that archive. Null on rows
+  /// written before it was stored: those are never resent.
+  artifactSha256    String?
+  /// A REFUSED `version_mismatch`: the version the node could install instead (its Homebrew
+  /// tap's), which the owner may install anyway. A release version reported by the node.
+  availableVersion  String?
   /// When the server gives up waiting for the next phase (then TIMED_OUT). Null once ended.
   deadlineAt        DateTime?
   endedAt           DateTime?

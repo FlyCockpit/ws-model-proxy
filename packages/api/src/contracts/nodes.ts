@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { AGENT_UPDATE_PHASES, nodeBuildSchema } from "../lib/agent-update-wire";
+import {
+  AGENT_UPDATE_PHASES,
+  agentReleaseVersionSchema,
+  nodeBuildSchema,
+} from "../lib/agent-update-wire";
 import {
   declaredHardwareSchema,
   fabricNameSchema,
@@ -501,6 +505,11 @@ export const agentUpdateViewSchema = z
     fromVersion: z.string().nullable(),
     toVersion: z.string(),
     force: z.boolean(),
+    /**
+     * How the node was told to install this update (`self-replace` or `homebrew`), as the
+     * server chose it then. Copy about this attempt follows it, not the node's install now.
+     */
+    strategy: z.string(),
     createdAt: isoDateSchema,
     updatedAt: isoDateSchema,
     endedAt: isoDateSchema.nullable(),
@@ -517,7 +526,10 @@ export const nodeAgentUpdateViewSchema = z
     version: z.string().nullable(),
     build: nodeBuildSchema.nullable(),
     wsl: z.boolean(),
+    /** Behind the server's wsmp (a newer release is not behind: see `newerThanServer`). */
     outdated: z.boolean(),
+    /** The node runs a newer wsmp release than this server (installed anyway, or by hand). */
+    newerThanServer: z.boolean(),
     policy: z.enum(NODE_AGENT_UPDATE_POLICY),
     selfUpdate: nodeSelfUpdateSchema.nullable(),
     canUpdate: z.boolean(),
@@ -525,6 +537,16 @@ export const nodeAgentUpdateViewSchema = z
     blockedReason: refusalReasonSchema.nullable(),
     /** What to run on the node when it cannot update itself (or to recover a Homebrew failure). */
     manualCommand: z.string().nullable(),
+    /**
+     * "Install anyway": the version the node's Homebrew tap has, which the node offered when it
+     * refused this server's version (`start` with this `version` installs it). Null otherwise.
+     */
+    availableVersion: z.string().nullable(),
+    /**
+     * `availableVersion` is newer than this server's version (the tap is ahead of the server).
+     * False when it is older: the tap does not have this server's version yet.
+     */
+    availableVersionAhead: z.boolean(),
     /** What Force would stop. */
     runningInstances: z.array(z.object({ id: idSchema, name: z.string() }).strict()),
     latest: agentUpdateViewSchema.nullable(),
@@ -778,9 +800,19 @@ export const nodesContract = {
     ),
     start: mutation(
       "human",
-      z.object({ nodeId: idSchema, force: z.boolean().optional() }).strict(),
+      z
+        .object({
+          nodeId: idSchema,
+          force: z.boolean().optional(),
+          /**
+           * Install anyway: the node's `availableVersion` (its Homebrew tap's) instead of this
+           * server's version. Refused unless it is exactly what the node offered.
+           */
+          version: agentReleaseVersionSchema.optional(),
+        })
+        .strict(),
       agentUpdateViewSchema,
-      "Update one node's wsmp to this server's version (it rolls back by itself if the new build does not come up). Force stops its running instances first; forcing an update that waits for idle resends it forced.",
+      "Update one node's wsmp to this server's version. A self-replace update rolls back by itself if the new build does not come up; a Homebrew update cannot roll back. Force stops its running instances first; forcing an update that waits for idle resends it forced. `version`: install the version the node's Homebrew tap offered instead (its `availableVersion`).",
     ),
     startAll: mutation(
       "human",

@@ -1,7 +1,8 @@
 /**
  * Test-only: an in-memory stand-in for the Prisma delegates the self-update code uses (node,
- * nodeAgentUpdate, nodeAgentUpdateBatch, instanceRank, $transaction), with the two partial
- * unique indexes of the hardening (one update in flight per node, one running batch per owner).
+ * nodeAgentUpdate, nodeAgentUpdateBatch, instanceRank, $transaction, and $queryRaw for the
+ * claim's node row lock), with the two partial unique indexes of the hardening (one update in
+ * flight per node, one running batch per owner).
  * Tests install it with `vi.mock("@ws-model-proxy/db", ...)`; nothing reaches a database.
  */
 type Row = Record<string, unknown>;
@@ -58,8 +59,16 @@ export function createAgentUpdateDb() {
   let clock = 0;
   const stamp = () => new Date(Date.UTC(2026, 9, 28, 12, 0, 0) + clock++);
 
-  function delegate(name: keyof typeof tables) {
+  /**
+   * Every write and raw query, in order, with the transaction it ran in (`null`: outside any
+   * `$transaction`), so a test can check that a lock and a claim share one transaction.
+   */
+  const operations: Array<{ tx: number | null; op: string }> = [];
+  let transactions = 0;
+
+  function delegate(name: keyof typeof tables, tx: number | null = null) {
     const list = () => tables[name];
+    const log = (method: string) => operations.push({ tx, op: `${name}.${method}` });
     return {
       findFirst: async (args: { where?: unknown; orderBy?: unknown } = {}) => {
         const found = sorted(
@@ -87,6 +96,7 @@ export function createAgentUpdateDb() {
         return found.slice(0, args.take ?? found.length).map(project);
       },
       create: async (args: { data: Row }) => {
+        log("create");
         const now = stamp();
         const row: Row = {
           createdAt: now,
@@ -109,6 +119,7 @@ export function createAgentUpdateDb() {
         return project(row);
       },
       updateMany: async (args: { where?: unknown; data: Row }) => {
+        log("updateMany");
         let count = 0;
         for (const row of list())
           if (matches(row, args.where)) {
@@ -118,6 +129,7 @@ export function createAgentUpdateDb() {
         return { count };
       },
       deleteMany: async (args: { where?: unknown } = {}) => {
+        log("deleteMany");
         const before = list().length;
         tables[name] = list().filter((row) => !matches(row, args.where));
         return { count: before - tables[name].length };
@@ -154,25 +166,53 @@ export function createAgentUpdateDb() {
     return {};
   }
 
+  /** Every raw query, in order, as its SQL text (`?` for each value) and values. */
+  const rawQueries: Array<{ sql: string; values: unknown[] }> = [];
+
+  // The one raw query the self-update code runs: the node row lock of a claim
+  // (`SELECT "agentUpdatePolicy", trust, "trustLowerRequestedAt" FROM node … FOR UPDATE`).
+  const queryRaw =
+    (tx: number | null) =>
+    async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      const sql = strings.join("?");
+      rawQueries.push({ sql, values });
+      operations.push({ tx, op: "lockNode" });
+      if (!/FROM node WHERE id = \? AND "userId" = \? FOR UPDATE$/.test(sql))
+        throw new Error(`unexpected raw query: ${sql}`);
+      const [id, userId] = values;
+      return tables.node
+        .filter((row) => row.id === id && row.userId === userId)
+        .map((row) => ({
+          agentUpdatePolicy: row.agentUpdatePolicy,
+          trust: row.trust,
+          trustLowerRequestedAt: row.trustLowerRequestedAt ?? null,
+        }));
+    };
+  const delegates = (tx: number | null) => ({
+    $queryRaw: queryRaw(tx),
+    node: delegate("node", tx),
+    nodeAgentUpdate: delegate("nodeAgentUpdate", tx),
+    nodeAgentUpdateBatch: delegate("nodeAgentUpdateBatch", tx),
+    instanceRank: delegate("instanceRank", tx),
+  });
   const client = {
-    node: delegate("node"),
-    nodeAgentUpdate: delegate("nodeAgentUpdate"),
-    nodeAgentUpdateBatch: delegate("nodeAgentUpdateBatch"),
-    instanceRank: delegate("instanceRank"),
-    // Atomic enough for tests: a failing callback rolls the tables back.
+    ...delegates(null),
+    // Atomic enough for tests: a failing callback rolls the tables back. The callback gets its
+    // own client, so what it runs is recorded under this transaction's number.
     $transaction: async (work: (tx: unknown) => Promise<unknown>) => {
       const snapshot = Object.fromEntries(
         Object.entries(tables).map(([key, rows]) => [key, rows.map((row) => ({ ...row }))]),
       ) as typeof tables;
+      transactions += 1;
       try {
-        return await work(client);
+        return await work(delegates(transactions));
       } catch (error) {
         Object.assign(tables, snapshot);
         throw error;
       }
     },
   };
-  return { client, tables };
+  return { client, tables, rawQueries, operations };
 }
 
 /** A node row as `AGENT_UPDATE_NODE_SELECT` reads it: online, Full, outdated, self-update able. */

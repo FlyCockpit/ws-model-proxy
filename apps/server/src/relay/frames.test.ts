@@ -87,6 +87,12 @@ describe("how a node command ran", () => {
       serverToNodeControlFrameSchema.safeParse({ ...hello, features: { execRanWith: true } })
         .success,
     ).toBe(true);
+    expect(
+      serverToNodeControlFrameSchema.safeParse({
+        ...hello,
+        features: { execRanWith: true, agentUpdateAvailableVersion: true },
+      }).success,
+    ).toBe(true);
   });
 });
 
@@ -428,6 +434,12 @@ describe("self-update frames", () => {
         },
       ],
     ]);
+    expectValid(nodeToServerControlFrameSchema, [
+      [
+        "progress refused with the tap's version",
+        { ...progress, reason: "version_mismatch", availableVersion: "0.4.4-rc.1" },
+      ],
+    ]);
     expect(SERVER_TO_NODE_CONTROL_TYPES).toContain("agent.update");
     expect(NODE_TO_SERVER_CONTROL_TYPES).toContain("agent.update.progress");
   });
@@ -454,6 +466,10 @@ describe("self-update frames", () => {
       { ...progress, reason: "because" },
       { ...progress, detail: "x".repeat(4001) },
       { ...progress, extra: 1 },
+      // availableVersion only with a version_mismatch refusal, and a release version.
+      { ...progress, availableVersion: "0.4.4" },
+      { ...progress, phase: "failed", reason: "version_mismatch", availableVersion: "0.4.4" },
+      { ...progress, reason: "version_mismatch", availableVersion: "latest" },
     ];
     for (const frame of badProgress)
       expect(nodeToServerControlFrameSchema.safeParse(frame).success, JSON.stringify(frame)).toBe(

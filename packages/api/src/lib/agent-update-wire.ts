@@ -82,6 +82,56 @@ export const AGENT_UPDATE_REASONS = [
 ] as const;
 export type AgentUpdateReason = (typeof AGENT_UPDATE_REASONS)[number];
 
+/** A release version (`0.4.3`, `0.4.4-rc.1`), as `agent.update`'s `version`. */
+export const agentReleaseVersionSchema = z
+  .string()
+  .max(80)
+  .regex(/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/);
+
+/**
+ * SemVer precedence of two release versions (build metadata ignored): negative when `a` is
+ * older, positive when newer, 0 when equal. `null` when either is not a release version.
+ */
+export function compareReleaseVersions(a: string, b: string): number | null {
+  const parse = (value: string) => {
+    if (!agentReleaseVersionSchema.safeParse(value).success) return null;
+    const [core = "", pre] = value.split("+")[0]?.split(/-(.*)/s) ?? [];
+    // BigInt: any number of digits, without a double's rounding past 2^53.
+    return { core: core.split(".").map(BigInt), pre: pre ? pre.split(".") : [] };
+  };
+  const order = (x: bigint, y: bigint) => (x < y ? -1 : x > y ? 1 : 0);
+  const left = parse(a);
+  const right = parse(b);
+  if (!left || !right) return null;
+  for (let index = 0; index < 3; index += 1) {
+    const diff = order(left.core[index] ?? 0n, right.core[index] ?? 0n);
+    if (diff !== 0) return diff;
+  }
+  // A pre-release sorts before its release.
+  if (left.pre.length === 0 || right.pre.length === 0)
+    return Math.sign(right.pre.length - left.pre.length);
+  const numeric = /^[0-9]+$/;
+  for (let index = 0; index < Math.max(left.pre.length, right.pre.length); index += 1) {
+    const x = left.pre[index];
+    const y = right.pre[index];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x === y) continue;
+    const xNumber = numeric.test(x);
+    const yNumber = numeric.test(y);
+    // `01` and `1` are equal numbers: the next identifiers decide (as the node compares).
+    if (xNumber && yNumber) {
+      const diff = order(BigInt(x), BigInt(y));
+      if (diff !== 0) return diff;
+      continue;
+    }
+    if (xNumber) return -1;
+    if (yNumber) return 1;
+    return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
 /** `detail`: at most this many characters (Unicode scalar values, as the node counts them). */
 export const AGENT_UPDATE_DETAIL_MAX_CHARS = 4000;
 
