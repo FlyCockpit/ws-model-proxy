@@ -1117,9 +1117,10 @@ export const agentUpdateProgressFrameSchema = z
      * Homebrew tap's). Sent only after a `hello.ok` with `features.agentUpdateAvailableVersion`
      * (a 0.4.3 server's strict schema refuses it), and only by a wsmp that checks its tap's
      * version before installing: so a refusal carrying it is what proves the node can be sent
-     * that version ("Install anyway").
+     * that version ("Install anyway"). A value the node could not install (not a release
+     * version as the node reads one) is dropped: no offer, the refusal itself still stored.
      */
-    availableVersion: agentReleaseVersionSchema.optional(),
+    availableVersion: agentReleaseVersionSchema.optional().catch(undefined),
   })
   .strict()
   .refine(

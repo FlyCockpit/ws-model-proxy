@@ -5,8 +5,10 @@
 //! binary (same filesystem, never `/tmp`), verify its SHA-256 (and, later, a
 //! signature), unpack it with the system `tar`, require `wsmp.new --version`
 //! to print exactly the requested version, keep a rollback copy
-//! (`wsmp.prev`), write `<state>/update/state.json`, arm a dead-man job that
-//! runs the *previous* binary at the deadline, swap the files, and exit with
+//! (`wsmp.prev`) and the dead-man's own copy of it (`.wsmp-recovery-<id>`,
+//! which nothing moves), write `<state>/update/state.json`, arm a dead-man job
+//! that runs that copy of the *previous* binary at the deadline, swap the
+//! files, and exit with
 //! [`crate::exit::ExitCode::RestartForUpdate`]. The new binary confirms after
 //! `hello.ok`, the definition sync and 30 s alive; it then disarms the
 //! dead-man. A new build that never confirms is rolled back by the dead-man

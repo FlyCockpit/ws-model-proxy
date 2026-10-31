@@ -656,7 +656,8 @@ pub fn run_script(
     whole.extend_from_slice(env);
     let Invocation { program, line } = invocation(shell, script, argv, &whole, false)
         .map_err(|_| crate::bounded_run::RunError::Spawn)?;
-    let program = program.to_string_lossy();
+    // The program's path as it is (never as text: a path that is not valid UTF-16 would name
+    // another file).
     match line {
         ShellLine::List(args) => crate::bounded_run::run_until_env(
             &program,

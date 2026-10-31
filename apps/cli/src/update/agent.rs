@@ -15,6 +15,7 @@ use crate::protocol::frames::{
     DefinitionSync, InstallMethod, NodeFrame, UpdatePhase, UpdateReason,
 };
 use crate::protocol::runtime_spec::{RemoteUpdates, SelfUpdateFeatures, UpdateStrategy};
+use crate::startup::TrustWatch;
 
 /// A new build confirms after `hello.ok`, the definition sync and this long alive.
 pub const CONFIRM_ALIVE: Duration = Duration::from_secs(30);
@@ -175,7 +176,6 @@ enum Event {
 }
 
 /// What the worker and the relay loop share.
-#[derive(Default)]
 struct Shared {
     /// No runtime instance runs (set by the relay loop while the worker waits).
     no_instances: AtomicBool,
@@ -189,8 +189,39 @@ struct Shared {
     /// From the last idle check to the restart: the relay starts no runtime
     /// launch and no node command, so the node stays idle.
     hold: AtomicBool,
-    /// The node lost Full control: the update stops at its next step.
+    /// The node lost Full control (seen by the relay loop's poll): the update
+    /// stops at its next step.
     lowered: AtomicBool,
+    /// The daemon's own trust, as this update was asked under it
+    /// ([`TerminalStartup::trust_watch`](crate::startup::TerminalStartup::trust_watch)):
+    /// revoked at the lowering itself, not at the next poll, and for good.
+    trust: TrustWatch,
+}
+
+impl Shared {
+    fn new(trust: TrustWatch) -> Self {
+        Self {
+            no_instances: AtomicBool::new(false),
+            no_commands: AtomicBool::new(false),
+            waiting: AtomicBool::new(false),
+            force: AtomicBool::new(false),
+            hold: AtomicBool::new(false),
+            lowered: AtomicBool::new(false),
+            trust,
+        }
+    }
+
+    /// The node is not at Full control for this update any more.
+    fn revoked(&self) -> bool {
+        self.lowered.load(Ordering::SeqCst) || self.trust.revoked()
+    }
+}
+
+#[cfg(test)]
+impl Default for Shared {
+    fn default() -> Self {
+        Self::new(TrustWatch::full_for_tests())
+    }
 }
 
 struct Worker {
@@ -337,8 +368,14 @@ impl DaemonUpdate {
     }
 
     /// Answer an `agent.update`: frames to send now (a refusal), or nothing
-    /// while a worker installs it.
-    pub fn request(&mut self, frame: UpdateFrame, gate: &Gate) -> Vec<NodeFrame> {
+    /// while a worker installs it. `trust`: the daemon's trust, taken before
+    /// `gate` was read; the worker asks it at every step.
+    pub fn request(
+        &mut self,
+        frame: UpdateFrame,
+        gate: &Gate,
+        trust: TrustWatch,
+    ) -> Vec<NodeFrame> {
         let refused_id = frame.update_id.clone();
         let refuse = |reason: UpdateReason, detail: String| {
             vec![progress_frame(
@@ -369,6 +406,11 @@ impl DaemonUpdate {
                 "the last update has not confirmed yet".into(),
             );
         }
+        // Lowered since the watch was taken (after `gate` read Full control).
+        let gate = &Gate {
+            full_control: gate.full_control && !trust.revoked(),
+            ..*gate
+        };
         let strategy = match check_gate(gate, &frame.version) {
             Ok(strategy) => strategy,
             Err((reason, detail)) => return refuse(reason, detail),
@@ -381,7 +423,7 @@ impl DaemonUpdate {
             );
         };
         let (tx, rx) = mpsc::channel();
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared::new(trust));
         shared.force.store(frame.force, Ordering::SeqCst);
         let worker_shared = Arc::clone(&shared);
         let update_id = frame.update_id.clone();
@@ -494,7 +536,9 @@ impl DaemonUpdate {
 
     /// Frames to send now (only while registered), and whether to exit for
     /// the restart into a new build. `full_control` is the node's trust now: a
-    /// worker of a node lowered to Relay only stops at its next step.
+    /// worker of a node lowered to Relay only stops at its next step. (The
+    /// worker sees a lowering sooner, through its [`TrustWatch`]; this latch
+    /// is a second way to the same stop.)
     pub fn poll(&mut self, full_control: bool) -> (Vec<NodeFrame>, bool) {
         if !full_control && let Some(worker) = &self.worker {
             worker.shared.lowered.store(true, Ordering::SeqCst);
@@ -634,8 +678,15 @@ fn for_server(mut frame: NodeFrame, available_version_accepted: bool) -> NodeFra
 
 /// Wait (bounded) until the node is idle: no instance runs and, unless the
 /// update is forced, no node command. A forced update's instances are stopped
-/// by the server. `false` when it did not go idle in time.
-fn wait_idle(shared: &Shared, progress: &mut dyn Progress, limit: Duration) -> bool {
+/// by the server. `false` when it did not go idle in time, or as soon as
+/// `stopped` (the node was lowered, or its operator turned remote updates
+/// off: the caller then refuses with that reason).
+fn wait_idle(
+    shared: &Shared,
+    progress: &mut dyn Progress,
+    limit: Duration,
+    stopped: &dyn Fn() -> bool,
+) -> bool {
     let idle = || {
         shared.no_instances.load(Ordering::SeqCst)
             && (shared.force.load(Ordering::SeqCst) || shared.no_commands.load(Ordering::SeqCst))
@@ -649,7 +700,7 @@ fn wait_idle(shared: &Shared, progress: &mut dyn Progress, limit: Duration) -> b
     }
     progress.report(UpdatePhase::WaitingIdle, None, None);
     let until = Instant::now() + limit;
-    while Instant::now() < until {
+    while Instant::now() < until && !stopped() {
         std::thread::sleep(Duration::from_secs(1));
         if idle() {
             shared.waiting.store(false, Ordering::SeqCst);
@@ -668,6 +719,9 @@ struct Host {
     remote: fn() -> RemoteUpdates,
     /// [`Machine::stable_service`].
     stable_service: fn(&std::path::Path) -> Result<()>,
+    /// The dead-man's scheduler ([`super::deadman::platform`]): what a self-replace arms, and
+    /// what tells whether an earlier update still has a rollback job.
+    scheduler: fn() -> Option<Box<dyn super::deadman::Scheduler>>,
 }
 
 impl Host {
@@ -676,6 +730,7 @@ impl Host {
             instances_survive: instances_survive(),
             remote: remote_setting,
             stable_service: crate::commands::service::ensure_stable_executable,
+            scheduler: super::deadman::platform,
         }
     }
 }
@@ -715,6 +770,13 @@ fn run_worker(
             return;
         }
     };
+    // An update abandoned before its swap with nothing left to finish it (no installer: this
+    // worker holds the lock; no dead-man registered) is settled here, not refused until the relay
+    // restarts. One whose dead-man or swap is still in play stays its owner's.
+    let scheduler = (host.scheduler)();
+    if let Err(error) = flow::settle_abandoned(&update_dir, scheduler.as_deref(), &lock) {
+        tracing::warn!(error = %format!("{error:#}"), "looking at an earlier update failed");
+    }
     if let Ok(Some(current)) = state::load(&update_dir)
         && current.phase.in_progress()
     {
@@ -725,39 +787,10 @@ fn run_worker(
         );
         return;
     }
-    let waited_from = Instant::now();
-    // A self-replace waits for idle before it downloads. Homebrew waits in
-    // `before_swap` instead, after its tap check: a tap without the version
-    // asked for is refused at once, not after up to 30 minutes of waiting.
-    if strategy == UpdateStrategy::SelfReplace
-        && !host.instances_survive
-        && !wait_idle(shared, &mut sink, IDLE_WAIT_MAX)
-    {
-        sink.report(
-            UpdatePhase::Refused,
-            Some(UpdateReason::Busy),
-            Some("the node did not go idle within 30 minutes".into()),
-        );
-        return;
-    }
-    // The node may have got busy during the download: hold new work, then
-    // wait (within the same limit) until it is idle again.
-    let before_swap = |progress: &mut dyn Progress| -> Result<(), String> {
-        if host.instances_survive {
-            return Ok(());
-        }
-        shared.hold.store(true, Ordering::SeqCst);
-        let left = IDLE_WAIT_MAX.saturating_sub(waited_from.elapsed());
-        if wait_idle(shared, progress, left) {
-            return Ok(());
-        }
-        shared.hold.store(false, Ordering::SeqCst);
-        Err("the node did not go idle within 30 minutes".into())
-    };
     // Full control and the operator's setting hold for the whole update, not
     // only when it was asked for.
     let proceed = || -> Result<(), (UpdateReason, String)> {
-        if shared.lowered.load(Ordering::SeqCst) {
+        if shared.revoked() {
             return Err((
                 UpdateReason::NotOwnerTrust,
                 "the node was lowered to Relay only; wsmp was not upgraded".into(),
@@ -771,7 +804,39 @@ fn run_worker(
         }
         Ok(())
     };
-    let scheduler = super::deadman::platform();
+    let waited_from = Instant::now();
+    // A self-replace waits for idle before it downloads. Homebrew waits in
+    // `before_swap` instead, after its tap check: a tap without the version
+    // asked for is refused at once, not after up to 30 minutes of waiting.
+    // A wait ends as soon as the update may not go on (F-FA-3): it refuses
+    // with that reason then, letting go of the update lock and the hold.
+    let stopped = || proceed().is_err();
+    if strategy == UpdateStrategy::SelfReplace
+        && !host.instances_survive
+        && !wait_idle(shared, &mut sink, IDLE_WAIT_MAX, &stopped)
+    {
+        let (reason, detail) = proceed().err().unwrap_or((
+            UpdateReason::Busy,
+            "the node did not go idle within 30 minutes".into(),
+        ));
+        sink.report(UpdatePhase::Refused, Some(reason), Some(detail));
+        return;
+    }
+    // The node may have got busy during the download: hold new work, then
+    // wait (within the same limit) until it is idle again.
+    let before_swap = |progress: &mut dyn Progress| -> Result<(), String> {
+        if host.instances_survive {
+            return Ok(());
+        }
+        shared.hold.store(true, Ordering::SeqCst);
+        let left = IDLE_WAIT_MAX.saturating_sub(waited_from.elapsed());
+        if wait_idle(shared, progress, left, &stopped) {
+            return Ok(());
+        }
+        shared.hold.store(false, Ordering::SeqCst);
+        // When stopped, the caller's next check refuses with the reason.
+        Err("the node did not go idle within 30 minutes".into())
+    };
     let machine = Machine {
         state_dir,
         live,
@@ -901,17 +966,25 @@ pub fn homebrew(machine: &Machine<'_>, request: &Request, progress: &mut dyn Pro
     if let Some(before_swap) = machine.before_swap
         && let Err(why) = before_swap(progress)
     {
+        // A wait the update may no longer go on ended: that reason, not busy.
+        if let Err(ended) = proceed(progress) {
+            return ended;
+        }
         return fail(progress, UpdatePhase::Refused, UpdateReason::Busy, why);
     }
     if let Err(ended) = proceed(progress) {
         return ended;
     }
+    // Idle (after a wait of up to 30 minutes, reported `waiting_idle`): from
+    // here the server's download window covers the service, `brew --prefix`
+    // and the lock wait, not what is left of the idle one.
+    progress.report(UpdatePhase::Downloading, None, None);
     // The path the service is made to start, and the one probed after the
     // upgrade: one value, so the probe runs exactly what the restart runs.
     let stable = keg.prefix.join("opt").join("wsmp").join("bin").join("wsmp");
-    // A service that would restart into the old keg's path (gone after the
-    // upgrade's cleanup, or the old build) makes the update useless: stop
-    // before the keg changes.
+    // A service that would restart into the old keg's path (still the old
+    // build after the upgrade, which keeps it: a later `brew cleanup` may
+    // remove it) makes the update useless: stop before the keg changes.
     if let Err(error) = (machine.stable_service)(&stable) {
         return fail(
             progress,
@@ -949,7 +1022,7 @@ pub fn homebrew(machine: &Machine<'_>, request: &Request, progress: &mut dyn Pro
             );
         }
     };
-    // From here the server's download deadline covers the check and the upgrade.
+    // Again: a fresh download window for the check and the upgrade.
     progress.report(UpdatePhase::Downloading, None, None);
     // Again, under the lock: someone may have run `brew update` while the node
     // waited for idle. From now until the upgrade has run, an ordinary one
@@ -1221,6 +1294,7 @@ mod tests {
                         instances_survive,
                         remote: || RemoteUpdates::Allowed,
                         stable_service: |_| Ok(()),
+                        scheduler: || None,
                     },
                 );
             });
@@ -1391,6 +1465,82 @@ mod tests {
         );
     }
 
+    /// F-FB-7: the idle wait may take up to 30 minutes, then the service, `brew
+    /// --prefix` and up to 5 minutes for Homebrew's lock follow. The server's
+    /// `waiting_idle` window (31 minutes) must not have to cover them: the node
+    /// says `downloading` as soon as it is idle, before it waits for the lock,
+    /// and again once it holds it (a fresh window for the check and the upgrade).
+    #[cfg(unix)]
+    #[test]
+    fn a_homebrew_update_reports_downloading_when_idle_before_it_waits_for_the_lock() {
+        struct Phases(std::sync::Arc<std::sync::Mutex<Vec<UpdatePhase>>>);
+        impl Progress for Phases {
+            fn report(&mut self, phase: UpdatePhase, _: Option<UpdateReason>, _: Option<String>) {
+                self.0.lock().expect("seen").push(phase);
+            }
+        }
+        let brew = FakeBrew::new("0.4.3");
+        // Another `brew update` holds Homebrew's lock while the node waits for idle.
+        std::fs::create_dir_all(
+            super::super::homebrew::TapLock::path(&brew.prefix)
+                .parent()
+                .expect("locks"),
+        )
+        .expect("locks dir");
+        let other = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(super::super::homebrew::TapLock::path(&brew.prefix))
+            .expect("lock file");
+        let held = nix::fcntl::Flock::lock(other, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .expect("held");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let snapshot = || seen.lock().expect("seen").clone();
+        let ended = std::thread::scope(|scope| {
+            let update = scope.spawn(|| {
+                // The node was busy, then went idle.
+                let idle = |progress: &mut dyn Progress| -> Result<(), String> {
+                    progress.report(UpdatePhase::WaitingIdle, None, None);
+                    Ok(())
+                };
+                let machine = brew.machine(Some(&idle));
+                let mut progress = Phases(std::sync::Arc::clone(&seen));
+                homebrew(&machine, &homebrew_request("0.4.3"), &mut progress)
+            });
+            let until = Instant::now() + Duration::from_secs(10);
+            while snapshot().len() < 3 && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Still waiting for the lock (nothing installed), and already
+            // `downloading` again since it went idle.
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                snapshot(),
+                [
+                    UpdatePhase::Downloading,
+                    UpdatePhase::WaitingIdle,
+                    UpdatePhase::Downloading
+                ]
+            );
+            assert!(!brew.marker("upgraded").exists(), "waiting for the lock");
+            drop(held);
+            update.join().expect("update")
+        });
+        assert_eq!(ended, Ended::Swapped);
+        // Once it holds the lock: `downloading` again, for the check and the upgrade.
+        assert_eq!(
+            snapshot(),
+            [
+                UpdatePhase::Downloading,
+                UpdatePhase::WaitingIdle,
+                UpdatePhase::Downloading,
+                UpdatePhase::Downloading
+            ]
+        );
+        assert_eq!(brew.installed().as_deref(), Some("0.4.3"));
+    }
+
     /// Every report's detail.
     #[cfg(unix)]
     #[derive(Default)]
@@ -1543,6 +1693,53 @@ mod tests {
         assert!(state::load(&machine.update_dir()).expect("load").is_none());
     }
 
+    /// F-FA-3 through the production worker: an earlier update left `armed` before its swap with
+    /// no rollback job (its arming and its terminal saves failed) no longer refuses every later
+    /// update "in progress" until the relay restarts. The worker, holding the update lock, settles
+    /// it and goes on (here to the tap check). Inverse: one whose swap began is still in progress.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_settles_an_update_abandoned_before_its_swap_and_goes_on() {
+        for swap_began in [false, true] {
+            let brew = FakeBrew::new("0.4.4");
+            let update_dir = brew.root.path().join("state/update");
+            let bin = brew.root.path().join("self-replace");
+            std::fs::create_dir_all(&bin).expect("bin");
+            let mut abandoned = state::sample(&bin, state::Phase::Armed);
+            abandoned.update_id = "ZZZZZZZZZZZZZZZZZZZZZZ".into();
+            std::fs::write(&abandoned.live_path, "old").expect("live");
+            if !swap_began {
+                std::fs::write(bin.join("wsmp.new"), "new").expect("new");
+            }
+            state::save(&update_dir, &abandoned).expect("save");
+            let shared = Arc::new(Shared::default());
+            shared.no_instances.store(true, Ordering::SeqCst);
+            shared.no_commands.store(true, Ordering::SeqCst);
+            let (worker, rx) = brew.worker(&shared, true);
+            let (seen, _) = worker_reports(&rx);
+            worker.join().expect("worker");
+            let stored = state::load(&update_dir).expect("load").expect("state");
+            if swap_began {
+                assert_eq!(
+                    seen,
+                    [(UpdatePhase::Refused, Some(UpdateReason::InProgress))]
+                );
+                assert_eq!(stored.phase, state::Phase::Armed);
+            } else {
+                assert_eq!(
+                    seen,
+                    [
+                        (UpdatePhase::Downloading, None),
+                        (UpdatePhase::Refused, Some(UpdateReason::VersionMismatch)),
+                    ]
+                );
+                assert_eq!(stored.update_id, "ZZZZZZZZZZZZZZZZZZZZZZ");
+                assert_eq!(stored.phase, state::Phase::Failed);
+                assert!(!bin.join("wsmp.new").exists());
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_busy_node_hears_about_the_taps_version_before_it_waits_for_idle() {
@@ -1596,6 +1793,217 @@ mod tests {
             assert!(
                 !brew.marker("upgraded").exists(),
                 "{step}: nothing installed"
+            );
+        }
+    }
+
+    /// F-FA-2 (P-BOUNDARY): trust lowered through the daemon's own authority
+    /// ([`crate::startup::TerminalStartup::lower_trust`]) while the last
+    /// version check runs, with no relay poll after it (`Shared.lowered` is
+    /// never set): the worker's check before `brew upgrade` sees the lowering
+    /// and installs nothing. Lowered and raised again before the check: that
+    /// attempt is still refused. Inverse: not lowered, the same worker
+    /// upgrades and restarts.
+    #[cfg(unix)]
+    #[test]
+    fn a_lowering_reaches_the_update_worker_without_a_poll() {
+        use crate::protocol::frames::TrustValue;
+        for case in ["lowered", "lowered-then-raised", "not-lowered"] {
+            let config = crate::config::Config {
+                trust: Some(TrustValue::Full),
+                ..crate::config::Config::default()
+            };
+            let startup = crate::startup::TerminalStartup::from_key(
+                crate::terminal_crypto::CliTerminalKey::generate().expect("key"),
+                &config,
+            );
+            let brew = FakeBrew::new("0.4.3");
+            brew.hold("info-2");
+            let shared = Arc::new(Shared::new(startup.trust_watch()));
+            shared.no_instances.store(true, Ordering::SeqCst);
+            shared.no_commands.store(true, Ordering::SeqCst);
+            let (worker, rx) = brew.worker(&shared, true);
+            assert!(brew.reached("info-2"), "{case}: the last check runs");
+            match case {
+                "lowered" => {
+                    assert!(startup.lower_trust());
+                }
+                "lowered-then-raised" => {
+                    assert!(startup.lower_trust());
+                    assert!(startup.raise_trust());
+                    assert!(startup.full_control());
+                }
+                _ => {}
+            }
+            // No poll: the relay loop's copy was never told.
+            assert!(!shared.lowered.load(Ordering::SeqCst), "{case}");
+            brew.release("info-2");
+            let (seen, restart) = worker_reports(&rx);
+            worker.join().expect("worker");
+            if case == "not-lowered" {
+                assert!(restart, "{case}: {seen:?}");
+                assert!(brew.marker("upgraded").exists(), "{case}: upgraded");
+            } else {
+                assert_eq!(
+                    seen.last(),
+                    Some(&(UpdatePhase::Refused, Some(UpdateReason::NotOwnerTrust))),
+                    "{case}: {seen:?}"
+                );
+                assert!(!restart, "{case}");
+                assert!(
+                    !brew.marker("upgraded").exists(),
+                    "{case}: nothing installed"
+                );
+            }
+        }
+    }
+
+    /// F-FA-2: an update asked under a watch that a lowering revoked since
+    /// (lowered and raised again before the frame was answered) is refused at
+    /// once. Inverse: a watch taken after the raise starts the worker.
+    #[test]
+    fn an_update_asked_under_a_revoked_watch_is_refused() {
+        use crate::protocol::frames::TrustValue;
+        let config = crate::config::Config {
+            trust: Some(TrustValue::Full),
+            ..crate::config::Config::default()
+        };
+        let startup = crate::startup::TerminalStartup::from_key(
+            crate::terminal_crypto::CliTerminalKey::generate().expect("key"),
+            &config,
+        );
+        let before = startup.trust_watch();
+        assert!(startup.lower_trust());
+        assert!(startup.raise_trust());
+        let gate = Gate {
+            full_control: startup.full_control(),
+            remote: RemoteUpdates::Allowed,
+            method: InstallMethod::Unknown,
+            has_live: true,
+            under_service: true,
+        };
+        let mut tracker = DaemonUpdate {
+            started: Instant::now(),
+            awaiting: None,
+            registered: true,
+            synced: true,
+            worker: None,
+            outbox: Vec::new(),
+            restart: false,
+            current_id: None,
+            own_sha256: None,
+            available_version_accepted: false,
+        };
+        let reason_of = |frames: Vec<NodeFrame>| match frames.as_slice() {
+            [NodeFrame::AgentUpdateProgress { reason, .. }] => *reason,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            reason_of(tracker.request(frame("CCCCCCCCCCCCCCCCCCCCCC", false), &gate, before)),
+            Some(UpdateReason::NotOwnerTrust)
+        );
+        // Inverse: the gate after that (here: the install method) decides.
+        assert_eq!(
+            reason_of(tracker.request(
+                frame("DDDDDDDDDDDDDDDDDDDDDD", false),
+                &gate,
+                startup.trust_watch()
+            )),
+            Some(UpdateReason::UnsupportedMethod)
+        );
+    }
+
+    /// F-FA-3: a worker waiting for a busy node to go idle stops waiting as
+    /// soon as the node is lowered: refused with that reason (not busy, not
+    /// after 30 minutes), nothing installed, its hold on new work let go and
+    /// the worker ended (so the update lock is free). Both waits: Homebrew's
+    /// last idle check (holding new work) and a self-replace's before its
+    /// download. Inverse: the same busy worker, not lowered, is still waiting.
+    /// Lowered through the daemon's authority (F-FA-2), with no poll after it.
+    #[cfg(unix)]
+    #[test]
+    fn a_node_lowered_while_its_update_waits_for_idle_stops_waiting() {
+        for strategy in [UpdateStrategy::Homebrew, UpdateStrategy::SelfReplace] {
+            let brew = FakeBrew::new("0.4.3");
+            let startup = crate::startup::TerminalStartup::from_key(
+                crate::terminal_crypto::CliTerminalKey::generate().expect("key"),
+                &crate::config::Config {
+                    trust: Some(crate::protocol::frames::TrustValue::Full),
+                    ..crate::config::Config::default()
+                },
+            );
+            let shared = Arc::new(Shared::new(startup.trust_watch()));
+            // Busy: an instance runs.
+            shared.no_instances.store(false, Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel();
+            let worker_shared = Arc::clone(&shared);
+            let live = brew.keg.join("bin/wsmp");
+            let state_dir = brew.root.path().join("state");
+            let worker = std::thread::spawn(move || {
+                run_worker(
+                    &frame("AAAAAAAAAAAAAAAAAAAAAA", false),
+                    strategy,
+                    live,
+                    state_dir,
+                    "test-target".into(),
+                    &tx,
+                    &worker_shared,
+                    &Host {
+                        instances_survive: false,
+                        remote: || RemoteUpdates::Allowed,
+                        stable_service: |_| Ok(()),
+                        scheduler: || None,
+                    },
+                );
+            });
+            let mut seen = Vec::new();
+            while let Ok(Event::Frame(frame)) = rx.recv_timeout(Duration::from_secs(10)) {
+                if let NodeFrame::AgentUpdateProgress { phase, reason, .. } = *frame {
+                    seen.push((phase, reason));
+                    if phase == UpdatePhase::WaitingIdle {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                seen.last(),
+                Some(&(UpdatePhase::WaitingIdle, None)),
+                "{strategy:?}"
+            );
+            // Inverse: not lowered, still waiting (and, for Homebrew, holding).
+            std::thread::sleep(Duration::from_millis(2500));
+            assert!(!worker.is_finished(), "{strategy:?}: still waiting");
+            assert_eq!(
+                shared.hold.load(Ordering::SeqCst),
+                strategy == UpdateStrategy::Homebrew,
+                "{strategy:?}"
+            );
+            let lowered_at = Instant::now();
+            assert!(startup.lower_trust());
+            let (rest, restart) = worker_reports(&rx);
+            // Checked before the join: a worker that kept waiting would hold
+            // the join for up to 30 minutes.
+            assert_eq!(
+                rest,
+                [(UpdatePhase::Refused, Some(UpdateReason::NotOwnerTrust))],
+                "{strategy:?}"
+            );
+            assert!(
+                lowered_at.elapsed() < Duration::from_secs(5),
+                "{strategy:?}"
+            );
+            worker.join().expect("worker");
+            assert!(!restart);
+            assert!(
+                !shared.hold.load(Ordering::SeqCst),
+                "{strategy:?}: hold let go"
+            );
+            assert!(!brew.marker("upgraded").exists(), "{strategy:?}");
+            assert!(
+                state::UpdateLock::acquire(&brew.root.path().join("state/update"))
+                    .expect("lock")
+                    .is_some(),
+                "{strategy:?}: the update lock is free"
             );
         }
     }
@@ -1854,21 +2262,41 @@ mod tests {
         let (shared, _tx) = waiting_worker(&mut tracker, id);
         assert!(tracker.wants_idle());
         // Another update is refused.
-        let other = tracker.request(frame("BBBBBBBBBBBBBBBBBBBBBB", true), &gate());
+        let other = tracker.request(
+            frame("BBBBBBBBBBBBBBBBBBBBBB", true),
+            &gate(),
+            TrustWatch::full_for_tests(),
+        );
         assert_eq!(reason_of(&other), Some(UpdateReason::InProgress));
         // The same one unforced: no answer, the worker goes on.
-        assert!(tracker.request(frame(id, false), &gate()).is_empty());
+        assert!(
+            tracker
+                .request(frame(id, false), &gate(), TrustWatch::full_for_tests())
+                .is_empty()
+        );
         assert!(!shared.force.load(Ordering::SeqCst));
         // With force: no answer; the server stops the instances.
-        assert!(tracker.request(frame(id, true), &gate()).is_empty());
+        assert!(
+            tracker
+                .request(frame(id, true), &gate(), TrustWatch::full_for_tests())
+                .is_empty()
+        );
         assert!(shared.force.load(Ordering::SeqCst));
         // A late force once the worker stopped waiting: still no refusal.
         shared.waiting.store(false, Ordering::SeqCst);
-        assert!(tracker.request(frame(id, true), &gate()).is_empty());
+        assert!(
+            tracker
+                .request(frame(id, true), &gate(), TrustWatch::full_for_tests())
+                .is_empty()
+        );
         // Awaiting the restart: the same id gets no answer either.
         tracker.worker = None;
         tracker.restart = true;
-        assert!(tracker.request(frame(id, true), &gate()).is_empty());
+        assert!(
+            tracker
+                .request(frame(id, true), &gate(), TrustWatch::full_for_tests())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1904,7 +2332,12 @@ mod tests {
         };
         shared.no_instances.store(true, Ordering::SeqCst);
         shared.no_commands.store(false, Ordering::SeqCst);
-        assert!(!wait_idle(&shared, &mut sink, Duration::from_millis(10)));
+        assert!(!wait_idle(
+            &shared,
+            &mut sink,
+            Duration::from_millis(10),
+            &|| false
+        ));
         assert!(matches!(
             rx.try_recv(),
             Ok(Event::Frame(frame)) if matches!(*frame, NodeFrame::AgentUpdateProgress {
@@ -1913,9 +2346,19 @@ mod tests {
             })
         ));
         shared.force.store(true, Ordering::SeqCst);
-        assert!(wait_idle(&shared, &mut sink, Duration::from_millis(10)));
+        assert!(wait_idle(
+            &shared,
+            &mut sink,
+            Duration::from_millis(10),
+            &|| false
+        ));
         shared.no_instances.store(false, Ordering::SeqCst);
-        assert!(!wait_idle(&shared, &mut sink, Duration::from_millis(10)));
+        assert!(!wait_idle(
+            &shared,
+            &mut sink,
+            Duration::from_millis(10),
+            &|| false
+        ));
     }
 
     #[test]
@@ -1939,7 +2382,11 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert!(restart);
         // A new update while the restart is pending is in progress.
-        let refused = tracker.request(frame("BBBBBBBBBBBBBBBBBBBBBB", false), &gate());
+        let refused = tracker.request(
+            frame("BBBBBBBBBBBBBBBBBBBBBB", false),
+            &gate(),
+            TrustWatch::full_for_tests(),
+        );
         assert_eq!(reason_of(&refused), Some(UpdateReason::InProgress));
     }
 }

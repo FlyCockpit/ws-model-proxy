@@ -174,7 +174,7 @@ pub(crate) fn command_line(program: &OsString, args: &[OsString]) -> OsString {
         if index > 0 {
             line.push(" ");
         }
-        line.push(quote(&part.to_string_lossy()));
+        line.push(quote(part));
     }
     line
 }
@@ -184,37 +184,61 @@ fn raw_command_line(program: &OsString, rest: &[OsString]) -> Result<OsString> {
     let [tail] = rest else {
         anyhow::bail!("a raw command line is one argument");
     };
-    let mut line = OsString::from(quote(&program.to_string_lossy()));
+    let mut line = quote(program);
     line.push(" ");
     line.push(tail);
     Ok(line)
 }
 
-fn quote(arg: &str) -> String {
-    if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\u{b}', '"']) {
-        return arg.to_string();
+/// `arg` quoted for the command line, as the OS string it is: on Windows its UTF-16 units go
+/// through as they are (a path with an unpaired surrogate keeps it, never turned into U+FFFD).
+/// Quoting only looks at ASCII units (space, tab, newline, vertical tab, `"`, `\\`).
+fn quote(arg: &std::ffi::OsStr) -> OsString {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        OsString::from_wide(&quote_units(&arg.encode_wide().collect::<Vec<_>>()))
     }
-    let mut quoted = String::from("\"");
+    #[cfg(not(windows))]
+    {
+        // No console host runs here (tests only); text is quoted the same way.
+        let units: Vec<u16> = arg.to_string_lossy().encode_utf16().collect();
+        OsString::from(String::from_utf16_lossy(&quote_units(&units)))
+    }
+}
+
+fn quote_units(arg: &[u16]) -> Vec<u16> {
+    const BACKSLASH: u16 = b'\\' as u16;
+    const QUOTE: u16 = b'"' as u16;
+    let special = |unit: &u16| {
+        [b' ', b'\t', b'\n', 0x0b, b'"']
+            .iter()
+            .any(|ch| u16::from(*ch) == *unit)
+    };
+    if !arg.is_empty() && !arg.iter().any(special) {
+        return arg.to_vec();
+    }
+    let mut quoted = vec![QUOTE];
     let mut backslashes = 0;
-    for ch in arg.chars() {
-        match ch {
-            '\\' => backslashes += 1,
-            '"' => {
+    for &unit in arg {
+        match unit {
+            BACKSLASH => backslashes += 1,
+            QUOTE => {
                 // Backslashes before a quote are doubled, and the quote escaped.
-                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
-                quoted.push('"');
+                quoted.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2 + 1));
+                quoted.push(QUOTE);
                 backslashes = 0;
             }
             _ => {
-                quoted.extend(std::iter::repeat_n('\\', backslashes));
-                quoted.push(ch);
+                quoted.extend(std::iter::repeat_n(BACKSLASH, backslashes));
+                quoted.push(unit);
                 backslashes = 0;
             }
         }
     }
     // Backslashes before the closing quote are doubled.
-    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
-    quoted.push('"');
+    quoted.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2));
+    quoted.push(QUOTE);
     quoted
 }
 

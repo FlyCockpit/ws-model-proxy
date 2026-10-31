@@ -25,7 +25,8 @@ pub struct TerminalStartup {
     identity: Option<CliIdentity>,
     allow_human_terminal: bool,
     /// Full control until lowered; a lowering latches for the daemon's life.
-    full: std::sync::atomic::AtomicBool,
+    /// Shared with whatever must see a lowering at once (an update worker).
+    trust: std::sync::Arc<TrustAuthority>,
     require_terminal_approval: bool,
     max_terminals: usize,
     allow_file_tools_as_root: bool,
@@ -37,6 +38,51 @@ pub struct TerminalStartup {
     /// The shells a browser terminal may start, the default first (none on
     /// Unix: the login shell). Found once, as the relay starts.
     shells: Vec<crate::shells::Shell>,
+}
+
+/// The daemon's trust: the one value every lowering changes
+/// ([`TerminalStartup::lower_trust`]), and how many lowerings there were.
+pub struct TrustAuthority {
+    full: std::sync::atomic::AtomicBool,
+    lowerings: std::sync::atomic::AtomicU64,
+}
+
+/// Full control as one piece of work started under it
+/// ([`TerminalStartup::trust_watch`]): it holds while the daemon is at Full
+/// control and has not been lowered since the watch was taken. Read on any
+/// thread, at the moment of each step; no poll in between.
+#[derive(Clone)]
+pub struct TrustWatch {
+    authority: std::sync::Arc<TrustAuthority>,
+    lowerings: u64,
+}
+
+impl TrustWatch {
+    /// The node was lowered since this watch was taken (even if it was
+    /// raised again since), or it is not at Full control now.
+    pub fn revoked(&self) -> bool {
+        !self
+            .authority
+            .full
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .authority
+                .lowerings
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != self.lowerings
+    }
+
+    /// Test-only: a watch on a daemon at Full control that nothing lowers.
+    #[cfg(test)]
+    pub fn full_for_tests() -> Self {
+        Self {
+            authority: std::sync::Arc::new(TrustAuthority {
+                full: std::sync::atomic::AtomicBool::new(true),
+                lowerings: std::sync::atomic::AtomicU64::new(0),
+            }),
+            lowerings: 0,
+        }
+    }
 }
 
 impl TerminalStartup {
@@ -67,9 +113,12 @@ impl TerminalStartup {
             key,
             identity: None,
             allow_human_terminal: config.allow_human_terminal,
-            full: std::sync::atomic::AtomicBool::new(
-                crate::trust::at_startup(config) == TrustValue::Full,
-            ),
+            trust: std::sync::Arc::new(TrustAuthority {
+                full: std::sync::atomic::AtomicBool::new(
+                    crate::trust::at_startup(config) == TrustValue::Full,
+                ),
+                lowerings: std::sync::atomic::AtomicU64::new(0),
+            }),
             require_terminal_approval: config.require_terminal_approval,
             max_terminals: usize::try_from(config.effective_max_terminals()).unwrap_or(usize::MAX),
             allow_file_tools_as_root: config.allow_file_tools_as_root,
@@ -107,15 +156,38 @@ impl TerminalStartup {
         }
     }
 
-    /// Relay only from now on. Returns whether trust changed.
+    /// Relay only from now on. Returns whether trust changed. Every
+    /// [`TrustWatch`] taken before this call is revoked when it returns, for
+    /// good: a later [`Self::raise_trust`] does not give it back.
     pub fn lower_trust(&self) -> bool {
-        self.full.swap(false, std::sync::atomic::Ordering::SeqCst)
+        self.trust
+            .lowerings
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.trust
+            .full
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Full control again: only after `wsmp trust full` passed the control
     /// socket's peer check and was persisted. Returns whether trust changed.
     pub fn raise_trust(&self) -> bool {
-        !self.full.swap(true, std::sync::atomic::Ordering::SeqCst)
+        !self
+            .trust
+            .full
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A handle on this daemon's trust for work that runs on its own thread
+    /// (an update): revoked from the moment trust is lowered, whatever
+    /// happens to trust after that. Take it before checking Full control.
+    pub fn trust_watch(&self) -> TrustWatch {
+        TrustWatch {
+            lowerings: self
+                .trust
+                .lowerings
+                .load(std::sync::atomic::Ordering::SeqCst),
+            authority: std::sync::Arc::clone(&self.trust),
+        }
     }
 
     pub fn runtime_hosts(&self) -> Vec<String> {
@@ -133,7 +205,7 @@ impl TerminalStartup {
 
     /// Full control: definitions, commands, file ops and browser terminals.
     pub fn full_control(&self) -> bool {
-        self.full.load(std::sync::atomic::Ordering::SeqCst)
+        self.trust.full.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The hello / `node.state` trust: frozen exactly at Relay only.
@@ -365,6 +437,32 @@ mod tests {
             assert!(startup.lower_trust());
             assert!(!startup.full_control());
         }
+    }
+
+    /// F-FA-2: a watch is revoked the moment trust is lowered, and stays
+    /// revoked when trust is raised again; a watch taken after that holds.
+    #[test]
+    fn a_lowering_revokes_every_earlier_trust_watch_for_good() {
+        let config = Config {
+            trust: Some(TrustValue::Full),
+            ..Config::default()
+        };
+        let startup = TerminalStartup::from_key(key(), &config);
+        let watch = startup.trust_watch();
+        assert!(!watch.revoked());
+        assert!(startup.lower_trust());
+        assert!(watch.revoked());
+        assert!(startup.raise_trust());
+        assert!(startup.full_control());
+        assert!(
+            watch.revoked(),
+            "raised again: the earlier watch stays revoked"
+        );
+        let after = startup.trust_watch();
+        assert!(!after.revoked());
+        // A watch taken at Relay only never holds.
+        assert!(startup.lower_trust());
+        assert!(startup.trust_watch().revoked());
     }
 
     #[test]

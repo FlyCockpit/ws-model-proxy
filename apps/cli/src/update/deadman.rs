@@ -1,6 +1,10 @@
 //! The dead-man (D1): a job, separate from the relay service, that runs the
-//! *previous* binary at the deadline: `<wsmp.prev> update rollback
-//! --if-unconfirmed <updateId>`. It is armed before the swap, so a new build
+//! *previous* binary at the deadline: `<recovery copy> update rollback
+//! --if-unconfirmed <updateId>`. Its program is the recovery copy
+//! (`.wsmp-recovery-<updateId>`, the previous binary's bytes;
+//! [`super::install::prepare_recovery`]), never `wsmp.prev` itself: the
+//! restore consumes `wsmp.prev`, and a job whose relay restart failed must
+//! still be able to run again. It is armed before the swap, so a new build
 //! that cannot even start cannot disarm it.
 //!
 //! - Linux and WSL: a systemd user timer and service written beside the relay's
@@ -44,28 +48,96 @@ pub fn windows_task_name(user: &str) -> String {
 /// The Windows dead-man's early run: start the relay task again after the exit 75.
 pub const WINDOWS_KICK_AFTER: Duration = Duration::from_secs(5);
 
-/// What one dead-man runs, and when.
+/// What one dead-man runs, and when. Built only with [`DeadmanSpec::new`],
+/// which makes every path that goes into the job absolute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadmanSpec {
-    pub update_id: String,
-    /// The previous binary (the rollback copy).
-    pub prev: PathBuf,
+    update_id: String,
+    /// The program the job runs: the recovery copy of the previous binary
+    /// (never the rollback copy, which the restore consumes).
+    program: PathBuf,
     /// Passed as `--state-dir`: the job's environment is not the service's.
-    pub state_dir: PathBuf,
-    pub fire_in: Duration,
+    state_dir: PathBuf,
+    fire_in: Duration,
+}
+
+/// `path` resolved against this process's working directory
+/// ([`std::path::absolute`]: no symlink is followed and the bytes of the
+/// path are kept). An empty path is refused.
+fn job_path(what: &str, path: &Path) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !path.as_os_str().is_empty(),
+        "{what} is empty; nothing was written"
+    );
+    std::path::absolute(path).with_context(|| {
+        format!(
+            "{what} `{}` could not be made absolute; nothing was written",
+            path.display()
+        )
+    })
 }
 
 impl DeadmanSpec {
-    /// `update rollback --if-unconfirmed <id> --state-dir <dir>` (after the program).
-    pub fn rollback_args(&self) -> Vec<String> {
-        vec![
+    /// The one way to build a spec. The scheduler starts the job in a working
+    /// directory of its own (systemd: the user's home; launchd: `/`; Task
+    /// Scheduler: `System32`), so a relative state directory or previous
+    /// program would name another place there: a rollback that finds no
+    /// update, exits 0 and leaves the failed build live. Both are resolved
+    /// here, in the updater's context, before anything is armed; the log and
+    /// task-file paths derive from the state directory. An empty path is an
+    /// error.
+    pub fn new(
+        update_id: String,
+        program: &Path,
+        state_dir: &Path,
+        fire_in: Duration,
+    ) -> Result<Self> {
+        Ok(Self {
+            update_id,
+            program: job_path("the rollback job's wsmp", program)?,
+            state_dir: job_path("the update state directory", state_dir)?,
+            fire_in,
+        })
+    }
+
+    pub fn update_id(&self) -> &str {
+        &self.update_id
+    }
+
+    /// The program the job runs.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    pub fn fire_in(&self) -> Duration {
+        self.fire_in
+    }
+
+    /// `update rollback --if-unconfirmed <id> --state-dir <dir>` (after the
+    /// program). The state directory must be exact UTF-8 text
+    /// ([`crate::commands::service::path_text`]): an error otherwise, before
+    /// any job is written, rather than a job that looks in another
+    /// directory, finds no update there and rolls nothing back.
+    pub fn rollback_args(&self) -> Result<Vec<String>> {
+        let state_dir =
+            crate::commands::service::path_text("the update state directory", &self.state_dir)?;
+        Ok(vec![
             "update".into(),
             "rollback".into(),
             "--if-unconfirmed".into(),
             self.update_id.clone(),
             "--state-dir".into(),
-            self.state_dir.display().to_string(),
-        ]
+            state_dir.to_string(),
+        ])
+    }
+
+    /// The program as exact text ([`Self::rollback_args`]).
+    pub fn program_text(&self) -> Result<&str> {
+        crate::commands::service::path_text("the rollback job's wsmp", &self.program)
     }
 }
 
@@ -124,44 +196,81 @@ const OUTPUT_LIMIT: usize = 1 << 20;
 
 /// Run a short management command with a deadline; its status, stdout and
 /// stderr. It goes through [`crate::bounded_run::run_managed`]: both pipes are
-/// drained at once (a program that fills stderr never blocks), everything it
-/// started is killed at the deadline, and a helper that holds a pipe after it
-/// exited cannot hold the call past it.
+/// drained at once (a program that fills stderr never blocks), it is killed
+/// at the deadline with its process group (Unix; a helper that detached into
+/// a session of its own is not reached) or its job (Windows), and a helper
+/// that holds a pipe after it exited cannot hold the call past it.
 pub(crate) fn run_bounded_split(
-    program: &str,
-    args: &[String],
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[impl AsRef<std::ffi::OsStr>],
     env: &[(&str, String)],
     timeout: Duration,
 ) -> Result<(bool, String, String)> {
+    let ran = run_bounded_status(program, args, env, timeout)?;
+    Ok((ran.code == Some(0), ran.stdout, ran.stderr))
+}
+
+/// How a [`run_bounded_status`] command ended: it ran to its end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Exited {
+    /// Its exit code; `None` when a signal ended it.
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// [`run_bounded_split`] with the exit code: `Ok` only for a command that
+/// ran to its end (whatever its status); an error when it could not be
+/// started, ran out of time, or was stopped, so nothing is known of what it
+/// would have said.
+pub(crate) fn run_bounded_status(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[impl AsRef<std::ffi::OsStr>],
+    env: &[(&str, String)],
+    timeout: Duration,
+) -> Result<Exited> {
+    let ran = run_bounded_bytes(program, args, env, timeout)?;
+    Ok(Exited {
+        code: ran.code,
+        stdout: String::from_utf8_lossy(&ran.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&ran.stderr).into_owned(),
+    })
+}
+
+/// [`run_bounded_status`] with stdout and stderr exactly as the program
+/// wrote them (for output that must be read byte for byte, like a path).
+pub(crate) fn run_bounded_bytes(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[impl AsRef<std::ffi::OsStr>],
+    env: &[(&str, String)],
+    timeout: Duration,
+) -> Result<crate::bounded_run::Managed> {
     use crate::bounded_run::{RunError, run_managed};
+    let program = program.as_ref();
+    // The program runs exactly as named; only the messages show it as text.
+    let shown = Path::new(program).display();
     match run_managed(program, args, env, timeout, OUTPUT_LIMIT) {
-        Ok(ran) => Ok((
-            ran.success,
-            String::from_utf8_lossy(&ran.stdout).into_owned(),
-            String::from_utf8_lossy(&ran.stderr).into_owned(),
-        )),
-        Err(RunError::Spawn) => Err(anyhow::anyhow!("running `{program}`: it could not start")),
+        Ok(ran) => Ok(ran),
+        Err(RunError::Spawn) => Err(anyhow::anyhow!("running `{shown}`: it could not start")),
         Err(RunError::Timeout) => Err(anyhow::anyhow!(
-            "`{program}` did not finish within {} s",
+            "`{shown}` did not finish within {} s",
             timeout.as_secs()
         )),
-        Err(RunError::Cancelled) => {
-            Err(anyhow::anyhow!("`{program}` was stopped: wsmp is exiting"))
-        }
+        Err(RunError::Cancelled) => Err(anyhow::anyhow!("`{shown}` was stopped: wsmp is exiting")),
         Err(RunError::Resources) => Err(anyhow::anyhow!(
-            "running `{program}`: too many commands are running or stuck; try again later"
+            "running `{shown}`: too many commands are running or stuck; try again later"
         )),
         // A managed run returns every exit status and drops output past the limit.
         Err(RunError::ExitStatus(_) | RunError::OutputTooLarge) => {
-            Err(anyhow::anyhow!("running `{program}` failed unexpectedly"))
+            Err(anyhow::anyhow!("running `{shown}` failed unexpectedly"))
         }
     }
 }
 
 /// [`run_bounded_split`] with stdout and then stderr as one text.
 pub(crate) fn run_bounded(
-    program: &str,
-    args: &[String],
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[impl AsRef<std::ffi::OsStr>],
     env: &[(&str, String)],
     timeout: Duration,
 ) -> Result<(bool, String)> {
@@ -183,19 +292,23 @@ pub fn systemd_calendar_utc(unix_secs: u64) -> String {
 /// the rollback check, and a timer for the deadline. `Persistent=true` fires a
 /// deadline that passed while the machine was off at the next boot; the check
 /// then gives a build that came up after the reboot a full window of its own
-/// ([`super::flow::rollback_if_unconfirmed`]). An error, with nothing
+/// ([`super::flow::rollback_if_unconfirmed`]). The service runs again a
+/// minute after a run that exits nonzero (`Restart=on-failure`): the run whose
+/// relay restart failed after a rollback, or that could not record it, keeps
+/// the job, and the next run finishes it. A run that exits 0, or the job's own
+/// removal (the timer disabled, the files gone), is not repeated. An error, with nothing
 /// rendered, for a program or argument systemd would read differently
-/// ([`crate::commands::service::systemd_exec_path`]).
+/// ([`crate::commands::service::systemd_exec_path`],
+/// [`crate::commands::service::systemd_exec_arg`]: a `$` in an argument is
+/// written `$$`, so systemd passes it as it is) or a path that is not exact
+/// text ([`DeadmanSpec::rollback_args`]).
 pub fn systemd_units(spec: &DeadmanSpec, deadline_unix: u64) -> Result<(String, String)> {
-    let prev = spec
-        .prev
-        .to_str()
-        .with_context(|| format!("`{}` is not valid UTF-8", spec.prev.display()))?;
-    let exec: Vec<String> = std::iter::once(crate::commands::service::systemd_exec_path(prev))
+    use crate::commands::service::{systemd_exec_arg, systemd_exec_path};
+    let exec: Vec<String> = std::iter::once(systemd_exec_path(spec.program_text()?))
         .chain(
-            spec.rollback_args()
+            spec.rollback_args()?
                 .iter()
-                .map(|arg| crate::commands::service::systemd_quote_arg(arg)),
+                .map(|arg| systemd_exec_arg(arg)),
         )
         .collect::<Result<_>>()?;
     let service = format!(
@@ -205,7 +318,9 @@ pub fn systemd_units(spec: &DeadmanSpec, deadline_unix: u64) -> Result<(String, 
          [Service]\n\
          Type=simple\n\
          ExecStart={exec}\n\
-         TimeoutStartSec=infinity\n",
+         TimeoutStartSec=infinity\n\
+         Restart=on-failure\n\
+         RestartSec=60\n",
         id = spec.update_id,
         exec = exec.join(" "),
     );
@@ -350,9 +465,13 @@ impl Scheduler for SystemdTimer {
 
 // ── macOS ──
 
-/// The one-shot LaunchAgent that runs the rollback command (which sleeps
-/// until the deadline itself). Each value is plist text
-/// ([`crate::commands::service::plist_text`]): an error, with nothing
+/// The LaunchAgent that runs the rollback command (which sleeps until the
+/// deadline itself), once, and again a minute after a run that exits nonzero
+/// (`KeepAlive`/`SuccessfulExit` false, `ThrottleInterval`): a rollback whose
+/// relay restart failed, or that could not be recorded, is finished by the
+/// next run. Removing the agent (`bootout`) ends it. Each value is plist text
+/// ([`crate::commands::service::plist_text`]), each path exact text
+/// ([`crate::commands::service::path_text`]): an error, with nothing
 /// rendered, for one XML cannot carry.
 pub fn render_macos_plist(
     label: &str,
@@ -360,8 +479,11 @@ pub fn render_macos_plist(
     args: &[String],
     log: &Path,
 ) -> Result<String> {
+    use crate::commands::service::path_text;
     let escape = crate::commands::service::plist_text;
-    let arguments: String = std::iter::once(program.display().to_string())
+    let program = path_text("the rollback job's wsmp", program)?;
+    let log = path_text("the dead-man log path", log)?;
+    let arguments: String = std::iter::once(program.to_string())
         .chain(args.iter().cloned())
         .map(|arg| {
             Ok(format!(
@@ -384,7 +506,12 @@ pub fn render_macos_plist(
          \t<key>RunAtLoad</key>\n\
          \t<true/>\n\
          \t<key>KeepAlive</key>\n\
-         \t<false/>\n\
+         \t<dict>\n\
+         \t\t<key>SuccessfulExit</key>\n\
+         \t\t<false/>\n\
+         \t</dict>\n\
+         \t<key>ThrottleInterval</key>\n\
+         \t<integer>60</integer>\n\
          \t<key>ProcessType</key>\n\
          \t<string>Background</string>\n\
          \t<key>StandardOutPath</key>\n\
@@ -394,7 +521,7 @@ pub fn render_macos_plist(
          </dict>\n\
          </plist>\n",
         label = escape("the LaunchAgent label", label)?,
-        log = escape("the dead-man log path", &log.display().to_string())?,
+        log = escape("the dead-man log path", log)?,
     ))
 }
 
@@ -434,20 +561,19 @@ impl Scheduler for LaunchAgent {
     }
     fn register(&self, spec: &DeadmanSpec) -> Result<()> {
         let plist = Self::plist_path()?;
+        // Everything rendered and checked before anything is written.
+        let log = spec.state_dir.join("update").join("deadman.log");
+        let body = render_macos_plist(MACOS_LABEL, &spec.program, &spec.rollback_args()?, &log)?;
+        let plist_arg =
+            crate::commands::service::path_text("the dead-man LaunchAgent", &plist)?.to_string();
         if let Some(parent) = plist.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating `{}`", parent.display()))?;
         }
-        let log = spec.state_dir.join("update").join("deadman.log");
-        let body = render_macos_plist(MACOS_LABEL, &spec.prev, &spec.rollback_args(), &log)?;
         std::fs::write(&plist, body).with_context(|| format!("writing `{}`", plist.display()))?;
         let (ok, output) = run_bounded(
             "launchctl",
-            &[
-                "bootstrap".into(),
-                Self::domain(),
-                plist.display().to_string(),
-            ],
+            &["bootstrap".into(), Self::domain(), plist_arg],
             &[],
             Duration::from_secs(15),
         )?;
@@ -482,11 +608,16 @@ impl Scheduler for LaunchAgent {
 
 // ── Windows ──
 
-/// The one-shot task: a +5 s trigger (start the relay again) and the deadline
-/// trigger, both running `conhost --headless <prev> update rollback …`. The
+/// The task: a +5 s trigger (start the relay again) and the deadline
+/// trigger, both running `conhost --headless <program> update rollback …`
+/// (the recovery copy, [`DeadmanSpec::program`]). The
 /// triggers never expire: a machine off for days still runs the deadline at
 /// the next log on (`StartWhenAvailable`), and the rollback command removes
-/// the task once the update is settled.
+/// the task once the update is settled. The deadline trigger repeats every
+/// 10 minutes until then (Task Scheduler's `RestartOnFailure` is for a task
+/// that fails to start, not for a nonzero exit): a run whose relay restart
+/// failed after a rollback, or that could not record it, keeps the task, and
+/// a later run finishes it.
 pub fn render_windows_task(
     user_sid: &str,
     arguments: &str,
@@ -514,6 +645,10 @@ pub fn render_windows_task(
          \x20     <Enabled>true</Enabled>\n\
          \x20   </TimeTrigger>\n\
          \x20   <TimeTrigger>\n\
+         \x20     <Repetition>\n\
+         \x20       <Interval>PT10M</Interval>\n\
+         \x20       <StopAtDurationEnd>false</StopAtDurationEnd>\n\
+         \x20     </Repetition>\n\
          \x20     <StartBoundary>{deadline}</StartBoundary>\n\
          \x20     <Enabled>true</Enabled>\n\
          \x20   </TimeTrigger>\n\
@@ -547,15 +682,17 @@ pub fn render_windows_task(
     )
 }
 
-/// `--headless <prev> update rollback …`, quoted for the task's command line.
-pub fn windows_task_arguments(spec: &DeadmanSpec) -> String {
+/// `--headless <program> update rollback …`, quoted for the task's command
+/// line. An error for a path that is not exact text
+/// ([`DeadmanSpec::rollback_args`]).
+pub fn windows_task_arguments(spec: &DeadmanSpec) -> Result<String> {
     use crate::commands::service::windows_task::quote_arg;
-    std::iter::once("--headless".to_string())
-        .chain(std::iter::once(spec.prev.display().to_string()))
-        .chain(spec.rollback_args())
+    Ok(std::iter::once("--headless".to_string())
+        .chain(std::iter::once(spec.program_text()?.to_string()))
+        .chain(spec.rollback_args()?)
         .map(|arg| quote_arg(&arg))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" "))
 }
 
 #[cfg(windows)]
@@ -602,11 +739,14 @@ impl Scheduler for ScheduledTask {
         let sid = wsmp_windows::current_user_sid().context("reading this user's SID")?;
         let xml = render_windows_task(
             &sid,
-            &windows_task_arguments(spec),
+            &windows_task_arguments(spec)?,
             now + WINDOWS_KICK_AFTER.as_secs(),
             now + spec.fire_in.as_secs(),
         );
         let file = spec.state_dir.join("update").join("deadman-task.xml");
+        // Checked before the file is written: `schtasks` is given it.
+        let file_arg =
+            crate::commands::service::path_text("the dead-man task definition", &file)?.to_string();
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating `{}`", parent.display()))?;
@@ -617,7 +757,6 @@ impl Scheduler for ScheduledTask {
         )
         .with_context(|| format!("writing `{}`", file.display()))?;
         let name = Self::name()?;
-        let file_arg = file.display().to_string();
         let (ok, output) = Self::schtasks(&["/Create", "/TN", &name, "/XML", &file_arg, "/F"])?;
         anyhow::ensure!(
             ok,
@@ -718,6 +857,10 @@ pub(crate) mod fake {
         /// `running()` answers true this many more times.
         pub running_for: RefCell<u32>,
         pub refuse: RefCell<bool>,
+        /// Called inside `register`, after the job is registered: what
+        /// happens elsewhere while the service manager registers it.
+        #[allow(clippy::type_complexity)]
+        pub during_register: RefCell<Option<Box<dyn Fn()>>>,
     }
 
     impl Scheduler for FakeScheduler {
@@ -737,6 +880,9 @@ pub(crate) mod fake {
             anyhow::ensure!(self.registered.borrow().is_none(), "name taken");
             *self.registered.borrow_mut() = Some(spec.clone());
             *self.registrations.borrow_mut() += 1;
+            if let Some(during) = self.during_register.borrow().as_ref() {
+                during();
+            }
             Ok(())
         }
         fn remove(&self) -> Result<()> {
@@ -859,8 +1005,13 @@ mod tests {
 
     #[test]
     fn a_program_that_cannot_start_is_an_error() {
-        let error = run_bounded("wsmp-no-such-program", &[], &[], Duration::from_secs(5))
-            .expect_err("missing");
+        let error = run_bounded(
+            "wsmp-no-such-program",
+            &[] as &[&str],
+            &[],
+            Duration::from_secs(5),
+        )
+        .expect_err("missing");
         assert!(
             format!("{error:#}").contains("could not start"),
             "{error:#}"
@@ -878,9 +1029,67 @@ mod tests {
     fn spec(id: &str) -> DeadmanSpec {
         DeadmanSpec {
             update_id: id.into(),
-            prev: PathBuf::from("/home/u/.cargo/bin/wsmp.prev"),
+            program: PathBuf::from("/home/u/.cargo/bin/.wsmp-recovery-abc"),
             state_dir: PathBuf::from("/home/u/.local/state/ws-model-proxy"),
             fire_in: Duration::from_secs(90),
+        }
+    }
+
+    /// R7-B-1: a relative previous binary or state directory is resolved
+    /// against this process's working directory when the spec is built (the
+    /// scheduler starts the job elsewhere); an absolute one keeps its bytes
+    /// (`$`, spaces, not UTF-8); an empty one is refused.
+    #[test]
+    fn a_spec_makes_its_paths_absolute_and_refuses_an_empty_one() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let relative = DeadmanSpec::new(
+            "abc".into(),
+            Path::new("bin/wsmp.prev"),
+            Path::new("relative-state"),
+            Duration::from_secs(90),
+        )
+        .expect("relative");
+        assert_eq!(relative.program(), cwd.join("bin/wsmp.prev"));
+        assert_eq!(relative.state_dir(), cwd.join("relative-state"));
+        assert!(relative.state_dir().is_absolute() && relative.program().is_absolute());
+        let args = relative.rollback_args().expect("args");
+        assert_eq!(
+            args.last().map(String::as_str),
+            cwd.join("relative-state").to_str()
+        );
+
+        let absolute = spec("abc");
+        let kept = DeadmanSpec::new(
+            "abc".into(),
+            absolute.program(),
+            absolute.state_dir(),
+            absolute.fire_in(),
+        )
+        .expect("absolute");
+        assert_eq!(kept, absolute);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"/tmp/${HOME}/$$/a b%/state-\xff");
+            let kept = DeadmanSpec::new(
+                "abc".into(),
+                Path::new("/tmp/wsmp.prev"),
+                Path::new(raw),
+                Duration::from_secs(1),
+            )
+            .expect("raw");
+            assert_eq!(kept.state_dir().as_os_str(), raw);
+        }
+
+        for (prev, state) in [("", "/tmp/state"), ("/tmp/wsmp.prev", "")] {
+            let error = DeadmanSpec::new(
+                "abc".into(),
+                Path::new(prev),
+                Path::new(state),
+                Duration::from_secs(1),
+            )
+            .expect_err("empty");
+            assert!(format!("{error:#}").contains("is empty"), "{error:#}");
         }
     }
 
@@ -936,12 +1145,18 @@ mod tests {
         let (service, timer) = systemd_units(&spec("abc"), 1_793_188_890).expect("units");
         assert!(
             service.contains(
-                "ExecStart=/home/u/.cargo/bin/wsmp.prev update rollback --if-unconfirmed abc \
+                "ExecStart=/home/u/.cargo/bin/.wsmp-recovery-abc update rollback --if-unconfirmed abc \
                  --state-dir /home/u/.local/state/ws-model-proxy\n"
             ),
             "{service}"
         );
         assert!(service.contains("TimeoutStartSec=infinity\n"), "{service}");
+        // F-FA-5: a run that exits nonzero (its relay restart failed after a rollback) runs
+        // again, so the job is not a one-shot recovery that a failure ends.
+        assert!(
+            service.contains("Restart=on-failure\nRestartSec=60\n"),
+            "{service}"
+        );
         assert!(
             timer.contains("OnCalendar=2026-10-28 12:01:30 UTC\n"),
             "{timer}"
@@ -956,18 +1171,23 @@ mod tests {
     }
 
     #[test]
-    fn the_macos_dead_man_is_a_one_shot_agent() {
+    fn the_macos_dead_man_runs_once_and_again_after_a_failed_run() {
         let plist = render_macos_plist(
             MACOS_LABEL,
-            Path::new("/Users/u/.cargo/bin/wsmp.prev"),
-            &spec("abc").rollback_args(),
+            Path::new("/Users/u/.cargo/bin/.wsmp-recovery-abc"),
+            &spec("abc").rollback_args().expect("args"),
             Path::new("/tmp/log & more"),
         )
         .expect("plist");
         assert!(plist.contains("<string>com.flycockpit.wsmp.update-deadman</string>"));
-        assert!(plist.contains("<string>/Users/u/.cargo/bin/wsmp.prev</string>"));
+        assert!(plist.contains("<string>/Users/u/.cargo/bin/.wsmp-recovery-abc</string>"));
         assert!(plist.contains("<string>--if-unconfirmed</string>\n\t\t<string>abc</string>"));
-        assert!(plist.contains("<key>KeepAlive</key>\n\t<false/>"));
+        // F-FA-5: relaunched only after a nonzero exit, at most once a minute.
+        assert!(plist.contains(
+            "<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>"
+        ));
+        assert!(plist.contains("<key>ThrottleInterval</key>\n\t<integer>60</integer>"));
+        assert!(plist.contains("<key>RunAtLoad</key>\n\t<true/>"));
         assert!(plist.contains("/tmp/log &amp; more"));
     }
 
@@ -982,29 +1202,179 @@ mod tests {
         assert!(format!("{error:#}").contains("U+000A"), "{error:#}");
         let error = render_macos_plist(
             MACOS_LABEL,
-            &bad.prev,
-            &bad.rollback_args(),
+            &bad.program,
+            &bad.rollback_args().expect("args"),
             Path::new("/tmp/log"),
         )
         .expect_err("newline");
         assert!(format!("{error:#}").contains("U+000A"), "{error:#}");
         let mut quoted = spec("abc");
-        quoted.prev = PathBuf::from("/home/u/a\"b/wsmp.prev");
+        quoted.program = PathBuf::from("/home/u/a\"b/wsmp.prev");
         assert!(systemd_units(&quoted, 1_793_188_890).is_err());
         let mut nul = spec("abc");
-        nul.prev = PathBuf::from("/home/u/wsmp\0.prev");
+        nul.program = PathBuf::from("/home/u/wsmp\0.prev");
         assert!(systemd_units(&nul, 1_793_188_890).is_err());
+    }
+
+    /// R6-B-2 / R6-A-1: a `$` in a dead-man argument is written `$$`, so
+    /// systemd (which expands `${NAME}` and `$NAME` in `ExecStart=`
+    /// arguments, inside quotes too) passes the state directory as it is. The
+    /// program path keeps its `$` (systemd runs it as written), and `%`,
+    /// spaces and quotes are written as before.
+    #[test]
+    fn a_dollar_in_a_dead_man_argument_reaches_the_rollback_as_it_is() {
+        let mut odd = spec("abc");
+        odd.program = PathBuf::from("/home/u/$HOME/wsmp.prev");
+        odd.state_dir = PathBuf::from("/tmp/${HOME}/$$/a b%/\"q\"");
+        let (service, _) = systemd_units(&odd, 1_793_188_890).expect("units");
+        assert!(
+            service.contains(
+                "ExecStart=\"/home/u/$HOME/wsmp.prev\" update rollback --if-unconfirmed abc \
+                 --state-dir \"/tmp/$${HOME}/$$$$/a b%%/\\\"q\\\"\"\n"
+            ),
+            "{service}"
+        );
+    }
+
+    /// R5-A-1 sibling / R6-A-2: a path that is not UTF-8 (the state
+    /// directory, the previous binary, the macOS log) is refused before
+    /// anything is rendered: `display()` would have written U+FFFD and so
+    /// armed a job that looks in another directory, finds no update and rolls
+    /// nothing back.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_text_is_refused_before_any_job_is_rendered() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = |bytes: &[u8]| PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()));
+        let mut state = spec("abc");
+        state.state_dir = raw(b"/tmp/state-\xff");
+        let mut prev = spec("abc");
+        prev.program = raw(b"/tmp/wsmp\xfe.prev");
+        for bad in [&state, &prev] {
+            assert!(systemd_units(bad, 1_793_188_890).is_err(), "{bad:?}");
+            assert!(windows_task_arguments(bad).is_err(), "{bad:?}");
+        }
+        let error = state.rollback_args().expect_err("state");
+        assert!(
+            format!("{error:#}").contains("not valid UTF-8"),
+            "{error:#}"
+        );
+        let args = spec("abc").rollback_args().expect("args");
+        assert!(
+            render_macos_plist(MACOS_LABEL, &prev.program, &args, Path::new("/tmp/l")).is_err()
+        );
+        assert!(
+            render_macos_plist(
+                MACOS_LABEL,
+                Path::new("/tmp/wsmp.prev"),
+                &args,
+                &raw(b"/tmp/log-\x80")
+            )
+            .is_err()
+        );
+    }
+
+    /// R5-A-1 sibling / R6-B-2, through the real Linux registration (in a
+    /// child, with `XDG_CONFIG_HOME` in a temp dir and a fake `systemctl`
+    /// that logs its calls): a state directory that is not UTF-8 is refused
+    /// with no unit written and no `systemctl` run; one with `${HOME}`,
+    /// `$$`, `%` and a space is registered with `$` written `$$`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registration_refuses_a_path_that_is_not_text_and_keeps_dollars() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        if let Some(out) = std::env::var_os("WSMP_TEST_DEADMAN_RESULT") {
+            // The update id too, for a probe outside the tests (an empty one).
+            let mut bad =
+                spec(&std::env::var("WSMP_TEST_DEADMAN_ID").unwrap_or_else(|_| "abc".into()));
+            bad.state_dir = PathBuf::from(std::ffi::OsString::from_vec(
+                std::env::var_os("WSMP_TEST_DEADMAN_STATE")
+                    .expect("state")
+                    .as_bytes()
+                    .to_vec(),
+            ));
+            let result = SystemdTimer.register(&bad);
+            std::fs::write(out, format!("{result:?}")).expect("result");
+            return;
+        }
+        let root = tempfile::tempdir().expect("root");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).expect("bin");
+        let systemctl = bin.join("systemctl");
+        std::fs::write(
+            &systemctl,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$WSMP_TEST_CALLS\"\nexit 0\n",
+        )
+        .expect("systemctl");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let register = |case: &str, state: &[u8]| {
+            let dir = root.path().join(case);
+            let result = dir.join("result");
+            let calls = dir.join("calls");
+            std::fs::create_dir(&dir).expect("dir");
+            let child = std::process::Command::new(std::env::current_exe().expect("exe"))
+                .args([
+                    "--exact",
+                    "update::deadman::tests::registration_refuses_a_path_that_is_not_text_and_keeps_dollars",
+                    "--nocapture",
+                ])
+                .env("WSMP_TEST_DEADMAN_RESULT", &result)
+                .env(
+                    "WSMP_TEST_DEADMAN_STATE",
+                    std::ffi::OsStr::from_bytes(state),
+                )
+                .env("WSMP_TEST_CALLS", &calls)
+                .env("XDG_CONFIG_HOME", dir.join("config"))
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .output()
+                .expect("child");
+            assert!(
+                child.status.success(),
+                "{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            let units = dir.join("config/systemd/user");
+            (
+                std::fs::read_to_string(result).expect("result"),
+                std::fs::read_to_string(units.join(format!("{LINUX_UNIT}.service"))).ok(),
+                std::fs::read_to_string(calls).unwrap_or_default(),
+            )
+        };
+
+        let (result, unit, calls) = register("nonutf8", b"/tmp/state-\xff");
+        assert!(
+            result.contains("not valid UTF-8") && result.contains("nothing was written"),
+            "{result}"
+        );
+        assert_eq!(unit, None);
+        assert_eq!(calls, "");
+
+        let (result, unit, calls) = register("dollar", b"/tmp/${HOME}/$$/a b%");
+        assert_eq!(result, "Ok(())");
+        let unit = unit.expect("unit");
+        assert!(
+            unit.contains("--state-dir \"/tmp/$${HOME}/$$$$/a b%%\"\n"),
+            "{unit}"
+        );
+        assert!(
+            calls.contains("enable --now wsmp-update-deadman.timer"),
+            "{calls}"
+        );
     }
 
     #[test]
     fn the_windows_dead_man_kicks_then_rolls_back() {
         let mut windows = spec("abc");
-        windows.prev = PathBuf::from(r"C:\Users\A B\.cargo\bin\wsmp.prev.exe");
+        windows.program = PathBuf::from(r"C:\Users\A B\.cargo\bin\.wsmp-recovery-abc.exe");
         windows.state_dir = PathBuf::from(r"C:\Users\A B\AppData\Local\ws-model-proxy");
-        let arguments = windows_task_arguments(&windows);
+        let arguments = windows_task_arguments(&windows).expect("arguments");
         assert_eq!(
             arguments,
-            r#"--headless "C:\Users\A B\.cargo\bin\wsmp.prev.exe" update rollback --if-unconfirmed abc --state-dir "C:\Users\A B\AppData\Local\ws-model-proxy""#
+            r#"--headless "C:\Users\A B\.cargo\bin\.wsmp-recovery-abc.exe" update rollback --if-unconfirmed abc --state-dir "C:\Users\A B\AppData\Local\ws-model-proxy""#
         );
         let xml = render_windows_task("S-1-5-21-1", &arguments, 1_700_000_005, 1_700_000_090);
         assert!(xml.contains("<StartBoundary>2023-11-14T22:13:25Z</StartBoundary>"));
@@ -1013,6 +1383,17 @@ mod tests {
         assert!(!xml.contains("EndBoundary"));
         assert!(!xml.contains("DeleteExpiredTaskAfter"));
         assert!(xml.contains("<StartWhenAvailable>true</StartWhenAvailable>"));
+        // F-FA-5: the deadline trigger repeats until the task is removed (a failed run, its
+        // relay restart after a rollback, is tried again); the early +5 s trigger does not.
+        let deadline = xml
+            .split("<TimeTrigger>")
+            .find(|trigger| trigger.contains("2023-11-14T22:14:50Z"))
+            .expect("deadline trigger");
+        assert!(deadline.contains(
+            "<Repetition>\n        <Interval>PT10M</Interval>\n        <StopAtDurationEnd>false</StopAtDurationEnd>\n      </Repetition>"
+        ), "{deadline}");
+        assert!(!deadline.contains("<Duration>"));
+        assert_eq!(xml.matches("<Repetition>").count(), 1);
         assert!(xml.contains("&quot;C:\\Users\\A B"));
         assert_eq!(windows_task_name("me"), "wsmp-update-deadman-me");
     }

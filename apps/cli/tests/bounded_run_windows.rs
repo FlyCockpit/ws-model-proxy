@@ -63,7 +63,7 @@ fn a_program_that_cannot_start_fails_closed() {
     assert_eq!(
         run(
             "wsmp-no-such-program",
-            &[],
+            &[] as &[&str],
             Duration::from_secs(1),
             1024,
             None

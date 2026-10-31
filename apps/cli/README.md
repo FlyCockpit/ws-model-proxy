@@ -405,19 +405,29 @@ shows the command to run on the node, and `wsmp update` there still works.
 1. It downloads the release archive beside the binary (never in `/tmp`), checks its SHA-256, and
    runs the new build's `--version`, which must print the server's version. Nothing changes if any
    of that fails.
-2. It keeps the current binary as `wsmp.prev`, arms a rollback job that runs `wsmp.prev` at a
-   deadline (180 s by default), puts the new binary in place and restarts the relay service (exit
+2. It keeps the current binary as `wsmp.prev`, arms a rollback job that runs a copy of it
+   (`.wsmp-recovery-<update id>`, which the rollback never moves, so a job that runs again still
+   has its program; removed once the job is done) at a deadline (180 s by default), puts the new binary in place and restarts the relay service (exit
    code 75). The window counts from the new build's start: each time it starts unconfirmed (at
    most three times) it moves the deadline to a full window after that start, so a slow restart
    or reconnect does not roll back a good build. The rollback job is a persistent systemd user timer and service
-   (`wsmp-update-deadman.{timer,service}`, beside the relay's unit) on Linux and WSL, a one-shot
-   LaunchAgent (`com.flycockpit.wsmp.update-deadman`) on macOS, and a one-shot scheduled task
+   (`wsmp-update-deadman.{timer,service}`, beside the relay's unit) on Linux and WSL, a
+   LaunchAgent (`com.flycockpit.wsmp.update-deadman`) on macOS, and a scheduled task
    (`wsmp-update-deadman-<user>`) on Windows. It survives a reboot during the trial; the new
-   build then gets a full window from the boot to confirm before it is rolled back.
+   build then gets a full window from the boot to confirm before it is rolled back. A run of the
+   job that fails (the relay service did not restart after the rollback, after three tries, or the
+   rollback could not be recorded) exits nonzero and keeps the job, which runs again: a minute
+   later on Linux (`Restart=on-failure`) and macOS (`KeepAlive`/`SuccessfulExit`), every 10
+   minutes on Windows (the deadline trigger repeats). The job removes itself once nothing is left
+   to do.
 3. The new build confirms once it has connected, applied the server's definitions and stayed up
    for 30 s; it then removes the rollback job. A build that does not confirm is rolled back: the
    failed build is kept as `wsmp.failed`, the previous one returns, and the relay tells the server
-   (with the end of the failed build's log).
+   (with the end of the failed build's log). The rollback is recorded before the previous build
+   is put back, so a rollback cut short (a crash, a full disk) is finished by whatever runs next
+   (the job, the relay starting, or a confirmation, which then refuses to confirm a build that is
+   no longer installed). A confirmation checks the installed binary itself, not only the
+   recorded state.
 
 - **Homebrew** installs are updated with `brew upgrade flycockpit/tap/wsmp`, with no automatic
   rollback; a pinned formula or one from another tap is refused. The node first refreshes the tap
@@ -426,6 +436,8 @@ shows the command to run on the node, and `wsmp update` there still works.
   the tap's version is newer than the node's own and the node runs a wsmp that reports it (this
   release on), the node's page then offers **Install anyway** to install the tap's version
   without upgrading the server; a tap that is not ahead of the node gets the refusal alone.
+  When the node's build commit is unknown (a local build), the offer lasts only while the node
+  stays connected: after a reconnect, press Update again so the node checks the tap again.
   `wsmp update` on the node refuses the same way. The last version check and `brew
   upgrade` run while wsmp holds Homebrew's update lock, so an ordinary `brew update` elsewhere
   fails at once until the upgrade is done ("Another `brew update` process is already running")
@@ -437,8 +449,12 @@ shows the command to run on the node, and `wsmp update` there still works.
   window could make the upgrade install another version (the version wsmp reports when it starts
   again shows it). Before the upgrade, the service files `wsmp service install` wrote are written
   again as it writes them now, on Homebrew's stable `opt/wsmp/bin/wsmp` path (hand edits to them
-  are replaced); a service file written by hand is left alone, unless it runs a versioned `Cellar`
-  path, which stops the update. After the upgrade the node runs that path with `--version`, and
+  are replaced). A LaunchAgent plist whose `Label` is `com.flycockpit.wsmp` counts as one wsmp
+  wrote, even after `plutil`, `defaults` or Xcode saved it again with its keys in another order,
+  so it is written again too. Any other service file (written by hand or by another tool: another
+  label, or one `plutil` cannot read) stops the update before the keg changes, whatever it runs,
+  with nothing changed: run `wsmp service install` and update again, or update by hand. After the
+  upgrade the node runs that path with `--version`, and
   only a build that runs and is the version asked for is restarted into. On macOS, `wsmp update`
   reloads the LaunchAgent (`bootout`, waits until launchd has unloaded it, then `bootstrap`,
   tried again while it fails, within 3 minutes; if launchd does not load it again, the error says

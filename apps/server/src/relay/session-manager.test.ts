@@ -284,6 +284,136 @@ describe("RelaySessionManager (relay 3.0)", () => {
     return socket;
   }
 
+  describe("agent.update and a successor hello (F-FA-1, P5)", () => {
+    /** The update rows `startAgentUpdate` writes, in memory (Prisma stays mocked). */
+    function updateRows() {
+      const rows: Array<Record<string, unknown>> = [];
+      const matching = (where: Record<string, unknown> = {}) =>
+        rows.filter((row) => Object.entries(where).every(([key, value]) => row[key] === value));
+      Object.assign(prisma.nodeAgentUpdate, {
+        findFirst: vi.fn(async ({ where }: { where?: Record<string, unknown> }) => {
+          const [found] = matching(where);
+          return found ? { ...found } : null;
+        }),
+        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+          rows.push({ endedAt: null, createdAt: new Date(), ...data });
+          return { id: data.id };
+        }),
+        deleteMany: vi.fn(async ({ where }: { where?: Record<string, unknown> }) => {
+          const gone = matching(where);
+          for (const row of gone) rows.splice(rows.indexOf(row), 1);
+          return { count: gone.length };
+        }),
+        updateMany: vi.fn(async () => ({ count: 0 })),
+      });
+      return rows;
+    }
+
+    async function setUp() {
+      const { startAgentUpdate } = await import("@ws-model-proxy/api/lib/agent-updates");
+      const { createAgentUpdates } = await import("./agent-updates.js");
+      const updates = createAgentUpdates(manager);
+      const rows = updateRows();
+      const first = await connect();
+      Object.assign(stored.rows.get("node-1") ?? {}, {
+        agentUpdatePolicy: "ALLOWED",
+        cliVersion: "0.4.0",
+        cliBuild: { commit: null, installMethod: "script", target: "x86_64-unknown-linux-gnu" },
+      });
+      (db.node as unknown as { findFirst: MockInstance }).findFirst.mockImplementation(
+        async () => ({ ...stored.rows.get("node-1") }),
+      );
+      // The node's authority lock reads the stored row; the update's row lock reads `rows`.
+      db.$queryRaw.mockImplementation(
+        async (strings: TemplateStringsArray, ...values: unknown[]) => {
+          const sql = strings.join("?");
+          if (sql.includes("FROM node_agent_update WHERE"))
+            return rows
+              .filter((row) => row.id === values[0])
+              .map((row) => ({ phase: row.phase, endedAt: row.endedAt, force: row.force }));
+          if (sql.includes("FROM node WHERE")) return [{ ...stored.rows.get("node-1") }];
+          return [{ acquired: true }];
+        },
+      );
+      const port = {
+        ...updates.port,
+        server: async () => ({
+          version: "0.4.3",
+          commit: null,
+          sourceBuild: false,
+          cargoInstall: "test",
+          windowsUpdates: false,
+        }),
+        release: async () => ({
+          kind: "release" as const,
+          version: "0.4.3",
+          commit: null,
+          releaseUrl: "https://r.example/v0.4.3",
+          artifacts: {
+            "x86_64-unknown-linux-gnu": {
+              url: "https://r.example/a.tar.xz",
+              sha256: "a".repeat(64),
+            },
+          },
+        }),
+      };
+      const start = () =>
+        startAgentUpdate(port, {
+          userId: "user-1",
+          nodeId: "node-1",
+          force: false,
+          origin: "https://proxy.example.com",
+        });
+      const successor = () => {
+        const socket = new FakeSocket();
+        expect(manager.acceptAuthenticatedSocket({ socket, identity })).toBe(true);
+        const frame = JSON.parse(hello(socket));
+        frame.node.version = "0.4.0";
+        frame.node.build = {
+          commit: null,
+          installMethod: "script",
+          target: "x86_64-unknown-linux-gnu",
+        };
+        return { socket, frame: JSON.stringify(frame) };
+      };
+      return { updates, rows, first, start, successor };
+    }
+
+    it("P5: a successor hello that committed its generation refuses agent.update on the previous socket", async () => {
+      const { updates, rows, first, start, successor } = await setUp();
+      let started: unknown;
+      db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+        const registered = await callback(db);
+        // Registration committed generation 2; the session map still holds generation 1.
+        expect(stored.rows.get("node-1")?.connectionGeneration).toBe(2);
+        expect(manager.nodeSession("node-1")?.connectionGeneration).toBe(1);
+        started = await start();
+        return registered;
+      });
+      const second = successor();
+      await manager.handleTextFrame(second.socket, second.frame);
+      expect(started).toMatchObject({ kind: "refused", reason: "node_offline" });
+      expect(first.last("agent.update")).toBeUndefined();
+      expect(second.socket.last("agent.update")).toBeUndefined();
+      // Nothing was claimed for the node to answer.
+      expect(rows).toEqual([]);
+      await updates.stop();
+    });
+
+    it("P5 control: once the successor is installed, the update goes to it", async () => {
+      const { updates, first, start, successor } = await setUp();
+      const second = successor();
+      await manager.handleTextFrame(second.socket, second.frame);
+      expect(await start()).toMatchObject({ kind: "started", connectionGeneration: 2 });
+      expect(first.last("agent.update")).toBeUndefined();
+      expect(second.socket.last("agent.update")).toMatchObject({
+        type: "agent.update",
+        version: "0.4.3",
+      });
+      await updates.stop();
+    });
+  });
+
   it("registers a signed 3.0 hello and answers hello.ok with the node id", async () => {
     const socket = await connect();
     expect(socket.last("hello.ok")).toEqual({

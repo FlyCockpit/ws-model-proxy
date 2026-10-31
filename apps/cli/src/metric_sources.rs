@@ -283,9 +283,11 @@ fn command_ok(command: &CommandLine, shell: Option<CommandShell>) -> bool {
 /// How a metric command starts: a program and its arguments, or (Windows `cmd`) a program and
 /// the command line after it as written.
 enum Invocation {
-    List(String, Vec<String>),
+    /// The program as the OS string it is (a found path is never turned into text), its
+    /// arguments.
+    List(std::ffi::OsString, Vec<String>),
     #[cfg(windows)]
-    Raw(String, String),
+    Raw(std::ffi::OsString, String),
 }
 
 /// Text in `sh -c`; an argv started directly.
@@ -294,11 +296,11 @@ fn invocation(command: &CommandLine, _shell: Option<CommandShell>) -> Option<Inv
     Some(match command {
         CommandLine::Text(text) => {
             let (shell, flag) = crate::child_env::exec_shell();
-            Invocation::List(shell.to_string(), vec![flag.to_string(), text.clone()])
+            Invocation::List(shell.into(), vec![flag.to_string(), text.clone()])
         }
         CommandLine::Argv(argv) => {
             let (program, args) = argv.split_first()?;
-            Invocation::List(program.clone(), args.to_vec())
+            Invocation::List(program.into(), args.to_vec())
         }
     })
 }
@@ -331,15 +333,12 @@ fn invocation(command: &CommandLine, shell: Option<CommandShell>) -> Option<Invo
                         })
                 })
             {
-                return Some(Invocation::List(
-                    found.to_string_lossy().into_owned(),
-                    args.to_vec(),
-                ));
+                return Some(Invocation::List(found.into_os_string(), args.to_vec()));
             }
             crate::runtimes::render::argv_script(shell, argv)?
         }
     };
-    let program = shell_program(shell).ok()?.to_string_lossy().into_owned();
+    let program = shell_program(shell).ok()?.into_os_string();
     Some(match shell_line(shell, &script).ok()? {
         ShellLine::List(args) => Invocation::List(program, args),
         ShellLine::Raw(raw) => Invocation::Raw(program, raw),

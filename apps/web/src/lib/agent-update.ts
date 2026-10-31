@@ -163,13 +163,17 @@ export function nodeUpdateMode(
   return view.canUpdate ? "ready" : "blocked";
 }
 
-/** Force is offered only when the platform's instances would stop and something runs. */
+/**
+ * Force is offered only when the platform's instances would stop and something runs, and never
+ * on a node whose operator turned remote updates off (the server refuses it there too).
+ */
 export function forceOffered(view: {
-  selfUpdate: { instancesSurvive: boolean } | null;
+  selfUpdate: { instancesSurvive: boolean; remote: "allowed" | "off" } | null;
   runningInstances: readonly unknown[];
 }): boolean {
   return (
     view.selfUpdate !== null &&
+    view.selfUpdate.remote !== "off" &&
     !view.selfUpdate.instancesSurvive &&
     view.runningInstances.length > 0
   );

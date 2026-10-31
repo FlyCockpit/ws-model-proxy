@@ -369,21 +369,35 @@ export type AgentUpdateLatest = {
   fromVersion?: string | null;
   fromCommit?: string | null;
   availableVersion?: string | null;
+  availableGeneration?: number | null;
 } | null;
 
 /**
  * The wsmp that answered an update is still the one the node runs: the same release version and
- * (when either is known) the same commit. A release is one build of one source, so a property the
- * answer proved (a refusal carrying `availableVersion`) still holds.
+ * the same build. A release is one build of one source, so a property the answer proved (a
+ * refusal carrying `availableVersion`) still holds.
+ *
+ * Both commits known: the same commit is the same wsmp, on any connection. Either one unknown:
+ * the version alone does not identify the build (a reinstall or a local build reconnects with
+ * the same version), so only the connection the answer arrived on (`availableGeneration`, the
+ * node's `connectionGeneration`) proves it; after a reconnect the node must answer again.
  */
 function sameWsmp(
-  from: { fromVersion?: string | null; fromCommit?: string | null },
-  now: { cliVersion: string | null; commit: string | null },
+  from: {
+    fromVersion?: string | null;
+    fromCommit?: string | null;
+    availableGeneration?: number | null;
+  },
+  now: { cliVersion: string | null; commit: string | null; connectionGeneration: number | null },
 ): boolean {
+  if (now.cliVersion === null || from.fromVersion !== now.cliVersion) return false;
+  const was = from.fromCommit ?? null;
+  if (was !== null && now.commit !== null) return was === now.commit;
   return (
-    now.cliVersion !== null &&
-    from.fromVersion === now.cliVersion &&
-    (from.fromCommit ?? null) === now.commit
+    was === null &&
+    now.commit === null &&
+    now.connectionGeneration !== null &&
+    (from.availableGeneration ?? null) === now.connectionGeneration
   );
 }
 
@@ -393,7 +407,8 @@ function sameWsmp(
  * The capability is proved by the node's own answer, never by its hello (a hello field would be
  * refused by a 0.4.3 server): only a wsmp that checks its tap's version before installing sends
  * `availableVersion`, so the node's latest update must have been refused `version_mismatch`
- * carrying it, by the wsmp it still runs ({@link sameWsmp}; an older wsmp, which would
+ * carrying it, by the wsmp it still runs ({@link sameWsmp}: when a build commit is unknown, on
+ * this same connection; an older wsmp, which would
  * `brew upgrade` blindly, never sent one). Also: the tap's version is newer than the node's
  * (`brew upgrade` never goes back), the node updates with Homebrew, and it is still outdated and
  * otherwise free to update ({@link agentUpdateEligibility}'s gates).
@@ -402,6 +417,7 @@ function installAnywayVersion(input: {
   latest: AgentUpdateLatest | undefined;
   cliVersion: string | null;
   commit: string | null;
+  connectionGeneration: number | null;
   outdated: boolean;
   free: boolean;
   strategy: AgentUpdateStrategy | null;
@@ -413,6 +429,31 @@ function installAnywayVersion(input: {
   const available = latest.availableVersion ?? null;
   if (available === null || cliVersion === null) return null;
   return (compareReleaseVersions(available, cliVersion) ?? 0) > 0 ? available : null;
+}
+
+/**
+ * The live gates of every update effect the server makes on a node: its first `agent.update`,
+ * a forced resend, and the STOP of its instances a forced update makes. The node's session here
+ * (this owner's), Full control on that session and in the database, the owner's browser policy,
+ * a wsmp that updates itself, and the node operator's own `selfUpdate.remote` setting, as the
+ * session reports it now. Null when all hold.
+ *
+ * `row` is what the caller read last (under the node row lock in a claim); `live` must be
+ * `port.liveNode()` read at the moment of the effect, never a snapshot from before other I/O.
+ * When `generation` is given, the session must still be that connection.
+ */
+export function liveAgentUpdateGate(
+  row: Pick<AgentUpdateNodeRow, "userId" | "trust" | "trustLowerRequestedAt" | "agentUpdatePolicy">,
+  live: AgentUpdateLiveNode | null,
+  generation?: number,
+): RefusalReason | null {
+  if (!live || live.userId !== row.userId) return "node_offline";
+  if (generation !== undefined && live.connectionGeneration !== generation) return "node_offline";
+  if (live.trust !== "full" || effectiveTrust(row) !== "FULL") return "trust_relay";
+  if (row.agentUpdatePolicy === "OFF") return "agent_update_off";
+  if (!live.selfUpdate) return "upgrade_wsmp";
+  if (live.selfUpdate.remote === "off") return "agent_update_opted_out";
+  return null;
 }
 
 /**
@@ -444,25 +485,18 @@ export function agentUpdateEligibility(input: {
     ) as AgentUpdateStrategy | undefined) ?? null;
   const artifact =
     release.kind === "release" && build ? (release.artifacts[build.target] ?? null) : null;
-  const full = live !== null && live.trust === "full" && effectiveTrust(row) === "FULL";
-  // What keeps the server from sending this node an update at all, whatever its version.
-  const gate: RefusalReason | null = !live
-    ? "node_offline"
-    : !full
-      ? "trust_relay"
-      : row.agentUpdatePolicy === "OFF"
-        ? "agent_update_off"
-        : !selfUpdate
-          ? "upgrade_wsmp"
-          : !strategy
-            ? "agent_update_unsupported"
-            : !agentUpdateOffered(build, strategy, server)
-              ? "agent_update_platform"
-              : selfUpdate.remote === "off"
-                ? "agent_update_opted_out"
-                : !artifact
-                  ? "agent_update_unavailable"
-                  : null;
+  // What keeps the server from sending this node an update at all, whatever its version: the
+  // live gates ({@link liveAgentUpdateGate}), with the node's opt-out named after what this
+  // install cannot do anyway.
+  const liveGate = liveAgentUpdateGate(row, live);
+  const gate: RefusalReason | null =
+    liveGate !== null && liveGate !== "agent_update_opted_out"
+      ? liveGate
+      : !strategy
+        ? "agent_update_unsupported"
+        : !agentUpdateOffered(build, strategy, server)
+          ? "agent_update_platform"
+          : (liveGate ?? (!artifact ? "agent_update_unavailable" : null));
   const blockedReason: RefusalReason | null = input.active
     ? "agent_update_in_progress"
     : !outdated
@@ -482,6 +516,7 @@ export function agentUpdateEligibility(input: {
     latest: input.latest,
     cliVersion: row.cliVersion,
     commit: build?.commit ?? null,
+    connectionGeneration: live?.connectionGeneration ?? null,
     outdated,
     free: blockedReason === null,
     strategy,
@@ -541,7 +576,8 @@ export function agentUpdateRefusalMessage(reason: RefusalReason, slug: string): 
 // ── Starting an update ──
 
 export type StartOutcome =
-  | { kind: "started"; updateId: string }
+  /** `connectionGeneration`: the connection the frame went out on (what its STOP is bound to). */
+  | { kind: "started"; updateId: string; connectionGeneration: number }
   | { kind: "refused"; reason: RefusalReason; message: string }
   | { kind: "not_found" }
   /** A batch step whose run was pinned to another release than the server offers now. */
@@ -581,13 +617,18 @@ async function activeUpdate(userId: string, nodeId: string) {
       artifactSha256: true,
       fromVersion: true,
       fromCommit: true,
+      availableGeneration: true,
     },
   });
 }
 
 /** The node's latest update, ended or not (owner-scoped): what "Install anyway" checks. */
-async function latestUpdate(userId: string, nodeId: string): Promise<AgentUpdateLatest> {
-  const latest = await prisma.nodeAgentUpdate.findFirst({
+async function latestUpdate(
+  userId: string,
+  nodeId: string,
+  db: Pick<typeof prisma, "nodeAgentUpdate"> = prisma,
+): Promise<AgentUpdateLatest> {
+  const latest = await db.nodeAgentUpdate.findFirst({
     where: { userId, nodeId },
     orderBy: { createdAt: "desc" },
     select: {
@@ -597,6 +638,7 @@ async function latestUpdate(userId: string, nodeId: string): Promise<AgentUpdate
       fromVersion: true,
       fromCommit: true,
       availableVersion: true,
+      availableGeneration: true,
     },
   });
   return latest ? { ...latest, phase: phaseFromDb(latest.phase) } : null;
@@ -696,11 +738,31 @@ export async function startAgentUpdate(
     rollbackAfterSecs: AGENT_UPDATE_ROLLBACK_SECS_DEFAULT,
     phase: "REQUESTED" as const,
     deadlineAt: agentUpdateDeadline("requested", AGENT_UPDATE_ROLLBACK_SECS_DEFAULT, now),
+    // Install anyway: the connection it goes to, where the tap's version was proved
+    // (`sameWsmp`; a forced resend after a reconnect needs a known build).
+    availableGeneration: input.version !== undefined ? live.connectionGeneration : null,
   };
   const batch = input.batch;
   try {
     await prisma.$transaction(async (tx) => {
-      await lockClaimGates(tx, input.userId, row.id);
+      const locked = await lockClaimGates(
+        tx,
+        port,
+        input.userId,
+        row.id,
+        live.connectionGeneration,
+      );
+      // Install anyway: the tap's version was proved to the wsmp on a connection; still that
+      // wsmp, on the connection as stored now (a hello since may have replaced the build).
+      if (
+        input.version !== undefined &&
+        !installAnywayStillProved(
+          await latestUpdate(input.userId, row.id, tx),
+          locked,
+          input.version,
+        )
+      )
+        throw new NoLongerAllowed("agent_update_unavailable");
       await tx.nodeAgentUpdate.create({ data: update, select: { id: true } });
       if (batch) {
         const moved = await tx.nodeAgentUpdateBatch.updateMany({
@@ -723,13 +785,19 @@ export async function startAgentUpdate(
     if (isUniqueViolation(error)) return refused("agent_update_in_progress");
     throw error;
   }
-  const sent = port.send(row.id, frameFor(update, eligibility.artifact), {
-    connectionGeneration: live.connectionGeneration,
-    userId: input.userId,
-  });
-  if (!sent) {
-    // Gone (or lowered) between the check and the send: nothing reached the node.
-    await prisma.$transaction(async (tx) => {
+  // The claim is committed (the node's first report finds its row); the send takes the authority
+  // lock again and checks everything on what it reads there, the frame going out in that turn.
+  const lost = await sendUnderAuthority(
+    port,
+    {
+      userId: input.userId,
+      nodeId: row.id,
+      generation: live.connectionGeneration,
+      claim: { updateId: update.id, kind: "first" },
+    },
+    frameFor(update, eligibility.artifact),
+    // Not sent: nothing reached the node, so the claim goes, under the same lock.
+    async (tx) => {
       await tx.nodeAgentUpdate.deleteMany({
         where: { id: update.id, userId: input.userId, phase: "REQUESTED" },
       });
@@ -738,45 +806,227 @@ export async function startAgentUpdate(
           where: { id: batch.id, userId: input.userId, currentUpdateId: update.id },
           data: { currentUpdateId: null, currentNodeId: null },
         });
-    });
-    return refused("node_offline");
-  }
+    },
+  );
+  if (lost !== null) return refused(lost);
   publishNodeEvent({ type: "node.agentUpdate", userId: input.userId, nodeId: row.id });
-  return { kind: "started", updateId: update.id };
+  return { kind: "started", updateId: update.id, connectionGeneration: live.connectionGeneration };
 }
 
 class BatchMoved extends Error {}
 
-/** The node's policy or trust, re-read under its row lock, no longer allows an update. */
+// ── The update-authority lock ──
+
+/** What {@link lockAgentUpdateAuthority} reads under the lock. */
+type AgentUpdateAuthority = {
+  agentUpdatePolicy: "ALLOWED" | "OFF";
+  trust: "FULL" | "RELAY" | null;
+  trustLowerRequestedAt: Date | null;
+  features: unknown;
+  /** The node's connection as stored: a hello commits a new generation before this process
+   * installs its session, so the row, not the session map, says which connection is current. */
+  connection: "ONLINE" | "OFFLINE";
+  connectionGeneration: number;
+  /** The build that connection reported (what an Install-anyway approval is bound to). */
+  cliVersion: string | null;
+  cliBuild: unknown;
+};
+
+type RawTx = Pick<typeof prisma, "$queryRaw">;
+
+/**
+ * The node's update-authority lock: its row, `FOR UPDATE`, and the columns that decide whether
+ * the owner may update it. Every writer that can take that permission away writes this row (so
+ * it waits here, or this waits for it): the browser policy (`setPolicy`, through this helper),
+ * a trust lowering (`nodes.lowerTrust`), the node's own trust and features as the server records
+ * them (`node.state`, hello), the disconnect, the node's deletion. Every effect of an update takes
+ * it and decides on what it reads here, right before the effect: the claim, the send of a first
+ * or forced `agent.update` (Install anyway and "Update all" steps included), and the STOP of a
+ * forced update's instances. Null when the owner has no such node (any more).
+ *
+ * It also reads the node's connection as stored (ONLINE, and its generation): a hello commits
+ * the next generation here before the session map installs the new socket, so an effect that
+ * locks after that commit sees the new generation and refuses the old socket.
+ *
+ * Lock order: after the transaction's fences (owner, then capacity, in a graph write), before the
+ * node's update row ({@link lockClaimedUpdate}), then batch, operation and instance rows. Never
+ * held across a network wait: a send is synchronous.
+ */
+export async function lockAgentUpdateAuthority(
+  tx: RawTx,
+  userId: string,
+  nodeId: string,
+): Promise<AgentUpdateAuthority | null> {
+  const [node] = await tx.$queryRaw<
+    AgentUpdateAuthority[]
+  >`SELECT "agentUpdatePolicy", trust, "trustLowerRequestedAt", features, connection, "connectionGeneration", "cliVersion", "cliBuild" FROM node WHERE id = ${nodeId} AND "userId" = ${userId} FOR UPDATE`;
+  return node ?? null;
+}
+
+/**
+ * Whether the owner may still update the node, from what {@link lockAgentUpdateAuthority} read
+ * and the live session read now (in the same turn as the effect): null when allowed. The stored
+ * connection first: ONLINE, on `generation` (the session the effect targets), so a successor
+ * hello that committed while the session map still holds the old socket refuses it. Then the live
+ * gates ({@link liveAgentUpdateGate}, the session on that same generation), then the features as
+ * stored: a node that turned remote updates off writes that here before the session's copy
+ * changes, so an effect in between still sees it.
+ */
+function agentUpdateAuthorityRefusal(
+  locked: AgentUpdateAuthority | null,
+  userId: string,
+  live: AgentUpdateLiveNode | null,
+  generation: number,
+): RefusalReason | null {
+  if (!locked) return "trust_relay";
+  if (locked.connection !== "ONLINE" || locked.connectionGeneration !== generation)
+    return "node_offline";
+  const gate = liveAgentUpdateGate({ ...locked, userId }, live, generation);
+  if (gate !== null) return gate;
+  const stored = storedSelfUpdate(locked.features);
+  if (!stored) return "upgrade_wsmp";
+  if (stored.remote === "off") return "agent_update_opted_out";
+  return null;
+}
+
+/** The node's policy, trust or live gates, read under the authority lock, no longer allow it. */
 class NoLongerAllowed extends Error {
-  constructor(readonly reason: "agent_update_off" | "trust_relay") {
+  constructor(readonly reason: RefusalReason) {
     super(reason);
   }
 }
 
 /**
  * Inside the transaction that claims an update (creates its row, or marks a waiting one
- * forced): locks the owner's node row (`FOR UPDATE`) and reads its update policy and trust
- * again. Turning updates off (`setPolicy`) and lowering trust write that row, so either one
- * committed before this lock is seen here (the claim is refused and rolled back), and either
- * one that comes later waits for the claim to commit. The checks before the transaction are a
- * snapshot; this is the one that orders the claim against them. Lock order: the node row first,
- * then the update and batch rows.
+ * forced): takes the authority lock ({@link lockAgentUpdateAuthority}) and refuses (rolls the
+ * claim back) unless {@link agentUpdateAuthorityRefusal} allows it on the session as it is now,
+ * still the connection the caller checked. The checks before the transaction are a snapshot.
  */
 async function lockClaimGates(
-  tx: Pick<typeof prisma, "$queryRaw">,
+  tx: RawTx,
+  port: AgentUpdatePort,
   userId: string,
   nodeId: string,
-): Promise<void> {
-  const [node] = await tx.$queryRaw<
-    Array<{
-      agentUpdatePolicy: "ALLOWED" | "OFF";
-      trust: "FULL" | "RELAY" | null;
-      trustLowerRequestedAt: Date | null;
-    }>
-  >`SELECT "agentUpdatePolicy", trust, "trustLowerRequestedAt" FROM node WHERE id = ${nodeId} AND "userId" = ${userId} FOR UPDATE`;
-  if (!node || effectiveTrust(node) !== "FULL") throw new NoLongerAllowed("trust_relay");
-  if (node.agentUpdatePolicy === "OFF") throw new NoLongerAllowed("agent_update_off");
+  generation: number,
+): Promise<AgentUpdateAuthority> {
+  const locked = await lockAgentUpdateAuthority(tx, userId, nodeId);
+  const lost = agentUpdateAuthorityRefusal(locked, userId, port.liveNode(nodeId), generation);
+  if (lost !== null || !locked) throw new NoLongerAllowed(lost ?? "trust_relay");
+  return locked;
+}
+
+/** The build identity the locked row names (what {@link sameWsmp} compares). */
+function lockedWsmp(locked: AgentUpdateAuthority) {
+  return {
+    cliVersion: locked.cliVersion,
+    commit: parseBuild(locked.cliBuild)?.commit ?? null,
+    connectionGeneration: locked.connectionGeneration,
+  };
+}
+
+/**
+ * Under the authority lock: the node's latest update still proves `version` for Install anyway
+ * (refused `version_mismatch` by Homebrew, offering exactly that version) to the wsmp and
+ * connection the locked row names now.
+ */
+function installAnywayStillProved(
+  latest: AgentUpdateLatest,
+  locked: AgentUpdateAuthority,
+  version: string,
+): boolean {
+  return (
+    latest?.phase === "refused" &&
+    latest.reason === "version_mismatch" &&
+    latest.strategy === "homebrew" &&
+    latest.availableVersion === version &&
+    sameWsmp(latest, lockedWsmp(locked))
+  );
+}
+
+/** What {@link lockClaimedUpdate} reads under the update row's lock. */
+type ClaimedUpdate = { phase: DbPhase; endedAt: Date | null; force: boolean };
+
+/**
+ * The claimed update's row, `FOR UPDATE`, after the node's authority lock (that order everywhere:
+ * node row, then update row, then batch, operation and instance rows). The update's own
+ * lifecycle writers serialize on this same row lock: the deadline sweep and the node's progress
+ * each change it with one conditional `UPDATE` (which takes the row's lock and, waiting, re-reads
+ * its condition on what committed). So an expiry or a final report that committed first is seen
+ * here, and one that comes later waits until the frame is out. Null when the row is gone.
+ */
+async function lockClaimedUpdate(
+  tx: RawTx,
+  update: { userId: string; nodeId: string; updateId: string },
+): Promise<ClaimedUpdate | null> {
+  const [row] = await tx.$queryRaw<
+    ClaimedUpdate[]
+  >`SELECT phase, "endedAt", force FROM node_agent_update WHERE id = ${update.updateId} AND "userId" = ${update.userId} AND "nodeId" = ${update.nodeId} FOR UPDATE`;
+  return row ?? null;
+}
+
+/**
+ * The send a claim permits: a first send while its row is still `REQUESTED`; a forced resend
+ * while it still waits for idle with the force mark its claim set. Ended (timed out, refused,
+ * failed) or moved on (the node left the wait): the claim no longer owns a send.
+ */
+type ClaimedSend = { updateId: string; kind: "first" | "forced_resend" };
+
+function claimPermitsSend(row: ClaimedUpdate | null, send: ClaimedSend): boolean {
+  if (!row || row.endedAt !== null) return false;
+  return send.kind === "first"
+    ? row.phase === "REQUESTED"
+    : row.phase === "WAITING_IDLE" && row.force;
+}
+
+/**
+ * Sends a claimed `agent.update` under the authority lock: in a transaction of its own (the
+ * claim is committed, so the node's first report finds its row), takes the node's lock and then
+ * the claimed update's ({@link lockClaimedUpdate}), decides on what it reads there and on the
+ * live session, and sends in that same turn (no await in between: nothing in this process, and
+ * no writer of either row, can land between the check and the send). A writer that commits first
+ * refuses it (`undo` then runs under the same locks); one that comes later waits until the frame
+ * is out. Null when sent, or the reason it was not.
+ */
+async function sendUnderAuthority(
+  port: AgentUpdatePort,
+  target: { userId: string; nodeId: string; generation: number; claim: ClaimedSend },
+  frame: AgentUpdateFrame,
+  undo: (tx: Pick<typeof prisma, "nodeAgentUpdate" | "nodeAgentUpdateBatch">) => Promise<void>,
+): Promise<RefusalReason | null> {
+  let sent = false;
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const locked = await lockAgentUpdateAuthority(tx, target.userId, target.nodeId);
+      const claimed = await lockClaimedUpdate(tx, {
+        userId: target.userId,
+        nodeId: target.nodeId,
+        updateId: target.claim.updateId,
+      });
+      const lost =
+        agentUpdateAuthorityRefusal(
+          locked,
+          target.userId,
+          port.liveNode(target.nodeId),
+          target.generation,
+        ) ?? (claimPermitsSend(claimed, target.claim) ? null : "agent_update_in_progress");
+      sent =
+        lost === null &&
+        port.send(target.nodeId, frame, {
+          connectionGeneration: target.generation,
+          userId: target.userId,
+        });
+      if (sent) return null;
+      await undo(tx);
+      // Gone, lowered or opted out between the check and the socket: nothing reached the node.
+      return lost ?? "node_offline";
+    });
+  } catch (error) {
+    // The frame is out (only the lock's commit failed, and it wrote nothing): the update runs.
+    if (sent) return null;
+    // Nothing was sent: the claim goes (if that fails too, its deadline ends it), then the error.
+    await prisma.$transaction(async (tx) => undo(tx)).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function forceWaitingUpdate(
@@ -787,9 +1037,8 @@ async function forceWaitingUpdate(
   live: AgentUpdateLiveNode | null,
   refused: (reason: RefusalReason) => StartOutcome,
 ): Promise<StartOutcome> {
-  if (!live || live.userId !== input.userId) return refused("node_offline");
-  if (live.trust !== "full" || effectiveTrust(row) !== "FULL") return refused("trust_relay");
-  if (row.agentUpdatePolicy === "OFF") return refused("agent_update_off");
+  const blocked = liveAgentUpdateGate(row, live);
+  if (blocked !== null || !live) return refused(blocked ?? "node_offline");
   const release = await port.release();
   const build = parseBuild(row.cliBuild);
   const artifact =
@@ -803,12 +1052,26 @@ async function forceWaitingUpdate(
   // That was granted to the wsmp that offered it; resend it only while that wsmp still runs.
   const anyway =
     active.strategy === "homebrew" &&
-    sameWsmp(active, { cliVersion: row.cliVersion, commit: build?.commit ?? null });
+    sameWsmp(active, {
+      cliVersion: row.cliVersion,
+      commit: build?.commit ?? null,
+      connectionGeneration: live.connectionGeneration,
+    });
   if (release.version !== active.toVersion && !anyway) return refused("agent_update_unavailable");
   let marked: { count: number };
   try {
     marked = await prisma.$transaction(async (tx) => {
-      await lockClaimGates(tx, input.userId, row.id);
+      const locked = await lockClaimGates(
+        tx,
+        port,
+        input.userId,
+        row.id,
+        live.connectionGeneration,
+      );
+      // The tap's version installed anyway: granted to the wsmp that offered it, which the
+      // locked row must still name.
+      if (release.version !== active.toVersion && !sameWsmp(active, lockedWsmp(locked)))
+        throw new NoLongerAllowed("agent_update_unavailable");
       return tx.nodeAgentUpdate.updateMany({
         where: { id: active.id, userId: input.userId, nodeId: row.id, phase: "WAITING_IDLE" },
         data: { force: true },
@@ -819,19 +1082,68 @@ async function forceWaitingUpdate(
     throw error;
   }
   if (marked.count !== 1) return refused("agent_update_in_progress");
-  const sent = port.send(row.id, frameFor({ ...active, force: true }, artifact), {
-    connectionGeneration: live.connectionGeneration,
-    userId: input.userId,
-  });
-  if (!sent) {
-    await prisma.nodeAgentUpdate.updateMany({
-      where: { id: active.id, userId: input.userId, phase: "WAITING_IDLE", force: true },
-      data: { force: active.force },
-    });
-    return refused("node_offline");
-  }
+  // As a first start: the send under the authority lock; not sent, the force mark goes.
+  const lost = await sendUnderAuthority(
+    port,
+    {
+      userId: input.userId,
+      nodeId: row.id,
+      generation: live.connectionGeneration,
+      claim: { updateId: active.id, kind: "forced_resend" },
+    },
+    frameFor({ ...active, force: true }, artifact),
+    async (tx) => {
+      await tx.nodeAgentUpdate.updateMany({
+        where: { id: active.id, userId: input.userId, phase: "WAITING_IDLE", force: true },
+        data: { force: active.force },
+      });
+    },
+  );
+  if (lost !== null) return refused(lost);
   publishNodeEvent({ type: "node.agentUpdate", userId: input.userId, nodeId: row.id });
-  return { kind: "started", updateId: active.id };
+  return { kind: "started", updateId: active.id, connectionGeneration: live.connectionGeneration };
+}
+
+/**
+ * Whether the STOP of a forced update's instances may be recorded, decided in the STOP's own
+ * transaction (`tx`, after its owner and capacity fences): the authority lock
+ * ({@link lockAgentUpdateAuthority}) and {@link agentUpdateAuthorityRefusal} on the live session
+ * and the stored connection, still the connection the forced frame went out on, and that update,
+ * under its row lock ({@link lockClaimedUpdate}), still running and forced (a node that refused
+ * it, or ended it, gets no STOP). The stop asks again after its last write, before it commits: a
+ * change of the live session meanwhile rolls it back.
+ *
+ * The STOP's authorization point is its commit. A committed STOP is always dispatched, after the
+ * commit, and is not checked again or called back then (as a sent `agent.update` is not): a
+ * revocation that commits after it is ordered after the effect.
+ */
+export async function agentUpdateStopAllowed(
+  tx: RawTx,
+  port: AgentUpdatePort,
+  update: { userId: string; nodeId: string; updateId: string; connectionGeneration: number },
+): Promise<boolean> {
+  const locked = await lockAgentUpdateAuthority(tx, update.userId, update.nodeId);
+  if (
+    !locked ||
+    agentUpdateAuthorityRefusal(
+      locked,
+      update.userId,
+      port.liveNode(update.nodeId),
+      update.connectionGeneration,
+    ) !== null
+  )
+    return false;
+  const claimed = await lockClaimedUpdate(tx, update);
+  const running = claimed !== null && claimed.endedAt === null && claimed.force;
+  // The live session again, after the read (an await): the decision is this turn's.
+  return (
+    running &&
+    liveAgentUpdateGate(
+      { ...locked, userId: update.userId },
+      port.liveNode(update.nodeId),
+      update.connectionGeneration,
+    ) === null
+  );
 }
 
 // ── Progress from the node ──
@@ -842,7 +1154,8 @@ async function forceWaitingUpdate(
  * ended with this report.
  */
 export async function applyAgentUpdateProgress(
-  node: { nodeId: string; userId: string },
+  /** `connectionGeneration`: the session the report arrived on (an offer is bound to it). */
+  node: { nodeId: string; userId: string; connectionGeneration?: number },
   frame: {
     updateId: string;
     phase: AgentUpdateNodePhase;
@@ -857,6 +1170,8 @@ export async function applyAgentUpdateProgress(
   // handled concurrently: `verifying`, then at once `refused`) reads the row again and tries
   // again, so the later report is never dropped. The deadline sweep can win too: then the
   // re-read decides whether the report still applies.
+  // The conditional write takes the update row's lock, the one a send holds while it decides
+  // ({@link lockClaimedUpdate}): it waits for that send, then applies to what committed.
   for (let attempt = 0; attempt < AGENT_UPDATE_PROGRESS_ATTEMPTS; attempt += 1) {
     const row = await prisma.nodeAgentUpdate.findFirst({
       where: { id: frame.updateId, nodeId: node.nodeId, userId: node.userId },
@@ -883,7 +1198,10 @@ export async function applyAgentUpdateProgress(
         ...(frame.availableVersion !== undefined &&
         frame.phase === "refused" &&
         frame.reason === "version_mismatch"
-          ? { availableVersion: frame.availableVersion }
+          ? {
+              availableVersion: frame.availableVersion,
+              availableGeneration: node.connectionGeneration ?? null,
+            }
           : {}),
         deadlineAt: agentUpdateDeadline(frame.phase, row.rollbackAfterSecs, now),
         endedAt: ended ? now : null,
@@ -913,6 +1231,9 @@ export async function expireAgentUpdates(now: Date = new Date()): Promise<number
   });
   let ended = 0;
   for (const update of due) {
+    // One conditional write per row: it takes the row's lock, the one a send holds while it
+    // decides ({@link lockClaimedUpdate}). Committed first, the send sees the row ended and does
+    // not go out; otherwise it waits and times out an update that was sent.
     const written = await prisma.nodeAgentUpdate.updateMany({
       where: { id: update.id, phase: update.phase, endedAt: null, deadlineAt: { lte: now } },
       data: {

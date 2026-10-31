@@ -82,22 +82,33 @@ export const AGENT_UPDATE_REASONS = [
 ] as const;
 export type AgentUpdateReason = (typeof AGENT_UPDATE_REASONS)[number];
 
-/** A release version (`0.4.3`, `0.4.4-rc.1`), as `agent.update`'s `version`. */
+/**
+ * A release version (`0.4.3`, `0.4.4-rc.1`), as `agent.update`'s `version` and a refusal's
+ * `availableVersion`: exactly what the node reads as one (`is_release_version` in the CLI's
+ * `frames.rs`, the same since relay 3.0's first wsmp), so the server never offers or sends a
+ * version the node cannot install. At most 64 characters; `MAJOR.MINOR.PATCH` without leading
+ * zeros; then nothing, or `-` or `+` followed by at least one of `[0-9A-Za-z.+-]`. Both sides
+ * check `agent-release-version-vectors.json`.
+ */
 export const agentReleaseVersionSchema = z
   .string()
-  .max(80)
-  .regex(/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/);
+  .max(64)
+  .regex(/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.+-]+)?$/);
 
 /**
  * SemVer precedence of two release versions (build metadata ignored): negative when `a` is
- * older, positive when newer, 0 when equal. `null` when either is not a release version.
+ * older, positive when newer, 0 when equal. `null` when either is not a release version. The
+ * node's order exactly (`compare_release` in the CLI's `homebrew.rs`): both sides check the
+ * `comparisons` of `agent-release-version-vectors.json`.
  */
 export function compareReleaseVersions(a: string, b: string): number | null {
   const parse = (value: string) => {
     if (!agentReleaseVersionSchema.safeParse(value).success) return null;
     const [core = "", pre] = value.split("+")[0]?.split(/-(.*)/s) ?? [];
     // BigInt: any number of digits, without a double's rounding past 2^53.
-    return { core: core.split(".").map(BigInt), pre: pre ? pre.split(".") : [] };
+    // An empty pre-release (`1.2.3-+b`) is one empty identifier, as the node reads it: only no
+    // `-` at all is a release.
+    return { core: core.split(".").map(BigInt), pre: pre !== undefined ? pre.split(".") : [] };
   };
   const order = (x: bigint, y: bigint) => (x < y ? -1 : x > y ? 1 : 0);
   const left = parse(a);

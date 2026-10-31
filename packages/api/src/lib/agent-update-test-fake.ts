@@ -1,7 +1,7 @@
 /**
  * Test-only: an in-memory stand-in for the Prisma delegates the self-update code uses (node,
  * nodeAgentUpdate, nodeAgentUpdateBatch, instanceRank, $transaction, and $queryRaw for the
- * claim's node row lock), with the two partial unique indexes of the hardening (one update in
+ * node's update-authority lock), with the two partial unique indexes of the hardening (one update in
  * flight per node, one running batch per owner).
  * Tests install it with `vi.mock("@ws-model-proxy/db", ...)`; nothing reaches a database.
  */
@@ -65,6 +65,10 @@ export function createAgentUpdateDb() {
    */
   const operations: Array<{ tx: number | null; op: string }> = [];
   let transactions = 0;
+  /** The transactions open now, innermost last. */
+  const open: number[] = [];
+  /** Records `op` (a port call: `send`) under the transaction open now, if any. */
+  const note = (op: string) => operations.push({ tx: open.at(-1) ?? null, op });
 
   function delegate(name: keyof typeof tables, tx: number | null = null) {
     const list = () => tables[name];
@@ -169,13 +173,31 @@ export function createAgentUpdateDb() {
   /** Every raw query, in order, as its SQL text (`?` for each value) and values. */
   const rawQueries: Array<{ sql: string; values: unknown[] }> = [];
 
-  // The one raw query the self-update code runs: the node row lock of a claim
-  // (`SELECT "agentUpdatePolicy", trust, "trustLowerRequestedAt" FROM node … FOR UPDATE`).
+  // The two raw queries the self-update code runs: the node's update-authority lock
+  // (`SELECT "agentUpdatePolicy", … FROM node … FOR UPDATE`, op `lockNode`) and the claimed
+  // update's row lock (`SELECT phase, "endedAt", force FROM node_agent_update … FOR UPDATE`, op
+  // `lockUpdate`). In-memory tests run one turn at a time, so a lock is a read here; what a test
+  // commits between transactions is what the next lock sees.
   const queryRaw =
     (tx: number | null) =>
     async (strings: TemplateStringsArray, ...values: unknown[]) => {
       const sql = strings.join("?");
       rawQueries.push({ sql, values });
+      if (
+        /FROM node_agent_update WHERE id = \? AND "userId" = \? AND "nodeId" = \? FOR UPDATE$/.test(
+          sql,
+        )
+      ) {
+        operations.push({ tx, op: "lockUpdate" });
+        const [id, userId, nodeId] = values;
+        return tables.nodeAgentUpdate
+          .filter((row) => row.id === id && row.userId === userId && row.nodeId === nodeId)
+          .map((row) => ({
+            phase: row.phase,
+            endedAt: row.endedAt ?? null,
+            force: row.force ?? false,
+          }));
+      }
       operations.push({ tx, op: "lockNode" });
       if (!/FROM node WHERE id = \? AND "userId" = \? FOR UPDATE$/.test(sql))
         throw new Error(`unexpected raw query: ${sql}`);
@@ -186,6 +208,11 @@ export function createAgentUpdateDb() {
           agentUpdatePolicy: row.agentUpdatePolicy,
           trust: row.trust,
           trustLowerRequestedAt: row.trustLowerRequestedAt ?? null,
+          features: row.features ?? null,
+          connection: row.connection ?? "OFFLINE",
+          connectionGeneration: row.connectionGeneration ?? 0,
+          cliVersion: row.cliVersion ?? null,
+          cliBuild: row.cliBuild ?? null,
         }));
     };
   const delegates = (tx: number | null) => ({
@@ -204,24 +231,32 @@ export function createAgentUpdateDb() {
         Object.entries(tables).map(([key, rows]) => [key, rows.map((row) => ({ ...row }))]),
       ) as typeof tables;
       transactions += 1;
+      const id = transactions;
+      open.push(id);
       try {
-        return await work(delegates(transactions));
+        return await work(delegates(id));
       } catch (error) {
         Object.assign(tables, snapshot);
         throw error;
+      } finally {
+        open.splice(open.lastIndexOf(id), 1);
       }
     },
   };
-  return { client, tables, rawQueries, operations };
+  return { client, tables, rawQueries, operations, note };
 }
 
-/** A node row as `AGENT_UPDATE_NODE_SELECT` reads it: online, Full, outdated, self-update able. */
+/**
+ * A node row as `AGENT_UPDATE_NODE_SELECT` reads it: online (connection generation 1), Full,
+ * outdated, self-update able.
+ */
 export function nodeRow(overrides: Row = {}): Row {
   return {
     id: "node-1",
     userId: "owner-1",
     slug: "box-1",
     connection: "ONLINE",
+    connectionGeneration: 1,
     trust: "FULL",
     trustLowerRequestedAt: null,
     trustChangedAt: null,

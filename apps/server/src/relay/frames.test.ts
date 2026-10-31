@@ -440,6 +440,27 @@ describe("self-update frames", () => {
         { ...progress, reason: "version_mismatch", availableVersion: "0.4.4-rc.1" },
       ],
     ]);
+    // F-FB-2: a version the node could not install is no offer; the refusal still parses.
+    for (const availableVersion of ["latest", "00.4.4", `1.2.3-${"a".repeat(59)}`, 4]) {
+      const parsed = nodeToServerControlFrameSchema.safeParse({
+        ...progress,
+        reason: "version_mismatch",
+        availableVersion,
+      });
+      expect(parsed.success, String(availableVersion)).toBe(true);
+      expect(
+        (parsed.data as { availableVersion?: unknown } | undefined)?.availableVersion,
+        String(availableVersion),
+      ).toBeUndefined();
+      expect(parsed.data).toMatchObject({ phase: "refused", reason: "version_mismatch" });
+    }
+    expect(
+      nodeToServerControlFrameSchema.safeParse({
+        ...progress,
+        reason: "version_mismatch",
+        availableVersion: `1.2.3-${"a".repeat(58)}`,
+      }).data,
+    ).toHaveProperty("availableVersion", `1.2.3-${"a".repeat(58)}`);
     expect(SERVER_TO_NODE_CONTROL_TYPES).toContain("agent.update");
     expect(NODE_TO_SERVER_CONTROL_TYPES).toContain("agent.update.progress");
   });
@@ -452,6 +473,9 @@ describe("self-update frames", () => {
       { ...update, rollbackAfterSecs: 601 },
       { ...update, sha256: "A".repeat(64) },
       { ...update, version: "latest" },
+      // Not a version the node reads (F-FB-2): never sent.
+      { ...update, version: "00.4.4" },
+      { ...update, version: `1.2.3-${"a".repeat(59)}` },
       { ...update, updateId: "short" },
       { ...update, extra: true },
       (({ signature: _, ...rest }) => rest)(update),
@@ -466,10 +490,9 @@ describe("self-update frames", () => {
       { ...progress, reason: "because" },
       { ...progress, detail: "x".repeat(4001) },
       { ...progress, extra: 1 },
-      // availableVersion only with a version_mismatch refusal, and a release version.
+      // availableVersion only with a version_mismatch refusal.
       { ...progress, availableVersion: "0.4.4" },
       { ...progress, phase: "failed", reason: "version_mismatch", availableVersion: "0.4.4" },
-      { ...progress, reason: "version_mismatch", availableVersion: "latest" },
     ];
     for (const frame of badProgress)
       expect(nodeToServerControlFrameSchema.safeParse(frame).success, JSON.stringify(frame)).toBe(

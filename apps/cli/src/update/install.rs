@@ -11,7 +11,12 @@
 //! - Windows cannot replace a running `.exe` but can rename it: the rollback
 //!   copy is a copy, and the swap renames `wsmp.exe` aside, then
 //!   `wsmp.new.exe` to `wsmp.exe` (moving it back if that fails).
+//! - The dead-man runs neither: it runs its recovery copy
+//!   `.wsmp-recovery-<id>` (a hard link of the rollback copy on Unix, a copy
+//!   where linking fails and on Windows), which nothing here moves, so the
+//!   job still has its program after a rollback consumed `wsmp.prev`.
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -43,6 +48,8 @@ pub struct Layout {
     pub staging: PathBuf,
     /// Windows: where the swap renames the running binary.
     pub retired: PathBuf,
+    /// The dead-man's program (`.wsmp-recovery-<id>`): see [`prepare_recovery`].
+    pub recovery: PathBuf,
 }
 
 impl Layout {
@@ -57,6 +64,7 @@ impl Layout {
             failed: dir.join(exe_name("wsmp.failed")),
             staging: dir.join(format!(".wsmp-update-{update_id}")),
             retired: dir.join(exe_name(&format!("{RETIRED_PREFIX}{update_id}"))),
+            recovery: dir.join(exe_name(&format!("{RECOVERY_PREFIX}{update_id}"))),
         })
     }
 }
@@ -148,13 +156,15 @@ pub fn system_tar() -> PathBuf {
 /// lay it out), a regular file (never a link).
 pub fn extract(tar: &Path, archive: &Path, into: &Path, target: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(into).with_context(|| format!("creating `{}`", into.display()))?;
+    // The paths go to `tar` exactly as they are (never as text: a path that is not UTF-8 would
+    // name another file).
     let (ok, output) = super::deadman::run_bounded(
-        &tar.display().to_string(),
+        tar,
         &[
-            "-xf".into(),
-            archive.display().to_string(),
-            "-C".into(),
-            into.display().to_string(),
+            OsStr::new("-xf"),
+            archive.as_os_str(),
+            OsStr::new("-C"),
+            into.as_os_str(),
         ],
         &[],
         Duration::from_secs(120),
@@ -177,13 +187,9 @@ pub fn extract(tar: &Path, archive: &Path, into: &Path, target: &str) -> Result<
 /// Run `binary --version` (bounded) and return the version it prints after
 /// `wsmp `.
 pub fn probe_version(binary: &Path) -> Result<String> {
-    let (ok, output) = super::deadman::run_bounded(
-        &binary.display().to_string(),
-        &["--version".into()],
-        &[],
-        VERSION_PROBE_TIMEOUT,
-    )
-    .context("the new build does not run on this machine")?;
+    let (ok, output) =
+        super::deadman::run_bounded(binary, &["--version"], &[], VERSION_PROBE_TIMEOUT)
+            .context("the new build does not run on this machine")?;
     anyhow::ensure!(
         ok,
         "the new build does not run on this machine: {}",
@@ -260,6 +266,98 @@ pub fn prepare_prev(layout: &Layout) -> Result<()> {
     copy_file(&layout.live, &layout.prev)?;
     sync_dir(&layout.prev);
     Ok(())
+}
+
+/// Write the dead-man's program `recovery`: the same bytes as the rollback copy `prev`, at a
+/// name no swap or rollback moves (a hard link on Unix, a copy where linking fails and on
+/// Windows), synced, and verified to hash as `prev` does (removed, and an error, otherwise).
+/// Written before the state that names it and before the job that runs it.
+pub fn prepare_recovery(prev: &Path, recovery: &Path) -> Result<()> {
+    clear(recovery)?;
+    #[cfg(unix)]
+    {
+        if std::fs::hard_link(prev, recovery).is_err() {
+            copy_file(prev, recovery)?;
+        }
+    }
+    #[cfg(not(unix))]
+    copy_file(prev, recovery)?;
+    sync_dir(recovery);
+    verify_recovery(prev, recovery).inspect_err(|_| {
+        let _ = std::fs::remove_file(recovery);
+    })
+}
+
+/// Whether `recovery` is a runnable copy of `prev`: a regular file with the same SHA-256.
+pub fn verify_recovery(prev: &Path, recovery: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(recovery)
+        .with_context(|| format!("reading `{}`", recovery.display()))?;
+    anyhow::ensure!(
+        meta.file_type().is_file(),
+        "the rollback job's program `{}` is not a regular file",
+        recovery.display()
+    );
+    anyhow::ensure!(
+        sha256_file(recovery)? == sha256_file(prev)?,
+        "the rollback job's program `{}` is not a copy of `{}`",
+        recovery.display(),
+        prev.display()
+    );
+    Ok(())
+}
+
+/// A rollback job armed by an earlier build runs `program` (the rollback copy, `wsmp.prev`),
+/// which the restore consumed: put the restored live binary there again (a hard link, or a
+/// copy), so the job's next run (a retried restart) still has its program. Nothing is changed
+/// when `program` is there.
+pub fn relink_program(live: &Path, program: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(program).is_ok() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        if std::fs::hard_link(live, program).is_err() {
+            copy_file(live, program)?;
+        }
+    }
+    #[cfg(not(unix))]
+    copy_file(live, program)?;
+    sync_dir(program);
+    Ok(())
+}
+
+/// The prefix of a dead-man's program ([`prepare_recovery`]): `.wsmp-recovery-`.
+pub const RECOVERY_PREFIX: &str = ".wsmp-recovery-";
+
+/// Remove every dead-man program ([`prepare_recovery`]) beside `live` except `keep`. The
+/// caller has made sure no registered job runs one (see `flow::sweep_recovery`). One still
+/// running (Windows refuses to delete it) stays and goes on a later call.
+pub fn clear_recovery(live: &Path, keep: Option<&Path>) {
+    for path in recovery_copies(live) {
+        if keep != Some(path.as_path()) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Every dead-man program ([`prepare_recovery`]) beside `live`.
+pub fn recovery_copies(live: &Path) -> Vec<PathBuf> {
+    let Some(dir) = live.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(RECOVERY_PREFIX))
+        })
+        .map(|entry| entry.path())
+        .collect()
 }
 
 fn copy_file(from: &Path, to: &Path) -> Result<()> {
@@ -455,6 +553,38 @@ mod tests {
         // Nothing to roll back to a second time.
         assert!(!restore(&layout).expect("restore again"));
         assert_eq!(std::fs::read_to_string(&live).expect("live"), "old");
+    }
+
+    /// F-FB-1: `tar` gets the archive and the destination, and the probe runs the binary,
+    /// exactly as their paths are: a directory whose name is not UTF-8 is used as it is, and
+    /// the sibling named by its text form (U+FFFD) is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_utf8_is_unpacked_and_probed_as_it_is() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().expect("dir");
+        let odd = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"update-\xff".to_vec()));
+        let sibling = PathBuf::from(odd.display().to_string());
+        assert_ne!(odd, sibling);
+        let src = odd.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        write_exe(&src.join("wsmp"), "#!/bin/sh\necho 'wsmp 9.8.7'\n");
+        let archive = odd.join("a.tar.gz");
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .arg("wsmp")
+            .status()
+            .expect("tar");
+        assert!(status.success());
+        let found = extract(&system_tar(), &archive, &odd.join("out"), "any").expect("extract");
+        assert_eq!(found, odd.join("out").join("wsmp"));
+        assert_eq!(probe_version(&found).expect("probe"), "9.8.7");
+        assert!(!sibling.exists(), "the text-form sibling was used");
     }
 
     #[cfg(unix)]

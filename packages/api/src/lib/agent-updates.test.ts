@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createAgentUpdateDb, nodeRow } from "./agent-update-test-fake";
 
@@ -11,11 +12,13 @@ vi.mock("@ws-model-proxy/db", () => ({
 import {
   AGENT_UPDATE_ROLLBACK_SECS_DEFAULT,
   type AgentUpdateFrame,
+  agentReleaseVersionSchema,
   compareReleaseVersions,
 } from "./agent-update-wire";
 import {
   type AgentUpdatePort,
   advanceAgentUpdateBatch,
+  advanceAgentUpdateBatches,
   agentUpdateDeadline,
   agentUpdateEligibility,
   agentUpdateReleaseDigest,
@@ -75,7 +78,8 @@ function port(overrides: Partial<AgentUpdatePort> = {}) {
 }
 
 function addNodes(...rows: Array<Record<string, unknown>>) {
-  store.tables.node.push(...rows.map((row) => nodeRow(row)));
+  // Stored on the connection the port's live sessions report (generation 3).
+  store.tables.node.push(...rows.map((row) => nodeRow({ connectionGeneration: 3, ...row })));
 }
 
 beforeEach(() => {
@@ -381,7 +385,11 @@ describe("startAgentUpdate", () => {
       force: true,
       origin: ORIGIN,
     });
-    expect(forced).toEqual({ kind: "started", updateId: first.updateId });
+    expect(forced).toEqual({
+      kind: "started",
+      updateId: first.updateId,
+      connectionGeneration: 3,
+    });
     expect(store.tables.nodeAgentUpdate).toHaveLength(1);
     expect(store.tables.nodeAgentUpdate[0]?.force).toBe(true);
     expect(sent.map(({ frame }) => [frame.updateId, frame.force])).toEqual([
@@ -392,6 +400,33 @@ describe("startAgentUpdate", () => {
 });
 
 describe("versions", () => {
+  // F-FB-2: the server accepts exactly the release versions the node reads (the CLI's
+  // `is_release_version` checks the same vectors), so it never offers or sends one the node
+  // cannot install.
+  it("accepts exactly the release versions the node accepts", () => {
+    const shared = JSON.parse(
+      readFileSync(new URL("./agent-release-version-vectors.json", import.meta.url), "utf8"),
+    ) as { vectors: Array<{ value: string; valid: boolean }> };
+    expect(shared.vectors.length).toBeGreaterThan(30);
+    expect(shared.vectors.some((vector) => vector.valid)).toBe(true);
+    expect(shared.vectors.some((vector) => !vector.valid)).toBe(true);
+    for (const { value, valid } of shared.vectors)
+      expect(agentReleaseVersionSchema.safeParse(value).success, JSON.stringify(value)).toBe(valid);
+  });
+
+  // F-FB-1: the server orders every accepted version exactly as the node does (the CLI's
+  // `compare_release` checks the same pairs), including an empty pre-release before `+`.
+  it("orders release versions exactly as the node does", () => {
+    const shared = JSON.parse(
+      readFileSync(new URL("./agent-release-version-vectors.json", import.meta.url), "utf8"),
+    ) as { comparisons: Array<[string, string, number]> };
+    expect(shared.comparisons.length).toBeGreaterThan(1000);
+    for (const [a, b, order] of shared.comparisons)
+      expect(compareReleaseVersions(a, b), `${a} vs ${b}`).toBe(order);
+    expect(compareReleaseVersions("1.2.3-+foo", "1.2.3")).toBe(-1);
+    expect(compareReleaseVersions("1.2.3", "1.2.3-+foo")).toBe(1);
+  });
+
   it("orders release versions by SemVer precedence", () => {
     expect(compareReleaseVersions("0.4.4", "0.4.3")).toBe(1);
     expect(compareReleaseVersions("0.4.3", "0.4.10")).toBe(-1);
@@ -467,7 +502,8 @@ describe("Homebrew: Install anyway and forced resends", () => {
       origin: ORIGIN,
       ...extra,
     });
-  const node = { nodeId: "node-1", userId: OWNER };
+  // The reports arrive on the live session (generation 3), which an offer is bound to.
+  const node = { nodeId: "node-1", userId: OWNER, connectionGeneration: 3 };
   /**
    * The node refused the server's version: its tap has `available`. `null`: the refusal came
    * without `availableVersion` (an older wsmp, or a server that did not advertise it).
@@ -504,10 +540,60 @@ describe("Homebrew: Install anyway and forced resends", () => {
             fromVersion: latest.fromVersion as string | null,
             fromCommit: (latest.fromCommit as string | null) ?? null,
             availableVersion: (latest.availableVersion as string | null) ?? null,
+            availableGeneration: (latest.availableGeneration as number | null) ?? null,
           }
         : null,
     });
   };
+
+  /** Runs `between` right before the next transaction's work (after the reads before it). */
+  const beforeNextTransaction = (between: () => void) => {
+    const base = store.client;
+    fake.db = {
+      ...base,
+      $transaction: async (work: (tx: unknown) => Promise<unknown>) => {
+        fake.db = base;
+        between();
+        return base.$transaction(work);
+      },
+    };
+  };
+
+  it("rechecks the Install-anyway approval under the lock: a newer refusal offers another version (F-FA-1)", async () => {
+    macNode();
+    const { port: p, sent } = homebrewPort();
+    const refusedId = await refusedForTap(p);
+    sent.length = 0;
+    // After the eligibility read, before the claim: the node's latest answer now offers 0.4.5.
+    beforeNextTransaction(() => {
+      Object.assign(store.tables.nodeAgentUpdate.find((row) => row.id === refusedId) ?? {}, {
+        availableVersion: "0.4.5",
+      });
+    });
+    expect(await start(p, { version: "0.4.4" })).toMatchObject({
+      kind: "refused",
+      reason: "agent_update_unavailable",
+    });
+    expect(sent).toEqual([]);
+    expect(store.tables.nodeAgentUpdate).toHaveLength(1);
+  });
+
+  it("refuses Install anyway after a hello stored the next connection, while the session map still holds the one the offer came on (F-FA-1)", async () => {
+    macNode();
+    const { port: p, sent } = homebrewPort();
+    await refusedForTap(p);
+    sent.length = 0;
+    // The successor hello committed generation 4; this process still serves generation 3.
+    beforeNextTransaction(() => {
+      Object.assign(store.tables.node[0] ?? {}, { connectionGeneration: 4 });
+    });
+    expect(await start(p, { version: "0.4.4" })).toMatchObject({
+      kind: "refused",
+      reason: "node_offline",
+    });
+    expect(sent).toEqual([]);
+    expect(store.tables.nodeAgentUpdate).toHaveLength(1);
+  });
 
   it("stores the tap's version from a refusal, offers it, and installs it end to end", async () => {
     macNode();
@@ -518,6 +604,7 @@ describe("Homebrew: Install anyway and forced resends", () => {
       phase: "REFUSED",
       reason: "version_mismatch",
       availableVersion: "0.4.4",
+      availableGeneration: 3,
       artifactSha256: "c".repeat(64),
     });
     expect(await eligibilityNow(p)).toMatchObject({
@@ -667,7 +754,11 @@ describe("Homebrew: Install anyway and forced resends", () => {
     expect(sent).toHaveLength(1);
     // Back to the archive it was sent: the forced resend goes out.
     rebuild("c".repeat(64));
-    expect(await start(p, { force: true })).toEqual({ kind: "started", updateId: first.updateId });
+    expect(await start(p, { force: true })).toEqual({
+      kind: "started",
+      updateId: first.updateId,
+      connectionGeneration: 3,
+    });
     expect(sent.map(({ frame }) => [frame.version, frame.force])).toEqual([
       ["0.4.3", false],
       ["0.4.3", true],
@@ -712,8 +803,39 @@ describe("Homebrew: Install anyway and forced resends", () => {
     const anyway = await start(p, { version: "0.4.4" });
     if (anyway.kind !== "started") throw new Error("not started");
     await applyAgentUpdateProgress(node, { updateId: anyway.updateId, phase: "waiting_idle" });
-    expect(await start(p, { force: true })).toEqual({ kind: "started", updateId: anyway.updateId });
+    expect(await start(p, { force: true })).toEqual({
+      kind: "started",
+      updateId: anyway.updateId,
+      connectionGeneration: 3,
+    });
     expect(sent.at(-1)?.frame).toMatchObject({ version: "0.4.4", force: true });
+  });
+
+  it("does not resend an Install anyway update after a reconnect when no build commit is known", async () => {
+    macNode();
+    const { port: p, sent } = homebrewPort();
+    await refusedForTap(p);
+    const anyway = await start(p, { version: "0.4.4" });
+    if (anyway.kind !== "started") throw new Error("not started");
+    expect(store.tables.nodeAgentUpdate.find((row) => row.id === anyway.updateId)).toMatchObject({
+      availableGeneration: 3,
+    });
+    await applyAgentUpdateProgress(node, { updateId: anyway.updateId, phase: "waiting_idle" });
+    // The node reconnected (generation 4) with the same version and still no commit: it may be
+    // another wsmp, so the tap's version is not resent.
+    const live = p.liveNode;
+    p.liveNode = (id) => {
+      const session = live(id);
+      return session ? { ...session, connectionGeneration: 4 } : null;
+    };
+    expect(await start(p, { force: true })).toMatchObject({
+      kind: "refused",
+      reason: "agent_update_unavailable",
+    });
+    expect(store.tables.nodeAgentUpdate.find((row) => row.id === anyway.updateId)?.force).toBe(
+      false,
+    );
+    expect(sent.map(({ frame }) => frame.version)).toEqual(["0.4.3", "0.4.4"]);
   });
 
   it("does not resend an Install anyway update once another wsmp runs", async () => {
@@ -931,6 +1053,55 @@ describe("Update all", () => {
     expect(batch()).toMatchObject({ state: "DONE", skippedNodeIds: [] });
   });
 
+  // F-FB-7: the node's progress as the Homebrew worker sends it
+  // (`a_homebrew_update_reports_downloading_when_idle_before_it_waits_for_the_lock`): the tap
+  // refresh, a wait for idle of 29 minutes, `downloading` once idle, a 4-minute wait for
+  // Homebrew's lock, `downloading` again under it, then the upgrade and the restart. Through the
+  // server's tick (expiry first, then the batch driver, as `relay/agent-updates.ts` runs them).
+  it.each([
+    ["reports downloading once idle (the node's sequence)", true],
+    ["stays waiting_idle until the lock (the sequence before the fix)", false],
+  ])("a Homebrew step that waits for idle, then for the lock, %s", async (_label, idleReport) => {
+    addNodes({ id: "n1", slug: "n1" }, { id: "n2", slug: "n2" });
+    batchOf(["n1", "n2"]);
+    const { port: p, sent } = port();
+    const t0 = new Date(Date.UTC(2026, 9, 31, 8, 0, 0));
+    const at = (minutes: number) => new Date(t0.getTime() + minutes * 60_000);
+    const tick = async (now: Date) => {
+      await expireAgentUpdates(now);
+      await advanceAgentUpdateBatches(p, ORIGIN, now);
+    };
+    await advanceAgentUpdateBatch(p, "batch-1", ORIGIN, t0);
+    const id = sent[0]?.frame.updateId as string;
+    const node = { nodeId: "n1", userId: OWNER, connectionGeneration: 3 };
+    const progress = (
+      phase: "downloading" | "waiting_idle" | "restarting" | "confirmed",
+      m: number,
+    ) => applyAgentUpdateProgress(node, { updateId: id, phase }, at(m));
+    await progress("downloading", 0.01);
+    await progress("waiting_idle", 0.02);
+    if (idleReport) await progress("downloading", 29);
+    await tick(at(32));
+    const row = () => store.tables.nodeAgentUpdate.find((update) => update.id === id);
+    if (!idleReport) {
+      // What the reviewer replayed: the idle window ran out while the node waited for the lock.
+      expect(row()?.phase).toBe("TIMED_OUT");
+      expect(batch()).toMatchObject({ state: "STOPPED", stoppedReason: "timed_out" });
+      return;
+    }
+    expect(row()?.phase).toBe("DOWNLOADING");
+    expect(batch()).toMatchObject({ state: "RUNNING", currentUpdateId: id });
+    await progress("downloading", 33);
+    await tick(at(40));
+    expect(row()?.phase).toBe("DOWNLOADING");
+    await progress("restarting", 41);
+    await progress("confirmed", 42);
+    await tick(at(42.5));
+    expect(row()?.phase).toBe("CONFIRMED");
+    expect(sent.map(({ nodeId }) => nodeId)).toEqual(["n1", "n2"]);
+    expect(batch()).toMatchObject({ state: "RUNNING", position: 1 });
+  });
+
   it("stops when the server offers another release than the canary validated", async () => {
     addNodes({ id: "n1", slug: "n1" }, { id: "n2", slug: "n2" }, { id: "n3", slug: "n3" });
     batchOf(["n1", "n2", "n3"]);
@@ -1057,5 +1228,143 @@ describe("Update all", () => {
     const { port: p, sent } = port();
     await advanceAgentUpdateBatch(p, "batch-1", ORIGIN);
     expect(sent.map(({ nodeId }) => nodeId)).toEqual(["n2"]);
+  });
+});
+
+describe("a send stays bound to the stored connection and to its live claim (F-FA-1, F-FA-2)", () => {
+  /** Runs `after` once, right after the next transaction committed (the claim's). */
+  function afterNextCommit(after: () => Promise<void> | void) {
+    const base = store.client;
+    fake.db = {
+      ...base,
+      $transaction: async (work: (tx: unknown) => Promise<unknown>) => {
+        const result = await base.$transaction(work);
+        fake.db = base;
+        await after();
+        return result;
+      },
+    };
+  }
+  const start = (p: AgentUpdatePort, force = false) =>
+    startAgentUpdate(p, {
+      userId: OWNER,
+      nodeId: "node-1",
+      force,
+      origin: ORIGIN,
+      now: new Date(0),
+    });
+
+  beforeEach(() => addNodes({}));
+
+  it("allowed control: sends when nothing changed between the claim and the send", async () => {
+    const { port: p, sent } = port();
+    afterNextCommit(() => undefined);
+    expect(await start(p)).toMatchObject({ kind: "started", connectionGeneration: 3 });
+    expect(sent).toHaveLength(1);
+  });
+
+  it("P3a: a claim that expired before the send is not sent", async () => {
+    const { port: p, sent } = port();
+    afterNextCommit(async () => {
+      expect(await expireAgentUpdates(new Date(120_001))).toBe(1);
+    });
+    expect(await start(p)).toMatchObject({ kind: "refused", reason: "agent_update_in_progress" });
+    expect(sent).toEqual([]);
+    expect(store.tables.nodeAgentUpdate[0]).toMatchObject({ phase: "TIMED_OUT" });
+  });
+
+  it("P3b: a forced resend of an update the node ended meanwhile is not sent", async () => {
+    const { port: p, sent } = port();
+    const first = await start(p);
+    if (first.kind !== "started") throw new Error("not started");
+    Object.assign(store.tables.nodeAgentUpdate[0] ?? {}, { phase: "WAITING_IDLE" });
+    sent.length = 0;
+    afterNextCommit(async () => {
+      expect(
+        await applyAgentUpdateProgress(
+          { nodeId: "node-1", userId: OWNER },
+          { updateId: first.updateId, phase: "refused", reason: "busy" },
+        ),
+      ).toMatchObject({ applied: true, ended: true });
+    });
+    expect(await start(p, true)).toMatchObject({
+      kind: "refused",
+      reason: "agent_update_in_progress",
+    });
+    expect(sent).toEqual([]);
+    expect(store.tables.nodeAgentUpdate[0]).toMatchObject({ phase: "REFUSED" });
+  });
+
+  it("a forced resend of an update that left the idle wait meanwhile is not sent", async () => {
+    const { port: p, sent } = port();
+    const first = await start(p);
+    if (first.kind !== "started") throw new Error("not started");
+    Object.assign(store.tables.nodeAgentUpdate[0] ?? {}, { phase: "WAITING_IDLE" });
+    sent.length = 0;
+    afterNextCommit(async () => {
+      await applyAgentUpdateProgress(
+        { nodeId: "node-1", userId: OWNER },
+        { updateId: first.updateId, phase: "downloading" },
+      );
+    });
+    expect(await start(p, true)).toMatchObject({ kind: "refused" });
+    expect(sent).toEqual([]);
+    expect(store.tables.nodeAgentUpdate[0]).toMatchObject({ phase: "DOWNLOADING", endedAt: null });
+  });
+
+  it("allowed control: a forced resend of an update still waiting for idle is sent", async () => {
+    const { port: p, sent } = port();
+    await start(p);
+    Object.assign(store.tables.nodeAgentUpdate[0] ?? {}, { phase: "WAITING_IDLE" });
+    sent.length = 0;
+    afterNextCommit(() => undefined);
+    expect(await start(p, true)).toMatchObject({ kind: "started" });
+    expect(sent.map(({ frame }) => frame.force)).toEqual([true]);
+  });
+
+  it("P3c: refuses a target whose stored generation is not the session's, though the map still holds it", async () => {
+    Object.assign(store.tables.node[0] ?? {}, { connectionGeneration: 4 });
+    const { port: p, sent } = port();
+    expect(await start(p)).toMatchObject({ kind: "refused", reason: "node_offline" });
+    expect(sent).toEqual([]);
+    expect(store.tables.nodeAgentUpdate).toEqual([]);
+  });
+
+  it("refuses the send when a successor hello committed between the claim and the send", async () => {
+    const { port: p, sent } = port();
+    afterNextCommit(() => {
+      Object.assign(store.tables.node[0] ?? {}, { connectionGeneration: 4 });
+    });
+    expect(await start(p)).toMatchObject({ kind: "refused", reason: "node_offline" });
+    expect(sent).toEqual([]);
+    // Nothing reached the node: the claim went.
+    expect(store.tables.nodeAgentUpdate).toEqual([]);
+  });
+
+  it("refuses the send when the disconnect committed OFFLINE before the session map dropped it", async () => {
+    const { port: p, sent } = port({
+      liveNode: () => ({
+        userId: OWNER,
+        connectionGeneration: 3,
+        trust: "full",
+        selfUpdate: SELF_UPDATE,
+      }),
+    });
+    afterNextCommit(() => {
+      Object.assign(store.tables.node[0] ?? {}, { connection: "OFFLINE" });
+    });
+    expect(await start(p)).toMatchObject({ kind: "refused", reason: "node_offline" });
+    expect(sent).toEqual([]);
+    expect(store.tables.nodeAgentUpdate).toEqual([]);
+  });
+
+  it("P3d (control): browser updates turned off after the claim refuse the send and undo the claim", async () => {
+    const { port: p, sent } = port();
+    afterNextCommit(() => {
+      Object.assign(store.tables.node[0] ?? {}, { agentUpdatePolicy: "OFF" });
+    });
+    expect(await start(p)).toMatchObject({ kind: "refused", reason: "agent_update_off" });
+    expect(sent).toEqual([]);
+    expect(store.tables.nodeAgentUpdate).toEqual([]);
   });
 });

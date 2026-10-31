@@ -152,14 +152,15 @@ pub fn guard_lock_arg(state_dir: &Path) -> Result<String> {
 }
 
 /// `program args` as the guard runs it: `<wsmp> __launch-guard --parent <pid> --lock <path>
-/// -- program args`. `lock` comes from [`guard_lock_arg`].
+/// -- program args`. `lock` comes from [`guard_lock_arg`]. `exe` stays the OS string it is
+/// (the wsmp binary's path is executed, so it is never turned into text).
 pub fn wrap(
-    exe: &str,
+    exe: impl AsRef<std::ffi::OsStr>,
     parent: u32,
     lock: &str,
     program: &str,
     args: &[String],
-) -> (String, Vec<String>) {
+) -> (std::ffi::OsString, Vec<String>) {
     let mut wrapped = vec![
         SUBCOMMAND.to_owned(),
         "--parent".to_owned(),
@@ -170,25 +171,25 @@ pub fn wrap(
         program.to_owned(),
     ];
     wrapped.extend_from_slice(args);
-    (exe.to_owned(), wrapped)
+    (exe.as_ref().to_owned(), wrapped)
 }
 
 /// `program args` under the guard of this process. Unit tests run the program as is: their
 /// binary is the test harness, which has no guard subcommand (`tests/launch_guard.rs` runs the
 /// real one).
-pub fn command(program: &str, args: &[String]) -> Result<(String, Vec<String>)> {
+pub fn command(program: &str, args: &[String]) -> Result<(std::ffi::OsString, Vec<String>)> {
     if cfg!(test) {
-        return Ok((program.to_owned(), args.to_vec()));
+        return Ok((program.into(), args.to_vec()));
     }
     let lock = guard_lock_arg(&crate::paths::state_dir()?)?;
-    // `/proc/self/exe` is this binary even after an upgrade replaced its file.
+    // `/proc/self/exe` is this binary even after an upgrade replaced its file. Elsewhere the
+    // binary's path exactly as the OS gives it (never as text: it is executed).
     let exe = if cfg!(target_os = "linux") {
-        "/proc/self/exe".to_owned()
+        "/proc/self/exe".into()
     } else {
         std::env::current_exe()
             .context("the wsmp binary could not be found")?
-            .to_string_lossy()
-            .into_owned()
+            .into_os_string()
     };
     Ok(wrap(&exe, std::process::id(), &lock, program, args))
 }

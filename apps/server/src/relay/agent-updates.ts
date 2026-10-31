@@ -119,13 +119,24 @@ export function createAgentUpdates(relay: RelayPort, deps: AgentUpdateDeps = {})
         : null;
     },
     // Full control and the owner are re-checked on the live session at the socket: a lowering
-    // or a rebind that landed after the procedure's checks wins, and nothing is sent.
-    send: (nodeId, frame, guard) =>
-      relay.sendToNode(nodeId, frame, {
+    // or a rebind that landed after the procedure's checks wins, and nothing is sent. So is the
+    // node operator's own setting: a session that reports no self-update, or `remote: "off"`,
+    // gets no `agent.update` (read in the same turn as the send, so nothing lands in between).
+    send: (nodeId, frame, guard) => {
+      const session = relay.nodeSession(nodeId);
+      if (
+        !session ||
+        session.connectionGeneration !== guard.connectionGeneration ||
+        !session.selfUpdate ||
+        session.selfUpdate.remote === "off"
+      )
+        return false;
+      return relay.sendToNode(nodeId, frame, {
         connectionGeneration: guard.connectionGeneration,
         requireFullTrust: true,
         userId: guard.userId,
-      }),
+      });
+    },
     wake: () => wake(),
   };
 
@@ -164,7 +175,11 @@ export function createAgentUpdates(relay: RelayPort, deps: AgentUpdateDeps = {})
   const handlers: Pick<NodeFrameHandlers, "agent.update.progress"> = {
     "agent.update.progress": async (node: NodeSessionRef, frame: ProgressFrame) => {
       const result = await applyAgentUpdateProgress(
-        { nodeId: node.nodeId, userId: node.userId },
+        {
+          nodeId: node.nodeId,
+          userId: node.userId,
+          connectionGeneration: node.connectionGeneration,
+        },
         frame,
       );
       if (result.ended) wake();

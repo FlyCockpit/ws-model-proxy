@@ -21,7 +21,9 @@ use crate::output;
 
 #[cfg(target_os = "linux")]
 const LINUX_UNIT: &str = "wsmp.service";
-#[cfg(target_os = "macos")]
+/// The relay LaunchAgent's label: a plist with it is wsmp's
+/// ([`ServiceKind::LaunchdPlist`]).
+#[cfg(unix)]
 const MACOS_LABEL: &str = "com.flycockpit.wsmp";
 #[cfg(target_os = "macos")]
 const MACOS_WRAPPER_NAME: &str = "wsmp-service-run.sh";
@@ -97,7 +99,18 @@ pub(crate) fn service_file() -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn macos_wrapper_path() -> Result<PathBuf> {
-    Ok(crate::paths::state_dir()?.join(MACOS_WRAPPER_NAME))
+    absolute_in(&crate::paths::state_dir()?, MACOS_WRAPPER_NAME)
+}
+
+/// `name` in `dir`, made absolute against this process's working directory
+/// (as [`pinned_service_env`] pins the state directory): the plist names the
+/// wrapper, and launchd reads a relative path against its own working
+/// directory, not that of the shell that ran `wsmp service install` or
+/// `wsmp update` (a relative `WSMP_STATE_DIR`). No link is followed.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn absolute_in(dir: &Path, name: &str) -> Result<PathBuf> {
+    let path = dir.join(name);
+    std::path::absolute(&path).with_context(|| format!("resolving `{}`", path.display()))
 }
 
 #[cfg(target_os = "macos")]
@@ -146,12 +159,15 @@ fn executable() -> Result<String> {
 /// LaunchAgent plist) is rendered again by the same renderer, with `stable`
 /// and this process's pins ([`pinned_service_env`]), and written when its
 /// bytes or mode differ: an older template, a `Cellar` path, an alias, a hand
-/// edit or a file cut short are all replaced. A path or pin the service
+/// edit or a file cut short after its opening are all replaced (one that does
+/// not have wsmp's complete opening, an empty one too, is custom: see
+/// [`ServiceKind::generated`]). A path or pin the service
 /// file cannot hold as written (a control character such as a newline) is an
-/// error before anything is written ([`refuse_unwritable`]). A file written
-/// by hand is left as it is, unless it names a `Cellar` path (an error). No service is fine;
-/// a broken one (a dangling link, not a regular file) is an error. See
-/// [`stable_service_files`].
+/// error before anything is written ([`refuse_unwritable`]). Any file not
+/// written by `wsmp service install` (by hand, or by another tool) is an
+/// error before anything is written, whatever it says: wsmp cannot tell what
+/// it starts. No service is fine; a broken one (a dangling link, not a
+/// regular file) is an error. See [`stable_service_files`].
 pub fn ensure_stable_executable(stable: &Path) -> Result<()> {
     // Asked only when a service is there to render.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -172,6 +188,8 @@ pub fn ensure_stable_executable(stable: &Path) -> Result<()> {
         },
         &publish_file,
         || run_finite("systemctl", &["--user", "daemon-reload"]),
+        // No plist here.
+        &|_| None,
     )?;
     #[cfg(target_os = "macos")]
     {
@@ -199,6 +217,7 @@ pub fn ensure_stable_executable(stable: &Path) -> Result<()> {
             // back is `wsmp service install` (`wsmp update` does nothing when
             // wsmp is already current). The wrapper is read at every start.
             || Ok(()),
+            &macos_plist_label,
         )?;
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -251,12 +270,49 @@ impl ServiceKind {
         }
     }
 
-    /// Whether `text` is wsmp's rendering (any template, edited, or cut
-    /// short: a start of the opening, an empty file too), not one by hand.
-    fn generated(self, text: &str) -> bool {
-        let opening = self.opening();
-        text.starts_with(opening) || opening.starts_with(text)
+    /// Whether `bytes` are wsmp's rendering: they start with the complete
+    /// [`Self::opening`] (any template, edited or cut short after it). Anything
+    /// less is not wsmp's (the owner's rule, round 13): an empty file, one cut
+    /// short inside the opening, or one that only shares a generic start with
+    /// it (`#!/bin/sh\n`, an XML declaration) cannot be told apart from one by
+    /// hand, so it is custom, and the Homebrew update refuses it with
+    /// `wsmp service install` advice. A plist is also wsmp's when its `Label`
+    /// is [`MACOS_LABEL`], whatever its layout ([`find`]).
+    fn generated(self, bytes: &[u8]) -> bool {
+        bytes.starts_with(self.opening().as_bytes())
     }
+}
+
+/// The `Label` of the plist at a path, `None` when it has none or it cannot
+/// be read as a plist: [`macos_plist_label`] on macOS, a fake in tests.
+#[cfg(unix)]
+type PlistLabel<'a> = dyn Fn(&Path) -> Option<String> + 'a;
+
+/// How long [`macos_plist_label`] waits for `plutil`.
+#[cfg(target_os = "macos")]
+const PLUTIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The plist's `Label` as `/usr/bin/plutil -extract Label raw` gives it
+/// (XML or binary, keys in any order, as `plutil`, `defaults` or Xcode save
+/// it), bounded ([`crate::update::deadman::run_bounded_split`]). `file` is
+/// one [`read_service_file`] found to be a regular file, passed as the OS
+/// path it is. `None` when `plutil` fails (no `Label`, not a plist): the
+/// plist is then taken as one by hand.
+#[cfg(target_os = "macos")]
+fn macos_plist_label(file: &Path) -> Option<String> {
+    // The file's path as it is (never as text: it would name another file).
+    let args = [
+        std::ffi::OsStr::new("-extract"),
+        "Label".as_ref(),
+        "raw".as_ref(),
+        "-o".as_ref(),
+        "-".as_ref(),
+        file.as_os_str(),
+    ];
+    let (ok, stdout, _) =
+        crate::update::deadman::run_bounded_split("/usr/bin/plutil", &args, &[], PLUTIL_TIMEOUT)
+            .ok()?;
+    ok.then(|| stdout.strip_suffix('\n').unwrap_or(&stdout).to_string())
 }
 
 /// How [`stable_service_files`] writes a file: [`publish_file`] (tests vary it).
@@ -271,7 +327,7 @@ struct ServiceText {
     /// Where it is: `path`, or what its links lead to.
     target: PathBuf,
     mode: u32,
-    text: String,
+    bytes: Vec<u8>,
 }
 
 /// The most of a service file [`read_service_file`] reads: a unit, plist or
@@ -317,13 +373,14 @@ fn read_service_file(path: &Path) -> Result<Option<ServiceText>> {
         "the relay service `{}` is not a regular file; run `wsmp service install`",
         path.display()
     );
-    let mut text = String::new();
+    // Bytes, not text: `defaults` saves a plist in the binary format.
+    let mut bytes = Vec::new();
     (&file)
         .take(SERVICE_FILE_LIMIT + 1)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .with_context(context)?;
     anyhow::ensure!(
-        text.len() as u64 <= SERVICE_FILE_LIMIT,
+        bytes.len() as u64 <= SERVICE_FILE_LIMIT,
         "the relay service `{}` is larger than {} bytes",
         path.display(),
         SERVICE_FILE_LIMIT
@@ -332,7 +389,7 @@ fn read_service_file(path: &Path) -> Result<Option<ServiceText>> {
         file,
         target,
         mode: metadata.permissions().mode() & 0o7777,
-        text,
+        bytes,
     }))
 }
 
@@ -342,16 +399,30 @@ enum Found {
     Absent,
     /// wsmp's rendering ([`ServiceKind::generated`]): rendered again.
     Generated(ServiceText),
-    /// Written by hand: left as it is.
-    Custom(ServiceText),
+    /// Not wsmp's rendering (by hand, or by another tool): the update stops.
+    /// Its text is never inspected: what a service file starts depends on
+    /// syntax wsmp does not parse (escapes, references, quoting, includes).
+    Custom,
 }
 
+/// The file at `path` ([`read_service_file`]), classified: wsmp's when it
+/// starts as wsmp's renderings do ([`ServiceKind::generated`]), or, for the
+/// LaunchAgent plist, when `plist_label` reads [`MACOS_LABEL`] from it (a
+/// plist wsmp wrote, saved again by `plutil`, `defaults` or Xcode with its
+/// keys in another order: the owner's rule, 2026-10-30). Custom otherwise,
+/// and when the label cannot be read.
 #[cfg(unix)]
-fn find(path: &Path, kind: ServiceKind) -> Result<Found> {
+fn find(path: &Path, kind: ServiceKind, plist_label: &PlistLabel<'_>) -> Result<Found> {
     Ok(match read_service_file(path)? {
         None => Found::Absent,
-        Some(found) if kind.generated(&found.text) => Found::Generated(found),
-        Some(found) => Found::Custom(found),
+        Some(found) if kind.generated(&found.bytes) => Found::Generated(found),
+        Some(found)
+            if kind == ServiceKind::LaunchdPlist
+                && plist_label(&found.target).as_deref() == Some(MACOS_LABEL) =>
+        {
+            Found::Generated(found)
+        }
+        Some(_) => Found::Custom,
     })
 }
 
@@ -359,16 +430,17 @@ fn find(path: &Path, kind: ServiceKind) -> Result<Found> {
 /// (macOS: the wrapper, then the plist that runs it), the last one the loader,
 /// without which no service is installed. `render` gives, in the same order,
 /// what `wsmp service install` writes now for `stable`. Each call:
-/// 1. finds each file ([`read_service_file`]): absent, wsmp's ([`Found::Generated`]),
-///    or by hand; a broken one is an error. No loader: no service, done.
-/// 2. refuses, with nothing written, a file by hand that names a `Cellar`
-///    path (wsmp does not know how to write it again), and, when any file is
-///    wsmp's, a rendering that fails (a path or pin with a character no
-///    service file can hold: [`refuse_unwritable`]);
+/// 1. finds each file ([`find`]; `plist_label` reads a plist's label): absent,
+///    wsmp's ([`Found::Generated`]), or custom; a broken one is an error. No
+///    loader: no service, done.
+/// 2. refuses, with nothing written, any custom file (the owner's rule,
+///    2026-10-30: wsmp cannot tell what it starts, so it cannot tell whether
+///    the restart runs the new keg), and a rendering that fails (a path or
+///    pin with a character no service file can hold: [`refuse_unwritable`]);
 /// 3. `publish`es ([`publish_file`]: the old file stays whole when this
-///    fails) each of wsmp's files whose bytes or mode differ from `render`'s,
-///    and a missing runner the loader is wsmp's (it names it). Nothing is
-///    written while `stable` does not exist (`brew unlink`);
+///    fails) each file whose bytes or mode differ from `render`'s, and a
+///    missing runner (the loader, wsmp's, names it). Nothing is written while
+///    `stable` does not exist (`brew unlink`);
 /// 4. syncs every file found and its directory (a rename an earlier try could
 ///    not sync is synced now), then `reload`s (Linux: `daemon-reload`).
 ///
@@ -382,38 +454,37 @@ fn stable_service_files(
     render: impl FnOnce() -> Result<Vec<String>>,
     publish: &Publish<'_>,
     reload: impl FnOnce() -> Result<()>,
+    plist_label: &PlistLabel<'_>,
 ) -> Result<()> {
     let Some(((loader, loader_kind), runners)) = files.split_last() else {
         return Ok(());
     };
-    let loader_found = find(loader, *loader_kind)?;
+    let loader_found = find(loader, *loader_kind, plist_label)?;
     if matches!(loader_found, Found::Absent) {
         return Ok(());
     }
-    let loader_generated = matches!(loader_found, Found::Generated(_));
     let mut found = runners
         .iter()
-        .map(|(path, kind)| find(path, *kind))
+        .map(|(path, kind)| find(path, *kind, plist_label))
         .collect::<Result<Vec<_>>>()?;
     found.push(loader_found);
-    for ((path, _), file) in files.iter().zip(&found) {
-        if let Found::Custom(custom) = file {
-            anyhow::ensure!(
-                !custom.text.contains("/Cellar/wsmp/"),
-                "the relay service `{}` was not written by `wsmp service install` and runs a versioned Homebrew `Cellar` path: after the upgrade it would still start the old keg (which a later `brew cleanup` may remove); make it run `{}`, or run `wsmp service install`",
-                path.display(),
-                stable.display()
-            );
-        }
+    if let Some((path, _)) = files
+        .iter()
+        .zip(&found)
+        .find(|(_, file)| matches!(file, Found::Custom))
+        .map(|(file, _)| *file)
+    {
+        anyhow::bail!(
+            "the relay service `{}` was not written by `wsmp service install`, so a Homebrew update cannot tell what it starts; nothing was changed and wsmp was not upgraded. Run `wsmp service install` (it writes a service the update keeps on the stable path `{}`) and update again, or update by hand: `brew upgrade flycockpit/tap/wsmp`, then make your service start `{}` and restart it",
+            path.display(),
+            stable.display(),
+            stable.display()
+        );
     }
-    // Rendered only when wsmp owns a file: a value that no service file can
-    // hold ([`refuse_unwritable`]) refuses the update here, before anything
-    // is written; files by hand never need it.
-    let rendered = if found.iter().any(|file| matches!(file, Found::Generated(_))) {
-        render()?
-    } else {
-        vec![String::new(); files.len()]
-    };
+    // Every file found is wsmp's now (the loader is there, so it is): a value
+    // that no service file can hold ([`refuse_unwritable`]) refuses the update
+    // here, before anything is written.
+    let rendered = render()?;
     anyhow::ensure!(
         rendered.len() == files.len(),
         "rendered {} service files for {}",
@@ -425,9 +496,12 @@ fn stable_service_files(
         .zip(&found)
         .zip(&rendered)
         .filter(|(((_, kind), file), bytes)| match file {
-            Found::Generated(current) => current.text != **bytes || current.mode != kind.mode(),
-            Found::Absent => loader_generated,
-            Found::Custom(_) => false,
+            Found::Generated(current) => {
+                current.bytes != bytes.as_bytes() || current.mode != kind.mode()
+            }
+            // A runner the loader (wsmp's) names.
+            Found::Absent => true,
+            Found::Custom => false,
         })
         .map(|(((path, kind), _), bytes)| (*path, *kind, bytes))
         .collect();
@@ -450,7 +524,7 @@ fn stable_service_files(
     // Finish what an earlier try may have left: each file (the one found, or
     // the one just published, already synced) and the rename in its directory.
     for file in &found {
-        if let Found::Generated(current) | Found::Custom(current) = file {
+        if let Found::Generated(current) = file {
             current
                 .file
                 .sync_all()
@@ -498,14 +572,15 @@ pub fn restart_quietly(how: Restart) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         require_installed()?;
-        let domain = launchd_domain()?;
         let file = service_file()?;
+        let file = path_text("the relay service", &file)?;
+        let domain = launchd_domain()?;
         restart_launch_agent(
             &mut SystemLaunchctl,
             LaunchAgentCaller::Restart(how),
             &domain,
             &format!("{domain}/{MACOS_LABEL}"),
-            &file.display().to_string(),
+            file,
             std::time::Instant::now() + FINITE_COMMAND_TIMEOUT,
         )
     }
@@ -529,9 +604,15 @@ pub fn restart_quietly(how: Restart) -> Result<()> {
 /// [`SystemLaunchctl`] on macOS, a fake in tests.
 #[cfg(any(target_os = "macos", test))]
 trait Launchctl {
-    /// `launchctl args`, stopped after `timeout`; an error (with its output)
-    /// when it fails.
-    fn run(&mut self, args: &[&str], timeout: std::time::Duration) -> Result<()>;
+    /// `launchctl args`, stopped after `timeout`: how it ended (exit code and
+    /// output) when it ran to its end, whatever its status. An error when it
+    /// could not start, ran out of time or was stopped (too many commands,
+    /// wsmp exiting): then nothing is known of what launchd would have said.
+    fn run(
+        &mut self,
+        args: &[&str],
+        timeout: std::time::Duration,
+    ) -> Result<crate::update::deadman::Exited>;
     fn now(&self) -> std::time::Instant;
     fn sleep(&mut self, pause: std::time::Duration);
 }
@@ -541,8 +622,13 @@ struct SystemLaunchctl;
 
 #[cfg(target_os = "macos")]
 impl Launchctl for SystemLaunchctl {
-    fn run(&mut self, args: &[&str], timeout: std::time::Duration) -> Result<()> {
-        run_finite_within("launchctl", args, timeout)
+    fn run(
+        &mut self,
+        args: &[&str],
+        timeout: std::time::Duration,
+    ) -> Result<crate::update::deadman::Exited> {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        crate::update::deadman::run_bounded_status("launchctl", &args, &[], timeout)
     }
     fn now(&self) -> std::time::Instant {
         std::time::Instant::now()
@@ -553,11 +639,18 @@ impl Launchctl for SystemLaunchctl {
 }
 
 /// The first wait between two looks at launchd (an unload to finish, a
-/// bootstrap to try again); each next one doubles, up to [`LAUNCHD_POLL_MAX`].
+/// bootstrap to try again, a look that failed); each next one doubles, up to
+/// [`LAUNCHD_POLL_MAX`].
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_POLL_FIRST: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `launchctl print <domain>/<label>`'s exit status for a service launchd
+/// does not have ("Bad request. Could not find service … in domain"), as
+/// seen on a Mac. Every other failure of `print` says nothing about it.
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHCTL_NOT_LOADED: i32 = 113;
 
 /// What a person runs when the relay's LaunchAgent is left unloaded by a
 /// restart.
@@ -579,25 +672,67 @@ enum LaunchAgentCaller {
     Install,
 }
 
+/// What `launchctl print` showed of the agent.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Agent {
+    /// Exit 0: launchd has it.
+    Loaded,
+    /// Exit [`LAUNCHCTL_NOT_LOADED`]: launchd does not have it.
+    Absent,
+}
+
+/// `Ok` for a `launchctl` call that exited 0; its output otherwise.
+#[cfg(any(target_os = "macos", test))]
+fn launchctl_ok(args: &[&str], ran: crate::update::deadman::Exited) -> Result<()> {
+    if ran.code == Some(0) {
+        return Ok(());
+    }
+    Err(launchctl_failed(args, &ran))
+}
+
+/// The error for a `launchctl` call that exited `ran.code`, with its output.
+#[cfg(any(target_os = "macos", test))]
+fn launchctl_failed(args: &[&str], ran: &crate::update::deadman::Exited) -> anyhow::Error {
+    let status = ran
+        .code
+        .map_or_else(|| "a signal".to_string(), |code| format!("exit {code}"));
+    anyhow::anyhow!(
+        "`launchctl {}` failed ({status}): {}{}",
+        args.join(" "),
+        ran.stdout.trim(),
+        ran.stderr.trim()
+    )
+}
+
 /// macOS [`restart_quietly`]: restart the LaunchAgent `agent`
 /// (`<domain>/<label>`, loaded from `file`), every `launchctl` call within
 /// one `deadline`.
 ///
-/// - `Restart::Reloaded`: when loaded, `bootout`, then wait until launchd no
-///   longer has it: `bootout` returns before launchd has finished unloading,
-///   and a `bootstrap` meanwhile fails (commonly "Bootstrap failed: 5:
-///   Input/output error"). A `bootout` that fails while the agent is still
-///   loaded is an error (the relay keeps running what launchd loaded).
+/// Each look at launchd (`print`) is loaded (exit 0), not loaded (exit
+/// [`LAUNCHCTL_NOT_LOADED`]), or no answer (any other end: it could not run,
+/// ran out of time, another status). No answer is never taken as not
+/// loaded: it is asked again until the deadline, then an error.
+///
+/// - `Restart::Reloaded`: when loaded, `bootout`, then wait until launchd
+///   says it no longer has it: `bootout` returns before launchd has finished
+///   unloading, and a `bootstrap` meanwhile fails (commonly "Bootstrap
+///   failed: 5: Input/output error"). A `bootout` that fails while the agent
+///   is still loaded is an error (the relay keeps running what launchd
+///   loaded).
 /// - Then (always for `Reloaded`, and for `Loaded` when the agent is not
 ///   loaded: `kickstart` fails on that, exit 113) `bootstrap`, tried again
-///   until the deadline while it fails and the agent is not loaded.
+///   until the deadline while it fails and the agent is not loaded. A
+///   `bootstrap` that fails while launchd says the agent is loaded is
+///   taken as loaded only after launchd said it was not loaded (so what it
+///   has was loaded since, from the file as it is now), which every path
+///   here establishes before it runs `bootstrap`.
 /// - Then `kickstart -k`.
 ///
-/// Once the agent may be unloaded, every error names the way back
-/// ([`LAUNCHD_RECOVERY`]; for `Install`: run it again, or `launchctl
-/// bootstrap` by hand), so the relay is never left unloaded in silence.
-/// `Install` is `Reloaded`: its first install (nothing loaded) is
-/// `bootstrap`, then `kickstart`, as before.
+/// Every error names the way back ([`LAUNCHD_RECOVERY`]; for `Install`: run
+/// it again, or `launchctl bootstrap` by hand), so the relay is never left
+/// unloaded in silence. `Install` is `Reloaded`: its first install (nothing
+/// loaded) is `bootstrap`, then `kickstart`, as before.
 #[cfg(any(target_os = "macos", test))]
 fn restart_launch_agent(
     launchctl: &mut dyn Launchctl,
@@ -612,31 +747,64 @@ fn restart_launch_agent(
         LaunchAgentCaller::Install => (
             Restart::Reloaded,
             format!(
-                "run `wsmp service install` again, or load it by hand: `launchctl bootstrap {domain} {file}`"
+                "run `wsmp service install` again, or load it by hand: `launchctl bootstrap {domain} '{}'`",
+                shell_single_quote(file)
             ),
         ),
     };
     let left = |launchctl: &dyn Launchctl| deadline.saturating_duration_since(launchctl.now());
-    // Whether launchd has the agent; not loaded when the deadline has passed
-    // (the caller then fails on its own step).
-    let loaded = |launchctl: &mut dyn Launchctl| {
-        let time = left(launchctl);
-        !time.is_zero() && launchctl.run(&["print", agent], time).is_ok()
+    // Whether launchd has the agent, asked again (with the same backoff)
+    // while `print` gives no answer; an error when none came by the deadline.
+    let look = |launchctl: &mut dyn Launchctl| -> Result<Agent> {
+        let mut pause = LAUNCHD_POLL_FIRST;
+        loop {
+            let time = left(launchctl);
+            let error = if time.is_zero() {
+                anyhow::anyhow!("no time was left to run `launchctl print {agent}`")
+            } else {
+                match launchctl.run(&["print", agent], time) {
+                    Ok(ran) => match ran.code {
+                        Some(0) => return Ok(Agent::Loaded),
+                        Some(LAUNCHCTL_NOT_LOADED) => return Ok(Agent::Absent),
+                        _ => launchctl_failed(&["print", agent], &ran),
+                    },
+                    Err(error) => error,
+                }
+            };
+            if left(launchctl) <= pause {
+                return Err(error.context(format!(
+                    "launchd did not say whether it has the relay service `{agent}` loaded; {recovery}"
+                )));
+            }
+            launchctl.sleep(pause);
+            pause = (pause * 2).min(LAUNCHD_POLL_MAX);
+        }
     };
-    let was_loaded = loaded(launchctl);
+    let was_loaded = look(launchctl)? == Agent::Loaded;
+    // Set once launchd has said it does not have the agent: whatever it has
+    // after that was loaded from the file as it is now.
+    let mut seen_absent = !was_loaded;
     if how == Restart::Reloaded && was_loaded {
         // launchd runs the plist it loaded, never the file as it is now:
         // `bootout` and `bootstrap` make it read the file again.
-        if let Err(error) = launchctl.run(&["bootout", agent], left(launchctl)) {
+        let bootout = launchctl
+            .run(&["bootout", agent], left(launchctl))
+            .and_then(|ran| launchctl_ok(&["bootout", agent], ran));
+        if let Err(error) = bootout {
             // One that went away meanwhile is what was asked for.
-            if loaded(launchctl) {
+            if look(launchctl)? == Agent::Loaded {
                 return Err(error.context(format!(
                     "unloading the relay service `{agent}`: it still runs the definition launchd loaded; {recovery}"
                 )));
             }
+            seen_absent = true;
         }
         let mut pause = LAUNCHD_POLL_FIRST;
-        while loaded(launchctl) {
+        while !seen_absent {
+            if look(launchctl)? == Agent::Absent {
+                seen_absent = true;
+                break;
+            }
             let time = left(launchctl);
             anyhow::ensure!(
                 time > pause,
@@ -650,20 +818,30 @@ fn restart_launch_agent(
     // `kickstart` fails on it (exit 113), where systemd and Task Scheduler
     // start a stopped service.
     if how == Restart::Reloaded || !was_loaded {
+        anyhow::ensure!(
+            seen_absent,
+            "launchd was not seen to unload the relay service `{agent}`; {recovery}"
+        );
         let mut pause = LAUNCHD_POLL_FIRST;
         loop {
             let time = left(launchctl);
             let error = if time.is_zero() {
                 anyhow::anyhow!("no time was left to run `launchctl bootstrap`")
             } else {
-                match launchctl.run(&["bootstrap", domain, file], time) {
+                let args = ["bootstrap", domain, file];
+                match launchctl
+                    .run(&args, time)
+                    .and_then(|ran| launchctl_ok(&args, ran))
+                {
                     Ok(()) => break,
                     Err(error) => error,
                 }
             };
             // Loaded after all (launchd can report an error for a load it
-            // made, or another `bootstrap` won): restart it below.
-            if loaded(launchctl) {
+            // made, or another `bootstrap` won): since launchd said it did
+            // not have the agent, this is the file as it is now. Restart it
+            // below.
+            if look(launchctl)? == Agent::Loaded {
                 break;
             }
             if left(launchctl) <= pause {
@@ -680,8 +858,10 @@ fn restart_launch_agent(
         !time.is_zero(),
         "the relay service `{agent}` was loaded but no time was left to restart it; {recovery}"
     );
+    let args = ["kickstart", "-k", agent];
     let kicked = launchctl
-        .run(&["kickstart", "-k", agent], time)
+        .run(&args, time)
+        .and_then(|ran| launchctl_ok(&args, ran))
         .with_context(|| format!("restarting the relay service `{agent}`; {recovery}"));
     if caller == LaunchAgentCaller::Install {
         // Loaded with `RunAtLoad`: it starts without the kick.
@@ -716,14 +896,15 @@ pub fn restart_hint_after_login() -> Option<String> {
     None
 }
 
-/// A character no service file wsmp writes can carry as itself: a control
-/// character (C0 such as LF, CR, tab and NUL; DEL; C1), or U+FFFE / U+FFFF.
-/// Each grammar would read such a value as something else:
+/// A character wsmp does not write into a service file: a control character
+/// (C0 such as LF, CR, tab and NUL; DEL; C1), or U+FFFE / U+FFFF. One rule
+/// for every renderer is wsmp's policy; what each grammar does with them:
 /// - systemd (`systemd.syntax(7)`): a unit is read line by line, so LF and CR
 ///   end the setting inside quotes (`Unbalanced quoting`), and NUL ends it;
 /// - launchd plists are XML 1.0: C0 other than tab, LF and CR, and U+FFFE /
 ///   U+FFFF, are not `Char`s (§2.2), and a parser turns CR and CRLF into LF
-///   (§2.11), so even those three would not come back as written;
+///   (§2.11). Tab, LF and C1 would come back as written; they are refused
+///   by the policy, not by XML;
 /// - the `/bin/sh` wrapper: a shell script holds no NUL (POSIX XCU 2.1, text
 ///   files), and a value's LF would put a second line into the file wsmp
 ///   reads back as its own.
@@ -746,15 +927,49 @@ pub(crate) fn refuse_unwritable(what: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Quote a single ExecStart argument (or `Environment=` assignment) for a
-/// systemd unit. Inside double quotes systemd unescapes C escapes, so `\` and
-/// `"` are escaped; `%` starts a specifier and is doubled (`systemd.unit(5)`,
-/// "Specifiers"). A value with a character [`unwritable`] is an error.
-pub fn systemd_quote_arg(value: &str) -> Result<String> {
+/// `path` exactly as text, or an error naming it (`what`), before anything
+/// is written or run: `display()` writes U+FFFD for bytes that are not
+/// UTF-8, which would name another file. Service files and the commands
+/// that load them carry paths as UTF-8 text.
+pub(crate) fn path_text<'a>(what: &str, path: &'a Path) -> Result<&'a str> {
+    path.to_str().with_context(|| {
+        format!(
+            "{what} `{}` is not valid UTF-8; nothing was written",
+            path.display()
+        )
+    })
+}
+
+/// Where a value goes in a systemd unit, which decides how
+/// [`systemd_quote`] writes it (`systemd.service(5)`, "Command lines";
+/// `systemd.exec(5)`, `Environment=`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SystemdField {
+    /// The program of `ExecStart=`: systemd runs this path as written
+    /// (variables are expanded only in the arguments), so `$` is itself.
+    ExecPath,
+    /// An argument of `ExecStart=`: `${NAME}` and `$NAME` are expanded from
+    /// the service's environment, inside quotes too, and `$$` is one `$`; so
+    /// each `$` is written `$$`.
+    ExecArg,
+    /// An `Environment=` assignment: "the `$` character has no special
+    /// meaning", so it is itself.
+    Environment,
+}
+
+/// `value` as one word of a unit line for `field`. Inside double quotes
+/// systemd unescapes C escapes, so `\` and `"` are escaped; `%` starts a
+/// specifier in every setting and is doubled (`systemd.unit(5)`,
+/// "Specifiers"); `$` is doubled in an [`SystemdField::ExecArg`]. An empty
+/// value is `""` (an empty argument; written bare it would be none). A value
+/// with a character [`unwritable`] is an error.
+fn systemd_quote(value: &str, field: SystemdField) -> Result<String> {
     refuse_unwritable("the value", value)?;
-    let safe = value.chars().all(|ch| {
-        ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '@' | '+' | '=')
-    });
+    let safe = !value.is_empty()
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '/' | '.' | '_' | '-' | ':' | '@' | '+' | '=')
+        });
     if safe {
         return Ok(value.to_string());
     }
@@ -765,6 +980,7 @@ pub fn systemd_quote_arg(value: &str) -> Result<String> {
             '"' => out.push_str("\\\""),
             // systemd treats `%` as a specifier in unit files.
             '%' => out.push_str("%%"),
+            '$' if field == SystemdField::ExecArg => out.push_str("$$"),
             _ => out.push(ch),
         }
     }
@@ -772,11 +988,26 @@ pub fn systemd_quote_arg(value: &str) -> Result<String> {
     Ok(out)
 }
 
+/// One argument (after the program) of an `ExecStart=` line, kept exactly as
+/// it is: quoted, with `$` written `$$` so systemd does not expand it
+/// ([`SystemdField::ExecArg`]).
+pub fn systemd_exec_arg(value: &str) -> Result<String> {
+    systemd_quote(value, SystemdField::ExecArg)
+}
+
+/// An `Environment=` setting's value for `name=value`, kept exactly as it is
+/// ([`SystemdField::Environment`]: `$` is itself there).
+pub fn systemd_environment(name: &str, value: &str) -> Result<String> {
+    refuse_unwritable(&format!("the pinned `{name}`"), value)?;
+    systemd_quote(&format!("{name}={value}"), SystemdField::Environment)
+}
+
 /// The program of an `ExecStart=` line: an absolute path (a leading `-`, `@`,
 /// `+`, `!` or `:` is a prefix to systemd, a bare name is looked up), with no
 /// character systemd's `string_is_safe()` refuses in an executable name
 /// (`"`, `'`, `\` and control characters: "Executable name contains special
-/// characters", `systemd.service(5)`, "Command lines"), then quoted.
+/// characters", `systemd.service(5)`, "Command lines"), then quoted
+/// ([`SystemdField::ExecPath`]).
 pub fn systemd_exec_path(path: &str) -> Result<String> {
     refuse_unwritable("the wsmp executable path", path)?;
     anyhow::ensure!(
@@ -787,7 +1018,7 @@ pub fn systemd_exec_path(path: &str) -> Result<String> {
         !path.contains(['"', '\'', '\\']),
         "the wsmp executable path `{path}` contains a quote or a backslash, which systemd refuses in the program it runs; nothing was written. Install wsmp on a path without them, then run `wsmp service install`"
     );
-    systemd_quote_arg(path)
+    systemd_quote(path, SystemdField::ExecPath)
 }
 
 /// Variables `wsmp service install` pins into the service so it resolves the
@@ -868,10 +1099,9 @@ pub fn render_systemd_user_unit(executable: &str, pinned: &[(&str, String)]) -> 
     let pinned: String = pinned
         .iter()
         .map(|(name, value)| {
-            refuse_unwritable(&format!("the pinned `{name}`"), value)?;
             Ok(format!(
                 "Environment={}\n",
-                systemd_quote_arg(&format!("{name}={value}"))?
+                systemd_environment(name, value)?
             ))
         })
         .collect::<Result<_>>()?;
@@ -1045,6 +1275,8 @@ pub fn install(to_stderr: bool) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub fn install(to_stderr: bool) -> Result<()> {
     let file = service_file()?;
+    // Checked before anything is written: `launchctl bootstrap` is given it.
+    let file_text = path_text("the relay service", &file)?;
     let executable = executable()?;
 
     let wrapper = macos_wrapper_path()?;
@@ -1072,7 +1304,7 @@ pub fn install(to_stderr: bool) -> Result<()> {
         LaunchAgentCaller::Install,
         &domain,
         &format!("{domain}/{MACOS_LABEL}"),
-        &file.display().to_string(),
+        file_text,
         std::time::Instant::now() + FINITE_COMMAND_TIMEOUT,
     )?;
 
@@ -1090,22 +1322,13 @@ pub fn install(to_stderr: bool) -> Result<()> {
 fn macos_plist(wrapper: &Path) -> Result<String> {
     let log_dir = macos_log_dir()?;
     let home = dirs::home_dir().context("could not determine the user home directory")?;
-    // Each path as it is: `display()` would write U+FFFD for bytes that are
-    // not UTF-8, which the plist (UTF-8 XML) cannot name.
-    let text = |path: &Path| {
-        path.to_str().map(str::to_owned).with_context(|| {
-            format!(
-                "`{}` is not valid UTF-8; nothing was written",
-                path.display()
-            )
-        })
-    };
+    // Each path as it is ([`path_text`]): the plist is UTF-8 XML.
     render_launch_agent_plist(
         MACOS_LABEL,
-        &text(wrapper)?,
-        &text(&home)?,
-        &text(&log_dir.join("relay.out.log"))?,
-        &text(&log_dir.join("relay.err.log"))?,
+        path_text("the wrapper path", wrapper)?,
+        path_text("the home directory", &home)?,
+        path_text("the log path", &log_dir.join("relay.out.log"))?,
+        path_text("the log path", &log_dir.join("relay.err.log"))?,
     )
 }
 
@@ -1232,11 +1455,11 @@ fn logs(args: &LogsArgs) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn logs(args: &LogsArgs) -> Result<()> {
     let dir = macos_log_dir()?;
-    let files: Vec<String> = ["relay.err.log", "relay.out.log"]
+    // The paths go to `tail` as they are (never as text).
+    let files: Vec<PathBuf> = ["relay.err.log", "relay.out.log"]
         .iter()
         .map(|name| dir.join(name))
         .filter(|path| path.exists())
-        .map(|path| path.display().to_string())
         .collect();
     anyhow::ensure!(
         !files.is_empty(),
@@ -1244,11 +1467,11 @@ fn logs(args: &LogsArgs) -> Result<()> {
         dir.display()
     );
     let lines = args.lines.to_string();
-    let mut argv = vec!["-n", lines.as_str()];
+    let mut argv = vec![std::ffi::OsStr::new("-n"), lines.as_ref()];
     if args.follow {
-        argv.push("-F");
+        argv.push("-F".as_ref());
     }
-    argv.extend(files.iter().map(String::as_str));
+    argv.extend(files.iter().map(|file| file.as_os_str()));
     run_command("tail", &argv)
 }
 
@@ -1446,7 +1669,7 @@ fn run_finite_within(program: &str, args: &[&str], timeout: std::time::Duration)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_command(program: &str, args: &[&str]) -> Result<()> {
+fn run_command(program: &str, args: &[impl AsRef<std::ffi::OsStr>]) -> Result<()> {
     let status = Command::new(program)
         .args(args)
         .status()
@@ -1465,7 +1688,8 @@ fn run_command(program: &str, args: &[&str]) -> Result<()> {
 fn bootout_if_loaded(domain: &str, file: &Path) {
     if agent_loaded(domain) {
         let _ = Command::new("launchctl")
-            .args(["bootout", domain, &file.display().to_string()])
+            .args(["bootout", domain])
+            .arg(file)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -1761,15 +1985,16 @@ pub fn install(to_stderr: bool) -> Result<()> {
     let home = dirs::home_dir().context("could not determine the user home directory")?;
     let sid = wsmp_windows::current_user_sid().context("reading this user's SID")?;
     let arguments = windows_task::arguments(&executable, &config, &state_dir, &log_file);
-    let xml = windows_task::render_xml(&sid, &arguments, &home.display().to_string());
+    let xml = windows_task::render_xml(&sid, &arguments, path_text("the home directory", &home)?);
     let file = service_file()?;
+    // Checked before the file is written: `schtasks` is given it.
+    let file_arg = path_text("the task definition", &file)?.to_string();
     if let Some(parent) = file.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
     }
     fs::write(&file, windows_task::utf16_bytes(&xml))
         .with_context(|| format!("writing `{}`", file.display()))?;
     let name = windows_task_name()?;
-    let file_arg = file.display().to_string();
     schtasks(&["/Create", "/TN", &name, "/XML", &file_arg, "/F"])?;
     // Reinstall or upgrade: a running relay is replaced by the new binary.
     end_windows_task(&name);
@@ -2040,12 +2265,18 @@ mod tests {
                 || Ok(vec![self.render(kind)]),
                 publish,
                 reload,
+                &no_label,
             )
         }
 
         /// One update's service step on macOS's pair: the wrapper, then the
         /// plist (the loader).
         fn pair(&self, publish: &Publish<'_>) -> Result<()> {
+            self.pair_reading(publish, &no_label)
+        }
+
+        /// [`Self::pair`], reading a plist's label with `label`.
+        fn pair_reading(&self, publish: &Publish<'_>, label: &PlistLabel<'_>) -> Result<()> {
             stable_service_files(
                 &[
                     (
@@ -2066,8 +2297,15 @@ mod tests {
                 },
                 publish,
                 no_reload,
+                label,
             )
         }
+    }
+
+    /// A plist label reader that never finds one (`plutil` failed).
+    #[cfg(unix)]
+    fn no_label(_: &Path) -> Option<String> {
+        None
     }
 
     /// The pins the update renders with in these tests.
@@ -2113,9 +2351,10 @@ mod tests {
         }
     }
 
-    /// wsmp's files are recognized by the opening every template had (and by
-    /// any part of it: a file cut short), whatever follows; a file by hand
-    /// is not.
+    /// wsmp's files are recognized by the complete opening every template had,
+    /// whatever follows (a file cut short after it too); a file by hand is not,
+    /// nor one with only part of the opening (empty, cut short inside it, or a
+    /// generic start such as `#!/bin/sh\n`).
     #[cfg(unix)]
     #[test]
     fn every_template_wsmp_wrote_is_its_own_and_a_file_by_hand_is_not() {
@@ -2138,14 +2377,22 @@ mod tests {
                 }
                 let text = keg.render_for(kind, path, &pins());
                 assert!(text.starts_with(kind.opening()), "{kind:?}");
+                // Cut short anywhere after the complete opening: still wsmp's. Inside it
+                // (an empty file too): custom, as a file by hand that starts the same way
+                // would be.
+                let opening = kind.opening().len();
                 for end in (0..=text.len()).filter(|end| text.is_char_boundary(*end)) {
-                    assert!(kind.generated(&text[..end]), "{kind:?} cut at {end}");
+                    assert_eq!(
+                        kind.generated(&text.as_bytes()[..end]),
+                        end >= opening,
+                        "{kind:?} cut at {end}"
+                    );
                 }
             }
         }
         for kind in [ServiceKind::SystemdUnit, ServiceKind::LaunchdWrapper] {
             assert!(
-                kind.generated(&pre_0_4_template(kind, &keg.old)),
+                kind.generated(pre_0_4_template(kind, &keg.old).as_bytes()),
                 "{kind:?}"
             );
         }
@@ -2160,13 +2407,23 @@ mod tests {
             ),
             (ServiceKind::LaunchdWrapper, "#!/bin/bash\nexec wsmp run\n"),
             (ServiceKind::LaunchdWrapper, "#!/bin/sh\nexec wsmp run\n"),
+            // Only a generic start in common with wsmp's (no marker): not wsmp's.
+            (ServiceKind::LaunchdWrapper, "#!/bin/sh\n"),
+            (ServiceKind::LaunchdWrapper, ""),
+            (ServiceKind::SystemdUnit, "[Unit]\n"),
+            (ServiceKind::SystemdUnit, ""),
+            (
+                ServiceKind::LaunchdPlist,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            ),
+            (ServiceKind::LaunchdPlist, ""),
             // As `plutil` writes it: keys sorted, `KeepAlive` first.
             (
                 ServiceKind::LaunchdPlist,
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>KeepAlive</key>\n",
             ),
         ] {
-            assert!(!kind.generated(by_hand), "{kind:?}: {by_hand}");
+            assert!(!kind.generated(by_hand.as_bytes()), "{kind:?}: {by_hand}");
         }
     }
 
@@ -2225,7 +2482,6 @@ mod tests {
                 ),
                 ("trailing text", format!("{want}# more\n"), kind.mode()),
                 ("cut short", want[..want.len() / 2].to_string(), kind.mode()),
-                ("empty", String::new(), kind.mode()),
                 ("mode 0666", want.clone(), 0o666),
                 ("mode 0777", want.clone(), 0o777),
                 ("mode 0600", want.clone(), 0o600),
@@ -2250,12 +2506,84 @@ mod tests {
                 keg.single(&file, kind, &never_publish, no_reload)
                     .unwrap_or_else(|error| panic!("{kind:?} {state} again: {error:#}"));
             }
+            // Round 13: a file without wsmp's complete opening (empty, or cut short inside it)
+            // is not wsmp's: refused with `wsmp service install` advice, left byte for byte.
+            let opening = kind.opening();
+            for (state, text) in [
+                ("empty", String::new()),
+                (
+                    "cut inside the opening",
+                    opening[..opening.len() - 1].to_string(),
+                ),
+            ] {
+                std::fs::write(&file, &text).expect("write");
+                set_mode(&file, kind.mode());
+                let error = keg
+                    .single(&file, kind, &never_publish, no_reload)
+                    .expect_err(state);
+                assert!(
+                    format!("{error:#}").contains("Run `wsmp service install`"),
+                    "{kind:?} {state}: {error:#}"
+                );
+                assert_eq!(
+                    std::fs::read(&file).expect("read"),
+                    text.as_bytes(),
+                    "{kind:?} {state}"
+                );
+            }
             assert!(
                 others_in(keg.dir.path(), &[name, "Cellar", "opt", "pinned-wsmp"]).is_empty(),
                 "{kind:?}: a temporary file was left"
             );
             std::fs::remove_file(&file).expect("rm");
         }
+    }
+
+    /// F-FB-2 (the review's C9 probe `partial_custom_noop_wrapper_is_overwritten`, with the
+    /// fixed expectation): a wrapper written by hand that only shares wsmp's generic start
+    /// (`#!/bin/sh\n`: a valid script that does nothing), beside wsmp's plist, is custom: the
+    /// update is refused, the wrapper stays byte for byte, and nothing is written.
+    #[cfg(unix)]
+    #[test]
+    fn partial_custom_noop_wrapper_is_refused() {
+        let dir = tempfile::tempdir().expect("dir");
+        let wrapper = dir.path().join("run.sh");
+        let loader = dir.path().join("agent.plist");
+        let stable = dir.path().join("wsmp");
+        fs::write(&stable, b"placeholder").expect("stable");
+        fs::write(&wrapper, b"#!/bin/sh\n").expect("wrapper");
+        fs::write(&loader, ServiceKind::LaunchdPlist.opening()).expect("plist");
+        let before = (
+            fs::read(&wrapper).expect("w"),
+            fs::read(&loader).expect("p"),
+        );
+        let error = stable_service_files(
+            &[
+                (&wrapper, ServiceKind::LaunchdWrapper),
+                (&loader, ServiceKind::LaunchdPlist),
+            ],
+            &stable,
+            || {
+                Ok(vec![
+                    render_macos_service_wrapper(stable.to_str().expect("utf-8"), &[])?,
+                    ServiceKind::LaunchdPlist.opening().into(),
+                ])
+            },
+            &never_publish,
+            || anyhow::bail!("nothing may be reloaded"),
+            &|_| None,
+        )
+        .expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(text.contains(&format!("`{}`", wrapper.display())), "{text}");
+        assert!(text.contains("Run `wsmp service install`"), "{text}");
+        assert_eq!(
+            (
+                fs::read(&wrapper).expect("w"),
+                fs::read(&loader).expect("p")
+            ),
+            before
+        );
     }
 
     /// A4-WRAPPER and B4-FILESYSTEM: the wrapper wsmp writes again runs the
@@ -2288,47 +2616,43 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout), "DAEMON 0.4.4\n");
     }
 
-    /// A file by hand is left as it is (bytes and mode), and reloaded; one
-    /// that names a `Cellar` path stops the update, untouched and unreloaded.
+    /// Owner, 2026-10-30: any file not written by `wsmp service install`
+    /// stops the update, untouched (bytes and mode) and unreloaded, whatever
+    /// it runs: a `Cellar` path, the stable path, another program, or one
+    /// spelled with systemd escapes (F-FA-2's `\x43ellar`). The refusal says
+    /// the file is not wsmp's, never what it names.
     #[cfg(unix)]
     #[test]
-    fn a_file_by_hand_is_left_alone_unless_it_names_a_cellar_path() {
+    fn a_file_by_hand_stops_the_update_whatever_it_runs() {
         let keg = Keg::new();
         let file = keg.path("wsmp.service");
         let kind = ServiceKind::SystemdUnit;
-        let reloads = std::cell::Cell::new(0);
-        let reload = || {
-            reloads.set(reloads.get() + 1);
-            Ok(())
-        };
-        let by_hand = "[Service]\nExecStart=/usr/local/bin/wsmp run --verbose\n";
-        std::fs::write(&file, by_hand).expect("write");
-        set_mode(&file, 0o600);
-        keg.single(&file, kind, &never_publish, reload)
-            .expect("by hand");
-        assert_eq!(std::fs::read_to_string(&file).expect("read"), by_hand);
-        assert_eq!(mode_of(&file), 0o600);
-        assert_eq!(reloads.get(), 1);
-        let on_cellar = format!("[Service]\nExecStart={} run\n", keg.old);
-        std::fs::write(&file, &on_cellar).expect("write");
-        let error = keg
-            .single(&file, kind, &never_publish, reload)
-            .expect_err("a Cellar path by hand");
-        assert!(
-            format!("{error:#}").contains("not written by `wsmp service install`"),
-            "{error:#}"
-        );
-        // R5-B-1: the upgrade keeps the old keg (`HOMEBREW_NO_INSTALL_CLEANUP`);
-        // the service would stay on it, which a later cleanup may remove.
-        let text = format!("{error:#}");
-        assert!(
-            text.contains("would still start the old keg")
-                && text.contains("later `brew cleanup` may remove")
-                && !text.contains("upgrade removes"),
-            "{text}"
-        );
-        assert_eq!(std::fs::read_to_string(&file).expect("read"), on_cellar);
-        assert_eq!(reloads.get(), 1, "not reloaded");
+        let escaped = keg.old.replace("/Cellar/", "/\\x43ellar/");
+        assert!(!escaped.contains("Cellar"), "{escaped}");
+        for by_hand in [
+            "[Service]\nExecStart=/usr/local/bin/wsmp run --verbose\n".to_string(),
+            format!("[Service]\nExecStart={} run\n", keg.old),
+            format!("[Service]\nExecStart={} run\n", keg.stable()),
+            format!("[Service]\nExecStart={escaped} run\n"),
+        ] {
+            std::fs::write(&file, &by_hand).expect("write");
+            set_mode(&file, 0o600);
+            let error = keg
+                .single(&file, kind, &never_publish, || {
+                    anyhow::bail!("a file by hand is never reloaded")
+                })
+                .expect_err(&by_hand);
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("was not written by `wsmp service install`")
+                    && text.contains("Run `wsmp service install`")
+                    && text.contains("update by hand")
+                    && !text.contains("Cellar"),
+                "{by_hand}: {text}"
+            );
+            assert_eq!(std::fs::read_to_string(&file).expect("read"), by_hand);
+            assert_eq!(mode_of(&file), 0o600);
+        }
     }
 
     /// A service that is there but broken is not "no service": each stops the
@@ -2475,21 +2799,10 @@ mod tests {
         // Done: the next update writes nothing.
         keg.pair(&never_publish).expect("done");
         reset();
-        // A plist by hand: the wrapper is still wsmp's (written again), a
-        // missing one is left missing.
-        let by_hand = "<plist><dict><key>Label</key><string>mine</string></dict></plist>\n";
-        std::fs::write(&plist, by_hand).expect("plist");
-        keg.pair(&never_publish).expect("plist by hand, no wrapper");
-        assert!(std::fs::symlink_metadata(&wrapper).is_err());
-        std::fs::write(&wrapper, keg.render_for(wrapper_kind, &keg.old, &[])).expect("w");
-        keg.pair(&recording).expect("wrapper written");
-        assert_eq!(*written.borrow(), ["wsmp-service-run.sh"]);
-        assert_eq!(std::fs::read_to_string(&plist).expect("plist"), by_hand);
-        reset();
-        // Stops with nothing written: a plist by hand on a Cellar path (the
-        // old wrapper stays as it was), a dangling plist beside a healthy
-        // wrapper, a FIFO or a wrapper by hand on a Cellar path beside
-        // wsmp's plist.
+        // Stops with nothing written: a plist by hand (beside a missing
+        // wrapper, or an old one of wsmp's, which stays as it was), a
+        // dangling plist beside a healthy wrapper, a FIFO or a wrapper by
+        // hand beside wsmp's plist.
         let old_wrapper = keg.render_for(wrapper_kind, &keg.old, &[]);
         let refused = |needle: &str| {
             let before = bytes_of(&wrapper);
@@ -2497,6 +2810,12 @@ mod tests {
             assert!(format!("{error:#}").contains(needle), "{needle}: {error:#}");
             assert_eq!(bytes_of(&wrapper), before, "{needle}");
         };
+        let by_hand = "<plist><dict><key>Label</key><string>mine</string></dict></plist>\n";
+        std::fs::write(&plist, by_hand).expect("plist");
+        refused("not written by `wsmp service install`");
+        assert!(std::fs::symlink_metadata(&wrapper).is_err());
+        assert_eq!(std::fs::read_to_string(&plist).expect("plist"), by_hand);
+        reset();
         std::fs::write(&wrapper, &old_wrapper).expect("w");
         std::fs::write(
             &plist,
@@ -2513,8 +2832,13 @@ mod tests {
         nix::unistd::mkfifo(&wrapper, nix::sys::stat::Mode::S_IRWXU).expect("fifo");
         refused("not a regular file");
         std::fs::remove_file(&wrapper).expect("rm");
-        std::fs::write(&wrapper, format!("#!/bin/sh\nexec '{}' run\n", keg.old)).expect("w");
-        refused("not written by `wsmp service install`");
+        for by_hand in [
+            format!("#!/bin/sh\nexec '{}' run\n", keg.old),
+            format!("#!/bin/sh\nexec '{}' run\n", keg.stable()),
+        ] {
+            std::fs::write(&wrapper, by_hand).expect("w");
+            refused("not written by `wsmp service install`");
+        }
         assert_eq!(
             std::fs::read_to_string(&plist).expect("plist"),
             keg.render(plist_kind)
@@ -2978,7 +3302,8 @@ mod tests {
             assert!(render_launch_agent_plist("l", &value, "/u", "/u/o", "/u/e").is_err());
             assert!(render_launch_agent_plist("l", "/u/w", &value, "/u/o", "/u/e").is_err());
             assert!(render_launch_agent_plist("l", "/u/w", "/u", "/u/o", &value).is_err());
-            assert!(systemd_quote_arg(&value).is_err());
+            assert!(systemd_exec_arg(&value).is_err());
+            assert!(systemd_environment("WSMP_CONFIG", &value).is_err());
         }
         for bad in ["/u/a\"b", "/u/a'b", "/u/a\\b", "wsmp", "-/u/wsmp"] {
             assert!(render_systemd_user_unit(bad, &ok).is_err(), "{bad}");
@@ -2997,7 +3322,7 @@ mod tests {
     /// R5-A-1, through the update's service step: a rendering that fails
     /// (here, a pin no unit can hold) stops the step before anything is
     /// written or reloaded, and leaves wsmp's old unit as it was. A unit by
-    /// hand is never rendered, so the same pin does not stop it.
+    /// hand is refused before anything is rendered.
     #[cfg(unix)]
     #[test]
     fn a_rendering_that_fails_writes_nothing() {
@@ -3019,6 +3344,7 @@ mod tests {
                 reloaded.set(true);
                 Ok(())
             },
+            &no_label,
         )
         .expect_err("refused");
         assert!(format!("{error:#}").contains("U+000A"), "{error:#}");
@@ -3033,8 +3359,9 @@ mod tests {
             || -> Result<Vec<String>> { panic!("a unit by hand is not rendered") },
             &never_publish,
             no_reload,
+            &no_label,
         )
-        .expect("by hand");
+        .expect_err("by hand");
         assert_eq!(std::fs::read_to_string(&unit).expect("read"), by_hand);
     }
 
@@ -3129,7 +3456,12 @@ mod tests {
     /// call takes 10 ms; `sleep` moves it), an agent that `bootout` unloads
     /// only after `unload_after` more looks (`print`), a `bootstrap` that
     /// fails while the agent is loaded (as launchd does, "5: Input/output
-    /// error") and `bootstrap_failures` more times, and a log of every call.
+    /// error") and `bootstrap_failures` more times, and a log of every call:
+    /// `ok` for exit 0, `err` for another exit (`print`: 113, not loaded),
+    /// `fail` for a call that gave no answer (it could not run, or ran out of
+    /// time). `print_fails` scripts that: the looks (counted from 1) that
+    /// give no answer (every one with `print_fails_all`), an error or, with
+    /// `print_exit`, another exit status.
     struct FakeLaunchd {
         start: std::time::Instant,
         at: std::time::Duration,
@@ -3139,6 +3471,10 @@ mod tests {
         bootout_fails: bool,
         bootstrap_failures: u32,
         kickstart_fails: bool,
+        prints: u32,
+        print_fails: Vec<u32>,
+        print_fails_all: bool,
+        print_exit: Option<i32>,
         log: Vec<String>,
     }
 
@@ -3153,6 +3489,10 @@ mod tests {
                 bootout_fails: false,
                 bootstrap_failures: 0,
                 kickstart_fails: false,
+                prints: 0,
+                print_fails: Vec::new(),
+                print_fails_all: false,
+                print_exit: None,
                 log: Vec::new(),
             }
         }
@@ -3176,13 +3516,24 @@ mod tests {
     }
 
     impl Launchctl for FakeLaunchd {
-        fn run(&mut self, args: &[&str], timeout: std::time::Duration) -> Result<()> {
+        fn run(
+            &mut self,
+            args: &[&str],
+            timeout: std::time::Duration,
+        ) -> Result<crate::update::deadman::Exited> {
             assert!(!timeout.is_zero(), "a call with no time left: {args:?}");
             assert!(
                 self.now() + timeout <= self.deadline(),
                 "past the deadline: {args:?}"
             );
             self.at += std::time::Duration::from_millis(10);
+            let exit = |code: i32, text: &str| {
+                Ok(crate::update::deadman::Exited {
+                    code: Some(code),
+                    stdout: String::new(),
+                    stderr: text.to_string(),
+                })
+            };
             let result = match args[0] {
                 "print" => {
                     if let Some(left) = self.unloading {
@@ -3193,37 +3544,47 @@ mod tests {
                             self.unloading = Some(left - 1);
                         }
                     }
-                    if self.loaded {
-                        Ok(())
+                    self.prints += 1;
+                    if self.print_fails_all || self.print_fails.contains(&self.prints) {
+                        match self.print_exit {
+                            Some(code) => exit(code, "Unexpected error"),
+                            None => Err(anyhow::anyhow!(
+                                "running `launchctl`: too many commands are running or stuck; try again later"
+                            )),
+                        }
+                    } else if self.loaded {
+                        exit(0, "")
                     } else {
-                        Err(anyhow::anyhow!("113"))
+                        exit(113, "Bad request.\nCould not find service")
                     }
                 }
-                "bootout" if self.bootout_fails => Err(anyhow::anyhow!("Boot-out failed: 1")),
+                "bootout" if self.bootout_fails => exit(1, "Boot-out failed: 1"),
                 "bootout" => {
                     self.unloading = Some(self.unload_after);
-                    Ok(())
+                    exit(0, "")
                 }
-                "bootstrap" if self.loaded => {
-                    Err(anyhow::anyhow!("Bootstrap failed: 5: Input/output error"))
-                }
+                "bootstrap" if self.loaded => exit(5, "Bootstrap failed: 5: Input/output error"),
                 "bootstrap" if self.bootstrap_failures > 0 => {
                     self.bootstrap_failures -= 1;
-                    Err(anyhow::anyhow!("Bootstrap failed: 5: Input/output error"))
+                    exit(5, "Bootstrap failed: 5: Input/output error")
                 }
                 "bootstrap" => {
                     self.loaded = true;
-                    Ok(())
+                    exit(0, "")
                 }
-                "kickstart" if self.kickstart_fails => Err(anyhow::anyhow!("kickstart failed")),
-                "kickstart" if self.loaded => Ok(()),
-                "kickstart" => Err(anyhow::anyhow!("113: Could not find service")),
+                "kickstart" if self.kickstart_fails => exit(1, "kickstart failed"),
+                "kickstart" if self.loaded => exit(0, ""),
+                "kickstart" => exit(113, "Could not find service"),
                 other => panic!("unexpected launchctl {other}"),
             };
             self.log.push(format!(
                 "{} {}",
                 args[0],
-                if result.is_ok() { "ok" } else { "err" }
+                match &result {
+                    Ok(ran) if ran.code == Some(0) => "ok",
+                    Ok(_) => "err",
+                    Err(_) => "fail",
+                }
             ));
             result
         }
@@ -3388,7 +3749,7 @@ mod tests {
         let text = format!("{error:#}");
         assert!(
             text.contains("run `wsmp service install` again")
-                && text.contains("`launchctl bootstrap gui/501 /u/l.plist`")
+                && text.contains("load it by hand: `launchctl bootstrap gui/501 '/u/l.plist'`")
                 && !text.contains("to load the relay service again"),
             "{text}"
         );
@@ -3403,6 +3764,331 @@ mod tests {
             launchd.restart(Restart::Loaded).is_err(),
             "but not for a restart"
         );
+    }
+
+    /// Both callers that reload ([`restart_launch_agent`]).
+    const RELOADERS: [LaunchAgentCaller; 2] = [
+        LaunchAgentCaller::Restart(Restart::Reloaded),
+        LaunchAgentCaller::Install,
+    ];
+
+    /// R6-B-1 / R6-A-3 (ported from `r6_b_query_failure_must_not_bypass_reload`
+    /// and `r6a_initial_query_error_must_not_skip_reload`): the first look
+    /// gives no answer while the old agent is loaded. That is not "not
+    /// loaded": it is asked again, and the reload boots the old agent out,
+    /// waits for launchd to say it is gone, and only then bootstraps. Both
+    /// callers.
+    #[test]
+    fn a_first_look_without_an_answer_is_asked_again_never_taken_as_unloaded() {
+        for caller in RELOADERS {
+            for exit in [None, Some(5)] {
+                let mut launchd = FakeLaunchd::new(true);
+                launchd.print_fails = vec![1];
+                launchd.print_exit = exit;
+                launchd.call(caller).expect("reload");
+                let first = if exit.is_some() {
+                    "print err"
+                } else {
+                    "print fail"
+                };
+                assert_eq!(
+                    launchd.calls(),
+                    [
+                        first,
+                        "sleep 100",
+                        "print ok",
+                        "bootout ok",
+                        "print err",
+                        "bootstrap ok",
+                        "kickstart ok"
+                    ],
+                    "{caller:?} {exit:?}"
+                );
+            }
+
+            // No answer until the deadline: an error that names the way
+            // back, and nothing was booted out or bootstrapped.
+            let mut launchd = FakeLaunchd::new(true);
+            launchd.print_fails_all = true;
+            let error = launchd.call(caller).expect_err("no answer");
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("launchd did not say whether it has the relay service")
+                    && text.contains("wsmp service install")
+                    && text.contains("too many commands"),
+                "{caller:?}: {text}"
+            );
+            assert!(launchd.now() <= launchd.deadline());
+            assert!(
+                launchd
+                    .calls()
+                    .iter()
+                    .all(|call| call.starts_with("print") || call.starts_with("sleep")),
+                "{caller:?}: {:?}",
+                launchd.calls()
+            );
+            assert!(launchd.loaded, "the old agent stays loaded");
+        }
+    }
+
+    /// R6-A-3 (ported from `r6a_bootout_query_error_must_not_report_success`):
+    /// after `bootout`, a look that gives no answer while launchd is still
+    /// unloading the old agent does not end the wait: a reload whose old
+    /// agent never unloads is an error, not a success that kickstarts the
+    /// old definition. When it does unload, `bootstrap` runs only after
+    /// launchd said so. Both callers.
+    #[test]
+    fn a_look_without_an_answer_while_unloading_does_not_end_the_wait() {
+        for caller in RELOADERS {
+            let mut launchd = FakeLaunchd::new(true);
+            launchd.unload_after = u32::MAX;
+            launchd.print_fails = vec![2];
+            let deadline = launchd.start + std::time::Duration::from_secs(2);
+            let error = restart_launch_agent(
+                &mut launchd,
+                caller,
+                "gui/501",
+                "gui/501/l",
+                "/u/l.plist",
+                deadline,
+            )
+            .expect_err("never unloads");
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("still unloading") && text.contains("wsmp service install"),
+                "{caller:?}: {text}"
+            );
+            assert!(
+                !launchd
+                    .log
+                    .iter()
+                    .any(|call| call.starts_with("bootstrap") || call.starts_with("kickstart")),
+                "{caller:?}: {:?}",
+                launchd.calls()
+            );
+
+            let mut launchd = FakeLaunchd::new(true);
+            launchd.unload_after = 1;
+            launchd.print_fails = vec![2];
+            launchd.call(caller).expect("reload");
+            assert_eq!(
+                launchd.calls(),
+                [
+                    "print ok",
+                    "bootout ok",
+                    "print fail",
+                    "sleep 100",
+                    "print err",
+                    "bootstrap ok",
+                    "kickstart ok"
+                ],
+                "{caller:?}"
+            );
+            assert!(launchd.loaded);
+
+            // A failed bootout followed by a look with no answer: asked
+            // again; the old agent is still there, so it is an error.
+            let mut launchd = FakeLaunchd::new(true);
+            launchd.bootout_fails = true;
+            launchd.print_fails = vec![2];
+            let error = launchd.call(caller).expect_err("bootout failed");
+            assert!(
+                format!("{error:#}").contains("still runs the definition launchd loaded"),
+                "{error:#}"
+            );
+            assert_eq!(
+                launchd.calls(),
+                [
+                    "print ok",
+                    "bootout err",
+                    "print fail",
+                    "sleep 100",
+                    "print ok"
+                ]
+            );
+        }
+    }
+
+    /// R6-B-3 / R6-A-4: the `launchctl bootstrap` install prints for loading
+    /// the plist by hand gives the shell the plist's path as one argument,
+    /// whatever a home directory may hold (a space, `'`, `$`, a backtick).
+    #[cfg(unix)]
+    #[test]
+    fn the_bootstrap_by_hand_names_the_plist_as_one_argument() {
+        for file in [
+            "/Users/Jane Doe/Library/LaunchAgents/com.flycockpit.wsmp.plist",
+            "/Users/o'neil/$HOME/`id`/a b'c$(x).plist",
+            "/u/''/$$/\\/l.plist",
+        ] {
+            let mut launchd = FakeLaunchd::new(false);
+            launchd.bootstrap_failures = u32::MAX;
+            let deadline = launchd.deadline();
+            let error = restart_launch_agent(
+                &mut launchd,
+                LaunchAgentCaller::Install,
+                "gui/501",
+                "gui/501/l",
+                file,
+                deadline,
+            )
+            .expect_err("never loads");
+            // The outermost message, which ends with the hint.
+            let text = format!("{error}");
+            let start = text.find("load it by hand: `").expect("hint") + "load it by hand: `".len();
+            let command = text[start..]
+                .strip_suffix('`')
+                .unwrap_or_else(|| panic!("the hint ends the message: {text}"));
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "launchctl() {{ printf '%s\\0' \"$@\"; }}; {command}"
+                ))
+                .output()
+                .expect("sh");
+            assert!(out.status.success(), "{command}");
+            assert_eq!(
+                out.stdout,
+                format!("bootstrap\0gui/501\0{file}\0").into_bytes(),
+                "{command}"
+            );
+        }
+    }
+
+    /// `plist` saved again as `plutil -convert`, `defaults` or Xcode save
+    /// it: keys sorted (`KeepAlive` first, so it no longer starts as wsmp's
+    /// renderings do), XML or binary (`format`: `FMT_XML`, `FMT_BINARY`).
+    /// Python's `plistlib`; `None` when there is no `python3`.
+    #[cfg(unix)]
+    fn resaved_plist(plist: &[u8], format: &str) -> Option<Vec<u8>> {
+        use std::io::Write;
+        let mut child = std::process::Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                "import plistlib,sys; d=plistlib.loads(sys.stdin.buffer.read()); \
+                 sys.stdout.buffer.write(plistlib.dumps(d, fmt=getattr(plistlib, sys.argv[1]), sort_keys=True))",
+                format,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(plist).ok()?;
+        let out = child.wait_with_output().ok()?;
+        out.status.success().then_some(out.stdout)
+    }
+
+    /// The plist label reader: on macOS the real one (`plutil`); elsewhere
+    /// `plistlib` stands in for it (XML or binary; `None` without a string
+    /// `Label`, or for a file that is not a plist).
+    #[cfg(unix)]
+    fn label_reader(path: &Path) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            macos_plist_label(path)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let out = std::process::Command::new("python3")
+                .args([
+                    "-I",
+                    "-c",
+                    "import plistlib,sys; v=plistlib.load(open(sys.argv[1],'rb')).get('Label'); \
+                     assert isinstance(v,str); sys.stdout.write(v + '\\n')",
+                ])
+                .arg(path)
+                .stderr(Stdio::null())
+                .output()
+                .ok()?;
+            out.status.success().then(|| {
+                let text = String::from_utf8_lossy(&out.stdout);
+                text.strip_suffix('\n').unwrap_or(&text).to_string()
+            })
+        }
+    }
+
+    /// MAC-D (owner, 2026-10-30): a LaunchAgent plist whose `Label` is
+    /// `com.flycockpit.wsmp` is wsmp's, even after `plutil`, `defaults` or
+    /// Xcode saved it again with its keys sorted (XML or binary), so the
+    /// update writes it again with the renderer, as any file of wsmp's; one
+    /// that named a `Cellar` path is moved, not refused. A plist with
+    /// another label, none, or one the reader cannot read is custom: refused,
+    /// untouched, whatever it runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_plist_with_wsmps_label_is_wsmps_whatever_its_layout() {
+        let keg = Keg::new();
+        let wrapper = keg.path("wsmp-service-run.sh");
+        let plist = keg.path("com.flycockpit.wsmp.plist");
+        let ours = keg.render(ServiceKind::LaunchdPlist);
+        let Some(probe) = resaved_plist(ours.as_bytes(), "FMT_XML") else {
+            // Said, so a skipped check is visible in the test log.
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!("skipped: no python3 to save a plist again");
+            }
+            return;
+        };
+        assert!(!ServiceKind::LaunchdPlist.generated(&probe), "re-sorted");
+        let on_cellar = ours.replace(
+            &keg.path("wsmp-service-run.sh").display().to_string(),
+            &format!("{}/../run.sh", keg.old),
+        );
+        let theirs = ours.replace("com.flycockpit.wsmp", "com.example.relay");
+        let theirs_on_cellar = on_cellar.replace("com.flycockpit.wsmp", "com.example.relay");
+        let write_both = |bytes: &[u8]| {
+            std::fs::write(&wrapper, keg.render(ServiceKind::LaunchdWrapper)).expect("wrapper");
+            set_mode(&wrapper, PRIVATE_SCRIPT_MODE);
+            std::fs::write(&plist, bytes).expect("plist");
+            set_mode(&plist, SERVICE_FILE_MODE);
+        };
+        for format in ["FMT_XML", "FMT_BINARY"] {
+            for source in [&ours, &on_cellar] {
+                let saved = resaved_plist(source.as_bytes(), format).expect("save");
+                write_both(&saved);
+                keg.pair_reading(&publish_file, &label_reader)
+                    .unwrap_or_else(|error| panic!("{format}: {error:#}"));
+                assert_eq!(
+                    std::fs::read_to_string(&plist).expect("plist"),
+                    ours,
+                    "{format}: written again as install writes it"
+                );
+                // The label reader failing: custom, refused, untouched.
+                write_both(&saved);
+                let error = keg
+                    .pair_reading(&never_publish, &no_label)
+                    .expect_err("custom");
+                assert!(
+                    format!("{error:#}").contains("not written by `wsmp service install`"),
+                    "{error:#}"
+                );
+                assert_eq!(std::fs::read(&plist).expect("plist"), saved);
+            }
+            // Another label: custom, whatever it runs.
+            for source in [&theirs, &theirs_on_cellar] {
+                let saved = resaved_plist(source.as_bytes(), format).expect("save");
+                write_both(&saved);
+                let error = keg
+                    .pair_reading(&never_publish, &label_reader)
+                    .expect_err("another label");
+                assert!(
+                    format!("{error:#}").contains("not written by `wsmp service install`"),
+                    "{error:#}"
+                );
+                assert_eq!(std::fs::read(&plist).expect("plist"), saved);
+            }
+        }
+        // Not a plist, or no label: custom.
+        for bytes in [
+            &b"not a plist"[..],
+            b"<?xml version=\"1.0\"?><plist><dict/></plist>",
+        ] {
+            write_both(bytes);
+            assert_eq!(label_reader(&plist), None);
+            keg.pair_reading(&never_publish, &label_reader)
+                .expect_err("custom");
+            assert_eq!(std::fs::read(&plist).expect("plist"), bytes);
+        }
     }
 
     /// A3-DIRSYNC: a directory sync that fails after the rename leaves a
@@ -3454,8 +4140,8 @@ mod tests {
     /// Through the production function, every unit a review found accepted
     /// or refused (A4-ADV; A3 short write, FIFO, dangling link): wsmp's unit
     /// in any shape is written again as install writes it; what is broken
-    /// stops the update untouched and unreloaded; no unit, a healthy unit
-    /// and a unit by hand pass as they are.
+    /// or written by hand stops the update untouched and unreloaded; no unit
+    /// and a healthy unit pass as they are.
     #[cfg(target_os = "linux")]
     #[test]
     fn ensure_stable_executable_writes_wsmps_unit_again_and_refuses_a_broken_one() {
@@ -3530,15 +4216,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&elsewhere).expect("read"), healthy);
         through.take("systemctl.log");
         std::fs::remove_file(&through.unit).expect("rm");
-        // By hand: left as it is (and reloaded).
-        let by_hand = "[Service]\nExecStart=/usr/local/bin/wsmp run\n";
-        std::fs::write(&through.unit, by_hand).expect("write");
-        assert_eq!(through.ensure(false), "ok", "by hand");
-        assert_eq!(
-            std::fs::read_to_string(&through.unit).expect("read"),
-            by_hand
-        );
-        through.take("systemctl.log");
         let refused = |needle: &str| {
             let bytes = bytes_of(&through.unit);
             let started = std::time::Instant::now();
@@ -3560,6 +4237,12 @@ mod tests {
                 "[Service]\nExecStart={} run\n",
                 through.path("Cellar/wsmp/0.4.2/bin/wsmp").display()
             ),
+        )
+        .expect("write");
+        refused("not written by `wsmp service install`");
+        std::fs::write(
+            &through.unit,
+            "[Service]\nExecStart=/usr/local/bin/wsmp run\n",
         )
         .expect("write");
         refused("not written by `wsmp service install`");
@@ -3690,6 +4373,298 @@ mod tests {
         assert!(through.update().starts_with("Swapped\n"));
         assert!(std::fs::symlink_metadata(&through.unit).is_err());
         assert_eq!(through.take("systemctl.log"), "");
+    }
+
+    /// macOS's pair of service files, for an in-process Homebrew update on
+    /// a [`Through`] prefix ([`homebrew_update_with_pair`]): the wrapper and
+    /// the plist in the prefix (`stable` is `<prefix>/opt/wsmp/bin/wsmp`),
+    /// rendered as `wsmp service install` writes them, a plist's label read
+    /// by [`label_reader`]. The same service step `ensure_stable_executable`
+    /// takes on macOS, with these paths.
+    #[cfg(target_os = "linux")]
+    fn pair_in_prefix(stable: &Path) -> Result<()> {
+        let prefix = stable.ancestors().nth(4).context("no prefix")?;
+        let wrapper = prefix.join("wsmp-service-run.sh");
+        let plist = prefix.join("com.flycockpit.wsmp.plist");
+        stable_service_files(
+            &[
+                (&wrapper, ServiceKind::LaunchdWrapper),
+                (&plist, ServiceKind::LaunchdPlist),
+            ],
+            stable,
+            || Ok(vec![pair_wrapper(stable)?, pair_plist(prefix)?]),
+            &publish_file,
+            no_reload,
+            &label_reader,
+        )
+    }
+
+    /// The wrapper [`pair_in_prefix`] writes.
+    #[cfg(target_os = "linux")]
+    fn pair_wrapper(executable: &Path) -> Result<String> {
+        render_macos_service_wrapper(path_text("the executable", executable)?, &pins())
+    }
+
+    /// The plist [`pair_in_prefix`] writes.
+    #[cfg(target_os = "linux")]
+    fn pair_plist(prefix: &Path) -> Result<String> {
+        render_launch_agent_plist(
+            MACOS_LABEL,
+            path_text("the wrapper", &prefix.join("wsmp-service-run.sh"))?,
+            "/Users/u",
+            "/Users/u/Library/Logs/ws-model-proxy/relay.out.log",
+            "/Users/u/Library/Logs/ws-model-proxy/relay.err.log",
+        )
+    }
+
+    /// The whole Homebrew update ([`crate::update::agent::homebrew`]) on
+    /// `through`'s prefix, in this process, its service step
+    /// [`pair_in_prefix`]: `Swapped` or `Stopped`, then the progress.
+    #[cfg(target_os = "linux")]
+    fn homebrew_update_with_pair(through: &Through) -> String {
+        use crate::protocol::frames::{UpdatePhase, UpdateReason};
+        use crate::update::flow::{Machine, Progress, Request};
+        struct Log(String);
+        impl Progress for Log {
+            fn report(
+                &mut self,
+                phase: UpdatePhase,
+                reason: Option<UpdateReason>,
+                detail: Option<String>,
+            ) {
+                self.0.push_str(&format!(
+                    "{phase:?} {reason:?} {}\n",
+                    detail.unwrap_or_default().replace('\n', " ")
+                ));
+            }
+        }
+        let machine = Machine {
+            state_dir: through.path("state"),
+            live: through.path("Cellar/wsmp/0.4.2/bin/wsmp"),
+            target: "test-target".into(),
+            scheduler: None,
+            tar: crate::update::install::system_tar(),
+            current_version: "0.4.2".into(),
+            before_swap: None,
+            proceed: None,
+            stable_service: pair_in_prefix,
+        };
+        let request = Request {
+            update_id: "u-1".into(),
+            version: "0.4.3".into(),
+            artifact_url: String::new(),
+            sha256: String::new(),
+            signature: None,
+            rollback_after_secs: 90,
+            origin: crate::update::state::Origin::Cli,
+        };
+        let mut log = Log(String::new());
+        let ended = crate::update::agent::homebrew(&machine, &request, &mut log);
+        format!("{ended:?}\n{}", log.0)
+    }
+
+    /// Owner, 2026-10-30, through the Homebrew update itself: any service
+    /// file not written by `wsmp service install` stops the update before
+    /// the keg changes (no `brew upgrade`), every file byte for byte as it
+    /// was, nothing reloaded or recorded, for the one reason that it is not
+    /// wsmp's: a systemd unit (the real `ensure_stable_executable`, in a
+    /// child), a wrapper or a plist (XML or binary, another label or none),
+    /// each on a `Cellar` path, on the stable path, or spelled so no text
+    /// search finds the `Cellar` path (systemd's `\x43ellar`: F-FA-2;
+    /// CDATA and a binary string with a literal `&#108;`: B8-CDATA-INVERSE).
+    /// Inverses: wsmp's files (even a plist saved again in binary, on an
+    /// old `Cellar` path) are written again and the update installs; no
+    /// service installs too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_homebrew_update_refuses_any_service_file_by_hand() {
+        let refused =
+            |through: &Through, result: &str, files: &[(&Path, Option<Vec<u8>>)], case: &str| {
+                assert!(
+                    result.starts_with("Stopped\n")
+                        && result.contains("Refused Some(UnsupportedMethod)")
+                        && result.contains("was not written by `wsmp service install`")
+                        && result.contains("Run `wsmp service install`")
+                        && result.contains("update by hand"),
+                    "{case}: {result}"
+                );
+                assert!(
+                    !through.take("brew.log").contains("upgrade"),
+                    "{case}: the keg is untouched"
+                );
+                for (path, before) in files {
+                    assert_eq!(
+                        &bytes_of(path),
+                        before,
+                        "{case}: `{}` changed",
+                        path.display()
+                    );
+                }
+                assert_eq!(through.take("systemctl.log"), "", "{case}: reloaded");
+                assert!(
+                    crate::update::state::load(&through.path("state/update"))
+                        .expect("load")
+                        .is_none(),
+                    "{case}: recorded"
+                );
+            };
+
+        // Units, through the production service step.
+        let old = |through: &Through| {
+            through
+                .path("Cellar/wsmp/0.4.2/bin/wsmp")
+                .display()
+                .to_string()
+        };
+        type Unit = fn(&Through) -> String;
+        let units: [(&str, Unit); 4] = [
+            ("unit, another program", |_| {
+                "[Service]\nExecStart=/usr/local/bin/wsmp run\n".to_string()
+            }),
+            ("unit, Cellar", |t| {
+                format!(
+                    "[Service]\nExecStart={} run\n",
+                    t.path("Cellar/wsmp/0.4.2/bin/wsmp").display()
+                )
+            }),
+            ("unit, stable", |t| {
+                format!("[Service]\nExecStart={} run\n", t.stable)
+            }),
+            ("unit, \\x43ellar", |t| {
+                format!(
+                    "[Service]\nExecStart={} run\n",
+                    t.path("Cellar/wsmp/0.4.2/bin/wsmp")
+                        .display()
+                        .to_string()
+                        .replace("/Cellar/", "/\\x43ellar/")
+                )
+            }),
+        ];
+        for (case, text) in units {
+            let through = Through::new();
+            let text = text(&through);
+            assert_eq!(text.contains("Cellar"), case == "unit, Cellar", "{case}");
+            std::fs::write(&through.unit, &text).expect("write");
+            let result = through.update();
+            refused(
+                &through,
+                &result,
+                &[(&through.unit, Some(text.into_bytes()))],
+                case,
+            );
+        }
+
+        // macOS's pair, through the same update in this process.
+        let pair = |through: &Through| {
+            (
+                through.path("wsmp-service-run.sh"),
+                through.path("com.flycockpit.wsmp.plist"),
+            )
+        };
+        let check_pair = |case: &str, wrapper_bytes: Option<&[u8]>, plist_bytes: &[u8]| {
+            let through = Through::new();
+            let (wrapper, plist) = pair(&through);
+            if let Some(bytes) = wrapper_bytes {
+                std::fs::write(&wrapper, bytes).expect("wrapper");
+                set_mode(&wrapper, PRIVATE_SCRIPT_MODE);
+            }
+            std::fs::write(&plist, plist_bytes).expect("plist");
+            let before = [
+                (wrapper.as_path(), bytes_of(&wrapper)),
+                (plist.as_path(), bytes_of(&plist)),
+            ];
+            let result = homebrew_update_with_pair(&through);
+            refused(&through, &result, &before, case);
+        };
+        let probe = Through::new();
+        let stable = PathBuf::from(&probe.stable);
+        let prefix = probe.dir.path();
+        let ours = pair_plist(prefix).expect("plist");
+        let healthy_wrapper = pair_wrapper(&stable).expect("wrapper");
+        let wrapper_name = prefix.join("wsmp-service-run.sh").display().to_string();
+        let cellar = old(&probe);
+        let theirs = ours.replace(MACOS_LABEL, "com.example.relay");
+        let runs = |program: &str| theirs.replace(&wrapper_name, program);
+        // Wrappers by hand beside wsmp's plist.
+        for (case, program) in [
+            ("wrapper, Cellar", &cellar),
+            ("wrapper, stable", &probe.stable),
+        ] {
+            let wrapper = format!("#!/bin/sh\nexec '{program}' run\n");
+            check_pair(case, Some(wrapper.as_bytes()), ours.as_bytes());
+        }
+        // Plists by hand beside wsmp's wrapper, and beside none.
+        let mut plists: Vec<(String, Vec<u8>)> = vec![
+            ("XML, Cellar".into(), runs(&cellar).into_bytes()),
+            ("XML, stable".into(), runs(&probe.stable).into_bytes()),
+            (
+                "XML, CDATA with a literal reference".into(),
+                runs("<![CDATA[/opt/x/Cel&#108;ar/wsmp/0.4.2/bin/wsmp]]>").into_bytes(),
+            ),
+            (
+                "XML, no label".into(),
+                b"<?xml version=\"1.0\"?><plist><dict/></plist>".to_vec(),
+            ),
+        ];
+        match resaved_plist(theirs.as_bytes(), "FMT_BINARY") {
+            Some(_) => {
+                for (case, program) in [
+                    ("binary, Cellar", cellar.clone()),
+                    ("binary, stable", probe.stable.clone()),
+                    (
+                        "binary, a literal reference",
+                        "/opt/x/Cel&#108;ar/wsmp/0.4.2/bin/wsmp".into(),
+                    ),
+                    (
+                        "binary, UTF-16 Cellar",
+                        cellar.replace("/Cellar/", "/\u{e9}/../Cellar/"),
+                    ),
+                ] {
+                    let bytes =
+                        resaved_plist(runs(&program).as_bytes(), "FMT_BINARY").expect("save");
+                    plists.push((case.into(), bytes));
+                }
+            }
+            None => {
+                #[allow(clippy::print_stderr)]
+                {
+                    eprintln!("skipped: no python3 to save a binary plist");
+                }
+            }
+        }
+        for (case, bytes) in &plists {
+            check_pair(
+                &format!("{case}, wsmp's wrapper"),
+                Some(healthy_wrapper.as_bytes()),
+                bytes,
+            );
+            check_pair(&format!("{case}, no wrapper"), None, bytes);
+        }
+
+        // Inverses. wsmp's pair on an old Cellar path (its plist saved again
+        // in binary when python3 is there): written again, then installed.
+        let through = Through::new();
+        let (wrapper, plist) = pair(&through);
+        let old_wrapper = pair_wrapper(Path::new(&old(&through))).expect("wrapper");
+        std::fs::write(&wrapper, &old_wrapper).expect("wrapper");
+        let wsmps_plist = pair_plist(through.dir.path()).expect("plist");
+        let saved = resaved_plist(wsmps_plist.as_bytes(), "FMT_BINARY")
+            .unwrap_or_else(|| wsmps_plist.clone().into_bytes());
+        std::fs::write(&plist, &saved).expect("plist");
+        let result = homebrew_update_with_pair(&through);
+        assert!(result.starts_with("Swapped\n"), "{result}");
+        assert!(through.take("brew.log").contains("upgrade\n"));
+        assert_eq!(
+            std::fs::read_to_string(&wrapper).expect("wrapper"),
+            pair_wrapper(Path::new(&through.stable)).expect("wrapper")
+        );
+        assert_eq!(std::fs::read_to_string(&plist).expect("plist"), wsmps_plist);
+        // No service: installed, nothing written.
+        let through = Through::new();
+        let (wrapper, plist) = pair(&through);
+        let result = homebrew_update_with_pair(&through);
+        assert!(result.starts_with("Swapped\n"), "{result}");
+        assert!(bytes_of(&wrapper).is_none() && bytes_of(&plist).is_none());
     }
 
     #[cfg(unix)]
@@ -3838,15 +4813,67 @@ mod tests {
         assert!(!usable_service_path_dir(&root.path().join("missing")));
     }
 
+    /// R6-B-2 / R6-A-1: each place in a unit has its own rule for `$`:
+    /// doubled in an `ExecStart=` argument (systemd expands `${NAME}` and
+    /// `$NAME` there, inside quotes too, and `$$` is one `$`), itself in the
+    /// program path and in an `Environment=` value. `%` is doubled in all
+    /// three; an empty argument stays an argument.
     #[test]
-    fn systemd_quote_arg_escapes_percent_and_quotes() {
+    fn systemd_quotes_each_place_by_its_own_rule() {
         assert_eq!(
-            systemd_quote_arg("/usr/bin/wsmp").expect("quote"),
+            systemd_exec_arg("/usr/bin/wsmp").expect("quote"),
             "/usr/bin/wsmp"
         );
         assert_eq!(
-            systemd_quote_arg("/tmp/a\"b%c").expect("quote"),
+            systemd_exec_arg("/tmp/a\"b%c").expect("quote"),
             "\"/tmp/a\\\"b%%c\""
+        );
+        assert_eq!(
+            systemd_exec_arg("/tmp/${HOME}/$$/a b%").expect("quote"),
+            "\"/tmp/$${HOME}/$$$$/a b%%\""
+        );
+        assert_eq!(systemd_exec_arg("").expect("quote"), "\"\"");
+        assert_eq!(
+            systemd_exec_path("/tmp/$HOME/a b%/wsmp").expect("quote"),
+            "\"/tmp/$HOME/a b%%/wsmp\""
+        );
+        assert_eq!(
+            systemd_environment("WSMP_STATE_DIR", "/tmp/${HOME}/$$ %").expect("quote"),
+            "\"WSMP_STATE_DIR=/tmp/${HOME}/$$ %%\""
+        );
+    }
+
+    /// F-FB-3: the wrapper path the LaunchAgent plist names
+    /// ([`macos_wrapper_path`], for `wsmp service install` and a Homebrew
+    /// update alike) is absolute even from a relative `WSMP_STATE_DIR`:
+    /// resolved against this process's working directory, where that state
+    /// directory is, not launchd's. An absolute one is kept as it is.
+    #[cfg(unix)]
+    #[test]
+    fn the_wrapper_the_plist_names_is_absolute_from_a_relative_state_dir() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let wrapper = absolute_in(Path::new("rel-state"), "wsmp-service-run.sh").expect("path");
+        assert!(wrapper.is_absolute(), "{}", wrapper.display());
+        assert_eq!(wrapper, cwd.join("rel-state").join("wsmp-service-run.sh"));
+        let fixed = cwd.join("abs-state");
+        assert_eq!(
+            absolute_in(&fixed, "wsmp-service-run.sh").expect("path"),
+            fixed.join("wsmp-service-run.sh")
+        );
+        let plist = render_launch_agent_plist(
+            MACOS_LABEL,
+            path_text("the wrapper path", &wrapper).expect("text"),
+            "/Users/u",
+            "/Users/u/Library/Logs/ws-model-proxy/relay.out.log",
+            "/Users/u/Library/Logs/ws-model-proxy/relay.err.log",
+        )
+        .expect("render");
+        assert!(
+            plist.contains(&format!(
+                "<string>{}</string>",
+                xml_escape(path_text("w", &wrapper).expect("text"))
+            )),
+            "{plist}"
         );
     }
 

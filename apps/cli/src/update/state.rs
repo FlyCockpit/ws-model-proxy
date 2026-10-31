@@ -79,6 +79,14 @@ pub struct UpdateState {
     pub live_path: PathBuf,
     /// The rollback copy (the binary that was live before).
     pub prev_path: PathBuf,
+    /// The dead-man's own program: a copy of the rollback copy that no swap or rollback moves
+    /// (`.wsmp-recovery-<id>` beside the binary), so the job still has a program to run after
+    /// the restore consumed `prev_path` (a retried relay restart, a replay). Kept while
+    /// [`Self::needs_recovery`], removed once the job is gone. `None`: no dead-man of this
+    /// release was armed (Homebrew, no scheduler), or one of an earlier build was, which runs
+    /// `prev_path`. Optional: a released wsmp ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_path: Option<PathBuf>,
     /// Where a rollback moves the build that failed.
     pub failed_path: PathBuf,
     pub rollback_after_secs: u32,
@@ -100,10 +108,31 @@ pub struct UpdateState {
     /// The end of a server update was sent to the server.
     #[serde(default)]
     pub reported: bool,
+    /// A rollback was decided and may have begun: saved before the restore takes the rollback
+    /// copy, so a rollback interrupted after it (a crash, a failed save) is finished on replay,
+    /// and no confirmation certifies the build it replaces. Optional, not a phase: a released
+    /// wsmp that starts after a rollback reads this file and ignores fields it does not know.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rolling_back: bool,
+    /// Rolled back by the dead-man, and the relay service has not restarted into the restored
+    /// build yet: the dead-man job stays and restarts it on its next run.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restart_pending: bool,
     pub updated_at: String,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl UpdateState {
+    /// Whether a recovery owner (the dead-man) may still have to act on this update: it is in
+    /// progress, a rollback was decided and not recorded as done, or the relay still has to be
+    /// restarted into the restored build. Its recovery copy is kept while this holds.
+    pub fn needs_recovery(&self) -> bool {
+        self.phase.in_progress() || self.rolling_back || self.restart_pending
+    }
+
     /// Move to `next`, refusing a move the sequence does not allow.
     pub fn advance(&mut self, next: Phase) -> Result<()> {
         anyhow::ensure!(
@@ -253,6 +282,7 @@ pub(crate) fn sample(dir: &Path, phase: Phase) -> UpdateState {
         deadman_at: None,
         live_path: dir.join("wsmp"),
         prev_path: dir.join("wsmp.prev"),
+        recovery_path: None,
         failed_path: dir.join("wsmp.failed"),
         rollback_after_secs: 90,
         deadline: 0,
@@ -261,6 +291,8 @@ pub(crate) fn sample(dir: &Path, phase: Phase) -> UpdateState {
         reason: None,
         detail: None,
         reported: false,
+        rolling_back: false,
+        restart_pending: false,
         updated_at: String::new(),
     }
 }
@@ -320,6 +352,31 @@ mod tests {
                 .as_deref()
                 .is_some_and(|d| d.encode_utf16().count() <= 4000)
         );
+    }
+
+    /// The rollback marks are optional fields, not phases: absent when false (the file is what a
+    /// released wsmp wrote), read back when set, and a reader ignores fields it does not know (as
+    /// a released wsmp does with these, after a rollback restores it).
+    #[test]
+    fn the_rollback_marks_are_optional_fields_old_readers_skip() {
+        let dir = tempfile::tempdir().expect("dir");
+        let update = dir.path().join("update");
+        let mut state = sample(dir.path(), Phase::Swapped);
+        save(&update, &state).expect("save");
+        let plain: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path(&update)).expect("read")).expect("json");
+        assert!(plain.get("rollingBack").is_none() && plain.get("restartPending").is_none());
+        state.rolling_back = true;
+        state.restart_pending = true;
+        save(&update, &state).expect("save");
+        assert_eq!(load(&update).expect("load"), Some(state.clone()));
+        let mut marked: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path(&update)).expect("read")).expect("json");
+        assert_eq!(marked["rollingBack"], true);
+        assert_eq!(marked["phase"], "swapped");
+        marked["aFieldFromALaterWsmp"] = serde_json::json!(1);
+        let read: UpdateState = serde_json::from_value(marked).expect("unknown fields are ignored");
+        assert_eq!(read, state);
     }
 
     #[test]

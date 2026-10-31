@@ -2446,6 +2446,35 @@ mod tests {
     use serde::de::DeserializeOwned;
     use std::path::{Path, PathBuf};
 
+    /// F-FB-2: the release versions this node reads are exactly the ones the
+    /// server accepts (`agentReleaseVersionSchema` checks the same vectors),
+    /// so the server never offers or sends one the node cannot install.
+    #[test]
+    fn release_versions_match_the_servers_vectors() {
+        #[derive(serde::Deserialize)]
+        struct Vector {
+            value: String,
+            valid: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Shared {
+            vectors: Vec<Vector>,
+        }
+        let shared: Shared = serde_json::from_str(include_str!(
+            "../../../../packages/api/src/lib/agent-release-version-vectors.json"
+        ))
+        .expect("shared release version vectors");
+        assert!(shared.vectors.len() > 30);
+        for vector in shared.vectors {
+            assert_eq!(
+                is_release_version(&vector.value),
+                vector.valid,
+                "{:?}",
+                vector.value
+            );
+        }
+    }
+
     fn fixtures() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/relay-3.0")
     }

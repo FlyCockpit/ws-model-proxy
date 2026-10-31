@@ -1693,6 +1693,8 @@ where
             rollback_after_secs,
         } => {
             let identity = crate::update::build::identity();
+            // Taken first: a lowering from here on revokes the update, at once.
+            let trust = startup.trust_watch();
             let gate = crate::update::agent::Gate {
                 full_control: startup.full_control(),
                 remote: Config::load_required()
@@ -1714,6 +1716,7 @@ where
                     rollback_after_secs,
                 },
                 &gate,
+                trust,
             );
             for frame in frames {
                 send_control(socket, &frame, "answering an update")?;

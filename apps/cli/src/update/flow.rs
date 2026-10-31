@@ -162,13 +162,57 @@ pub fn self_replace(
         }
     };
     install::clear_retired(&layout.live);
+    // Dead-man programs of earlier updates that no job runs any more.
+    sweep_recovery(&machine.update_dir(), &layout.live, machine.scheduler);
     let ended = install_files(machine, request, &layout, progress);
-    if ended == Ended::Stopped {
+    if ended == Ended::Stopped && settled(&machine.update_dir(), &request.update_id) {
         install::clean(&layout);
+        // This update's dead-man program too, once no job is registered (its removal
+        // failed, or arming failed after it registered: then the copy stays for it).
+        sweep_recovery(&machine.update_dir(), &layout.live, machine.scheduler);
     } else {
+        // Swapped, or stopped with this update still recorded in progress (its terminal state
+        // could not be saved, or the swap began): `wsmp.new` and the rollback copy are the
+        // dead-man's evidence (whether the swap happened, what to put back). Only staging goes.
         let _ = std::fs::remove_dir_all(&layout.staging);
     }
     ended
+}
+
+/// Whether nothing durable still names `update_id` as in progress: no state, another update's,
+/// or this one ended. An unreadable state counts as not settled (its evidence is kept).
+fn settled(update_dir: &Path, update_id: &str) -> bool {
+    match state::load(update_dir) {
+        Ok(Some(current)) => current.update_id != update_id || !current.phase.in_progress(),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+/// How often a terminal state is written before the update leaves it to the dead-man.
+const TERMINAL_SAVE_ATTEMPTS: u32 = 4;
+
+/// Save the terminal state `current` (already moved there), trying again on a failure (a
+/// transient storage error). True once it is durable: only then may the dead-man be removed.
+fn save_terminal(update_dir: &Path, current: &UpdateState) -> bool {
+    let mut wait = Duration::from_millis(50);
+    for attempt in 1..=TERMINAL_SAVE_ATTEMPTS {
+        match state::save(update_dir, current) {
+            Ok(()) => return true,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    attempt,
+                    "recording the update's end failed"
+                );
+                if attempt < TERMINAL_SAVE_ATTEMPTS {
+                    std::thread::sleep(wait);
+                    wait *= 3;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn install_files(
@@ -274,6 +318,10 @@ fn install_files(
     if let Some(before_swap) = machine.before_swap
         && let Err(why) = before_swap(progress)
     {
+        // A wait the update may no longer go on ended: that reason, not busy.
+        if let Err(ended) = machine.may_proceed(progress) {
+            return ended;
+        }
         return stop(progress, UpdatePhase::Refused, UpdateReason::Busy, why);
     }
     if let Err(ended) = machine.may_proceed(progress) {
@@ -287,6 +335,18 @@ fn install_files(
             UpdatePhase::Failed,
             UpdateReason::Internal,
             format!("{error:#}"),
+        );
+    }
+    // The dead-man's own program, beside the rollback copy, that no swap or rollback moves:
+    // made and verified before the state that names it and the job that runs it.
+    if machine.scheduler.is_some()
+        && let Err(error) = install::prepare_recovery(&layout.prev, &layout.recovery)
+    {
+        return stop(
+            progress,
+            UpdatePhase::Failed,
+            UpdateReason::Internal,
+            format!("writing the rollback job's program: {error:#}"),
         );
     }
 
@@ -315,6 +375,7 @@ fn install_files(
         to_sha256: Some(to_sha256),
         live_path: layout.live.clone(),
         prev_path: layout.prev.clone(),
+        recovery_path: machine.scheduler.map(|_| layout.recovery.clone()),
         failed_path: layout.failed.clone(),
         rollback_after_secs: request.rollback_after_secs,
         deadline: super::unix_now() + u64::from(request.rollback_after_secs),
@@ -326,6 +387,8 @@ fn install_files(
         reason: None,
         detail: None,
         reported: false,
+        rolling_back: false,
+        restart_pending: false,
         updated_at: crate::file_ops::fmt::rfc3339_secs(super::unix_now()),
     };
     if let Err(error) = state::save(&update_dir, &current) {
@@ -336,26 +399,46 @@ fn install_files(
             format!("{error:#}"),
         );
     }
-    let failed = |current: &mut UpdateState, progress: &mut dyn Progress, detail: String| {
-        if current.fail(UpdateReason::Internal, detail.clone()).is_ok() {
-            // Reported again on later sessions until the server acknowledges it.
-            let _ = state::save(&update_dir, current);
+    // Ends the update as `phase`/`reason`: the terminal state is saved first (reported again on
+    // later sessions until the server acknowledges it), and the dead-man is removed only once it
+    // is durable. Not durable: the dead-man stays, with `wsmp.new` (the swap did not happen) and
+    // the rollback copy; at its deadline it finds `armed` and settles it (`NeverSwapped`). An
+    // update whose dead-man could not be armed has no job to settle it: the next update attempt
+    // does, under the update lock ([`settle_abandoned`]), or else the next start (`on_start`).
+    let end = |current: &mut UpdateState,
+               progress: &mut dyn Progress,
+               phase: UpdatePhase,
+               reason: UpdateReason,
+               detail: String,
+               disarm: bool| {
+        let durable =
+            current.fail(reason, detail.clone()).is_ok() && save_terminal(&update_dir, current);
+        if durable
+            && disarm
+            && let Some(scheduler) = machine.scheduler
+        {
+            let _ = super::deadman::disarm(scheduler);
         }
-        stop(
+        stop(progress, phase, reason, detail)
+    };
+    let failed = |current: &mut UpdateState, progress: &mut dyn Progress, detail: String| {
+        end(
+            current,
             progress,
             UpdatePhase::Failed,
             UpdateReason::Internal,
             detail,
+            false,
         )
     };
     if let Some(scheduler) = machine.scheduler {
-        let spec = DeadmanSpec {
-            update_id: request.update_id.clone(),
-            prev: layout.prev.clone(),
-            state_dir: machine.state_dir.clone(),
-            fire_in: Duration::from_secs(u64::from(request.rollback_after_secs)),
-        };
-        if let Err(error) = super::deadman::arm(scheduler, &spec, super::deadman::ARM_WAIT) {
+        let armed = deadman_spec(
+            &current,
+            &machine.state_dir,
+            Duration::from_secs(u64::from(request.rollback_after_secs)),
+        )
+        .and_then(|spec| super::deadman::arm(scheduler, &spec, super::deadman::ARM_WAIT));
+        if let Err(error) = armed {
             return failed(
                 &mut current,
                 progress,
@@ -364,11 +447,43 @@ fn install_files(
         }
         progress.report(UpdatePhase::Armed, None, None);
     }
+    // Arming can wait on the service manager (a rollback still running, a
+    // name not yet free): the node may have been lowered or its operator may
+    // have turned remote updates off meanwhile. Asked again last, right
+    // before the swap. A refusal here ends the update like any other, with
+    // the old binary in place: the state is recorded as ended first (so a
+    // dead-man that cannot be removed finds it settled and moves nothing),
+    // then, once that is durable, the dead-man is removed.
+    if let Some(Err((reason, detail))) = machine.proceed.map(|proceed| proceed()) {
+        return end(
+            &mut current,
+            progress,
+            UpdatePhase::Refused,
+            reason,
+            detail,
+            true,
+        );
+    }
     if let Err(error) = install::swap(layout) {
-        if let Some(scheduler) = machine.scheduler {
-            let _ = super::deadman::disarm(scheduler);
+        let detail = format!("{error:#}");
+        if swap_began(layout) {
+            // Partly done (Windows: the live binary moved aside, and putting it back failed):
+            // the state stays `armed` and the dead-man puts the rollback copy back.
+            return stop(
+                progress,
+                UpdatePhase::Failed,
+                UpdateReason::Internal,
+                detail,
+            );
         }
-        return failed(&mut current, progress, format!("{error:#}"));
+        return end(
+            &mut current,
+            progress,
+            UpdatePhase::Failed,
+            UpdateReason::Internal,
+            detail,
+            true,
+        );
     }
     if current.advance(Phase::Swapped).is_ok()
         && let Err(error) = state::save(&update_dir, &current)
@@ -398,6 +513,7 @@ pub fn record_homebrew(machine: &Machine<'_>, request: &Request, stable: &Path) 
         to_sha256,
         live_path: stable.to_path_buf(),
         prev_path: stable.to_path_buf(),
+        recovery_path: None,
         failed_path: stable.to_path_buf(),
         rollback_after_secs: request.rollback_after_secs,
         deadline: now + u64::from(request.rollback_after_secs),
@@ -407,6 +523,8 @@ pub fn record_homebrew(machine: &Machine<'_>, request: &Request, stable: &Path) 
         reason: None,
         detail: None,
         reported: false,
+        rolling_back: false,
+        restart_pending: false,
         updated_at: crate::file_ops::fmt::rfc3339_secs(now),
     };
     state::save(&machine.update_dir(), &current)
@@ -441,12 +559,98 @@ pub enum Rollback {
 
 /// The files of `current`'s update.
 fn layout_of(current: &UpdateState) -> Result<Layout> {
+    let beside = Layout::beside(&current.live_path, &current.update_id)?;
     Ok(Layout {
         live: current.live_path.clone(),
         prev: current.prev_path.clone(),
         failed: current.failed_path.clone(),
-        ..Layout::beside(&current.live_path, &current.update_id)?
+        recovery: current
+            .recovery_path
+            .clone()
+            .unwrap_or_else(|| beside.recovery.clone()),
+        ..beside
     })
+}
+
+/// The dead-man job for `current`: it runs the recorded recovery copy
+/// ([`UpdateState::recovery_path`], [`install::prepare_recovery`]), never the rollback copy the
+/// restore consumes. The one place a job's program is chosen: the installer and a start that
+/// arms a lost job again both use it. An error when no recovery copy is recorded.
+pub fn deadman_spec(
+    current: &UpdateState,
+    state_dir: &Path,
+    fire_in: Duration,
+) -> Result<DeadmanSpec> {
+    let program = current
+        .recovery_path
+        .as_deref()
+        .context("the update has no program recorded for its rollback job")?;
+    DeadmanSpec::new(current.update_id.clone(), program, state_dir, fire_in)
+}
+
+/// Make sure `current`'s recovery copy is there and is the rollback copy's bytes, writing it
+/// (again) from the rollback copy otherwise, and record it. An update armed by an earlier build
+/// (whose job ran `wsmp.prev`) gets one here, before its job is armed again.
+fn ensure_recovery(current: &mut UpdateState, layout: &Layout) -> Result<()> {
+    if current.recovery_path.is_none()
+        || install::verify_recovery(&layout.prev, &layout.recovery).is_err()
+    {
+        install::prepare_recovery(&layout.prev, &layout.recovery)?;
+    }
+    current.recovery_path = Some(layout.recovery.clone());
+    Ok(())
+}
+
+/// Remove the dead-man programs ([`install::prepare_recovery`]) beside `live` that no job can
+/// run any more, under the update lock (the caller holds it). Only when no dead-man job is
+/// registered (`present()` is `false`, or there is no scheduler): a job that is still there
+/// keeps its program, whatever it is for. The one the state still needs
+/// ([`UpdateState::needs_recovery`]: a job lost and armed again runs it) stays. Any doubt (the
+/// scheduler cannot tell, the state cannot be read) removes nothing.
+fn sweep_recovery(update_dir: &Path, live: &Path, scheduler: Option<&dyn Scheduler>) {
+    if install::recovery_copies(live).is_empty() {
+        return;
+    }
+    if let Some(scheduler) = scheduler
+        && !matches!(scheduler.present(), Ok(false))
+    {
+        return;
+    }
+    let keep = match state::load(update_dir) {
+        Ok(current) => current
+            .filter(UpdateState::needs_recovery)
+            .and_then(|current| current.recovery_path),
+        Err(_) => return,
+    };
+    install::clear_recovery(live, keep.as_deref());
+}
+
+/// The dead-man of `update_id` removed its own job (`remove()` succeeded) and has nothing left
+/// to do: remove its program (the recovery copy), under the update lock. Kept while the update
+/// still needs recovery ([`UpdateState::needs_recovery`]: a restart still owed, a rollback not
+/// recorded). A job armed by an earlier build ran `wsmp.prev`, which this build linked again
+/// after the restore ([`rollback_if_unconfirmed`]): that link goes instead. Best effort: what
+/// stays (Windows cannot delete the running program; the lock was busy) goes with a later
+/// sweep.
+pub fn job_removed(update_dir: &Path, update_id: &str) {
+    let Ok(Some(_lock)) = state::UpdateLock::wait(update_dir, LOCK_WAIT) else {
+        return;
+    };
+    let Ok(Some(current)) = state::load(update_dir) else {
+        return;
+    };
+    if current.update_id != update_id || current.needs_recovery() {
+        return;
+    }
+    match &current.recovery_path {
+        Some(recovery) => {
+            let _ = std::fs::remove_file(recovery);
+        }
+        None if current.phase == Phase::RolledBack => {
+            let _ = std::fs::remove_file(&current.prev_path);
+        }
+        None => {}
+    }
 }
 
 /// Whether the swap began: it takes `wsmp.new` away (and on Windows moves
@@ -487,15 +691,19 @@ pub fn rollback_if_unconfirmed(
     if !current.phase.in_progress() {
         return Ok(Rollback::Settled);
     }
-    let window = u64::from(current.rollback_after_secs);
-    let armed_at = current.deadline.saturating_sub(window);
-    let due = match booted_at {
-        Some(boot) if boot > armed_at => current.deadline.max(boot.saturating_add(window)),
-        _ => current.deadline,
-    };
-    // One second of slack for a timer that fires a little early.
-    if now + 1 < due {
-        return Ok(Rollback::NotDue(Duration::from_secs(due - now)));
+    // A rollback already decided (its intent is saved, and it may have begun) is finished now,
+    // whatever the deadline says since.
+    if !current.rolling_back {
+        let window = u64::from(current.rollback_after_secs);
+        let armed_at = current.deadline.saturating_sub(window);
+        let due = match booted_at {
+            Some(boot) if boot > armed_at => current.deadline.max(boot.saturating_add(window)),
+            _ => current.deadline,
+        };
+        // One second of slack for a timer that fires a little early.
+        if now + 1 < due {
+            return Ok(Rollback::NotDue(Duration::from_secs(due - now)));
+        }
     }
     let layout = layout_of(&current)?;
     if current.phase == Phase::Armed {
@@ -511,7 +719,7 @@ pub fn rollback_if_unconfirmed(
         }
         current.advance(Phase::Swapped)?;
     }
-    if !install::restore(&layout)? {
+    if restore_durably(update_dir, &mut current, &layout)? == Restored::NoCopy {
         current.fail(
             UpdateReason::Internal,
             "the new build did not confirm and there is no rollback copy",
@@ -519,11 +727,140 @@ pub fn rollback_if_unconfirmed(
         state::save(update_dir, &current)?;
         return Ok(Rollback::NoCopy);
     }
-    install::clear_retired(&layout.live);
     current.advance(Phase::RolledBack)?;
+    current.rolling_back = false;
+    // The relay still runs the build that failed: this dead-man restarts it, and keeps its job
+    // until that worked ([`restart_pending`]).
+    current.restart_pending = true;
     current.detail = log_tail().map(|tail| super::clip_detail(&tail));
+    // Failing here leaves `swapped` with the intent saved: the job runs again, and the replay
+    // finds the restore done.
     state::save(update_dir, &current)?;
+    if current.recovery_path.is_none()
+        && let Err(error) = install::relink_program(&layout.live, &current.prev_path)
+    {
+        // A job armed by an earlier build runs `wsmp.prev`, which the restore consumed: its
+        // next run (a retried restart) needs it there again.
+        tracing::warn!(error = %format!("{error:#}"), "keeping the rollback job's program failed");
+    }
     Ok(Rollback::RolledBack)
+}
+
+/// How a durable restore went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restored {
+    /// The rollback copy is the live binary now (by this call, or by an earlier one).
+    Done,
+    /// There is no rollback copy, and the live binary is still the new build.
+    NoCopy,
+}
+
+/// Put the rollback copy back, durably, under the update lock: the intent (`rolling_back`) is
+/// saved before the restore consumes `wsmp.prev`, so a rollback that stops after it (a crash, a
+/// failed save) is recognised as done on replay instead of finding no copy. Both rollbacks use
+/// it: the dead-man's ([`rollback_if_unconfirmed`]) and the one after too many unconfirmed
+/// starts ([`on_start`]). The caller records `rolled_back` on [`Restored::Done`].
+fn restore_durably(
+    update_dir: &Path,
+    current: &mut UpdateState,
+    layout: &Layout,
+) -> Result<Restored> {
+    let copy = std::fs::symlink_metadata(&layout.prev).is_ok();
+    if !current.rolling_back {
+        if !copy {
+            return Ok(Restored::NoCopy);
+        }
+        current.rolling_back = true;
+        if let Err(error) = state::save(update_dir, current) {
+            // Nothing was restored: the copy is still there for the next try.
+            current.rolling_back = false;
+            return Err(error.context("recording the rollback before it begins"));
+        }
+    }
+    let restored_now = copy && install::restore(layout)?;
+    if !restored_now && !restore_completed(current, layout)? {
+        // The copy went without a restore (removed by hand): nothing to put back.
+        current.rolling_back = false;
+        return Ok(Restored::NoCopy);
+    }
+    install::clear_retired(&layout.live);
+    Ok(Restored::Done)
+}
+
+/// With the rollback decided and its copy gone: whether the restore already ran. The live
+/// binary is then no longer the new build (by its SHA-256, when the update recorded one; without
+/// it, the intent and the consumed copy decide). An unreadable live binary is an error: the
+/// rollback is tried again later.
+fn restore_completed(current: &UpdateState, layout: &Layout) -> Result<bool> {
+    let Some(new) = current.to_sha256.as_deref() else {
+        return Ok(true);
+    };
+    Ok(install::sha256_file(&layout.live)? != new)
+}
+
+/// Whether the dead-man of `update_id` rolled it back and the relay has not restarted into the
+/// restored build yet (its restart failed): the dead-man job's next run restarts it.
+pub fn restart_pending(update_dir: &Path, update_id: &str) -> bool {
+    matches!(
+        state::load(update_dir),
+        Ok(Some(current))
+            if current.update_id == update_id
+                && current.phase == Phase::RolledBack
+                && current.restart_pending
+    )
+}
+
+/// The relay restarted into the restored build: the dead-man owes nothing more. Best effort
+/// (a mark left behind costs one more restart, if the job could not be removed either).
+pub fn restart_done(update_dir: &Path, update_id: &str) -> Result<()> {
+    let Some(_lock) = state::UpdateLock::wait(update_dir, LOCK_WAIT)? else {
+        anyhow::bail!("the update state is locked");
+    };
+    if let Some(mut current) = state::load(update_dir)?
+        && current.update_id == update_id
+        && current.restart_pending
+    {
+        current.restart_pending = false;
+        state::save(update_dir, &current)?;
+    }
+    Ok(())
+}
+
+/// A later update attempt, holding the update lock (`_held`: no installer, dead-man run or
+/// confirmation can run meanwhile, all take it), settles an update that was abandoned before
+/// its swap: still `armed`, `wsmp.new` still there (the swap did not begin), and no recovery job
+/// registered (its arming failed, or there is no scheduler). Its installer ended without
+/// recording the end (the terminal save failed) and nothing else would ever finish it until the
+/// relay restarts. It is recorded failed, nothing moved. True when it settled one. An `armed`
+/// state whose swap began, or whose dead-man is registered (or the scheduler cannot tell), is
+/// left to its owner: the dead-man, or the next start.
+pub fn settle_abandoned(
+    update_dir: &Path,
+    scheduler: Option<&dyn Scheduler>,
+    _held: &state::UpdateLock,
+) -> Result<bool> {
+    let Some(mut current) = state::load(update_dir)? else {
+        return Ok(false);
+    };
+    if current.phase != Phase::Armed {
+        return Ok(false);
+    }
+    let layout = layout_of(&current)?;
+    if swap_began(&layout) {
+        return Ok(false);
+    }
+    if let Some(scheduler) = scheduler
+        && scheduler.present()?
+    {
+        return Ok(false);
+    }
+    current.fail(
+        UpdateReason::Internal,
+        "the update stopped before the swap; nothing was changed",
+    )?;
+    state::save(update_dir, &current)?;
+    install::clean(&layout);
+    Ok(true)
 }
 
 /// What the dead-man of `update_id` can tell without the lock: the update
@@ -568,11 +905,24 @@ pub fn confirm(
     if current.update_id != update_id {
         return Ok(Confirm::NotOurs);
     }
+    // A rollback was decided (it may have restored the old build already): never confirmed.
+    if current.rolling_back {
+        return Ok(Confirm::RolledBack);
+    }
     match current.phase {
         Phase::Armed => current.advance(Phase::Swapped)?,
         Phase::Swapped => {}
         Phase::RolledBack => return Ok(Confirm::RolledBack),
         Phase::Confirmed | Phase::Failed => return Ok(Confirm::NotOurs),
+    }
+    // Not only the phase: the installed binary must be this update's new build. One that a
+    // rollback (or anything else) replaced is not certified; the relay restarts into it.
+    if current.strategy == UpdateStrategy::SelfReplace
+        && let Some(expected) = current.to_sha256.as_deref()
+        && install::sha256_file(&current.live_path).context("reading the installed wsmp")?
+            != expected
+    {
+        return Ok(Confirm::RolledBack);
     }
     current.advance(Phase::Confirmed)?;
     state::save(update_dir, &current)?;
@@ -589,6 +939,8 @@ pub fn confirm(
         tracing::warn!(error = %format!("{error:#}"), "writing the install receipt failed");
     }
     install::clear_retired(&current.live_path);
+    // Its dead-man's program, once the job is gone.
+    sweep_recovery(update_dir, &current.live_path, scheduler);
     Ok(Confirm::Confirmed(Box::new(current)))
 }
 
@@ -650,13 +1002,41 @@ pub fn on_start(
         return Ok(OnStart::Nothing);
     };
     if !current.phase.in_progress() {
+        sweep_recovery(update_dir, &current.live_path, scheduler);
         return Ok(if current.needs_report() {
             OnStart::Report(current)
         } else {
             OnStart::Nothing
         });
     }
-    if !current.is_new_build(running.version, running.sha256) {
+    let new_build = current.is_new_build(running.version, running.sha256);
+    if current.rolling_back {
+        // A rollback was decided and stopped before it was recorded: finish it first.
+        let layout = layout_of(&current)?;
+        if restore_durably(update_dir, &mut current, &layout)? == Restored::Done {
+            current.advance(Phase::RolledBack)?;
+            current.rolling_back = false;
+            current
+                .detail
+                .get_or_insert_with(|| "the rollback was finished when wsmp started".to_string());
+            state::save(update_dir, &current)?;
+            if let Some(scheduler) = scheduler {
+                let _ = super::deadman::disarm(scheduler);
+            }
+            sweep_recovery(update_dir, &current.live_path, scheduler);
+            return Ok(if new_build {
+                // This process is the build that was rolled back: the service starts the other.
+                OnStart::RolledBackSelf
+            } else if current.needs_report() {
+                OnStart::Report(current)
+            } else {
+                OnStart::Nothing
+            });
+        }
+        // No copy, and the new build is still installed: nothing was restored.
+        state::save(update_dir, &current)?;
+    }
+    if !new_build {
         // This is not the new build: the swap did not happen or did not take.
         let layout = layout_of(&current)?;
         let why = if current.phase == Phase::Armed && !swap_began(&layout) {
@@ -678,6 +1058,7 @@ pub fn on_start(
         if let Some(scheduler) = scheduler {
             let _ = super::deadman::disarm(scheduler);
         }
+        sweep_recovery(update_dir, &current.live_path, scheduler);
         return Ok(if current.needs_report() {
             OnStart::Report(current)
         } else {
@@ -694,9 +1075,9 @@ pub fn on_start(
     }
     if current.attempts > max_starts {
         let layout = layout_of(&current)?;
-        if install::restore(&layout)? {
-            install::clear_retired(&layout.live);
+        if restore_durably(update_dir, &mut current, &layout)? == Restored::Done {
             current.advance(Phase::RolledBack)?;
+            current.rolling_back = false;
             current.detail = Some(format!(
                 "wsmp {} started {max_starts} times without confirming",
                 running.version
@@ -705,6 +1086,7 @@ pub fn on_start(
             if let Some(scheduler) = scheduler {
                 let _ = super::deadman::disarm(scheduler);
             }
+            sweep_recovery(update_dir, &current.live_path, scheduler);
             return Ok(OnStart::RolledBackSelf);
         }
     }
@@ -718,16 +1100,20 @@ pub fn on_start(
         && current.attempts <= max_starts
         && deadman_lost(scheduler, current.deadman_at, now)
     {
-        let spec = DeadmanSpec {
-            update_id: current.update_id.clone(),
-            prev: current.prev_path.clone(),
-            state_dir: update_dir
-                .parent()
-                .context("the update directory has no parent")?
-                .to_path_buf(),
-            fire_in: Duration::from_secs(current.deadline.saturating_sub(now)),
-        };
-        match super::deadman::arm(scheduler, &spec, super::deadman::ARM_WAIT) {
+        let state_dir = update_dir
+            .parent()
+            .context("the update directory has no parent")?;
+        let armed = layout_of(&current)
+            .and_then(|layout| ensure_recovery(&mut current, &layout))
+            .and_then(|()| {
+                deadman_spec(
+                    &current,
+                    state_dir,
+                    Duration::from_secs(current.deadline.saturating_sub(now)),
+                )
+            })
+            .and_then(|spec| super::deadman::arm(scheduler, &spec, super::deadman::ARM_WAIT));
+        match armed {
             Ok(()) => current.deadman_at = Some(current.deadline),
             Err(error) => tracing::warn!(
                 error = %format!("{error:#}"),
@@ -934,8 +1320,17 @@ mod tests {
                 .contains("0.4.2")
         );
         let spec = node.scheduler.registered.borrow().clone().expect("armed");
-        assert_eq!(spec.prev, prev);
-        assert_eq!(spec.fire_in, Duration::from_secs(90));
+        // The job runs its own copy of the old build, not the rollback copy.
+        let recovery = node
+            .live
+            .with_file_name(".wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(spec.program(), recovery);
+        assert_ne!(spec.program(), prev);
+        assert_eq!(
+            install::sha256_file(&recovery).expect("recovery"),
+            install::sha256_file(&prev).expect("prev")
+        );
+        assert_eq!(spec.fire_in(), Duration::from_secs(90));
         let saved = state::load(&node.update_dir())
             .expect("load")
             .expect("state");
@@ -982,6 +1377,8 @@ mod tests {
         .expect("check");
         assert_eq!(late, Rollback::Settled);
         assert!(prev.exists());
+        // Confirmed and its job removed: the job's program went with it.
+        assert!(!recovery.exists());
     }
 
     #[cfg(unix)]
@@ -1081,6 +1478,185 @@ mod tests {
             .expect("load")
             .expect("state");
         (node, saved)
+    }
+
+    /// R7-B-1, through both producers of a dead-man (the update, and a start
+    /// that re-arms a lost one): each runs in a child whose working directory
+    /// is the updater's, with a relative state directory. The job it arms
+    /// names the state directory absolutely, and that command, run from
+    /// another working directory (the scheduler's), restores the old build.
+    /// The same command with the relative path finds nothing there and rolls
+    /// nothing back (what was armed before).
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_state_dir_is_armed_absolute_and_the_job_restores_from_another_cwd() {
+        const NAME: &str = "update::flow::tests::a_relative_state_dir_is_armed_absolute_and_the_job_restores_from_another_cwd";
+        const SCRIPT: &str =
+            "#!/bin/sh\ncase \"$1\" in --version) echo 'wsmp 0.4.3';; *) exit 1;; esac\n";
+        if let Some(mode) = std::env::var_os("WSMP_TEST_R7B1_MODE") {
+            let out = PathBuf::from(std::env::var_os("WSMP_TEST_R7B1_OUT").expect("out"));
+            let var = |name: &str| std::env::var(name).expect(name);
+            let emit = |scheduler: &FakeScheduler| {
+                let spec = scheduler.registered.borrow().clone().expect("armed");
+                let mut job = vec![spec.program_text().expect("program").to_string()];
+                job.extend(spec.rollback_args().expect("args"));
+                std::fs::write(&out, job.join("\n")).expect("job");
+            };
+            let node = Node::new();
+            match mode.to_str().expect("mode") {
+                "update" => {
+                    let archive = archive_with(SCRIPT);
+                    let url = serve(archive.clone());
+                    let machine = Machine {
+                        state_dir: "relative-state".into(),
+                        live: var("WSMP_TEST_R7B1_LIVE").into(),
+                        ..node.machine()
+                    };
+                    let mut progress = Recorded::default();
+                    let ended = self_replace(&machine, &request(url, sha(&archive)), &mut progress);
+                    assert_eq!(ended, Ended::Swapped, "{:?}", progress.0);
+                }
+                "start" => {
+                    let sha = var("WSMP_TEST_R7B1_SHA");
+                    let now = var("WSMP_TEST_R7B1_NOW").parse().expect("now");
+                    let start = on_start(
+                        Path::new("relative-state/update"),
+                        Some(&node.scheduler),
+                        new_build(&sha),
+                        3,
+                        now,
+                    )
+                    .expect("start");
+                    assert!(matches!(start, OnStart::AwaitConfirm(_)), "{start:?}");
+                }
+                "job" => {
+                    // What `wsmp update rollback` does with the job's
+                    // arguments (`commands::update::run`), past any deadline.
+                    let job = std::fs::read_to_string(var("WSMP_TEST_R7B1_JOB")).expect("job");
+                    let args: Vec<&str> = job.lines().collect();
+                    let after = |flag: &str| {
+                        args.iter()
+                            .position(|arg| *arg == flag)
+                            .and_then(|at| args.get(at + 1))
+                            .copied()
+                            .expect(flag)
+                    };
+                    crate::paths::pin(None, Some(after("--state-dir").into())).expect("pin");
+                    let outcome = rollback_if_unconfirmed(
+                        &crate::update::update_dir().expect("update dir"),
+                        after("--if-unconfirmed"),
+                        u64::MAX / 2,
+                        None,
+                        || None,
+                    );
+                    std::fs::write(&out, format!("{outcome:?}")).expect("outcome");
+                    return;
+                }
+                other => panic!("unknown mode {other}"),
+            }
+            emit(&node.scheduler);
+            return;
+        }
+
+        let child = |mode: &str, cwd: &Path, out: &Path, env: &[(&str, std::ffi::OsString)]| {
+            let ran = std::process::Command::new(std::env::current_exe().expect("exe"))
+                .args(["--exact", NAME, "--nocapture"])
+                .current_dir(cwd)
+                .env("WSMP_TEST_R7B1_MODE", mode)
+                .env("WSMP_TEST_R7B1_OUT", out)
+                .envs(env.iter().map(|(name, value)| (name, value)))
+                .output()
+                .expect("child");
+            assert!(
+                ran.status.success(),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&ran.stdout),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+            std::fs::read_to_string(out).expect("child output")
+        };
+        for producer in ["update", "start"] {
+            let node = Node::new();
+            let updater = node.root.path().join("updater");
+            let manager = node.root.path().join("manager");
+            std::fs::create_dir_all(&updater).expect("updater");
+            std::fs::create_dir_all(&manager).expect("manager");
+            let state_dir = updater.join("relative-state");
+            let job_file = node.root.path().join("job");
+            if producer == "update" {
+                child(
+                    producer,
+                    &updater,
+                    &job_file,
+                    &[("WSMP_TEST_R7B1_LIVE", node.live.clone().into())],
+                );
+            } else {
+                // Swapped (here, absolute), then the dead-man went missing:
+                // the new build's start re-arms it from a relative path.
+                let archive = archive_with(SCRIPT);
+                let url = serve(archive.clone());
+                let machine = Machine {
+                    state_dir: state_dir.clone(),
+                    ..node.machine()
+                };
+                let mut progress = Recorded::default();
+                let ended = self_replace(&machine, &request(url, sha(&archive)), &mut progress);
+                assert_eq!(ended, Ended::Swapped, "{:?}", progress.0);
+                let saved = state::load(&state_dir.join("update"))
+                    .expect("load")
+                    .expect("state");
+                child(
+                    producer,
+                    &updater,
+                    &job_file,
+                    &[
+                        ("WSMP_TEST_R7B1_SHA", node.live_sha().into()),
+                        (
+                            "WSMP_TEST_R7B1_NOW",
+                            (saved.deadline + 10).to_string().into(),
+                        ),
+                    ],
+                );
+            }
+            let job = std::fs::read_to_string(&job_file).expect("job");
+            let expected = std::fs::canonicalize(&updater)
+                .expect("canonical")
+                .join("relative-state");
+            assert!(node.live_text().contains("0.4.3"), "{producer}: swapped");
+
+            // The job as armed before this fix, from the scheduler's directory:
+            // no update there, nothing rolled back.
+            let relative_job = node.root.path().join("relative-job");
+            let relative = job.replace(&expected.display().to_string(), "relative-state");
+            std::fs::write(&relative_job, relative).expect("relative job");
+            let outcome = child(
+                "job",
+                &manager,
+                &node.root.path().join("relative-outcome"),
+                &[("WSMP_TEST_R7B1_JOB", relative_job.into())],
+            );
+            assert_eq!(outcome, "Ok(NotOurs)", "{producer}");
+            assert!(node.live_text().contains("0.4.3"), "{producer}");
+
+            // The job as armed now, from the same directory: the old build is back.
+            let outcome = child(
+                "job",
+                &manager,
+                &node.root.path().join("outcome"),
+                &[("WSMP_TEST_R7B1_JOB", job_file.into())],
+            );
+            assert_eq!(outcome, "Ok(RolledBack)", "{producer}");
+            assert!(node.live_text().contains("0.4.2"), "{producer}: restored");
+            let restored = state::load(&state_dir.join("update"))
+                .expect("load")
+                .expect("state");
+            assert_eq!(restored.phase, Phase::RolledBack, "{producer}");
+            // Armed with the updater's directory, made absolute.
+            assert!(
+                job.ends_with(&format!("\n--state-dir\n{}", expected.display())),
+                "{producer}: {job}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1188,7 +1764,7 @@ mod tests {
                 .registered
                 .borrow()
                 .as_ref()
-                .map(|spec| spec.fire_in),
+                .map(DeadmanSpec::fire_in),
             Some(Duration::from_secs(rearmed.deadline - late))
         );
         // Running now (waiting for the deadline): left alone.
@@ -1202,6 +1778,118 @@ mod tests {
         )
         .expect("start");
         assert_eq!(*node.scheduler.registrations.borrow(), before + 1);
+    }
+
+    /// F-FA-1: the dead-man's program (the recovery copy) is not the rollback copy, survives the
+    /// restore, and stays while its job is registered or anything is still owed (a restart);
+    /// only once the job is gone and nothing is owed does a sweep remove it.
+    #[cfg(unix)]
+    #[test]
+    fn the_job_keeps_its_program_while_it_is_registered_or_owed() {
+        let (node, saved) = swapped_node();
+        let recovery = saved.recovery_path.clone().expect("recorded");
+        assert_eq!(
+            node.scheduler
+                .registered
+                .borrow()
+                .as_ref()
+                .map(|spec| spec.program().to_path_buf()),
+            Some(recovery.clone())
+        );
+        let outcome = rollback_if_unconfirmed(
+            &node.update_dir(),
+            &saved.update_id,
+            saved.deadline + 10,
+            None,
+            || None,
+        )
+        .expect("rollback");
+        assert_eq!(outcome, Rollback::RolledBack);
+        assert!(
+            !saved.prev_path.exists(),
+            "the restore consumed the rollback copy"
+        );
+        assert!(recovery.exists(), "never the job's program");
+        // The old build starts while the job is still registered (its restart is owed):
+        // nothing is swept.
+        let start = |now| {
+            on_start(&node.update_dir(), Some(&node.scheduler), OLD_BUILD, 3, now).expect("start")
+        };
+        start(saved.deadline + 20);
+        assert!(recovery.exists(), "a registered job keeps its program");
+        // The job is gone but the restart is still owed: kept for a job armed again.
+        let spec = node.scheduler.registered.borrow().clone().expect("job");
+        node.scheduler.remove().expect("remove");
+        start(saved.deadline + 30);
+        assert!(recovery.exists(), "still owed");
+        // Nothing owed, but a job is registered (its removal failed, say): it keeps its
+        // program, whatever the state says.
+        node.scheduler.register(&spec).expect("job again");
+        restart_done(&node.update_dir(), &saved.update_id).expect("done");
+        start(saved.deadline + 40);
+        assert!(recovery.exists(), "a registered job keeps its program");
+        // Nothing owed and no job: removed.
+        node.scheduler.remove().expect("remove");
+        start(saved.deadline + 50);
+        assert!(!recovery.exists(), "swept");
+    }
+
+    /// F-FA-1, the old layout: an update whose job an earlier build armed (it ran `wsmp.prev`;
+    /// the state names no recovery copy) and lost is armed again with a recovery copy of the
+    /// rollback copy, recorded in the state.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_an_earlier_build_armed_is_armed_again_with_a_recovery_copy() {
+        let (node, mut saved) = swapped_node();
+        let recovery = saved.recovery_path.take().expect("recorded");
+        std::fs::remove_file(&recovery).expect("rm");
+        state::save(&node.update_dir(), &saved).expect("save");
+        node.scheduler.remove().expect("lost");
+        let late = saved.deadline + 300;
+        on_start(
+            &node.update_dir(),
+            Some(&node.scheduler),
+            new_build(&node.live_sha()),
+            3,
+            late,
+        )
+        .expect("start");
+        let spec = node
+            .scheduler
+            .registered
+            .borrow()
+            .clone()
+            .expect("armed again");
+        assert_eq!(spec.program(), recovery);
+        assert_eq!(
+            install::sha256_file(&recovery).expect("copy"),
+            install::sha256_file(&saved.prev_path).expect("prev")
+        );
+        let stored = state::load(&node.update_dir())
+            .expect("load")
+            .expect("state");
+        assert_eq!(stored.recovery_path.as_deref(), Some(recovery.as_path()));
+    }
+
+    /// F-FA-1, the inverse: a recovery copy that cannot be written stops the update before
+    /// anything is armed or swapped (the old build stays live, no job).
+    #[cfg(unix)]
+    #[test]
+    fn a_recovery_copy_that_cannot_be_made_stops_before_the_arm() {
+        let node = Node::new();
+        let blocked = node
+            .live
+            .with_file_name(".wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA");
+        std::fs::create_dir_all(blocked.join("in-the-way")).expect("dir");
+        let archive = archive_with("#!/bin/sh\necho 'wsmp 0.4.3'\n");
+        let url = serve(archive.clone());
+        let mut progress = Recorded::default();
+        let ended = self_replace(&node.machine(), &request(url, sha(&archive)), &mut progress);
+        assert_eq!(ended, Ended::Stopped);
+        assert_eq!(progress.phases().last(), Some(&UpdatePhase::Failed));
+        assert!(node.live_text().contains("0.4.2"));
+        assert!(node.scheduler.registered.borrow().is_none());
+        assert_eq!(*node.scheduler.registrations.borrow(), 0);
     }
 
     #[cfg(unix)]
@@ -1494,6 +2182,116 @@ mod tests {
         assert_eq!(state::load(&node.update_dir()).expect("load"), None);
     }
 
+    /// F-FA-1: full control and the operator's setting are asked again after
+    /// the dead-man is armed, right before the swap. Lowered while the
+    /// service manager registers the dead-man: refused (the reason the gate
+    /// gives), the old build stays, the state is ended (failed, with that
+    /// reason, to be reported) and the dead-man removed. Inverses: lowered
+    /// before the arm refuses with nothing armed or recorded; never lowered
+    /// swaps.
+    #[cfg(unix)]
+    #[test]
+    fn a_node_lowered_while_the_dead_man_registers_is_not_swapped() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let lowered_detail = "the node was lowered to Relay only; wsmp was not upgraded";
+        for when in ["during the arm", "before the arm", "never"] {
+            let node = Node::new();
+            let lowered = Rc::new(Cell::new(false));
+            let gate = {
+                let lowered = Rc::clone(&lowered);
+                move || -> std::result::Result<(), (UpdateReason, String)> {
+                    if lowered.get() {
+                        Err((UpdateReason::NotOwnerTrust, lowered_detail.to_string()))
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            // The last step before the arm: the idle check.
+            let before = {
+                let lowered = Rc::clone(&lowered);
+                move |_: &mut dyn Progress| -> std::result::Result<(), String> {
+                    if when == "before the arm" {
+                        lowered.set(true);
+                    }
+                    Ok(())
+                }
+            };
+            if when == "during the arm" {
+                let lowered = Rc::clone(&lowered);
+                *node.scheduler.during_register.borrow_mut() =
+                    Some(Box::new(move || lowered.set(true)));
+            }
+            let machine = Machine {
+                proceed: Some(&gate),
+                before_swap: Some(&before),
+                ..node.machine()
+            };
+            let archive = archive_with("#!/bin/sh\necho 'wsmp 0.4.3'\n");
+            let url = serve(archive.clone());
+            let mut progress = Recorded::default();
+            let ended = self_replace(&machine, &request(url, sha(&archive)), &mut progress);
+            let saved = state::load(&node.update_dir()).expect("load");
+            match when {
+                "during the arm" => {
+                    assert_eq!(ended, Ended::Stopped, "{:?}", progress.0);
+                    assert_eq!(
+                        progress.phases(),
+                        [
+                            UpdatePhase::Downloading,
+                            UpdatePhase::Verifying,
+                            UpdatePhase::Armed,
+                            UpdatePhase::Refused
+                        ]
+                    );
+                    assert_eq!(progress.last_reason(), Some(UpdateReason::NotOwnerTrust));
+                    assert!(node.live_text().contains("0.4.2"), "the old build stays");
+                    assert_eq!(*node.scheduler.registrations.borrow(), 1);
+                    assert!(
+                        node.scheduler.registered.borrow().is_none(),
+                        "the dead-man is removed"
+                    );
+                    let saved = saved.expect("state");
+                    assert_eq!(saved.phase, Phase::Failed);
+                    assert_eq!(saved.reason, Some(UpdateReason::NotOwnerTrust));
+                    assert!(saved.needs_report());
+                    assert!(
+                        !node.live.with_file_name("wsmp.new").exists(),
+                        "the new build is not left beside the live one"
+                    );
+                    // A dead-man that could not be removed finds it settled.
+                    assert_eq!(
+                        rollback_if_unconfirmed(
+                            &node.update_dir(),
+                            &saved.update_id,
+                            u64::MAX / 2,
+                            None,
+                            || None
+                        )
+                        .expect("check"),
+                        Rollback::Settled
+                    );
+                    assert!(node.live_text().contains("0.4.2"));
+                }
+                "before the arm" => {
+                    assert_eq!(ended, Ended::Stopped);
+                    assert_eq!(progress.last_reason(), Some(UpdateReason::NotOwnerTrust));
+                    assert!(!progress.phases().contains(&UpdatePhase::Armed));
+                    assert_eq!(*node.scheduler.registrations.borrow(), 0);
+                    node.untouched();
+                    assert_eq!(saved, None);
+                }
+                _ => {
+                    assert_eq!(ended, Ended::Swapped, "{:?}", progress.0);
+                    assert!(node.live_text().contains("0.4.3"));
+                    assert!(node.scheduler.registered.borrow().is_some(), "armed");
+                    assert_eq!(saved.expect("state").phase, Phase::Swapped);
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_waiting_dead_man_sees_its_update_settle_without_the_lock() {
@@ -1552,5 +2350,547 @@ mod tests {
         );
         assert_eq!(archive_name("https://h/"), "wsmp-update-archive");
         assert_eq!(archive_name("https://h/..%2f"), "wsmp-update-archive");
+    }
+
+    /// The state directory stops taking writes while the dead-man registers
+    /// (`update_dir` becomes a plain file; the real directory, with the
+    /// durable `armed` state in it, is kept aside), and the node is lowered
+    /// at the same moment. `restore_after`: when to put the directory back
+    /// (`None`: only by hand, after the update returned).
+    #[cfg(unix)]
+    fn revoked_while_storage_fails(
+        restore_after: Option<Duration>,
+    ) -> (Node, Ended, Recorded, PathBuf) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let node = Node::new();
+        let held = node.root.path().join("held-state");
+        let lowered = Rc::new(Cell::new(false));
+        {
+            let lowered = Rc::clone(&lowered);
+            let (update_dir, held) = (node.update_dir(), held.clone());
+            *node.scheduler.during_register.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&update_dir, &held).expect("aside");
+                std::fs::write(&update_dir, b"not a directory").expect("block");
+                lowered.set(true);
+                if let Some(after) = restore_after {
+                    let (update_dir, held) = (update_dir.clone(), held.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(after);
+                        std::fs::remove_file(&update_dir).expect("unblock");
+                        std::fs::rename(&held, &update_dir).expect("back");
+                    });
+                }
+            }));
+        }
+        let gate = {
+            let lowered = Rc::clone(&lowered);
+            move || -> std::result::Result<(), (UpdateReason, String)> {
+                if lowered.get() {
+                    Err((UpdateReason::NotOwnerTrust, "lowered during the arm".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        let machine = Machine {
+            proceed: Some(&gate),
+            ..node.machine()
+        };
+        let archive = archive_with("#!/bin/sh\necho 'wsmp 0.4.3'\n");
+        let mut progress = Recorded::default();
+        let ended = self_replace(
+            &machine,
+            &request(serve(archive.clone()), sha(&archive)),
+            &mut progress,
+        );
+        (node, ended, progress, held)
+    }
+
+    /// F-FA-3 (the reviewer's `fa_revocation_save_failure_must_keep_a_recovery_trigger`):
+    /// refused after the arm while the terminal state cannot be saved at
+    /// all. The dead-man stays armed, and `wsmp.new` (its evidence that no
+    /// swap happened) stays beside the live binary; once storage works again
+    /// the dead-man's own check settles the update (`NeverSwapped`, `failed`)
+    /// with the old build in place, and later updates are free again.
+    #[cfg(unix)]
+    #[test]
+    fn fa_revocation_save_failure_must_keep_a_recovery_trigger() {
+        let (node, ended, progress, held) = revoked_while_storage_fails(None);
+        assert_eq!(ended, Ended::Stopped);
+        assert_eq!(progress.last_reason(), Some(UpdateReason::NotOwnerTrust));
+        assert!(node.live_text().contains("0.4.2"), "the old build stays");
+        assert!(
+            node.scheduler.registered.borrow().is_some(),
+            "the dead-man stays armed while the end is not durable"
+        );
+        assert_eq!(*node.scheduler.removals.borrow(), 0);
+        assert!(
+            node.live.with_file_name("wsmp.new").exists(),
+            "the dead-man's evidence (no swap) is kept"
+        );
+        // Storage works again; the durable state is still `armed`.
+        std::fs::remove_file(node.update_dir()).expect("unblock");
+        std::fs::rename(&held, node.update_dir()).expect("back");
+        let durable = state::load(&node.update_dir())
+            .expect("load")
+            .expect("state");
+        assert_eq!(durable.phase, Phase::Armed);
+        // The dead-man fires at its deadline: nothing was swapped, so it
+        // records the end itself and moves nothing.
+        assert_eq!(
+            rollback_if_unconfirmed(
+                &node.update_dir(),
+                &durable.update_id,
+                durable.deadline + 2,
+                None,
+                || None,
+            )
+            .expect("dead-man"),
+            Rollback::NeverSwapped
+        );
+        let settled = state::load(&node.update_dir())
+            .expect("load")
+            .expect("state");
+        assert_eq!(settled.phase, Phase::Failed);
+        assert!(!settled.phase.in_progress(), "later updates are free again");
+        assert!(!node.live.with_file_name("wsmp.new").exists());
+        assert!(node.live_text().contains("0.4.2"));
+    }
+
+    /// Inverse: a save that fails once and then works (a transient error)
+    /// is tried again; once the end is durable the dead-man is removed and
+    /// nothing is left beside the live binary, as with no fault at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_save_that_fails_once_is_tried_again_before_the_dead_man_goes() {
+        let (node, ended, progress, _held) =
+            revoked_while_storage_fails(Some(Duration::from_millis(10)));
+        assert_eq!(ended, Ended::Stopped);
+        assert_eq!(progress.last_reason(), Some(UpdateReason::NotOwnerTrust));
+        let saved = state::load(&node.update_dir())
+            .expect("load")
+            .expect("state");
+        assert_eq!(saved.phase, Phase::Failed);
+        assert_eq!(saved.reason, Some(UpdateReason::NotOwnerTrust));
+        assert!(
+            node.scheduler.registered.borrow().is_none(),
+            "removed once durable"
+        );
+        assert!(!node.live.with_file_name("wsmp.new").exists());
+        assert!(node.live_text().contains("0.4.2"));
+    }
+
+    /// A scheduler whose registration fails after it made the state directory unwritable (the
+    /// installer's terminal saves then fail too), with no job installed (F-FA-3, review P8).
+    #[cfg(unix)]
+    struct Unarmed<'a> {
+        dir: PathBuf,
+        held: PathBuf,
+        registered: &'a std::cell::Cell<bool>,
+    }
+
+    #[cfg(unix)]
+    impl Scheduler for Unarmed<'_> {
+        fn present(&self) -> Result<bool> {
+            Ok(self.registered.get())
+        }
+        fn running(&self) -> Result<bool> {
+            Ok(false)
+        }
+        fn register(&self, _: &DeadmanSpec) -> Result<()> {
+            std::fs::rename(&self.dir, &self.held)?;
+            std::fs::write(&self.dir, b"temporarily not a directory")?;
+            anyhow::bail!("service manager temporarily unavailable")
+        }
+        fn remove(&self) -> Result<()> {
+            self.registered.set(false);
+            Ok(())
+        }
+    }
+
+    /// Review P8 (F-FA-3), with the fixed expectation: arming fails and every terminal save
+    /// fails, so the installer leaves a durable `armed` state and no dead-man. Once storage is
+    /// back, the next attempt, under the update lock, settles it (instead of refusing every
+    /// update until the relay restarts), and the update after it installs.
+    #[cfg(unix)]
+    #[test]
+    fn fa_unarmed_terminal_save_failure_has_no_recovery_trigger() {
+        let node = Node::new();
+        let registered = std::cell::Cell::new(false);
+        let held = node.root.path().join("held-state");
+        let scheduler = Unarmed {
+            dir: node.update_dir(),
+            held: held.clone(),
+            registered: &registered,
+        };
+        let machine = Machine {
+            scheduler: Some(&scheduler),
+            ..node.machine()
+        };
+        let archive = archive_with("#!/bin/sh\necho 'wsmp 0.4.3'\n");
+        let mut reports = Recorded::default();
+        assert_eq!(
+            self_replace(
+                &machine,
+                &request(serve(archive.clone()), sha(&archive)),
+                &mut reports
+            ),
+            Ended::Stopped
+        );
+        assert_eq!(reports.last_reason(), Some(UpdateReason::Internal));
+        std::fs::remove_file(node.update_dir()).expect("storage restored");
+        std::fs::rename(&held, node.update_dir()).expect("directory restored");
+        let stranded = state::load(&node.update_dir())
+            .expect("load")
+            .expect("state");
+        assert_eq!(stranded.phase, Phase::Armed);
+        assert!(!registered.get(), "no dead-man exists to settle this state");
+        assert!(node.live.with_file_name("wsmp.new").exists());
+
+        // The next attempt: its lock proves no installer, dead-man run or confirmation is active.
+        let lock = state::UpdateLock::acquire(&node.update_dir())
+            .expect("lock")
+            .expect("free");
+        assert!(settle_abandoned(&node.update_dir(), Some(&scheduler), &lock).expect("settle"));
+        let settled = state::load(&node.update_dir())
+            .expect("load")
+            .expect("state");
+        assert_eq!(settled.phase, Phase::Failed);
+        assert_eq!(settled.reason, Some(UpdateReason::Internal));
+        assert!(!node.live.with_file_name("wsmp.new").exists());
+        assert!(node.live_text().contains("0.4.2"), "nothing was moved");
+
+        // And the update after it goes through.
+        let mut reports = Recorded::default();
+        let mut next = request(serve(archive.clone()), sha(&archive));
+        next.update_id = "BBBBBBBBBBBBBBBBBBBBBB".into();
+        assert_eq!(
+            self_replace(&node.machine(), &next, &mut reports),
+            Ended::Swapped
+        );
+        drop(lock);
+    }
+
+    /// The inverse of the settle: an `armed` state that still has an owner is never settled by
+    /// a later attempt. Its dead-man is registered; its swap began (`wsmp.new` gone: the new build
+    /// may be live); or the scheduler cannot say whether a job is registered.
+    #[cfg(unix)]
+    #[test]
+    fn a_later_attempt_leaves_an_armed_update_that_still_has_an_owner() {
+        struct Unsure;
+        impl Scheduler for Unsure {
+            fn present(&self) -> Result<bool> {
+                anyhow::bail!("the service manager did not answer")
+            }
+            fn running(&self) -> Result<bool> {
+                Ok(false)
+            }
+            fn register(&self, _: &DeadmanSpec) -> Result<()> {
+                Ok(())
+            }
+            fn remove(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let node = Node::new();
+        let update_dir = node.update_dir();
+        let mut armed = state::sample(node.live.parent().expect("bin"), Phase::Armed);
+        armed.live_path = node.live.clone();
+        state::save(&update_dir, &armed).expect("save");
+        let new = node.live.with_file_name("wsmp.new");
+        std::fs::write(&new, "new").expect("new");
+        let lock = state::UpdateLock::acquire(&update_dir)
+            .expect("lock")
+            .expect("free");
+        let still_armed = || {
+            state::load(&update_dir)
+                .expect("load")
+                .expect("state")
+                .phase
+                == Phase::Armed
+        };
+
+        // A registered dead-man owns it.
+        let spec = DeadmanSpec::new(
+            armed.update_id.clone(),
+            &armed.prev_path,
+            &node.state_dir(),
+            Duration::from_secs(90),
+        )
+        .expect("spec");
+        node.scheduler.register(&spec).expect("register");
+        assert!(!settle_abandoned(&update_dir, Some(&node.scheduler), &lock).expect("look"));
+        assert!(still_armed());
+        node.scheduler.remove().expect("remove");
+
+        // A scheduler that cannot tell: not settled (the error is the caller's to log).
+        assert!(settle_abandoned(&update_dir, Some(&Unsure), &lock).is_err());
+        assert!(still_armed());
+
+        // The swap began: the dead-man or the next start decides what is live.
+        std::fs::remove_file(&new).expect("swap began");
+        assert!(!settle_abandoned(&update_dir, Some(&node.scheduler), &lock).expect("look"));
+        assert!(still_armed());
+
+        // Control: pre-swap, no job, lock held: settled.
+        std::fs::write(&new, "new").expect("new");
+        assert!(settle_abandoned(&update_dir, Some(&node.scheduler), &lock).expect("settle"));
+        assert!(!still_armed());
+    }
+
+    /// Swaps, then lets the dead-man's restore run and fails the `rolled_back` save right after
+    /// it (through the log-tail callback, which runs between the two), then puts storage back.
+    #[cfg(unix)]
+    fn rollback_whose_save_failed() -> (Node, UpdateState) {
+        let (node, current) = swapped_node();
+        let held = node.root.path().join("held-rollback-state");
+        let failed = rollback_if_unconfirmed(
+            &node.update_dir(),
+            &current.update_id,
+            current.deadline + 2,
+            None,
+            || {
+                std::fs::rename(node.update_dir(), &held).expect("block the save");
+                std::fs::write(node.update_dir(), b"not a directory").expect("block");
+                None
+            },
+        );
+        assert!(failed.is_err());
+        assert!(
+            node.live_text().contains("0.4.2"),
+            "restored before the save failed"
+        );
+        assert!(!current.prev_path.exists(), "the restore consumed the copy");
+        std::fs::remove_file(node.update_dir()).expect("unblock");
+        std::fs::rename(&held, node.update_dir()).expect("storage back");
+        let stored = state::load(&node.update_dir())
+            .expect("load")
+            .expect("state");
+        assert_eq!(stored.phase, Phase::Swapped);
+        assert!(
+            stored.rolling_back,
+            "the intent was saved before the restore"
+        );
+        (node, current)
+    }
+
+    /// Review P13 (F-FA-4), with the fixed expectations. The restore ran and its `rolled_back`
+    /// save failed. A confirmation (the new build, still running) must not certify the install
+    /// the rollback replaced, nor remove the dead-man; the dead-man's next run recognises the
+    /// completed restore and records it (it found no copy before: `NoCopy`, and no restart).
+    #[cfg(unix)]
+    #[test]
+    fn fa_rollback_save_failure_can_confirm_the_restored_old_binary() {
+        for observer in ["confirm", "retry_rollback"] {
+            let (node, current) = rollback_whose_save_failed();
+            if observer == "confirm" {
+                let confirmed = confirm(
+                    &node.update_dir(),
+                    Some(&node.scheduler),
+                    &current.update_id,
+                    |_| None,
+                )
+                .expect("confirm");
+                assert_eq!(confirmed, Confirm::RolledBack);
+                assert!(node.live_text().contains("0.4.2"));
+                assert!(
+                    node.scheduler.registered.borrow().is_some(),
+                    "the dead-man stays to finish the rollback"
+                );
+                let stored = state::load(&node.update_dir())
+                    .expect("load")
+                    .expect("state");
+                assert_ne!(stored.phase, Phase::Confirmed);
+            }
+            // The dead-man's next run (at once: a decided rollback does not wait for a deadline).
+            assert_eq!(
+                rollback_if_unconfirmed(
+                    &node.update_dir(),
+                    &current.update_id,
+                    current.deadline.saturating_sub(1_000),
+                    None,
+                    || None,
+                )
+                .expect("replay"),
+                Rollback::RolledBack
+            );
+            let done = state::load(&node.update_dir())
+                .expect("load")
+                .expect("state");
+            assert_eq!(done.phase, Phase::RolledBack);
+            assert!(!done.rolling_back);
+            assert!(
+                done.restart_pending,
+                "the replay still owes the relay a restart"
+            );
+            assert!(node.live_text().contains("0.4.2"));
+        }
+    }
+
+    /// Both rollback sites record their intent before the restore: a restore that fails (here:
+    /// the binary's directory cannot be written) finds `rolling_back` already durable, and the
+    /// next look finishes the rollback (the dead-man at once, a start as the crash-loop). Without
+    /// the intent first, the state would still read as a plain unconfirmed update.
+    #[cfg(unix)]
+    #[test]
+    fn both_rollbacks_record_their_intent_before_the_restore() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root writes into a read-only directory: the failure cannot be staged.
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        for site in ["deadman", "crash_loop"] {
+            let (node, current) = swapped_node();
+            let sha = node.live_sha();
+            let dir = node.update_dir();
+            let bin = node.live.parent().expect("bin").to_path_buf();
+            let look = || {
+                if site == "deadman" {
+                    rollback_if_unconfirmed(
+                        &dir,
+                        &current.update_id,
+                        current.deadline + 2,
+                        None,
+                        || None,
+                    )
+                    .map(|_| ())
+                } else {
+                    on_start(&dir, Some(&node.scheduler), new_build(&sha), 0, 0).map(|_| ())
+                }
+            };
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o500)).expect("ro");
+            let result = look();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).expect("rw");
+            assert!(result.is_err(), "{site}: the restore failed");
+            assert_eq!(node.live_sha(), sha, "{site}: nothing restored");
+            assert!(
+                current.prev_path.exists(),
+                "{site}: the copy is still there"
+            );
+            let stored = state::load(&dir).expect("load").expect("state");
+            assert_eq!(stored.phase, Phase::Swapped, "{site}");
+            assert!(stored.rolling_back, "{site}: the intent was durable first");
+            // The next look finishes it.
+            look().expect("finished");
+            let done = state::load(&dir).expect("load").expect("state");
+            assert_eq!(done.phase, Phase::RolledBack, "{site}");
+            assert!(node.live_text().contains("0.4.2"), "{site}");
+        }
+    }
+
+    /// The crash-loop sibling (F-FA-4): a rollback decided and begun, then interrupted (the
+    /// restore done, `rolled_back` not saved), is finished by the next start, by the dead-man,
+    /// and refused by a confirmation, whichever comes first. One whose restore did not run yet
+    /// is finished the same way.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_rollback_is_finished_by_whoever_comes_next() {
+        for (restored, next) in [
+            (true, "start_old"),
+            (true, "deadman"),
+            (true, "confirm"),
+            (false, "start_new"),
+            (false, "deadman"),
+            // Decided, not begun: the new build is still installed, and still not confirmed.
+            (false, "confirm"),
+        ] {
+            let (node, current) = swapped_node();
+            let sha = node.live_sha();
+            let mut interrupted = current.clone();
+            interrupted.rolling_back = true;
+            state::save(&node.update_dir(), &interrupted).expect("intent");
+            if restored {
+                let layout = layout_of(&current).expect("layout");
+                assert!(install::restore(&layout).expect("restore"));
+            }
+            match next {
+                "start_old" => assert!(matches!(
+                    on_start(&node.update_dir(), Some(&node.scheduler), OLD_BUILD, 3, 0)
+                        .expect("start"),
+                    OnStart::Report(_)
+                )),
+                "start_new" => assert_eq!(
+                    on_start(
+                        &node.update_dir(),
+                        Some(&node.scheduler),
+                        new_build(&sha),
+                        3,
+                        0
+                    )
+                    .expect("start"),
+                    OnStart::RolledBackSelf
+                ),
+                "deadman" => assert_eq!(
+                    rollback_if_unconfirmed(
+                        &node.update_dir(),
+                        &current.update_id,
+                        0,
+                        None,
+                        || None
+                    )
+                    .expect("replay"),
+                    Rollback::RolledBack
+                ),
+                _ => {
+                    assert_eq!(
+                        confirm(
+                            &node.update_dir(),
+                            Some(&node.scheduler),
+                            &current.update_id,
+                            |_| None
+                        )
+                        .expect("confirm"),
+                        Confirm::RolledBack
+                    );
+                    assert!(node.scheduler.registered.borrow().is_some());
+                    continue;
+                }
+            }
+            let done = state::load(&node.update_dir())
+                .expect("load")
+                .expect("state");
+            assert_eq!(done.phase, Phase::RolledBack, "{restored} {next}");
+            assert!(!done.rolling_back);
+            assert!(node.live_text().contains("0.4.2"), "{restored} {next}");
+            assert!(!current.prev_path.exists());
+        }
+    }
+
+    /// The inverse of the confirmation check: a build whose bytes are this update's confirms (the
+    /// check reads the installed binary, not only the phase); one whose bytes are not does not.
+    #[cfg(unix)]
+    #[test]
+    fn a_confirmation_certifies_only_the_installed_new_build() {
+        let (node, current) = swapped_node();
+        assert!(matches!(
+            confirm(
+                &node.update_dir(),
+                Some(&node.scheduler),
+                &current.update_id,
+                |_| None
+            )
+            .expect("confirm"),
+            Confirm::Confirmed(_)
+        ));
+        let (node, current) = swapped_node();
+        std::fs::write(&node.live, "#!/bin/sh\necho 'wsmp 0.4.2'\n").expect("replaced");
+        assert_eq!(
+            confirm(
+                &node.update_dir(),
+                Some(&node.scheduler),
+                &current.update_id,
+                |_| None
+            )
+            .expect("confirm"),
+            Confirm::RolledBack
+        );
+        assert_eq!(
+            state::load(&node.update_dir())
+                .expect("load")
+                .expect("state")
+                .phase,
+            Phase::Swapped
+        );
     }
 }

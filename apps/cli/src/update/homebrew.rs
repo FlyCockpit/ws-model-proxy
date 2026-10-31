@@ -130,8 +130,8 @@ fn brew(keg: &Keg) -> PathBuf {
 /// formula, or one from another tap.
 pub fn refusal(keg: &Keg) -> Result<Option<String>> {
     let (ok, listing) = super::deadman::run_bounded(
-        &brew(keg).display().to_string(),
-        &["list".into(), "--pinned".into()],
+        brew(keg),
+        &["list", "--pinned"],
         &[],
         Duration::from_secs(60),
     )
@@ -157,13 +157,8 @@ pub fn refusal(keg: &Keg) -> Result<Option<String>> {
 /// Changes Homebrew's tap checkouts only, never an installed keg. It takes
 /// Homebrew's update lock itself: never call it while holding a [`TapLock`].
 pub fn refresh(keg: &Keg) -> Result<()> {
-    let (ok, output) = super::deadman::run_bounded(
-        &brew(keg).display().to_string(),
-        &["update".into()],
-        &[],
-        REFRESH_TIMEOUT,
-    )
-    .context("running `brew update`")?;
+    let (ok, output) = super::deadman::run_bounded(brew(keg), &["update"], &[], REFRESH_TIMEOUT)
+        .context("running `brew update`")?;
     anyhow::ensure!(ok, "`brew update` failed: {}", output.trim());
     Ok(())
 }
@@ -172,8 +167,8 @@ pub fn refresh(keg: &Keg) -> Result<()> {
 /// (`brew info --json=v2`; no refresh of its own).
 pub fn tap_version(keg: &Keg) -> Result<String> {
     let (ok, json, errors) = super::deadman::run_bounded_split(
-        &brew(keg).display().to_string(),
-        &["info".into(), "--json=v2".into(), FORMULA.into()],
+        brew(keg),
+        &["info", "--json=v2", FORMULA],
         &[("HOMEBREW_NO_AUTO_UPDATE", "1".into())],
         INFO_TIMEOUT,
     )
@@ -282,20 +277,45 @@ pub fn compare_release(a: &str, b: &str) -> Option<std::cmp::Ordering> {
 }
 
 /// `brew --prefix`: where Homebrew keeps its locks (`var/homebrew/locks`).
+/// The path is the output exactly ([`prefix_from_output`]): the lock is the
+/// file `brew` itself takes, never one at a path trimmed differently.
 pub fn prefix(keg: &Keg) -> Result<PathBuf> {
-    let (ok, out, errors) = super::deadman::run_bounded_split(
-        &brew(keg).display().to_string(),
-        &["--prefix".into()],
+    let ran = super::deadman::run_bounded_bytes(
+        brew(keg),
+        &["--prefix"],
         &[("HOMEBREW_NO_AUTO_UPDATE", "1".into())],
         PREFIX_TIMEOUT,
     )
     .context("running `brew --prefix`")?;
-    anyhow::ensure!(ok, "`brew --prefix` failed: {}", errors.trim());
-    let prefix = PathBuf::from(out.trim());
+    anyhow::ensure!(
+        ran.code == Some(0),
+        "`brew --prefix` failed: {}",
+        String::from_utf8_lossy(&ran.stderr).trim()
+    );
+    prefix_from_output(&ran.stdout)
+}
+
+/// What `brew --prefix` printed, as a path: one line, its terminator (`\n`,
+/// or `\r\n`) taken off and nothing else, so a prefix that ends in a space
+/// keeps it. Output that is not UTF-8, empty, more than one line, without
+/// its terminator (cut short) or not an absolute path is refused: such a
+/// prefix cannot be told apart from another one.
+pub fn prefix_from_output(out: &[u8]) -> Result<PathBuf> {
+    let text = std::str::from_utf8(out)
+        .map_err(|_| anyhow::anyhow!("`brew --prefix` printed something that is not UTF-8"))?;
+    let line = text
+        .strip_suffix('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .ok_or_else(|| anyhow::anyhow!("`brew --prefix` printed `{text}`, not one line"))?;
+    anyhow::ensure!(
+        !line.is_empty() && !line.contains(['\n', '\r']),
+        "`brew --prefix` printed `{}`, not one line",
+        line.escape_debug()
+    );
+    let prefix = PathBuf::from(line);
     anyhow::ensure!(
         prefix.is_absolute(),
-        "`brew --prefix` printed `{}`, not a directory",
-        out.trim()
+        "`brew --prefix` printed `{line}`, not a directory"
     );
     Ok(prefix)
 }
@@ -477,8 +497,8 @@ impl TapLock {
 /// version the next start reports do. Its output on failure.
 pub fn upgrade(keg: &Keg, _checked_under: TapLock) -> Result<()> {
     let (ok, output) = super::deadman::run_bounded(
-        &brew(keg).display().to_string(),
-        &["upgrade".into(), FORMULA.into()],
+        brew(keg),
+        &["upgrade", FORMULA],
         &[
             ("HOMEBREW_NO_AUTO_UPDATE", "1".into()),
             ("HOMEBREW_NO_INSTALL_CLEANUP", "1".into()),
@@ -493,6 +513,63 @@ pub fn upgrade(keg: &Keg, _checked_under: TapLock) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-FB-1 (the review's C9 two-path probe, with the fixed expectation): a Homebrew prefix
+    /// whose path is not UTF-8 runs its own `brew` for every call (`list --pinned`, `update`,
+    /// `info`, `--prefix`, `upgrade`), exactly as named; the sibling whose name is that path
+    /// shown as text (U+FFFD for the invalid byte) never runs.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_brew_prefix_never_runs_the_replacement_character_sibling() {
+        use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+        let root = tempfile::tempdir().expect("root");
+        let intended = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"brew-\xff".to_vec()));
+        let sibling = PathBuf::from(intended.display().to_string());
+        assert_ne!(intended, sibling);
+        let marker = root.path().join("marker");
+        for (prefix, name) in [(&intended, "intended"), (&sibling, "sibling")] {
+            std::fs::create_dir_all(prefix.join("bin")).expect("bin");
+            let brew = prefix.join("bin/brew");
+            std::fs::write(
+                &brew,
+                format!(
+                    "#!/bin/sh\nprintf '%s %s\\n' {name} \"$1\" >> '{marker}'\n\
+                     case \"$1\" in\n\
+                     info) printf '%s' '{{\"formulae\":[{{\"name\":\"wsmp\",\"versions\":{{\"stable\":\"0.4.3\"}}}}]}}' ;;\n\
+                     --prefix) printf '%s\\n' '{root}' ;;\n\
+                     esac\n",
+                    marker = marker.display(),
+                    root = root.path().display(),
+                ),
+            )
+            .expect("brew");
+            std::fs::set_permissions(&brew, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        let keg = Keg {
+            prefix: intended.clone(),
+            dir: intended.join("Cellar/wsmp/0.4.3"),
+        };
+        std::fs::create_dir_all(&keg.dir).expect("keg");
+        std::fs::write(
+            keg.dir.join("INSTALL_RECEIPT.json"),
+            br#"{"source":{"tap":"flycockpit/tap"}}"#,
+        )
+        .expect("receipt");
+        assert_eq!(refusal(&keg).expect("refusal"), None);
+        refresh(&keg).expect("refresh");
+        assert_eq!(tap_version(&keg).expect("info"), "0.4.3");
+        assert_eq!(prefix(&keg).expect("prefix"), root.path());
+        let lock = TapLock::acquire(root.path(), Duration::from_secs(5), &|| true)
+            .expect("lock")
+            .expect("held");
+        upgrade(&keg, lock).expect("upgrade");
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("marker"),
+            "intended list\nintended update\nintended info\nintended --prefix\nintended upgrade\n"
+        );
+    }
 
     #[test]
     fn finds_the_keg_and_its_stable_link() {
@@ -581,6 +658,89 @@ mod tests {
             why.contains("does not have wsmp 0.4.3 yet") && !why.contains("anyway"),
             "{why}"
         );
+    }
+
+    /// F-FB-2: the prefix is `brew --prefix`'s line exactly, only its
+    /// terminator taken off; anything else is refused.
+    #[test]
+    fn the_prefix_is_brews_line_exactly() {
+        let ok = |out: &[u8]| prefix_from_output(out).expect("prefix");
+        assert_eq!(ok(b"/opt/homebrew\n"), PathBuf::from("/opt/homebrew"));
+        assert_eq!(ok(b"/opt/homebrew\r\n"), PathBuf::from("/opt/homebrew"));
+        assert_eq!(ok(b"/opt/home brew \n"), PathBuf::from("/opt/home brew "));
+        assert_eq!(ok(b"/x\t\n"), PathBuf::from("/x\t"));
+        for bad in [
+            &b""[..],
+            b"\n",
+            b"\r\n",
+            b"/opt/homebrew",
+            b"/opt/homebrew\n\n",
+            b"/opt/homebrew\n/other\n",
+            b"/opt/home\rbrew\n",
+            b"/opt/\xffbrew\n",
+            b"opt/homebrew\n",
+            b" /x\n",
+        ] {
+            assert!(prefix_from_output(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// F-FB-2 (FB-P1): through the real `brew --prefix` run, a prefix whose
+    /// name ends in a space is that directory, and Homebrew's update lock is
+    /// taken in it, not in the directory without the space.
+    #[cfg(unix)]
+    #[test]
+    fn a_prefix_ending_in_a_space_keeps_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("dir");
+        let prefix = dir.path().join("prefix ");
+        std::fs::create_dir_all(prefix.join("bin")).expect("bin");
+        let script = prefix.join("bin/brew");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+                prefix.to_str().expect("utf-8")
+            ),
+        )
+        .expect("brew");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let keg = Keg {
+            prefix: prefix.clone(),
+            dir: prefix.clone(),
+        };
+        let got = super::prefix(&keg).expect("prefix");
+        assert_eq!(got, prefix);
+        assert_eq!(
+            TapLock::path(&got),
+            prefix.join("var/homebrew/locks/update")
+        );
+        assert_ne!(
+            TapLock::path(&got),
+            dir.path().join("prefix/var/homebrew/locks/update")
+        );
+    }
+
+    /// F-FB-1: the node orders every pair of the shared vectors exactly as
+    /// the server's `compareReleaseVersions` does (it checks the same file).
+    #[test]
+    fn release_versions_compare_as_the_servers_vectors_say() {
+        #[derive(serde::Deserialize)]
+        struct Shared {
+            comparisons: Vec<(String, String, i8)>,
+        }
+        let shared: Shared = serde_json::from_str(include_str!(
+            "../../../../packages/api/src/lib/agent-release-version-vectors.json"
+        ))
+        .expect("shared release version vectors");
+        assert!(shared.comparisons.len() > 1000);
+        for (a, b, order) in shared.comparisons {
+            assert_eq!(
+                compare_release(&a, &b).map(|o| o as i8),
+                Some(order),
+                "{a:?} vs {b:?}"
+            );
+        }
     }
 
     #[test]

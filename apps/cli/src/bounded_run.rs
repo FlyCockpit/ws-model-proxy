@@ -35,8 +35,10 @@
 //! or a cancel) for the direct child to exit without reaping it where the
 //! platform allows, `SIGKILL` its whole process group and the direct child
 //! itself (a child that left its group is still ours to kill), then reap it
-//! for at most [`REAP_GRACE`]. A launch guard ([`crate::launch_guard`]) leads a
-//! session instead of a group, and is sent SIGTERM instead of being killed: it
+//! for at most [`REAP_GRACE`]. That is the whole reach on Unix: a helper that
+//! detached into a session or group of its own is not killed and can outlive
+//! the deadline (the call still returns as below). A launch guard
+//! ([`crate::launch_guard`]) leads a session instead of a group, and is sent SIGTERM instead of being killed: it
 //! ends its session itself, holding its launcher lock until it has (a guard
 //! still ending goes to the reaper). Only a guard someone else killed has its
 //! session killed here. A child that survives even that (blocked in
@@ -77,6 +79,7 @@ use crate::job_tree::{Child, JobTree};
 #[cfg(unix)]
 use crate::process_list::Process;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 /// Registered with the subreaper, so its scan never reaps the run's child.
 #[cfg(not(windows))]
 type Child = crate::subreaper::Owned<std::process::Child>;
@@ -381,12 +384,13 @@ fn kill_all_in(shared: &'static Mutex<Registry>) {
     }
 }
 
-/// A program's arguments: a list std quotes for the platform, or (Windows) the command line
-/// after the program passed as is, for `cmd.exe`, which does not read its command line the way
-/// std quotes it.
+/// A program's arguments: a list std quotes for the platform (each exactly as the OS string it
+/// is: Unix bytes, Windows wide characters, never converted to text on the way), or (Windows)
+/// the command line after the program passed as is, for `cmd.exe`, which does not read its
+/// command line the way std quotes it.
 #[derive(Clone, Copy)]
 enum Args<'a> {
-    List(&'a [String]),
+    List(&'a [&'a OsStr]),
     #[cfg(windows)]
     Raw(&'a str),
 }
@@ -412,6 +416,8 @@ struct Ran {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     success: bool,
+    /// The exit code; `None` when a signal ended it.
+    code: Option<i32>,
 }
 
 /// What a [`run_managed`] program left: its exit status (a nonzero one is a
@@ -419,12 +425,16 @@ struct Ran {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Managed {
     pub success: bool,
+    /// The exit code; `None` when a signal ended it.
+    pub code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
 
 /// Run a management command with the limits above: its own process group
-/// (a Windows job), everything it started killed at `timeout`, a bounded
+/// (a Windows job), killed at `timeout` (on Unix the group and the direct
+/// child: a helper that detached into a session or group of its own is not
+/// reached; on Windows the whole job tree), a bounded
 /// reap, the shared budget and the daemon's shutdown. Unlike [`run`] it
 /// inherits the parent's environment (plus `env`) and reads stderr too.
 /// stdout and stderr are drained at the same time, so a program that fills
@@ -433,16 +443,16 @@ pub struct Managed {
 /// that still holds a pipe after the program exited cannot hold the call
 /// past `timeout`: the run is then a `Timeout` and the group is killed.
 pub fn run_managed(
-    program: &str,
-    args: &[String],
+    program: impl AsRef<OsStr>,
+    args: &[impl AsRef<OsStr>],
     env: &[(&str, String)],
     timeout: Duration,
     limit: usize,
 ) -> Result<Managed, RunError> {
     let deadline = Instant::now() + timeout;
     run_inner(
-        program,
-        Args::List(args),
+        program.as_ref(),
+        Args::List(&os_args(args)),
         deadline,
         limit,
         None,
@@ -451,6 +461,7 @@ pub fn run_managed(
     )
     .map(|ran| Managed {
         success: ran.success,
+        code: ran.code,
         stdout: ran.stdout,
         stderr: ran.stderr,
     })
@@ -461,16 +472,16 @@ pub fn run_managed(
 /// `cancel`, when set, ends the run at the next poll (a few milliseconds),
 /// including while it waits for the program to exit after stdout closed.
 pub fn run(
-    program: &str,
-    args: &[String],
+    program: impl AsRef<OsStr>,
+    args: &[impl AsRef<OsStr>],
     timeout: Duration,
     limit: usize,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, RunError> {
     let deadline = Instant::now() + timeout;
     run_inner(
-        program,
-        Args::List(args),
+        program.as_ref(),
+        Args::List(&os_args(args)),
         deadline,
         limit,
         cancel,
@@ -486,15 +497,15 @@ pub fn run(
 /// Total budget variant: settlement shares the caller's absolute deadline.
 /// Pending reaping retains its permit and can never return a success verdict.
 pub fn run_until(
-    program: &str,
-    args: &[String],
+    program: impl AsRef<OsStr>,
+    args: &[impl AsRef<OsStr>],
     deadline: Instant,
     limit: usize,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, RunError> {
     run_inner(
-        program,
-        Args::List(args),
+        program.as_ref(),
+        Args::List(&os_args(args)),
         deadline,
         limit,
         cancel,
@@ -510,16 +521,16 @@ pub fn run_until(
 /// [`run_until`] with extra environment on top of the scrubbed parent
 /// environment (runtime commands: node secrets). Never log `env`.
 pub fn run_until_env(
-    program: &str,
-    args: &[String],
+    program: impl AsRef<OsStr>,
+    args: &[impl AsRef<OsStr>],
     deadline: Instant,
     limit: usize,
     cancel: Option<&AtomicBool>,
     env: &[(String, String)],
 ) -> Result<Vec<u8>, RunError> {
     run_inner(
-        program,
-        Args::List(args),
+        program.as_ref(),
+        Args::List(&os_args(args)),
         deadline,
         limit,
         cancel,
@@ -537,15 +548,15 @@ pub fn run_until_env(
 /// 1): stdout is returned whatever the exit status, never `ExitStatus`. Every
 /// other failure (spawn, timeout, size, cancel) is still an error.
 pub fn run_until_any_status(
-    program: &str,
-    args: &[String],
+    program: impl AsRef<OsStr>,
+    args: &[impl AsRef<OsStr>],
     deadline: Instant,
     limit: usize,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, RunError> {
     run_inner(
-        program,
-        Args::List(args),
+        program.as_ref(),
+        Args::List(&os_args(args)),
         deadline,
         limit,
         cancel,
@@ -562,7 +573,7 @@ pub fn run_until_any_status(
 /// "…"` runs the text between the outer quotes exactly as written.
 #[cfg(windows)]
 pub fn run_raw_until_env(
-    program: &str,
+    program: impl AsRef<OsStr>,
     raw: &str,
     deadline: Instant,
     limit: usize,
@@ -570,7 +581,7 @@ pub fn run_raw_until_env(
     env: &[(String, String)],
 ) -> Result<Vec<u8>, RunError> {
     run_inner(
-        program,
+        program.as_ref(),
         Args::Raw(raw),
         deadline,
         limit,
@@ -584,8 +595,13 @@ pub fn run_raw_until_env(
     .map(|ran| ran.stdout)
 }
 
+/// `args` as the OS strings they are, for [`Args::List`].
+fn os_args(args: &[impl AsRef<OsStr>]) -> Vec<&OsStr> {
+    args.iter().map(AsRef::as_ref).collect()
+}
+
 fn run_inner(
-    program: &str,
+    program: &OsStr,
     args: Args<'_>,
     deadline: Instant,
     limit: usize,
@@ -651,11 +667,12 @@ fn run_inner(
     #[cfg(unix)]
     let session = args
         .first()
-        .is_some_and(|arg| arg == crate::launch_guard::SUBCOMMAND);
+        .is_some_and(|arg| *arg == OsStr::new(crate::launch_guard::SUBCOMMAND));
     #[cfg(unix)]
     if !session {
         use std::os::unix::process::CommandExt;
-        // Its own group, so the deadline kills everything it started.
+        // Its own group, so the deadline kills the child and every helper still
+        // in that group (not one that made a session or group of its own).
         command.process_group(0);
     }
     if cancelled() || Instant::now() >= deadline {
@@ -756,6 +773,7 @@ fn run_inner(
             stdout,
             stderr,
             success: status.success(),
+            code: status.code(),
         }),
         Some(status) => Err(RunError::ExitStatus(status.code())),
         // Exited but never reaped in the grace: no verdict on its status.
@@ -1195,8 +1213,9 @@ fn kill_group(pid: u32) {
     );
 }
 
-/// Everything a registered run started: its group AND the direct child by pid
-/// (it may have left the group). On Linux a registered run is still an
+/// What a registered run is killed as: its group AND the direct child by pid
+/// (it may have left the group). A helper that left the group (`setsid`,
+/// its own `setpgid`) is not reached. On Linux a registered run is still an
 /// unreaped zombie or live process (`waitid(WNOWAIT)` in `finish`), so its
 /// pid cannot have been recycled. Other Unix targets reap first, so this
 /// widens the accepted G1-2 window (a recycled pid, in the microseconds
@@ -1228,9 +1247,10 @@ fn kill_group(job: &JobTree) {
     let _ = job.terminate();
 }
 
-/// Kill everything the run started: the group, then the direct child itself
-/// (it may have left the group; while unreaped its pid cannot be recycled,
-/// and `Child::kill` is a no-op once std has reaped it).
+/// Kill the run: its group, then the direct child itself (it may have left
+/// the group; while unreaped its pid cannot be recycled, and `Child::kill` is
+/// a no-op once std has reaped it). A detached helper (its own session or
+/// group) is not reached.
 #[cfg(unix)]
 fn kill_group_or_child(child: &mut Child) {
     kill_group(child.id());
