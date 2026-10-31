@@ -19,6 +19,12 @@ type FakeTerminal = {
   keyHandler: ((event: KeyboardEvent) => boolean) | null;
   gate: CopyOutGate | null;
   binary: ((data: string) => void) | null;
+  modes: { mouseTrackingMode: string };
+  /** Lines scrolled in the scrollback (the normal buffer's wheel). */
+  scrolled: number[];
+  /** The alternate screen (no scrollback): the wheel sends arrow keys outside a mouse app. */
+  alternate: boolean;
+  element: HTMLElement | null;
 };
 
 const xterm = vi.hoisted(() => ({ instances: [] as FakeTerminal[] }));
@@ -46,6 +52,28 @@ vi.mock("@xterm/xterm", () => ({
     open(container: HTMLElement) {
       this.element = document.createElement("div");
       container.appendChild(this.element);
+      // xterm's wheel listeners on its element: the custom wheel handler first, then in a mouse
+      // app one SGR wheel report per event, on the alternate screen one arrow key (both
+      // cancelled); otherwise left to the scrollback.
+      this.element.addEventListener("wheel", (event) => {
+        if (this.wheelHandler?.(event) === false) return;
+        if (this.modes.mouseTrackingMode !== "none") {
+          event.preventDefault();
+          this.emit?.(event.deltaY < 0 ? "\x1b[<64;1;1M" : "\x1b[<65;1;1M");
+        } else if (this.alternate) {
+          event.preventDefault();
+          this.emit?.(event.deltaY < 0 ? "\x1b[A" : "\x1b[B");
+        }
+      });
+    }
+    alternate = false;
+    wheelHandler: ((event: WheelEvent) => boolean) | null = null;
+    attachCustomWheelEventHandler(handler: (event: WheelEvent) => boolean) {
+      this.wheelHandler = handler;
+    }
+    scrolled: number[] = [];
+    scrollLines(amount: number) {
+      this.scrolled.push(amount);
     }
     onResize() {
       return { dispose() {} };
@@ -158,14 +186,16 @@ function outputSource() {
   let listener: ((event: TerminalOutputEvent) => void) | null = null;
   const queued: TerminalOutputEvent[] = [];
   let retire: (() => void) | undefined;
+  let reset: (() => void) | undefined;
   const subscribeOutput = vi.fn(
     (
       _localId: string,
       next: (event: TerminalOutputEvent) => void,
-      _reset?: () => void,
+      onReset?: () => void,
       onRetire?: () => void,
     ) => {
       listener = next;
+      reset = onReset;
       retire = onRetire;
       for (const event of queued.splice(0)) next(event);
       return () => {
@@ -179,7 +209,9 @@ function outputSource() {
   };
   /** The session hook ending this tab's session (detach, disconnect). */
   const retireSession = () => retire?.();
-  return { subscribeOutput, emit, retireSession };
+  /** The session hook starting a new attach of this tab (before its replay). */
+  const resetSession = () => reset?.();
+  return { subscribeOutput, emit, retireSession, resetSession };
 }
 
 const data = (text: string, replay = false, attach = 1): TerminalOutputEvent => ({
@@ -1150,6 +1182,344 @@ describe("useTerminalPane", () => {
     act(() => term.parse());
     container.dispatchEvent(new Event("pointerdown"));
     expect(gate.allowed(true)).toBe(false);
+  });
+});
+
+/** Where the one finger these tests use was last (a touchend lifts it there). */
+let lastFinger: { identifier: number; clientX: number; clientY: number } | null = null;
+
+/**
+ * A one-finger touch event with these fingers down (jsdom has no Touch constructor). Its
+ * changedTouches are the finger it puts down, moves or lifts (where it was last).
+ */
+function touch(type: string, points: { x: number; y: number }[]) {
+  const event = new Event(type, { cancelable: true, bubbles: true });
+  const touches = points.map((point) => ({ identifier: 0, clientX: point.x, clientY: point.y }));
+  Object.defineProperty(event, "touches", { value: touches });
+  Object.defineProperty(event, "changedTouches", {
+    value: touches.length > 0 ? touches : lastFinger ? [lastFinger] : [],
+  });
+  lastFinger = touches[0] ?? null;
+  return event;
+}
+
+/**
+ * One finger on the pane from y0 to y1, with the pointer events a browser sends around it
+ * (pointer events come first). A tap is the same with no movement.
+ */
+function swipe(container: HTMLElement, y0: number, y1: number) {
+  container.dispatchEvent(new PointerEvent("pointerdown", { pointerType: "touch", bubbles: true }));
+  container.dispatchEvent(touch("touchstart", [{ x: 100, y: y0 }]));
+  for (let step = 1; step <= 10; step += 1)
+    container.dispatchEvent(touch("touchmove", [{ x: 100, y: y0 + ((y1 - y0) * step) / 10 }]));
+  container.dispatchEvent(new PointerEvent("pointerup", { pointerType: "touch", bubbles: true }));
+  const end = touch("touchend", []);
+  container.dispatchEvent(end);
+  return end;
+}
+
+/** The fake xterm draws no screen: a row is 16 px (the fallback height). */
+const ROW = 16;
+const WHEEL_DOWN = "\x1b[<65;1;1M";
+
+describe("useTerminalPane touch scrolling", () => {
+  function pane(options: { follow?: { cols: number; rows: number } | null; selecting?: boolean }) {
+    const sendInput = vi.fn();
+    const container = document.createElement("div");
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: options.follow ?? null,
+        selecting: options.selecting ?? false,
+        sendInput,
+        sendResize: () => undefined,
+        subscribeOutput: outputSource().subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(container));
+    const term = xterm.instances[0];
+    const gate = term?.gate;
+    if (!term || !gate) throw new Error("no terminal");
+    act(() => term.parse());
+    return { term, gate, container, sendInput };
+  }
+
+  it("scrolls a mouse app with wheel reports, which open no copy window", () => {
+    const { term, gate, container, sendInput } = pane({});
+    term.modes.mouseTrackingMode = "vt200";
+    const end = swipe(container, 300, 300 - 5 * ROW);
+    // Round 9 (owner): a touch scroll is the person's own input, as a key is (it may take over).
+    expect(sendInput.mock.calls).toEqual(
+      Array.from({ length: 5 }, () => ["local_1", WHEEL_DOWN, "user"]),
+    );
+    // A swipe is not a press: no copy window, and no click after it.
+    expect(gate.allowed(true)).toBe(false);
+    expect(end.defaultPrevented).toBe(true);
+  });
+
+  it("scrolls the scrollback outside a mouse app, sending nothing", () => {
+    const { term, container, sendInput } = pane({});
+    swipe(container, 100, 100 + 3 * ROW);
+    expect(term.scrolled).toEqual([-1, -1, -1]);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it("opens the copy window for a tap, when the finger lifts", () => {
+    const { gate, container } = pane({});
+    container.dispatchEvent(
+      new PointerEvent("pointerdown", { pointerType: "touch", bubbles: true }),
+    );
+    expect(gate.allowed(true)).toBe(false);
+    const end = swipe(container, 200, 200);
+    expect(gate.allowed(true)).toBe(true);
+    expect(end.defaultPrevented).toBe(false);
+  });
+
+  it("still opens the copy window on a mouse press", () => {
+    const { gate, container } = pane({});
+    container.dispatchEvent(
+      new PointerEvent("pointerdown", { pointerType: "mouse", bubbles: true }),
+    );
+    expect(gate.allowed(true)).toBe(true);
+  });
+
+  it("leaves a follower's swipe to the box: no wheel, no writer claim, no copy window", () => {
+    const { term, gate, container, sendInput } = pane({ follow: { cols: 100, rows: 30 } });
+    term.modes.mouseTrackingMode = "vt200";
+    const end = swipe(container, 300, 100);
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(term.scrolled).toEqual([]);
+    expect(end.defaultPrevented).toBe(false);
+    expect(gate.allowed(true)).toBe(false);
+    // The swipe armed nothing: a report xterm sends now is still not this follower's input.
+    act(() => term.emit?.(WHEEL_DOWN));
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it("does not scroll during Select text", () => {
+    const { term, container, sendInput } = pane({ selecting: true });
+    term.modes.mouseTrackingMode = "vt200";
+    swipe(container, 300, 100);
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(term.scrolled).toEqual([]);
+  });
+
+  it("sends the alternate screen's arrow keys as the person's input", () => {
+    const { term, container, sendInput } = pane({});
+    term.alternate = true;
+    swipe(container, 100, 100 + 2 * ROW);
+    expect(sendInput.mock.calls).toEqual([
+      ["local_1", "\x1b[A", "user"],
+      ["local_1", "\x1b[A", "user"],
+    ]);
+  });
+
+  it("sends the desktop wheel's input as wheel input, and keys after it as keys", async () => {
+    const { term, container, sendInput } = pane({});
+    term.modes.mouseTrackingMode = "vt200";
+    const inner = term.element?.appendChild(document.createElement("div"));
+    inner?.dispatchEvent(new WheelEvent("wheel", { deltaY: 1, bubbles: true, cancelable: true }));
+    expect(sendInput.mock.calls).toEqual([["local_1", WHEEL_DOWN, "wheel"]]);
+    // A key right after it, in the same task, is a key.
+    container.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    act(() => term.emit?.("a"));
+    // And so is data after the wheel's dispatch is over.
+    await Promise.resolve();
+    act(() => term.emit?.("b"));
+    expect(sendInput.mock.calls.slice(1)).toEqual([
+      ["local_1", "a", "user"],
+      ["local_1", "b", "user"],
+    ]);
+  });
+
+  it("never lets a follower's wheel through, even right after a key", () => {
+    const { term, container, sendInput } = pane({ follow: { cols: 100, rows: 30 } });
+    term.modes.mouseTrackingMode = "vt200";
+    container.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    term.element?.dispatchEvent(new WheelEvent("wheel", { deltaY: 1, cancelable: true }));
+    expect(sendInput).not.toHaveBeenCalled();
+    // The key itself still goes out (and takes over).
+    act(() => term.emit?.("a"));
+    expect(sendInput.mock.calls).toEqual([["local_1", "a", "user"]]);
+  });
+});
+
+/**
+ * A flick's momentum, run on a controlled animation-frame queue: a gesture belongs to one
+ * interaction, and whatever ends it (hidden, Select text, following, a reset, a retire, a new
+ * attach) stops its queued frames for good.
+ */
+describe("useTerminalPane touch scrolling lifecycle", () => {
+  let time = 0;
+  let pending = new Map<number, FrameRequestCallback>();
+  let handle = 0;
+  const original = {
+    request: globalThis.requestAnimationFrame,
+    cancel: globalThis.cancelAnimationFrame,
+  };
+  afterEach(() => {
+    vi.restoreAllMocks();
+    globalThis.requestAnimationFrame = original.request;
+    globalThis.cancelAnimationFrame = original.cancel;
+  });
+
+  type Props = {
+    active: boolean;
+    selecting: boolean;
+    follow: { cols: number; rows: number } | null;
+  };
+
+  function livePane() {
+    time = 0;
+    pending = new Map();
+    handle = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => time);
+    globalThis.requestAnimationFrame = (callback: FrameRequestCallback) => {
+      handle += 1;
+      pending.set(handle, callback);
+      return handle;
+    };
+    globalThis.cancelAnimationFrame = (id: number) => {
+      pending.delete(id);
+    };
+    const source = outputSource();
+    const sent: string[] = [];
+    const container = document.createElement("div");
+    const view = renderHook(
+      (props: Props) =>
+        useTerminalPane({
+          localId: "local_1",
+          ...props,
+          sendInput: (_localId, input) => sent.push(String(input)),
+          sendResize: () => undefined,
+          subscribeOutput: source.subscribeOutput,
+        }),
+      { initialProps: { active: true, selecting: false, follow: null } as Props },
+    );
+    act(() => view.result.current.containerRef(container));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    act(() => term.parse());
+    term.modes.mouseTrackingMode = "vt200";
+    /** A flick up: reports during the drag, then momentum queued. */
+    const flick = () => {
+      container.dispatchEvent(touch("touchstart", [{ x: 100, y: 400 }]));
+      for (let step = 1; step <= 5; step += 1) {
+        time += 8;
+        container.dispatchEvent(touch("touchmove", [{ x: 100, y: 400 - step * 20 }]));
+      }
+      container.dispatchEvent(touch("touchend", []));
+    };
+    /** Run every queued frame (as many as get queued), 16 ms apart. */
+    const runFrames = () => {
+      for (let count = 0; pending.size > 0 && count < 1000; count += 1) {
+        const [id, callback] = [...pending.entries()][0] ?? [];
+        if (id === undefined || !callback) break;
+        pending.delete(id);
+        time += 16;
+        act(() => callback(time));
+      }
+    };
+    /** Run the frames queued now even if they were cancelled (a browser may already have them). */
+    const runQueued = (callbacks: FrameRequestCallback[]) => {
+      for (const callback of callbacks) {
+        time += 16;
+        act(() => callback(time));
+      }
+    };
+    return { ...view, source, sent, container, term, flick, runFrames, runQueued };
+  }
+
+  const queued = () => [...pending.values()];
+
+  it("keeps coasting when nothing ends the interaction (the inverse)", () => {
+    const { sent, flick, runFrames } = livePane();
+    flick();
+    const afterDrag = sent.length;
+    expect(pending.size).toBe(1);
+    runFrames();
+    expect(sent.length).toBeGreaterThan(afterDrag + 3);
+  });
+
+  it("stops coasting for good when the tab is hidden, even if it is shown before the next frame", () => {
+    const { sent, flick, rerender, runFrames, runQueued } = livePane();
+    flick();
+    const afterDrag = sent.length;
+    const frames = queued();
+    rerender({ active: false, selecting: false, follow: null });
+    rerender({ active: true, selecting: false, follow: null });
+    runQueued(frames);
+    runFrames();
+    expect(sent.length).toBe(afterDrag);
+    // A new flick after it scrolls and coasts again.
+    flick();
+    const second = sent.length;
+    expect(second).toBeGreaterThan(afterDrag);
+    runFrames();
+    expect(sent.length).toBeGreaterThan(second + 3);
+  });
+
+  it("stops coasting for good on Select text and on following, even when they end at once", () => {
+    const { sent, flick, rerender, runQueued } = livePane();
+    flick();
+    let before = sent.length;
+    let frames = queued();
+    rerender({ active: true, selecting: true, follow: null });
+    rerender({ active: true, selecting: false, follow: null });
+    runQueued(frames);
+    expect(sent.length).toBe(before);
+
+    flick();
+    before = sent.length;
+    frames = queued();
+    rerender({ active: true, selecting: false, follow: { cols: 100, rows: 30 } });
+    rerender({ active: true, selecting: false, follow: null });
+    runQueued(frames);
+    expect(sent.length).toBe(before);
+  });
+
+  it("stops coasting when the session is retired, reset, or a new attach starts", () => {
+    const { sent, flick, source, runQueued } = livePane();
+    flick();
+    let before = sent.length;
+    let frames = queued();
+    act(() => source.retireSession());
+    // Output of a newer attach arrives before the old frame runs.
+    act(() => source.emit(data("next", false, 2)));
+    runQueued(frames);
+    expect(sent.length).toBe(before);
+
+    flick();
+    before = sent.length;
+    frames = queued();
+    act(() => source.resetSession());
+    runQueued(frames);
+    expect(sent.length).toBe(before);
+
+    flick();
+    before = sent.length;
+    frames = queued();
+    act(() => source.emit(data("third", false, 3)));
+    runQueued(frames);
+    expect(sent.length).toBe(before);
+  });
+
+  it("ends a drag in progress on a retire: it scrolls no more, and its release is no click", () => {
+    const { sent, container, source } = livePane();
+    container.dispatchEvent(touch("touchstart", [{ x: 100, y: 400 }]));
+    time += 8;
+    container.dispatchEvent(touch("touchmove", [{ x: 100, y: 400 - 3 * ROW }]));
+    const before = sent.length;
+    expect(before).toBe(3);
+    act(() => source.retireSession());
+    time += 8;
+    container.dispatchEvent(touch("touchmove", [{ x: 100, y: 400 - 8 * ROW }]));
+    const end = touch("touchend", []);
+    container.dispatchEvent(end);
+    expect(sent.length).toBe(before);
+    expect(pending.size).toBe(0);
+    expect(end.defaultPrevented).toBe(true);
   });
 });
 

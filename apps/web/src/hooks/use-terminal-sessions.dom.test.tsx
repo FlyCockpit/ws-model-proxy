@@ -7,6 +7,7 @@ import {
   TERMINAL_BROWSER_BINARY_WINDOW_MS,
   TERMINAL_BROWSER_JSON_WINDOW_MS,
 } from "@ws-model-proxy/config/terminal-socket-policy";
+import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -30,6 +31,7 @@ import {
   type TerminalSessionKeys,
 } from "@/hooks/use-terminal-crypto";
 import type { TerminalSendResult, TerminalSocketHandlers } from "@/hooks/use-terminal-socket";
+import { useXterm } from "@/hooks/use-xterm";
 import { createMemoryCliPinStore } from "@/lib/terminal-cli-identity";
 import {
   decodeSealedFrame,
@@ -66,9 +68,34 @@ vi.mock("@/hooks/use-terminal-socket", async (importOriginal) => ({
   },
 }));
 
+/**
+ * A barrier on the browser's sealing: the next browser-to-CLI frame whose plaintext contains
+ * `text` waits in sealing until `release` resolves (`entered` runs once it is waiting).
+ */
+const sealing = vi.hoisted(() => ({
+  hold: null as null | { text: string; entered: () => void; release: Promise<void> },
+}));
+
 vi.mock("@/hooks/use-terminal-crypto", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/hooks/use-terminal-crypto")>();
-  return { ...actual, useTerminalIdentity: () => identity };
+  return {
+    ...actual,
+    useTerminalIdentity: () => identity,
+    sealTerminalBytesV2: async (...args: Parameters<typeof actual.sealTerminalBytesV2>) => {
+      const hold = sealing.hold;
+      const [input] = args;
+      if (
+        hold &&
+        input.direction === actual.DIRECTION_BROWSER_TO_CLI &&
+        new TextDecoder().decode(input.plaintext).includes(hold.text)
+      ) {
+        sealing.hold = null;
+        hold.entered();
+        await hold.release;
+      }
+      return actual.sealTerminalBytesV2(...args);
+    },
+  };
 });
 
 const TERMINAL_ID = "dGVybWluYWwtaWQtMDAwMQ";
@@ -86,6 +113,7 @@ beforeAll(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  sealing.hold = null;
   cleanup();
   currentCli = null;
   socket.handlers = null;
@@ -676,6 +704,84 @@ describe("useTerminalSessions (multi-viewer)", () => {
     expect(socket.sendFrame).toHaveBeenCalledTimes(1);
     const frames = await browserFrames(cli);
     expect(frames.filter((frame) => "data" in frame).map((frame) => frame.data)).toEqual(["x"]);
+  });
+
+  it("never takes the writer for wheel input queued before another viewer took over", async () => {
+    const { view, cli, localId } = await setupV2();
+    useFakeClock();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await advanceClock(200);
+    socket.sendFrame.mockClear();
+    // The writer scrolls: its wheel report goes out.
+    act(() => view.result.current.sendInput(localId, "\x1b[<65;1;1M", "wheel"));
+    await settle();
+    expect(socket.sendFrame).toHaveBeenCalledTimes(1);
+    // The next one waits in the batching window, and another viewer takes over meanwhile.
+    act(() => view.result.current.sendInput(localId, "\x1b[<65;1;1M", "wheel"));
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    await advanceClock(200);
+    expect(socket.sendFrame).toHaveBeenCalledTimes(1);
+    expect(view.result.current.tabs[0]?.writer).toBe("other");
+    const frames = await browserFrames(cli);
+    expect(frames.filter((frame) => "data" in frame).map((frame) => frame.data)).toEqual([
+      "\x1b[<65;1;1M",
+    ]);
+  });
+
+  it("does not send sealed wheel input once the writer changed, nor later", async () => {
+    const { view, cli, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await settle();
+    act(() => {
+      view.result.current.sendInput(localId, "\x1b[B", "wheel");
+      handlers().onMessage({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    });
+    await settle();
+    // Refused after sealing, it is not held for another try (which could take over).
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await settle();
+    expect((await browserFrames(cli)).filter((frame) => "data" in frame)).toEqual([]);
+    expect(view.result.current.tabs[0]?.writer).toBe("other");
+  });
+
+  it("does not keep wheel input through Select text: a scroll is for the moment it was made", async () => {
+    const { view, cli, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 120, 40));
+    act(() => {
+      view.result.current.sendInput(localId, "\x1b[<65;1;1M", "wheel");
+      view.result.current.sendInput(localId, "k");
+      view.result.current.setSelecting(localId);
+    });
+    await settle();
+    act(() => view.result.current.setSelecting(null));
+    await settle();
+    // The key waited and went out; the scroll did not.
+    const frames = await browserFrames(cli);
+    expect(frames.filter((frame) => "data" in frame).map((frame) => frame.data)).toEqual(["k"]);
+  });
+
+  it("drops a follower's wheel input, and takes over only for its keys", async () => {
+    const { view, cli, localId } = await setupV2();
+    useFakeClock();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    act(() => view.result.current.sendInput(localId, "\x1b[<64;1;1M", "wheel"));
+    await advanceClock(200);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    expect(view.result.current.tabs[0]?.writer).toBe("other");
+    // A scroll and then a key in one batch: the key takes over, the scroll is not sent.
+    act(() => {
+      view.result.current.sendInput(localId, "\x1b[A", "wheel");
+      view.result.current.sendInput(localId, "q");
+    });
+    await vi.waitFor(() => expect(view.result.current.tabs[0]?.writer).toBe("you"));
+    expect(await browserFrames(cli)).toEqual([
+      { seq: 1, resize: [100, 30] },
+      { seq: 2, data: "q" },
+    ]);
   });
 
   it("never takes over from a hidden or unmeasured tab", async () => {
@@ -1917,10 +2023,24 @@ describe("useTerminalSessions terminal tickets", () => {
     useFakeClock();
     await unicast(cli, text("$ "));
     await settle();
-    // The quiet timer fires and the command is sealed; the relay detaches meanwhile.
+    // The quiet timer fires and the command is sealed; the relay detaches while it is.
+    let entered = () => {};
+    const sealStarted = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release = () => {};
+    sealing.hold = {
+      text: "nvidia-smi -L",
+      entered,
+      release: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    };
     await act(async () => {
       await vi.advanceTimersByTimeAsync(400);
+      await sealStarted;
       handlers().onMessage({ type: "detached", terminalId: TERMINAL_ID, reason: "slow" });
+      release();
     });
     await settle();
     expect((await browserFrames(cli)).filter((frame) => "data" in frame)).toEqual([]);
@@ -2138,4 +2258,540 @@ describe("useTerminalSessions frame budget", () => {
       .replaceAll("\x1b[0n", "");
     expect(typed).toBe("x".repeat(keys));
   }, 60_000);
+});
+
+// Round 6 (reviewer B's B-GATEWAY): the real useXterm on the real session gateway and sealing. A
+// mouse press is in progress when another viewer takes the writer; a touch elsewhere on the page
+// makes compatibility mouse events. xterm's document listener of that press must not see them, or
+// its release report would go out as `user` input and take the writer back. Round 7 (reviewer A's
+// A-GATEWAY-TOUCH, reviewer B's B6-GATEWAY touchpress): the same for a press xterm took from a tap's
+// own mousedown, whose release is still pending, or never reached the document.
+describe("a touch elsewhere and a terminal's mouse press in progress", () => {
+  it.each([
+    ["B-GATEWAY", "a mouse press"],
+    ["A-GATEWAY-TOUCH", "a tap's press, its release pending"],
+    ["B6-GATEWAY touchpress", "a tap's press, its release stopped before the document"],
+  ] as const)(
+    "%s (%s): the writer stays the other viewer and no data frame is sent",
+    async (_id, kind) => {
+      const globals = globalThis as unknown as Record<string, unknown>;
+      const saved = { ResizeObserver: globals.ResizeObserver, matchMedia: globals.matchMedia };
+      globals.ResizeObserver = class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      };
+      globals.matchMedia = () => ({
+        matches: false,
+        addListener() {},
+        removeListener() {},
+        addEventListener() {},
+        removeEventListener() {},
+      });
+      const context: Partial<CanvasRenderingContext2D> = {
+        measureText: () => ({ width: 8 }) as TextMetrics,
+        createLinearGradient: () => ({ addColorStop() {} }),
+        fillRect() {},
+        clearRect() {},
+        getImageData: () => ({ data: new Uint8ClampedArray([0, 0, 0, 255]) }) as ImageData,
+      };
+      const canvas = vi
+        .spyOn(HTMLCanvasElement.prototype, "getContext")
+        .mockImplementation(() => context as CanvasRenderingContext2D);
+      const fire = (target: EventTarget, type: string, byTouch: boolean) => {
+        const event = new MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          clientX: 40,
+          clientY: 40,
+          buttons: type === "mousedown" ? 1 : 0,
+          detail: type === "click" ? 1 : 0,
+        });
+        Object.defineProperty(event, "sourceCapabilities", {
+          value: { firesTouchEvents: byTouch },
+        });
+        target.dispatchEvent(event);
+      };
+      const touchAt = (target: EventTarget, type: string, fingers: number) => {
+        const event = new Event(type, { bubbles: true, cancelable: true });
+        const touches = Array.from({ length: fingers }, (_, identifier) => ({
+          identifier,
+          clientX: 40,
+          clientY: 40,
+        }));
+        Object.defineProperty(event, "touches", { value: touches });
+        // A lift's changed finger is the last one down (where they all are); others change them all.
+        const lifted = { identifier: fingers, clientX: 40, clientY: 40 };
+        Object.defineProperty(event, "changedTouches", {
+          value: type === "touchend" || type === "touchcancel" ? [lifted] : touches,
+        });
+        target.dispatchEvent(event);
+      };
+      let term: Terminal | null = null;
+      try {
+        const session = await setupV2();
+        message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "you" });
+        act(() => session.view.result.current.sendResize(session.localId, 100, 30));
+        await settle();
+        const open = Terminal.prototype.open;
+        const spy = vi.spyOn(Terminal.prototype, "open").mockImplementation(function (
+          this: Terminal,
+          parent: HTMLElement,
+        ) {
+          term = this;
+          open.call(this, parent);
+        });
+        const container = document.body.appendChild(document.createElement("div"));
+        const xterm = renderHook(() =>
+          useXterm({
+            active: true,
+            selecting: false,
+            follow: { cols: 80, rows: 24 },
+            shiftEnter: "off",
+            onResize() {},
+            onData: (data, origin) =>
+              session.view.result.current.sendInput(session.localId, data, origin),
+          }),
+        );
+        act(() => xterm.result.current.containerRef(container));
+        spy.mockRestore();
+        const opened: Terminal | null = term;
+        if (!opened) throw new Error("no xterm");
+        const terminal: Terminal = opened;
+        const element = terminal.element;
+        if (!element) throw new Error("xterm not open");
+        await new Promise<void>((resolve) => terminal.write("\x1b[?1002h\x1b[?1006h", resolve));
+        const core = (
+          terminal as unknown as {
+            _core: {
+              _charSizeService: { width: number; height: number };
+              _renderService: {
+                dimensions: {
+                  css: {
+                    cell: { width: number; height: number };
+                    canvas: { width: number; height: number };
+                  };
+                };
+              };
+            };
+          }
+        )._core;
+        Object.assign(core._charSizeService, { width: 8, height: 16 });
+        Object.assign(core._renderService.dimensions.css.cell, { width: 8, height: 16 });
+        Object.assign(core._renderService.dimensions.css.canvas, { width: 640, height: 384 });
+        if (kind === "a mouse press") {
+          // A mouse press in the terminal; its release is pending on the document.
+          element.dispatchEvent(
+            new PointerEvent("pointerdown", { pointerType: "mouse", bubbles: true }),
+          );
+          act(() => fire(element, "mousedown", false));
+        } else {
+          // The pane's own tap; xterm takes its compatibility mousedown as a press.
+          element.dispatchEvent(
+            new PointerEvent("pointerdown", { pointerType: "touch", bubbles: true }),
+          );
+          touchAt(element, "touchstart", 1);
+          element.dispatchEvent(
+            new PointerEvent("pointerup", { pointerType: "touch", bubbles: true }),
+          );
+          touchAt(element, "touchend", 0);
+          act(() => fire(element, "mousedown", true));
+          if (kind !== "a tap's press, its release pending") {
+            // Something on the page stops the tap's own mouseup before it reaches the document.
+            const stop = (event: Event) => event.stopPropagation();
+            element.addEventListener("mouseup", stop);
+            act(() => fire(element, "mouseup", true));
+            element.removeEventListener("mouseup", stop);
+          }
+        }
+        await settle();
+        message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+        act(() => xterm.result.current.attached());
+        socket.sendFrame.mockClear();
+        // A finger elsewhere on the page.
+        const outside = document.body.appendChild(document.createElement("div"));
+        outside.dispatchEvent(
+          new PointerEvent("pointerdown", { pointerType: "touch", bubbles: true }),
+        );
+        touchAt(outside, "touchstart", 1);
+        outside.dispatchEvent(
+          new PointerEvent("pointerup", { pointerType: "touch", bubbles: true }),
+        );
+        touchAt(outside, "touchend", 0);
+        act(() => {
+          for (const type of ["mousemove", "mousedown", "mouseup", "click"])
+            fire(outside, type, true);
+        });
+        await settle();
+        expect.soft(session.view.result.current.tabs[0]?.writer).toBe("other");
+        expect
+          .soft((await browserFrames(session.cli)).filter((frame) => "data" in frame))
+          .toEqual([]);
+        // The mouse's own release ends the press (xterm takes its listener off the document).
+        act(() => fire(document.body, "mouseup", false));
+        xterm.unmount();
+      } finally {
+        canvas.mockRestore();
+        globals.ResizeObserver = saved.ResizeObserver;
+        globals.matchMedia = saved.matchMedia;
+      }
+    },
+  );
+
+  // Round 8 (reviewer A's A7-RESIDUAL-B): the same with a press made while this viewer was the
+  // writer, the pane then following. With sourceCapabilities (Chromium) the outside tap's events
+  // are a touch's and are held back. Without them (Safari, Firefox) its plain mouseup cannot be told
+  // from the mouse's own release: the accepted, documented gap (the release note, the header of
+  // terminal-touch-mouse.ts). This RESIDUAL case asserts what happens there now, so that a change
+  // to it shows up: the release goes out as this viewer's input and takes the writer back.
+  it.each([
+    ["A7-RESIDUAL-B with sourceCapabilities", true],
+    ["RESIDUAL A7-RESIDUAL-B without sourceCapabilities", false],
+  ] as const)("%s: an outside tap during a mouse press made as the writer", async (_id, caps) => {
+    const globals = globalThis as unknown as Record<string, unknown>;
+    const saved = { ResizeObserver: globals.ResizeObserver, matchMedia: globals.matchMedia };
+    globals.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+    globals.matchMedia = () => ({
+      matches: false,
+      addListener() {},
+      removeListener() {},
+      addEventListener() {},
+      removeEventListener() {},
+    });
+    const context: Partial<CanvasRenderingContext2D> = {
+      measureText: () => ({ width: 8 }) as TextMetrics,
+      createLinearGradient: () => ({ addColorStop() {} }),
+      fillRect() {},
+      clearRect() {},
+      getImageData: () => ({ data: new Uint8ClampedArray([0, 0, 0, 255]) }) as ImageData,
+    };
+    const canvas = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(() => context as CanvasRenderingContext2D);
+    const fire = (target: EventTarget, type: string, byTouch: boolean) => {
+      const event = new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        clientX: 40,
+        clientY: 40,
+        buttons: type === "mousedown" ? 1 : 0,
+        detail: type === "click" ? 1 : 0,
+      });
+      if (caps)
+        Object.defineProperty(event, "sourceCapabilities", {
+          value: { firesTouchEvents: byTouch },
+        });
+      target.dispatchEvent(event);
+    };
+    const touchAt = (target: EventTarget, type: string, fingers: number) => {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      const touches = Array.from({ length: fingers }, (_, identifier) => ({
+        identifier,
+        clientX: 40,
+        clientY: 40,
+      }));
+      Object.defineProperty(event, "touches", { value: touches });
+      // A lift's changed finger is the last one down (where they all are); others change them all.
+      const lifted = { identifier: fingers, clientX: 40, clientY: 40 };
+      Object.defineProperty(event, "changedTouches", {
+        value: type === "touchend" || type === "touchcancel" ? [lifted] : touches,
+      });
+      target.dispatchEvent(event);
+    };
+    let term: Terminal | null = null;
+    try {
+      const session = await setupV2();
+      message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "you" });
+      act(() => session.view.result.current.sendResize(session.localId, 100, 30));
+      await settle();
+      const open = Terminal.prototype.open;
+      const spy = vi.spyOn(Terminal.prototype, "open").mockImplementation(function (
+        this: Terminal,
+        parent: HTMLElement,
+      ) {
+        term = this;
+        open.call(this, parent);
+      });
+      const container = document.body.appendChild(document.createElement("div"));
+      const xterm = renderHook(
+        (follow: { cols: number; rows: number } | null) =>
+          useXterm({
+            active: true,
+            selecting: false,
+            follow,
+            shiftEnter: "off",
+            onResize() {},
+            onData: (data, origin) =>
+              session.view.result.current.sendInput(session.localId, data, origin),
+          }),
+        { initialProps: null as { cols: number; rows: number } | null },
+      );
+      act(() => xterm.result.current.containerRef(container));
+      spy.mockRestore();
+      const opened: Terminal | null = term;
+      if (!opened) throw new Error("no xterm");
+      const terminal: Terminal = opened;
+      const element = terminal.element;
+      if (!element) throw new Error("xterm not open");
+      await new Promise<void>((resolve) => terminal.write("\x1b[?1002h\x1b[?1006h", resolve));
+      const core = (
+        terminal as unknown as {
+          _core: {
+            _charSizeService: { width: number; height: number };
+            _renderService: {
+              dimensions: {
+                css: {
+                  cell: { width: number; height: number };
+                  canvas: { width: number; height: number };
+                };
+              };
+            };
+          };
+        }
+      )._core;
+      Object.assign(core._charSizeService, { width: 8, height: 16 });
+      Object.assign(core._renderService.dimensions.css.cell, { width: 8, height: 16 });
+      Object.assign(core._renderService.dimensions.css.canvas, { width: 640, height: 384 });
+      // A mouse press in the terminal while this viewer is the writer; its release is pending.
+      element.dispatchEvent(
+        new PointerEvent("pointerdown", { pointerType: "mouse", bubbles: true }),
+      );
+      act(() => fire(element, "mousedown", false));
+      await settle();
+      // Another viewer takes the writer; the pane follows.
+      message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+      xterm.rerender({ cols: 80, rows: 24 });
+      socket.sendFrame.mockClear();
+      // A finger taps outside every pane, within the input window the press opened.
+      const outside = document.body.appendChild(document.createElement("div"));
+      outside.dispatchEvent(
+        new PointerEvent("pointerdown", { pointerType: "touch", bubbles: true }),
+      );
+      touchAt(outside, "touchstart", 1);
+      outside.dispatchEvent(new PointerEvent("pointerup", { pointerType: "touch", bubbles: true }));
+      touchAt(outside, "touchend", 0);
+      act(() => {
+        for (const type of ["mousemove", "mousedown", "mouseup", "click"])
+          fire(outside, type, true);
+      });
+      await settle();
+      const sent = (await browserFrames(session.cli)).filter((frame) => "data" in frame);
+      if (caps) {
+        expect(session.view.result.current.tabs[0]?.writer).toBe("other");
+        expect(sent).toEqual([]);
+        // The mouse's own release ends the press (xterm takes its listener off the document).
+        act(() => fire(document.body, "mouseup", false));
+      } else {
+        // The documented gap: the tap's mouseup is taken as the mouse's release.
+        expect(session.view.result.current.tabs[0]?.writer).toBe("you");
+        expect(sent.map((frame) => frame.data)).toEqual(["\x1b[<0;6;3m"]);
+      }
+      xterm.unmount();
+    } finally {
+      canvas.mockRestore();
+      globals.ResizeObserver = saved.ResizeObserver;
+      globals.matchMedia = saved.matchMedia;
+    }
+  });
+});
+
+// Round 9 (owner decision): a touch scroll's input is the person's own input, as a tap's or a
+// key's is: a follower's swipe in a mouse app takes over and is sent. The desktop wheel stays
+// writer-only. The real useXterm and wheel provenance on the real session gateway and sealing.
+describe("touch scrolling and the writer, through the real gateway", () => {
+  /** The number of SGR wheel-down reports `data` is made of, or -1 if it holds anything else. */
+  const wheelDowns = (data: string) => {
+    const [head, ...reports] = data.split("\x1b[<65;");
+    return head === "" && reports.every((report) => /^\d+;\d+M$/.test(report))
+      ? reports.length
+      : -1;
+  };
+  async function mounted(writer: "you" | "other") {
+    const globals = globalThis as unknown as Record<string, unknown>;
+    const saved = { ResizeObserver: globals.ResizeObserver, matchMedia: globals.matchMedia };
+    globals.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+    globals.matchMedia = () => ({
+      matches: false,
+      addListener() {},
+      removeListener() {},
+      addEventListener() {},
+      removeEventListener() {},
+    });
+    const context: Partial<CanvasRenderingContext2D> = {
+      measureText: () => ({ width: 8 }) as TextMetrics,
+      createLinearGradient: () => ({ addColorStop() {} }),
+      fillRect() {},
+      clearRect() {},
+      getImageData: () => ({ data: new Uint8ClampedArray([0, 0, 0, 255]) }) as ImageData,
+    };
+    const canvas = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(() => context as CanvasRenderingContext2D);
+    const restore = () => {
+      canvas.mockRestore();
+      globals.ResizeObserver = saved.ResizeObserver;
+      globals.matchMedia = saved.matchMedia;
+    };
+    const session = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "you" });
+    act(() => session.view.result.current.sendResize(session.localId, 100, 30));
+    await settle();
+    let term: Terminal | null = null;
+    const open = Terminal.prototype.open;
+    const spy = vi.spyOn(Terminal.prototype, "open").mockImplementation(function (
+      this: Terminal,
+      parent: HTMLElement,
+    ) {
+      term = this;
+      open.call(this, parent);
+    });
+    const container = document.body.appendChild(document.createElement("div"));
+    // Not following a size: touch scrolling is the pane's (a follower whose PTY size is not
+    // known yet, or a takeover that comes while a swipe is under way).
+    const xterm = renderHook(() =>
+      useXterm({
+        active: true,
+        selecting: false,
+        follow: null,
+        shiftEnter: "off",
+        onResize() {},
+        onData: (data, origin) =>
+          session.view.result.current.sendInput(session.localId, data, origin),
+      }),
+    );
+    act(() => xterm.result.current.containerRef(container));
+    spy.mockRestore();
+    const opened: Terminal | null = term;
+    if (!opened) throw new Error("no xterm");
+    const terminal: Terminal = opened;
+    const element = terminal.element;
+    if (!element) throw new Error("xterm not open");
+    await new Promise<void>((resolve) => terminal.write("\x1b[?1000h\x1b[?1006h", resolve));
+    const core = (
+      terminal as unknown as {
+        _core: {
+          _charSizeService: { width: number; height: number };
+          _renderService: {
+            dimensions: {
+              css: {
+                cell: { width: number; height: number };
+                canvas: { width: number; height: number };
+              };
+            };
+          };
+        };
+      }
+    )._core;
+    Object.assign(core._charSizeService, { width: 8, height: 16 });
+    Object.assign(core._renderService.dimensions.css.cell, { width: 8, height: 16 });
+    Object.assign(core._renderService.dimensions.css.canvas, { width: 640, height: 384 });
+    if (writer === "other")
+      message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    await settle();
+    socket.sendFrame.mockClear();
+    let lastY = 0;
+    const touchAt = (type: string, y: number | null) => {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      const touches = y === null ? [] : [{ identifier: 0, clientX: 40, clientY: y }];
+      Object.defineProperty(event, "touches", { value: touches });
+      // A lift's changed finger is where it was last.
+      Object.defineProperty(event, "changedTouches", {
+        value: y === null ? [{ identifier: 0, clientX: 40, clientY: lastY }] : touches,
+      });
+      if (y !== null) lastY = y;
+      element.dispatchEvent(event);
+    };
+    /** A one-finger swipe up by `lines` rows (16 px each): toward newer output, wheel down. */
+    const swipe = (lines: number) =>
+      act(() => {
+        touchAt("touchstart", 300);
+        for (let step = 1; step <= lines; step += 1) touchAt("touchmove", 300 - step * 16 - 1);
+        touchAt("touchend", null);
+      });
+    const sentData = async () =>
+      (await browserFrames(session.cli)).filter((frame) => "data" in frame);
+    return { session, element, xterm, swipe, sentData, restore };
+  }
+
+  it("a follower's swipe in a mouse app takes over, and its wheel reports are sent", async () => {
+    const m = await mounted("other");
+    try {
+      m.swipe(4);
+      await vi.waitFor(() => expect(m.session.view.result.current.tabs[0]?.writer).toBe("you"));
+      await settle();
+      const frames = await browserFrames(m.session.cli);
+      // Takeover: the resize first, then the scroll's input.
+      expect(frames.findIndex((frame) => "resize" in frame)).toBeLessThan(
+        frames.findIndex((frame) => "data" in frame),
+      );
+      const data = (await m.sentData()).map((frame) => frame.data).join("");
+      expect(wheelDowns(data)).toBeGreaterThanOrEqual(3);
+      m.xterm.unmount();
+    } finally {
+      m.restore();
+    }
+  });
+
+  it("the writer's swipe is sent, and so is its desktop wheel", async () => {
+    const m = await mounted("you");
+    try {
+      m.swipe(4);
+      await settle();
+      const data = (await m.sentData()).map((frame) => frame.data).join("");
+      expect(wheelDowns(data)).toBeGreaterThanOrEqual(3);
+      expect(m.session.view.result.current.tabs[0]?.writer).toBe("you");
+      // The control for the follower's case below: the same desktop wheel makes a report.
+      const before = (await m.sentData()).length;
+      act(() => {
+        m.element.dispatchEvent(
+          new WheelEvent("wheel", {
+            deltaY: 1,
+            deltaMode: WheelEvent.DOM_DELTA_LINE,
+            clientX: 40,
+            clientY: 40,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      });
+      await vi.waitFor(async () => expect((await m.sentData()).length).toBeGreaterThan(before));
+      m.xterm.unmount();
+    } finally {
+      m.restore();
+    }
+  });
+
+  it("a follower's desktop wheel is still dropped: no takeover, nothing sent", async () => {
+    const m = await mounted("other");
+    try {
+      act(() => {
+        m.element.dispatchEvent(
+          new WheelEvent("wheel", {
+            deltaY: 1,
+            deltaMode: WheelEvent.DOM_DELTA_LINE,
+            clientX: 40,
+            clientY: 40,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      });
+      await settle();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await settle();
+      expect(m.session.view.result.current.tabs[0]?.writer).toBe("other");
+      expect(await m.sentData()).toEqual([]);
+      m.xterm.unmount();
+    } finally {
+      m.restore();
+    }
+  });
 });

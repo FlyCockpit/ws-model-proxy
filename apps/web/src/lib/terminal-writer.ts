@@ -73,11 +73,21 @@ export function isFocusReport(data: string): boolean {
 
 /**
  * Where a piece of input came from. The session hook's gateway decides at send time, not when
- * the input was made, whether it may go out: `user` input (keys, pastes, mouse) and a ticket's
- * `typed` command wait while Select text is on and take over the writer when needed; a `reply`
- * (xterm's automatic answer to output) only ever goes out from the writer.
+ * the input was made, whether it may go out: `user` input (keys, pastes, clicks, and a touch
+ * scroll's wheel reports or arrow keys) and a ticket's `typed` command wait while Select text is
+ * on and take over the writer when needed. The rest only ever goes out from the writer and never
+ * waits: a `reply` (xterm's automatic answer to output), and `wheel` input (what xterm sends for
+ * a desktop mouse wheel: wheel reports in a mouse app, arrow keys on the alternate screen), since
+ * the desktop wheel never takes over typing. (The CLI does not know the origin: a `wheel` frame
+ * sealed before another viewer's takeover and arriving after it still makes this viewer the
+ * writer there. Known limit; it needs a writer-only flag the CLI enforces.)
  */
-export type TerminalInputOrigin = "user" | "typed" | "reply";
+export type TerminalInputOrigin = "user" | "typed" | "reply" | "wheel";
+
+/** Input that takes over the writer when this tab is not it (keys, pastes, clicks, a ticket). */
+export function inputTakesOver(origin: TerminalInputOrigin): boolean {
+  return origin === "user" || origin === "typed";
+}
 
 /**
  * The replies xterm writes on its own when output asks (one reply per onData call): cursor and

@@ -124,7 +124,9 @@ export function TerminalPane(props: TerminalPaneProps) {
           // measures it as the pane's size, so it must stay the pane-sized box itself.
           props.follow
             ? "overflow-x-auto overflow-y-auto overscroll-contain bg-(--term-shade) [&>.xterm]:w-fit"
-            : "overflow-x-hidden overflow-y-hidden",
+            : // Writing: a one-finger swipe scrolls the terminal like the wheel (useXterm), so
+              // the browser keeps only pinch zoom. Following, the box pans natively.
+              "touch-pinch-zoom overflow-x-hidden overflow-y-hidden [&_*]:touch-pinch-zoom",
         )}
       />
       {selectionText !== null ? (

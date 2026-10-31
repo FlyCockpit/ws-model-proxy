@@ -59,6 +59,7 @@ import {
 import {
   canSendResize,
   classifyBroadcastEpoch,
+  inputTakesOver,
   needsTakeover,
   nextReattach,
   type ReattachState,
@@ -1036,8 +1037,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
    * batch then (so nothing later can be sealed ahead of it), decides by the tab's rules at that
    * moment, seals, checks the rules again, and only then sends. Taking over is part of the step:
    * the writer becomes "you" only once its resize and first input actually reached the socket.
-   * - Select text: input waits; replies are dropped (they answer output that has moved on).
+   * - Select text: input waits; replies and wheel input are dropped (they answer output, or
+   *   scroll a screen, that has moved on).
    * - Replies go out only from the writer, in their own frames: they never claim the writer.
+   * - Wheel input (a desktop mouse wheel's) also goes out only from the writer, never claims
+   *   it and never waits: it is dropped whenever it cannot go out as the writer, including when
+   *   the writer changes while its frame is sealed. (A touch scroll's input is `user`.)
    * - Input from a follower takes over first, only from the visible, measured tab, at the size
    *   it measured (a newer measurement rebuilds the step); otherwise user input is dropped and a
    *   typed command waits for the tab.
@@ -1059,8 +1064,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           localId,
           held.filter((item) => item.image),
         );
-        // Ahead of anything already back in the batch: it was made after these.
-        batch.returned.unshift(...held.filter((item) => !item.image && item.origin !== "reply"));
+        // Ahead of anything already back in the batch: it was made after these. Only input that
+        // could take over waits: a reply or a scroll is for the moment it was made.
+        batch.returned.unshift(
+          ...held.filter((item) => !item.image && inputTakesOver(item.origin)),
+        );
       };
       if (selectingRef.current === localId) {
         hold(items);
@@ -1069,10 +1077,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       batch.lastSentAt = performance.now();
       const writer = !needsTakeover(viewOf(localId));
       const takeOver =
-        !writer && items.some((item) => item.origin !== "reply") && canTakeOver(localId);
+        !writer && items.some((item) => inputTakesOver(item.origin)) && canTakeOver(localId);
       const own = ownSizeRef.current.get(localId);
       const sending = items.filter((item) =>
-        item.origin === "reply" ? writer : writer || takeOver,
+        inputTakesOver(item.origin) ? writer || takeOver : writer,
       );
       const going = new Set(sending);
       settleUnsent(
