@@ -518,7 +518,9 @@ mod tests {
     /// whose path is not UTF-8 runs its own `brew` for every call (`list --pinned`, `update`,
     /// `info`, `--prefix`, `upgrade`), exactly as named; the sibling whose name is that path
     /// shown as text (U+FFFD for the invalid byte) never runs.
-    #[cfg(unix)]
+    /// Not on macOS: its file systems refuse names that are not UTF-8
+    /// (EILSEQ), so the lossy case cannot arise there.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn non_utf8_brew_prefix_never_runs_the_replacement_character_sibling() {
         use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
@@ -661,7 +663,9 @@ mod tests {
     }
 
     /// F-FB-2: the prefix is `brew --prefix`'s line exactly, only its
-    /// terminator taken off; anything else is refused.
+    /// terminator taken off; anything else is refused. Unix only: Homebrew
+    /// prints Unix paths, which are not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn the_prefix_is_brews_line_exactly() {
         let ok = |out: &[u8]| prefix_from_output(out).expect("prefix");

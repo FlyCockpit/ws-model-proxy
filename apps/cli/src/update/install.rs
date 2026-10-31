@@ -558,7 +558,8 @@ mod tests {
     /// F-FB-1: `tar` gets the archive and the destination, and the probe runs the binary,
     /// exactly as their paths are: a directory whose name is not UTF-8 is used as it is, and
     /// the sibling named by its text form (U+FFFD) is never touched.
-    #[cfg(unix)]
+    /// Not on macOS: its file systems refuse names that are not UTF-8.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_path_that_is_not_utf8_is_unpacked_and_probed_as_it_is() {
         use std::os::unix::ffi::OsStringExt;

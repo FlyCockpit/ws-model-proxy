@@ -1058,7 +1058,12 @@ mod tests {
             cwd.join("relative-state").to_str()
         );
 
-        let absolute = spec("abc");
+        // Absolute on this platform (`/home/u` is not absolute on Windows).
+        let absolute = DeadmanSpec {
+            program: cwd.join("bin").join(".wsmp-recovery-abc"),
+            state_dir: cwd.join("state"),
+            ..spec("abc")
+        };
         let kept = DeadmanSpec::new(
             "abc".into(),
             absolute.program(),
