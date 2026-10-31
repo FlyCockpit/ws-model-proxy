@@ -21,6 +21,7 @@ import {
   AGENT_UPDATE_REASONS,
   AGENT_UPDATE_ROLLBACK_SECS_MAX,
   AGENT_UPDATE_ROLLBACK_SECS_MIN,
+  agentReleaseVersionSchema,
   agentUpdateArtifactUrlAllowed,
   nodeBuildSchema,
   nodeEnvironmentSchema,
@@ -1065,10 +1066,7 @@ export const agentUpdateFrameSchema = z
   .object({
     type: z.literal("agent.update"),
     updateId: base64Url16Schema,
-    version: z
-      .string()
-      .max(80)
-      .regex(/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/),
+    version: agentReleaseVersionSchema,
     artifactUrl: z
       .string()
       .max(2048)
@@ -1114,12 +1112,27 @@ export const agentUpdateProgressFrameSchema = z
         "detail is at most 4000 characters.",
       )
       .optional(),
+    /**
+     * With `refused` / `version_mismatch` only: the version the node could install instead (its
+     * Homebrew tap's). Sent only after a `hello.ok` with `features.agentUpdateAvailableVersion`
+     * (a 0.4.3 server's strict schema refuses it), and only by a wsmp that checks its tap's
+     * version before installing: so a refusal carrying it is what proves the node can be sent
+     * that version ("Install anyway"). A value the node could not install (not a release
+     * version as the node reads one) is dropped: no offer, the refusal itself still stored.
+     */
+    availableVersion: agentReleaseVersionSchema.optional().catch(undefined),
   })
   .strict()
   .refine(
     (frame) =>
       (frame.phase === "refused" || frame.phase === "failed") === (frame.reason !== undefined),
     { message: "A reason exactly for refused and failed." },
+  )
+  .refine(
+    (frame) =>
+      frame.availableVersion === undefined ||
+      (frame.phase === "refused" && frame.reason === "version_mismatch"),
+    { message: "availableVersion only with a version_mismatch refusal." },
   );
 
 export const nodeToServerControlFrameSchema = z.discriminatedUnion("type", [
@@ -1375,6 +1388,8 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
         .object({
           /** `exec.started` may carry `ranWith`. */
           execRanWith: z.literal(true).optional(),
+          /** A `version_mismatch` refusal in `agent.update.progress` may carry `availableVersion`. */
+          agentUpdateAvailableVersion: z.literal(true).optional(),
         })
         .strict()
         .optional(),

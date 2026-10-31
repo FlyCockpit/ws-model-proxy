@@ -67,16 +67,22 @@ describe("nodeUpdateMode", () => {
 describe("forceOffered", () => {
   it("needs instances that would stop and something running", () => {
     const running = [{ id: "i-1" }];
+    const stops = { instancesSurvive: false, remote: "allowed" as const };
+    expect(forceOffered({ selfUpdate: stops, runningInstances: running })).toBe(true);
     expect(
-      forceOffered({ selfUpdate: { instancesSurvive: false }, runningInstances: running }),
-    ).toBe(true);
-    expect(
-      forceOffered({ selfUpdate: { instancesSurvive: true }, runningInstances: running }),
+      forceOffered({ selfUpdate: { ...stops, instancesSurvive: true }, runningInstances: running }),
     ).toBe(false);
-    expect(forceOffered({ selfUpdate: { instancesSurvive: false }, runningInstances: [] })).toBe(
-      false,
-    );
+    expect(forceOffered({ selfUpdate: stops, runningInstances: [] })).toBe(false);
     expect(forceOffered({ selfUpdate: null, runningInstances: running })).toBe(false);
+  });
+
+  it("is never offered on a node whose operator turned remote updates off", () => {
+    expect(
+      forceOffered({
+        selfUpdate: { instancesSurvive: false, remote: "off" },
+        runningInstances: [{ id: "i-1" }],
+      }),
+    ).toBe(false);
   });
 });
 

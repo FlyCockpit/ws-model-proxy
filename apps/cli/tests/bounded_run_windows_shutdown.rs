@@ -24,13 +24,7 @@ fn shutdown_reaches_the_job_registered_by_run_and_refuses_later_runs() {
         assert_eq!(active_runs(), 0);
     });
     assert_eq!(
-        run(
-            "cmd",
-            &["/C".into(), "exit 0".into()],
-            Duration::from_secs(5),
-            1024,
-            None
-        ),
+        run("cmd", &["/C", "exit 0"], Duration::from_secs(5), 1024, None),
         Err(RunError::Cancelled)
     );
 }

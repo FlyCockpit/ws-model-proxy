@@ -235,6 +235,15 @@ fn update(args: &Args) -> Result<()> {
     // Released before the restart: the new build takes it to confirm.
     let lock = state::UpdateLock::acquire(&update_dir)?
         .context("another update is in progress on this machine")?;
+    // One abandoned before its swap, with no rollback job left to finish it, is settled now
+    // (a registered job, or a swap that began, stays its owner's).
+    if let Err(error) = flow::settle_abandoned(
+        &update_dir,
+        crate::update::deadman::platform().as_deref(),
+        &lock,
+    ) {
+        tracing::warn!(error = %format!("{error:#}"), "looking at an earlier update failed");
+    }
     if let Some(previous) = state::load(&update_dir)?
         && previous.phase.in_progress()
     {
@@ -259,6 +268,7 @@ fn update(args: &Args) -> Result<()> {
         current_version: current.clone(),
         before_swap: None,
         proceed: None,
+        stable_service: crate::commands::service::ensure_stable_executable,
     };
 
     if identity.method == InstallMethod::Homebrew {
@@ -283,7 +293,14 @@ fn update(args: &Args) -> Result<()> {
             settle_without_service(&update_dir)?;
         }
         drop(lock);
-        return finish(args.json, service, &current, &manifest.version, None);
+        return finish(
+            args.json,
+            service,
+            &current,
+            &manifest.version,
+            None,
+            crate::commands::service::Restart::Reloaded,
+        );
     }
 
     let artifact = manifest.artifacts.get(&identity.target).with_context(|| {
@@ -339,6 +356,7 @@ fn update(args: &Args) -> Result<()> {
         &current,
         &manifest.version,
         Some(CLI_ROLLBACK_SECS),
+        crate::commands::service::Restart::Loaded,
     )
 }
 
@@ -354,9 +372,17 @@ fn settle_without_service(update_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn finish(json: bool, service: bool, from: &str, to: &str, rollback: Option<u32>) -> Result<()> {
+fn finish(
+    json: bool,
+    service: bool,
+    from: &str,
+    to: &str,
+    rollback: Option<u32>,
+    restart: crate::commands::service::Restart,
+) -> Result<()> {
     if service {
-        crate::commands::service::restart_quietly().context("restarting the relay service")?;
+        crate::commands::service::restart_quietly(restart)
+            .context("restarting the relay service")?;
         let text = match rollback {
             Some(secs) => format!(
                 "updated wsmp {from} to {to} and restarted the service; it rolls back by itself unless the new build connects within {secs} s (`wsmp update status`)"
@@ -467,23 +493,58 @@ fn status(json: bool) -> Result<()> {
 const DEADMAN_LOOK_EVERY: Duration = Duration::from_secs(5);
 
 /// The dead-man: roll back when due and unconfirmed, then restart the
-/// service and remove itself.
+/// service and remove itself. It removes itself only once nothing is left
+/// for it to do: a restart that failed after the rollback (retried here
+/// first) keeps the job and exits nonzero, and the job's next run restarts
+/// the relay ([`flow::restart_pending`]); so does an error before the
+/// rollback was recorded (the replay finishes it). Every scheduler runs the
+/// job again after a nonzero exit (see [`crate::update::deadman`]). The job
+/// runs its recovery copy, which the rollback does not move, so that next
+/// run has its program; the copy is removed once the job is
+/// ([`flow::job_removed`]).
 fn rollback(update_id: &str) -> Result<()> {
     let update_dir = crate::update::update_dir()?;
     let scheduler = crate::update::deadman::platform();
+    rollback_with(
+        &update_dir,
+        update_id,
+        scheduler.as_deref(),
+        &|| crate::commands::service::restart_quietly(crate::commands::service::Restart::Loaded),
+        &RESTART_RETRY_WAITS,
+        log_tail,
+    )
+}
+
+/// Before the second and third try of the relay's restart after a rollback
+/// (each try is bounded by the service command's own limit). The job's next
+/// run tries again after that.
+const RESTART_RETRY_WAITS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+
+fn rollback_with(
+    update_dir: &std::path::Path,
+    update_id: &str,
+    scheduler: Option<&dyn crate::update::deadman::Scheduler>,
+    restart: &dyn Fn() -> Result<()>,
+    waits: &[Duration],
+    log_tail: fn() -> Option<String>,
+) -> Result<()> {
     loop {
         // Read without the lock (the file is replaced atomically): a dead-man
         // whose update confirmed or was replaced ends now, even while an
         // installer holds the lock to arm the next one.
-        if let Some(gone) = flow::no_longer_due(&update_dir, update_id) {
+        if let Some(gone) = flow::no_longer_due(update_dir, update_id) {
             tracing::info!(update_id, outcome = ?gone, "update dead-man");
             if gone == Rollback::NotOurs {
                 return Ok(());
             }
+            // Rolled back by an earlier run whose restart failed: this run's.
+            if flow::restart_pending(update_dir, update_id) {
+                restart_after_rollback(update_dir, update_id, restart, waits)?;
+            }
             break;
         }
         let outcome = flow::rollback_if_unconfirmed(
-            &update_dir,
+            update_dir,
             update_id,
             crate::update::unix_now(),
             crate::update::deadman::booted_at(),
@@ -492,16 +553,14 @@ fn rollback(update_id: &str) -> Result<()> {
         tracing::info!(update_id, ?outcome, "update dead-man");
         match outcome {
             Rollback::NotDue(wait) => {
-                if early_run_done(&update_dir) {
+                if early_run_done(update_dir) {
                     return Ok(());
                 }
                 // In short steps, to see a confirmation soon.
                 std::thread::sleep(wait.min(DEADMAN_LOOK_EVERY));
             }
             Rollback::RolledBack => {
-                if let Err(error) = crate::commands::service::restart_quietly() {
-                    tracing::warn!(error = %format!("{error:#}"), "restarting the relay after the rollback failed");
-                }
+                restart_after_rollback(update_dir, update_id, restart, waits)?;
                 break;
             }
             // Another update owns the state (and the dead-man's name now).
@@ -509,11 +568,47 @@ fn rollback(update_id: &str) -> Result<()> {
             Rollback::Settled | Rollback::NeverSwapped | Rollback::NoCopy => break,
         }
     }
-    // Last: on macOS removing the agent ends this process.
-    if let Some(scheduler) = scheduler {
-        let _ = scheduler.remove();
+    // Last: on macOS removing the agent ends this process (its program then goes with a later
+    // sweep). Once the job is gone, nothing runs its program (the recovery copy) any more.
+    if let Some(scheduler) = scheduler
+        && scheduler.remove().is_ok()
+    {
+        flow::job_removed(update_dir, update_id);
     }
     Ok(())
+}
+
+/// Restart the relay into the restored build, trying again after each of
+/// `waits`. An error when it never worked: the caller then keeps the job
+/// (and exits nonzero), so the job's next run tries again.
+fn restart_after_rollback(
+    update_dir: &std::path::Path,
+    update_id: &str,
+    restart: &dyn Fn() -> Result<()>,
+    waits: &[Duration],
+) -> Result<()> {
+    let mut tries = std::iter::once(Duration::ZERO).chain(waits.iter().copied());
+    let mut last = None;
+    for wait in &mut tries {
+        std::thread::sleep(wait);
+        match restart() {
+            Ok(()) => {
+                if let Err(error) = flow::restart_done(update_dir, update_id) {
+                    tracing::warn!(error = %format!("{error:#}"), "recording the relay's restart failed");
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "restarting the relay after the rollback failed");
+                last = Some(error);
+            }
+        }
+    }
+    Err(last
+        .unwrap_or_else(|| anyhow::anyhow!("no restart was tried"))
+        .context(
+            "the update was rolled back but the relay service did not restart; the rollback job stays and tries again",
+        ))
 }
 
 /// Windows: the dead-man's early trigger, well before the deadline job
@@ -548,14 +643,14 @@ fn log_tail() -> Option<String> {
         let (_, text) = crate::update::deadman::run_bounded(
             "journalctl",
             &[
-                "--user".into(),
-                "-u".into(),
-                "wsmp.service".into(),
-                "-n".into(),
-                "40".into(),
-                "--no-pager".into(),
-                "-o".into(),
-                "cat".into(),
+                "--user",
+                "-u",
+                "wsmp.service",
+                "-n",
+                "40",
+                "--no-pager",
+                "-o",
+                "cat",
             ],
             &[],
             Duration::from_secs(15),
@@ -573,5 +668,165 @@ fn log_tail() -> Option<String> {
         let text = String::from_utf8_lossy(&text);
         let lines: Vec<&str> = text.lines().collect();
         Some(lines[lines.len().saturating_sub(40)..].join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::update::deadman::Scheduler;
+    use crate::update::deadman::fake::FakeScheduler;
+
+    /// A self-replace update that swapped and never confirmed, past its deadline, with its
+    /// rollback copy, and its dead-man registered.
+    fn unconfirmed(root: &std::path::Path) -> (PathBuf, FakeScheduler, state::UpdateState) {
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let mut current = state::sample(&bin, Phase::Swapped);
+        std::fs::write(&current.live_path, "new wsmp 0.4.3\n").expect("live");
+        std::fs::write(&current.prev_path, "old wsmp 0.4.2\n").expect("prev");
+        current.to_sha256 =
+            Some(crate::update::install::sha256_file(&current.live_path).expect("sha"));
+        let recovery = bin.join(format!(".wsmp-recovery-{}", current.update_id));
+        crate::update::install::prepare_recovery(&current.prev_path, &recovery).expect("recovery");
+        current.recovery_path = Some(recovery);
+        let update_dir = root.join("state/update");
+        state::save(&update_dir, &current).expect("save");
+        let scheduler = FakeScheduler::default();
+        let spec = flow::deadman_spec(&current, &root.join("state"), Duration::from_secs(90))
+            .expect("spec");
+        scheduler.register(&spec).expect("register");
+        (update_dir, scheduler, current)
+    }
+
+    fn no_log() -> Option<String> {
+        None
+    }
+
+    /// Review P14 (F-FA-5), with the fixed expectations: the rollback restored the old build and
+    /// the relay's restart then failed (every try). The dead-man must not report success and
+    /// remove its job: it exits with an error and keeps the job, which owes the restart. Its next
+    /// run (the scheduler runs it again after the failure) restarts the relay, then removes the
+    /// job.
+    #[test]
+    fn a_failed_restart_after_a_rollback_keeps_the_dead_man() {
+        let root = tempfile::tempdir().expect("root");
+        let (update_dir, scheduler, current) = unconfirmed(root.path());
+        let tries = Cell::new(0);
+        let failing = || -> Result<()> {
+            tries.set(tries.get() + 1);
+            anyhow::bail!("temporary service-manager failure")
+        };
+        let waits = [Duration::from_millis(1), Duration::from_millis(1)];
+        let error = rollback_with(
+            &update_dir,
+            &current.update_id,
+            Some(&scheduler),
+            &failing,
+            &waits,
+            no_log,
+        )
+        .expect_err("a failed restart is not success");
+        assert!(
+            format!("{error:#}").contains("did not restart"),
+            "{error:#}"
+        );
+        assert_eq!(tries.get(), 3, "tried again within the run");
+        assert!(scheduler.registered.borrow().is_some(), "the job stays");
+        assert_eq!(*scheduler.removals.borrow(), 0);
+        assert!(
+            std::fs::read_to_string(&current.live_path)
+                .expect("live")
+                .starts_with("old")
+        );
+        assert!(flow::restart_pending(&update_dir, &current.update_id));
+        // The job's program is still there for that next run (the restore consumed
+        // `wsmp.prev`, never it).
+        let program = scheduler
+            .registered
+            .borrow()
+            .as_ref()
+            .expect("job")
+            .program()
+            .to_path_buf();
+        assert!(!current.prev_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&program).expect("program"),
+            "old wsmp 0.4.2\n"
+        );
+
+        // The job's next run: the update is settled, but the restart is still owed.
+        let restarted = Cell::new(0);
+        let working = || -> Result<()> {
+            restarted.set(restarted.get() + 1);
+            Ok(())
+        };
+        rollback_with(
+            &update_dir,
+            &current.update_id,
+            Some(&scheduler),
+            &working,
+            &waits,
+            no_log,
+        )
+        .expect("restarted");
+        assert_eq!(restarted.get(), 1);
+        assert!(
+            scheduler.registered.borrow().is_none(),
+            "removed once nothing is owed"
+        );
+        assert!(!flow::restart_pending(&update_dir, &current.update_id));
+        assert_eq!(
+            state::load(&update_dir)
+                .expect("load")
+                .expect("state")
+                .phase,
+            Phase::RolledBack
+        );
+        // Restarted and its job removed: the program goes too.
+        assert!(!program.exists());
+    }
+
+    /// The inverses: a restart that works at once (or on a later try) ends the job with
+    /// success; a settled update that owes no restart is not restarted again.
+    #[test]
+    fn a_rollback_whose_restart_works_removes_the_dead_man() {
+        let root = tempfile::tempdir().expect("root");
+        let (update_dir, scheduler, current) = unconfirmed(root.path());
+        let tries = Cell::new(0);
+        let second_time = || -> Result<()> {
+            tries.set(tries.get() + 1);
+            if tries.get() < 2 {
+                anyhow::bail!("not yet");
+            }
+            Ok(())
+        };
+        let waits = [Duration::from_millis(1), Duration::from_millis(1)];
+        rollback_with(
+            &update_dir,
+            &current.update_id,
+            Some(&scheduler),
+            &second_time,
+            &waits,
+            no_log,
+        )
+        .expect("rolled back and restarted");
+        assert_eq!(tries.get(), 2);
+        assert!(scheduler.registered.borrow().is_none());
+        assert!(!flow::restart_pending(&update_dir, &current.update_id));
+
+        // Run again (the job could not be removed, say): nothing is owed, nothing restarts.
+        let never = || -> Result<()> { panic!("no restart is owed") };
+        rollback_with(
+            &update_dir,
+            &current.update_id,
+            Some(&scheduler),
+            &never,
+            &waits,
+            no_log,
+        )
+        .expect("settled");
     }
 }

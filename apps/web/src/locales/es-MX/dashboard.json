@@ -551,10 +551,11 @@
     },
     "agentUpdate": {
       "title": "Versión de wsmp",
-      "description": "Actualiza wsmp en este nodo a la versión que corre este servidor. Si la nueva versión no arranca bien, el nodo vuelve solo a la anterior.",
+      "description": "Actualiza wsmp en este nodo a la versión que corre este servidor (o, si eliges Instalar de todos modos, a la versión que tiene su tap de Homebrew). Si la nueva versión no arranca bien, el nodo vuelve solo a la anterior, salvo una instalación de Homebrew, que no puede.",
       "loadFailed": "No se pudieron cargar las versiones de wsmp.",
       "outdated": "Desactualizado",
       "current": "Al día",
+      "newerThanServer": "Más reciente que este servidor",
       "wslBadge": "WSL",
       "updatingBadge": "Actualizando wsmp",
       "nodeVersion": "En el nodo",
@@ -563,6 +564,7 @@
       "unknownCommit": "Compilación desconocida",
       "serverVersion": "Este servidor",
       "wslWarning": "Este nodo corre en WSL. Windows puede detener una distribución de WSL inactiva, y entonces la actualización, o la vuelta a la versión anterior, espera hasta que la distribución vuelva a correr.",
+      "newerThanServerHelp": "Este nodo ejecuta un wsmp más reciente que este servidor ({{server}}). Actualiza el servidor para que coincidan: mientras tanto, un cambio del lado del servidor podría impedir que este nodo se conecte.",
       "nodeSaid": "Lo que reportó el nodo",
       "fixByHand": "Para arreglarlo a mano, ejecuta esto en el nodo:",
       "manualCommand": "Comando para ejecutar en el nodo",
@@ -613,7 +615,7 @@
           "OFF": "Actualizar solo en la propia máquina"
         },
         "help": {
-          "ALLOWED": "Puedes actualizar este nodo desde aquí. Solo instala la versión de este servidor.",
+          "ALLOWED": "Puedes actualizar este nodo desde aquí. Instala la versión de este servidor, salvo que elijas Instalar de todos modos para la versión que tiene el tap de Homebrew del nodo.",
           "OFF": "El botón Actualizar queda desactivado. Actualiza ejecutando el comando de instalación en el nodo."
         }
       },
@@ -634,6 +636,10 @@
         "in_progress": "Ya hay otra actualización en curso en el nodo.",
         "internal": "Algo salió mal en el nodo.",
         "other": "El nodo dio un motivo que esta página no conoce."
+      },
+      "homebrewReason": {
+        "version_mismatch_refused": "El tap de Homebrew no tiene la versión pedida. wsmp no se actualizó.",
+        "version_mismatch_failed": "Homebrew hizo la actualización, pero el wsmp instalado no es la versión pedida, o no se pudo comprobar su versión. Revisa el nodo (`wsmp --version`) antes de reiniciarlo."
       },
       "method": {
         "script": "script de instalación",
@@ -703,6 +709,17 @@
         "swapped": "cambiaba de versión",
         "restarting": "se reiniciaba",
         "other": "se actualizaba"
+      },
+      "anyway": {
+        "offer": "El tap de Homebrew del nodo tiene wsmp {{version}}, más reciente que el {{server}} de este servidor. Lo habitual es actualizar este servidor a {{version}}.",
+        "offerBehind": "El tap de Homebrew del nodo todavía no tiene wsmp {{server}}; tiene {{version}}. Vuelve a actualizar cuando el tap tenga {{server}}, o instala {{version}} ahora.",
+        "button": "Instalar {{version}} de todos modos",
+        "title": "¿Instalar wsmp {{version}} en {{slug}}?",
+        "description": "Este servidor ejecuta wsmp {{server}}, pero Homebrew en {{slug}} solo puede instalar {{version}}. Lo habitual es actualizar el servidor a {{version}}.",
+        "descriptionBehind": "Este servidor ejecuta wsmp {{server}}, pero Homebrew en {{slug}} por ahora solo tiene {{version}}. Lo habitual es esperar a que el tap tenga {{server}}.",
+        "risk": "Si lo instalas de todos modos, {{slug}} ejecutará un wsmp distinto al del servidor. Si {{version}} necesita un servidor más reciente, {{slug}} no podrá volver a conectarse hasta que actualices el servidor, y Homebrew no puede volver solo a la versión anterior.",
+        "riskBehind": "Si lo instalas de todos modos, {{slug}} seguirá ejecutando un wsmp más antiguo que el del servidor, y Homebrew no puede volver solo a la versión anterior. Vuelve a actualizarlo cuando el tap tenga {{server}}.",
+        "confirm": "Instalar {{version}}"
       }
     }
   },

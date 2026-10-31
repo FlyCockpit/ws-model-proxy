@@ -1612,7 +1612,10 @@ where
                 .execs
                 .set_report_ran_with(features.unwrap_or_default().exec_ran_with);
             tracing::info!(id, node_id, ?definition_sync, "relay registration accepted");
-            session.update.on_hello_ok(definition_sync);
+            session.update.on_hello_ok(
+                definition_sync,
+                features.unwrap_or_default().agent_update_available_version,
+            );
             send_inventory(session);
         }
         ServerFrame::HelloChallenge { .. } => {
@@ -1690,6 +1693,8 @@ where
             rollback_after_secs,
         } => {
             let identity = crate::update::build::identity();
+            // Taken first: a lowering from here on revokes the update, at once.
+            let trust = startup.trust_watch();
             let gate = crate::update::agent::Gate {
                 full_control: startup.full_control(),
                 remote: Config::load_required()
@@ -1711,6 +1716,7 @@ where
                     rollback_after_secs,
                 },
                 &gate,
+                trust,
             );
             for frame in frames {
                 send_control(socket, &frame, "answering an update")?;
@@ -2761,6 +2767,7 @@ where
                     phase: crate::protocol::frames::UpdatePhase::Failed,
                     reason: Some(crate::protocol::frames::UpdateReason::Internal),
                     detail: Some("the node could not read this `agent.update`".into()),
+                    available_version: None,
                 },
                 "refusing an update",
             )

@@ -283,7 +283,7 @@ fn a_program_that_cannot_start_is_a_spawn_error() {
     assert_eq!(
         run(
             "wsmp-no-such-program",
-            &[],
+            &[] as &[&str],
             Duration::from_secs(1),
             1024,
             None
@@ -411,7 +411,7 @@ fn any_status_returns_stdout_on_a_nonzero_exit() {
         Err(RunError::OutputTooLarge)
     );
     assert_eq!(
-        run_until_any_status("wsmp-no-such-program", &[], deadline(), 16, None),
+        run_until_any_status("wsmp-no-such-program", &[] as &[&str], deadline(), 16, None),
         Err(RunError::Spawn)
     );
 }

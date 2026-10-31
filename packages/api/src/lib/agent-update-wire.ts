@@ -82,6 +82,67 @@ export const AGENT_UPDATE_REASONS = [
 ] as const;
 export type AgentUpdateReason = (typeof AGENT_UPDATE_REASONS)[number];
 
+/**
+ * A release version (`0.4.3`, `0.4.4-rc.1`), as `agent.update`'s `version` and a refusal's
+ * `availableVersion`: exactly what the node reads as one (`is_release_version` in the CLI's
+ * `frames.rs`, the same since relay 3.0's first wsmp), so the server never offers or sends a
+ * version the node cannot install. At most 64 characters; `MAJOR.MINOR.PATCH` without leading
+ * zeros; then nothing, or `-` or `+` followed by at least one of `[0-9A-Za-z.+-]`. Both sides
+ * check `agent-release-version-vectors.json`.
+ */
+export const agentReleaseVersionSchema = z
+  .string()
+  .max(64)
+  .regex(/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.+-]+)?$/);
+
+/**
+ * SemVer precedence of two release versions (build metadata ignored): negative when `a` is
+ * older, positive when newer, 0 when equal. `null` when either is not a release version. The
+ * node's order exactly (`compare_release` in the CLI's `homebrew.rs`): both sides check the
+ * `comparisons` of `agent-release-version-vectors.json`.
+ */
+export function compareReleaseVersions(a: string, b: string): number | null {
+  const parse = (value: string) => {
+    if (!agentReleaseVersionSchema.safeParse(value).success) return null;
+    const [core = "", pre] = value.split("+")[0]?.split(/-(.*)/s) ?? [];
+    // BigInt: any number of digits, without a double's rounding past 2^53.
+    // An empty pre-release (`1.2.3-+b`) is one empty identifier, as the node reads it: only no
+    // `-` at all is a release.
+    return { core: core.split(".").map(BigInt), pre: pre !== undefined ? pre.split(".") : [] };
+  };
+  const order = (x: bigint, y: bigint) => (x < y ? -1 : x > y ? 1 : 0);
+  const left = parse(a);
+  const right = parse(b);
+  if (!left || !right) return null;
+  for (let index = 0; index < 3; index += 1) {
+    const diff = order(left.core[index] ?? 0n, right.core[index] ?? 0n);
+    if (diff !== 0) return diff;
+  }
+  // A pre-release sorts before its release.
+  if (left.pre.length === 0 || right.pre.length === 0)
+    return Math.sign(right.pre.length - left.pre.length);
+  const numeric = /^[0-9]+$/;
+  for (let index = 0; index < Math.max(left.pre.length, right.pre.length); index += 1) {
+    const x = left.pre[index];
+    const y = right.pre[index];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x === y) continue;
+    const xNumber = numeric.test(x);
+    const yNumber = numeric.test(y);
+    // `01` and `1` are equal numbers: the next identifiers decide (as the node compares).
+    if (xNumber && yNumber) {
+      const diff = order(BigInt(x), BigInt(y));
+      if (diff !== 0) return diff;
+      continue;
+    }
+    if (xNumber) return -1;
+    if (yNumber) return 1;
+    return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
 /** `detail`: at most this many characters (Unicode scalar values, as the node counts them). */
 export const AGENT_UPDATE_DETAIL_MAX_CHARS = 4000;
 

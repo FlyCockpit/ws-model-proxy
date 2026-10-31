@@ -57,17 +57,33 @@ function blockedReasonText(t: TFunction, reason: string | null): string {
   return t([...refusalKeys(reason), `${K}.blocked.generic`]);
 }
 
-/** Copy for the reason a node gave with `refused` or `failed`. */
-function nodeReasonText(t: TFunction, reason: string | null): string | null {
+/**
+ * Copy for the reason a node gave with `refused` or `failed`. A Homebrew version mismatch is
+ * the tap's version before anything is installed (refused), or after `brew upgrade` ran
+ * (failed): the installed version was another, or could not be checked.
+ */
+function nodeReasonText(
+  t: TFunction,
+  reason: string | null,
+  homebrew: boolean,
+  phase: AgentUpdateView["phase"],
+): string | null {
   if (!reason) return null;
+  if (homebrew && reason === "version_mismatch")
+    return t(
+      phase === "refused"
+        ? `${K}.homebrewReason.version_mismatch_refused`
+        : `${K}.homebrewReason.version_mismatch_failed`,
+    );
   return t(`${K}.reason.${knownOr(AGENT_UPDATE_NODE_REASONS, reason, "other")}`);
 }
 
-function isHomebrew(view: NodeAgentUpdateView): boolean {
-  return (
-    view.build?.installMethod === "homebrew" ||
-    (view.selfUpdate?.strategies.includes("homebrew") ?? false)
-  );
+/**
+ * Whether this attempt was a Homebrew upgrade: the strategy the server chose for it, not how
+ * the node is installed now (it may have been reinstalled another way since).
+ */
+function viaHomebrew(latest: AgentUpdateView): boolean {
+  return latest.strategy === "homebrew";
 }
 
 /** The node's wsmp: version and build, the update action, progress and the policy setting. */
@@ -113,6 +129,8 @@ export function AgentUpdatePanel({
             <StatusPill tone="info">{t(`${K}.updatingBadge`)}</StatusPill>
           ) : view.version === null ? null : view.outdated ? (
             <StatusPill tone="warning">{t(`${K}.outdated`)}</StatusPill>
+          ) : view.newerThanServer ? (
+            <StatusPill tone="info">{t(`${K}.newerThanServer`)}</StatusPill>
           ) : (
             <StatusPill tone="success">{t(`${K}.current`)}</StatusPill>
           )}
@@ -144,7 +162,13 @@ export function AgentUpdatePanel({
 
         {view.wsl ? <Notice tone="warning">{t(`${K}.wslWarning`)}</Notice> : null}
 
-        {view.latest ? <LatestUpdate view={view} latest={view.latest} /> : null}
+        {view.newerThanServer ? (
+          <Notice tone="info">
+            <p>{t(`${K}.newerThanServerHelp`, { server: server.version })}</p>
+          </Notice>
+        ) : null}
+
+        {view.latest ? <LatestUpdate server={server} view={view} latest={view.latest} /> : null}
 
         <UpdateActions view={view} />
 
@@ -199,17 +223,26 @@ function NodeText({ text, label }: { text: string; label: string }) {
   );
 }
 
-function LatestUpdate({ view, latest }: { view: NodeAgentUpdateView; latest: AgentUpdateView }) {
+function LatestUpdate({
+  server,
+  view,
+  latest,
+}: {
+  server: AgentUpdateOverview["server"];
+  view: NodeAgentUpdateView;
+  latest: AgentUpdateView;
+}) {
   const { t } = useTranslation(["dashboard"]);
   const values = {
     from: latest.fromVersion ?? t(`${K}.unknownVersion`),
     to: latest.toVersion,
   };
-  const reason = nodeReasonText(t, latest.reason);
+  const reason = nodeReasonText(t, latest.reason, viaHomebrew(latest), latest.phase);
   const detail = latest.detail ? (
     <NodeText text={latest.detail} label={t(`${K}.nodeSaid`)} />
   ) : null;
-  // The server sets it when the node cannot update itself, or to recover a Homebrew failure.
+  // The server sets it when the node cannot update itself, or to recover a Homebrew failure; it
+  // follows how the node is installed now, the explanation above how this attempt ran.
   const recovery = view.manualCommand;
   const recoveryBlock = recovery ? (
     <div className="min-w-0 space-y-1.5">
@@ -253,6 +286,9 @@ function LatestUpdate({ view, latest }: { view: NodeAgentUpdateView; latest: Age
           <p className="font-medium">{t(`${K}.refusedTitle`, values)}</p>
           {reason ? <p>{reason}</p> : null}
           {detail}
+          {view.availableVersion ? (
+            <InstallAnyway server={server} view={view} version={view.availableVersion} />
+          ) : null}
           {recoveryBlock}
         </Notice>
       );
@@ -265,7 +301,7 @@ function LatestUpdate({ view, latest }: { view: NodeAgentUpdateView; latest: Age
               phase: t(`${K}.stuck.${knownOr(STUCK_PHASES, latest.reason, "other")}`),
             })}
           </p>
-          <p>{isHomebrew(view) ? t(`${K}.timedOutHomebrew`) : t(`${K}.timedOut`)}</p>
+          <p>{viaHomebrew(latest) ? t(`${K}.timedOutHomebrew`) : t(`${K}.timedOut`)}</p>
           {detail}
           {recoveryBlock}
         </Notice>
@@ -284,7 +320,7 @@ function LatestUpdate({ view, latest }: { view: NodeAgentUpdateView; latest: Age
 
 function UpdateProgress({ view, latest }: { view: NodeAgentUpdateView; latest: AgentUpdateView }) {
   const { t } = useTranslation(["dashboard"]);
-  const steps = progressSteps(latest.phase, isHomebrew(view));
+  const steps = progressSteps(latest.phase, viaHomebrew(latest));
   return (
     <section className="min-w-0 space-y-2" aria-live="polite">
       <h3 className="font-medium">
@@ -372,6 +408,71 @@ function ForceUpdateButton({ view }: { view: NodeAgentUpdateView }) {
         onConfirm={() => start.mutate({ nodeId: view.nodeId, force: true })}
       />
     </>
+  );
+}
+
+/**
+ * The node's Homebrew tap has another version than this server's (it refused the server's):
+ * install the tap's version anyway, after a confirmation that says what that means. The advice
+ * follows the direction: a tap ahead of the server (upgrade the server), or behind it (wait).
+ */
+function InstallAnyway({
+  server,
+  view,
+  version,
+}: {
+  server: AgentUpdateOverview["server"];
+  view: NodeAgentUpdateView;
+  version: string;
+}) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  const [confirming, setConfirming] = useState(false);
+  const start = useStartUpdate(() => setConfirming(false));
+  const values = { version, server: server.version, slug: view.slug };
+  // The tap ahead of the server (upgrade the server) or behind it (it does not have it yet).
+  const ahead = view.availableVersionAhead;
+  return (
+    <div className="min-w-0 space-y-1.5">
+      <p>{t(ahead ? `${K}.anyway.offer` : `${K}.anyway.offerBehind`, values)}</p>
+      <Button
+        variant="outline"
+        className="min-h-[44px]"
+        disabled={start.isPending}
+        onClick={() => setConfirming(true)}
+      >
+        {t(`${K}.anyway.button`, values)}
+      </Button>
+      <Dialog open={confirming} onOpenChange={setConfirming}>
+        <DialogContent className="max-h-[90dvh] overflow-x-hidden overflow-y-auto overscroll-contain sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t(`${K}.anyway.title`, values)}</DialogTitle>
+            <DialogDescription>
+              {t(ahead ? `${K}.anyway.description` : `${K}.anyway.descriptionBehind`, values)}
+            </DialogDescription>
+          </DialogHeader>
+          <p className="text-sm">
+            {t(ahead ? `${K}.anyway.risk` : `${K}.anyway.riskBehind`, values)}
+          </p>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="ghost"
+              className="min-h-[44px]"
+              onClick={() => setConfirming(false)}
+            >
+              {t("common:actions.cancel")}
+            </Button>
+            <Button
+              className="min-h-[44px]"
+              disabled={start.isPending}
+              onClick={() => start.mutate({ nodeId: view.nodeId, version })}
+            >
+              {t(`${K}.anyway.confirm`, values)}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
   );
 }
 

@@ -1,0 +1,8 @@
+{
+  "type": "agent.update.progress",
+  "updateId": "q8Zr0T3vX1yB2nC4dE5fGw",
+  "phase": "refused",
+  "reason": "version_mismatch",
+  "detail": "the Homebrew tap `flycockpit/tap` has wsmp 0.4.4, not 0.4.3; wsmp was not upgraded. Upgrade the server to wsmp 0.4.4, or install 0.4.4 anyway from the node's page",
+  "availableVersion": "0.4.4"
+}

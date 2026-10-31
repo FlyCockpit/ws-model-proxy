@@ -927,6 +927,10 @@ const SQL_ELSEWHERE: Record<string, [number, string]> = {
   ],
   "apps/server/src/relay/node-metrics-rollup.ts | fragment-other": [4, "node_metrics_minute."],
   "apps/server/src/relay/runtime-load-rollup.ts | fragment-other": [2, "runtime_load_minute."],
+  "packages/api/src/lib/agent-updates.ts | raw-other": [
+    2,
+    "Self-update authority locks: the node row (policy, trust, stored connection) and the claimed node_agent_update row.",
+  ],
   "packages/api/src/lib/metrics-query.ts | fragment-other": [
     54,
     "Read-only metrics over rollup tables.",

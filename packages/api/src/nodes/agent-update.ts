@@ -25,7 +25,9 @@ import {
   agentUpdateEligibility,
   agentUpdateRefusalMessage,
   agentUpdateReleaseDigest,
+  agentUpdateStopAllowed,
   chooseCanary,
+  lockAgentUpdateAuthority,
   orderForBatch,
   parseWsl,
   phaseFromDb,
@@ -85,6 +87,9 @@ const UPDATE_SELECT = {
   toVersion: true,
   force: true,
   strategy: true,
+  fromCommit: true,
+  availableVersion: true,
+  availableGeneration: true,
   createdAt: true,
   updatedAt: true,
   endedAt: true,
@@ -98,6 +103,7 @@ type UpdateRow = {
   fromVersion: string | null;
   toVersion: string;
   force: boolean;
+  strategy: string;
   createdAt: Date;
   updatedAt: Date;
   endedAt: Date | null;
@@ -112,6 +118,7 @@ function toUpdateView(row: UpdateRow): UpdateView {
     fromVersion: row.fromVersion,
     toVersion: row.toVersion,
     force: row.force,
+    strategy: row.strategy,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     endedAt: row.endedAt?.toISOString() ?? null,
@@ -222,7 +229,18 @@ async function loadOverview(userId: string, port: AgentUpdatePort, now: Date) {
         latest && latest.endedAt === null && latestPhase
           ? { phase: latestPhase, strategy: latest.strategy }
           : null,
-      latest: latest && latestPhase ? { phase: latestPhase, strategy: latest.strategy } : null,
+      latest:
+        latest && latestPhase
+          ? {
+              phase: latestPhase,
+              strategy: latest.strategy,
+              reason: latest.reason,
+              fromVersion: latest.fromVersion,
+              fromCommit: latest.fromCommit,
+              availableVersion: latest.availableVersion,
+              availableGeneration: latest.availableGeneration,
+            }
+          : null,
     });
     return {
       nodeId: node.id,
@@ -233,11 +251,14 @@ async function loadOverview(userId: string, port: AgentUpdatePort, now: Date) {
       build: eligibility.build,
       wsl: parseWsl(node.environment),
       outdated: eligibility.outdated,
+      newerThanServer: eligibility.newerThanServer,
       policy: node.agentUpdatePolicy,
       selfUpdate: eligibility.selfUpdate,
       canUpdate: eligibility.canUpdate,
       blockedReason: eligibility.blockedReason,
       manualCommand: eligibility.manualCommand,
+      availableVersion: eligibility.availableVersion,
+      availableVersionAhead: eligibility.availableVersionAhead,
       runningInstances: [...(runningByNode.get(node.id) ?? new Map()).entries()].map(
         ([id, name]) => ({ id, name }),
       ),
@@ -301,6 +322,7 @@ export const agentUpdateProcedures = {
       nodeId: input.nodeId,
       force: input.force ?? false,
       origin: origin(),
+      ...(input.version !== undefined ? { version: input.version } : {}),
     });
     if (outcome.kind === "not_found") throw notFound("That node does not exist.");
     if (outcome.kind === "refused")
@@ -310,9 +332,21 @@ export const agentUpdateProcedures = {
       throw refuse("agent_update_unavailable", "The server's release changed; try again.");
     // Force: the node's instances would not survive its restart, so the server stops them
     // itself, as `runtimes.stop` does (recorded and shown like any stop). The node waits until
-    // they are stopped, then installs.
-    if (input.force && port.liveNode(input.nodeId)?.selfUpdate?.instancesSurvive === false)
-      await stopInstancesOnNode(context, userId, input.nodeId);
+    // they are stopped, then installs. Only while that update still runs and is still allowed:
+    // decided inside the stop's own transaction under the node's update-authority lock, before
+    // it records anything and again before it commits (a node that opted out, was lowered or
+    // turned off since refuses the update; its instances keep running).
+    if (input.force && port.liveNode(input.nodeId)?.selfUpdate?.instancesSurvive === false) {
+      const forced = {
+        userId,
+        nodeId: input.nodeId,
+        updateId: outcome.updateId,
+        connectionGeneration: outcome.connectionGeneration,
+      };
+      await stopInstancesOnNode(context, userId, input.nodeId, (tx) =>
+        agentUpdateStopAllowed(tx, port, forced),
+      );
+    }
     const row = await prisma.nodeAgentUpdate.findFirst({
       where: { id: outcome.updateId, userId },
       select: UPDATE_SELECT,
@@ -397,11 +431,17 @@ export const agentUpdateProcedures = {
 
   setPolicy: contractProcedure(c.agentUpdate.setPolicy).handler(async ({ context, input }) => {
     const userId = assertOwnSession(context);
-    const written = await prisma.node.updateMany({
-      where: { id: input.nodeId, userId },
-      data: { agentUpdatePolicy: input.policy },
+    // Under the node's update-authority lock, as every update effect: one that holds it now
+    // (a send, a STOP) finishes first, and every later one reads this policy.
+    const written = await prisma.$transaction(async (tx) => {
+      if (!(await lockAgentUpdateAuthority(tx, userId, input.nodeId))) return 0;
+      const updated = await tx.node.updateMany({
+        where: { id: input.nodeId, userId },
+        data: { agentUpdatePolicy: input.policy },
+      });
+      return updated.count;
     });
-    if (written.count !== 1) throw notFound("That node does not exist.");
+    if (written !== 1) throw notFound("That node does not exist.");
     return { policy: input.policy };
   }),
 };

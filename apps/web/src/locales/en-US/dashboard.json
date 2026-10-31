@@ -551,10 +551,11 @@
     },
     "agentUpdate": {
       "title": "wsmp version",
-      "description": "Update wsmp on this node to the version this server runs. If the new version does not come up healthy, the node goes back to the old one by itself.",
+      "description": "Update wsmp on this node to the version this server runs (or, if you choose Install anyway, the version its Homebrew tap has). If the new version does not come up healthy, the node goes back to the old one by itself, except for a Homebrew install, which cannot.",
       "loadFailed": "Could not load the wsmp versions.",
       "outdated": "Outdated",
       "current": "Up to date",
+      "newerThanServer": "Newer than this server",
       "wslBadge": "WSL",
       "updatingBadge": "Updating wsmp",
       "nodeVersion": "On the node",
@@ -563,6 +564,7 @@
       "unknownCommit": "Unknown build",
       "serverVersion": "This server",
       "wslWarning": "This node runs in WSL. Windows can stop an idle WSL distribution, and then the update, or going back to the old version, waits until the distribution runs again.",
+      "newerThanServerHelp": "This node runs a newer wsmp than this server ({{server}}). Upgrade the server to match: until then, a change on the server side could keep this node from connecting.",
       "nodeSaid": "What the node reported",
       "fixByHand": "To fix it by hand, run this on the node:",
       "manualCommand": "Command to run on the node",
@@ -613,7 +615,7 @@
           "OFF": "Only update on the machine itself"
         },
         "help": {
-          "ALLOWED": "You can update this node from here. It only ever installs this server's version.",
+          "ALLOWED": "You can update this node from here. It installs this server's version, unless you choose Install anyway for the version the node's Homebrew tap has.",
           "OFF": "The Update button is turned off. Update by running the install command on the node."
         }
       },
@@ -634,6 +636,10 @@
         "in_progress": "Another update is already running on the node.",
         "internal": "Something went wrong on the node.",
         "other": "The node gave a reason this page does not know."
+      },
+      "homebrewReason": {
+        "version_mismatch_refused": "The Homebrew tap does not have the version asked for. wsmp was not upgraded.",
+        "version_mismatch_failed": "Homebrew ran the upgrade, but the installed wsmp is not the version asked for, or its version could not be checked. Check the node (`wsmp --version`) before you restart it."
       },
       "method": {
         "script": "install script",
@@ -703,6 +709,17 @@
         "swapped": "switching versions",
         "restarting": "restarting",
         "other": "updating"
+      },
+      "anyway": {
+        "offer": "The node's Homebrew tap has wsmp {{version}}, newer than this server's {{server}}. The usual fix is to upgrade this server to {{version}}.",
+        "offerBehind": "The node's Homebrew tap does not have wsmp {{server}} yet; it has {{version}}. Update again once the tap has {{server}}, or install {{version}} now.",
+        "button": "Install {{version}} anyway",
+        "title": "Install wsmp {{version}} on {{slug}}?",
+        "description": "This server runs wsmp {{server}}, but Homebrew on {{slug}} can only install {{version}}. Upgrading the server to {{version}} is the usual fix.",
+        "descriptionBehind": "This server runs wsmp {{server}}, but Homebrew on {{slug}} only has {{version}} so far. Waiting until the tap has {{server}} is the usual fix.",
+        "risk": "If you install it anyway, {{slug}} runs a different wsmp than the server. If {{version}} needs a newer server, {{slug}} cannot reconnect until you upgrade the server, and Homebrew cannot go back to the old version by itself.",
+        "riskBehind": "If you install it anyway, {{slug}} still runs an older wsmp than the server, and Homebrew cannot go back to the old version by itself. Update it again once the tap has {{server}}.",
+        "confirm": "Install {{version}}"
       }
     }
   },

@@ -74,11 +74,6 @@ const AUDIT_OUTCOME: Record<
 };
 
 /**
- * Records a command's end once: the row leaves RUNNING (guarded, so concurrent settlers
- * record it exactly once) and the audit event is appended by whoever settled it. Answers the
- * row as stored afterwards.
- */
-/**
  * A command's end on the server's clock: its stored start plus the run time the node measured.
  * The node's own end time is on its clock, which can be behind the server's (a laptop): the
  * end would then read as the start. Without a measured run time, when the end reached us.
@@ -91,6 +86,11 @@ export function commandFinishedAt(
   return live.finishedAt;
 }
 
+/**
+ * Records a command's end once: the row leaves RUNNING (guarded, so concurrent settlers
+ * record it exactly once) and the audit event is appended by whoever settled it. Answers the
+ * row as stored afterwards.
+ */
 export async function settleNodeCommand(
   row: NodeCommandRow,
   state: NodeCommandEndState,

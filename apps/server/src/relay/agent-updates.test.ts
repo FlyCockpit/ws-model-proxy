@@ -81,6 +81,41 @@ describe("the self-update relay port", () => {
     });
   });
 
+  it("sends no agent.update to a session that opted out, has no self-update, or reconnected", () => {
+    const frame = {
+      type: "agent.update" as const,
+      updateId: "AAAAAAAAAAAAAAAAAAAAAA",
+      version: "0.4.2",
+      artifactUrl: "https://r.example/a",
+      sha256: "a".repeat(64),
+      signature: null,
+      force: true,
+      rollbackAfterSecs: 90,
+    };
+    const live = relay().nodeSession();
+    for (const session of [
+      { ...live, selfUpdate: { ...live.selfUpdate, remote: "off" as const } },
+      { ...live, selfUpdate: null },
+      { ...live, connectionGeneration: 8 },
+      null,
+    ]) {
+      const r = relay();
+      r.nodeSession.mockReturnValue(session as never);
+      const updates = createAgentUpdates(r, { manifest: { get: async () => MANIFEST } });
+      expect(
+        updates.port.send("node-1", frame, { connectionGeneration: 7, userId: "owner-1" }),
+      ).toBe(false);
+      expect(r.sendToNode).not.toHaveBeenCalled();
+    }
+    // The inverse: remote allowed on the same connection goes out.
+    const r = relay();
+    const updates = createAgentUpdates(r, { manifest: { get: async () => MANIFEST } });
+    expect(updates.port.send("node-1", frame, { connectionGeneration: 7, userId: "owner-1" })).toBe(
+      true,
+    );
+    expect(r.sendToNode).toHaveBeenCalledTimes(1);
+  });
+
   it("offers nothing when the manifest cannot be read (fail closed)", async () => {
     const updates = createAgentUpdates(relay(), {
       manifest: {
@@ -123,8 +158,9 @@ describe("the self-update relay port", () => {
       settled: true,
     });
     await updates.handlers["agent.update.progress"]?.(node, frame);
+    // With the session's connection: an offer it carries is bound to it (Install anyway).
     expect(lib.applyAgentUpdateProgress).toHaveBeenCalledWith(
-      { nodeId: "node-1", userId: "owner-1" },
+      { nodeId: "node-1", userId: "owner-1", connectionGeneration: 7 },
       frame,
     );
     await updates.tick();

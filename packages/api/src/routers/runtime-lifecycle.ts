@@ -360,18 +360,27 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
  * Every running instance placed on `nodeId` (a rank there, or a reservation of its plan there),
  * stopped as `runtimes.stop` stops them: one recorded STOP operation, dispatched. A forced wsmp
  * update uses it on a node whose instances do not survive the agent's restart. Null when
- * nothing runs there.
+ * nothing runs there, or when `allowed` says the stop's reason no longer holds: it runs in the
+ * stop's transaction after its fences (it may take row locks there), before anything is
+ * recorded and again after the last write, before the commit; false either time rolls the whole
+ * stop back, so nothing is recorded or dispatched.
  */
 export async function stopInstancesOnNode(
   context: SignedInContext,
   userId: string,
   nodeId: string,
+  allowed?: (tx: Prisma.TransactionClient) => Promise<boolean>,
 ): Promise<string | null> {
-  return stopInstancesWhere(context, userId, {
+  return stopInstancesWhere(
+    context,
     userId,
-    desiredState: "RUNNING" as const,
-    ...placedOnNodesWhere([nodeId]),
-  });
+    {
+      userId,
+      desiredState: "RUNNING" as const,
+      ...placedOnNodesWhere([nodeId]),
+    },
+    allowed,
+  );
 }
 
 /** The STOP operation of `runtimes.stop`, for the running instances `where` selects. */
@@ -379,6 +388,7 @@ async function stopInstancesWhere(
   context: SignedInContext,
   userId: string,
   where: Prisma.RuntimeInstanceWhereInput,
+  allowed?: (tx: Prisma.TransactionClient) => Promise<boolean>,
 ): Promise<string | null> {
   const actor = callerActor(context.auth, userId);
   // Read, check and write under the owner fence, so a trust lowering (an owner write) cannot
@@ -387,6 +397,9 @@ async function stopInstancesWhere(
   const operationId: string | null = await graphWrite(
     [userId],
     async (tx) => {
+      // The stop's reason, decided after the fences and the instance read (both waits), right
+      // before the writes.
+      if (allowed && !(await allowed(tx))) throw new NotAllowed();
       const operation = await tx.runtimeOperation.create({
         data: {
           userId,
@@ -403,6 +416,8 @@ async function stopInstancesWhere(
         select: { id: true },
       });
       await markInstancesStopping(tx, userId, ids, operation.id, "stop_requested");
+      // And once more before the commit: whatever changed during these writes rolls them back.
+      if (allowed && !(await allowed(tx))) throw new NotAllowed();
       return operation.id;
     },
     async (tx) => {
@@ -424,12 +439,19 @@ async function stopInstancesWhere(
       return instanceCapacityFences(ids);
     },
   ).catch((error: unknown) => {
-    if (error instanceof NothingRunning) return null;
+    // Rolled back whole: nothing was recorded.
+    if (error instanceof NothingRunning || error instanceof NotAllowed) return null;
     throw error;
   });
   if (!operationId) return null;
+  // The STOP's authorization point is its commit (`allowed` ran inside the transaction, last
+  // right before the commit). A committed STOP is always dispatched, here, after the commit; it is
+  // not checked again or called back, whatever changes after it (as a sent update is not).
   await context.services?.dispatchRuntimeOperation?.({ userId, operationId });
   return operationId;
 }
 
 class NothingRunning extends Error {}
+
+/** `allowed` said no: the stop's reason no longer holds. */
+class NotAllowed extends Error {}

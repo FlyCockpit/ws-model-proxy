@@ -305,28 +305,39 @@ model NodeCommand {
 /// `node_agent_update_one_active`). History: ended rows are deleted after 30 days.
 model NodeAgentUpdate {
   /// The relay updateId (16 random bytes, base64url).
-  id                String               @id
-  createdAt         DateTime             @default(now())
-  updatedAt         DateTime             @default(now()) @updatedAt
-  userId            String
-  nodeId            String
-  batchId           String?
-  fromVersion       String?
-  fromCommit        String?
-  toVersion         String
+  id                  String               @id
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @default(now()) @updatedAt
+  userId              String
+  nodeId              String
+  batchId             String?
+  fromVersion         String?
+  fromCommit          String?
+  toVersion           String
   /// `self-replace` or `homebrew` (the node's strategy the server chose).
-  strategy          String
-  force             Boolean              @default(false)
+  strategy            String
+  force               Boolean              @default(false)
   /// The dead-man deadline sent to the node (30..600).
-  rollbackAfterSecs Int
-  phase             NodeAgentUpdatePhase @default(REQUESTED)
+  rollbackAfterSecs   Int
+  phase               NodeAgentUpdatePhase @default(REQUESTED)
   /// The node's (or the server's) reason code for REFUSED / FAILED / TIMED_OUT.
-  reason            String?
+  reason              String?
   /// Node text (a manual command or a log tail), at most 4000 characters. Shown as plain text.
-  detail            String?
+  detail              String?
+  /// The SHA-256 of the archive `agent.update` sent (the node's target). A forced resend of a
+  /// waiting update goes out only while the server still offers that archive. Null on rows
+  /// written before it was stored: those are never resent.
+  artifactSha256      String?
+  /// A REFUSED `version_mismatch`: the version the node could install instead (its Homebrew
+  /// tap's), which the owner may install anyway. A release version reported by the node.
+  availableVersion    String?
+  /// The node connection (`Node.connectionGeneration`) the refusal carrying `availableVersion`
+  /// arrived on, or an Install anyway update was sent on. When a build commit is unknown, that
+  /// connection is the only proof the node still runs the same wsmp (no reuse after reconnect).
+  availableGeneration Int?
   /// When the server gives up waiting for the next phase (then TIMED_OUT). Null once ended.
-  deadlineAt        DateTime?
-  endedAt           DateTime?
+  deadlineAt          DateTime?
+  endedAt             DateTime?
 
   Node  Node                  @relation(fields: [nodeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   Batch NodeAgentUpdateBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull, onUpdate: Cascade)
