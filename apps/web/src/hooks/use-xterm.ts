@@ -2,7 +2,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { type RefCallback, useCallback, useEffect, useRef, useState } from "react";
+import { type RefCallback, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { useLatestRef } from "@/hooks/use-latest-ref";
 import {
@@ -18,6 +18,11 @@ import { newlineSequence } from "@/lib/terminal-keys";
 import type { TerminalShiftEnterMode } from "@/lib/terminal-settings";
 import { TERMINAL_FONT_FAMILY, TERMINAL_THEME } from "@/lib/terminal-theme";
 import {
+  isTouchScrollWheel,
+  type TouchScrollWiring,
+  wireTouchScroll,
+} from "@/lib/terminal-touch-scroll";
+import {
   floorTerminalSize,
   sameSize,
   type TerminalInputOrigin,
@@ -29,7 +34,8 @@ import {
 type XtermHandlers = {
   /**
    * Input for the PTY: text (UTF-8), or raw bytes for xterm's binary mouse reports. `origin`
-   * tells the session hook's send-time gateway what it is (a reply never claims the writer).
+   * tells the session hook's send-time gateway what it is (a reply or the desktop wheel's input
+   * never claims the writer; a touch scroll's is `user`, as a key's is).
    */
   onData: (data: string | Uint8Array, origin: Exclude<TerminalInputOrigin, "typed">) => void;
   onImage?: (file: File) => Promise<TerminalImageAttachment>;
@@ -103,6 +109,8 @@ export function useXterm(options: XtermOptions): {
   const termRef = useRef<Terminal | null>(null);
   const writerRef = useRef<ReturnType<typeof createReplayAwareWriter> | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  /** The current xterm's touch scrolling, owned by the xterm effect. */
+  const touchScrollRef = useRef<TouchScrollWiring | null>(null);
   const [gate] = useState(() => new CopyOutGate());
   const [inputGate] = useState(() => new TerminalUserInputGate());
   const ownSizeRef = useRef<TerminalSize | null>(null);
@@ -252,16 +260,60 @@ export function useXterm(options: XtermOptions): {
      */
     let modifiedF3 = false;
     let modifiedF3Timer: ReturnType<typeof setTimeout> | null = null;
+    // A one-finger vertical swipe scrolls like the wheel (a mouse app gets wheel reports); what it
+    // sends is the person's input, as a key's is, and takes the writer from someone else. Following
+    // (the pane shows the writer's size), touch is left to the browser: the follow box pans on both
+    // axes and sends nothing. Select text and a hidden tab take no touch either.
+    const touchScroll = wireTouchScroll(term, container, {
+      enabled: () => activeRef.current && !selectingRef.current && followRef.current === null,
+      onTap: () => gate.armFromUserGesture(),
+    });
+    touchScrollRef.current = touchScroll;
+    /**
+     * The wheel event xterm's own wheel listener is handling. xterm calls the custom wheel handler
+     * first thing in both of its wheel paths (a mouse app's wheel report, the alternate screen's
+     * arrow key) and emits that input synchronously before the listener returns. Data is the
+     * wheel's only while a listener of that very event is running: the window's current event
+     * (`window.event`, set around every listener call and restored after, nested dispatches
+     * included) is it. A key, paste, input or focus event dispatched from inside the wheel's
+     * dispatch is the current event while its own listeners run, so its data keeps its own origin.
+     * A microtask ends the wheel's turn as soon as xterm's listener returns from a real wheel, so
+     * a later listener or a promise continuation never counts. Nothing outside this hook holds the
+     * terminal, so nothing else can make xterm emit while the wheel's listeners run. Covers the
+     * desktop wheel and the touch scroll's wheel events alike; which of the two it is decides the
+     * origin in `forward`.
+     */
+    const view = container.ownerDocument.defaultView;
+    let wheelEvent: WheelEvent | null = null;
+    term.attachCustomWheelEventHandler((event) => {
+      wheelEvent = event;
+      queueMicrotask(() => {
+        if (wheelEvent === event) wheelEvent = null;
+      });
+      return true;
+    });
+    /** A desktop wheel's, not a touch scroll's (`isTouchScrollWheel`). */
+    const handlingDesktopWheel = () =>
+      wheelEvent !== null && view?.event === wheelEvent && !isTouchScrollWheel(wheelEvent);
     /**
      * Everything xterm emits goes out through here with its origin. A follower sends only real
      * input (never a reply, and only right after a real gesture); the session hook's gateway
      * applies the rest at send time.
      */
     const forward = (data: string | Uint8Array, text: string) => {
-      const origin = terminalDataOrigin(text, modifiedF3);
-      if (origin === "user") modifiedF3 = false;
+      // xterm answering a touch's release with the release of an earlier touch press whose own
+      // release never reached it: not this touch's input, and nothing to send.
+      if (touchScroll.foreignRelease(view?.event)) return;
+      const dataOrigin = terminalDataOrigin(text, modifiedF3);
+      if (dataOrigin === "user") modifiedF3 = false;
+      // The desktop wheel's input only scrolls: the gateway sends it only from the writer. A touch
+      // scroll's is the person's own input, as a tap or a key is: it stays `user` and takes the
+      // writer. (Known limit, older than the `wheel` origin: a desktop wheel's input sealed before
+      // another viewer's takeover can reach the CLI after it, and the CLI makes this viewer the
+      // writer again. Only the CLI can refuse it; see TerminalInputOrigin.)
+      const origin = dataOrigin === "user" && handlingDesktopWheel() ? "wheel" : dataOrigin;
       if (followRef.current !== null) {
-        if (origin === "reply" || !inputGate.armed(performance.now())) return;
+        if (origin !== "user" || !inputGate.armed(performance.now())) return;
       }
       if (imagePaste && typeof data === "string")
         imagePaste.sent =
@@ -322,15 +374,30 @@ export function useXterm(options: XtermOptions): {
       armInput();
       gate.armFromUserGesture();
     };
-    // A click claims the writer only in a mouse-reporting app. The wheel never does, and neither
-    // does a Mac Option+click, which selects text instead of sending a report.
+    // A click claims the writer only in a mouse-reporting app. The desktop wheel never does (a
+    // touch scroll does, through its own input, which is `user`), and neither does a Mac
+    // Option+click, which selects text instead of sending a report.
     const armClick = (event: MouseEvent) => {
       if (term.modes.mouseTrackingMode === "none") return;
       if (event.altKey && MAC_PLATFORM.test(navigator.platform)) return;
       armInput();
     };
-    // Any press in the pane opens the copy window: tmux and agents copy on mouse release.
-    const armCopy = () => gate.armFromUserGesture();
+    // Any press in the pane opens the copy window: tmux and agents copy on mouse release. A
+    // finger counts only as a tap, decided in its touchend once every finger on the page is known:
+    // a swipe is a scroll, not a press; a touch with a second finger anywhere is no tap; and a
+    // touch that outlived its interaction (a reset, a retire, a new attach, the pane hidden or
+    // following) is no tap of this one. A touch's pointer events open nothing. The mouse events a
+    // touch makes (focus, a click report, `armClick`'s writer claim, xterm's release report from the
+    // document) act only after its tap here: a finger that went down on a pane since replaced (a
+    // remount, a closed tab) lifts with no touchend, and its click lands on this terminal. The
+    // document's owner of those events (terminal-touch-mouse.ts) decides before any listener here.
+    // The one exception, a long press's context menu while its finger is still down, only focuses:
+    // no user input (no keystroke or mouse-button report), no writer claim, no copy window. A
+    // program that enabled focus reports (DECSET 1004) still gets xterm's `ESC [ I`, as a reply.
+    const armCopy = (event: PointerEvent) => {
+      if (event.pointerType === "touch") return;
+      gate.armFromUserGesture();
+    };
     let disposed = false;
     let uploading = false;
     const pasteImages = async (files: File[], fallbackText = "") => {
@@ -458,6 +525,8 @@ export function useXterm(options: XtermOptions): {
     return () => {
       disposed = true;
       observer.disconnect();
+      touchScroll.dispose();
+      if (touchScrollRef.current === touchScroll) touchScrollRef.current = null;
       container.removeEventListener("keydown", armKey, true);
       container.removeEventListener("compositionstart", armInput, true);
       container.removeEventListener("compositionupdate", armInput, true);
@@ -491,6 +560,14 @@ export function useXterm(options: XtermOptions): {
     selectingRef,
     shiftEnterRef,
   ]);
+
+  // Touch stops being the pane's (hidden, Select text, following): the touch or coasting scroll in
+  // progress ends with it (a touch still down is no tap and scrolls no more), so it cannot pick up
+  // again if touch is the pane's again before its next frame. Run with the refs `enabled()` reads (also updated in layout effects).
+  const touchEnabled = options.active && !options.selecting && options.follow === null;
+  useLayoutEffect(() => {
+    if (!touchEnabled) touchScrollRef.current?.cancel();
+  }, [touchEnabled]);
 
   // Becoming the visible tab lays out again (its box may have changed while hidden); hiding drops
   // any gesture authorization, so nothing typed or clicked before counts later.
@@ -557,14 +634,18 @@ export function useXterm(options: XtermOptions): {
     // and the screen resets in output order (see createReplayAwareWriter).
     gate.disarm();
     inputGate.disarm();
+    // A touch belongs to the attach it began on: one still down is void (no tap, no scroll).
+    touchScrollRef.current?.cancel();
     writerRef.current?.reset();
   }, [gate, inputGate]);
   const retire = useCallback(() => {
     gate.disarm();
     inputGate.disarm();
+    touchScrollRef.current?.cancel();
     writerRef.current?.retire();
   }, [gate, inputGate]);
   const attached = useCallback(() => {
+    touchScrollRef.current?.cancel();
     gate.attached();
   }, [gate]);
   const focus = useCallback(() => {
