@@ -281,3 +281,48 @@ hold the update past it. On Linux and macOS, a helper that detached into a sessi
 outside that group and can keep running after the limit. The service-manager commands an
 update or a rollback runs (`systemctl --user daemon-reload` / `restart`, `launchctl`) run the same
 way, with a 3-minute limit.
+
+## Touch scrolling in the browser terminal
+
+On a phone or tablet, swiping up or down in the terminal now scrolls it the way a mouse wheel
+does on a desktop: inside tmux with `mouse on` (and other apps that use the mouse) it scrolls
+the app's history, on a full-screen app without the mouse it sends arrow keys, and at a plain
+shell it scrolls the terminal's scrollback. A swipe never counts as a click, so it does not let
+a program copy to the clipboard. What it sends is your input, like a key you press: if someone
+else took over typing while your swipe (or its coasting) is still scrolling, it takes typing
+back for you. A tap still focuses the terminal and opens the keyboard, and a program may copy
+to the clipboard right after it. A tap is a finger that lifts where it went down, within a small movement
+threshold: one that lifts farther away is not a tap, even if the browser reported no movement before it lifted. How long
+the finger stays down does not matter: a long press that does not move is a tap too. A long
+press can also focus the terminal while the finger is still down (the browser's long-press menu
+does this); that sends no keystrokes or mouse clicks, does not take over typing and does not let a
+program copy to the clipboard. A program that asked to be told about focus is told the terminal
+gained focus. A touch
+that is still down when the terminal reattaches, resets or is hidden (or when someone else starts typing)
+does nothing when it lifts: tap again. Neither does a touch with a second finger on the screen,
+even one outside the terminal, nor a finger still resting on a terminal whose tab closes or reloads: it does not
+click into the terminal that takes its place. On a device with both a mouse and a touch screen,
+a tap made while a mouse button is held down in a terminal clicks into no terminal and does not
+end that mouse drag, and pressing a second mouse or pen button during a drag works as before.
+In Safari and Firefox, which do not mark the mouse events a touch makes, three of these protections
+do not apply, and those cases behave as they did before this release. A finger resting on a
+terminal that is replaced can still click into the terminal that takes its place. A long-press
+menu that the browser does not mark as a touch's can focus a terminal you did not tap (and may
+open the keyboard); it sends no keystrokes or mouse clicks, does not take over typing and does
+not let a program copy (a program that asked to be told about focus is told the terminal gained
+focus). And on a device
+with both a mouse and a touch screen, if a mouse button is held down in a terminal and a finger taps
+outside every terminal, the browser's release for that tap looks the same as the mouse's own: the
+terminal sends the program a mouse release you did not make, as your input. That input can also
+take typing back for you from someone who took it over meanwhile: while the terminal box follows
+their screen size, only if the tap comes within half a second of the mouse press; while their
+screen size is not known yet, at any time. While someone else is typing and the terminal box
+follows their screen size, a swipe pans the box as before and sends nothing; while their size is
+not known yet, a swipe scrolls and takes typing back for you, as a key would. A swipe that starts
+on the terminal no longer scrolls the page.
+
+The mouse wheel on a desktop is now sent only while you are the one typing: if someone else takes
+over while a wheel scroll is on its way, it is dropped instead of taking typing back from them.
+One case is not covered yet and behaves as before this release: a wheel scroll that had already
+left your browser when they took over can still reach the computer after their takeover, and then
+takes typing back for you.
