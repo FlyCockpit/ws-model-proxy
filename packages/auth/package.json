@@ -44,6 +44,9 @@
     "./user-ban-listeners": {
       "default": "./src/user-ban-listeners.ts"
     },
+    "./session-revoked-listeners": {
+      "default": "./src/session-revoked-listeners.ts"
+    },
     "./user-deletion-access-guard": {
       "default": "./src/user-deletion-access-guard.ts"
     },

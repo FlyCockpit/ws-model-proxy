@@ -13,7 +13,7 @@ import prisma from "@ws-model-proxy/db";
 import type { Context, RuntimeStepRefusal, RuntimeStepServices } from "../context";
 import { contractProcedure } from "../contract-procedure";
 import { runtimesContract as c } from "../contracts/runtimes";
-import { notFound, refuse } from "../lib/refuse";
+import { notFound, refuse, refuseImpersonatedShell } from "../lib/refuse";
 import { INSTANCE_INCLUDE, stepView, stepViewContext } from "../lib/runtime-views";
 
 function services(context: Context): RuntimeStepServices {
@@ -63,6 +63,7 @@ async function ownedStepView(userId: string, stepId: string) {
 
 export const runtimeSteps = {
   attach: contractProcedure(c.steps.attach).handler(async ({ input, context }) => {
+    refuseImpersonatedShell(context.session.session);
     const userId = context.session.user.id;
     const result = await services(context).attach({
       userId,

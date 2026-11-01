@@ -570,6 +570,8 @@ enum NodeChange {
     Raised,
     /// Features changed (secrets, runtime hosts): report `node.state`.
     Features,
+    /// `config.json` turned `allowHumanTerminal` off (latched already).
+    HumanTerminalsDisabled,
 }
 
 /// Lower to Relay only: freeze (today's set when coming from Full),
@@ -586,15 +588,21 @@ fn apply_lower(startup: &TerminalStartup) -> Result<bool> {
 }
 
 /// Hot reload (every 2 s on a changed `config.json`, and on `Reload`):
-/// runtime hosts follow the file; trust only ever goes down. A file that
-/// says `full` while the node is Relay only is written back to `relay`.
+/// runtime hosts follow the file; trust and the browser terminal switch only
+/// ever go down. A file that says `full` while the node is Relay only is
+/// written back to `relay`.
 fn reload_config(startup: &TerminalStartup) -> Result<Vec<NodeChange>> {
     let mut changes = vec![NodeChange::Features];
     // Trust first, from the raw file: a config that does not parse (a typo
     // anywhere) or lacks `trust: full` reads as Relay only.
     let file_trust = crate::trust::configured_on_disk();
     match Config::load_required() {
-        Ok(config) => startup.set_runtime_hosts(config.runtime_hosts.clone()),
+        Ok(config) => {
+            startup.set_runtime_hosts(config.runtime_hosts.clone());
+            changes.extend(reload_human_terminal(startup, &config));
+        }
+        // A config that does not load reads as Relay only below, which ends
+        // browser shells too.
         Err(error) => tracing::warn!(
             error = %format!("{error:#}"),
             "config.json does not load; keeping the runtime hosts"
@@ -621,6 +629,19 @@ fn reload_config(startup: &TerminalStartup) -> Result<Vec<NodeChange>> {
         _ => {}
     }
     Ok(changes)
+}
+
+/// The browser terminal switch on hot reload: off latches now (and ends
+/// browser shells); on is left for a restart, like a trust raise.
+fn reload_human_terminal(startup: &TerminalStartup, config: &Config) -> Option<NodeChange> {
+    if !config.allow_human_terminal && startup.disable_human_terminal() {
+        tracing::warn!("config.json turned browser terminals off; ending browser shells");
+        return Some(NodeChange::HumanTerminalsDisabled);
+    }
+    if config.allow_human_terminal && !startup.allow_human_terminal() {
+        tracing::warn!("config.json turns browser terminals on; that takes a restart of the relay");
+    }
+    None
 }
 
 /// Polls `config.json` for edits (mtime, every 2 s).
@@ -1814,6 +1835,15 @@ where
         } else {
             let _ = session.terminals.on_trust_lowered();
             session.deferred.extend(interrupted);
+        }
+    }
+    if changes.contains(&NodeChange::HumanTerminalsDisabled)
+        && !changes.contains(&NodeChange::Lowered)
+    {
+        // Operator terminals do not need the switch: they stay.
+        let closed = session.terminals.on_human_terminals_disabled();
+        if session.registered {
+            send_outbound_frames(socket, closed)?;
         }
     }
     if changes.contains(&NodeChange::Raised) {
@@ -4623,6 +4653,31 @@ mod tests {
                 "https://example.test".to_string()
             )
         );
+    }
+
+    #[test]
+    fn hot_reload_turns_browser_terminals_off_but_never_on() {
+        let on = Config {
+            allow_human_terminal: true,
+            ..Config::default()
+        };
+        let off = Config::default();
+        let startup = TerminalStartup::from_key(
+            crate::terminal_crypto::CliTerminalKey::generate().expect("key"),
+            &on,
+        );
+        assert!(reload_human_terminal(&startup, &on).is_none());
+        assert!(startup.allow_human_terminal());
+        assert_eq!(
+            reload_human_terminal(&startup, &off),
+            Some(NodeChange::HumanTerminalsDisabled)
+        );
+        assert!(!startup.allow_human_terminal());
+        // Reported once; turning it back on in the file takes a restart.
+        assert!(reload_human_terminal(&startup, &off).is_none());
+        assert!(reload_human_terminal(&startup, &on).is_none());
+        assert!(!startup.allow_human_terminal());
+        assert!(!startup.features().terminals.supported);
     }
 
     fn config_with(server_url: &str, public_origin: Option<&str>) -> Config {

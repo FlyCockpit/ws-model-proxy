@@ -313,6 +313,21 @@ describe("terminal websocket admission", () => {
     expect(continued).toBe(true);
   });
 
+  it("refuses a session an admin impersonates through before upgrade", async () => {
+    const impersonated = browserSession();
+    sessions.getSession.mockResolvedValue({
+      ...impersonated,
+      session: { ...impersonated.session, impersonatedBy: "admin-id" },
+    });
+    const response = await middlewareApp().request("/api/dashboard/terminal/ws", {
+      headers: { upgrade: "websocket", cookie: "session=ok", origin: "https://proxy.example.com" },
+    });
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: "Terminals are not available while impersonating a user.",
+    });
+  });
+
   it("admits an unenrolled user when two-factor is not mandatory", async () => {
     sessions.getSession.mockResolvedValue(browserSession("user-id", false));
     const response = await middlewareApp().request("/api/dashboard/terminal/ws", {
@@ -462,10 +477,11 @@ describe("terminal browser hub", () => {
     db.node.findMany.mockResolvedValue([]);
     db.runtimeInstance.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
+    // Far ahead of every test's clock: each open and attach re-reads it (finding 2).
     db.session.findUnique.mockResolvedValue({
       userId: "user-id",
-      expiresAt: new Date("2026-02-01T00:00:00.000Z"),
-      user: { twoFactorEnabled: false },
+      expiresAt: new Date("2099-01-01T00:00:00.000Z"),
+      user: { twoFactorEnabled: false, deletionRequestedAt: null, banned: null, banExpires: null },
     });
     twoFactorPolicy.required.mockReset();
     twoFactorPolicy.required.mockResolvedValue(false);
@@ -896,6 +912,99 @@ describe("terminal browser hub", () => {
     expect(cli.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(1);
   });
 
+  it("a revoked session closes its sockets, ends the shells they view and burns its tickets", async () => {
+    const cli = await connectCli("one");
+    const stolen = new FakeSocket();
+    terminalBrowserHub.accept({ socket: stolen, userId: "user-id", sessionId: "stolen" });
+    const own = attachBrowser();
+    await terminalBrowserHub.handleText(
+      stolen,
+      JSON.stringify({
+        type: "open",
+        ticket: ticketFor("one", "user-id", "stolen"),
+        cols: 80,
+        rows: 24,
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      }),
+    );
+    await open(own, "one");
+    const opened = cli.jsonSends().filter((message) => message.type === "term.open");
+    expect(opened).toHaveLength(2);
+    const unused = ticketFor("one", "user-id", "stolen");
+
+    terminalBrowserHub.revokeTerminalAccessForSession("stolen");
+    expect(stolen.closes).toEqual([{ code: 4401, reason: "session_revoked" }]);
+    expect(own.closes).toEqual([]);
+    // The stolen session's shell ends on the node; the person's own keeps running.
+    const closed = cli.jsonSends().filter((message) => message.type === "term.close");
+    expect(closed).toEqual([expect.objectContaining({ terminalId: opened[0]?.terminalId })]);
+    expect(relaySessionManager.hasTerminal(String(opened[1]?.terminalId))).toBe(true);
+    // Its unredeemed tickets are gone.
+    expect(
+      terminalTicketStore.redeem({ ticket: unused, userId: "user-id", sessionId: "stolen" }),
+    ).toBeNull();
+  });
+
+  it("a ban ends the user's browser shells on the node", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    await open(browser, "one");
+    const opened = cli.jsonSends().find((message) => message.type === "term.open");
+    relaySessionManager.closeBrowserTerminalsForUser("other-id");
+    expect(cli.jsonSends().some((message) => message.type === "term.close")).toBe(false);
+    relaySessionManager.closeBrowserTerminalsForUser("user-id");
+    expect(cli.jsonSends().filter((message) => message.type === "term.close")).toEqual([
+      expect.objectContaining({ terminalId: opened?.terminalId }),
+    ]);
+    expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([]);
+  });
+
+  it("re-reads the session before an open: a revoked session or a banned owner gets no shell", async () => {
+    const cli = await connectCli("one");
+    const revoked = attachBrowser();
+    db.session.findUnique.mockResolvedValueOnce(null);
+    await open(revoked, "one");
+    expect(revoked.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
+
+    const banned = attachBrowser();
+    db.session.findUnique.mockResolvedValueOnce({
+      userId: "user-id",
+      expiresAt: new Date(Date.now() + 60_000),
+      user: { deletionRequestedAt: null, banned: true, banExpires: null },
+    });
+    await open(banned, "one");
+    expect(banned.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
+
+    const failed = attachBrowser();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    db.session.findUnique.mockRejectedValueOnce(new Error("db down"));
+    await open(failed, "one");
+    expect(failed.closes).toEqual([{ code: 1011, reason: "admission_failed" }]);
+    errors.mockRestore();
+
+    expect(cli.jsonSends().some((message) => message.type === "term.open")).toBe(false);
+    // A live session still opens.
+    await open(attachBrowser(), "one");
+    expect(cli.jsonSends().some((message) => message.type === "term.open")).toBe(true);
+  });
+
+  it("re-reads the session before an attach to a running shell", async () => {
+    await connectCli("one");
+    const browser = attachBrowser();
+    db.session.findUnique.mockResolvedValueOnce(null);
+    await terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({
+        type: "attach",
+        terminalId: Buffer.alloc(16, 1).toString("base64url"),
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      }),
+    );
+    expect(browser.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
+  });
+
   /** The admission read's row: a live session of `user-id`, owner flags as given. */
   function admissionRow(user: Record<string, unknown> = {}) {
     return {
@@ -1104,26 +1213,28 @@ describe("terminal browser hub", () => {
       sessionId: "impersonation",
       impersonatedBy: "admin-id",
     });
-    const pending = new FakeSocket();
-    const read = deferredAdmissionRead();
-    const admission = admitBrowserConnection({
-      socket: pending,
-      userId: "user-id",
-      sessionId: "impersonation-2",
-      impersonatedBy: "admin-id",
-    });
     const own = attachBrowser();
 
     terminalBrowserHub.revokeTerminalAccessForUser("admin-id");
     expect(admitted.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
-    expect(pending.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
     // The impersonated user's own session is not the admin's.
     expect(own.closes).toEqual([]);
-    read.resolve(admissionRow());
-    await admission;
-    expect(registered(pending)).toBe(false);
     expect(registered(admitted)).toBe(false);
     expect(registered(own)).toBe(true);
+  });
+
+  it("never admits a socket an admin impersonates through, without reading the session", async () => {
+    const socket = new FakeSocket();
+    db.session.findUnique.mockClear();
+    await admitBrowserConnection({
+      socket,
+      userId: "user-id",
+      sessionId: "impersonation",
+      impersonatedBy: "admin-id",
+    });
+    expect(socket.closes).toEqual([{ code: 4403, reason: "impersonating" }]);
+    expect(registered(socket)).toBe(false);
+    expect(db.session.findUnique).not.toHaveBeenCalled();
   });
 
   // Shutdown sets the drain flag and closes every browser socket in one turn
@@ -1188,17 +1299,17 @@ describe("terminal browser hub", () => {
     });
     const events = terminalSocketEvents({
       user: { id: "user-id" },
-      session: { id: "session-id", impersonatedBy: "admin-id" },
+      session: { id: "session-id", impersonatedBy: null },
     } as unknown as Session);
     const read = deferredAdmissionRead();
     events.onOpen?.(new Event("open"), ws);
-    // Registered before the read resolved: the admin's mark closes it.
+    // Registered before the read resolved: the user's mark closes it.
     expect(db.session.findUnique).toHaveBeenCalledWith(
       expect.objectContaining({ where: { id: "session-id" } }),
     );
     db.node.findMany.mockResolvedValue([device("one")]);
     events.onMessage?.(new MessageEvent("message", { data: '{"type":"list"}' }), ws);
-    terminalBrowserHub.revokeTerminalAccessForUser("admin-id");
+    terminalBrowserHub.revokeTerminalAccessForUser("user-id");
     expect(socket.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
     read.resolve(admissionRow());
     await vi.waitFor(() => expect(db.session.findUnique).toHaveBeenCalledTimes(1));

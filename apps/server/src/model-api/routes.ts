@@ -7992,7 +7992,9 @@ async function relaySelectedModelNoFailover({
  *
  * S0 stub: the sidecar hop is not run yet (its send authority through the target pool is
  * lane R work). Raw media reaches the pool's members unchanged and is served or refused by
- * their own capabilities. Transform envelopes already in the history are still fenced with
+ * their own capabilities. When the hop runs, it re-checks that the target pool is the caller
+ * pool owner's or still shared with them with `canUse` (the share triggers delete such
+ * sidecars when that use ends, but a hop in flight must not rely on that alone). Transform envelopes already in the history are still fenced with
  * the policy system message, so prior or spoofed envelope text is never treated as
  * unguarded instructions.
  */

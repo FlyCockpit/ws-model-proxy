@@ -272,7 +272,9 @@ pub struct Config {
     /// own origin is always trusted; these are additive.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub media_trusted_origins: Vec<String>,
-    /// Browser terminal master switch. Read once when the relay starts.
+    /// Browser terminal master switch. Read when the relay starts; turning it
+    /// off while the daemon runs takes effect on the next hot reload and ends
+    /// open browser shells, turning it on takes a restart.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_human_terminal: bool,
     /// Require a locally approved browser identity before opening a terminal.

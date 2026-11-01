@@ -398,12 +398,40 @@ export class TerminalBrowserHub {
    * registration and so after this listener ran after the commit, sees the
    * marker or the missing session ({@link admitBrowserConnection}).
    */
-  revokeTerminalAccessForUser(userId: string) {
+  revokeTerminalAccessForUser(
+    userId: string,
+    reason: "user_deletion_pending" | "user_banned" = "user_deletion_pending",
+  ) {
     this.tickets.revokeForUser(userId);
     for (const conn of [...this.bySocket.values()]) {
       if (conn.userId !== userId && conn.impersonatedBy !== userId) continue;
       this.detachAll(conn);
-      if (conn.socket.readyState === 1) conn.socket.close(4401, "user_deletion_pending");
+      if (conn.socket.readyState === 1) conn.socket.close(4401, reason);
+      this.forgetConn(conn);
+    }
+  }
+
+  /**
+   * A sign-in session was deleted (sign-out, "sign out other sessions", a revoke, a password
+   * reset; `@ws-model-proxy/auth/session-revoked-listeners`): its unredeemed tickets go, the
+   * shells its sockets view or are opening end for everyone (whoever held the session may have
+   * typed in them), and its sockets, pending or admitted, close. The user's other sessions
+   * keep their sockets and their other shells.
+   */
+  revokeTerminalAccessForSession(sessionId: string) {
+    this.tickets.revokeForSession(sessionId);
+    const conns = [...this.bySocket.values()].filter((conn) => conn.sessionId === sessionId);
+    const byUser = new Map<string, Set<string>>();
+    for (const conn of conns) {
+      const ids = byUser.get(conn.userId) ?? new Set<string>();
+      ids.add(conn.id);
+      byUser.set(conn.userId, ids);
+    }
+    for (const [userId, connIds] of byUser)
+      relaySessionManager.closeBrowserTerminalsForConns(userId, connIds);
+    for (const conn of conns) {
+      this.detachAll(conn);
+      if (conn.socket.readyState === 1) conn.socket.close(4401, "session_revoked");
       this.forgetConn(conn);
     }
   }
@@ -646,6 +674,13 @@ export class TerminalBrowserHub {
       await this.sendTerminalList(conn, false, ref.requestId);
       return;
     }
+    // A new shell or a new viewer re-reads the session and its owner first: a session revoked
+    // or an owner banned on another replica (or since the last 60 s recheck) gets neither.
+    if (
+      (data.type === "open" || data.type === "attach") &&
+      !(await this.credentialStillValid(conn))
+    )
+      return;
     if (data.type === "open") {
       // Used up here, whatever follows: a ticket opens at most one terminal.
       const redeemed = this.tickets.redeem({
@@ -1151,6 +1186,45 @@ export class TerminalBrowserHub {
     });
   }
 
+  /**
+   * The admission read again, for one open or attach: the session still exists, is the
+   * socket's and has not expired, and its owner is neither banned nor being deleted. Otherwise
+   * the socket closes (4401) and this answers false. A failed read refuses this frame only
+   * (`admission_failed`), like admission it fails closed.
+   */
+  private async credentialStillValid(conn: BrowserConn): Promise<boolean> {
+    let row: {
+      userId: string;
+      expiresAt: Date;
+      user: { deletionRequestedAt: Date | null; banned: boolean | null; banExpires: Date | null };
+    } | null;
+    try {
+      row = await prisma.session.findUnique({
+        where: { id: conn.sessionId },
+        select: {
+          userId: true,
+          expiresAt: true,
+          user: { select: { deletionRequestedAt: true, banned: true, banExpires: true } },
+        },
+      });
+    } catch (error) {
+      console.error("[terminal] session re-read failed", errorKind(error));
+      if (this.bySocket.get(conn.socket) === conn) this.refuse(conn, 1011, "admission_failed");
+      return false;
+    }
+    if (!this.isLive(conn)) return false;
+    const now = new Date();
+    if (!row || row.userId !== conn.userId || row.expiresAt.getTime() <= now.getTime()) {
+      this.expire(conn);
+      return false;
+    }
+    if (!row.user || userCredentialAccessBlocked(row.user, now)) {
+      this.expire(conn, "user_deletion_pending");
+      return false;
+    }
+    return true;
+  }
+
   private async ownedNode(userId: string, nodeId: string): Promise<NodeListRow | null> {
     return prisma.node.findFirst({
       where: { id: nodeId, userId },
@@ -1241,6 +1315,11 @@ registerTerminalBridge({
  */
 export async function admitBrowserConnection(input: BrowserConnInput): Promise<void> {
   const conn = terminalBrowserHub.register(input);
+  // The upgrade middleware already refuses impersonated sessions; never admit one.
+  if (input.impersonatedBy) {
+    terminalBrowserHub.refuse(conn, 4403, "impersonating");
+    return;
+  }
   // Shutdown sets the drain flag and runs closeAll() in one synchronous turn.
   // An upgrade that passed the middleware's drain check before that registers
   // here after closeAll() already ran, so nothing else would close it.
@@ -1334,6 +1413,11 @@ export function createTerminalWebsocketMiddleware(): MiddlewareHandler<{
     const session = c.get("session");
     if (!session?.user?.id || !session.session?.id) {
       return c.json({ error: "Authentication required." }, 401);
+    }
+    // An admin impersonating a user gets no terminal socket: no shell on the person's nodes,
+    // and no attach to the shells they have open (packages/api `refuseImpersonatedShell`).
+    if (session.session.impersonatedBy) {
+      return c.json({ error: "Terminals are not available while impersonating a user." }, 403);
     }
     const origin = c.req.header("origin");
     if (!origin) return c.json({ error: "Origin required." }, 403);
