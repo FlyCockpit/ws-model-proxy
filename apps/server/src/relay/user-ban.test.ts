@@ -4,13 +4,17 @@ const mocks = vi.hoisted(() => ({
   cancelNodeCommandsForUser: vi.fn(),
   cancelFileOpsForUser: vi.fn(),
   cancelOperatorTerminalsForUser: vi.fn(),
+  closeBrowserTerminalsForUser: vi.fn(),
 }));
 vi.mock("./node-commands.js", () => ({
   cancelNodeCommandsForUser: mocks.cancelNodeCommandsForUser,
 }));
 vi.mock("./node-file-ops.js", () => ({ cancelFileOpsForUser: mocks.cancelFileOpsForUser }));
 vi.mock("./session-manager.js", () => ({
-  relaySessionManager: { cancelOperatorTerminalsForUser: mocks.cancelOperatorTerminalsForUser },
+  relaySessionManager: {
+    cancelOperatorTerminalsForUser: mocks.cancelOperatorTerminalsForUser,
+    closeBrowserTerminalsForUser: mocks.closeBrowserTerminalsForUser,
+  },
 }));
 
 const { cancelRelayWorkForBannedUser } = await import("./user-ban.js");
@@ -20,11 +24,12 @@ describe("cancelRelayWorkForBannedUser", () => {
     vi.clearAllMocks();
   });
 
-  it("ends the user's node commands, file ops and operator terminals", () => {
+  it("ends the user's node commands, file ops, operator terminals and browser shells", () => {
     cancelRelayWorkForBannedUser("user-1");
     expect(mocks.cancelNodeCommandsForUser).toHaveBeenCalledWith("user-1");
     expect(mocks.cancelFileOpsForUser).toHaveBeenCalledWith("user-1");
     expect(mocks.cancelOperatorTerminalsForUser).toHaveBeenCalledWith("user-1");
+    expect(mocks.closeBrowserTerminalsForUser).toHaveBeenCalledWith("user-1");
   });
 
   it("still ends file ops when the command sweep throws", () => {
@@ -34,5 +39,14 @@ describe("cancelRelayWorkForBannedUser", () => {
     expect(() => cancelRelayWorkForBannedUser("user-1")).toThrow();
     expect(mocks.cancelFileOpsForUser).toHaveBeenCalledWith("user-1");
     expect(mocks.cancelOperatorTerminalsForUser).toHaveBeenCalledWith("user-1");
+    expect(mocks.closeBrowserTerminalsForUser).toHaveBeenCalledWith("user-1");
+  });
+
+  it("still ends browser shells when the operator terminal sweep throws", () => {
+    mocks.cancelOperatorTerminalsForUser.mockImplementationOnce(() => {
+      throw new Error("operator");
+    });
+    expect(() => cancelRelayWorkForBannedUser("user-1")).toThrow();
+    expect(mocks.closeBrowserTerminalsForUser).toHaveBeenCalledWith("user-1");
   });
 });

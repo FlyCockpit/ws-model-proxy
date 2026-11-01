@@ -1121,6 +1121,35 @@ export class RelaySessionManager {
     else if (!terminal) this.sendControl(session, { type: "term.close", terminalId });
   }
 
+  /**
+   * Ban fence: end every browser shell of this user on every node, telling each node to close
+   * it. Operator terminals are the step's (`cancelOperatorTerminalsForUser`).
+   */
+  closeBrowserTerminalsForUser(userId: string) {
+    for (const session of this.sessionsByNodeId.values()) {
+      for (const terminal of [...session.terminalsById.values()]) {
+        if (terminal.userId !== userId || terminal.operator) continue;
+        this.closeTerminal(session, terminal, true);
+      }
+    }
+  }
+
+  /**
+   * A revoked sign-in session: end every browser shell of this user that one of the
+   * session's sockets (`connIds`) views or is opening, for everyone viewing it. Its other
+   * shells keep running. Operator terminals are only detached (when the sockets close).
+   */
+  closeBrowserTerminalsForConns(userId: string, connIds: ReadonlySet<string>) {
+    if (connIds.size === 0) return;
+    for (const session of this.sessionsByNodeId.values()) {
+      for (const terminal of [...session.terminalsById.values()]) {
+        if (terminal.userId !== userId || terminal.operator) continue;
+        if (terminalConnIds(terminal).some((connId) => connIds.has(connId)))
+          this.closeTerminal(session, terminal, true);
+      }
+    }
+  }
+
   /** Ban fence: close every operator terminal of this user. */
   cancelOperatorTerminalsForUser(userId: string) {
     for (const session of this.sessionsByNodeId.values()) {

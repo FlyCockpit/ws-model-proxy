@@ -27,6 +27,7 @@ import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { recordProvedEmail } from "./proved-email";
+import { notifySessionRevoked } from "./session-revoked-listeners";
 import {
   acceptClaimedShareInviteToken,
   acceptShareInvitesForProvenEmail,
@@ -424,6 +425,11 @@ export const auth = betterAuth({
       delete: {
         before: async (session, context) => {
           await refuseUndeletableUserBeforeCredentialDelete(session, context);
+        },
+        // Committed: end what is bound to the session now, such as its terminal sockets
+        // (./session-revoked-listeners.ts). Never throws.
+        after: async (session) => {
+          await notifySessionRevoked({ id: session.id, userId: session.userId });
         },
       },
     },

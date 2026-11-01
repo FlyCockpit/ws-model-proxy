@@ -21,6 +21,7 @@ import { auth as defaultAuth } from "@ws-model-proxy/auth";
 import { armAuthDbShutdownFence } from "@ws-model-proxy/auth/auth-db-shutdown-fence";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
 import { onMcpGrantLevelLowered } from "@ws-model-proxy/auth/mcp-grant-level";
+import { onSessionRevoked } from "@ws-model-proxy/auth/session-revoked-listeners";
 import { onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import { onUserDeleted, onUserDeletionMarked } from "@ws-model-proxy/auth/user-deletion-listeners";
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
@@ -270,6 +271,13 @@ onUserBanned(cancelRelayWorkForBannedUser);
 // A ban ends the user's live transcription sessions, and those their engines
 // or pools serve, at once (not at the next 60 s recheck).
 onUserBanned((userId) => realtimeSessionRegistry.terminateForUser(userId));
+// A ban closes the user's browser terminal sockets (and those an admin impersonates through)
+// and burns their tickets at once, not at the next 60 s recheck. Their shells end in
+// cancelRelayWorkForBannedUser above.
+onUserBanned((userId) => terminalBrowserHub.revokeTerminalAccessForUser(userId, "user_banned"));
+// A deleted sign-in session (sign-out, "sign out other sessions", a revoke, a password reset)
+// closes its terminal sockets and ends the shells they view at once.
+onSessionRevoked((session) => terminalBrowserHub.revokeTerminalAccessForSession(session.id));
 
 /**
  * A grant lowered from Full to Read-only (committed): its Full work ends now

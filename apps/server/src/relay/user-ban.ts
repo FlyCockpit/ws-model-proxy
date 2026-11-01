@@ -4,11 +4,12 @@ import { relaySessionManager } from "./session-manager.js";
 
 /**
  * The ban fence: a user was banned, so nothing they started may keep running. Ends their
- * node commands, in-flight file ops and operator terminals (the engine opens no new one for a
- * banned or deleting owner, and its drain cancels their waiting interactive steps) and refuses
- * admissions still reading (the per-user twin of the token revoke). Their relay sockets stay
- * open; a ban already refuses reauthentication and every new admission re-reads the owner's
- * ban state. Browser terminals end at the terminal hub's session recheck.
+ * node commands, in-flight file ops, operator terminals (the engine opens no new one for a
+ * banned or deleting owner, and its drain cancels their waiting interactive steps) and browser
+ * shells, and refuses admissions still reading (the per-user twin of the token revoke). Their
+ * relay sockets stay open; a ban already refuses reauthentication and every new admission
+ * re-reads the owner's ban state. Their browser terminal sockets close in the same
+ * notification (`terminalBrowserHub.revokeTerminalAccessForUser`, ../app.ts).
  *
  * Synchronous, so the work has ended before `notifyUserBanned`
  * (`@ws-model-proxy/auth/user-ban-listeners`) returns to the ban path. Every sweep runs even
@@ -21,7 +22,11 @@ export function cancelRelayWorkForBannedUser(userId: string): void {
     try {
       cancelFileOpsForUser(userId);
     } finally {
-      relaySessionManager.cancelOperatorTerminalsForUser(userId);
+      try {
+        relaySessionManager.cancelOperatorTerminalsForUser(userId);
+      } finally {
+        relaySessionManager.closeBrowserTerminalsForUser(userId);
+      }
     }
   }
 }

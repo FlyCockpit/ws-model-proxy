@@ -477,10 +477,11 @@ describe("terminal browser hub", () => {
     db.node.findMany.mockResolvedValue([]);
     db.runtimeInstance.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
+    // Far ahead of every test's clock: each open and attach re-reads it (finding 2).
     db.session.findUnique.mockResolvedValue({
       userId: "user-id",
-      expiresAt: new Date("2026-02-01T00:00:00.000Z"),
-      user: { twoFactorEnabled: false },
+      expiresAt: new Date("2099-01-01T00:00:00.000Z"),
+      user: { twoFactorEnabled: false, deletionRequestedAt: null, banned: null, banExpires: null },
     });
     twoFactorPolicy.required.mockReset();
     twoFactorPolicy.required.mockResolvedValue(false);
@@ -909,6 +910,99 @@ describe("terminal browser hub", () => {
     );
     expect(browser.sends).toHaveLength(sendsBefore);
     expect(cli.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(1);
+  });
+
+  it("a revoked session closes its sockets, ends the shells they view and burns its tickets", async () => {
+    const cli = await connectCli("one");
+    const stolen = new FakeSocket();
+    terminalBrowserHub.accept({ socket: stolen, userId: "user-id", sessionId: "stolen" });
+    const own = attachBrowser();
+    await terminalBrowserHub.handleText(
+      stolen,
+      JSON.stringify({
+        type: "open",
+        ticket: ticketFor("one", "user-id", "stolen"),
+        cols: 80,
+        rows: 24,
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      }),
+    );
+    await open(own, "one");
+    const opened = cli.jsonSends().filter((message) => message.type === "term.open");
+    expect(opened).toHaveLength(2);
+    const unused = ticketFor("one", "user-id", "stolen");
+
+    terminalBrowserHub.revokeTerminalAccessForSession("stolen");
+    expect(stolen.closes).toEqual([{ code: 4401, reason: "session_revoked" }]);
+    expect(own.closes).toEqual([]);
+    // The stolen session's shell ends on the node; the person's own keeps running.
+    const closed = cli.jsonSends().filter((message) => message.type === "term.close");
+    expect(closed).toEqual([expect.objectContaining({ terminalId: opened[0]?.terminalId })]);
+    expect(relaySessionManager.hasTerminal(String(opened[1]?.terminalId))).toBe(true);
+    // Its unredeemed tickets are gone.
+    expect(
+      terminalTicketStore.redeem({ ticket: unused, userId: "user-id", sessionId: "stolen" }),
+    ).toBeNull();
+  });
+
+  it("a ban ends the user's browser shells on the node", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    await open(browser, "one");
+    const opened = cli.jsonSends().find((message) => message.type === "term.open");
+    relaySessionManager.closeBrowserTerminalsForUser("other-id");
+    expect(cli.jsonSends().some((message) => message.type === "term.close")).toBe(false);
+    relaySessionManager.closeBrowserTerminalsForUser("user-id");
+    expect(cli.jsonSends().filter((message) => message.type === "term.close")).toEqual([
+      expect.objectContaining({ terminalId: opened?.terminalId }),
+    ]);
+    expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([]);
+  });
+
+  it("re-reads the session before an open: a revoked session or a banned owner gets no shell", async () => {
+    const cli = await connectCli("one");
+    const revoked = attachBrowser();
+    db.session.findUnique.mockResolvedValueOnce(null);
+    await open(revoked, "one");
+    expect(revoked.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
+
+    const banned = attachBrowser();
+    db.session.findUnique.mockResolvedValueOnce({
+      userId: "user-id",
+      expiresAt: new Date(Date.now() + 60_000),
+      user: { deletionRequestedAt: null, banned: true, banExpires: null },
+    });
+    await open(banned, "one");
+    expect(banned.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
+
+    const failed = attachBrowser();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    db.session.findUnique.mockRejectedValueOnce(new Error("db down"));
+    await open(failed, "one");
+    expect(failed.closes).toEqual([{ code: 1011, reason: "admission_failed" }]);
+    errors.mockRestore();
+
+    expect(cli.jsonSends().some((message) => message.type === "term.open")).toBe(false);
+    // A live session still opens.
+    await open(attachBrowser(), "one");
+    expect(cli.jsonSends().some((message) => message.type === "term.open")).toBe(true);
+  });
+
+  it("re-reads the session before an attach to a running shell", async () => {
+    await connectCli("one");
+    const browser = attachBrowser();
+    db.session.findUnique.mockResolvedValueOnce(null);
+    await terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({
+        type: "attach",
+        terminalId: Buffer.alloc(16, 1).toString("base64url"),
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      }),
+    );
+    expect(browser.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
   });
 
   /** The admission read's row: a live session of `user-id`, owner flags as given. */

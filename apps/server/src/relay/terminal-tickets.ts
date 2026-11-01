@@ -114,6 +114,13 @@ export class TerminalTicketStore {
     }
   }
 
+  /** A sign-in session was deleted: its unredeemed tickets go. */
+  revokeForSession(sessionId: string): void {
+    for (const [key, entry] of this.byDigest) {
+      if (entry.sessionId === sessionId) this.byDigest.delete(key);
+    }
+  }
+
   get size(): number {
     return this.byDigest.size;
   }

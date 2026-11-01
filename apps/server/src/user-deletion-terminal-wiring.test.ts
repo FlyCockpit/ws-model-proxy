@@ -1,3 +1,4 @@
+import { notifySessionRevoked } from "@ws-model-proxy/auth/session-revoked-listeners";
 import { notifyUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import {
   notifyUserDeleted,
@@ -192,6 +193,45 @@ describe("app deletion listeners reach browser terminal sockets", () => {
     await notifyUserDeleted("admin-id");
     expect(impersonation.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
     expect(targetOwn.closes).toEqual([]);
+  });
+});
+
+describe("app ban and session-revoke listeners close browser terminal sockets at once", () => {
+  afterEach(() => {
+    terminalBrowserHub.closeAll();
+    vi.restoreAllMocks();
+  });
+
+  it("a ban closes every terminal socket of the user and ends their browser shells", async () => {
+    const closeShells = vi.spyOn(relaySessionManager, "closeBrowserTerminalsForUser");
+    const one = new FakeSocket();
+    const two = new FakeSocket();
+    const other = new FakeSocket();
+    terminalBrowserHub.accept({ socket: one, userId: "user-id", sessionId: "a" });
+    terminalBrowserHub.accept({ socket: two, userId: "user-id", sessionId: "b" });
+    terminalBrowserHub.accept({ socket: other, userId: "other-id", sessionId: "c" });
+
+    await notifyUserBanned("user-id");
+    expect(one.closes).toEqual([{ code: 4401, reason: "user_banned" }]);
+    expect(two.closes).toEqual([{ code: 4401, reason: "user_banned" }]);
+    expect(other.closes).toEqual([]);
+    expect(closeShells).toHaveBeenCalledExactlyOnceWith("user-id");
+  });
+
+  it("a deleted session closes only that session's sockets and ends the shells they view", async () => {
+    const closeShells = vi.spyOn(relaySessionManager, "closeBrowserTerminalsForConns");
+    const revoked = new FakeSocket();
+    const kept = new FakeSocket();
+    terminalBrowserHub.accept({ socket: revoked, userId: "user-id", sessionId: "stolen" });
+    terminalBrowserHub.accept({ socket: kept, userId: "user-id", sessionId: "own" });
+
+    await notifySessionRevoked({ id: "stolen", userId: "user-id" });
+    expect(revoked.closes).toEqual([{ code: 4401, reason: "session_revoked" }]);
+    expect(kept.closes).toEqual([]);
+    expect(closeShells).toHaveBeenCalledOnce();
+    const [userId, connIds] = closeShells.mock.calls[0] ?? [];
+    expect(userId).toBe("user-id");
+    expect((connIds as ReadonlySet<string>).size).toBe(1);
   });
 });
 
