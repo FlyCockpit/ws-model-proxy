@@ -1510,7 +1510,29 @@ try {
     `SELECT count(*) FROM pool_routing_rule WHERE id = 'rule-exclude' AND "memberId" IS NULL AND NOT exclude`,
     1,
   );
-  // 6. clearing can-contribute, then deleting a share
+  // 6. clearing can-use, clearing can-contribute, then deleting a share. A sidecar of the
+  //    grantee's pool that targets the shared pool goes with the use it was allowed by.
+  await client.query(`
+    INSERT INTO pool (id, "userId", slug, name, "modelType") VALUES
+      ('pool-b-own', 'owner-b', 'b-chat', 'B chat', 'LLM');
+    INSERT INTO pool_sidecar (id, "poolId", input, "targetPoolId") VALUES
+      ('sc-b-use', 'pool-b-own', 'VIDEO', 'pool-a')`);
+  await client.query(`UPDATE share SET "canUse" = false WHERE id = 'share-b'`);
+  await expectValue(
+    "clearing canUse removes the grantee's sidecars targeting the pool",
+    `SELECT count(*) FROM pool_sidecar WHERE "poolId" = 'pool-b-own'`,
+    0,
+  );
+  await expectValue(
+    "clearing canUse removes the grantee's API-key entries",
+    `SELECT count(*) FROM api_key_pool WHERE "apiKeyId" = 'key-b'`,
+    0,
+  );
+  await client.query(`
+    UPDATE share SET "canUse" = true WHERE id = 'share-b';
+    INSERT INTO api_key_pool ("apiKeyId", "poolId") VALUES ('key-b', 'pool-a');
+    INSERT INTO pool_sidecar (id, "poolId", input, "targetPoolId") VALUES
+      ('sc-b-use-2', 'pool-b-own', 'VIDEO', 'pool-a')`);
   await client.query(`UPDATE share SET "canContribute" = false WHERE id = 'share-b'`);
   await expectValue(
     "clearing canContribute removes contributed members",
@@ -1521,6 +1543,11 @@ try {
   await expectValue(
     "share delete removes the grantee's API-key entries",
     `SELECT count(*) FROM api_key_pool WHERE "apiKeyId" = 'key-b'`,
+    0,
+  );
+  await expectValue(
+    "share delete removes the grantee's sidecars targeting the pool",
+    `SELECT count(*) FROM pool_sidecar WHERE "poolId" = 'pool-b-own'`,
     0,
   );
   // 1. a user with running instances: the sweeper's order (instances, profiles, runtimes,

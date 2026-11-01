@@ -1107,7 +1107,9 @@ ALTER TABLE share DROP CONSTRAINT IF EXISTS share_permission_shape;
 ALTER TABLE share ADD CONSTRAINT share_permission_shape CHECK ("canUse" OR "canContribute");
 
 -- The grantee's own-key model is the grantee's; clearing canContribute removes the members the
--- share contributed; clearing canUse removes the grantee's API-key entries for the pool.
+-- share contributed; clearing canUse removes the grantee's API-key entries for the pool and the
+-- sidecars of the grantee's pools that target it (enforce_pool_sidecar_target checks only on
+-- write, so a sidecar must not outlive the use it was allowed by).
 CREATE OR REPLACE FUNCTION enforce_share_consistency()
 RETURNS trigger LANGUAGE plpgsql AS $share_consistency$
 BEGIN
@@ -1123,6 +1125,8 @@ BEGIN
     IF OLD."canUse" AND NOT NEW."canUse" THEN
       DELETE FROM api_key_pool kp USING api_key k -- policy: bounded-delete
        WHERE kp."apiKeyId" = k.id AND k."userId" = NEW."granteeUserId" AND kp."poolId" = NEW."poolId";
+      DELETE FROM pool_sidecar ps USING pool p -- policy: bounded-delete
+       WHERE ps."poolId" = p.id AND p."userId" = NEW."granteeUserId" AND ps."targetPoolId" = NEW."poolId";
     END IF;
   END IF;
   RETURN NEW;
@@ -1137,6 +1141,9 @@ RETURNS trigger LANGUAGE plpgsql AS $share_delete_cleanup$
 BEGIN
   DELETE FROM api_key_pool kp USING api_key k -- policy: bounded-delete
    WHERE kp."apiKeyId" = k.id AND k."userId" = OLD."granteeUserId" AND kp."poolId" = OLD."poolId";
+  -- The grantee's sidecars targeting the pool go with the share (see enforce_share_consistency).
+  DELETE FROM pool_sidecar ps USING pool p -- policy: bounded-delete
+   WHERE ps."poolId" = p.id AND p."userId" = OLD."granteeUserId" AND ps."targetPoolId" = OLD."poolId";
   RETURN OLD;
 END;
 $share_delete_cleanup$;
