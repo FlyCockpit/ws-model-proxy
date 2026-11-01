@@ -1241,6 +1241,11 @@ registerTerminalBridge({
  */
 export async function admitBrowserConnection(input: BrowserConnInput): Promise<void> {
   const conn = terminalBrowserHub.register(input);
+  // The upgrade middleware already refuses impersonated sessions; never admit one.
+  if (input.impersonatedBy) {
+    terminalBrowserHub.refuse(conn, 4403, "impersonating");
+    return;
+  }
   // Shutdown sets the drain flag and runs closeAll() in one synchronous turn.
   // An upgrade that passed the middleware's drain check before that registers
   // here after closeAll() already ran, so nothing else would close it.
@@ -1334,6 +1339,11 @@ export function createTerminalWebsocketMiddleware(): MiddlewareHandler<{
     const session = c.get("session");
     if (!session?.user?.id || !session.session?.id) {
       return c.json({ error: "Authentication required." }, 401);
+    }
+    // An admin impersonating a user gets no terminal socket: no shell on the person's nodes,
+    // and no attach to the shells they have open (packages/api `refuseImpersonatedShell`).
+    if (session.session.impersonatedBy) {
+      return c.json({ error: "Terminals are not available while impersonating a user." }, 403);
     }
     const origin = c.req.header("origin");
     if (!origin) return c.json({ error: "Origin required." }, 403);

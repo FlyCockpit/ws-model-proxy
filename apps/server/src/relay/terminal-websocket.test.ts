@@ -313,6 +313,21 @@ describe("terminal websocket admission", () => {
     expect(continued).toBe(true);
   });
 
+  it("refuses a session an admin impersonates through before upgrade", async () => {
+    const impersonated = browserSession();
+    sessions.getSession.mockResolvedValue({
+      ...impersonated,
+      session: { ...impersonated.session, impersonatedBy: "admin-id" },
+    });
+    const response = await middlewareApp().request("/api/dashboard/terminal/ws", {
+      headers: { upgrade: "websocket", cookie: "session=ok", origin: "https://proxy.example.com" },
+    });
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: "Terminals are not available while impersonating a user.",
+    });
+  });
+
   it("admits an unenrolled user when two-factor is not mandatory", async () => {
     sessions.getSession.mockResolvedValue(browserSession("user-id", false));
     const response = await middlewareApp().request("/api/dashboard/terminal/ws", {
@@ -1104,26 +1119,28 @@ describe("terminal browser hub", () => {
       sessionId: "impersonation",
       impersonatedBy: "admin-id",
     });
-    const pending = new FakeSocket();
-    const read = deferredAdmissionRead();
-    const admission = admitBrowserConnection({
-      socket: pending,
-      userId: "user-id",
-      sessionId: "impersonation-2",
-      impersonatedBy: "admin-id",
-    });
     const own = attachBrowser();
 
     terminalBrowserHub.revokeTerminalAccessForUser("admin-id");
     expect(admitted.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
-    expect(pending.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
     // The impersonated user's own session is not the admin's.
     expect(own.closes).toEqual([]);
-    read.resolve(admissionRow());
-    await admission;
-    expect(registered(pending)).toBe(false);
     expect(registered(admitted)).toBe(false);
     expect(registered(own)).toBe(true);
+  });
+
+  it("never admits a socket an admin impersonates through, without reading the session", async () => {
+    const socket = new FakeSocket();
+    db.session.findUnique.mockClear();
+    await admitBrowserConnection({
+      socket,
+      userId: "user-id",
+      sessionId: "impersonation",
+      impersonatedBy: "admin-id",
+    });
+    expect(socket.closes).toEqual([{ code: 4403, reason: "impersonating" }]);
+    expect(registered(socket)).toBe(false);
+    expect(db.session.findUnique).not.toHaveBeenCalled();
   });
 
   // Shutdown sets the drain flag and closes every browser socket in one turn
@@ -1188,17 +1205,17 @@ describe("terminal browser hub", () => {
     });
     const events = terminalSocketEvents({
       user: { id: "user-id" },
-      session: { id: "session-id", impersonatedBy: "admin-id" },
+      session: { id: "session-id", impersonatedBy: null },
     } as unknown as Session);
     const read = deferredAdmissionRead();
     events.onOpen?.(new Event("open"), ws);
-    // Registered before the read resolved: the admin's mark closes it.
+    // Registered before the read resolved: the user's mark closes it.
     expect(db.session.findUnique).toHaveBeenCalledWith(
       expect.objectContaining({ where: { id: "session-id" } }),
     );
     db.node.findMany.mockResolvedValue([device("one")]);
     events.onMessage?.(new MessageEvent("message", { data: '{"type":"list"}' }), ws);
-    terminalBrowserHub.revokeTerminalAccessForUser("admin-id");
+    terminalBrowserHub.revokeTerminalAccessForUser("user-id");
     expect(socket.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
     read.resolve(admissionRow());
     await vi.waitFor(() => expect(db.session.findUnique).toHaveBeenCalledTimes(1));

@@ -121,6 +121,12 @@ export const REFUSAL_REASONS = [
   "already_released",
   /** A release request for this node part already waits for a person. */
   "release_request_pending",
+  // Security audit 2026-10-31.
+  /**
+   * An admin impersonating a user opens no shell on that user's nodes: no browser terminal,
+   * no queued command run, no operator step attach.
+   */
+  "impersonating",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

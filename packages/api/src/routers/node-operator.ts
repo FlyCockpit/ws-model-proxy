@@ -32,7 +32,7 @@ import {
   nodeCommandSelect,
   settleNodeCommand,
 } from "../lib/node-command-settle";
-import { notFound, refuse, refuseAbout } from "../lib/refuse";
+import { notFound, refuse, refuseAbout, refuseImpersonatedShell } from "../lib/refuse";
 import { NODE_COMMAND_GET_WAIT_MAX_MS, runtimeTextIssue } from "../lib/runtime-spec";
 
 /** How long `commands.run` waits for a quick command before answering `running`. */
@@ -423,6 +423,7 @@ async function appendTerminalAudit(args: {
 
 const terminals = {
   openTicket: contractProcedure(c.terminals.openTicket).handler(async ({ context, input }) => {
+    refuseImpersonatedShell(context.session.session);
     const userId = userIdOf(context);
     const node = await fullControlNode(userId, input.nodeId);
     const ticket = await services(context).openTerminalTicket({
@@ -601,6 +602,8 @@ const queued = {
   }),
 
   run: contractProcedure(c.queued.run).handler(async ({ context, input }) => {
+    // Before anything is decided: the person may still run it themselves.
+    refuseImpersonatedShell(context.session.session);
     const userId = userIdOf(context);
     const row = await pendingQueued(userId, input.queuedCommandId);
     let node: OperatorNode;

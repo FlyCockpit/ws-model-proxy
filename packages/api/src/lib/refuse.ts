@@ -35,6 +35,7 @@ const REFUSAL_STATUS: Partial<Record<RefusalReason, RefusalCode>> = {
   invalid_node_count: "BAD_REQUEST",
   node_online: "CONFLICT",
   rate_limited: "TOO_MANY_REQUESTS",
+  impersonating: "FORBIDDEN",
 };
 
 /**
@@ -108,4 +109,19 @@ export function isConstraintViolation(error: unknown): boolean {
   return [Reflect.get(error, "code"), metaCode, causeCode].some(
     (code) => typeof code === "string" && (/^23[0-9A-Z]{3}$/.test(code) || code === "P0001"),
   );
+}
+
+/**
+ * Refuses a shell (browser terminal, queued command run, operator step attach) to a session an
+ * admin impersonates through. A shell runs as the node's OS user on the person's own machine, so
+ * no one but the person opens one. The terminal socket refuses such sessions too
+ * (apps/server relay/terminal-websocket.ts).
+ */
+export function refuseImpersonatedShell(session: { impersonatedBy?: string | null }): void {
+  if (session.impersonatedBy) {
+    throw refuse(
+      "impersonating",
+      "Terminals are not available while impersonating a user. Stop impersonating first.",
+    );
+  }
 }

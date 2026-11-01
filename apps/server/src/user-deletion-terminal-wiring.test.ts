@@ -177,9 +177,9 @@ describe("app deletion listeners reach browser terminal sockets", () => {
 
   it("the delete listener closes sockets an admin impersonates through (IMP-MARK)", async () => {
     closeRelay.mockResolvedValue(undefined);
+    // Admission refuses impersonated sessions now; accept() stands for one admitted earlier.
     const impersonation = new FakeSocket();
-    db.session.findUnique.mockResolvedValueOnce(admissionRow("target-id"));
-    await admitBrowserConnection({
+    terminalBrowserHub.accept({
       socket: impersonation,
       userId: "target-id",
       sessionId: "imp",
