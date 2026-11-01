@@ -377,16 +377,31 @@ impl TerminalRegistry {
     /// higher trust, and the person reopens them from the frozen copy. A
     /// person's run already under way stays; the registry stays usable.
     pub(crate) fn on_trust_lowered(&mut self) -> Vec<OutboundFrame> {
+        let mut frames = self.on_human_terminals_disabled();
+        frames.extend(self.close_confirming(|_| true));
+        self.retain_operator_attaches();
+        self.operators.cancel_where(|_, _| true);
+        frames
+    }
+
+    /// The local switch turned browser terminals off: browser shells end and
+    /// their queued opens and attaches never spawn. Operator terminals are
+    /// not browser shells (they are allowed without the switch) and stay.
+    pub(crate) fn on_human_terminals_disabled(&mut self) -> Vec<OutboundFrame> {
         let ids = self
             .sessions
             .iter()
             .filter(|(_, session)| session.operator.is_none())
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        let mut frames: Vec<OutboundFrame> = ids.iter().flat_map(|id| self.close(id)).collect();
-        frames.extend(self.close_confirming(|_| true));
-        // Approvals waiting to join survive only for operator terminals still
-        // here (running commands); a queued browser-shell open never spawns.
+        let frames: Vec<OutboundFrame> = ids.iter().flat_map(|id| self.close(id)).collect();
+        self.retain_operator_attaches();
+        frames
+    }
+
+    /// Approvals waiting to join survive only for operator terminals still
+    /// here; a queued browser-shell open never spawns.
+    fn retain_operator_attaches(&mut self) {
         let sessions = &self.sessions;
         self.pending.retain(|(terminal_id, _), pending| {
             pending.attach
@@ -394,8 +409,6 @@ impl TerminalRegistry {
                     .get(terminal_id)
                     .is_some_and(|session| session.operator.is_some())
         });
-        self.operators.cancel_where(|_, _| true);
-        frames
     }
 
     /// A key on the confirm screen, from a viewer that becomes the writer.

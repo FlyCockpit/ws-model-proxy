@@ -618,6 +618,33 @@ fn queue_shell_approval(terminals: &mut TerminalRegistry, dir: &Path) {
 }
 
 #[test]
+fn turning_browser_terminals_off_keeps_operator_terminals_and_drops_shell_approvals() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (tx, _rx) = channel();
+    let mut terminals = multi_registry(tx);
+    let sudo = FakeSudo::new();
+    let (open, events) = request(MULTI_TERMINAL, "step1", "true", sudo.env());
+    let _ = reserve_and_open(&mut terminals, open);
+    queue_shell_approval(&mut terminals, dir.path());
+    let frames = terminals.on_human_terminals_disabled();
+    // The operator terminal on its confirm screen is not a browser shell.
+    assert!(results(&frames).is_empty());
+    assert!(terminals.sessions.contains_key(MULTI_TERMINAL));
+    assert!(events.try_recv().is_err());
+    // The queued shell open never spawns.
+    assert!(terminals.pending.is_empty());
+    let frames = terminals.auth(
+        &enabled_startup(true),
+        Some(dir.path()),
+        "term-shell",
+        Some("viewer-a"),
+        "c2lnbmF0dXJl",
+    );
+    assert!(frames.is_empty());
+    assert!(!terminals.sessions.contains_key("term-shell"));
+}
+
+#[test]
 fn a_shell_waiting_for_approval_never_spawns_after_a_lowering() {
     let dir = tempfile::tempdir().expect("dir");
     let (tx, _rx) = channel();
