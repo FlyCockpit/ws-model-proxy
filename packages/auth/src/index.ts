@@ -29,7 +29,7 @@ import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { passwordResetOptions } from "./password-reset";
 import { recordProvedEmail } from "./proved-email";
-import { notifySessionEnded } from "./session-ended-listeners";
+import { notifySessionEnded, sessionEndCause } from "./session-ended-listeners";
 import {
   acceptClaimedShareInviteToken,
   acceptShareInvitesForProvenEmail,
@@ -436,8 +436,13 @@ export const auth = betterAuth({
           await refuseUndeletableUserBeforeCredentialDelete(session, context);
         },
         // After the delete committed: the session's browser sockets close now.
-        after: async (session) => {
-          notifySessionEnded({ id: session.id, userId: session.userId });
+        // The endpoint tells a sign-out from a revoke (./session-ended-listeners.ts).
+        after: async (session, context) => {
+          notifySessionEnded({
+            id: session.id,
+            userId: session.userId,
+            cause: sessionEndCause(context?.path),
+          });
         },
       },
     },

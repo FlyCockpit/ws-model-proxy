@@ -298,11 +298,12 @@ onUserBanned((userId) => terminalBrowserHub.revokeTerminalAccessForUser(userId, 
 
 // Committed node changes reach their owner's browser event streams (#255; ./node-events/).
 onNodeEvent((event) => nodeEventHub.publish(event));
-// A signed-out or revoked session's browser sockets close now, not at the 60 s recheck, and
-// the shells its terminal sockets view end (./relay/terminal-websocket.ts endSession).
+// A signed-out or revoked session's browser sockets close now, not at the 60 s recheck. A
+// revoked one also ends the shells its terminal sockets view; a sign-out only detaches them
+// (./relay/terminal-websocket.ts endSession).
 onSessionEnded((session) => {
   nodeEventHub.endSession(session.id);
-  terminalBrowserHub.endSession(session.id);
+  terminalBrowserHub.endSession(session.id, session.cause);
 });
 
 /**

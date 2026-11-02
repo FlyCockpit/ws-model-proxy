@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { upgradeWebSocket, type WebSocketLike } from "@hono/node-server";
 import type { Session } from "@ws-model-proxy/auth";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
+import type { SessionEndCause } from "@ws-model-proxy/auth/session-ended-listeners";
 import {
   TERMINAL_BROWSER_BINARY_LIMIT,
   TERMINAL_BROWSER_BINARY_WINDOW_MS,
@@ -416,12 +417,13 @@ export class TerminalBrowserHub {
   /**
    * A dashboard session ended (sign-out, "sign out other sessions", a revoke, a password reset,
    * an admin who stops impersonating; its row was deleted, `@ws-model-proxy/auth/session-ended-listeners`):
-   * its unredeemed tickets go, the shells its sockets view or are opening end for everyone
-   * (whoever held the session may have typed in them), and its sockets, pending or admitted,
-   * close now instead of at the next recheck. The user's other sessions keep their sockets and
-   * their other shells.
+   * its unredeemed tickets go, and its sockets, pending or admitted, close now instead of at
+   * the next recheck. A revoked session (anything but the person's own sign-out) also ends the
+   * shells its sockets view or are opening, for everyone: whoever held it may have typed in
+   * them. A sign-out only detaches them, like a closed tab, so a sign-out on one device leaves a
+   * shell running on another. The user's other sessions keep their sockets.
    */
-  endSession(sessionId: string) {
+  endSession(sessionId: string, cause: SessionEndCause = "revoked") {
     this.tickets.revokeForSession(sessionId);
     const conns = [...this.bySocket.values()].filter((conn) => conn.sessionId === sessionId);
     const byUser = new Map<string, Set<string>>();
@@ -430,8 +432,9 @@ export class TerminalBrowserHub {
       ids.add(conn.id);
       byUser.set(conn.userId, ids);
     }
-    for (const [userId, connIds] of byUser)
-      relaySessionManager.closeBrowserTerminalsForConns(userId, connIds);
+    if (cause === "revoked")
+      for (const [userId, connIds] of byUser)
+        relaySessionManager.closeBrowserTerminalsForConns(userId, connIds);
     for (const conn of conns) this.expire(conn);
   }
 
@@ -1196,8 +1199,9 @@ export class TerminalBrowserHub {
   /**
    * The admission read again, for one open or attach: the session still exists, is the
    * socket's and has not expired, and its owner is neither banned nor being deleted. Otherwise
-   * the socket closes (4401) and this answers false. A failed read refuses this frame only
-   * (`admission_failed`), like admission it fails closed.
+   * the socket closes (4401) and this answers false. A failed read closes the socket too
+   * (1011 `admission_failed`): like admission, it fails closed. The shells it viewed are only
+   * detached, and the browser reconnects.
    */
   private async credentialStillValid(conn: BrowserConn): Promise<boolean> {
     let row: {

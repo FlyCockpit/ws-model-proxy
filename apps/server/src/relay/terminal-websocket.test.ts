@@ -1006,6 +1006,35 @@ describe("terminal browser hub", () => {
     ).toBeNull();
   });
 
+  it("a sign-out closes its sockets and burns its tickets, but only detaches its shells", async () => {
+    const cli = await connectCli("one");
+    const phone = new FakeSocket();
+    terminalBrowserHub.accept({ socket: phone, userId: "user-id", sessionId: "phone" });
+    await terminalBrowserHub.handleText(
+      phone,
+      JSON.stringify({
+        type: "open",
+        ticket: ticketFor("one", "user-id", "phone"),
+        cols: 80,
+        rows: 24,
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      }),
+    );
+    const opened = cli.jsonSends().filter((message) => message.type === "term.open");
+    expect(opened).toHaveLength(1);
+    const unused = ticketFor("one", "user-id", "phone");
+
+    terminalBrowserHub.endSession("phone", "signed_out");
+    expect(phone.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
+    // The shell keeps running on the node, as when a tab closes.
+    expect(cli.jsonSends().filter((message) => message.type === "term.close")).toEqual([]);
+    expect(relaySessionManager.hasTerminal(String(opened[0]?.terminalId))).toBe(true);
+    expect(
+      terminalTicketStore.redeem({ ticket: unused, userId: "user-id", sessionId: "phone" }),
+    ).toBeNull();
+  });
+
   it("a ban ends the user's browser shells on the node", async () => {
     const cli = await connectCli("one");
     const browser = attachBrowser();

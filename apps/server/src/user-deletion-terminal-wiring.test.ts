@@ -225,7 +225,7 @@ describe("app ban and session-revoke listeners close browser terminal sockets at
     terminalBrowserHub.accept({ socket: revoked, userId: "user-id", sessionId: "stolen" });
     terminalBrowserHub.accept({ socket: kept, userId: "user-id", sessionId: "own" });
 
-    notifySessionEnded({ id: "stolen", userId: "user-id" });
+    notifySessionEnded({ id: "stolen", userId: "user-id", cause: "revoked" });
     expect(revoked.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
     expect(kept.closes).toEqual([]);
     expect(closeShells).toHaveBeenCalledOnce();

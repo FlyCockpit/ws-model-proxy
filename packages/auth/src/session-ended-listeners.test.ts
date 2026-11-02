@@ -26,7 +26,9 @@ vi.mock("@ws-model-proxy/mailer", () => ({
   verifyTransport: vi.fn(async () => true),
 }));
 
-const { notifySessionEnded, onSessionEnded } = await import("./session-ended-listeners");
+const { notifySessionEnded, onSessionEnded, sessionEndCause } = await import(
+  "./session-ended-listeners"
+);
 const { auth } = await import("./index");
 
 describe("session ended listeners", () => {
@@ -37,10 +39,10 @@ describe("session ended listeners", () => {
       throw new Error("boom");
     });
     const offSeen = onSessionEnded((session) => seen.push(session.id));
-    notifySessionEnded({ id: "sess-1", userId: "user-1" });
+    notifySessionEnded({ id: "sess-1", userId: "user-1", cause: "revoked" });
     offFailing();
     offSeen();
-    notifySessionEnded({ id: "sess-2", userId: "user-1" });
+    notifySessionEnded({ id: "sess-2", userId: "user-1", cause: "revoked" });
     expect(seen).toEqual(["sess-1"]);
     expect(error).toHaveBeenCalledWith("[auth] session ended listener failed", "Error");
     error.mockRestore();
@@ -49,7 +51,7 @@ describe("session ended listeners", () => {
   it("is told by Better Auth's session delete hook (sign-out, revoked sessions)", async () => {
     const after = auth.options.databaseHooks?.session?.delete?.after;
     if (!after) throw new Error("no session delete hook");
-    const seen: Array<{ id: string; userId: string }> = [];
+    const seen: Array<{ id: string; userId: string; cause: string }> = [];
     const off = onSessionEnded((session) => seen.push(session));
     const row = {
       id: "sess-1",
@@ -59,8 +61,26 @@ describe("session ended listeners", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     };
-    await after(row);
+    await after(row, null);
+    await after(row, { path: "/sign-out" } as Parameters<typeof after>[1]);
+    await after(row, { path: "/revoke-session" } as Parameters<typeof after>[1]);
     off();
-    expect(seen).toEqual([{ id: "sess-1", userId: "user-1" }]);
+    expect(seen).toEqual([
+      { id: "sess-1", userId: "user-1", cause: "revoked" },
+      { id: "sess-1", userId: "user-1", cause: "signed_out" },
+      { id: "sess-1", userId: "user-1", cause: "revoked" },
+    ]);
+  });
+
+  it("treats only Better Auth's sign-out as a sign-out", () => {
+    expect(sessionEndCause("/sign-out")).toBe("signed_out");
+    for (const path of [
+      "/revoke-session",
+      "/revoke-sessions",
+      "/reset-password",
+      "/admin/ban-user",
+    ])
+      expect(sessionEndCause(path), path).toBe("revoked");
+    expect(sessionEndCause(undefined)).toBe("revoked");
   });
 });
