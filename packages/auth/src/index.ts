@@ -24,6 +24,7 @@ import { admin, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
+import { refuseImpersonatedAuthWrite } from "./impersonation-read-only";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { passwordResetOptions } from "./password-reset";
@@ -411,7 +412,9 @@ export const auth = betterAuth({
   hooks: {
     // Defense in depth for the pending-deletion restore contract
     // (./user-deletion-access-guard.ts); consumers enforce the marker.
+    // An admin's impersonation session is read-only (./impersonation-read-only.ts).
     before: createAuthMiddleware(async (ctx) => {
+      await refuseImpersonatedAuthWrite(ctx);
       await refuseAdminRestoreOfDeletingUser(ctx);
     }),
   },

@@ -686,7 +686,7 @@ describe("browser terminals and queued commands", () => {
     expect(db.node.findFirst).not.toHaveBeenCalled();
   });
 
-  it("refuses a terminal and a queued run to an admin impersonating the person", async () => {
+  it("refuses a terminal, a queued run and a node command to an admin impersonating the person", async () => {
     const ops = operator();
     db.node.findFirst.mockResolvedValue(fullNode as never);
     const impersonated = createRouterClient(nodeOperatorRouters, {
@@ -699,12 +699,15 @@ describe("browser terminals and queued commands", () => {
     for (const call of [
       () => impersonated.terminals.openTicket({ nodeId: "node1", cols: 80, rows: 24 }),
       () => impersonated.queued.run({ queuedCommandId: "q1", cols: 80, rows: 24 }),
+      () => impersonated.commands.run({ nodeId: "node1", command: "ls -la", confirm: "RUN" }),
     ])
       await expect(call()).rejects.toMatchObject({
         code: "FORBIDDEN",
         data: { reason: "impersonating" },
       });
     expect(ops.openTerminalTicket).not.toHaveBeenCalled();
+    expect(ops.startCommand).not.toHaveBeenCalled();
+    expect(db.nodeCommand.create).not.toHaveBeenCalled();
     // Refused before anything is read or decided: the person may still run it.
     expect(db.queuedNodeCommand.findFirst).not.toHaveBeenCalled();
     expect(db.queuedNodeCommand.updateMany).not.toHaveBeenCalled();

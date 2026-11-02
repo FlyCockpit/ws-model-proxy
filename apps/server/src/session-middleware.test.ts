@@ -20,7 +20,7 @@ vi.mock("@ws-model-proxy/auth", () => ({
 }));
 
 import { auth } from "@ws-model-proxy/auth";
-import { sessionMiddleware } from "./session-middleware";
+import { impersonationReadOnly, sessionMiddleware } from "./session-middleware";
 
 const SENTINEL = "SECRET-TOKEN-VALUE";
 
@@ -121,5 +121,40 @@ describe("sessionMiddleware — getSession failure sink (pass 10, L19)", () => {
 
     expect(warnSpy).not.toHaveBeenCalled();
     expect(c.set).toHaveBeenCalledWith("session", session);
+  });
+});
+
+describe("impersonationReadOnly", () => {
+  function routes(session: Session | null) {
+    const hono = new Hono<{ Variables: { session: Session | null } }>();
+    hono.use("*", async (c, next) => {
+      c.set("session", session);
+      await next();
+    });
+    hono.use("*", impersonationReadOnly);
+    hono.on(["GET", "POST", "PUT", "DELETE"], "/x", (c) => c.text("ran"));
+    return hono;
+  }
+  const impersonated = {
+    user: { id: "person" },
+    session: { id: "s", impersonatedBy: "admin-1" },
+  } as unknown as Session;
+  const own = {
+    user: { id: "person" },
+    session: { id: "s", impersonatedBy: null },
+  } as unknown as Session;
+
+  it("refuses a change through an impersonation session with 403", async () => {
+    for (const method of ["POST", "PUT", "DELETE"]) {
+      const response = await routes(impersonated).request("/x", { method });
+      expect(response.status, method).toBe(403);
+      expect(await response.json()).toMatchObject({ reason: "impersonating" });
+    }
+  });
+
+  it("lets reads through, and the person's own session", async () => {
+    expect(await (await routes(impersonated).request("/x")).text()).toBe("ran");
+    expect(await (await routes(own).request("/x", { method: "POST" })).text()).toBe("ran");
+    expect(await (await routes(null).request("/x", { method: "POST" })).text()).toBe("ran");
   });
 });

@@ -137,16 +137,17 @@ export function isConstraintViolation(error: unknown): boolean {
 }
 
 /**
- * Refuses a shell (browser terminal, queued command run, operator step attach) to a session an
- * admin impersonates through. A shell runs as the node's OS user on the person's own machine, so
- * no one but the person opens one. The terminal socket refuses such sessions too
- * (apps/server relay/terminal-websocket.ts).
+ * An admin's impersonation session is read-only: every mutation is refused (`contractProcedure`
+ * calls this), so the admin never mints the person's credentials or runs code on the person's
+ * nodes. Queries still answer, so the admin sees what the person sees. Better Auth's own writes
+ * are refused in packages/auth `impersonation-read-only.ts`, and the terminal socket refuses
+ * such sessions too (apps/server relay/terminal-websocket.ts).
  */
-export function refuseImpersonatedShell(session: { impersonatedBy?: string | null }): void {
+export function refuseImpersonatedChange(session: { impersonatedBy?: string | null }): void {
   if (session.impersonatedBy) {
     throw refuse(
       "impersonating",
-      "Terminals are not available while impersonating a user. Stop impersonating first.",
+      "Changes are not available while impersonating a user. Stop impersonating first.",
     );
   }
 }

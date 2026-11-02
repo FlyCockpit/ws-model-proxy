@@ -185,8 +185,8 @@ export const REFUSAL_REASONS = [
   "agent_update_current",
   // Security audit 2026-10-31.
   /**
-   * An admin impersonating a user opens no shell on that user's nodes: no browser terminal,
-   * no queued command run, no operator step attach.
+   * An admin's impersonation session is read-only: no change through it (no terminal, node
+   * command, runtime, agent token, MCP grant or setting), only reads.
    */
   "impersonating",
 ] as const;

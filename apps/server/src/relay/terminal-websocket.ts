@@ -1422,7 +1422,7 @@ export function createTerminalWebsocketMiddleware(): MiddlewareHandler<{
       return c.json({ error: "Authentication required." }, 401);
     }
     // An admin impersonating a user gets no terminal socket: no shell on the person's nodes,
-    // and no attach to the shells they have open (packages/api `refuseImpersonatedShell`).
+    // and no attach to the shells they have open (packages/api `refuseImpersonatedChange`).
     if (session.session.impersonatedBy) {
       return c.json({ error: "Terminals are not available while impersonating a user." }, 403);
     }

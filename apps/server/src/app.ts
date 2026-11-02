@@ -166,7 +166,7 @@ import {
 import { createRpcBatchHandlerPlugin } from "./rpc-batch-plugin.js";
 import { mountSecurityHeaders, withWebsocketConnectSources } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";
-import { sessionMiddleware } from "./session-middleware.js";
+import { impersonationReadOnly, sessionMiddleware } from "./session-middleware.js";
 import { SIGNIN_FAILURE_PATH, signinFailureLimit } from "./signin-failure-limit.js";
 import { signupAccessGate } from "./signup-access-gate.js";
 import { getOrSetSsrCache } from "./ssr-cache.js";
@@ -497,6 +497,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   // trailing `/*`) matches only the upload endpoint — `/api/internal/media/sign`
   // is a JSON route that stays under the global limit.
   app.use("/api/internal/media", sessionMiddleware);
+  app.use("/api/internal/media", impersonationReadOnly);
   app.use("/api/internal/media", createRateLimiterMiddleware(rpcLimiter));
   app.use("/api/internal/media", mediaCsrfGuard);
   app.use(
@@ -975,6 +976,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   );
 
   app.use("/api/internal/chat-test/*", sessionMiddleware);
+  app.use("/api/internal/chat-test/*", impersonationReadOnly);
   // Same-origin guard as on the media mutators. Chat-test is less exposed (its
   // JSON body can't come from a cross-site HTML form without a preflight), but
   // uniform coverage keeps the cookie-auth mutation surface one policy. Cost:
@@ -995,6 +997,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.route("/api/internal/chat-test", createChatTestRoutes());
 
   app.use("/api/internal/pools/*", sessionMiddleware);
+  app.use("/api/internal/pools/*", impersonationReadOnly);
   app.use("/api/internal/pools/*", mediaCsrfGuard);
   app.use("/api/internal/pools/*", createRateLimiterMiddleware(rpcLimiter));
   app.route("/api/internal/pools", createPoolMemberTestRoutes());
@@ -1004,6 +1007,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   // dedicated body limit needed. The upload endpoint itself is mounted earlier
   // with its larger limit.
   app.use("/api/internal/media/sign", sessionMiddleware);
+  app.use("/api/internal/media/sign", impersonationReadOnly);
   app.use("/api/internal/media/sign", createRateLimiterMiddleware(rpcLimiter));
   app.use("/api/internal/media/sign", mediaCsrfGuard);
   app.post("/api/internal/media/sign", createMediaSignHandler());
@@ -1022,6 +1026,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   // non-admins so the surface's existence isn't leaked. Metadata/policy only:
   // stats are aggregate counts, and purge/delete-all are audit-logged by count.
   app.use("/api/internal/media/admin/*", sessionMiddleware);
+  app.use("/api/internal/media/admin/*", impersonationReadOnly);
   app.use("/api/internal/media/admin/*", createRateLimiterMiddleware(rpcLimiter));
   app.use("/api/internal/media/admin/*", mediaCsrfGuard);
   app.use("/api/internal/media/admin/*", mediaAdminGate);
