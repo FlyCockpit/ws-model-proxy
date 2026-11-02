@@ -169,7 +169,8 @@ describe("nodes.agentUpdate access", () => {
       } as unknown as Session;
       await expect(
         procedureAt(client(makePort(), PERSON, impersonated), operation)(input),
-      ).rejects.toMatchObject({ code: "FORBIDDEN", data: { reason: "human_only" } });
+        // Every mutation: an impersonation session is read-only (refuseImpersonatedChange).
+      ).rejects.toMatchObject({ code: "FORBIDDEN", data: { reason: "impersonating" } });
       expect(sent).toEqual([]);
     });
 
@@ -180,10 +181,10 @@ describe("nodes.agentUpdate access", () => {
     } as unknown as Session;
     await expect(
       client(makePort(), PERSON, impersonated).start({ nodeId: "node-1" }),
-    ).rejects.toMatchObject({ code: "FORBIDDEN", data: { reason: "human_only" } });
+    ).rejects.toMatchObject({ code: "FORBIDDEN", data: { reason: "impersonating" } });
     await expect(
       client(makePort(), PERSON, impersonated).setPolicy({ nodeId: "node-1", policy: "OFF" }),
-    ).rejects.toMatchObject({ data: { reason: "human_only" } });
+    ).rejects.toMatchObject({ data: { reason: "impersonating" } });
     expect(sent).toEqual([]);
   });
 

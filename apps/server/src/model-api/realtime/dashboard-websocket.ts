@@ -133,6 +133,16 @@ export function createDashboardRealtimeMiddleware(
         "Sign in to the dashboard first.",
       );
     }
+    // An admin's impersonation session is read-only: no live session as the person.
+    if (session?.session?.impersonatedBy) {
+      return errorResponse(
+        c,
+        403,
+        "invalid_request_error",
+        "impersonating",
+        "Changes are not available while impersonating a user. Stop impersonating first.",
+      );
+    }
     let verdict: Awaited<ReturnType<typeof checkDashboardSession>>;
     try {
       verdict = await checkSession({ sessionId, userId });

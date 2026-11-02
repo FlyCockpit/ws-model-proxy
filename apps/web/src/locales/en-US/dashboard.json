@@ -1760,7 +1760,8 @@
       "not_your_command": "Only the agent credential that queued this command can withdraw it.",
       "not_marked_stopped": "Only a part marked stopped can be released. Mark it stopped first.",
       "already_released": "These resources are already released.",
-      "release_request_pending": "An agent's release request for this part is already waiting."
+      "release_request_pending": "An agent's release request for this part is already waiting.",
+      "impersonating": "You can only look while you impersonate someone. Stop impersonating to make changes."
     },
     "delete": "Delete runtime",
     "deleteTitle": "Delete {{name}}?",

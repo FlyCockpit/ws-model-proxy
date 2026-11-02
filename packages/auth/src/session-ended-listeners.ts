@@ -14,7 +14,22 @@
  * sockets close at their next recheck, which reads the missing row.
  */
 
-export type SessionEndedListener = (session: { id: string; userId: string }) => void;
+/**
+ * Why the session ended: `signed_out` when the person signed out (Better Auth's `/sign-out`),
+ * `revoked` for everything else (a revoke, "sign out other sessions", a password reset, an
+ * admin's ban), and when the endpoint is unknown, so an unknown end is treated as the stricter
+ * one.
+ */
+export type SessionEndCause = "signed_out" | "revoked";
+
+export type SessionEnded = { id: string; userId: string; cause: SessionEndCause };
+
+export type SessionEndedListener = (session: SessionEnded) => void;
+
+/** The cause of a session delete, from the Better Auth endpoint that ran it (if any). */
+export function sessionEndCause(endpointPath: string | null | undefined): SessionEndCause {
+  return endpointPath === "/sign-out" ? "signed_out" : "revoked";
+}
 
 const listeners = new Set<SessionEndedListener>();
 
@@ -30,7 +45,7 @@ export function onSessionEnded(listener: SessionEndedListener): () => void {
  * Runs every listener for a deleted session. A listener failure is logged (class only) and
  * never thrown: the sign-out already happened and must not be reported as failed.
  */
-export function notifySessionEnded(session: { id: string; userId: string }): void {
+export function notifySessionEnded(session: SessionEnded): void {
   for (const listener of [...listeners]) {
     try {
       listener(session);

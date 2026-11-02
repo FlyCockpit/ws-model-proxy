@@ -40,6 +40,7 @@ const REFUSAL_STATUS: Partial<Record<RefusalReason, RefusalCode>> = {
   invalid_node_count: "BAD_REQUEST",
   node_online: "CONFLICT",
   rate_limited: "TOO_MANY_REQUESTS",
+  impersonating: "FORBIDDEN",
 };
 
 /**
@@ -133,4 +134,20 @@ export function isConstraintViolation(error: unknown): boolean {
   return [Reflect.get(error, "code"), metaCode, causeCode].some(
     (code) => typeof code === "string" && (/^23[0-9A-Z]{3}$/.test(code) || code === "P0001"),
   );
+}
+
+/**
+ * An admin's impersonation session is read-only: every mutation is refused (`contractProcedure`
+ * calls this), so the admin never mints the person's credentials or runs code on the person's
+ * nodes. Queries still answer, so the admin sees what the person sees. Better Auth's own writes
+ * are refused in packages/auth `impersonation-read-only.ts`, and the terminal socket refuses
+ * such sessions too (apps/server relay/terminal-websocket.ts).
+ */
+export function refuseImpersonatedChange(session: { impersonatedBy?: string | null }): void {
+  if (session.impersonatedBy) {
+    throw refuse(
+      "impersonating",
+      "Changes are not available while impersonating a user. Stop impersonating first.",
+    );
+  }
 }

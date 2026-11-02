@@ -1760,7 +1760,8 @@
       "not_your_command": "Solo la credencial de agente que puso este comando en espera puede retirarlo.",
       "not_marked_stopped": "Solo se puede liberar una parte marcada como detenida. Márcala como detenida primero.",
       "already_released": "Estos recursos ya se liberaron.",
-      "release_request_pending": "Ya hay una solicitud de liberación de un agente esperando para esta parte."
+      "release_request_pending": "Ya hay una solicitud de liberación de un agente esperando para esta parte.",
+      "impersonating": "Mientras suplantas a alguien solo puedes ver. Deja de suplantar para hacer cambios."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",

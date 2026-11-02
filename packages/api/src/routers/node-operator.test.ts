@@ -686,6 +686,34 @@ describe("browser terminals and queued commands", () => {
     expect(db.node.findFirst).not.toHaveBeenCalled();
   });
 
+  it("refuses a terminal, a queued run and a node command to an admin impersonating the person", async () => {
+    const ops = operator();
+    db.node.findFirst.mockResolvedValue(fullNode as never);
+    const impersonated = createRouterClient(nodeOperatorRouters, {
+      context: {
+        session: { ...session, session: { ...session.session, impersonatedBy: "admin-id" } },
+        auth: PERSON,
+        services: { nodeOperator: ops },
+      } satisfies Context,
+    });
+    for (const call of [
+      () => impersonated.terminals.openTicket({ nodeId: "node1", cols: 80, rows: 24 }),
+      () => impersonated.queued.run({ queuedCommandId: "q1", cols: 80, rows: 24 }),
+      () => impersonated.commands.run({ nodeId: "node1", command: "ls -la", confirm: "RUN" }),
+    ])
+      await expect(call()).rejects.toMatchObject({
+        code: "FORBIDDEN",
+        data: { reason: "impersonating" },
+      });
+    expect(ops.openTerminalTicket).not.toHaveBeenCalled();
+    expect(ops.startCommand).not.toHaveBeenCalled();
+    expect(db.nodeCommand.create).not.toHaveBeenCalled();
+    // Refused before anything is read or decided: the person may still run it.
+    expect(db.queuedNodeCommand.findFirst).not.toHaveBeenCalled();
+    expect(db.queuedNodeCommand.updateMany).not.toHaveBeenCalled();
+    expect(db.nodeAuditEvent.create).not.toHaveBeenCalled();
+  });
+
   it("opens a terminal ticket for a person on a Full-control node", async () => {
     const ops = operator();
     db.node.findFirst.mockResolvedValue(fullNode as never);

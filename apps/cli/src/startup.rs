@@ -23,7 +23,9 @@ pub struct TerminalStartup {
     /// Persistent identity from `terminal-identity.json`. `None` only in tests;
     /// production startup refuses to connect without a loadable identity.
     identity: Option<CliIdentity>,
-    allow_human_terminal: bool,
+    /// `config.json` `allowHumanTerminal` at startup; hot reload only turns it
+    /// off ([`Self::disable_human_terminal`]); on takes a restart.
+    allow_human_terminal: std::sync::atomic::AtomicBool,
     /// Full control until lowered; a lowering latches for the daemon's life.
     /// Shared with whatever must see a lowering at once (an update worker).
     trust: std::sync::Arc<TrustAuthority>,
@@ -112,7 +114,7 @@ impl TerminalStartup {
         Self {
             key,
             identity: None,
-            allow_human_terminal: config.allow_human_terminal,
+            allow_human_terminal: std::sync::atomic::AtomicBool::new(config.allow_human_terminal),
             trust: std::sync::Arc::new(TrustAuthority {
                 full: std::sync::atomic::AtomicBool::new(
                     crate::trust::at_startup(config) == TrustValue::Full,
@@ -145,6 +147,15 @@ impl TerminalStartup {
 
     pub fn allow_human_terminal(&self) -> bool {
         self.allow_human_terminal
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Browser terminals off from now on (`config.json` turned
+    /// `allowHumanTerminal` off). Latches for the daemon's life: turning it
+    /// back on takes a restart. Returns whether it changed.
+    pub fn disable_human_terminal(&self) -> bool {
+        self.allow_human_terminal
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The node's trust for this daemon's lifetime.
@@ -249,7 +260,7 @@ impl TerminalStartup {
     pub fn features(&self) -> NodeFeatures {
         NodeFeatures {
             terminals: TerminalFeatures {
-                supported: crate::protocol::terminal_supported() && self.allow_human_terminal,
+                supported: crate::protocol::terminal_supported() && self.allow_human_terminal(),
                 max: u8::try_from(self.max_terminals).unwrap_or(u8::MAX),
                 approval_required: self.require_terminal_approval,
                 shells: self.shells.iter().map(|shell| shell.id.clone()).collect(),

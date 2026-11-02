@@ -177,6 +177,24 @@ describe("runtimes.steps", () => {
     expect(steps.cancel).not.toHaveBeenCalled();
   });
 
+  it("attach refuses an admin impersonating the person", async () => {
+    const steps = services();
+    const impersonated = createRouterClient(
+      { steps: runtimeSteps },
+      {
+        context: {
+          session: { ...session, session: { ...session.session, impersonatedBy: "admin-id" } },
+          auth: PERSON,
+          services: { runtimeSteps: steps },
+        } satisfies Context,
+      },
+    );
+    await expect(
+      impersonated.steps.attach({ stepId: "step1", cols: 80, rows: 24 }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", data: { reason: "impersonating" } });
+    expect(steps.attach).not.toHaveBeenCalled();
+  });
+
   it("attach returns a ticket bound to the person's session and the step view", async () => {
     const steps = services();
     const answer = await client(PERSON, steps).steps.attach({

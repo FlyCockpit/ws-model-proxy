@@ -30,3 +30,24 @@ export async function sessionMiddleware(c: Context, next: Next) {
   c.set("session", session ?? null);
   await next();
 }
+
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/**
+ * An admin's impersonation session is read-only (packages/auth `impersonation-read-only.ts`):
+ * after `sessionMiddleware`, a cookie route that changes something (an upload, a Chat Test or
+ * pool test request) answers 403 to it. Reads pass.
+ */
+export async function impersonationReadOnly(c: Context, next: Next) {
+  const session = c.get("session") as Session | null | undefined;
+  if (session?.session.impersonatedBy && !SAFE_METHODS.has(c.req.method.toUpperCase())) {
+    return c.json(
+      {
+        error: "Changes are not available while impersonating a user. Stop impersonating first.",
+        reason: "impersonating",
+      },
+      403,
+    );
+  }
+  await next();
+}

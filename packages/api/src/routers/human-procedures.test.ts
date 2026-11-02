@@ -174,3 +174,57 @@ describe("session, admin and agent procedures", () => {
     });
   });
 });
+
+describe("an admin's impersonation session is read-only", () => {
+  const impersonated = {
+    user: { ...session.user, id: "person", role: "user" },
+    session: { ...session.session, userId: "person", impersonatedBy: "owner" },
+  } as unknown as Session;
+  const cookie: CallerAuth = {
+    kind: "cookie_session",
+    userId: "person",
+    sessionId: "s",
+    csrfVerified: true,
+  };
+  const procedures = flattenContract(apiContract).filter(
+    ([, procedure]) => procedure.access !== "public",
+  );
+  // Admin procedures answer NOT_FOUND to a non-admin before the read-only rule.
+  const mutations = procedures
+    .filter(([, p]) => p.kind === "mutation" && p.access !== "admin" && p.access !== "human_admin")
+    .map(([path]) => path);
+  const queries = procedures
+    .filter(([, p]) => p.kind === "query" && p.access !== "admin" && p.access !== "human_admin")
+    .map(([path]) => path);
+
+  it("covers a real set of procedures", () => {
+    expect(mutations.length).toBeGreaterThan(40);
+    expect(queries.length).toBeGreaterThan(10);
+  });
+
+  it("refuses every mutation before any handler or input check runs", async () => {
+    const client = createRouterClient(appRouter, {
+      context: { session: impersonated, auth: cookie } satisfies Context,
+    });
+    for (const path of mutations) {
+      await expect(procedureAt(client, path)({}), path).rejects.toMatchObject({
+        code: "FORBIDDEN",
+        data: { reason: "impersonating" },
+      });
+    }
+    expect(vi.mocked(prisma).$transaction).not.toHaveBeenCalled();
+    expect(vi.mocked(prisma).agentToken.create).not.toHaveBeenCalled();
+  });
+
+  it("does not refuse a query for the impersonation", async () => {
+    const client = createRouterClient(appRouter, {
+      context: { session: impersonated, auth: cookie } satisfies Context,
+    });
+    for (const path of queries) {
+      const error = await procedureAt(client, path)({}).catch((caught: unknown) => caught);
+      expect((error as { data?: { reason?: string } } | undefined)?.data?.reason, path).not.toBe(
+        "impersonating",
+      );
+    }
+  });
+});

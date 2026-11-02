@@ -106,6 +106,20 @@ function upgrade(headers: Record<string, string> = { Origin: APP }) {
 const PATH = `${DASHBOARD_REALTIME_PATH}?intent=transcription&model=owner%2Fasr`;
 
 describe("Chat Test realtime upgrade (dashboard login)", () => {
+  it("refuses an admin's impersonation session (read-only) before the session check", async () => {
+    const t = deps();
+    const current = {
+      user: { id: "user-1" },
+      session: { id: "sess-1", impersonatedBy: "admin-1" },
+    } as unknown as Session;
+    const { hono, seen, checkSession } = app(t.deps, { current });
+    const response = await hono.request(PATH, upgrade());
+    expect(response.status).toBe(403);
+    expect(JSON.stringify(await response.json())).toContain("impersonating");
+    expect(checkSession).not.toHaveBeenCalled();
+    expect(seen).toEqual([]);
+  });
+
   it("admits a valid session as the HTTP Chat Test requester", async () => {
     const t = deps();
     const { hono, seen, checkSession } = app(t.deps);

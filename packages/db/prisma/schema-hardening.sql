@@ -1217,7 +1217,9 @@ ALTER TABLE share DROP CONSTRAINT IF EXISTS share_permission_shape;
 ALTER TABLE share ADD CONSTRAINT share_permission_shape CHECK ("canUse" OR "canContribute");
 
 -- The grantee's own-key model is the grantee's; clearing canContribute removes the members the
--- share contributed; clearing canUse removes the grantee's API-key entries for the pool.
+-- share contributed; clearing canUse removes the grantee's API-key entries for the pool and the
+-- sidecars of the grantee's pools that target it (enforce_pool_sidecar_target checks only on
+-- write, so a sidecar must not outlive the use it was allowed by).
 CREATE OR REPLACE FUNCTION enforce_share_consistency()
 RETURNS trigger LANGUAGE plpgsql AS $share_consistency$
 BEGIN
@@ -1233,6 +1235,8 @@ BEGIN
     IF OLD."canUse" AND NOT NEW."canUse" THEN
       DELETE FROM api_key_pool kp USING api_key k -- policy: bounded-delete
        WHERE kp."apiKeyId" = k.id AND k."userId" = NEW."granteeUserId" AND kp."poolId" = NEW."poolId";
+      DELETE FROM pool_sidecar ps USING pool p -- policy: bounded-delete
+       WHERE ps."poolId" = p.id AND p."userId" = NEW."granteeUserId" AND ps."targetPoolId" = NEW."poolId";
     END IF;
   END IF;
   RETURN NEW;
@@ -1247,12 +1251,24 @@ RETURNS trigger LANGUAGE plpgsql AS $share_delete_cleanup$
 BEGIN
   DELETE FROM api_key_pool kp USING api_key k -- policy: bounded-delete
    WHERE kp."apiKeyId" = k.id AND k."userId" = OLD."granteeUserId" AND kp."poolId" = OLD."poolId";
+  -- The grantee's sidecars targeting the pool go with the share (see enforce_share_consistency).
+  DELETE FROM pool_sidecar ps USING pool p -- policy: bounded-delete
+   WHERE ps."poolId" = p.id AND p."userId" = OLD."granteeUserId" AND ps."targetPoolId" = OLD."poolId";
   RETURN OLD;
 END;
 $share_delete_cleanup$;
 DROP TRIGGER IF EXISTS share_delete_cleanup ON share;
 CREATE TRIGGER share_delete_cleanup BEFORE DELETE ON share
 FOR EACH ROW EXECUTE FUNCTION share_delete_cleanup();
+-- A sidecar written before the two cleanups above may target another owner's pool its own
+-- owner can no longer use (no share with canUse). It goes here; once none is left, this
+-- deletes nothing.
+DELETE FROM pool_sidecar ps USING pool p, pool t -- policy: bounded-delete
+ WHERE ps."poolId" = p.id AND t.id = ps."targetPoolId" AND t."userId" <> p."userId"
+   AND NOT EXISTS (
+     SELECT 1 FROM share s
+      WHERE s."poolId" = ps."targetPoolId" AND s."granteeUserId" = p."userId" AND s."canUse"
+   );
 
 -- An API key lists only pools its owner owns or may use (share with canUse).
 CREATE OR REPLACE FUNCTION enforce_api_key_pool_access()

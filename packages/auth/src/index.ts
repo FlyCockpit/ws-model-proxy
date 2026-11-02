@@ -24,11 +24,12 @@ import { admin, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
+import { refuseImpersonatedAuthWrite } from "./impersonation-read-only";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { passwordResetOptions } from "./password-reset";
 import { recordProvedEmail } from "./proved-email";
-import { notifySessionEnded } from "./session-ended-listeners";
+import { notifySessionEnded, sessionEndCause } from "./session-ended-listeners";
 import {
   acceptClaimedShareInviteToken,
   acceptShareInvitesForProvenEmail,
@@ -411,7 +412,9 @@ export const auth = betterAuth({
   hooks: {
     // Defense in depth for the pending-deletion restore contract
     // (./user-deletion-access-guard.ts); consumers enforce the marker.
+    // An admin's impersonation session is read-only (./impersonation-read-only.ts).
     before: createAuthMiddleware(async (ctx) => {
+      await refuseImpersonatedAuthWrite(ctx);
       await refuseAdminRestoreOfDeletingUser(ctx);
     }),
   },
@@ -433,8 +436,13 @@ export const auth = betterAuth({
           await refuseUndeletableUserBeforeCredentialDelete(session, context);
         },
         // After the delete committed: the session's browser sockets close now.
-        after: async (session) => {
-          notifySessionEnded({ id: session.id, userId: session.userId });
+        // The endpoint tells a sign-out from a revoke (./session-ended-listeners.ts).
+        after: async (session, context) => {
+          notifySessionEnded({
+            id: session.id,
+            userId: session.userId,
+            cause: sessionEndCause(context?.path),
+          });
         },
       },
     },

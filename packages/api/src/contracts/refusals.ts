@@ -183,6 +183,12 @@ export const REFUSAL_REASONS = [
   "agent_update_in_progress",
   /** The node already runs this server's wsmp. */
   "agent_update_current",
+  // Security audit 2026-10-31.
+  /**
+   * An admin's impersonation session is read-only: no change through it (no terminal, node
+   * command, runtime, agent token, MCP grant or setting), only reads.
+   */
+  "impersonating",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

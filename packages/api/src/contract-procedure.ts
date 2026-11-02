@@ -10,6 +10,7 @@ import type { z } from "zod";
 import type { Context } from "./context";
 import type { ProcedureContract } from "./contracts/procedure";
 import { assertAccess } from "./index";
+import { refuseImpersonatedChange } from "./lib/refuse";
 
 const o = os.$context<Context>();
 
@@ -22,6 +23,7 @@ function signedInBase(contract: ProcedureContract) {
       throw new Error("A public contract is bound with publicContractProcedure");
     }
     const session = await assertAccess(contract.access, context);
+    if (contract.kind === "mutation") refuseImpersonatedChange(session.session);
     return next({ context: { session } });
   });
 }
