@@ -1639,6 +1639,36 @@ try {
     INSERT INTO api_key_pool ("apiKeyId", "poolId") VALUES ('key-b', 'pool-a');
     INSERT INTO pool_sidecar (id, "poolId", input, "targetPoolId") VALUES
       ('sc-b-use-2', 'pool-b-own', 'VIDEO', 'pool-a')`);
+  // A sidecar orphaned before the cleanup triggers existed (use cleared with the trigger off)
+  // goes when the hardening applies again (forced: an unchanged SQL is skipped; a deploy that
+  // brings this SQL applies it once).
+  await client.query(`
+    ALTER TABLE share DISABLE TRIGGER share_consistency;
+    UPDATE share SET "canUse" = false WHERE id = 'share-b';
+    ALTER TABLE share ENABLE TRIGGER share_consistency`);
+  await expectValue(
+    "the orphaned sidecar is there before the hardening applies again",
+    `SELECT count(*) FROM pool_sidecar WHERE id = 'sc-b-use-2'`,
+    1,
+  );
+  const keptBefore = (
+    await client.query(`SELECT count(*) FROM pool_sidecar WHERE "poolId" <> 'pool-b-own'`)
+  ).rows[0].count;
+  await runHardening({ SCHEMA_HARDENING_FORCE: "1" });
+  await expectValue(
+    "applying the hardening removes a sidecar its owner may no longer use",
+    `SELECT count(*) FROM pool_sidecar WHERE id = 'sc-b-use-2'`,
+    0,
+  );
+  await expectValue(
+    "applying the hardening keeps a sidecar targeting the owner's own pool",
+    `SELECT count(*) FROM pool_sidecar WHERE "poolId" <> 'pool-b-own'`,
+    keptBefore,
+  );
+  await client.query(`
+    UPDATE share SET "canUse" = true WHERE id = 'share-b';
+    INSERT INTO pool_sidecar (id, "poolId", input, "targetPoolId") VALUES
+      ('sc-b-use-3', 'pool-b-own', 'VIDEO', 'pool-a')`);
   await client.query(`UPDATE share SET "canContribute" = false WHERE id = 'share-b'`);
   await expectValue(
     "clearing canContribute removes contributed members",

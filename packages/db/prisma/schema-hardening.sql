@@ -1260,6 +1260,15 @@ $share_delete_cleanup$;
 DROP TRIGGER IF EXISTS share_delete_cleanup ON share;
 CREATE TRIGGER share_delete_cleanup BEFORE DELETE ON share
 FOR EACH ROW EXECUTE FUNCTION share_delete_cleanup();
+-- A sidecar written before the two cleanups above may target another owner's pool its own
+-- owner can no longer use (no share with canUse). It goes here; once none is left, this
+-- deletes nothing.
+DELETE FROM pool_sidecar ps USING pool p, pool t -- policy: bounded-delete
+ WHERE ps."poolId" = p.id AND t.id = ps."targetPoolId" AND t."userId" <> p."userId"
+   AND NOT EXISTS (
+     SELECT 1 FROM share s
+      WHERE s."poolId" = ps."targetPoolId" AND s."granteeUserId" = p."userId" AND s."canUse"
+   );
 
 -- An API key lists only pools its owner owns or may use (share with canUse).
 CREATE OR REPLACE FUNCTION enforce_api_key_pool_access()
