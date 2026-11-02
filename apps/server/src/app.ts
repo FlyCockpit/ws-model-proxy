@@ -291,10 +291,15 @@ onUserBanned(cancelRelayWorkForBannedUser);
 // or pools serve, at once (not at the next 60 s recheck).
 onUserBanned((userId) => realtimeSessionRegistry.terminateForUser(userId));
 onUserBanned((userId) => nodeEventHub.closeUser(userId, "access_blocked"));
+// A ban closes the user's browser terminal sockets (and those an admin impersonates through)
+// and burns their tickets at once, not at the next 60 s recheck. Their shells end in
+// cancelRelayWorkForBannedUser above.
+onUserBanned((userId) => terminalBrowserHub.revokeTerminalAccessForUser(userId, "user_banned"));
 
 // Committed node changes reach their owner's browser event streams (#255; ./node-events/).
 onNodeEvent((event) => nodeEventHub.publish(event));
-// A signed-out or revoked session's browser sockets close now, not at the 60 s recheck.
+// A signed-out or revoked session's browser sockets close now, not at the 60 s recheck, and
+// the shells its terminal sockets view end (./relay/terminal-websocket.ts endSession).
 onSessionEnded((session) => {
   nodeEventHub.endSession(session.id);
   terminalBrowserHub.endSession(session.id);
