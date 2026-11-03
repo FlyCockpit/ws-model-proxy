@@ -258,8 +258,6 @@ export type TrackedFileOp = {
 };
 
 export type { TerminalRecord } from "./terminal-record.js";
-/** What the relay knows about an operator terminal: its step (no command text). */
-export type OperatorTerminalInfo = OperatorStep;
 
 /** What closing a step's operator terminal found (`closeOperatorStep`). */
 export type OperatorCloseAnswer = "unopened" | "closed" | "running" | "absent";

@@ -27,8 +27,6 @@ export type TabStatus =
   /** The relay's terminal list no longer has the terminal (it ended while this page was away). */
   | { phase: "exited"; cause: "gone" };
 
-export type TabPhase = TabStatus["phase"];
-
 export type TabEvent =
   /** Start the handshake again: everything about the earlier attempt is dropped. */
   | { type: "retry" }

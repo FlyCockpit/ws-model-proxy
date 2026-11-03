@@ -262,12 +262,23 @@ impl AtomicStage {
     /// Move by `step`; a move `step` does not allow from the current stage changes nothing
     /// (and is logged: the worker's own sequence never asks for one).
     fn advance(&self, step: fn(WorkerStage) -> Option<WorkerStage>, what: &str) -> bool {
-        let moved = self
-            .0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                step(WorkerStage::from_u8(value)).map(|next| next as u8)
-            })
-            .is_ok();
+        // A CAS loop rather than `fetch_update`, which current Rust deprecates for a
+        // replacement newer than our MSRV (1.88).
+        let mut value = self.0.load(Ordering::SeqCst);
+        let moved = loop {
+            let Some(next) = step(WorkerStage::from_u8(value)) else {
+                break false;
+            };
+            match self.0.compare_exchange_weak(
+                value,
+                next as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break true,
+                Err(current) => value = current,
+            }
+        };
         if !moved {
             tracing::warn!(stage = ?self.load(), what, "the update worker cannot move here");
         }

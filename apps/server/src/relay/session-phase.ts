@@ -53,8 +53,6 @@ export type SessionPhase =
   | { readonly kind: "ready"; readonly node: RegisteredNode }
   | { readonly kind: "closed"; readonly node: RegisteredNode | null };
 
-export type SessionPhaseKind = SessionPhase["kind"];
-
 /** Anything that holds a session phase (the manager's `SessionState`). */
 export type PhaseHolder = { phase: SessionPhase };
 

@@ -85,8 +85,8 @@ import type {
   RuntimeInventorySnapshot,
   SendGuard,
 } from "../relay/session-manager.js";
+import { createSerialTask } from "../serial-task.js";
 import { applyAlwaysOnInventory, instanceStoredFacts } from "./always-on.js";
-import { SerialTicker } from "./serial-ticker.js";
 import {
   GENERATION_STRIDE,
   generationSteps,
@@ -496,12 +496,15 @@ export class RuntimeLifecycle {
   readonly epoch = `e${randomBytes(9)
     .toString("base64url")
     .replace(/[^A-Za-z0-9]/g, "x")}`;
-  private timer: ReturnType<typeof setInterval> | null = null;
-  /** One tick at a time (idle, running, running with a rerun, stopped: `./serial-ticker.ts`). */
-  private readonly ticker = new SerialTicker(
-    () => this.tick(),
-    (error: unknown) => console.error("[lifecycle] tick failed", errorName(error)),
-  );
+  /**
+   * One tick at a time, every `TICK_MS` and on wake (idle, running, running with a rerun,
+   * stopped: `../serial-task.ts`).
+   */
+  private readonly ticker = createSerialTask({
+    run: () => this.tick(),
+    onError: (error: unknown) => console.error("[lifecycle] tick failed", errorName(error)),
+    intervalMs: TICK_MS,
+  });
   private readonly now: () => Date;
   private readonly startedAt = Date.now();
   /** Each batched sweep's page cursor (`./sweep.ts`): every matching row is reached. */
@@ -524,25 +527,20 @@ export class RuntimeLifecycle {
 
   /** Whether `stop()` was called (no tick starts on its own any more). */
   private get stopped(): boolean {
-    return this.ticker.state === "stopped";
+    return this.ticker.phase === "stopped";
   }
 
   start() {
-    if (this.timer || this.stopped) return;
-    this.timer = setInterval(() => this.wake(), TICK_MS);
-    this.timer.unref?.();
-    this.wake();
+    this.ticker.start();
   }
 
   async stop() {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
     await this.ticker.stop();
   }
 
   /** Runs a tick now (or right after the current one). */
   wake() {
-    this.ticker.wake();
+    void this.ticker.trigger();
   }
 
   /**

@@ -1122,6 +1122,7 @@ pub fn on_start(
 mod tests {
     use super::super::deadman::fake::FakeScheduler;
     use super::*;
+    #[cfg(unix)]
     use crate::update::state::Phase;
 
     #[derive(Default)]

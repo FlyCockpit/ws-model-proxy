@@ -32,9 +32,23 @@ pub enum Update {
         /// Observations are ordered: an older one never replaces a newer one.
         generation: u64,
         result: Option<NodeFrame>,
+        /// The step this update ends, when it ends one (`None` for an
+        /// observation pass).
+        ended: Option<StepEnded>,
         /// Every instance rank this node knows, verified against the machine.
         instances: Vec<(Job, InstanceRecord)>,
     },
+}
+
+/// A step its runner thread is done with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepEnded {
+    pub step_id: String,
+    /// Whether it succeeded. `false` too when it never ran (a deadline
+    /// waiting for its rank) and when its operator terminal ended without
+    /// success (no result rides along then: `operator_closed` already went
+    /// out).
+    pub succeeded: bool,
 }
 
 /// What an operator step's runner thread asks of the relay loop.
@@ -254,6 +268,7 @@ impl Runner {
                 let _ = tx.send(Update::Observation {
                     generation,
                     result: None,
+                    ended: None,
                     instances,
                 });
             });
@@ -332,6 +347,12 @@ impl Runner {
                     }),
                 };
                 forget_step(&running, &key, &cancel);
+                let ended = StepEnded {
+                    step_id: job.step_id.clone(),
+                    succeeded: outcome.as_ref().is_some_and(|outcome| {
+                        outcome.status == crate::protocol::frames::JobStatus::Succeeded
+                    }),
+                };
                 let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
                 let instances = observe_all_idle(&dir, &keys, &running);
                 let _ = tx.send(Update::Observation {
@@ -348,6 +369,7 @@ impl Runner {
                         }
                         frame
                     }),
+                    ended: Some(ended),
                     instances,
                 });
                 active.fetch_sub(1, Ordering::SeqCst);

@@ -156,14 +156,22 @@ impl SttRegistry {
     /// A deployment stop for `endpoint_slug` is about to run: its sessions
     /// end now (`not_found`, "model_unavailable") and no new one opens there
     /// until a start job for it arrives, the endpoint leaves the snapshot, or
-    /// the stop (`step_id`) is refused or fails ([`Self::stop_failed`]).
+    /// the stop (`step_id`) is refused or fails ([`Self::stop_failed`]). A
+    /// re-delivery of the stop already marking the endpoint keeps the mark as
+    /// it is (a start already waiting on it still waits).
     pub fn endpoint_stopping(&mut self, endpoint_slug: &str, step_id: &str) -> Vec<NodeFrame> {
-        self.stopping.insert(
-            endpoint_slug.to_string(),
-            StopMark::Running {
-                step_id: step_id.to_string(),
-            },
-        );
+        if self
+            .stopping
+            .get(endpoint_slug)
+            .is_none_or(|mark| mark.step_id() != step_id)
+        {
+            self.stopping.insert(
+                endpoint_slug.to_string(),
+                StopMark::Running {
+                    step_id: step_id.to_string(),
+                },
+            );
+        }
         let ids: Vec<String> = self
             .sessions
             .iter()
@@ -1060,4 +1068,4 @@ impl Turn {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

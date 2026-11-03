@@ -1,7 +1,5 @@
 //! Durable node credential storage (`node-credential.json`, 0600).
 
-use std::io::Write;
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -39,19 +37,17 @@ pub fn load_node_credential() -> Result<Option<NodeCredential>> {
     }
 }
 
+/// Written through a synced temp file in the same 0700 directory, renamed
+/// over the old credential (mode 0600), then the directory synced: a crash
+/// leaves the old credential or the new one, never a torn file.
 pub fn save_node_credential(credential: &NodeCredential) -> Result<()> {
-    let path = crate::paths::node_credential_file()?;
-    let dir = path
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .context("node credential path has no parent directory")?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating state directory `{}`", dir.display()))?;
-    set_private_dir(&dir)?;
-    let text = serde_json::to_string_pretty(credential).context("serializing node credential")?;
-    write_private_file(&path, text.as_bytes())?;
-    sync_parent_dir(&path)?;
-    Ok(())
+    write_node_credential(&crate::paths::node_credential_file()?, credential)
+}
+
+fn write_node_credential(path: &std::path::Path, credential: &NodeCredential) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(credential).context("serializing node credential")?;
+    bytes.push(b'\n');
+    crate::approvals::write_private_atomic(path, &bytes, "node credential", false).map(|_| ())
 }
 
 pub fn remove_node_credential() -> Result<bool> {
@@ -69,66 +65,6 @@ pub fn remove_node_credential() -> Result<bool> {
 }
 
 #[cfg(unix)]
-fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("opening private credential file `{}`", path.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("writing credential file `{}`", path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("writing credential file `{}`", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("syncing credential file `{}`", path.display()))?;
-    let mut permissions = file
-        .metadata()
-        .with_context(|| format!("reading metadata for `{}`", path.display()))?
-        .permissions();
-    use std::os::unix::fs::PermissionsExt;
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(path, permissions)
-        .with_context(|| format!("setting private permissions on `{}`", path.display()))
-}
-
-#[cfg(not(unix))]
-fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("opening credential file `{}`", path.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("writing credential file `{}`", path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("writing credential file `{}`", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("syncing credential file `{}`", path.display()))
-}
-
-#[cfg(unix)]
-fn set_private_dir(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = std::fs::metadata(path)
-        .with_context(|| format!("reading metadata for `{}`", path.display()))?
-        .permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(path, permissions)
-        .with_context(|| format!("setting private permissions on `{}`", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_private_dir(_path: &std::path::Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn sync_parent_dir(path: &std::path::Path) -> Result<()> {
     let Some(dir) = path.parent() else {
         return Ok(());
@@ -141,4 +77,48 @@ fn sync_parent_dir(path: &std::path::Path) -> Result<()> {
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &std::path::Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_credential_is_replaced_whole_in_its_format_and_mode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("state").join("node-credential.json");
+        let credential = |secret: &str| NodeCredential {
+            node_id: "node-1".into(),
+            slug: "box".into(),
+            server: "https://wmp.example".into(),
+            credential: secret.into(),
+        };
+        write_node_credential(&path, &credential("first")).expect("first write");
+        write_node_credential(&path, &credential("second")).expect("replacing it");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let expected = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&credential("second")).expect("json")
+        );
+        assert_eq!(text, expected);
+        // Only the credential is left: no temp file beside it.
+        let names: Vec<_> = std::fs::read_dir(path.parent().expect("parent"))
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["node-credential.json"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &std::path::Path| {
+                std::fs::metadata(path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(path.parent().expect("parent")), 0o700);
+        }
+    }
 }

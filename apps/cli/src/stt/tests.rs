@@ -146,7 +146,7 @@ fn serve(mut stream: TcpStream, reply: &Reply, seen: &Mutex<Seen>) {
     let _ = stream.write_all(response.as_bytes());
 }
 
-fn endpoint(
+pub(crate) fn endpoint(
     slug: &str,
     base_url: &str,
     realtime: Option<RealtimeTranscriptionProfile>,
@@ -169,7 +169,7 @@ fn endpoint(
     }
 }
 
-fn segmented(
+pub(crate) fn segmented(
     max_item_seconds: Option<u32>,
     max_sessions: Option<u32>,
 ) -> Option<RealtimeTranscriptionProfile> {
@@ -180,7 +180,7 @@ fn segmented(
     })
 }
 
-fn open(session_id: &str, slug: &str) -> SttServerMessage {
+pub(crate) fn open(session_id: &str, slug: &str) -> SttServerMessage {
     SttServerMessage::Open {
         session_id: session_id.to_string(),
         handle: slug.to_string(),
@@ -196,12 +196,12 @@ fn open(session_id: &str, slug: &str) -> SttServerMessage {
     }
 }
 
-fn session_id(n: u8) -> String {
+pub(crate) fn session_id(n: u8) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([n; 16])
 }
 
-fn registry() -> (SttRegistry, Receiver<FromWorker>) {
+pub(crate) fn registry() -> (SttRegistry, Receiver<FromWorker>) {
     let (tx, rx) = mpsc::sync_channel(64);
     (SttRegistry::new(tx), rx)
 }
@@ -240,7 +240,7 @@ fn has_event(predicate: impl Fn(&SttEvent) -> bool) -> impl Fn(&[NodeFrame]) -> 
     move |sent| events(sent).into_iter().any(&predicate)
 }
 
-fn is_error(message: &NodeFrame, expected: RelayFailure) -> bool {
+pub(crate) fn is_error(message: &NodeFrame, expected: RelayFailure) -> bool {
     matches!(message, NodeFrame::SttError { failure, .. } if *failure == expected)
 }
 

@@ -803,6 +803,7 @@ mod tests {
     /// `(name, bytes)` of each file in `tests/fixtures/update-state/written.txt`: what the
     /// build before [`Lifecycle`] (the flat `phase` and marks) wrote, byte for byte, for every
     /// state it could reach.
+    #[cfg(unix)]
     fn written_before() -> Vec<(String, String)> {
         let text = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),

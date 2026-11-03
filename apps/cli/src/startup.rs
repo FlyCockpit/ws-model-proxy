@@ -87,14 +87,22 @@ impl TrustAuthority {
     /// Relay only and one more lowering, in one atomic step. Returns whether
     /// the node was at Full control.
     pub fn lower(&self) -> bool {
-        let previous = self
-            .state
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |state| Some((state >> 1).saturating_add(1) << 1),
-            )
-            .unwrap_or_else(|state| state);
+        use std::sync::atomic::Ordering;
+        // A CAS loop rather than `fetch_update`, which current Rust deprecates for a
+        // replacement newer than our MSRV (1.88).
+        let mut previous = self.state.load(Ordering::SeqCst);
+        loop {
+            let next = (previous >> 1).saturating_add(1) << 1;
+            match self.state.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(current) => previous = current,
+            }
+        }
         TrustSnapshot::decode(previous).full
     }
 

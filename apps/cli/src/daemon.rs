@@ -2583,11 +2583,16 @@ where
                 Some(operator_ticket(&job, operator, &rendered))
             }
         };
+        // Live speech-to-text sessions on the instance end before its stop
+        // runs, and none opens there meanwhile.
+        let ended = stt_step_submitting(&mut session.stt, &job);
+        send_stt_frames(socket, &mut session.stt, ended)?;
         let submitted = match (session.runner.as_ref(), ticket) {
             (Some(runner), Some(ticket)) => runner.submit_operator(rendered, ticket),
             (Some(runner), None) => runner.submit(rendered),
             (None, _) => Err(anyhow::anyhow!("runtime steps are unavailable")),
         };
+        stt_step_submitted(&mut session.stt, &job, submitted.is_ok());
         if let Err(error) = submitted {
             if let Some(terminal_id) = &terminal_id {
                 session.terminals.release_operator(terminal_id);
@@ -2600,6 +2605,52 @@ where
             );
         }
         Ok(())
+    }
+}
+
+/// What a runtime step about to be submitted does to live speech-to-text:
+/// a stop ends the sessions on its instance's endpoint (its handle) and
+/// marks the endpoint, so none opens there until the stop is settled
+/// ([`crate::stt::SttRegistry::endpoint_stopping`]). Every rank's stop marks
+/// the handle; only the node running rank 0 serves it, and the endpoint
+/// check drops a mark on an endpoint this node does not serve.
+fn stt_step_submitting(
+    stt: &mut crate::stt::SttRegistry,
+    job: &crate::protocol::frames::RuntimeJob,
+) -> Vec<NodeFrame> {
+    if job.phase == JobPhase::Stop {
+        stt.endpoint_stopping(&job.handle, &job.step_id)
+    } else {
+        Vec::new()
+    }
+}
+
+/// After the runner took (`admitted`) or refused a runtime step: a refused
+/// stop leaves its endpoint serving; an admitted start lifts the stop mark,
+/// at once if the stop is done, else when it finishes.
+fn stt_step_submitted(
+    stt: &mut crate::stt::SttRegistry,
+    job: &crate::protocol::frames::RuntimeJob,
+    admitted: bool,
+) {
+    match job.phase {
+        JobPhase::Stop if !admitted => stt.stop_failed(&job.step_id),
+        JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin if admitted => {
+            stt.endpoint_starting(&job.handle);
+        }
+        _ => {}
+    }
+}
+
+/// A runtime step its runner thread is done with: a stop that succeeded
+/// may let a waiting start take sessions again; one that failed (or whose
+/// operator terminal closed without success) leaves its endpoint serving.
+/// Any other step's id names no mark.
+fn stt_step_ended(stt: &mut crate::stt::SttRegistry, ended: &crate::runtimes::runner::StepEnded) {
+    if ended.succeeded {
+        stt.stop_finished(&ended.step_id);
+    } else {
+        stt.stop_failed(&ended.step_id);
     }
 }
 
@@ -2706,11 +2757,15 @@ where
             Update::Observation {
                 generation,
                 result,
+                ended,
                 instances,
             } => {
                 if generation > session.observed_generation {
                     session.observed_generation = generation;
                     session.runtimes.set_instances(instances);
+                }
+                if let Some(ended) = &ended {
+                    stt_step_ended(&mut session.stt, ended);
                 }
                 // An operator step's runner thread is done with its terminal id.
                 if let Some(NodeFrame::RuntimeJobResult {
@@ -6728,6 +6783,134 @@ mod tests {
             }),
             reservations: Vec::new(),
         }
+    }
+
+    /// The instance `stop_job` names, served as a live STT endpoint, and another.
+    fn stt_endpoints() -> Vec<crate::config::EndpointConfig> {
+        use crate::stt::tests::{endpoint, segmented};
+        vec![
+            endpoint(
+                "i-abcdefabcdef",
+                "http://127.0.0.1:9",
+                segmented(None, None),
+            ),
+            endpoint(
+                "i-000000000000",
+                "http://127.0.0.1:9",
+                segmented(None, None),
+            ),
+        ]
+    }
+
+    fn opens(
+        stt: &mut crate::stt::SttRegistry,
+        managed: &[crate::config::EndpointConfig],
+        n: u8,
+        slug: &str,
+    ) -> bool {
+        use crate::stt::tests::{open, session_id};
+        stt.handle(open(&session_id(n), slug), managed, Instant::now())
+            .is_empty()
+    }
+
+    fn job_in(phase: JobPhase, step_id: &str) -> crate::protocol::frames::RuntimeJob {
+        crate::protocol::frames::RuntimeJob {
+            step_id: step_id.into(),
+            phase,
+            ..stop_job(false)
+        }
+    }
+
+    fn ended(step_id: &str, succeeded: bool) -> crate::runtimes::runner::StepEnded {
+        crate::runtimes::runner::StepEnded {
+            step_id: step_id.into(),
+            succeeded,
+        }
+    }
+
+    #[test]
+    fn a_stop_job_ends_the_stt_sessions_on_its_instance_before_it_runs() {
+        use crate::stt::tests::{is_error, registry, session_id};
+        let (mut stt, _rx) = registry();
+        let managed = stt_endpoints();
+        assert!(opens(&mut stt, &managed, 1, "i-abcdefabcdef"));
+        assert!(opens(&mut stt, &managed, 2, "i-000000000000"));
+        let stop = stop_job(false);
+        let frames = stt_step_submitting(&mut stt, &stop);
+        assert_eq!(frames.len(), 1);
+        assert!(is_error(
+            &frames[0],
+            crate::protocol::RelayFailure::NotFound
+        ));
+        assert!(!stt.is_live(&session_id(1)));
+        assert!(stt.is_live(&session_id(2)), "another instance's session");
+        stt_step_submitted(&mut stt, &stop, true);
+        assert!(
+            !opens(&mut stt, &managed, 3, "i-abcdefabcdef"),
+            "no session opens while the stop runs"
+        );
+        // Other steps change nothing: no sessions end, no mark.
+        for phase in [JobPhase::Status, JobPhase::Health, JobPhase::Readiness] {
+            assert!(stt_step_submitting(&mut stt, &job_in(phase, "probe")).is_empty());
+        }
+        assert!(stt.is_live(&session_id(2)));
+        stt.abort_all();
+    }
+
+    #[test]
+    fn a_refused_or_failed_stop_lifts_its_stt_mark() {
+        let (mut stt, _rx) = crate::stt::tests::registry();
+        let managed = stt_endpoints();
+        // The runner refuses the stop: its endpoint still serves.
+        let stop = stop_job(false);
+        stt_step_submitting(&mut stt, &stop);
+        stt_step_submitted(&mut stt, &stop, false);
+        assert!(opens(&mut stt, &managed, 1, "i-abcdefabcdef"));
+        // The stop runs and fails (or its operator terminal closes).
+        let stop = job_in(JobPhase::Stop, "step2");
+        stt_step_submitting(&mut stt, &stop);
+        stt_step_submitted(&mut stt, &stop, true);
+        stt_step_ended(&mut stt, &ended("other", false));
+        assert!(!opens(&mut stt, &managed, 2, "i-abcdefabcdef"));
+        stt_step_ended(&mut stt, &ended("step2", false));
+        assert!(opens(&mut stt, &managed, 3, "i-abcdefabcdef"));
+        stt.abort_all();
+    }
+
+    #[test]
+    fn a_start_after_a_stop_takes_stt_sessions_once_the_stop_is_done() {
+        let (mut stt, _rx) = crate::stt::tests::registry();
+        let managed = stt_endpoints();
+        // A start admitted while the stop runs waits for it.
+        let stop = stop_job(false);
+        stt_step_submitting(&mut stt, &stop);
+        stt_step_submitted(&mut stt, &stop, true);
+        let start = job_in(JobPhase::Start, "start1");
+        stt_step_submitting(&mut stt, &start);
+        stt_step_submitted(&mut stt, &start, true);
+        assert!(!opens(&mut stt, &managed, 1, "i-abcdefabcdef"));
+        // A re-delivery of the stop keeps the start waiting.
+        stt_step_submitting(&mut stt, &stop);
+        stt_step_submitted(&mut stt, &stop, true);
+        // The start's own result names no mark.
+        stt_step_ended(&mut stt, &ended("start1", true));
+        assert!(!opens(&mut stt, &managed, 2, "i-abcdefabcdef"));
+        stt_step_ended(&mut stt, &ended("step1", true));
+        assert!(opens(&mut stt, &managed, 3, "i-abcdefabcdef"));
+
+        // A stop that finished first: a refused start keeps the mark, an
+        // admitted prepare lifts it.
+        let stop = job_in(JobPhase::Stop, "step2");
+        stt_step_submitting(&mut stt, &stop);
+        stt_step_submitted(&mut stt, &stop, true);
+        stt_step_ended(&mut stt, &ended("step2", true));
+        assert!(!opens(&mut stt, &managed, 4, "i-abcdefabcdef"));
+        let prepare = job_in(JobPhase::Prepare, "prep1");
+        stt_step_submitted(&mut stt, &prepare, false);
+        assert!(!opens(&mut stt, &managed, 5, "i-abcdefabcdef"));
+        stt_step_submitted(&mut stt, &prepare, true);
+        assert!(opens(&mut stt, &managed, 6, "i-abcdefabcdef"));
+        stt.abort_all();
     }
 
     fn recorded(interactive_stop: bool) -> Job {
