@@ -31,8 +31,9 @@ and Terminals pages say "Live updates paused".
 
 A served model can now be declared as taking tool calls and reasoning controls, or not: on the
 runtime page (Capabilities, Change) or with MCP `runtime_update`'s `modelCapabilities`
-(`tools`, `reasoning`). Pools keep tool and reasoning requests off members declared without
-them; undeclared members are unknown and still take them, as before. `/v1/models` adds
+(`tools`, `reasoning`). Pools send tool and reasoning requests to members declared with them
+first, then to undeclared (unknown) members as before, and never to members declared without
+them; a reasoning effort of `"none"` still reaches those. `/v1/models` adds
 `supports_tools` / `supports_reasoning` (and `capabilities.tools` / `.reasoning`) once known:
 true for a pool when any active member takes them, false only when every one is declared
 without. The two new `runtime_model` columns need `APPLY_SCHEMA=safe`. No `wsmp` upgrade is

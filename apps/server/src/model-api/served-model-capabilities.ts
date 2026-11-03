@@ -3,6 +3,7 @@ import {
   type OpenAiCompatibleCapabilities,
   openAiCapabilitiesFromCoarse,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import type { SurfaceRequestRequirements } from "@ws-model-proxy/api/lib/surface-capabilities";
 import { transcriptionProfileSchema } from "@ws-model-proxy/api/lib/transcription-profile";
 
 /**
@@ -75,4 +76,27 @@ function withDeclaredFeatures(
       : {}),
     ...(capabilities.responses ? { responses: { ...capabilities.responses, ...declared } } : {}),
   };
+}
+
+/**
+ * How many of the request's tool and reasoning needs this served model is not declared to
+ * meet (0, 1 or 2). Pools route to the lowest count first, so a member declared to take tools
+ * wins over an unknown one; a member declared without them never gets here (routing refuses it).
+ */
+export function undeclaredRequestedFeatures(
+  capabilities: OpenAiCompatibleCapabilities | null | undefined,
+  request: Pick<SurfaceRequestRequirements, "tools" | "reasoning"> | undefined,
+): number {
+  if (!request || (!request.tools && !request.reasoning)) return 0;
+  const surfaces =
+    capabilities && (capabilities.version === 1 || capabilities.version === 2)
+      ? [capabilities.chatCompletions, capabilities.responses].filter(
+          (surface) => surface?.supported === true,
+        )
+      : [];
+  let undeclared = 0;
+  for (const key of ["tools", "reasoning"] as const) {
+    if (request[key] && !surfaces.some((surface) => surface?.[key] === true)) undeclared += 1;
+  }
+  return undeclared;
 }

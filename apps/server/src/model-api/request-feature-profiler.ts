@@ -83,6 +83,35 @@ function reasoningRequested(payload: JsonObject): boolean {
   return normalizedType(thinking.type) !== "disabled";
 }
 
+function isNoneEffort(value: unknown): boolean {
+  return normalizedType(value) === "none";
+}
+
+/**
+ * True when the request's only reasoning control turns reasoning off: `reasoning_effort` and/or
+ * `reasoning.effort` set to "none", with no other reasoning or thinking field. The profiler
+ * still counts that as a reasoning request, because cloud models without reasoning reject the
+ * parameter whatever its value. Local pool members ignore it, so their routing lets it through
+ * to a member declared without reasoning.
+ */
+export function reasoningOnlyTurnedOff(payload: JsonObject): boolean {
+  if (!reasoningRequested(payload)) return false;
+  const effort = payload.reasoning_effort;
+  if (effort !== undefined && effort !== null && !isNoneEffort(effort)) return false;
+  if (payload.reasoning !== undefined && payload.reasoning !== null) {
+    const reasoning = object(payload.reasoning);
+    if (!reasoning) return false;
+    for (const [key, value] of Object.entries(reasoning)) {
+      if (value === undefined || value === null || value === false) continue;
+      if (key !== "effort" || !isNoneEffort(value)) return false;
+    }
+  }
+  if (payload.thinking !== undefined && payload.thinking !== null) {
+    if (normalizedType(object(payload.thinking)?.type) !== "disabled") return false;
+  }
+  return true;
+}
+
 /**
  * Conservatively profiles raw generation payloads for capability routing.
  * This deliberately does not validate or canonicalize the request: native

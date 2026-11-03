@@ -2142,13 +2142,13 @@
       },
       "tools": {
         "label": "Llamadas a herramientas",
-        "hint": "Con Desconocido, las solicitudes con herramientas siguen llegando aquí; con No, van a otros miembros del pool.",
+        "hint": "Los pools envían las solicitudes con herramientas primero a los miembros con Sí, luego a los Desconocidos; nunca a los No.",
         "yes": "Herramientas",
         "no": "Sin herramientas"
       },
       "reasoning": {
         "label": "Razonamiento",
-        "hint": "Con Desconocido, las solicitudes con razonamiento siguen llegando aquí; con No, van a otros miembros del pool.",
+        "hint": "Los pools envían las solicitudes con razonamiento primero a los miembros con Sí, luego a los Desconocidos; nunca a los No. Un esfuerzo de none sí llega a los No.",
         "yes": "Razonamiento",
         "no": "Sin razonamiento"
       },

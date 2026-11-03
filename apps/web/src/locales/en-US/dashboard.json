@@ -2142,13 +2142,13 @@
       },
       "tools": {
         "label": "Tool calls",
-        "hint": "Unknown still routes tool requests here; No keeps them on other pool members.",
+        "hint": "Pools send tool requests to Yes members first, then Unknown ones; never to No.",
         "yes": "Tools",
         "no": "No tools"
       },
       "reasoning": {
         "label": "Reasoning",
-        "hint": "Unknown still routes reasoning requests here; No keeps them on other pool members.",
+        "hint": "Pools send reasoning requests to Yes members first, then Unknown ones; never to No. An effort of none still reaches No.",
         "yes": "Reasoning",
         "no": "No reasoning"
       },

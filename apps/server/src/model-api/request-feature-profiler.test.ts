@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { profileSurfaceRequest } from "./request-feature-profiler.js";
+import { profileSurfaceRequest, reasoningOnlyTurnedOff } from "./request-feature-profiler.js";
 
 describe("profileSurfaceRequest", () => {
   it("profiles tools, structured output, reasoning, and directional modalities", () => {
@@ -60,5 +60,29 @@ describe("profileSurfaceRequest", () => {
     expect(profileSurfaceRequest({ thinking: { type: "disabled" } })).toEqual({});
     expect(profileSurfaceRequest({ output_config: { effort: "high" } })).toEqual({});
     expect(profileSurfaceRequest({ effort: "high" })).toEqual({});
+  });
+});
+
+describe("reasoningOnlyTurnedOff", () => {
+  it("is true when the only reasoning control is an effort of none", () => {
+    expect(reasoningOnlyTurnedOff({ reasoning_effort: "none" })).toBe(true);
+    expect(reasoningOnlyTurnedOff({ reasoning_effort: "NONE" })).toBe(true);
+    expect(reasoningOnlyTurnedOff({ reasoning: { effort: "none" } })).toBe(true);
+    expect(reasoningOnlyTurnedOff({ reasoning: { effort: "none", summary: null } })).toBe(true);
+    expect(
+      reasoningOnlyTurnedOff({ reasoning_effort: "none", thinking: { type: "disabled" } }),
+    ).toBe(true);
+  });
+
+  it("is false when reasoning is asked for, or not mentioned", () => {
+    expect(reasoningOnlyTurnedOff({})).toBe(false);
+    expect(reasoningOnlyTurnedOff({ reasoning_effort: "minimal" })).toBe(false);
+    expect(reasoningOnlyTurnedOff({ reasoning: { effort: "low" } })).toBe(false);
+    expect(reasoningOnlyTurnedOff({ reasoning: { effort: "none", summary: "auto" } })).toBe(false);
+    expect(reasoningOnlyTurnedOff({ reasoning_effort: "none", reasoning: true })).toBe(false);
+    expect(
+      reasoningOnlyTurnedOff({ reasoning_effort: "none", thinking: { type: "enabled" } }),
+    ).toBe(false);
+    expect(reasoningOnlyTurnedOff({ thinking: { type: "disabled" } })).toBe(false);
   });
 });

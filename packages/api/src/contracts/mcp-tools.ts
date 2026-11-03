@@ -433,7 +433,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "runtime_update",
     description:
-      "Save a new version (say why in note); limit edits apply live, a changed definition needs restartRunning. Setup such as model downloads belongs in the idempotent prepare step. modelCapabilities declares per served model whether it takes tools and reasoning (known from its launch, e.g. a tool-call parser); routing keeps such requests off a model declared false.",
+      "Save a new version (say why in note); limit edits apply live, a changed definition needs restartRunning. Setup such as model downloads belongs in the idempotent prepare step. modelCapabilities declares per served model whether it takes tools and reasoning (e.g. from a tool-call parser); pools prefer true, then unknown, never false.",
     input: runtimeUpdateInput,
     output: runtimesContract.update.output.extend({
       models: z.array(runtimeModelViewSchema).optional(),

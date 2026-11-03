@@ -443,8 +443,10 @@ Whether a served model takes tool calls and reasoning (thinking) controls is
 not detected: declare it with `runtime_update`'s `modelCapabilities`
 (`{runtimeModelId, tools?, reasoning?}`, each `true`, `false`, or `null` for
 unknown) once you know it, for example from the engine's tool-call parser
-flags. A pool keeps tool or reasoning requests off a member declared `false`;
-unknown members still take them. `runtimes_get` shows the declarations on each
+flags. A pool sends tool or reasoning requests to members declared `true`
+first, then to unknown members, and never to a member declared `false` (a
+reasoning effort of `"none"` still reaches it). Directly addressed models are
+not filtered. `runtimes_get` shows the declarations on each
 served model, and `/v1/models` advertises `supports_tools` /
 `supports_reasoning` once they are known.
 

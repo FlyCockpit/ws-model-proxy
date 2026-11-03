@@ -491,3 +491,107 @@ describe("API adaptation on a pool", () => {
     });
   });
 });
+
+describe("declared tool and reasoning support on a pool", () => {
+  /** A TEXT_GENERATION member on its own instance, with the given declarations. */
+  function member(
+    n: number,
+    declared: { tools?: boolean | null; reasoning?: boolean | null },
+    weight = 1,
+  ): PoolRoute {
+    return {
+      ...RESPONSES_ONLY_ROUTE,
+      member: { ...RESPONSES_ONLY_ROUTE.member, id: `member-${n}`, weight },
+      target: { ...RESPONSES_ONLY_ROUTE.target, id: `target-${n}` },
+      instance: { ...RESPONSES_ONLY_ROUTE.instance, id: `instance-${n}`, handle: `handle-${n}` },
+      model: {
+        ...RESPONSES_ONLY_ROUTE.model,
+        id: `rm-${n}`,
+        capabilities: ["TEXT_GENERATION"],
+        tools: declared.tools ?? null,
+        reasoning: declared.reasoning ?? null,
+      },
+    };
+  }
+
+  const answerOk = (h: Handlers, requestId: string) => {
+    h.onHeaders({
+      type: "relay.response.headers",
+      requestId,
+      status: 200,
+      headers: [["content-type", "application/json"]],
+    });
+    h.onBody(
+      new TextEncoder().encode(
+        JSON.stringify({
+          id: "chatcmpl-1",
+          object: "chat.completion",
+          model: "local-model",
+          choices: [
+            { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+          ],
+        }),
+      ),
+      { type: "relay.response.body", requestId, chunkId: "0" },
+    );
+    h.onComplete({ type: "relay.complete", requestId });
+  };
+
+  const chat = (extra: Record<string, unknown>) =>
+    app().request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_key_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "owner/chat",
+        messages: [{ role: "user", content: "hello" }],
+        ...extra,
+      }),
+    });
+
+  const toolRequest = {
+    tools: [{ type: "function", function: { name: "lookup", parameters: { type: "object" } } }],
+  };
+
+  beforeEach(() => {
+    nodeAnswer = answerOk;
+  });
+
+  it("sends a tool request to a member declared with tools before a heavier unknown one", async () => {
+    resolve.poolRoutes.mockResolvedValue([
+      member(1, {}, 10),
+      member(2, { tools: true }, 1),
+    ] as never);
+    const response = await chat(toolRequest);
+    expect(response.status).toBe(200);
+    expect(sentRelayRequests.map((sent) => (sent as { handle?: string }).handle)).toEqual([
+      "handle-2",
+    ]);
+  });
+
+  it("keeps a tool request off a member declared without tools", async () => {
+    resolve.poolRoutes.mockResolvedValue([
+      member(1, { tools: false }, 10),
+      member(2, {}, 1),
+    ] as never);
+    const response = await chat(toolRequest);
+    expect(response.status).toBe(200);
+    expect(sentRelayRequests.map((sent) => (sent as { handle?: string }).handle)).toEqual([
+      "handle-2",
+    ]);
+  });
+
+  it("lets a reasoning effort of none reach a member declared without reasoning", async () => {
+    resolve.poolRoutes.mockResolvedValue([member(1, { reasoning: false })] as never);
+    const response = await chat({ reasoning_effort: "none" });
+    expect(response.status).toBe(200);
+    expect(sentRelayRequests).toHaveLength(1);
+  });
+
+  it("keeps a real reasoning request off a member declared without reasoning", async () => {
+    resolve.poolRoutes.mockResolvedValue([member(1, { reasoning: false })] as never);
+    const response = await chat({ reasoning_effort: "high" });
+    await response.text();
+    expect(response.status).not.toBe(200);
+    expect(sentRelayRequests).toHaveLength(0);
+  });
+});

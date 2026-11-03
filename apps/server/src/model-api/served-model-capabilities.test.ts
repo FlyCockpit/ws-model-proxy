@@ -2,7 +2,10 @@ import { resolveExecutionPath } from "@ws-model-proxy/api/lib/surface-capabiliti
 import { describe, expect, it } from "vitest";
 
 import { profileSurfaceRequest } from "./request-feature-profiler.js";
-import { servedModelCapabilities } from "./served-model-capabilities.js";
+import {
+  servedModelCapabilities,
+  undeclaredRequestedFeatures,
+} from "./served-model-capabilities.js";
 import type { TranscriptionRequestProfile } from "./transcription-request.js";
 import { transcriptionCapabilityCompatible } from "./transcription-request.js";
 
@@ -173,5 +176,29 @@ describe("declared tool and reasoning support", () => {
     });
     expect(capabilities.version).toBe(2);
     expect(capabilities.version === 2 && capabilities.chatCompletions?.tools).toBe(false);
+  });
+});
+
+describe("undeclaredRequestedFeatures", () => {
+  const model = (tools?: boolean, reasoning?: boolean) =>
+    servedModelCapabilities({
+      capabilities: ["TEXT_GENERATION", "RESPONSES_API"],
+      tools,
+      reasoning,
+    });
+
+  it("counts the requested tool and reasoning needs not declared true", () => {
+    const both = { tools: true, reasoning: true };
+    expect(undeclaredRequestedFeatures(model(true, true), both)).toBe(0);
+    expect(undeclaredRequestedFeatures(model(true), both)).toBe(1);
+    expect(undeclaredRequestedFeatures(model(), both)).toBe(2);
+    expect(undeclaredRequestedFeatures(model(), { tools: true })).toBe(1);
+    expect(undeclaredRequestedFeatures(model(undefined, true), { tools: true })).toBe(1);
+  });
+
+  it("is 0 when the request needs neither", () => {
+    expect(undeclaredRequestedFeatures(model(), {})).toBe(0);
+    expect(undeclaredRequestedFeatures(model(), undefined)).toBe(0);
+    expect(undeclaredRequestedFeatures(null, {})).toBe(0);
   });
 });
