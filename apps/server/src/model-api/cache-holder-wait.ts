@@ -18,7 +18,12 @@ export type CacheHolderPlan = {
   windowMs: number;
 };
 
-type RouteCandidate = { poolMemberId: string; executionTargetId: string | undefined };
+type RouteCandidate = {
+  poolMemberId: string;
+  executionTargetId: string | undefined;
+  /** Routing class (lower is better; absent is 0). Only the best class can hold the cache. */
+  rank?: number;
+};
 
 /**
  * Pool members with a real affinity hit as good as the best one: the deepest
@@ -47,7 +52,9 @@ export function cacheHolderMemberIds(
  * Builds the spill-over plan for one pool request, or null when nothing should
  * be deferred: no affinity decision, no real hit, every candidate is a holder,
  * or the pool turned the wait off (`cacheHolderWaitMs = 0`). The wait is
- * sized from the best-ranked holder (candidates are in route order).
+ * sized from the best-ranked holder (candidates are in route order). Only candidates of the
+ * best `rank` are considered, so a holder in a worse routing class (an adapted member, or one
+ * not declared to take the request's tools) never defers a better-ranked one.
  */
 export async function planCacheHolderWait({
   decision,
@@ -60,10 +67,13 @@ export async function planCacheHolderWait({
   poolOverrideMs: number | null | undefined;
   speedSource: PrefillSpeedSource;
 }): Promise<CacheHolderPlan | null> {
-  if (!decision || candidates.length < 2 || poolOverrideMs === 0) return null;
-  const holderMemberIds = cacheHolderMemberIds(decision, candidates);
-  if (holderMemberIds.size === 0 || holderMemberIds.size === candidates.length) return null;
-  const primary = candidates.find(({ poolMemberId }) => holderMemberIds.has(poolMemberId));
+  if (!decision || poolOverrideMs === 0) return null;
+  const bestRank = Math.min(...candidates.map((candidate) => candidate.rank ?? 0));
+  const best = candidates.filter((candidate) => (candidate.rank ?? 0) === bestRank);
+  if (best.length < 2) return null;
+  const holderMemberIds = cacheHolderMemberIds(decision, best);
+  if (holderMemberIds.size === 0 || holderMemberIds.size === best.length) return null;
+  const primary = best.find(({ poolMemberId }) => holderMemberIds.has(poolMemberId));
   const primaryTargetId = primary?.executionTargetId;
   const prefixTokens = primaryTargetId ? decision.prefixTokens?.[primaryTargetId] : undefined;
   let tokensPerSecond: number | undefined;

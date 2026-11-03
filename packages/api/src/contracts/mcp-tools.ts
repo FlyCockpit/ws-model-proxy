@@ -30,6 +30,7 @@ import { modelAliasNameSchema, poolsContract, poolViewSchema } from "./pools";
 import { profilesContract, profileViewSchema } from "./profiles";
 import { providersContract } from "./providers";
 import {
+  changesServedModelCapabilities,
   releaseEvidenceSchema,
   releaseFindingsSchema,
   runtimeDetailSchema,
@@ -38,6 +39,7 @@ import {
   runtimesContract,
   runtimeVersionDetailSchema,
   runtimeVersionSummarySchema,
+  SERVED_MODEL_CAPABILITIES_REQUIRED,
 } from "./runtimes";
 import { MCP_READ_TOOLS, type McpToolName } from "./tool-names";
 
@@ -226,7 +228,9 @@ const runtimeUpdateInput = z
             tools: z.boolean().nullable().optional(),
             reasoning: z.boolean().nullable().optional(),
           })
-          .strict(),
+          .strict()
+          // Checked here too, so an empty entry refuses the whole call before runtimes.update runs.
+          .refine(changesServedModelCapabilities, SERVED_MODEL_CAPABILITIES_REQUIRED),
       )
       .max(64)
       .optional(),

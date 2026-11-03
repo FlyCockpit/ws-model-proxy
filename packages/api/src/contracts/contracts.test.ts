@@ -415,6 +415,24 @@ describe("0.4.0 MCP tool manifest", () => {
     expect(run?.input.safeParse({ nodeId: "n", command: "ls", confirm: "RUN" }).success).toBe(true);
   });
 
+  it("refuses a runtime_update whose modelCapabilities entry changes nothing, before any call", () => {
+    const update = MCP_TOOLS.find((entry) => entry.name === "runtime_update");
+    // Rejected as a whole, so the rename never reaches runtimes.update.
+    expect(
+      update?.input.safeParse({
+        runtimeId: "r",
+        name: "Changed",
+        modelCapabilities: [{ runtimeModelId: "m" }],
+      }).success,
+    ).toBe(false);
+    expect(
+      update?.input.safeParse({
+        runtimeId: "r",
+        modelCapabilities: [{ runtimeModelId: "m", tools: null }],
+      }).success,
+    ).toBe(true);
+  });
+
   it("uses the user's words in names and descriptions", () => {
     for (const tool of MCP_TOOLS)
       for (const pattern of BANNED) {

@@ -193,7 +193,14 @@ function CapabilityForm({ model, onDone }: { model: ServedModel; onDone: () => v
             variant="outline"
             size="touch"
             disabled={set.isPending}
-            onClick={() => save({ capabilities: null })}
+            onClick={() =>
+              // Keep any Tools / Reasoning edits made in this dialog.
+              save({
+                capabilities: null,
+                tools: fromDeclaration(form.state.values.tools),
+                reasoning: fromDeclaration(form.state.values.reasoning),
+              })
+            }
           >
             {t("dashboard:runtime.capabilities.useDetected")}
           </Button>

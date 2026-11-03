@@ -2203,12 +2203,15 @@ function responsesOperationForRelay(
 function canonicalRequestRequirements(
   request: ReturnType<typeof parseCanonicalRequest>,
 ): SurfaceRequestRequirements {
+  // Only adds needs: a false here must not clear what the raw profile found (tool history).
   return {
     stream: request.stream,
-    tools: request.tools.length > 0,
-    inputImages: request.messages.some((message) =>
+    ...(request.tools.length > 0 ? { tools: true } : {}),
+    ...(request.messages.some((message) =>
       message.content.some((content) => content.type === "image"),
-    ),
+    )
+      ? { inputImages: true }
+      : {}),
   };
 }
 
@@ -5957,9 +5960,12 @@ async function relayPool({
     try {
       cacheHolderPlan = await planCacheHolderWait({
         decision: affinityDecision,
-        candidates: routeCandidates.map(({ poolMemberId }) => ({
-          poolMemberId,
-          executionTargetId: memberById.get(poolMemberId)?.target.id,
+        // The class rank (protocol mode, then declared tool / reasoning support): a holder
+        // ranked below the best class never defers a better-ranked member.
+        candidates: routeCandidates.map((candidate) => ({
+          poolMemberId: candidate.poolMemberId,
+          executionTargetId: memberById.get(candidate.poolMemberId)?.target.id,
+          rank: routeModeRank(candidate),
         })),
         poolOverrideMs: undefined,
         speedSource: prefillSpeedSource,

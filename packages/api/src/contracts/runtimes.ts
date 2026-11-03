@@ -65,6 +65,20 @@ export const runtimeSlugSchema = slugSchema.refine(
 
 // ── Views ──
 
+/** A served-model capability change sets at least one of capabilities, tools and reasoning. */
+export function changesServedModelCapabilities(input: {
+  capabilities?: unknown;
+  tools?: unknown;
+  reasoning?: unknown;
+}): boolean {
+  return (
+    input.capabilities !== undefined || input.tools !== undefined || input.reasoning !== undefined
+  );
+}
+export const SERVED_MODEL_CAPABILITIES_REQUIRED = {
+  message: "Set capabilities, tools or reasoning.",
+};
+
 export const runtimeModelViewSchema = z
   .object({
     id: idSchema,
@@ -852,13 +866,7 @@ export const runtimesContract = {
           note: noteSchema.optional(),
         })
         .strict()
-        .refine(
-          (input) =>
-            input.capabilities !== undefined ||
-            input.tools !== undefined ||
-            input.reasoning !== undefined,
-          { message: "Set capabilities, tools or reasoning." },
-        ),
+        .refine(changesServedModelCapabilities, SERVED_MODEL_CAPABILITIES_REQUIRED),
       runtimeModelViewSchema,
       "Override a served model's capabilities, or declare whether it takes tool calls and reasoning.",
       ["runtime_update"],

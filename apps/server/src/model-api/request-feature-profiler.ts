@@ -27,16 +27,42 @@ function markMediaType(type: string | undefined, requirements: SurfaceRequestReq
     requirements.inputVideo = true;
 }
 
-function visitInput(value: unknown, requirements: SurfaceRequestRequirements): void {
+/** Conversation items that carry an earlier tool call or its result. */
+const TOOL_HISTORY_TYPES = new Set([
+  "function_call",
+  "function_call_output",
+  "custom_tool_call",
+  "custom_tool_call_output",
+  "tool_use",
+  "tool_result",
+]);
+
+function isToolHistory(item: JsonObject): boolean {
+  const role = normalizedType(item.role);
+  if (role === "tool" || role === "function") return true;
+  if (Array.isArray(item.tool_calls) && item.tool_calls.length > 0) return true;
+  if (object(item.function_call)) return true;
+  const type = normalizedType(item.type);
+  return type !== undefined && TOOL_HISTORY_TYPES.has(type);
+}
+
+type InputScan = { toolHistory: boolean };
+
+function visitInput(
+  value: unknown,
+  requirements: SurfaceRequestRequirements,
+  scan: InputScan,
+): void {
   if (Array.isArray(value)) {
-    for (const item of value) visitInput(item, requirements);
+    for (const item of value) visitInput(item, requirements, scan);
     return;
   }
   const item = object(value);
   if (!item) return;
   markMediaType(normalizedType(item.type), requirements);
+  if (isToolHistory(item)) scan.toolHistory = true;
   for (const key of ["content", "input", "messages"] as const) {
-    if (key in item) visitInput(item[key], requirements);
+    if (key in item) visitInput(item[key], requirements, scan);
   }
 }
 
@@ -120,8 +146,9 @@ export function reasoningOnlyTurnedOff(payload: JsonObject): boolean {
 export function profileSurfaceRequest(payload: JsonObject): SurfaceRequestRequirements {
   const requirements: SurfaceRequestRequirements = {};
 
-  visitInput(payload.messages, requirements);
-  visitInput(payload.input, requirements);
+  const scan: InputScan = { toolHistory: false };
+  visitInput(payload.messages, requirements, scan);
+  visitInput(payload.input, requirements, scan);
   profileTools(payload.tools, requirements);
 
   if (
@@ -132,6 +159,9 @@ export function profileSurfaceRequest(payload: JsonObject): SurfaceRequestRequir
       object(payload.tool_choice)?.disable_parallel_tool_use === false)
   )
     requirements.parallelTools = true;
+  // Tool calls and results in the history need a tool-capable model even when this turn
+  // defines no tools (parallelTools stays about this turn's definitions).
+  if (scan.toolHistory) requirements.tools = true;
   if (structuredOutputRequested(payload)) requirements.structuredOutput = true;
   if (reasoningRequested(payload)) requirements.reasoning = true;
 

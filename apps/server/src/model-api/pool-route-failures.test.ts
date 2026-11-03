@@ -580,6 +580,30 @@ describe("declared tool and reasoning support on a pool", () => {
     ]);
   });
 
+  it("keeps a tool-history follow-up without tool definitions off a member declared without tools", async () => {
+    resolve.poolRoutes.mockResolvedValue([
+      member(1, { tools: false }, 10),
+      member(2, {}, 1),
+    ] as never);
+    const response = await chat({
+      messages: [
+        { role: "user", content: "Look this up." },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "call-1", type: "function", function: { name: "lookup", arguments: "{}" } },
+          ],
+        },
+        { role: "tool", tool_call_id: "call-1", content: "42" },
+      ],
+    });
+    expect(response.status).toBe(200);
+    expect(sentRelayRequests.map((sent) => (sent as { handle?: string }).handle)).toEqual([
+      "handle-2",
+    ]);
+  });
+
   it("lets a reasoning effort of none reach a member declared without reasoning", async () => {
     resolve.poolRoutes.mockResolvedValue([member(1, { reasoning: false })] as never);
     const response = await chat({ reasoning_effort: "none" });

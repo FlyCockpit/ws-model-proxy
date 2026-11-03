@@ -86,3 +86,51 @@ describe("reasoningOnlyTurnedOff", () => {
     expect(reasoningOnlyTurnedOff({ thinking: { type: "disabled" } })).toBe(false);
   });
 });
+
+describe("tool history", () => {
+  it("needs tools for a tool call or result in the history, even without tool definitions", () => {
+    // Chat Completions: an assistant tool call and its tool result.
+    expect(
+      profileSurfaceRequest({
+        messages: [
+          { role: "user", content: "Look it up." },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }],
+          },
+          { role: "tool", tool_call_id: "c1", content: "42" },
+        ],
+      }),
+    ).toEqual({ tools: true });
+    // Responses: function call items.
+    expect(
+      profileSurfaceRequest({
+        input: [
+          { type: "function_call", call_id: "c1", name: "f", arguments: "{}" },
+          { type: "function_call_output", call_id: "c1", output: "42" },
+        ],
+      }),
+    ).toEqual({ tools: true });
+    // Anthropic Messages: tool_use / tool_result blocks.
+    expect(
+      profileSurfaceRequest({
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "f", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "42" }] },
+        ],
+      }),
+    ).toEqual({ tools: true });
+  });
+
+  it("leaves a plain conversation and an empty tool_calls list alone", () => {
+    expect(
+      profileSurfaceRequest({
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: "hello", tool_calls: [] },
+        ],
+      }),
+    ).toEqual({});
+  });
+});
