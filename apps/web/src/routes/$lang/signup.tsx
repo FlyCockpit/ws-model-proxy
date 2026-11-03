@@ -13,13 +13,14 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
+import { AuthFormSkeleton } from "@/components/auth/auth-form-skeleton";
+import { AuthRetryCard } from "@/components/auth/auth-retry-card";
 import { ResendVerification } from "@/components/auth/resend-verification";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { authClient } from "@/lib/auth-client";
@@ -81,186 +82,210 @@ function SignupPage() {
   const { t } = useTranslation(["auth", "common"]);
   const [pendingEmail, setPendingEmail] = useState<string | null>(null);
 
-  const postAuthRedirect = safeRedirectTo(redirectTo, lang);
   const emailEnabled = config.data?.emailEnabled === true;
-  const canResend = emailEnabled;
-  const validInvite =
-    invite !== undefined && inviteInfo.data?.valid === true ? inviteInfo.data : null;
-  // "Sign in" on an invite link comes back here to accept it.
-  const signInRedirect = invite && validInvite ? inviteSignupPath(lang, invite) : redirectTo;
+  const validInvite = validInviteOf(invite, inviteInfo.data);
+  const view = pickSignupView({
+    pendingEmail,
+    sessionStatus: state.status,
+    configPending: config.isPending,
+    configError: config.isError,
+    invite,
+    invitePending: inviteInfo.isPending,
+    inviteError: inviteInfo.isError,
+    validInvite,
+  });
 
-  if (pendingEmail) {
-    return (
-      <Frame>
-        <Card className="w-full max-w-md">
-          <CardHeader className="text-center">
-            <CardTitle className="text-2xl">
-              {canResend ? t("auth:verifyEmail.sentTitle") : t("auth:verifyEmail.pendingTitle")}
-            </CardTitle>
-            <CardDescription>
-              {canResend
-                ? t("auth:verifyEmail.sentDescription", { email: pendingEmail })
-                : t("auth:verifyEmail.accountCreatedNoEmail", { email: pendingEmail })}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <Link
-              to="/$lang/login"
-              params={{ lang }}
-              search={{ redirectTo: undefined }}
-              className={cn(buttonVariants(), "min-h-[44px] w-full")}
-            >
-              {t("auth:verifyEmail.signIn")}
-            </Link>
-            {canResend ? (
-              <ResendVerification email={pendingEmail} />
-            ) : (
-              <p className="text-center text-sm text-muted-foreground">
-                {t("auth:verifyEmail.emailUnavailable")}
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      </Frame>
-    );
-  }
-
-  if (state.status === "pending" || config.isPending || (invite && inviteInfo.isPending)) {
-    return (
-      <Frame>
-        <div className="w-full max-w-md space-y-6">
-          <div className="space-y-2 text-center">
-            <Skeleton className="mx-auto h-8 w-40" />
-            <Skeleton className="mx-auto h-4 w-56" />
-          </div>
-          <div className="space-y-4">
-            <Skeleton className="h-10 w-full" />
-            <Skeleton className="h-10 w-full" />
-            <Skeleton className="h-10 w-full" />
-          </div>
-        </div>
-      </Frame>
-    );
-  }
-
-  if (config.isError) {
-    return (
-      <Frame>
-        <Card className="w-full max-w-md">
-          <CardHeader className="text-center">
-            <CardTitle className="text-2xl">{t("auth:login.unableToConnect")}</CardTitle>
-            <CardDescription>{t("auth:login.unableToConnectDescription")}</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Button className="min-h-[44px] w-full" onClick={() => config.refetch()}>
-              {t("common:actions.retry")}
-            </Button>
-          </CardContent>
-        </Card>
-      </Frame>
-    );
-  }
-
-  if (invite && inviteInfo.isError) {
-    return (
-      <Frame>
-        <Card className="w-full max-w-md">
-          <CardHeader className="text-center">
-            <CardTitle className="text-2xl">{t("auth:invite.checkFailedTitle")}</CardTitle>
-            <CardDescription>{t("auth:invite.checkFailedDescription")}</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Button className="min-h-[44px] w-full" onClick={() => inviteInfo.refetch()}>
-              {t("common:actions.retry")}
-            </Button>
-          </CardContent>
-        </Card>
-      </Frame>
-    );
-  }
-
-  const signedIn = state.status === "authenticated";
-
-  if (invite && !validInvite) {
-    return (
-      <Frame>
-        <Card className="w-full max-w-md">
-          <CardHeader className="text-center">
-            <CardTitle className="text-2xl">{t("auth:invite.invalidTitle")}</CardTitle>
-            <CardDescription>{t("auth:invite.invalidDescription")}</CardDescription>
-          </CardHeader>
-          <CardContent className="text-center">
-            {signedIn ? (
-              <Link
-                to="/$lang/overview"
-                params={{ lang }}
-                className={cn(buttonVariants({ variant: "link" }), "min-h-[44px]")}
-              >
-                {t("auth:invite.goToOverview")}
-              </Link>
-            ) : (
-              <Link
-                to="/$lang/login"
-                params={{ lang }}
-                search={{ redirectTo }}
-                className={cn(buttonVariants({ variant: "link" }), "min-h-[44px]")}
-              >
-                {t("auth:login.signinHint")}
-              </Link>
-            )}
-          </CardContent>
-        </Card>
-      </Frame>
-    );
-  }
-
-  if (invite && validInvite && signedIn) {
-    return (
-      <Frame>
-        <AcceptInviteCard
+  switch (view.kind) {
+    case "verificationPending":
+      return <VerificationPendingCard lang={lang} email={view.email} canResend={emailEnabled} />;
+    case "loading":
+      return (
+        <Frame>
+          <AuthFormSkeleton />
+        </Frame>
+      );
+    case "configError":
+      return (
+        <Frame>
+          <AuthRetryCard
+            title={t("auth:login.unableToConnect")}
+            description={t("auth:login.unableToConnectDescription")}
+            onRetry={() => config.refetch()}
+          />
+        </Frame>
+      );
+    case "inviteError":
+      return (
+        <Frame>
+          <AuthRetryCard
+            title={t("auth:invite.checkFailedTitle")}
+            description={t("auth:invite.checkFailedDescription")}
+            onRetry={() => inviteInfo.refetch()}
+          />
+        </Frame>
+      );
+    case "invalidInvite":
+      return <InvalidInviteCard lang={lang} signedIn={view.signedIn} redirectTo={redirectTo} />;
+    case "acceptInvite":
+      return (
+        <Frame>
+          <AcceptInviteCard
+            lang={lang}
+            token={view.token}
+            ownerName={view.invite.ownerName ?? ""}
+            target={view.invite.target}
+          />
+        </Frame>
+      );
+    case "form":
+      return (
+        <SignupFormCard
           lang={lang}
-          token={invite}
-          ownerName={validInvite.ownerName ?? ""}
-          target={validInvite.target}
+          redirectTo={redirectTo}
+          emailEnabled={emailEnabled}
+          invite={invite}
+          validInvite={validInvite}
+          onAccountCreatedNeedingVerification={setPendingEmail}
         />
-      </Frame>
-    );
+      );
   }
+}
 
+/** A pending invite as `auth.inviteInfo` returns it. */
+type InviteDetails = {
+  email: string | null;
+  ownerName: string | null;
+  target: { kind: "pool" | "runtime"; name: string } | null;
+};
+
+/** The account exists and waits for e-mail verification (or has no e-mail to verify with). */
+function VerificationPendingCard({
+  lang,
+  email,
+  canResend,
+}: {
+  lang: string;
+  email: string;
+  canResend: boolean;
+}) {
+  const { t } = useTranslation(["auth", "common"]);
   return (
     <Frame>
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
-          {validInvite ? (
-            <>
-              <CardTitle className="text-2xl">{t("auth:invite.title")}</CardTitle>
-              <CardDescription className="break-words">
-                {validInvite.target?.kind === "runtime"
-                  ? t("auth:invite.runtimeDescription", {
-                      ownerName: validInvite.ownerName ?? "",
-                      name: validInvite.target.name,
-                    })
-                  : t("auth:invite.description", {
-                      ownerName: validInvite.ownerName ?? "",
-                      callableId: validInvite.target?.name ?? "",
-                    })}
-              </CardDescription>
-              <CardDescription>{t("auth:invite.anyEmail")}</CardDescription>
-            </>
-          ) : (
-            <>
-              <CardTitle className="text-2xl">{t("auth:login.createAccount")}</CardTitle>
-              <CardDescription>{t("auth:login.createDescription")}</CardDescription>
-            </>
-          )}
+          <CardTitle className="text-2xl">
+            {canResend ? t("auth:verifyEmail.sentTitle") : t("auth:verifyEmail.pendingTitle")}
+          </CardTitle>
+          <CardDescription>
+            {canResend
+              ? t("auth:verifyEmail.sentDescription", { email })
+              : t("auth:verifyEmail.accountCreatedNoEmail", { email })}
+          </CardDescription>
         </CardHeader>
+        <CardContent className="space-y-4">
+          <Link
+            to="/$lang/login"
+            params={{ lang }}
+            search={{ redirectTo: undefined }}
+            className={cn(buttonVariants(), "min-h-[44px] w-full")}
+          >
+            {t("auth:verifyEmail.signIn")}
+          </Link>
+          {canResend ? (
+            <ResendVerification email={email} />
+          ) : (
+            <p className="text-center text-sm text-muted-foreground">
+              {t("auth:verifyEmail.emailUnavailable")}
+            </p>
+          )}
+        </CardContent>
+      </Card>
+    </Frame>
+  );
+}
+
+/** The invite as `auth.inviteInfo` returned it, when the page has a token and it is valid. */
+function validInviteOf(
+  invite: string | undefined,
+  data: (InviteDetails & { valid: boolean }) | undefined,
+): InviteDetails | null {
+  return invite !== undefined && data?.valid === true ? data : null;
+}
+
+type SignupView =
+  | { kind: "verificationPending"; email: string }
+  | { kind: "loading" }
+  | { kind: "configError" }
+  | { kind: "inviteError" }
+  | { kind: "invalidInvite"; signedIn: boolean }
+  | { kind: "acceptInvite"; token: string; invite: InviteDetails }
+  | { kind: "form" };
+
+/** Which card the sign-up page shows, checked in this order. */
+function pickSignupView({
+  pendingEmail,
+  sessionStatus,
+  configPending,
+  configError,
+  invite,
+  invitePending,
+  inviteError,
+  validInvite,
+}: {
+  pendingEmail: string | null;
+  sessionStatus: string;
+  configPending: boolean;
+  configError: boolean;
+  invite: string | undefined;
+  invitePending: boolean;
+  inviteError: boolean;
+  validInvite: InviteDetails | null;
+}): SignupView {
+  if (pendingEmail) return { kind: "verificationPending", email: pendingEmail };
+  if (sessionStatus === "pending" || configPending || (invite && invitePending)) {
+    return { kind: "loading" };
+  }
+  if (configError) return { kind: "configError" };
+  if (invite && inviteError) return { kind: "inviteError" };
+  const signedIn = sessionStatus === "authenticated";
+  if (invite && !validInvite) return { kind: "invalidInvite", signedIn };
+  if (invite && validInvite && signedIn) {
+    return { kind: "acceptInvite", token: invite, invite: validInvite };
+  }
+  return { kind: "form" };
+}
+
+/** Sign-up (or sign-up through an invite link) with the link to sign in instead. */
+function SignupFormCard({
+  lang,
+  redirectTo,
+  emailEnabled,
+  invite,
+  validInvite,
+  onAccountCreatedNeedingVerification,
+}: {
+  lang: string;
+  redirectTo: string | undefined;
+  emailEnabled: boolean;
+  invite: string | undefined;
+  validInvite: InviteDetails | null;
+  onAccountCreatedNeedingVerification: (email: string) => void;
+}) {
+  const { t } = useTranslation(["auth", "common"]);
+  const postAuthRedirect = safeRedirectTo(redirectTo, lang);
+  // "Sign in" on an invite link comes back here to accept it.
+  const signInRedirect = invite && validInvite ? inviteSignupPath(lang, invite) : redirectTo;
+  return (
+    <Frame>
+      <Card className="w-full max-w-md">
+        <SignupCardHeader validInvite={validInvite} />
         <CardContent className="space-y-4">
           <SignUpForm
             lang={lang}
             redirectTo={postAuthRedirect}
             emailEnabled={emailEnabled}
             invite={validInvite && invite ? { token: invite, email: validInvite.email } : null}
-            onAccountCreatedNeedingVerification={setPendingEmail}
+            onAccountCreatedNeedingVerification={onAccountCreatedNeedingVerification}
           />
           <div className="text-center">
             <Link
@@ -275,6 +300,78 @@ function SignupPage() {
         </CardContent>
       </Card>
     </Frame>
+  );
+}
+
+function InvalidInviteCard({
+  lang,
+  signedIn,
+  redirectTo,
+}: {
+  lang: string;
+  signedIn: boolean;
+  redirectTo: string | undefined;
+}) {
+  const { t } = useTranslation(["auth", "common"]);
+  return (
+    <Frame>
+      <Card className="w-full max-w-md">
+        <CardHeader className="text-center">
+          <CardTitle className="text-2xl">{t("auth:invite.invalidTitle")}</CardTitle>
+          <CardDescription>{t("auth:invite.invalidDescription")}</CardDescription>
+        </CardHeader>
+        <CardContent className="text-center">
+          {signedIn ? (
+            <Link
+              to="/$lang/overview"
+              params={{ lang }}
+              className={cn(buttonVariants({ variant: "link" }), "min-h-[44px]")}
+            >
+              {t("auth:invite.goToOverview")}
+            </Link>
+          ) : (
+            <Link
+              to="/$lang/login"
+              params={{ lang }}
+              search={{ redirectTo }}
+              className={cn(buttonVariants({ variant: "link" }), "min-h-[44px]")}
+            >
+              {t("auth:login.signinHint")}
+            </Link>
+          )}
+        </CardContent>
+      </Card>
+    </Frame>
+  );
+}
+
+function SignupCardHeader({ validInvite }: { validInvite: InviteDetails | null }) {
+  const { t } = useTranslation(["auth", "common"]);
+  return (
+    <CardHeader className="text-center">
+      {validInvite ? (
+        <>
+          <CardTitle className="text-2xl">{t("auth:invite.title")}</CardTitle>
+          <CardDescription className="break-words">
+            {validInvite.target?.kind === "runtime"
+              ? t("auth:invite.runtimeDescription", {
+                  ownerName: validInvite.ownerName ?? "",
+                  name: validInvite.target.name,
+                })
+              : t("auth:invite.description", {
+                  ownerName: validInvite.ownerName ?? "",
+                  callableId: validInvite.target?.name ?? "",
+                })}
+          </CardDescription>
+          <CardDescription>{t("auth:invite.anyEmail")}</CardDescription>
+        </>
+      ) : (
+        <>
+          <CardTitle className="text-2xl">{t("auth:login.createAccount")}</CardTitle>
+          <CardDescription>{t("auth:login.createDescription")}</CardDescription>
+        </>
+      )}
+    </CardHeader>
   );
 }
 

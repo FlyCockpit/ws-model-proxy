@@ -1,12 +1,9 @@
-import { useForm } from "@tanstack/react-form";
 import { Button } from "@ws-model-proxy/ui/components/button";
-import { Input } from "@ws-model-proxy/ui/components/input";
-import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import z from "zod";
 
+import { EmailOnlyForm } from "@/components/auth/email-only-form";
 import { authClient } from "@/lib/auth-client";
 import { friendly, isRateLimit } from "@/utils/friendly-error";
 
@@ -79,63 +76,13 @@ function ResendButton({ email, onSent }: { email: string; onSent: () => void }) 
 function ResendForm({ onSent }: { onSent: () => void }) {
   const { t } = useTranslation(["auth"]);
 
-  const form = useForm({
-    defaultValues: { email: "" },
-    onSubmit: async ({ value }) => {
-      if (await resend(value.email)) onSent();
-    },
-    validators: {
-      onSubmit: z.object({
-        email: z.email(),
-      }),
-    },
-  });
-
   return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        form.handleSubmit();
+    <EmailOnlyForm
+      onSubmit={async (email) => {
+        if (await resend(email)) onSent();
       }}
-      className="space-y-4"
-    >
-      <form.Field name="email">
-        {(field) => (
-          <div className="space-y-2">
-            <Label htmlFor={field.name}>{t("auth:fields.email")}</Label>
-            <Input
-              id={field.name}
-              name={field.name}
-              type="email"
-              inputMode="email"
-              autoComplete="email"
-              value={field.state.value}
-              onBlur={field.handleBlur}
-              onChange={(e) => field.handleChange(e.target.value)}
-            />
-            {field.state.meta.errors.map((error) => (
-              <p key={error?.message} className="text-sm text-destructive">
-                {error?.message}
-              </p>
-            ))}
-          </div>
-        )}
-      </form.Field>
-
-      <form.Subscribe
-        selector={(state) => ({ canSubmit: state.canSubmit, isSubmitting: state.isSubmitting })}
-      >
-        {({ canSubmit, isSubmitting }) => (
-          <Button
-            type="submit"
-            className="min-h-[44px] w-full"
-            disabled={!canSubmit || isSubmitting}
-          >
-            {isSubmitting ? t("auth:verifyEmail.resending") : t("auth:verifyEmail.resend")}
-          </Button>
-        )}
-      </form.Subscribe>
-    </form>
+      submitLabel={t("auth:verifyEmail.resend")}
+      submittingLabel={t("auth:verifyEmail.resending")}
+    />
   );
 }

@@ -42,15 +42,7 @@ export function OwnKeyChoice({ shareId }: { shareId: string }) {
   });
   if (!share || equivalent === null) return null;
   const fieldId = `own-key-${share.id}`;
-  // Enabled models of the pool's type (the server refuses another type).
-  const usable = (models.data?.models ?? []).filter(
-    (model) =>
-      model.type === share.modelType && (model.enabled || model.id === share.ownKeyProviderModelId),
-  );
-  // A chosen model that is gone from the list still shows as chosen (and can be cleared).
-  const missing =
-    share.ownKeyProviderModelId !== null &&
-    !usable.some((model) => model.id === share.ownKeyProviderModelId);
+  const chosenId = share.ownKeyProviderModelId;
   return (
     <div className="w-full min-w-0 basis-full space-y-1.5">
       <Label htmlFor={fieldId}>{t("access:ownKey.label")}</Label>
@@ -58,40 +50,85 @@ export function OwnKeyChoice({ shareId }: { shareId: string }) {
         <Skeleton className="h-11 w-full" />
       ) : models.isError ? (
         <p className="text-sm text-muted-foreground">{t("access:ownKey.loadFailed")}</p>
-      ) : usable.length === 0 && share.ownKeyProviderModelId === null ? (
-        <p className="text-sm text-muted-foreground">
-          {t("access:ownKey.noModels")}{" "}
-          <Link
-            to="/$lang/providers"
-            params={{ lang }}
-            className="inline-flex min-h-11 items-center underline underline-offset-4"
-          >
-            {t("access:ownKey.addProvider")}
-          </Link>
-        </p>
       ) : (
-        <NativeSelect
-          id={fieldId}
-          value={share.ownKeyProviderModelId ?? ""}
+        <OwnKeySelect
+          fieldId={fieldId}
+          lang={lang}
+          chosenId={chosenId}
+          usable={usableModels(models.data?.models ?? [], share.modelType, chosenId)}
           disabled={setOwnKey.isPending}
-          onChange={(event) =>
-            setOwnKey.mutate({ shareId: share.id, providerModelId: event.target.value || null })
-          }
-        >
-          <option value="">{t("access:ownKey.ownerKey")}</option>
-          {missing && share.ownKeyProviderModelId ? (
-            <option value={share.ownKeyProviderModelId}>{t("access:ownKey.unavailable")}</option>
-          ) : null}
-          {usable.map((model) => (
-            <option key={model.id} value={model.id}>
-              {model.displayName ?? model.upstreamModelId}
-            </option>
-          ))}
-        </NativeSelect>
+          onChoose={(providerModelId) => setOwnKey.mutate({ shareId: share.id, providerModelId })}
+        />
       )}
       <p className="text-xs text-muted-foreground">
         {t("access:ownKey.hint", { model: equivalent })}
       </p>
     </div>
+  );
+}
+
+type ProviderModel = Awaited<ReturnType<typeof orpc.providers.models.list.call>>["models"][number];
+
+/** Enabled models of the pool's type (the server refuses another type), plus the chosen one. */
+function usableModels(
+  models: ProviderModel[],
+  modelType: ProviderModel["type"],
+  chosenId: string | null,
+): ProviderModel[] {
+  return models.filter(
+    (model) => model.type === modelType && (model.enabled || model.id === chosenId),
+  );
+}
+
+/** The model picker, or a pointer to Providers when there is nothing to pick. */
+function OwnKeySelect({
+  fieldId,
+  lang,
+  chosenId,
+  usable,
+  disabled,
+  onChoose,
+}: {
+  fieldId: string;
+  lang: string;
+  chosenId: string | null;
+  usable: ProviderModel[];
+  disabled: boolean;
+  onChoose: (providerModelId: string | null) => void;
+}) {
+  const { t } = useTranslation(["access"]);
+  if (usable.length === 0 && chosenId === null) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        {t("access:ownKey.noModels")}{" "}
+        <Link
+          to="/$lang/providers"
+          params={{ lang }}
+          className="inline-flex min-h-11 items-center underline underline-offset-4"
+        >
+          {t("access:ownKey.addProvider")}
+        </Link>
+      </p>
+    );
+  }
+  // A chosen model that is gone from the list still shows as chosen (and can be cleared).
+  const missing = chosenId !== null && !usable.some((model) => model.id === chosenId);
+  return (
+    <NativeSelect
+      id={fieldId}
+      value={chosenId ?? ""}
+      disabled={disabled}
+      onChange={(event) => onChoose(event.target.value || null)}
+    >
+      <option value="">{t("access:ownKey.ownerKey")}</option>
+      {missing && chosenId ? (
+        <option value={chosenId}>{t("access:ownKey.unavailable")}</option>
+      ) : null}
+      {usable.map((model) => (
+        <option key={model.id} value={model.id}>
+          {model.displayName ?? model.upstreamModelId}
+        </option>
+      ))}
+    </NativeSelect>
   );
 }

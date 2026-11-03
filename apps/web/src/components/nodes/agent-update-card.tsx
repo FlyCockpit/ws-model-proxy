@@ -115,50 +115,18 @@ export function AgentUpdatePanel({
   view: NodeAgentUpdateView;
 }) {
   const { t } = useTranslation(["dashboard"]);
-  const commit = shortCommit(view.build?.commit);
-  const serverCommit = shortCommit(server.commit);
-  const method = view.build
-    ? t(`${K}.method.${knownOr(INSTALL_METHODS, view.build.installMethod, "unknown")}`)
-    : null;
   return (
     <Card className="min-w-0">
       <CardHeader>
         <CardTitle className="flex flex-wrap items-center gap-2 text-base">
           {t(`${K}.title`)}
-          {view.latest !== null && !isTerminalPhase(view.latest.phase) ? (
-            <StatusPill tone="info">{t(`${K}.updatingBadge`)}</StatusPill>
-          ) : view.version === null ? null : view.outdated ? (
-            <StatusPill tone="warning">{t(`${K}.outdated`)}</StatusPill>
-          ) : view.newerThanServer ? (
-            <StatusPill tone="info">{t(`${K}.newerThanServer`)}</StatusPill>
-          ) : (
-            <StatusPill tone="success">{t(`${K}.current`)}</StatusPill>
-          )}
+          <UpdateStatusPill view={view} />
           {view.wsl ? <StatusPill tone="muted">{t(`${K}.wslBadge`)}</StatusPill> : null}
         </CardTitle>
         <CardDescription>{t(`${K}.description`)}</CardDescription>
       </CardHeader>
       <CardContent className="min-w-0 space-y-4 text-sm">
-        <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1">
-          <dt className="text-muted-foreground">{t(`${K}.nodeVersion`)}</dt>
-          <dd className="min-w-0 break-words">
-            {view.version ? (
-              <span className="font-mono">{view.version}</span>
-            ) : (
-              t(`${K}.unknownVersion`)
-            )}
-          </dd>
-          <dt className="text-muted-foreground">{t(`${K}.build`)}</dt>
-          <dd className="min-w-0 break-words">
-            {commit ? <span className="font-mono">{commit}</span> : t(`${K}.unknownCommit`)}
-            {method ? ` · ${method}` : null}
-          </dd>
-          <dt className="text-muted-foreground">{t(`${K}.serverVersion`)}</dt>
-          <dd className="min-w-0 break-words">
-            <span className="font-mono">{server.version}</span>
-            {serverCommit ? <span className="font-mono"> · {serverCommit}</span> : null}
-          </dd>
-        </dl>
+        <VersionDetails server={server} view={view} />
 
         {view.wsl ? <Notice tone="warning">{t(`${K}.wslWarning`)}</Notice> : null}
 
@@ -175,6 +143,63 @@ export function AgentUpdatePanel({
         <PolicySetting view={view} />
       </CardContent>
     </Card>
+  );
+}
+
+type PillTone = React.ComponentProps<typeof StatusPill>["tone"];
+
+/** The title's status pill (tone and copy key under `K`), or none while the version is unknown. */
+function updateStatusPill(view: NodeAgentUpdateView): { tone: PillTone; key: string } | null {
+  if (view.latest !== null && !isTerminalPhase(view.latest.phase))
+    return { tone: "info", key: "updatingBadge" };
+  if (view.version === null) return null;
+  if (view.outdated) return { tone: "warning", key: "outdated" };
+  if (view.newerThanServer) return { tone: "info", key: "newerThanServer" };
+  return { tone: "success", key: "current" };
+}
+
+function UpdateStatusPill({ view }: { view: NodeAgentUpdateView }) {
+  const { t } = useTranslation(["dashboard"]);
+  const pill = updateStatusPill(view);
+  if (!pill) return null;
+  return <StatusPill tone={pill.tone}>{t(`${K}.${pill.key}`)}</StatusPill>;
+}
+
+/** The node's version and build next to the server's. */
+function VersionDetails({
+  server,
+  view,
+}: {
+  server: AgentUpdateOverview["server"];
+  view: NodeAgentUpdateView;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const commit = shortCommit(view.build?.commit);
+  const serverCommit = shortCommit(server.commit);
+  const method = view.build
+    ? t(`${K}.method.${knownOr(INSTALL_METHODS, view.build.installMethod, "unknown")}`)
+    : null;
+  return (
+    <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1">
+      <dt className="text-muted-foreground">{t(`${K}.nodeVersion`)}</dt>
+      <dd className="min-w-0 break-words">
+        {view.version ? (
+          <span className="font-mono">{view.version}</span>
+        ) : (
+          t(`${K}.unknownVersion`)
+        )}
+      </dd>
+      <dt className="text-muted-foreground">{t(`${K}.build`)}</dt>
+      <dd className="min-w-0 break-words">
+        {commit ? <span className="font-mono">{commit}</span> : t(`${K}.unknownCommit`)}
+        {method ? ` · ${method}` : null}
+      </dd>
+      <dt className="text-muted-foreground">{t(`${K}.serverVersion`)}</dt>
+      <dd className="min-w-0 break-words">
+        <span className="font-mono">{server.version}</span>
+        {serverCommit ? <span className="font-mono"> · {serverCommit}</span> : null}
+      </dd>
+    </dl>
   );
 }
 
@@ -232,90 +257,142 @@ function LatestUpdate({
   view: NodeAgentUpdateView;
   latest: AgentUpdateView;
 }) {
-  const { t } = useTranslation(["dashboard"]);
-  const values = {
-    from: latest.fromVersion ?? t(`${K}.unknownVersion`),
-    to: latest.toVersion,
-  };
-  const reason = nodeReasonText(t, latest.reason, viaHomebrew(latest), latest.phase);
-  const detail = latest.detail ? (
-    <NodeText text={latest.detail} label={t(`${K}.nodeSaid`)} />
-  ) : null;
-  // The server sets it when the node cannot update itself, or to recover a Homebrew failure; it
-  // follows how the node is installed now, the explanation above how this attempt ran.
-  const recovery = view.manualCommand;
-  const recoveryBlock = recovery ? (
-    <div className="min-w-0 space-y-1.5">
-      <p>{t(`${K}.fixByHand`)}</p>
-      <CommandBlock command={recovery} label={t(`${K}.manualCommand`)} />
-    </div>
-  ) : null;
-
   if (!isTerminalPhase(latest.phase)) return <UpdateProgress view={view} latest={latest} />;
 
   switch (latest.phase) {
     case "confirmed":
-      // The node has run something else since (reinstalled by hand, say): old news.
-      if (view.version !== latest.toVersion) return null;
-      return (
-        <Notice tone="success">
-          <p>
-            {t(`${K}.confirmed`, values)}{" "}
-            {latest.endedAt ? (
-              <span className="text-muted-foreground">
-                <TimeAgo value={latest.endedAt} />
-              </span>
-            ) : null}
-          </p>
-        </Notice>
-      );
+      return <ConfirmedNotice view={view} latest={latest} />;
     case "rolled_back":
-      return (
-        <Notice tone="warning">
-          <p className="flex items-center gap-1.5 font-medium">
-            <Undo2 aria-hidden="true" className="size-4 shrink-0" />
-            {t(`${K}.rolledBackTitle`)}
-          </p>
-          <p>{t(`${K}.rolledBack`, values)}</p>
-          {detail}
-        </Notice>
-      );
+      return <RolledBackNotice latest={latest} />;
     case "refused":
-      return (
-        <Notice tone="destructive">
-          <p className="font-medium">{t(`${K}.refusedTitle`, values)}</p>
-          {reason ? <p>{reason}</p> : null}
-          {detail}
-          {view.availableVersion ? (
-            <InstallAnyway server={server} view={view} version={view.availableVersion} />
-          ) : null}
-          {recoveryBlock}
-        </Notice>
-      );
+      return <RefusedNotice server={server} view={view} latest={latest} />;
     case "timed_out":
-      return (
-        <Notice tone="destructive">
-          <p className="font-medium">
-            {t(`${K}.timedOutTitle`, {
-              ...values,
-              phase: t(`${K}.stuck.${knownOr(STUCK_PHASES, latest.reason, "other")}`),
-            })}
-          </p>
-          <p>{viaHomebrew(latest) ? t(`${K}.timedOutHomebrew`) : t(`${K}.timedOut`)}</p>
-          {detail}
-          {recoveryBlock}
-        </Notice>
-      );
+      return <TimedOutNotice view={view} latest={latest} />;
     default:
-      return (
-        <Notice tone="destructive">
-          <p className="font-medium">{t(`${K}.failedTitle`, values)}</p>
-          {reason ? <p>{reason}</p> : null}
-          {detail}
-          {recoveryBlock}
-        </Notice>
-      );
+      return <FailedNotice view={view} latest={latest} />;
   }
+}
+
+/** The versions an attempt went from and to, for the notices' copy. */
+function attemptValues(t: TFunction, latest: AgentUpdateView) {
+  return {
+    from: latest.fromVersion ?? t(`${K}.unknownVersion`),
+    to: latest.toVersion,
+  };
+}
+
+/** What the node said about the attempt, if anything. */
+function AttemptDetail({ latest }: { latest: AgentUpdateView }) {
+  const { t } = useTranslation(["dashboard"]);
+  return latest.detail ? <NodeText text={latest.detail} label={t(`${K}.nodeSaid`)} /> : null;
+}
+
+/** The node's attempt reason as copy, or none. */
+function AttemptReason({ latest }: { latest: AgentUpdateView }) {
+  const { t } = useTranslation(["dashboard"]);
+  const reason = nodeReasonText(t, latest.reason, viaHomebrew(latest), latest.phase);
+  return reason ? <p>{reason}</p> : null;
+}
+
+/**
+ * The command to fix it by hand. The server sets it when the node cannot update itself, or to
+ * recover a Homebrew failure; it follows how the node is installed now, the explanation above
+ * how this attempt ran.
+ */
+function RecoveryBlock({ view }: { view: NodeAgentUpdateView }) {
+  const { t } = useTranslation(["dashboard"]);
+  const recovery = view.manualCommand;
+  if (!recovery) return null;
+  return (
+    <div className="min-w-0 space-y-1.5">
+      <p>{t(`${K}.fixByHand`)}</p>
+      <CommandBlock command={recovery} label={t(`${K}.manualCommand`)} />
+    </div>
+  );
+}
+
+function ConfirmedNotice({ view, latest }: { view: NodeAgentUpdateView; latest: AgentUpdateView }) {
+  const { t } = useTranslation(["dashboard"]);
+  // The node has run something else since (reinstalled by hand, say): old news.
+  if (view.version !== latest.toVersion) return null;
+  return (
+    <Notice tone="success">
+      <p>
+        {t(`${K}.confirmed`, attemptValues(t, latest))}{" "}
+        {latest.endedAt ? (
+          <span className="text-muted-foreground">
+            <TimeAgo value={latest.endedAt} />
+          </span>
+        ) : null}
+      </p>
+    </Notice>
+  );
+}
+
+function RolledBackNotice({ latest }: { latest: AgentUpdateView }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <Notice tone="warning">
+      <p className="flex items-center gap-1.5 font-medium">
+        <Undo2 aria-hidden="true" className="size-4 shrink-0" />
+        {t(`${K}.rolledBackTitle`)}
+      </p>
+      <p>{t(`${K}.rolledBack`, attemptValues(t, latest))}</p>
+      <AttemptDetail latest={latest} />
+    </Notice>
+  );
+}
+
+function RefusedNotice({
+  server,
+  view,
+  latest,
+}: {
+  server: AgentUpdateOverview["server"];
+  view: NodeAgentUpdateView;
+  latest: AgentUpdateView;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <Notice tone="destructive">
+      <p className="font-medium">{t(`${K}.refusedTitle`, attemptValues(t, latest))}</p>
+      <AttemptReason latest={latest} />
+      <AttemptDetail latest={latest} />
+      {view.availableVersion ? (
+        <InstallAnyway server={server} view={view} version={view.availableVersion} />
+      ) : null}
+      <RecoveryBlock view={view} />
+    </Notice>
+  );
+}
+
+function TimedOutNotice({ view, latest }: { view: NodeAgentUpdateView; latest: AgentUpdateView }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <Notice tone="destructive">
+      <p className="font-medium">
+        {t(`${K}.timedOutTitle`, {
+          ...attemptValues(t, latest),
+          phase: t(`${K}.stuck.${knownOr(STUCK_PHASES, latest.reason, "other")}`),
+        })}
+      </p>
+      <p>{viaHomebrew(latest) ? t(`${K}.timedOutHomebrew`) : t(`${K}.timedOut`)}</p>
+      <AttemptDetail latest={latest} />
+      <RecoveryBlock view={view} />
+    </Notice>
+  );
+}
+
+function FailedNotice({ view, latest }: { view: NodeAgentUpdateView; latest: AgentUpdateView }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <Notice tone="destructive">
+      <p className="font-medium">{t(`${K}.failedTitle`, attemptValues(t, latest))}</p>
+      <AttemptReason latest={latest} />
+      <AttemptDetail latest={latest} />
+      <RecoveryBlock view={view} />
+    </Notice>
+  );
 }
 
 function UpdateProgress({ view, latest }: { view: NodeAgentUpdateView; latest: AgentUpdateView }) {

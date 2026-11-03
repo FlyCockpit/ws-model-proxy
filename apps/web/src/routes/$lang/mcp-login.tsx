@@ -1,10 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, notFound } from "@tanstack/react-router";
-import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { SignInCard } from "@/components/auth/sign-in-card";
 import { McpInvalidRequestCard } from "@/components/mcp/mcp-invalid-request-card";
+import { McpPageSkeleton } from "@/components/mcp/mcp-page-skeleton";
 import { McpReauthBranch } from "@/components/mcp/mcp-reauth-branch";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { authClient } from "@/lib/auth-client";
@@ -95,23 +95,6 @@ function McpLoginPage() {
   }
 
   return <McpAnonymousLogin info={info} lang={lang} fingerprint={fingerprint} />;
-}
-
-function McpPageSkeleton() {
-  return (
-    <div className="flex min-w-0 items-center justify-center px-4 py-10">
-      <div className="w-full max-w-md space-y-6">
-        <div className="space-y-2 text-center">
-          <Skeleton className="mx-auto h-8 w-40" />
-          <Skeleton className="mx-auto h-4 w-56" />
-        </div>
-        <div className="space-y-4">
-          <Skeleton className="h-10 w-full" />
-          <Skeleton className="h-10 w-full" />
-        </div>
-      </div>
-    </div>
-  );
 }
 
 /**

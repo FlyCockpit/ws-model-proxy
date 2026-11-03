@@ -475,15 +475,8 @@ function SettingsRadioItem({ value, title, help }: { value: string; title: strin
 function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) {
   const { t } = useTranslation(["terminals", "dashboard"]);
   const ended = tab.phase === "exited" || tab.phase === "rejected";
-  const writerKey = tab.phase === "live" ? writerStatusKey(tab.writer) : null;
   const trust: CliTrust | undefined = sessions.cliTrust[tab.cliDeviceId];
   const changed = tab.rejectionReason === "identity_changed" && trust?.status === "changed";
-  const reason = tab.rejectionReason ?? tab.error;
-  const rejection = !reason
-    ? null
-    : KNOWN_REJECTIONS.has(reason)
-      ? t(`terminals:rejection.${reason}`)
-      : t("terminals:rejection.other", { reason });
   const trustNewKey = async () => {
     if (trust?.status !== "changed") return;
     if (!(await sessions.trustNewKey(tab.cliDeviceId, trust))) {
@@ -494,47 +487,9 @@ function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) 
     <div className="flex min-w-0 flex-col gap-2 text-sm">
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
         <p className="min-w-0 text-muted-foreground" role="status">
-          {tab.phase === "exited"
-            ? tab.exitCode !== null
-              ? t("terminals:exitedWithCode", { code: tab.exitCode })
-              : t("terminals:exitedPlain")
-            : tab.phase === "rejected"
-              ? rejection
-              : tab.ending === "failed"
-                ? t("terminals:endFailed")
-                : [
-                    writerKey ? t(writerKey) : null,
-                    tab.viewerCount > 1
-                      ? t("dashboard:terminals.status.viewers", { count: tab.viewerCount })
-                      : null,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
+          <TabStatusMessage tab={tab} />
         </p>
-        <div className="flex flex-wrap gap-2">
-          {/* An operator terminal ends with its command, or by its step's Cancel. */}
-          {ended || tab.stepId ? null : (
-            <Button
-              type="button"
-              variant="outline"
-              size="touch"
-              disabled={tab.ending === "pending"}
-              onClick={() => sessions.endSession(tab.localId)}
-            >
-              {tab.ending === "pending" ? t("terminals:ending") : t("terminals:endSession")}
-            </Button>
-          )}
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-touch"
-            aria-label={ended ? t("terminals:closeTab") : t("terminals:detach")}
-            title={ended ? t("terminals:closeTab") : t("terminals:detach")}
-            onClick={() => sessions.detachTab(tab.localId)}
-          >
-            <X aria-hidden="true" />
-          </Button>
-        </div>
+        <TabActions sessions={sessions} tab={tab} ended={ended} />
       </div>
       {tab.approvalCode && tab.phase === "opening" ? (
         <p className="min-w-0 break-words">
@@ -544,21 +499,101 @@ function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) 
         </p>
       ) : null}
       {changed ? (
-        <div className="flex min-w-0 flex-col gap-2">
-          <p className="min-w-0 break-words">
-            {t("terminals:identityChangedDetail", { fingerprint: trust.fingerprint })}
-          </p>
-          <Button
-            type="button"
-            variant="outline"
-            size="touch"
-            className="self-start"
-            onClick={() => void trustNewKey()}
-          >
-            {t("terminals:trustNewKey")}
-          </Button>
-        </div>
+        <IdentityChangedNotice
+          fingerprint={trust.fingerprint}
+          onTrustNewKey={() => void trustNewKey()}
+        />
       ) : null}
+    </div>
+  );
+}
+
+/** The tab's one-line status: how it ended, why it was refused, or who is typing. */
+function TabStatusMessage({ tab }: { tab: TerminalTab }) {
+  const { t } = useTranslation(["terminals", "dashboard"]);
+  const writerKey = tab.phase === "live" ? writerStatusKey(tab.writer) : null;
+  if (tab.phase === "exited") {
+    return tab.exitCode !== null
+      ? t("terminals:exitedWithCode", { code: tab.exitCode })
+      : t("terminals:exitedPlain");
+  }
+  if (tab.phase === "rejected") {
+    const reason = tab.rejectionReason ?? tab.error;
+    if (!reason) return null;
+    return KNOWN_REJECTIONS.has(reason)
+      ? t(`terminals:rejection.${reason}`)
+      : t("terminals:rejection.other", { reason });
+  }
+  if (tab.ending === "failed") return t("terminals:endFailed");
+  return [
+    writerKey ? t(writerKey) : null,
+    tab.viewerCount > 1
+      ? t("dashboard:terminals.status.viewers", { count: tab.viewerCount })
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+/** End session (not for an operator terminal or an ended tab) and detach / close. */
+function TabActions({
+  sessions,
+  tab,
+  ended,
+}: {
+  sessions: Sessions;
+  tab: TerminalTab;
+  ended: boolean;
+}) {
+  const { t } = useTranslation(["terminals", "dashboard"]);
+  return (
+    <div className="flex flex-wrap gap-2">
+      {/* An operator terminal ends with its command, or by its step's Cancel. */}
+      {ended || tab.stepId ? null : (
+        <Button
+          type="button"
+          variant="outline"
+          size="touch"
+          disabled={tab.ending === "pending"}
+          onClick={() => sessions.endSession(tab.localId)}
+        >
+          {tab.ending === "pending" ? t("terminals:ending") : t("terminals:endSession")}
+        </Button>
+      )}
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-touch"
+        aria-label={ended ? t("terminals:closeTab") : t("terminals:detach")}
+        title={ended ? t("terminals:closeTab") : t("terminals:detach")}
+        onClick={() => sessions.detachTab(tab.localId)}
+      >
+        <X aria-hidden="true" />
+      </Button>
+    </div>
+  );
+}
+
+function IdentityChangedNotice({
+  fingerprint,
+  onTrustNewKey,
+}: {
+  fingerprint: string;
+  onTrustNewKey: () => void;
+}) {
+  const { t } = useTranslation(["terminals", "dashboard"]);
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      <p className="min-w-0 break-words">{t("terminals:identityChangedDetail", { fingerprint })}</p>
+      <Button
+        type="button"
+        variant="outline"
+        size="touch"
+        className="self-start"
+        onClick={onTrustNewKey}
+      >
+        {t("terminals:trustNewKey")}
+      </Button>
     </div>
   );
 }

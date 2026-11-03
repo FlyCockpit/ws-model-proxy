@@ -212,99 +212,40 @@ function AdminUsers() {
         <CardHeader>
           <CardTitle>{t("admin:users.allUsers")}</CardTitle>
           <CardDescription>
-            {list.isPending
-              ? t("admin:users.loading")
-              : list.isError
-                ? t("admin:users.loadFailedShort")
-                : t("admin:users.totalCount", {
-                    count: list.data.total,
-                    shown: filtered.length,
-                    total: list.data.total,
-                  })}
+            <UsersCountText
+              pending={list.isPending}
+              failed={list.isError}
+              total={list.data?.total ?? 0}
+              shown={filtered.length}
+            />
           </CardDescription>
         </CardHeader>
         <CardContent className="p-0">
-          {list.isPending ? (
-            <ListSkeleton />
-          ) : list.isError ? (
-            <InlineRetry
-              className="py-12"
-              message={t("admin:users.loadFailed")}
-              onRetry={() => list.refetch()}
-            />
-          ) : filtered.length === 0 ? (
-            <div className="flex flex-col items-center gap-3 py-12 text-center">
-              <p className="text-sm font-medium">
-                {search.trim()
-                  ? t("admin:users.noMatch")
-                  : statusFilter === "archived"
-                    ? t("admin:users.noArchived")
-                    : statusFilter === "active"
-                      ? t("admin:users.noActive")
-                      : t("admin:users.noUsersYet")}
-              </p>
-              <p className="text-sm text-muted-foreground">
-                {search.trim() ? t("admin:users.tryDifferentQuery") : t("admin:users.inviteFirst")}
-              </p>
-            </div>
-          ) : (
-            <ul className="divide-y">
-              {filtered.map((user) => {
-                const isSelf = user.id === session.user.id;
-                const isAdmin = hasRole(user.role, "admin");
-                const isArchived = !!user.banned;
-                const isDeleting = Boolean(user.deletionRequestedAt);
-                return (
-                  <li
-                    key={user.id}
-                    className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <p className="flex flex-wrap items-center gap-2 font-medium">
-                        <span className="truncate">{user.name || user.email}</span>
-                        {isSelf && (
-                          <span className="rounded-full border bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase text-muted-foreground">
-                            {t("admin:users.youBadge")}
-                          </span>
-                        )}
-                        <RolePill isAdmin={isAdmin} />
-                        {isDeleting && <DeletingPill />}
-                        {isArchived && !isDeleting && <ArchivedPill />}
-                        {!user.emailVerified && <UnverifiedPill />}
-                      </p>
-                      <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                        {user.email} · {t("admin:users.joined")}{" "}
-                        <JoinedDate value={user.createdAt} />
-                        {user.banReason ? ` · ${user.banReason}` : ""}
-                      </p>
-                    </div>
-                    <UserActions
-                      user={user}
-                      isSelf={isSelf}
-                      isAdmin={isAdmin}
-                      isArchived={isArchived}
-                      onSetRole={(role) => {
-                        trigger("light");
-                        setRole.mutate({ userId: user.id, role });
-                      }}
-                      onArchive={() => {
-                        trigger("warning");
-                        archive.mutate({ userId: user.id });
-                      }}
-                      onUnarchive={() => {
-                        trigger("light");
-                        unarchive.mutate({ userId: user.id });
-                      }}
-                      onDelete={() => {
-                        trigger("warning");
-                        setDeleteId(user.id);
-                      }}
-                    />
-                  </li>
-                );
-              })}
-            </ul>
-          )}
+          <UsersListContent
+            pending={list.isPending}
+            failed={list.isError}
+            onRetry={() => list.refetch()}
+            users={filtered}
+            searching={Boolean(search.trim())}
+            statusFilter={statusFilter}
+            selfId={session.user.id}
+            onSetRole={(user, role) => {
+              trigger("light");
+              setRole.mutate({ userId: user.id, role });
+            }}
+            onArchive={(user) => {
+              trigger("warning");
+              archive.mutate({ userId: user.id });
+            }}
+            onUnarchive={(user) => {
+              trigger("light");
+              unarchive.mutate({ userId: user.id });
+            }}
+            onDelete={(user) => {
+              trigger("warning");
+              setDeleteId(user.id);
+            }}
+          />
         </CardContent>
       </Card>
 
@@ -338,6 +279,138 @@ function AdminUsers() {
         }}
       />
     </div>
+  );
+}
+
+function UsersCountText({
+  pending,
+  failed,
+  total,
+  shown,
+}: {
+  pending: boolean;
+  failed: boolean;
+  total: number;
+  shown: number;
+}) {
+  const { t } = useTranslation(["admin", "common"]);
+  if (pending) return t("admin:users.loading");
+  if (failed) return t("admin:users.loadFailedShort");
+  return t("admin:users.totalCount", { count: total, shown, total });
+}
+
+type UserRowHandlers = {
+  onSetRole: (user: UserRow, role: "user" | "admin") => void;
+  onArchive: (user: UserRow) => void;
+  onUnarchive: (user: UserRow) => void;
+  onDelete: (user: UserRow) => void;
+};
+
+function UsersListContent({
+  pending,
+  failed,
+  onRetry,
+  users,
+  searching,
+  statusFilter,
+  selfId,
+  ...handlers
+}: {
+  pending: boolean;
+  failed: boolean;
+  onRetry: () => void;
+  users: UserRow[];
+  searching: boolean;
+  statusFilter: StatusFilter;
+  selfId: string;
+} & UserRowHandlers) {
+  const { t } = useTranslation(["admin", "common"]);
+  if (pending) return <ListSkeleton />;
+  if (failed) {
+    return (
+      <InlineRetry className="py-12" message={t("admin:users.loadFailed")} onRetry={onRetry} />
+    );
+  }
+  if (users.length === 0) {
+    return <UsersEmptyState searching={searching} statusFilter={statusFilter} />;
+  }
+  return (
+    <ul className="divide-y">
+      {users.map((user) => (
+        <UserListItem key={user.id} user={user} isSelf={user.id === selfId} {...handlers} />
+      ))}
+    </ul>
+  );
+}
+
+function emptyUsersTitleKey(searching: boolean, statusFilter: StatusFilter) {
+  if (searching) return "admin:users.noMatch" as const;
+  if (statusFilter === "archived") return "admin:users.noArchived" as const;
+  if (statusFilter === "active") return "admin:users.noActive" as const;
+  return "admin:users.noUsersYet" as const;
+}
+
+function UsersEmptyState({
+  searching,
+  statusFilter,
+}: {
+  searching: boolean;
+  statusFilter: StatusFilter;
+}) {
+  const { t } = useTranslation(["admin", "common"]);
+  return (
+    <div className="flex flex-col items-center gap-3 py-12 text-center">
+      <p className="text-sm font-medium">{t(emptyUsersTitleKey(searching, statusFilter))}</p>
+      <p className="text-sm text-muted-foreground">
+        {searching ? t("admin:users.tryDifferentQuery") : t("admin:users.inviteFirst")}
+      </p>
+    </div>
+  );
+}
+
+function UserListItem({
+  user,
+  isSelf,
+  onSetRole,
+  onArchive,
+  onUnarchive,
+  onDelete,
+}: { user: UserRow; isSelf: boolean } & UserRowHandlers) {
+  const { t } = useTranslation(["admin", "common"]);
+  const isAdmin = hasRole(user.role, "admin");
+  const isArchived = !!user.banned;
+  const isDeleting = Boolean(user.deletionRequestedAt);
+  return (
+    <li className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0 flex-1">
+        <p className="flex flex-wrap items-center gap-2 font-medium">
+          <span className="truncate">{user.name || user.email}</span>
+          {isSelf && (
+            <span className="rounded-full border bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase text-muted-foreground">
+              {t("admin:users.youBadge")}
+            </span>
+          )}
+          <RolePill isAdmin={isAdmin} />
+          {isDeleting && <DeletingPill />}
+          {isArchived && !isDeleting && <ArchivedPill />}
+          {!user.emailVerified && <UnverifiedPill />}
+        </p>
+        <p className="mt-0.5 truncate text-xs text-muted-foreground">
+          {user.email} · {t("admin:users.joined")} <JoinedDate value={user.createdAt} />
+          {user.banReason ? ` · ${user.banReason}` : ""}
+        </p>
+      </div>
+      <UserActions
+        user={user}
+        isSelf={isSelf}
+        isAdmin={isAdmin}
+        isArchived={isArchived}
+        onSetRole={(role) => onSetRole(user, role)}
+        onArchive={() => onArchive(user)}
+        onUnarchive={() => onUnarchive(user)}
+        onDelete={() => onDelete(user)}
+      />
+    </li>
   );
 }
 

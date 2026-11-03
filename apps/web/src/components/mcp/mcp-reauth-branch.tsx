@@ -7,9 +7,9 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
-import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { useTranslation } from "react-i18next";
 import { McpInvalidRequestCard } from "@/components/mcp/mcp-invalid-request-card";
+import { McpPageSkeleton } from "@/components/mcp/mcp-page-skeleton";
 import { useMcpPageContinue } from "@/hooks/use-mcp-page-continue";
 import { useMcpReauthSignOut } from "@/hooks/use-mcp-reauth-sign-out";
 import { mcpReauthStatusQueryKey } from "@/lib/mcp-oauth-search";
@@ -101,7 +101,7 @@ export function McpReauthBranch({ session, clientId, fingerprint, lang }: McpRea
     // No fresh settled success yet: initial pending, fresh fetch in flight,
     // or offline-paused (fetchStatus "paused" — the probe has not run).
     // Skeleton only: no navigation, no actions.
-    return <McpReauthSkeleton />;
+    return <McpPageSkeleton />;
   }
 
   if (reauth.data?.status === "no-session") {
@@ -112,7 +112,7 @@ export function McpReauthBranch({ session, clientId, fingerprint, lang }: McpRea
   if (reauth.data?.status !== "reauth") {
     // "continue" already navigates via the effect hook; this render is a
     // transient frame only.
-    return <McpReauthSkeleton />;
+    return <McpPageSkeleton />;
   }
 
   return (
@@ -142,23 +142,6 @@ export function McpReauthBranch({ session, clientId, fingerprint, lang }: McpRea
           ) : null}
         </CardContent>
       </Card>
-    </div>
-  );
-}
-
-function McpReauthSkeleton() {
-  return (
-    <div className="flex min-w-0 items-center justify-center px-4 py-10">
-      <div className="w-full max-w-md space-y-6">
-        <div className="space-y-2 text-center">
-          <Skeleton className="mx-auto h-8 w-40" />
-          <Skeleton className="mx-auto h-4 w-56" />
-        </div>
-        <div className="space-y-4">
-          <Skeleton className="h-10 w-full" />
-          <Skeleton className="h-10 w-full" />
-        </div>
-      </div>
     </div>
   );
 }

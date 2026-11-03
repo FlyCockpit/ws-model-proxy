@@ -1,18 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@ws-model-proxy/ui/components/card";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useTranslation } from "react-i18next";
 
+import { AuthCard } from "@/components/auth/auth-card";
 import { ResendVerification } from "@/components/auth/resend-verification";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { parseVerifyEmailSearch } from "@/lib/verify-email-search";
@@ -60,29 +54,12 @@ function VerifyEmailPage() {
             : t("auth:verifyEmail.pendingDescription")
         }
       >
-        {configPending ? (
-          <Skeleton className="h-10 w-full" />
-        ) : configError ? (
-          <div className="space-y-2 text-center">
-            <p className="text-sm text-muted-foreground">
-              {t("auth:login.unableToConnectDescription")}
-            </p>
-            <Button
-              type="button"
-              variant="outline"
-              className="min-h-[44px] w-full"
-              onClick={() => refetchConfig()}
-            >
-              {t("common:actions.retry")}
-            </Button>
-          </div>
-        ) : canResend ? (
-          <ResendVerification />
-        ) : (
-          <p className="text-center text-sm text-muted-foreground">
-            {t("auth:verifyEmail.emailUnavailable")}
-          </p>
-        )}
+        <ResendSection
+          configPending={configPending}
+          configError={configError}
+          canResend={canResend}
+          onRetry={() => refetchConfig()}
+        />
         <div className="text-center">
           <Link
             to="/$lang/login"
@@ -97,6 +74,44 @@ function VerifyEmailPage() {
     );
   }
 
+  return <VerifiedCard lang={lang} isAuthenticated={isAuthenticated} />;
+}
+
+function ResendSection({
+  configPending,
+  configError,
+  canResend,
+  onRetry,
+}: {
+  configPending: boolean;
+  configError: boolean;
+  canResend: boolean;
+  onRetry: () => void;
+}) {
+  const { t } = useTranslation(["auth", "common"]);
+  if (configPending) return <Skeleton className="h-10 w-full" />;
+  if (configError) {
+    return (
+      <div className="space-y-2 text-center">
+        <p className="text-sm text-muted-foreground">
+          {t("auth:login.unableToConnectDescription")}
+        </p>
+        <Button type="button" variant="outline" className="min-h-[44px] w-full" onClick={onRetry}>
+          {t("common:actions.retry")}
+        </Button>
+      </div>
+    );
+  }
+  if (canResend) return <ResendVerification />;
+  return (
+    <p className="text-center text-sm text-muted-foreground">
+      {t("auth:verifyEmail.emailUnavailable")}
+    </p>
+  );
+}
+
+function VerifiedCard({ lang, isAuthenticated }: { lang: string; isAuthenticated: boolean }) {
+  const { t } = useTranslation(["auth", "common"]);
   return (
     <AuthCard
       title={t("auth:verifyEmail.successTitle")}
@@ -125,27 +140,5 @@ function VerifyEmailPage() {
         </Link>
       )}
     </AuthCard>
-  );
-}
-
-function AuthCard({
-  title,
-  description,
-  children,
-}: {
-  title: string;
-  description: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex min-h-[80vh] items-center justify-center px-4">
-      <Card className="w-full max-w-md">
-        <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{title}</CardTitle>
-          <CardDescription>{description}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">{children}</CardContent>
-      </Card>
-    </div>
   );
 }

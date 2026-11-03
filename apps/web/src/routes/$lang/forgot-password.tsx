@@ -1,24 +1,15 @@
-import { useForm } from "@tanstack/react-form";
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link, redirect } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@ws-model-proxy/ui/components/card";
-import { Input } from "@ws-model-proxy/ui/components/input";
-import { Label } from "@ws-model-proxy/ui/components/label";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import z from "zod";
 
+import { AuthCard } from "@/components/auth/auth-card";
+import { EmailOnlyForm } from "@/components/auth/email-only-form";
 import { authClient } from "@/lib/auth-client";
 import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
@@ -130,100 +121,27 @@ function ForgotPasswordPage() {
 
 function ForgotPasswordForm({ lang, onSent }: { lang: string; onSent: () => void }) {
   const { t } = useTranslation(["auth"]);
-
-  const form = useForm({
-    defaultValues: { email: "" },
-    onSubmit: async ({ value }) => {
-      // The server rewrites the emailed callback to this app's reset page; the
-      // path here only tells it which locale the person is using.
-      const result = await authClient.requestPasswordReset({
-        email: value.email,
-        redirectTo: `/${lang}/reset-password`,
-      });
-      if (result.error) {
-        if (isRateLimit(result.error)) {
-          toast.error(friendly(result.error));
-          return;
+  return (
+    <EmailOnlyForm
+      submitLabel={t("auth:forgotPassword.submit")}
+      submittingLabel={t("auth:forgotPassword.submitting")}
+      onSubmit={async (email) => {
+        // The server rewrites the emailed callback to this app's reset page; the
+        // path here only tells it which locale the person is using.
+        const result = await authClient.requestPasswordReset({
+          email,
+          redirectTo: `/${lang}/reset-password`,
+        });
+        if (result.error) {
+          if (isRateLimit(result.error)) {
+            toast.error(friendly(result.error));
+            return;
+          }
+          // Any other refusal gets the same neutral confirmation.
+          console.error("[forgot-password.request]", result.error);
         }
-        // Any other refusal gets the same neutral confirmation.
-        console.error("[forgot-password.request]", result.error);
-      }
-      onSent();
-    },
-    validators: {
-      onSubmit: z.object({
-        email: z.email(),
-      }),
-    },
-  });
-
-  return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        form.handleSubmit();
+        onSent();
       }}
-      className="space-y-4"
-    >
-      <form.Field name="email">
-        {(field) => (
-          <div className="space-y-2">
-            <Label htmlFor={field.name}>{t("auth:fields.email")}</Label>
-            <Input
-              id={field.name}
-              name={field.name}
-              type="email"
-              inputMode="email"
-              autoComplete="email"
-              value={field.state.value}
-              onBlur={field.handleBlur}
-              onChange={(e) => field.handleChange(e.target.value)}
-            />
-            {field.state.meta.errors.map((error) => (
-              <p key={error?.message} className="text-sm text-destructive">
-                {error?.message}
-              </p>
-            ))}
-          </div>
-        )}
-      </form.Field>
-
-      <form.Subscribe
-        selector={(state) => ({ canSubmit: state.canSubmit, isSubmitting: state.isSubmitting })}
-      >
-        {({ canSubmit, isSubmitting }) => (
-          <Button
-            type="submit"
-            className="min-h-[44px] w-full"
-            disabled={!canSubmit || isSubmitting}
-          >
-            {isSubmitting ? t("auth:forgotPassword.submitting") : t("auth:forgotPassword.submit")}
-          </Button>
-        )}
-      </form.Subscribe>
-    </form>
-  );
-}
-
-function AuthCard({
-  title,
-  description,
-  children,
-}: {
-  title: string;
-  description: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex min-h-[80vh] items-center justify-center px-4">
-      <Card className="w-full max-w-md">
-        <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{title}</CardTitle>
-          <CardDescription>{description}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">{children}</CardContent>
-      </Card>
-    </div>
+    />
   );
 }

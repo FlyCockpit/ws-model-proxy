@@ -20,6 +20,7 @@ import {
   SelectValue,
 } from "@ws-model-proxy/ui/components/select";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
+import type { TFunction } from "i18next";
 import { Plus, Trash } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -46,6 +47,68 @@ type ItemRow = {
   nodeIds: string[];
 };
 type HoldRow = { nodeId: string; note: string };
+type ProfileValues = {
+  name: string;
+  slug: string;
+  description: string;
+  nodeIds: string[];
+  holds: HoldRow[];
+  items: ItemRow[];
+};
+type StartableRuntime = { id: string; name: string; currentVersion: RuntimeVersionRef };
+
+/** The editor's one form instance; `submit` runs with the values on a valid submit. */
+function useProfileForm(
+  profile: ProfileView,
+  t: TFunction,
+  submit: (value: ProfileValues) => Promise<void>,
+) {
+  return useForm({
+    defaultValues: {
+      name: profile.name,
+      slug: profile.slug,
+      description: profile.description ?? "",
+      nodeIds: profile.nodeIds,
+      holds: profile.holds.map((hold) => ({
+        nodeId: hold.nodeId,
+        note: hold.note ?? "",
+      })) as HoldRow[],
+      items: profile.items.map((item) => ({
+        key: item.id,
+        runtimeId: item.runtimeId,
+        versionId: item.versionId,
+        count: String(item.count),
+        nodeIds: item.nodeIds,
+      })) as ItemRow[],
+    },
+    validators: {
+      onChange: z.object({
+        name: z.string().trim().min(1, t("dashboard:profiles.editor.nameRequired")).max(120),
+        slug: z.string().regex(PROFILE_SLUG_PATTERN, t("dashboard:profiles.editor.slugInvalid")),
+        description: z.string().max(2_000),
+        nodeIds: z.array(z.string()).min(1, t("dashboard:profiles.editor.nodesRequired")),
+        holds: z.array(z.object({ nodeId: z.string(), note: z.string().max(500) })),
+        items: z.array(
+          z.object({
+            key: z.string(),
+            runtimeId: z.string().min(1, t("dashboard:profiles.editor.runtimeRequired")),
+            versionId: z.string().nullable(),
+            count: z
+              .string()
+              .regex(/^[1-9][0-9]?$/, t("dashboard:profiles.editor.countInvalid"))
+              .refine((count) => Number(count) <= 64, t("dashboard:profiles.editor.countInvalid")),
+            nodeIds: z.array(z.string()),
+          }),
+        ),
+      }),
+    },
+    onSubmit: async ({ value }) => {
+      await submit(value);
+    },
+  });
+}
+
+type ProfileForm = ReturnType<typeof useProfileForm>;
 
 export function ProfileEditor({
   profile,
@@ -87,54 +150,9 @@ export function ProfileEditor({
     ...refusalToastOptions(t),
   });
 
-  const form = useForm({
-    defaultValues: {
-      name: profile.name,
-      slug: profile.slug,
-      description: profile.description ?? "",
-      nodeIds: profile.nodeIds,
-      holds: profile.holds.map((hold) => ({
-        nodeId: hold.nodeId,
-        note: hold.note ?? "",
-      })) as HoldRow[],
-      items: profile.items.map((item) => ({
-        key: item.id,
-        runtimeId: item.runtimeId,
-        versionId: item.versionId,
-        count: String(item.count),
-        nodeIds: item.nodeIds,
-      })) as ItemRow[],
-    },
-    validators: {
-      onChange: z.object({
-        name: z.string().trim().min(1, t("dashboard:profiles.editor.nameRequired")).max(120),
-        slug: z.string().regex(PROFILE_SLUG_PATTERN, t("dashboard:profiles.editor.slugInvalid")),
-        description: z.string().max(2_000),
-        nodeIds: z.array(z.string()).min(1, t("dashboard:profiles.editor.nodesRequired")),
-        holds: z.array(z.object({ nodeId: z.string(), note: z.string().max(500) })),
-        items: z.array(
-          z.object({
-            key: z.string(),
-            runtimeId: z.string().min(1, t("dashboard:profiles.editor.runtimeRequired")),
-            versionId: z.string().nullable(),
-            count: z
-              .string()
-              .regex(/^[1-9][0-9]?$/, t("dashboard:profiles.editor.countInvalid"))
-              .refine((count) => Number(count) <= 64, t("dashboard:profiles.editor.countInvalid")),
-            nodeIds: z.array(z.string()),
-          }),
-        ),
-      }),
-    },
-    onSubmit: async ({ value }) => {
-      await saveWith(value, false);
-    },
-  });
-
-  type Values = typeof form.state.values;
   const currentVersionOf = (runtimeId: string) =>
     startable.find((runtime) => runtime.id === runtimeId)?.currentVersion.id ?? null;
-  const saveWith = async (value: Values, updatePins: boolean) => {
+  const saveWith = async (value: ProfileValues, updatePins: boolean) => {
     const owned = new Set(value.nodeIds);
     // Omitting a version keeps the line's old pin on the server: never do that for a line set
     // to "Current version" whose current version is not known here.
@@ -171,6 +189,8 @@ export function ProfileEditor({
     });
   };
 
+  const form = useProfileForm(profile, t, (value) => saveWith(value, false));
+
   const runtimeLabel = (runtimeId: string) =>
     startable.find((runtime) => runtime.id === runtimeId)?.name ??
     profile.items.find((item) => item.runtimeId === runtimeId)?.runtimeSlug ??
@@ -185,348 +205,29 @@ export function ProfileEditor({
         form.handleSubmit().catch(() => undefined);
       }}
     >
-      <Card className="min-w-0">
-        <CardHeader>
-          <CardTitle className="text-base">{t("dashboard:profiles.editor.about")}</CardTitle>
-        </CardHeader>
-        <CardContent className="grid gap-3 sm:grid-cols-2">
-          <form.Field name="name">
-            {(field) => (
-              <div className="space-y-1.5">
-                <Label htmlFor="profile-name">{t("dashboard:profiles.editor.name")}</Label>
-                <Input
-                  id="profile-name"
-                  className="min-h-[44px]"
-                  value={field.state.value}
-                  onChange={(event) => field.handleChange(event.target.value)}
-                />
-                <FieldError errors={field.state.meta.errors} />
-              </div>
-            )}
-          </form.Field>
-          <form.Field name="slug">
-            {(field) => (
-              <div className="space-y-1.5">
-                <Label htmlFor="profile-slug">{t("dashboard:profiles.editor.slug")}</Label>
-                <Input
-                  id="profile-slug"
-                  className="min-h-[44px] font-mono"
-                  autoCapitalize="none"
-                  value={field.state.value}
-                  onChange={(event) => field.handleChange(event.target.value)}
-                />
-                <FieldError errors={field.state.meta.errors} />
-              </div>
-            )}
-          </form.Field>
-          <form.Field name="description">
-            {(field) => (
-              <div className="space-y-1.5 sm:col-span-2">
-                <Label htmlFor="profile-description">
-                  {t("dashboard:profiles.editor.description")}
-                </Label>
-                <Input
-                  id="profile-description"
-                  className="min-h-[44px]"
-                  value={field.state.value}
-                  onChange={(event) => field.handleChange(event.target.value)}
-                />
-              </div>
-            )}
-          </form.Field>
-        </CardContent>
-      </Card>
+      <AboutCard form={form} />
 
-      <Card className="min-w-0">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            {t("dashboard:profiles.editor.nodesTitle")}
-            <Help>{t("dashboard:profiles.editor.nodesHelp")}</Help>
-          </CardTitle>
-          <CardDescription>{t("dashboard:profiles.editor.nodesDescription")}</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form.Field name="nodeIds">
-            {(nodesField) => (
-              <form.Field name="holds">
-                {(holdsField) => (
-                  <div className="space-y-2">
-                    {nodes.map((node) => {
-                      const owned = nodesField.state.value.includes(node.id);
-                      const hold = holdsField.state.value.find((row) => row.nodeId === node.id);
-                      return (
-                        <div
-                          key={node.id}
-                          className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1"
-                        >
-                          <label className="flex min-h-[44px] min-w-0 items-center gap-3">
-                            <Checkbox
-                              checked={owned}
-                              onCheckedChange={(checked) =>
-                                nodesField.handleChange(
-                                  checked
-                                    ? [...nodesField.state.value, node.id]
-                                    : nodesField.state.value.filter((id) => id !== node.id),
-                                )
-                              }
-                            />
-                            <span className="truncate">{node.name ?? node.slug}</span>
-                          </label>
-                          {owned ? (
-                            <label className="flex min-h-[44px] items-center gap-2 text-sm">
-                              <Checkbox
-                                checked={!!hold}
-                                onCheckedChange={(checked) =>
-                                  holdsField.handleChange(
-                                    checked
-                                      ? [...holdsField.state.value, { nodeId: node.id, note: "" }]
-                                      : holdsField.state.value.filter(
-                                          (row) => row.nodeId !== node.id,
-                                        ),
-                                  )
-                                }
-                              />
-                              {t("dashboard:profiles.editor.holdLine")}
-                            </label>
-                          ) : null}
-                          {owned && hold ? (
-                            <Input
-                              aria-label={t("dashboard:profiles.editor.holdNote", {
-                                slug: node.slug,
-                              })}
-                              className="min-h-[44px] min-w-0 flex-1"
-                              placeholder={t("dashboard:nodes.hold.notePlaceholder")}
-                              maxLength={500}
-                              value={hold.note}
-                              onChange={(event) =>
-                                holdsField.handleChange(
-                                  holdsField.state.value.map((row) =>
-                                    row.nodeId === node.id
-                                      ? { ...row, note: event.target.value }
-                                      : row,
-                                  ),
-                                )
-                              }
-                            />
-                          ) : null}
-                        </div>
-                      );
-                    })}
-                    <FieldError errors={nodesField.state.meta.errors} />
-                  </div>
-                )}
-              </form.Field>
-            )}
-          </form.Field>
-        </CardContent>
-      </Card>
+      <NodesCard form={form} nodes={nodes} />
 
-      <Card className="min-w-0">
-        <CardHeader>
-          <CardTitle className="text-base">{t("dashboard:profiles.editor.itemsTitle")}</CardTitle>
-          <CardDescription>{t("dashboard:profiles.editor.itemsDescription")}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {runtimes.isError ? (
-            <p className="text-sm text-muted-foreground">
-              {t("dashboard:profiles.editor.runtimesUnavailable")}
-            </p>
-          ) : null}
-          <form.Field name="items" mode="array">
-            {(field) => (
-              <div className="space-y-2">
-                {field.state.value.map((row, index) => {
-                  // The saved line this row came from, while it still names the same runtime.
-                  const item = profile.items.find(
-                    (candidate) =>
-                      candidate.id === row.key && candidate.runtimeId === row.runtimeId,
-                  );
-                  return (
-                    <div
-                      key={row.key}
-                      className="flex min-w-0 flex-wrap items-end gap-2 border-b pb-2"
-                    >
-                      <form.Field name={`items[${index}].runtimeId`}>
-                        {(sub) => (
-                          <div className="min-w-0 flex-1 space-y-1">
-                            <Label htmlFor={`item-runtime-${index}`}>
-                              {t("dashboard:profiles.editor.runtime")}
-                            </Label>
-                            <Select
-                              value={sub.state.value}
-                              onValueChange={(next) => {
-                                if (typeof next !== "string") return;
-                                sub.handleChange(next);
-                                form.setFieldValue(`items[${index}].versionId`, null);
-                              }}
-                            >
-                              <SelectTrigger
-                                id={`item-runtime-${index}`}
-                                className="min-h-[44px] w-full"
-                              >
-                                <SelectValue>{runtimeLabel(sub.state.value)}</SelectValue>
-                              </SelectTrigger>
-                              <SelectContent>
-                                {startable.map((runtime) => (
-                                  <SelectItem key={runtime.id} value={runtime.id}>
-                                    {runtime.name}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </div>
-                        )}
-                      </form.Field>
-                      <form.Field name={`items[${index}].count`}>
-                        {(sub) => (
-                          <div className="w-24 space-y-1">
-                            <Label htmlFor={`item-count-${index}`}>
-                              {t("dashboard:profiles.editor.count")}
-                            </Label>
-                            <Input
-                              id={`item-count-${index}`}
-                              inputMode="numeric"
-                              className="min-h-[44px]"
-                              value={sub.state.value}
-                              onChange={(event) => sub.handleChange(event.target.value)}
-                            />
-                            <FieldError errors={sub.state.meta.errors} />
-                          </div>
-                        )}
-                      </form.Field>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon-touch"
-                        aria-label={t("dashboard:profiles.editor.removeItem")}
-                        onClick={() => field.removeValue(index)}
-                      >
-                        <Trash aria-hidden="true" />
-                      </Button>
-                      <form.Field name={`items[${index}].versionId`}>
-                        {(sub) => (
-                          <ItemVersionField
-                            id={`item-version-${index}`}
-                            runtimeId={row.runtimeId}
-                            currentVersion={
-                              startable.find((runtime) => runtime.id === row.runtimeId)
-                                ?.currentVersion ?? null
-                            }
-                            saved={item ?? null}
-                            value={sub.state.value}
-                            onChange={sub.handleChange}
-                          />
-                        )}
-                      </form.Field>
-                      {item ? (
-                        <p className="w-full text-xs text-muted-foreground">
-                          {t("dashboard:profiles.editor.pinned", { version: item.versionNumber })}
-                          {item.pinOutdated ? ` · ${t("dashboard:profiles.pinsOutdated")}` : ""}
-                        </p>
-                      ) : null}
-                      <form.Subscribe selector={(state) => state.values.nodeIds}>
-                        {(ownedIds) => (
-                          <form.Field name={`items[${index}].nodeIds`}>
-                            {(sub) => (
-                              <ItemNodesField
-                                index={index}
-                                owned={ownedNodes(nodes, ownedIds)}
-                                value={sub.state.value}
-                                onChange={sub.handleChange}
-                              />
-                            )}
-                          </form.Field>
-                        )}
-                      </form.Subscribe>
-                    </div>
-                  );
-                })}
-                <FieldError errors={field.state.meta.errors} />
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="min-h-[44px]"
-                  disabled={startable.length === 0}
-                  onClick={() =>
-                    field.pushValue({
-                      key: `new-${crypto.randomUUID()}`,
-                      runtimeId: startable[0]?.id ?? "",
-                      versionId: null,
-                      count: "1",
-                      nodeIds: [],
-                    })
-                  }
-                >
-                  <Plus aria-hidden="true" />
-                  {t("dashboard:profiles.editor.addItem")}
-                </Button>
-              </div>
-            )}
-          </form.Field>
-        </CardContent>
-      </Card>
+      <ItemsCard
+        form={form}
+        profile={profile}
+        nodes={nodes}
+        startable={startable}
+        runtimesUnavailable={runtimes.isError}
+        runtimeLabel={runtimeLabel}
+      />
 
-      <div className="flex flex-wrap gap-2">
-        <form.Subscribe selector={(state) => [state.canSubmit, state.isSubmitting] as const}>
-          {([canSubmit, isSubmitting]) => (
-            <Button
-              type="submit"
-              className="min-h-[44px]"
-              // "Current version" needs the runtimes' current versions to save as chosen.
-              disabled={!canSubmit || isSubmitting || runtimes.isPending || runtimes.isError}
-            >
-              {t("common:actions.save")}
-            </Button>
-          )}
-        </form.Subscribe>
-        <form.Subscribe selector={(state) => state.isDirty}>
-          {(dirty) => (
-            // Moves every saved line to its runtime's current version; unsaved picks would be
-            // lost, so it waits for a save.
-            <Button
-              type="button"
-              variant="outline"
-              className="min-h-[44px]"
-              disabled={dirty || save.isPending || !profile.items.some((item) => item.pinOutdated)}
-              title={dirty ? t("dashboard:profiles.editor.saveFirst") : undefined}
-              onClick={() => saveWith(form.state.values, true)}
-            >
-              {t("dashboard:profiles.editor.updatePins")}
-            </Button>
-          )}
-        </form.Subscribe>
-        <form.Subscribe selector={(state) => state.isDirty}>
-          {(dirty) => (
-            <Button
-              type="button"
-              variant="outline"
-              className="min-h-[44px]"
-              disabled={dirty}
-              title={dirty ? t("dashboard:profiles.editor.saveFirst") : undefined}
-              onClick={() => setApplying(true)}
-            >
-              {t("dashboard:profiles.apply.button")}
-            </Button>
-          )}
-        </form.Subscribe>
-        <Button
-          type="button"
-          variant="ghost"
-          className="min-h-[44px] text-destructive"
-          onClick={() => setDeleting(true)}
-        >
-          {t("common:actions.delete")}
-        </Button>
-      </div>
-      <form.Subscribe selector={(state) => state.isDirty}>
-        {(dirty) => (
-          <p className="text-xs text-muted-foreground">
-            {dirty
-              ? t("dashboard:profiles.editor.saveFirst")
-              : t("dashboard:profiles.editor.applyHint")}
-          </p>
-        )}
-      </form.Subscribe>
+      <ProfileActions
+        form={form}
+        profile={profile}
+        // "Current version" needs the runtimes' current versions to save as chosen.
+        runtimesReady={!(runtimes.isPending || runtimes.isError)}
+        savePending={save.isPending}
+        onUpdatePins={() => saveWith(form.state.values, true)}
+        onApply={() => setApplying(true)}
+        onDelete={() => setDeleting(true)}
+      />
 
       <ApplyProfileDialog profile={profile} open={applying} onOpenChange={setApplying} />
       <ConfirmDeleteDialog
@@ -541,6 +242,428 @@ export function ProfileEditor({
         onConfirm={() => remove.mutate({ profileId: profile.id })}
       />
     </form>
+  );
+}
+
+/** Name, slug and description. */
+function AboutCard({ form }: { form: ProfileForm }) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  return (
+    <Card className="min-w-0">
+      <CardHeader>
+        <CardTitle className="text-base">{t("dashboard:profiles.editor.about")}</CardTitle>
+      </CardHeader>
+      <CardContent className="grid gap-3 sm:grid-cols-2">
+        <form.Field name="name">
+          {(field) => (
+            <div className="space-y-1.5">
+              <Label htmlFor="profile-name">{t("dashboard:profiles.editor.name")}</Label>
+              <Input
+                id="profile-name"
+                className="min-h-[44px]"
+                value={field.state.value}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+              <FieldError errors={field.state.meta.errors} />
+            </div>
+          )}
+        </form.Field>
+        <form.Field name="slug">
+          {(field) => (
+            <div className="space-y-1.5">
+              <Label htmlFor="profile-slug">{t("dashboard:profiles.editor.slug")}</Label>
+              <Input
+                id="profile-slug"
+                className="min-h-[44px] font-mono"
+                autoCapitalize="none"
+                value={field.state.value}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+              <FieldError errors={field.state.meta.errors} />
+            </div>
+          )}
+        </form.Field>
+        <form.Field name="description">
+          {(field) => (
+            <div className="space-y-1.5 sm:col-span-2">
+              <Label htmlFor="profile-description">
+                {t("dashboard:profiles.editor.description")}
+              </Label>
+              <Input
+                id="profile-description"
+                className="min-h-[44px]"
+                value={field.state.value}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+            </div>
+          )}
+        </form.Field>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** The nodes the profile owns, and which of them it holds. */
+function NodesCard({ form, nodes }: { form: ProfileForm; nodes: readonly NodeSummary[] }) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  return (
+    <Card className="min-w-0">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          {t("dashboard:profiles.editor.nodesTitle")}
+          <Help>{t("dashboard:profiles.editor.nodesHelp")}</Help>
+        </CardTitle>
+        <CardDescription>{t("dashboard:profiles.editor.nodesDescription")}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form.Field name="nodeIds">
+          {(nodesField) => (
+            <form.Field name="holds">
+              {(holdsField) => (
+                <div className="space-y-2">
+                  {nodes.map((node) => {
+                    const owned = nodesField.state.value.includes(node.id);
+                    const hold = holdsField.state.value.find((row) => row.nodeId === node.id);
+                    return (
+                      <div
+                        key={node.id}
+                        className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1"
+                      >
+                        <label className="flex min-h-[44px] min-w-0 items-center gap-3">
+                          <Checkbox
+                            checked={owned}
+                            onCheckedChange={(checked) =>
+                              nodesField.handleChange(
+                                checked
+                                  ? [...nodesField.state.value, node.id]
+                                  : nodesField.state.value.filter((id) => id !== node.id),
+                              )
+                            }
+                          />
+                          <span className="truncate">{node.name ?? node.slug}</span>
+                        </label>
+                        {owned ? (
+                          <label className="flex min-h-[44px] items-center gap-2 text-sm">
+                            <Checkbox
+                              checked={!!hold}
+                              onCheckedChange={(checked) =>
+                                holdsField.handleChange(
+                                  checked
+                                    ? [...holdsField.state.value, { nodeId: node.id, note: "" }]
+                                    : holdsField.state.value.filter(
+                                        (row) => row.nodeId !== node.id,
+                                      ),
+                                )
+                              }
+                            />
+                            {t("dashboard:profiles.editor.holdLine")}
+                          </label>
+                        ) : null}
+                        {owned && hold ? (
+                          <Input
+                            aria-label={t("dashboard:profiles.editor.holdNote", {
+                              slug: node.slug,
+                            })}
+                            className="min-h-[44px] min-w-0 flex-1"
+                            placeholder={t("dashboard:nodes.hold.notePlaceholder")}
+                            maxLength={500}
+                            value={hold.note}
+                            onChange={(event) =>
+                              holdsField.handleChange(
+                                holdsField.state.value.map((row) =>
+                                  row.nodeId === node.id
+                                    ? { ...row, note: event.target.value }
+                                    : row,
+                                ),
+                              )
+                            }
+                          />
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                  <FieldError errors={nodesField.state.meta.errors} />
+                </div>
+              )}
+            </form.Field>
+          )}
+        </form.Field>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** The runtimes the profile runs, one line each. */
+function ItemsCard({
+  form,
+  profile,
+  nodes,
+  startable,
+  runtimesUnavailable,
+  runtimeLabel,
+}: {
+  form: ProfileForm;
+  profile: ProfileView;
+  nodes: readonly NodeSummary[];
+  startable: readonly StartableRuntime[];
+  runtimesUnavailable: boolean;
+  runtimeLabel: (runtimeId: string) => string;
+}) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  return (
+    <Card className="min-w-0">
+      <CardHeader>
+        <CardTitle className="text-base">{t("dashboard:profiles.editor.itemsTitle")}</CardTitle>
+        <CardDescription>{t("dashboard:profiles.editor.itemsDescription")}</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {runtimesUnavailable ? (
+          <p className="text-sm text-muted-foreground">
+            {t("dashboard:profiles.editor.runtimesUnavailable")}
+          </p>
+        ) : null}
+        <form.Field name="items" mode="array">
+          {(field) => (
+            <div className="space-y-2">
+              {field.state.value.map((row, index) => (
+                <ItemLine
+                  key={row.key}
+                  form={form}
+                  row={row}
+                  index={index}
+                  profile={profile}
+                  nodes={nodes}
+                  startable={startable}
+                  runtimeLabel={runtimeLabel}
+                  onRemove={() => field.removeValue(index)}
+                />
+              ))}
+              <FieldError errors={field.state.meta.errors} />
+              <Button
+                type="button"
+                variant="outline"
+                className="min-h-[44px]"
+                disabled={startable.length === 0}
+                onClick={() =>
+                  field.pushValue({
+                    key: `new-${crypto.randomUUID()}`,
+                    runtimeId: startable[0]?.id ?? "",
+                    versionId: null,
+                    count: "1",
+                    nodeIds: [],
+                  })
+                }
+              >
+                <Plus aria-hidden="true" />
+                {t("dashboard:profiles.editor.addItem")}
+              </Button>
+            </div>
+          )}
+        </form.Field>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** One line: runtime, count, version and the nodes it may run on. */
+function ItemLine({
+  form,
+  row,
+  index,
+  profile,
+  nodes,
+  startable,
+  runtimeLabel,
+  onRemove,
+}: {
+  form: ProfileForm;
+  row: ItemRow;
+  index: number;
+  profile: ProfileView;
+  nodes: readonly NodeSummary[];
+  startable: readonly StartableRuntime[];
+  runtimeLabel: (runtimeId: string) => string;
+  onRemove: () => void;
+}) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  // The saved line this row came from, while it still names the same runtime.
+  const item = profile.items.find(
+    (candidate) => candidate.id === row.key && candidate.runtimeId === row.runtimeId,
+  );
+  return (
+    <div className="flex min-w-0 flex-wrap items-end gap-2 border-b pb-2">
+      <form.Field name={`items[${index}].runtimeId`}>
+        {(sub) => (
+          <div className="min-w-0 flex-1 space-y-1">
+            <Label htmlFor={`item-runtime-${index}`}>
+              {t("dashboard:profiles.editor.runtime")}
+            </Label>
+            <Select
+              value={sub.state.value}
+              onValueChange={(next) => {
+                if (typeof next !== "string") return;
+                sub.handleChange(next);
+                form.setFieldValue(`items[${index}].versionId`, null);
+              }}
+            >
+              <SelectTrigger id={`item-runtime-${index}`} className="min-h-[44px] w-full">
+                <SelectValue>{runtimeLabel(sub.state.value)}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {startable.map((runtime) => (
+                  <SelectItem key={runtime.id} value={runtime.id}>
+                    {runtime.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        )}
+      </form.Field>
+      <form.Field name={`items[${index}].count`}>
+        {(sub) => (
+          <div className="w-24 space-y-1">
+            <Label htmlFor={`item-count-${index}`}>{t("dashboard:profiles.editor.count")}</Label>
+            <Input
+              id={`item-count-${index}`}
+              inputMode="numeric"
+              className="min-h-[44px]"
+              value={sub.state.value}
+              onChange={(event) => sub.handleChange(event.target.value)}
+            />
+            <FieldError errors={sub.state.meta.errors} />
+          </div>
+        )}
+      </form.Field>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-touch"
+        aria-label={t("dashboard:profiles.editor.removeItem")}
+        onClick={onRemove}
+      >
+        <Trash aria-hidden="true" />
+      </Button>
+      <form.Field name={`items[${index}].versionId`}>
+        {(sub) => (
+          <ItemVersionField
+            id={`item-version-${index}`}
+            runtimeId={row.runtimeId}
+            currentVersion={
+              startable.find((runtime) => runtime.id === row.runtimeId)?.currentVersion ?? null
+            }
+            saved={item ?? null}
+            value={sub.state.value}
+            onChange={sub.handleChange}
+          />
+        )}
+      </form.Field>
+      {item ? (
+        <p className="w-full text-xs text-muted-foreground">
+          {t("dashboard:profiles.editor.pinned", { version: item.versionNumber })}
+          {item.pinOutdated ? ` · ${t("dashboard:profiles.pinsOutdated")}` : ""}
+        </p>
+      ) : null}
+      <form.Subscribe selector={(state) => state.values.nodeIds}>
+        {(ownedIds) => (
+          <form.Field name={`items[${index}].nodeIds`}>
+            {(sub) => (
+              <ItemNodesField
+                index={index}
+                owned={ownedNodes(nodes, ownedIds)}
+                value={sub.state.value}
+                onChange={sub.handleChange}
+              />
+            )}
+          </form.Field>
+        )}
+      </form.Subscribe>
+    </div>
+  );
+}
+
+/** Save, update pins, apply and delete, with the hint under them. */
+function ProfileActions({
+  form,
+  profile,
+  runtimesReady,
+  savePending,
+  onUpdatePins,
+  onApply,
+  onDelete,
+}: {
+  form: ProfileForm;
+  profile: ProfileView;
+  runtimesReady: boolean;
+  savePending: boolean;
+  onUpdatePins: () => void;
+  onApply: () => void;
+  onDelete: () => void;
+}) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  return (
+    <>
+      <div className="flex flex-wrap gap-2">
+        <form.Subscribe selector={(state) => [state.canSubmit, state.isSubmitting] as const}>
+          {([canSubmit, isSubmitting]) => (
+            <Button
+              type="submit"
+              className="min-h-[44px]"
+              disabled={!canSubmit || isSubmitting || !runtimesReady}
+            >
+              {t("common:actions.save")}
+            </Button>
+          )}
+        </form.Subscribe>
+        <form.Subscribe selector={(state) => state.isDirty}>
+          {(dirty) => (
+            // Moves every saved line to its runtime's current version; unsaved picks would be
+            // lost, so it waits for a save.
+            <Button
+              type="button"
+              variant="outline"
+              className="min-h-[44px]"
+              disabled={dirty || savePending || !profile.items.some((item) => item.pinOutdated)}
+              title={dirty ? t("dashboard:profiles.editor.saveFirst") : undefined}
+              onClick={onUpdatePins}
+            >
+              {t("dashboard:profiles.editor.updatePins")}
+            </Button>
+          )}
+        </form.Subscribe>
+        <form.Subscribe selector={(state) => state.isDirty}>
+          {(dirty) => (
+            <Button
+              type="button"
+              variant="outline"
+              className="min-h-[44px]"
+              disabled={dirty}
+              title={dirty ? t("dashboard:profiles.editor.saveFirst") : undefined}
+              onClick={onApply}
+            >
+              {t("dashboard:profiles.apply.button")}
+            </Button>
+          )}
+        </form.Subscribe>
+        <Button
+          type="button"
+          variant="ghost"
+          className="min-h-[44px] text-destructive"
+          onClick={onDelete}
+        >
+          {t("common:actions.delete")}
+        </Button>
+      </div>
+      <form.Subscribe selector={(state) => state.isDirty}>
+        {(dirty) => (
+          <p className="text-xs text-muted-foreground">
+            {dirty
+              ? t("dashboard:profiles.editor.saveFirst")
+              : t("dashboard:profiles.editor.applyHint")}
+          </p>
+        )}
+      </form.Subscribe>
+    </>
   );
 }
 

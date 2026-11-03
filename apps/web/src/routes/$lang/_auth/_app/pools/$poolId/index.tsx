@@ -581,58 +581,17 @@ function MemberRow({
   actions: MemberActions;
 }) {
   const { t, i18n } = useTranslation(["dashboard", "common"]);
-  const { lang } = Route.useParams();
   const none = t("dashboard:overview.kpi.none");
   const { live } = member;
   return (
     <tr className="border-b align-middle last:border-b-0">
-      <th scope="row" className="py-2 pr-4 text-left font-normal">
-        <div className="w-48 max-w-72 min-w-0 sm:w-auto">
-          <p className="break-all font-mono text-sm">
-            {member.runtimeId ? (
-              <Link
-                to="/$lang/runtimes/$runtimeId"
-                params={{ lang, runtimeId: member.runtimeId }}
-                className="underline-offset-4 hover:underline"
-              >
-                {memberLabel(member)}
-              </Link>
-            ) : (
-              memberLabel(member)
-            )}
-          </p>
-          <p className="text-xs text-muted-foreground">
-            {member.kind === "CLOUD"
-              ? t("dashboard:pool.cloudMember", { order: (member.cloudOrder ?? 0) + 1 })
-              : member.contributorEmail
-                ? t("dashboard:pool.contributedBy", { email: member.contributorEmail })
-                : t("dashboard:pool.instancesLive", {
-                    running: live.running,
-                    total: live.instances,
-                  })}
-          </p>
-        </div>
-      </th>
+      <MemberNameCell member={member} />
       <td className="py-2 pr-4">
         <StatusPill tone={MEMBER_STATUS_TONE[member.status]}>
           {t(`dashboard:pool.memberStatus.${member.status}`)}
         </StatusPill>
       </td>
-      <td className="py-2 pr-4">
-        {live.share === null ? (
-          <span className="text-xs text-muted-foreground">{t("dashboard:pool.share.none")}</span>
-        ) : (
-          <FillMeter
-            fraction={live.share}
-            label={t("dashboard:pool.share.percent", { percent: Math.round(live.share * 100) })}
-            ariaLabel={t("dashboard:pool.share.aria", {
-              member: memberLabel(member),
-              percent: Math.round(live.share * 100),
-            })}
-            className="w-32"
-          />
-        )}
-      </td>
+      <MemberShareCell member={member} />
       <td className="py-2 pr-4">
         {member.kind === "LOCAL" ? (
           <MemberWeightForm
@@ -645,60 +604,141 @@ function MemberRow({
         )}
       </td>
       <td className="py-2 pr-4">
-        {member.kind === "CLOUD" ? (
-          <span className="text-xs text-muted-foreground">{t("dashboard:pool.slots.none")}</span>
-        ) : member.shareId ? (
-          // The contributor's engine (their other traffic included): its load stays theirs.
-          <span className="text-xs text-muted-foreground">
-            {t("dashboard:pool.slots.contributed")}
-          </span>
-        ) : live.active === null ? (
-          <span className="text-xs text-muted-foreground">
-            {live.slots === null
-              ? t("dashboard:pool.slots.unknown")
-              : t("dashboard:pool.slots.limitOnly", { slots: live.slots })}
-          </span>
-        ) : (
-          <SlotMeter
-            active={live.active}
-            slots={live.slots}
-            waiting={live.waiting ?? 0}
-            // The pool keeps its slots on each ready instance (fewer when pools sharing an
-            // instance keep more than it has: hence "up to").
-            kept={keptSlots * live.running}
-            className="w-60"
-          />
-        )}
+        <MemberSlots member={member} keptSlots={keptSlots} />
       </td>
       <td className="py-2 pr-4 tabular-nums whitespace-nowrap">
         {formatMs(live.p95LatencyMs, i18n.language, none)}
       </td>
-      <td className="py-2">
-        <div className="flex items-center justify-end gap-1">
-          {member.kind === "LOCAL" && !member.shareId ? (
-            <Button
-              variant="outline"
-              size="touch"
-              disabled={actions.pending}
-              onClick={() => actions.toggle(member)}
-            >
-              {member.state === "ACTIVE"
-                ? t("dashboard:pool.disableMember")
-                : t("dashboard:pool.enableMember")}
-            </Button>
-          ) : null}
-          <Button
-            variant="ghost"
-            size="icon-touch"
-            aria-label={t("dashboard:pool.removeMember", { member: memberLabel(member) })}
-            disabled={actions.pending}
-            onClick={() => actions.remove(member)}
-          >
-            <Trash2 aria-hidden="true" />
-          </Button>
-        </div>
-      </td>
+      <MemberActionsCell member={member} actions={actions} />
     </tr>
+  );
+}
+
+function MemberNameCell({ member }: { member: PoolMemberView }) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  const { lang } = Route.useParams();
+  const { live } = member;
+  return (
+    <th scope="row" className="py-2 pr-4 text-left font-normal">
+      <div className="w-48 max-w-72 min-w-0 sm:w-auto">
+        <p className="break-all font-mono text-sm">
+          {member.runtimeId ? (
+            <Link
+              to="/$lang/runtimes/$runtimeId"
+              params={{ lang, runtimeId: member.runtimeId }}
+              className="underline-offset-4 hover:underline"
+            >
+              {memberLabel(member)}
+            </Link>
+          ) : (
+            memberLabel(member)
+          )}
+        </p>
+        <p className="text-xs text-muted-foreground">
+          {member.kind === "CLOUD"
+            ? t("dashboard:pool.cloudMember", { order: (member.cloudOrder ?? 0) + 1 })
+            : member.contributorEmail
+              ? t("dashboard:pool.contributedBy", { email: member.contributorEmail })
+              : t("dashboard:pool.instancesLive", {
+                  running: live.running,
+                  total: live.instances,
+                })}
+        </p>
+      </div>
+    </th>
+  );
+}
+
+function MemberShareCell({ member }: { member: PoolMemberView }) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  const { share } = member.live;
+  return (
+    <td className="py-2 pr-4">
+      {share === null ? (
+        <span className="text-xs text-muted-foreground">{t("dashboard:pool.share.none")}</span>
+      ) : (
+        <FillMeter
+          fraction={share}
+          label={t("dashboard:pool.share.percent", { percent: Math.round(share * 100) })}
+          ariaLabel={t("dashboard:pool.share.aria", {
+            member: memberLabel(member),
+            percent: Math.round(share * 100),
+          })}
+          className="w-32"
+        />
+      )}
+    </td>
+  );
+}
+
+function MemberSlots({ member, keptSlots }: { member: PoolMemberView; keptSlots: number }) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  const { live } = member;
+  if (member.kind === "CLOUD") {
+    return <span className="text-xs text-muted-foreground">{t("dashboard:pool.slots.none")}</span>;
+  }
+  if (member.shareId) {
+    // The contributor's engine (their other traffic included): its load stays theirs.
+    return (
+      <span className="text-xs text-muted-foreground">{t("dashboard:pool.slots.contributed")}</span>
+    );
+  }
+  if (live.active === null) {
+    return (
+      <span className="text-xs text-muted-foreground">
+        {live.slots === null
+          ? t("dashboard:pool.slots.unknown")
+          : t("dashboard:pool.slots.limitOnly", { slots: live.slots })}
+      </span>
+    );
+  }
+  return (
+    <SlotMeter
+      active={live.active}
+      slots={live.slots}
+      waiting={live.waiting ?? 0}
+      // The pool keeps its slots on each ready instance (fewer when pools sharing an
+      // instance keep more than it has: hence "up to").
+      kept={keptSlots * live.running}
+      className="w-60"
+    />
+  );
+}
+
+function MemberActionsCell({
+  member,
+  actions,
+}: {
+  member: PoolMemberView;
+  actions: MemberActions;
+}) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  return (
+    <td className="py-2">
+      <div className="flex items-center justify-end gap-1">
+        {member.kind === "LOCAL" && !member.shareId ? (
+          <Button
+            variant="outline"
+            size="touch"
+            disabled={actions.pending}
+            onClick={() => actions.toggle(member)}
+          >
+            {member.state === "ACTIVE"
+              ? t("dashboard:pool.disableMember")
+              : t("dashboard:pool.enableMember")}
+          </Button>
+        ) : null}
+        <Button
+          variant="ghost"
+          size="icon-touch"
+          aria-label={t("dashboard:pool.removeMember", { member: memberLabel(member) })}
+          disabled={actions.pending}
+          onClick={() => actions.remove(member)}
+        >
+          <Trash2 aria-hidden="true" />
+        </Button>
+      </div>
+    </td>
   );
 }
 

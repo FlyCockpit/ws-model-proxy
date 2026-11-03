@@ -1,13 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@ws-model-proxy/ui/components/card";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
@@ -17,6 +10,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
+import { AuthCard } from "@/components/auth/auth-card";
 import { authClient } from "@/lib/auth-client";
 import { stripResetTokenFromAddressBar } from "@/lib/reset-password-search";
 import { friendly, isRateLimit } from "@/utils/friendly-error";
@@ -214,27 +208,5 @@ function ResetPasswordForm({
         )}
       </form.Subscribe>
     </form>
-  );
-}
-
-function AuthCard({
-  title,
-  description,
-  children,
-}: {
-  title: string;
-  description: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex min-h-[80vh] items-center justify-center px-4">
-      <Card className="w-full max-w-md">
-        <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{title}</CardTitle>
-          <CardDescription>{description}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">{children}</CardContent>
-      </Card>
-    </div>
   );
 }

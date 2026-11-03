@@ -764,6 +764,106 @@ function groupSizeOf(value: string): number {
   return Number.isInteger(size) && size >= 1 && size <= 64 ? size : 1;
 }
 
+/** The path of one resource draft: a rank's entry, or a reservation's resource. */
+type ResourcePath = `draft.resources[${number}]` | `draft.reservations[${number}].resource`;
+
+/**
+ * One resource's inputs (its kind and what that kind holds), for rank resources and
+ * reservations. `idPrefix` names the inputs (`resource-0`, `reservation-1`).
+ */
+function ResourceFields({
+  group,
+  id,
+  path,
+  idPrefix,
+  kind,
+}: {
+  group: Group;
+  id: (name: string) => string;
+  path: ResourcePath;
+  idPrefix: string;
+  kind: ResourceKind;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <>
+      <group.Field name={`${path}.kind`}>
+        {(field) => (
+          <div className="min-w-0 space-y-1.5">
+            <Label htmlFor={id(`${idPrefix}-kind`)}>
+              {t("dashboard:runtime.specForm.resourceKind")}
+            </Label>
+            <NativeSelect
+              id={id(`${idPrefix}-kind`)}
+              value={field.state.value}
+              onChange={(event) => field.handleChange(event.target.value as ResourceKind)}
+            >
+              {RESOURCE_KINDS.map((option) => (
+                <option key={option} value={option}>
+                  {t(`dashboard:runtime.specForm.resourceKinds.${option}`)}
+                </option>
+              ))}
+            </NativeSelect>
+            <FieldErrors field={field} />
+          </div>
+        )}
+      </group.Field>
+      {kind === "unified" ? (
+        <group.Field name={`${path}.memoryGb`}>
+          {(field) => (
+            <TextInput
+              id={id(`${idPrefix}-memory`)}
+              label={t("dashboard:runtime.specForm.memoryGb")}
+              field={field}
+              inputMode="decimal"
+            />
+          )}
+        </group.Field>
+      ) : null}
+      {kind === "discrete" ? (
+        <>
+          <group.Field name={`${path}.gpuCount`}>
+            {(field) => (
+              <TextInput
+                id={id(`${idPrefix}-gpus`)}
+                label={t("dashboard:runtime.specForm.gpuCount")}
+                field={field}
+                inputMode="numeric"
+              />
+            )}
+          </group.Field>
+          <group.Field name={`${path}.vramGb`}>
+            {(field) => (
+              <TextInput
+                id={id(`${idPrefix}-vram`)}
+                label={t("dashboard:runtime.specForm.vramGb")}
+                field={field}
+                inputMode="decimal"
+              />
+            )}
+          </group.Field>
+          <group.Field name={`${path}.vendor`}>
+            {(field) => <GpuVendorField id={id(`${idPrefix}-vendor`)} field={field} />}
+          </group.Field>
+        </>
+      ) : null}
+      {kind === "cpu" || kind === "discrete" ? (
+        <group.Field name={`${path}.ramGb`}>
+          {(field) => (
+            <TextInput
+              id={id(`${idPrefix}-ram`)}
+              label={t("dashboard:runtime.specForm.ramGb")}
+              hint={kind === "discrete" ? t("dashboard:runtime.specForm.optional") : undefined}
+              field={field}
+              inputMode="decimal"
+            />
+          )}
+        </group.Field>
+      ) : null}
+    </>
+  );
+}
+
 function ResourcesSection({ group, id }: { group: Group; id: (name: string) => string }) {
   const { t } = useTranslation(["dashboard"]);
   // Rows are ranks (row i is rank i), never removed one by one: the keys stay positional.
@@ -783,87 +883,13 @@ function ResourcesSection({ group, id }: { group: Group; id: (name: string) => s
               >
                 <RankTitle index={index} total={resources.state.value.length} />
                 <div className="grid min-w-0 gap-3 sm:grid-cols-2">
-                  <group.Field name={`draft.resources[${index}].kind`}>
-                    {(field) => (
-                      <div className="min-w-0 space-y-1.5">
-                        <Label htmlFor={id(`resource-${index}-kind`)}>
-                          {t("dashboard:runtime.specForm.resourceKind")}
-                        </Label>
-                        <NativeSelect
-                          id={id(`resource-${index}-kind`)}
-                          value={field.state.value}
-                          onChange={(event) =>
-                            field.handleChange(event.target.value as ResourceKind)
-                          }
-                        >
-                          {RESOURCE_KINDS.map((kind) => (
-                            <option key={kind} value={kind}>
-                              {t(`dashboard:runtime.specForm.resourceKinds.${kind}`)}
-                            </option>
-                          ))}
-                        </NativeSelect>
-                        <FieldErrors field={field} />
-                      </div>
-                    )}
-                  </group.Field>
-                  {resource.kind === "unified" ? (
-                    <group.Field name={`draft.resources[${index}].memoryGb`}>
-                      {(field) => (
-                        <TextInput
-                          id={id(`resource-${index}-memory`)}
-                          label={t("dashboard:runtime.specForm.memoryGb")}
-                          field={field}
-                          inputMode="decimal"
-                        />
-                      )}
-                    </group.Field>
-                  ) : null}
-                  {resource.kind === "discrete" ? (
-                    <>
-                      <group.Field name={`draft.resources[${index}].gpuCount`}>
-                        {(field) => (
-                          <TextInput
-                            id={id(`resource-${index}-gpus`)}
-                            label={t("dashboard:runtime.specForm.gpuCount")}
-                            field={field}
-                            inputMode="numeric"
-                          />
-                        )}
-                      </group.Field>
-                      <group.Field name={`draft.resources[${index}].vramGb`}>
-                        {(field) => (
-                          <TextInput
-                            id={id(`resource-${index}-vram`)}
-                            label={t("dashboard:runtime.specForm.vramGb")}
-                            field={field}
-                            inputMode="decimal"
-                          />
-                        )}
-                      </group.Field>
-                      <group.Field name={`draft.resources[${index}].vendor`}>
-                        {(field) => (
-                          <GpuVendorField id={id(`resource-${index}-vendor`)} field={field} />
-                        )}
-                      </group.Field>
-                    </>
-                  ) : null}
-                  {resource.kind === "cpu" || resource.kind === "discrete" ? (
-                    <group.Field name={`draft.resources[${index}].ramGb`}>
-                      {(field) => (
-                        <TextInput
-                          id={id(`resource-${index}-ram`)}
-                          label={t("dashboard:runtime.specForm.ramGb")}
-                          hint={
-                            resource.kind === "discrete"
-                              ? t("dashboard:runtime.specForm.optional")
-                              : undefined
-                          }
-                          field={field}
-                          inputMode="decimal"
-                        />
-                      )}
-                    </group.Field>
-                  ) : null}
+                  <ResourceFields
+                    group={group}
+                    id={id}
+                    path={`draft.resources[${index}]`}
+                    idPrefix={`resource-${index}`}
+                    kind={resource.kind}
+                  />
                 </div>
               </div>
             ))}
@@ -939,88 +965,13 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
                       />
                     )}
                   </group.Field>
-                  <group.Field name={`draft.reservations[${index}].resource.kind`}>
-                    {(field) => (
-                      <div className="min-w-0 space-y-1.5">
-                        <Label htmlFor={id(`reservation-${index}-kind`)}>
-                          {t("dashboard:runtime.specForm.resourceKind")}
-                        </Label>
-                        <NativeSelect
-                          id={id(`reservation-${index}-kind`)}
-                          value={field.state.value}
-                          onChange={(event) =>
-                            field.handleChange(event.target.value as ResourceKind)
-                          }
-                        >
-                          {RESOURCE_KINDS.map((kind) => (
-                            <option key={kind} value={kind}>
-                              {t(`dashboard:runtime.specForm.resourceKinds.${kind}`)}
-                            </option>
-                          ))}
-                        </NativeSelect>
-                        <FieldErrors field={field} />
-                      </div>
-                    )}
-                  </group.Field>
-                  {reservation.resource.kind === "unified" ? (
-                    <group.Field name={`draft.reservations[${index}].resource.memoryGb`}>
-                      {(field) => (
-                        <TextInput
-                          id={id(`reservation-${index}-memory`)}
-                          label={t("dashboard:runtime.specForm.memoryGb")}
-                          field={field}
-                          inputMode="decimal"
-                        />
-                      )}
-                    </group.Field>
-                  ) : null}
-                  {reservation.resource.kind === "discrete" ? (
-                    <>
-                      <group.Field name={`draft.reservations[${index}].resource.gpuCount`}>
-                        {(field) => (
-                          <TextInput
-                            id={id(`reservation-${index}-gpus`)}
-                            label={t("dashboard:runtime.specForm.gpuCount")}
-                            field={field}
-                            inputMode="numeric"
-                          />
-                        )}
-                      </group.Field>
-                      <group.Field name={`draft.reservations[${index}].resource.vramGb`}>
-                        {(field) => (
-                          <TextInput
-                            id={id(`reservation-${index}-vram`)}
-                            label={t("dashboard:runtime.specForm.vramGb")}
-                            field={field}
-                            inputMode="decimal"
-                          />
-                        )}
-                      </group.Field>
-                      <group.Field name={`draft.reservations[${index}].resource.vendor`}>
-                        {(field) => (
-                          <GpuVendorField id={id(`reservation-${index}-vendor`)} field={field} />
-                        )}
-                      </group.Field>
-                    </>
-                  ) : null}
-                  {reservation.resource.kind === "cpu" ||
-                  reservation.resource.kind === "discrete" ? (
-                    <group.Field name={`draft.reservations[${index}].resource.ramGb`}>
-                      {(field) => (
-                        <TextInput
-                          id={id(`reservation-${index}-ram`)}
-                          label={t("dashboard:runtime.specForm.ramGb")}
-                          hint={
-                            reservation.resource.kind === "discrete"
-                              ? t("dashboard:runtime.specForm.optional")
-                              : undefined
-                          }
-                          field={field}
-                          inputMode="decimal"
-                        />
-                      )}
-                    </group.Field>
-                  ) : null}
+                  <ResourceFields
+                    group={group}
+                    id={id}
+                    path={`draft.reservations[${index}].resource`}
+                    idPrefix={`reservation-${index}`}
+                    kind={reservation.resource.kind}
+                  />
                 </div>
               </div>
             ))}

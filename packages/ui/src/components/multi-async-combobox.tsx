@@ -1,3 +1,4 @@
+import { AsyncSearchInput } from "@ws-model-proxy/ui/components/async-search-input";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Command,
@@ -6,12 +7,10 @@ import {
   CommandItem,
   CommandList,
 } from "@ws-model-proxy/ui/components/command";
-import { InputGroup, InputGroupAddon } from "@ws-model-proxy/ui/components/input-group";
 import { Popover, PopoverContent, PopoverTrigger } from "@ws-model-proxy/ui/components/popover";
 import { useAsyncSearch } from "@ws-model-proxy/ui/hooks/use-async-search";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Command as CommandPrimitive } from "cmdk";
-import { CheckIcon, ChevronsUpDownIcon, LoaderIcon, SearchIcon, XIcon } from "lucide-react";
+import { CheckIcon, ChevronsUpDownIcon, XIcon } from "lucide-react";
 import * as React from "react";
 
 interface MultiAsyncComboboxProps<T> {
@@ -150,24 +149,12 @@ function MultiAsyncCombobox<T>({
       </PopoverTrigger>
       <PopoverContent className="w-[var(--anchor-width)] p-0" align="start">
         <Command shouldFilter={false}>
-          <div data-slot="command-input-wrapper" className="border-b pb-0">
-            <InputGroup className="h-8 border-none border-input/30 bg-input/30 shadow-none! *:data-[slot=input-group-addon]:pl-2!">
-              <CommandPrimitive.Input
-                data-slot="command-input"
-                className="w-full text-xs outline-hidden disabled:cursor-not-allowed disabled:opacity-50"
-                placeholder={searchPlaceholder}
-                value={query}
-                onValueChange={setQuery}
-              />
-              <InputGroupAddon>
-                {isLoading ? (
-                  <LoaderIcon className="size-4 shrink-0 animate-spin opacity-50" />
-                ) : (
-                  <SearchIcon className="size-4 shrink-0 opacity-50" />
-                )}
-              </InputGroupAddon>
-            </InputGroup>
-          </div>
+          <AsyncSearchInput
+            placeholder={searchPlaceholder}
+            value={query}
+            onValueChange={setQuery}
+            isLoading={isLoading}
+          />
           <CommandList>
             {!isLoading && results.length === 0 && <CommandEmpty>{emptyText}</CommandEmpty>}
             {results.length > 0 && (

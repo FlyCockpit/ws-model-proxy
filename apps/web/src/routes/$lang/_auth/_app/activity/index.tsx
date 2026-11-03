@@ -1,4 +1,4 @@
-import { skipToken, useQuery } from "@tanstack/react-query";
+import { skipToken, type UseQueryResult, useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import {
   type GroupBy,
@@ -7,6 +7,7 @@ import {
   type MetricScope,
   metricFamily,
 } from "@ws-model-proxy/api/contracts/metrics";
+import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Card, CardContent } from "@ws-model-proxy/ui/components/card";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Switch } from "@ws-model-proxy/ui/components/switch";
@@ -71,47 +72,12 @@ function ActivityMetricsPage() {
     });
 
   const scope: MetricScope = search.scope ?? "pool";
-  const metricWanted: Metric = search.metric ?? "requests";
   const targets = useScopeTargets(scope, search.runtime);
-  // Wait for the scope's list: it says whether a pool is shared (request metrics only) and
-  // whether a linked target still exists. Instances drop off the list once stopped, so a linked
-  // instance is kept; a pool, runtime, version or node that is gone falls back to the first.
-  const targetId =
-    targets.items === undefined
-      ? undefined
-      : search.id && (scope === "instance" || targets.items.some((item) => item.id === search.id))
-        ? search.id
-        : targets.items[0]?.id;
-  const sharedPool = scope === "pool" && targetId !== undefined && targets.shared.has(targetId);
-  // A pool shared with you has request metrics only.
-  const metric: Metric =
-    sharedPool && metricFamily(metricWanted) !== "request" ? "requests" : metricWanted;
-  const family = metricFamily(metric);
-  const ranges = rangesFor(metric);
-  const range: MetricRange =
-    search.range && ranges.includes(search.range)
-      ? search.range
-      : ranges.includes("24h")
-        ? "24h"
-        : (ranges[0] ?? "1h");
-  const steps = stepsFor(range, metric);
-  const step: MetricStep =
-    search.step && steps.includes(search.step) ? search.step : defaultStep(range, metric);
-  const groupOptions = groupByOptions(scope, metric, sharedPool);
-  const groupBy: GroupBy | undefined =
-    search.groupBy && groupOptions.includes(search.groupBy) ? search.groupBy : undefined;
-  const includeTests = family === "request" && search.tests === true;
-  const view: MetricsView = search.view ?? "chart";
+  const selection = resolveSelection(search, scope, targets);
+  const { metric, step, range, groupBy } = selection;
 
   const totalsMetrics = summaryMetrics(metric);
-  const base = targetId
-    ? {
-        scope: scopeInput(scope, targetId),
-        range,
-        step,
-        includeTests,
-      }
-    : null;
+  const base = metricsBase(selection);
   // Ungrouped, the totals query also carries the chart's series (one request).
   const totals = useQuery({
     ...orpc.activity.metrics.query.queryOptions({
@@ -122,11 +88,7 @@ function ActivityMetricsPage() {
   });
   const series = useQuery({
     ...orpc.activity.metrics.query.queryOptions({
-      input: base
-        ? groupBy
-          ? { ...base, metrics: [metric], groupBy }
-          : { ...base, metrics: totalsMetrics }
-        : skipToken,
+      input: seriesInput(base, metric, groupBy, totalsMetrics),
     }),
     meta: { skipGlobalErrorToast: true },
   });
@@ -155,168 +117,400 @@ function ActivityMetricsPage() {
         <RequestLogLink lang={lang} />
       </div>
 
-      <Card>
-        <CardContent className="flex min-w-0 flex-col gap-4">
-          <Field label={t("activity:metrics.scope")}>
+      <MetricsControls selection={selection} targets={targets} onUpdate={update} />
+
+      <MetricsResults
+        lang={lang}
+        selection={selection}
+        targets={targets}
+        totals={totals}
+        series={series}
+        loaded={{
+          totalsMetrics,
+          columns,
+          rows,
+          hasData,
+          tests,
+          title: metricLabel(metric),
+        }}
+        onUpdate={update}
+      />
+    </div>
+  );
+}
+
+type UpdateSearch = (patch: Partial<ActivityMetricsSearch>) => void;
+
+type Targets = ReturnType<typeof useScopeTargets>;
+
+type MetricsAnswer = Awaited<ReturnType<AppRouterClient["activity"]["metrics"]["query"]>>;
+
+type MetricsQuery = UseQueryResult<MetricsAnswer, Error>;
+
+/** What the URL asks for, narrowed to what the scope's target and metric allow. */
+type MetricsSelection = {
+  scope: MetricScope;
+  targetId: string | undefined;
+  sharedPool: boolean;
+  metric: Metric;
+  family: ReturnType<typeof metricFamily>;
+  ranges: MetricRange[];
+  range: MetricRange;
+  steps: MetricStep[];
+  step: MetricStep;
+  groupOptions: GroupBy[];
+  groupBy: GroupBy | undefined;
+  includeTests: boolean;
+  view: MetricsView;
+};
+
+/**
+ * Wait for the scope's list: it says whether a pool is shared (request metrics only) and
+ * whether a linked target still exists. Instances drop off the list once stopped, so a linked
+ * instance is kept; a pool, runtime, version or node that is gone falls back to the first.
+ */
+function resolveTargetId(
+  scope: MetricScope,
+  wanted: string | undefined,
+  items: Target[] | undefined,
+): string | undefined {
+  if (items === undefined) return undefined;
+  return wanted && (scope === "instance" || items.some((item) => item.id === wanted))
+    ? wanted
+    : items[0]?.id;
+}
+
+function resolveRange(wanted: MetricRange | undefined, ranges: MetricRange[]): MetricRange {
+  if (wanted && ranges.includes(wanted)) return wanted;
+  return ranges.includes("24h") ? "24h" : (ranges[0] ?? "1h");
+}
+
+function resolveSelection(
+  search: ActivityMetricsSearch,
+  scope: MetricScope,
+  targets: Targets,
+): MetricsSelection {
+  const metricWanted: Metric = search.metric ?? "requests";
+  const targetId = resolveTargetId(scope, search.id, targets.items);
+  const sharedPool = scope === "pool" && targetId !== undefined && targets.shared.has(targetId);
+  // A pool shared with you has request metrics only.
+  const metric: Metric =
+    sharedPool && metricFamily(metricWanted) !== "request" ? "requests" : metricWanted;
+  const family = metricFamily(metric);
+  const ranges = rangesFor(metric);
+  const range = resolveRange(search.range, ranges);
+  const steps = stepsFor(range, metric);
+  const step: MetricStep =
+    search.step && steps.includes(search.step) ? search.step : defaultStep(range, metric);
+  const groupOptions = groupByOptions(scope, metric, sharedPool);
+  const groupBy: GroupBy | undefined =
+    search.groupBy && groupOptions.includes(search.groupBy) ? search.groupBy : undefined;
+  return {
+    scope,
+    targetId,
+    sharedPool,
+    metric,
+    family,
+    ranges,
+    range,
+    steps,
+    step,
+    groupOptions,
+    groupBy,
+    includeTests: family === "request" && search.tests === true,
+    view: search.view ?? "chart",
+  };
+}
+
+function metricsBase(selection: MetricsSelection) {
+  const { scope, targetId, range, step, includeTests } = selection;
+  return targetId
+    ? {
+        scope: scopeInput(scope, targetId),
+        range,
+        step,
+        includeTests,
+      }
+    : null;
+}
+
+function seriesInput(
+  base: ReturnType<typeof metricsBase>,
+  metric: Metric,
+  groupBy: GroupBy | undefined,
+  totalsMetrics: Metric[],
+) {
+  if (!base) return skipToken;
+  return groupBy ? { ...base, metrics: [metric], groupBy } : { ...base, metrics: totalsMetrics };
+}
+
+function isRuntimeChildScope(scope: MetricScope): boolean {
+  return scope === "version" || scope === "instance";
+}
+
+function MetricsControls({
+  selection,
+  targets,
+  onUpdate: update,
+}: {
+  selection: MetricsSelection;
+  targets: Targets;
+  onUpdate: UpdateSearch;
+}) {
+  const { t } = useTranslation(["activity"]);
+  const { scope, targetId, metric, sharedPool, groupBy, groupOptions, ranges, range, steps, step } =
+    selection;
+  return (
+    <Card>
+      <CardContent className="flex min-w-0 flex-col gap-4">
+        <Field label={t("activity:metrics.scope")}>
+          <SegmentedControl
+            value={scope}
+            onChange={(next) =>
+              update({ scope: next, id: undefined, runtime: undefined, groupBy: undefined })
+            }
+            ariaLabel={t("activity:metrics.scope")}
+            items={METRIC_SCOPES.map((value) => ({
+              value,
+              label: t(`activity:metrics.scopeValue.${value}`),
+            }))}
+          />
+        </Field>
+        <div className="grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {isRuntimeChildScope(scope) ? (
+            <TargetSelect
+              label={t("activity:metrics.runtimeOf")}
+              items={targets.runtimes}
+              value={targets.runtimeId}
+              loading={targets.runtimesLoading}
+              failed={targets.runtimesFailed}
+              empty={t("activity:metrics.noTargets.runtime")}
+              onChange={(runtime) => update({ runtime, id: undefined })}
+            />
+          ) : null}
+          <TargetSelect
+            label={t(`activity:metrics.scopeValue.${scope}`)}
+            items={targets.items}
+            value={targetId}
+            loading={targets.loading}
+            failed={targets.failed}
+            empty={t(`activity:metrics.noTargets.${scope}`)}
+            onChange={(id) => update({ id })}
+          />
+          <MetricSelect
+            value={metric}
+            sharedPool={sharedPool}
+            onChange={(next) => update({ metric: next })}
+          />
+          <GroupBySelect
+            value={groupBy}
+            options={groupOptions}
+            onChange={(next) => update({ groupBy: next })}
+          />
+        </div>
+        <div className="flex min-w-0 flex-wrap gap-4">
+          <Field label={t("activity:metrics.range")}>
             <SegmentedControl
-              value={scope}
-              onChange={(next) =>
-                update({ scope: next, id: undefined, runtime: undefined, groupBy: undefined })
-              }
-              ariaLabel={t("activity:metrics.scope")}
-              items={METRIC_SCOPES.map((value) => ({
+              value={range}
+              onChange={(next) => update({ range: next, step: undefined })}
+              ariaLabel={t("activity:metrics.range")}
+              items={ranges.map((value) => ({
                 value,
-                label: t(`activity:metrics.scopeValue.${value}`),
+                label: t(`activity:metrics.rangeValue.${value}`),
               }))}
             />
           </Field>
-          <div className="grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {scope === "version" || scope === "instance" ? (
-              <TargetSelect
-                label={t("activity:metrics.runtimeOf")}
-                items={targets.runtimes}
-                value={targets.runtimeId}
-                loading={targets.runtimesLoading}
-                failed={targets.runtimesFailed}
-                empty={t("activity:metrics.noTargets.runtime")}
-                onChange={(runtime) => update({ runtime, id: undefined })}
-              />
-            ) : null}
-            <TargetSelect
-              label={t(`activity:metrics.scopeValue.${scope}`)}
-              items={targets.items}
-              value={targetId}
-              loading={targets.loading}
-              failed={targets.failed}
-              empty={t(`activity:metrics.noTargets.${scope}`)}
-              onChange={(id) => update({ id })}
+          <Field label={t("activity:metrics.step")}>
+            <SegmentedControl
+              value={step}
+              onChange={(next) => update({ step: next })}
+              ariaLabel={t("activity:metrics.step")}
+              items={steps.map((value) => ({
+                value,
+                label: t(`activity:metrics.stepValue.${value}`),
+              }))}
             />
-            <MetricSelect
-              value={metric}
-              sharedPool={sharedPool}
-              onChange={(next) => update({ metric: next })}
-            />
-            <GroupBySelect
-              value={groupBy}
-              options={groupOptions}
-              onChange={(next) => update({ groupBy: next })}
-            />
-          </div>
-          <div className="flex min-w-0 flex-wrap gap-4">
-            <Field label={t("activity:metrics.range")}>
-              <SegmentedControl
-                value={range}
-                onChange={(next) => update({ range: next, step: undefined })}
-                ariaLabel={t("activity:metrics.range")}
-                items={ranges.map((value) => ({
-                  value,
-                  label: t(`activity:metrics.rangeValue.${value}`),
-                }))}
-              />
-            </Field>
-            <Field label={t("activity:metrics.step")}>
-              <SegmentedControl
-                value={step}
-                onChange={(next) => update({ step: next })}
-                ariaLabel={t("activity:metrics.step")}
-                items={steps.map((value) => ({
-                  value,
-                  label: t(`activity:metrics.stepValue.${value}`),
-                }))}
-              />
-            </Field>
-          </div>
-          <div className="flex min-w-0 flex-wrap gap-x-6 gap-y-1">
-            {scope === "runtime" && groupOptions.includes("version") ? (
-              <SwitchRow
-                label={t("activity:metrics.compareVersions")}
-                checked={groupBy === "version"}
-                onChange={(checked) => update({ groupBy: checked ? "version" : undefined })}
-              />
-            ) : null}
-            {family === "request" ? (
-              <SwitchRow
-                label={t("activity:metrics.includeTests")}
-                checked={includeTests}
-                onChange={(checked) => update({ tests: checked || undefined })}
-              />
-            ) : null}
-          </div>
-          {sharedPool ? (
-            <p className="text-xs text-muted-foreground">{t("activity:metrics.sharedPool")}</p>
-          ) : null}
-        </CardContent>
-      </Card>
+          </Field>
+        </div>
+        <MetricsSwitches selection={selection} onUpdate={update} />
+        {sharedPool ? (
+          <p className="text-xs text-muted-foreground">{t("activity:metrics.sharedPool")}</p>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
 
-      {!targetId ? (
-        targets.loading ? (
-          <ResultsSkeleton />
-        ) : targets.failed ? (
-          <InlineRetry message={t("activity:metrics.targetsFailed")} onRetry={targets.retry} />
-        ) : (
-          <EmptyCard
-            lang={lang}
-            message={t(
-              (scope === "version" || scope === "instance") && targets.runtimes?.length === 0
-                ? "activity:metrics.noTargets.runtime"
-                : `activity:metrics.noTargets.${scope}`,
-            )}
-          />
-        )
-      ) : totals.isPending || series.isPending ? (
-        <ResultsSkeleton />
-      ) : series.isError || totals.isError ? (
-        <InlineRetry
-          message={t("activity:metrics.loadFailed")}
-          onRetry={() => {
-            void totals.refetch();
-            void series.refetch();
-          }}
+function MetricsSwitches({
+  selection,
+  onUpdate: update,
+}: {
+  selection: MetricsSelection;
+  onUpdate: UpdateSearch;
+}) {
+  const { t } = useTranslation(["activity"]);
+  const { scope, groupOptions, groupBy, family, includeTests } = selection;
+  return (
+    <div className="flex min-w-0 flex-wrap gap-x-6 gap-y-1">
+      {scope === "runtime" && groupOptions.includes("version") ? (
+        <SwitchRow
+          label={t("activity:metrics.compareVersions")}
+          checked={groupBy === "version"}
+          onChange={(checked) => update({ groupBy: checked ? "version" : undefined })}
         />
-      ) : (
-        <>
-          <section className="flex min-w-0 flex-col gap-2" aria-labelledby="metrics-totals">
-            <h2 id="metrics-totals" className="text-base font-semibold">
-              {t("activity:metrics.totals")}
-            </h2>
-            <MetricsTotals metrics={totalsMetrics} totals={totals.data.totals} />
-            {tests > 0 && !includeTests ? (
-              <p className="text-xs text-muted-foreground">
-                {t("activity:metrics.testsLeftOut", { count: tests })}
-              </p>
-            ) : null}
-          </section>
-          {hasData ? (
-            <Card>
-              <CardContent className="flex min-w-0 flex-col gap-3">
-                <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-                  <h2 className="text-base font-semibold">{metricLabel(metric)}</h2>
-                  <SegmentedControl
-                    value={view}
-                    onChange={(next) => update({ view: next === "chart" ? undefined : next })}
-                    ariaLabel={t("activity:metrics.view")}
-                    items={[
-                      { value: "chart", label: t("activity:metrics.viewValue.chart") },
-                      { value: "table", label: t("activity:metrics.viewValue.table") },
-                    ]}
-                  />
-                </div>
-                {series.data.truncated ? (
-                  <p className="text-xs text-muted-foreground">{t("activity:metrics.truncated")}</p>
-                ) : null}
-                {view === "table" ? (
-                  <MetricsTable rows={rows} columns={columns} metric={metric} step={step} />
-                ) : (
-                  <MetricsChart rows={rows} columns={columns} metric={metric} step={step} />
-                )}
-              </CardContent>
-            </Card>
-          ) : (
-            <EmptyCard lang={lang} message={t("activity:metrics.empty")} />
-          )}
-        </>
-      )}
+      ) : null}
+      {family === "request" ? (
+        <SwitchRow
+          label={t("activity:metrics.includeTests")}
+          checked={includeTests}
+          onChange={(checked) => update({ tests: checked || undefined })}
+        />
+      ) : null}
     </div>
+  );
+}
+
+/** What the loaded results show, worked out by the page from the two queries. */
+type LoadedResults = {
+  totalsMetrics: Metric[];
+  columns: MetricsColumn[];
+  rows: ReturnType<typeof chartRows>;
+  hasData: boolean;
+  tests: number;
+  title: string;
+};
+
+function MetricsResults({
+  lang,
+  selection,
+  targets,
+  totals,
+  series,
+  loaded,
+  onUpdate: update,
+}: {
+  lang: string;
+  selection: MetricsSelection;
+  targets: Targets;
+  totals: MetricsQuery;
+  series: MetricsQuery;
+  loaded: LoadedResults;
+  onUpdate: UpdateSearch;
+}) {
+  const { t } = useTranslation(["activity"]);
+  if (!selection.targetId) {
+    return <NoTargetResults lang={lang} scope={selection.scope} targets={targets} />;
+  }
+  if (totals.isPending || series.isPending) return <ResultsSkeleton />;
+  if (series.isError || totals.isError) {
+    return (
+      <InlineRetry
+        message={t("activity:metrics.loadFailed")}
+        onRetry={() => {
+          void totals.refetch();
+          void series.refetch();
+        }}
+      />
+    );
+  }
+  return (
+    <MetricsLoaded
+      lang={lang}
+      selection={selection}
+      totals={totals.data.totals}
+      truncated={series.data.truncated}
+      loaded={loaded}
+      onUpdate={update}
+    />
+  );
+}
+
+function NoTargetResults({
+  lang,
+  scope,
+  targets,
+}: {
+  lang: string;
+  scope: MetricScope;
+  targets: Targets;
+}) {
+  const { t } = useTranslation(["activity"]);
+  if (targets.loading) return <ResultsSkeleton />;
+  if (targets.failed) {
+    return <InlineRetry message={t("activity:metrics.targetsFailed")} onRetry={targets.retry} />;
+  }
+  return (
+    <EmptyCard
+      lang={lang}
+      message={t(
+        isRuntimeChildScope(scope) && targets.runtimes?.length === 0
+          ? "activity:metrics.noTargets.runtime"
+          : `activity:metrics.noTargets.${scope}`,
+      )}
+    />
+  );
+}
+
+function MetricsLoaded({
+  lang,
+  selection,
+  totals,
+  truncated,
+  loaded,
+  onUpdate: update,
+}: {
+  lang: string;
+  selection: MetricsSelection;
+  totals: MetricsAnswer["totals"];
+  truncated: MetricsAnswer["truncated"];
+  loaded: LoadedResults;
+  onUpdate: UpdateSearch;
+}) {
+  const { t } = useTranslation(["activity"]);
+  const { metric, step, view, includeTests } = selection;
+  const { totalsMetrics, columns, rows, hasData, tests, title } = loaded;
+  return (
+    <>
+      <section className="flex min-w-0 flex-col gap-2" aria-labelledby="metrics-totals">
+        <h2 id="metrics-totals" className="text-base font-semibold">
+          {t("activity:metrics.totals")}
+        </h2>
+        <MetricsTotals metrics={totalsMetrics} totals={totals} />
+        {tests > 0 && !includeTests ? (
+          <p className="text-xs text-muted-foreground">
+            {t("activity:metrics.testsLeftOut", { count: tests })}
+          </p>
+        ) : null}
+      </section>
+      {hasData ? (
+        <Card>
+          <CardContent className="flex min-w-0 flex-col gap-3">
+            <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+              <h2 className="text-base font-semibold">{title}</h2>
+              <SegmentedControl
+                value={view}
+                onChange={(next) => update({ view: next === "chart" ? undefined : next })}
+                ariaLabel={t("activity:metrics.view")}
+                items={[
+                  { value: "chart", label: t("activity:metrics.viewValue.chart") },
+                  { value: "table", label: t("activity:metrics.viewValue.table") },
+                ]}
+              />
+            </div>
+            {truncated ? (
+              <p className="text-xs text-muted-foreground">{t("activity:metrics.truncated")}</p>
+            ) : null}
+            {view === "table" ? (
+              <MetricsTable rows={rows} columns={columns} metric={metric} step={step} />
+            ) : (
+              <MetricsChart rows={rows} columns={columns} metric={metric} step={step} />
+            )}
+          </CardContent>
+        </Card>
+      ) : (
+        <EmptyCard lang={lang} message={t("activity:metrics.empty")} />
+      )}
+    </>
   );
 }
 
@@ -335,22 +529,111 @@ function scopeInput(scope: MetricScope, id: string) {
   }
 }
 
+type ListQuery<T> = { data: T | undefined; isError: boolean; refetch: () => Promise<unknown> };
+
+type PoolsList = {
+  pools: Array<{ id: string; slug: string; callableIds: string[] }>;
+  sharedWithMe: Array<{ poolId: string; callableIds: string[] }>;
+};
+
+type ScopeLists = {
+  pools: ListQuery<PoolsList>;
+  runtimes: ListQuery<unknown>;
+  versions: ListQuery<{ items: Array<{ id: string; version: number }> }>;
+  runtime: ListQuery<{
+    instanceList: Array<{ id: string; handle: string; versionNumber: number }>;
+  }>;
+  nodes: ListQuery<{ nodes: Array<{ id: string; slug: string }> }>;
+};
+
+function runtimeTargets(
+  data: { runtimes: Array<{ id: string; slug: string; service: unknown }> } | undefined,
+): Target[] | undefined {
+  return data?.runtimes
+    .filter((runtime) => !runtime.service)
+    .map((runtime) => ({ id: runtime.id, label: runtime.slug }));
+}
+
+function pickRuntimeId(
+  runtimeItems: Target[] | undefined,
+  runtimeWanted: string | undefined,
+): string | undefined {
+  return runtimeWanted && runtimeItems?.some((item) => item.id === runtimeWanted)
+    ? runtimeWanted
+    : runtimeItems?.[0]?.id;
+}
+
+function poolTargets(data: PoolsList | undefined): Target[] | undefined {
+  return data
+    ? [
+        ...data.pools.map((pool) => ({
+          id: pool.id,
+          label: pool.callableIds[0] ?? pool.slug,
+        })),
+        ...data.sharedWithMe.map((pool) => ({
+          id: pool.poolId,
+          label: pool.callableIds[0] ?? pool.poolId,
+        })),
+      ]
+    : undefined;
+}
+
+/** The scope's target list and the query whose failure or loading it reports. */
+function scopeList(
+  scope: MetricScope,
+  lists: ScopeLists,
+  runtimeItems: Target[] | undefined,
+  runtimeId: string | undefined,
+): { items: Target[] | undefined; query: ListQuery<unknown> } {
+  const { pools, runtimes, versions, runtime, nodes } = lists;
+  const runtimeSlug = runtimeItems?.find((item) => item.id === runtimeId)?.label ?? "";
+  // Version and instance lists hang off the runtime list: its failure or emptiness wins.
+  const runtimeGate = runtimes.isError || runtimeItems?.length === 0;
+  const noRuntimes = runtimeItems?.length === 0;
+  switch (scope) {
+    case "pool":
+      return { items: poolTargets(pools.data), query: pools };
+    case "runtime":
+      return { items: runtimeItems, query: runtimes };
+    case "version":
+      return {
+        items: noRuntimes
+          ? []
+          : versions.data?.items.map((version) => ({
+              id: version.id,
+              label: `${runtimeSlug} v${version.version}`,
+            })),
+        query: runtimeGate ? runtimes : versions,
+      };
+    case "instance":
+      return {
+        items: noRuntimes
+          ? []
+          : runtime.data?.instanceList.map((instance) => ({
+              id: instance.id,
+              label: `${instance.handle} · v${instance.versionNumber}`,
+            })),
+        query: runtimeGate ? runtimes : runtime,
+      };
+    case "node":
+      return {
+        items: nodes.data?.nodes.map((node) => ({ id: node.id, label: node.slug })),
+        query: nodes,
+      };
+  }
+}
+
 /**
  * What a scope can pick: pools (yours and shared with you), runtimes, a runtime's versions or
  * current instances, nodes. Only the lists the scope needs are fetched.
  */
 function useScopeTargets(scope: MetricScope, runtimeWanted: string | undefined) {
-  const needsRuntimes = scope === "runtime" || scope === "version" || scope === "instance";
+  const needsRuntimes = scope === "runtime" || isRuntimeChildScope(scope);
   const pools = useQuery({ ...orpc.pools.list.queryOptions(), enabled: scope === "pool" });
   const runtimes = useQuery({ ...orpc.runtimes.list.queryOptions(), enabled: needsRuntimes });
   const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), enabled: scope === "node" });
-  const runtimeItems: Target[] | undefined = runtimes.data?.runtimes
-    .filter((runtime) => !runtime.service)
-    .map((runtime) => ({ id: runtime.id, label: runtime.slug }));
-  const runtimeId =
-    runtimeWanted && runtimeItems?.some((item) => item.id === runtimeWanted)
-      ? runtimeWanted
-      : runtimeItems?.[0]?.id;
+  const runtimeItems = runtimeTargets(runtimes.data);
+  const runtimeId = pickRuntimeId(runtimeItems, runtimeWanted);
   const versions = useQuery(
     orpc.runtimes.versions.list.queryOptions({
       input: scope === "version" && runtimeId ? { runtimeId, limit: 200 } : skipToken,
@@ -363,51 +646,12 @@ function useScopeTargets(scope: MetricScope, runtimeWanted: string | undefined) 
   );
 
   const shared = new Set(pools.data?.sharedWithMe.map((pool) => pool.poolId) ?? []);
-  const runtimeSlug = runtimeItems?.find((item) => item.id === runtimeId)?.label ?? "";
-  let items: Target[] | undefined;
-  let query: { isError: boolean; refetch: () => Promise<unknown> } = pools;
-  // Version and instance lists hang off the runtime list: its failure or emptiness wins.
-  const runtimeGate = runtimes.isError || runtimeItems?.length === 0;
-  switch (scope) {
-    case "pool":
-      items = pools.data
-        ? [
-            ...pools.data.pools.map((pool) => ({
-              id: pool.id,
-              label: pool.callableIds[0] ?? pool.slug,
-            })),
-            ...pools.data.sharedWithMe.map((pool) => ({
-              id: pool.poolId,
-              label: pool.callableIds[0] ?? pool.poolId,
-            })),
-          ]
-        : undefined;
-      break;
-    case "runtime":
-      items = runtimeItems;
-      query = runtimes;
-      break;
-    case "version":
-      items = versions.data?.items.map((version) => ({
-        id: version.id,
-        label: `${runtimeSlug} v${version.version}`,
-      }));
-      query = runtimeGate ? runtimes : versions;
-      if (runtimeItems?.length === 0) items = [];
-      break;
-    case "instance":
-      items = runtime.data?.instanceList.map((instance) => ({
-        id: instance.id,
-        label: `${instance.handle} · v${instance.versionNumber}`,
-      }));
-      query = runtimeGate ? runtimes : runtime;
-      if (runtimeItems?.length === 0) items = [];
-      break;
-    case "node":
-      items = nodes.data?.nodes.map((node) => ({ id: node.id, label: node.slug }));
-      query = nodes;
-      break;
-  }
+  const { items, query } = scopeList(
+    scope,
+    { pools, runtimes, versions, runtime, nodes },
+    runtimeItems,
+    runtimeId,
+  );
   return {
     items,
     shared,
