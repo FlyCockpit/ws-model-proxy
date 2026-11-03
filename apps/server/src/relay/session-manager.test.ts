@@ -2,6 +2,7 @@ import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateTestHelloIdentity } from "./hello-identity.js";
 import type { NodeIdentity } from "./node-credential-auth.js";
+import { acceptanceRetryOf, type OperatorStep } from "./operator-step.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
@@ -44,7 +45,10 @@ vi.mock("./runtime-load-rollup.js", () => ({ observeRuntimeLoadRollup: vi.fn() }
 vi.mock("./node-metrics-rollup.js", () => ({ observeNodeMetricsRollup: vi.fn() }));
 
 const { default: prisma } = await import("@ws-model-proxy/db");
-const { RelaySessionManager, OPERATOR_ACCEPT_RETRIES } = await import("./session-manager.js");
+const { RelaySessionManager, OPERATOR_ACCEPT_RETRIES, registerTerminalBridge } = await import(
+  "./session-manager.js"
+);
+const { TERMINAL_PENDING_TTL_MS } = await import("./terminal-record.js");
 const { onNodeEvent } = await import("@ws-model-proxy/api/lib/node-events");
 type NodeEvent = import("@ws-model-proxy/api/lib/node-events").NodeEvent;
 const { startsEndedBy } = await import("../runtimes/lifecycle.js");
@@ -2089,11 +2093,21 @@ describe("RelaySessionManager (relay 3.0)", () => {
     const retryState = (socket: FakeSocket) => {
       const sessions = Reflect.get(manager, "sessionsBySocket") as Map<
         FakeSocket,
-        { acceptanceRetries: Map<string, unknown>; operatorSteps: Map<string, unknown> }
+        { operatorSteps: Map<string, OperatorStep> }
       >;
       const state = sessions.get(socket);
       if (state === undefined) throw new Error("no session for this socket");
-      return state;
+      const { operatorSteps } = state;
+      return {
+        operatorSteps,
+        /** Each retry chain lives in its step's `running` stage. */
+        acceptanceRetries: {
+          get size() {
+            return [...operatorSteps.values()].filter((step) => acceptanceRetryOf(step) !== null)
+              .length;
+          },
+        },
+      };
     };
 
     /**
@@ -2554,6 +2568,190 @@ describe("RelaySessionManager (relay 3.0)", () => {
       manager.cancelOperatorTerminalsForUser("user-1");
       expect(socket.last("term.close")).toEqual({ type: "term.close", terminalId });
       expect(manager.operatorStepTerminal("step-1", "user-1")).toBeNull();
+    });
+  });
+
+  describe("explicit state machines", () => {
+    const open = (id: number, connId = "conn-1") =>
+      manager.startTerminal({
+        terminalId: Buffer.alloc(16, id).toString("base64url"),
+        userId: "user-1",
+        nodeId: "node-1",
+        cols: 80,
+        rows: 24,
+        browserPublicKey: TERMINAL_KEY,
+        browserNonce: Buffer.alloc(16, 2).toString("base64url"),
+        connId,
+      });
+
+    it("refuses a second hello sent while the first one's registration runs, and undoes the late registration", async () => {
+      let resume: (value: unknown) => void = () => undefined;
+      db.$transaction.mockImplementationOnce(
+        (callback: (tx: typeof db) => unknown) =>
+          new Promise((resolve) => {
+            resume = () => resolve(callback(db));
+          }),
+      );
+      const socket = new FakeSocket();
+      expect(manager.acceptAuthenticatedSocket({ socket, identity })).toBe(true);
+      const first = manager.handleTextFrame(socket, hello(socket));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // Registering: the nonce is spent, and the second hello is a repeat, not a new proof.
+      await manager.handleTextFrame(socket, hello(socket));
+      expect(socket.last("protocol.error")).toMatchObject({
+        code: "malformed",
+        message: "Hello was already received.",
+      });
+      expect(socket.closes).toHaveLength(1);
+      resume(undefined);
+      await first;
+      // The registration committed for a session that is gone: it is put back, never installed.
+      expect(manager.getOnlineNodeIds()).toEqual([]);
+      expect(socket.last("hello.ok")).toBeUndefined();
+      expect(routing.disconnectNodeAtGeneration).toHaveBeenCalledWith(
+        expect.objectContaining({ nodeId: "node-1", generation: 1 }),
+      );
+    });
+
+    it("refuses node frames before registration and a hello after hello.ok", async () => {
+      const early = new FakeSocket();
+      expect(manager.acceptAuthenticatedSocket({ socket: early, identity })).toBe(true);
+      await manager.handleTextFrame(early, heartbeat());
+      expect(early.last("protocol.error")).toMatchObject({
+        message: "Registration is required before relay messages.",
+      });
+      const socket = await connect();
+      await manager.handleTextFrame(socket, hello(socket));
+      expect(socket.last("protocol.error")).toMatchObject({
+        message: "Hello was already received.",
+      });
+      expect(manager.getOnlineNodeIds()).toEqual([]);
+    });
+
+    it("between registration and hello.ok, model work reaches the node but lane frames do not", async () => {
+      let during: Record<string, unknown> | null = null;
+      manager.setNodeFrameHandlers({
+        definitionSync: async () => {
+          during = {
+            online: manager.getOnlineNodeIds(),
+            live: manager.getLiveNodeState("node-1") !== null,
+            countContext: manager.supportsCountContext("node-1"),
+            nodeSession: manager.nodeSession("node-1"),
+            lane: manager.sendToNode("node-1", { type: "runtime.detect", id: "early" }),
+          };
+          return "none";
+        },
+      });
+      await connect();
+      // Preserved: wsmp answers relay.request / stt / file / term frames from registration on.
+      expect(during).toEqual({
+        online: ["node-1"],
+        live: true,
+        countContext: true,
+        nodeSession: null,
+        lane: false,
+      });
+      expect(manager.nodeSession("node-1")).not.toBeNull();
+    });
+
+    it("an open the node never answers expires and frees its limit slot", async () => {
+      const events: Array<{ type: string; reason?: string }> = [];
+      registerTerminalBridge({ onTerminalEvent: (event) => events.push(event) });
+      const socket = await connect();
+      const startedAt = Date.now();
+      expect(open(1)).toBe(true);
+      const terminalId = Buffer.alloc(16, 1).toString("base64url");
+      expect(manager.terminalCounts("user-1", "node-1")).toEqual({ user: 1, node: 1 });
+      manager.sweepExpiredPendingTerminals(startedAt + TERMINAL_PENDING_TTL_MS - 1_000);
+      expect(manager.hasTerminal(terminalId)).toBe(true);
+      // The node never sent term.opened or term.rejected.
+      manager.sweepExpiredPendingTerminals(Date.now() + TERMINAL_PENDING_TTL_MS);
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+      expect(manager.terminalCounts("user-1", "node-1")).toEqual({ user: 0, node: 0 });
+      expect(socket.last("term.close")).toEqual({ type: "term.close", terminalId });
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "rejected",
+          terminalId,
+          connId: "conn-1",
+          reason: "expired",
+        }),
+      );
+    });
+
+    it("the limit slots an unanswered open held come back for new terminals", async () => {
+      await connect();
+      // WMP_TERMINAL_CLI_LIMIT is 4.
+      for (let id = 1; id <= 4; id++) expect(open(id)).toBe(true);
+      expect(open(5)).toBe(false);
+      manager.sweepExpiredPendingTerminals(Date.now() + TERMINAL_PENDING_TTL_MS);
+      expect(open(5)).toBe(true);
+    });
+
+    it("an opened terminal has no open deadline; its unanswered attachments still expire", async () => {
+      const socket = await connect();
+      expect(open(1)).toBe(true);
+      const terminalId = Buffer.alloc(16, 1).toString("base64url");
+      const viewerId = String(socket.last("term.open")?.viewerId);
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "term.opened",
+          terminalId,
+          viewerId,
+          cliNonce: Buffer.alloc(16, 3).toString("base64url"),
+        }),
+      );
+      expect(manager.listTerminalsForUser("user-1", "conn-1")).toEqual([
+        expect.objectContaining({ terminalId, viewerCount: 1, attachedHere: true }),
+      ]);
+      const attached = manager.attachTerminal({
+        terminalId,
+        userId: "user-1",
+        connId: "conn-2",
+        browserPublicKey: TERMINAL_KEY,
+        browserNonce: Buffer.alloc(16, 2).toString("base64url"),
+      });
+      expect(attached).toMatchObject({ ok: true });
+      manager.sweepExpiredPendingTerminals(Date.now() + 10 * TERMINAL_PENDING_TTL_MS);
+      expect(manager.hasTerminal(terminalId)).toBe(true);
+      expect(manager.terminalCounts("user-1", "node-1")).toEqual({ user: 1, node: 1 });
+      // conn-2's attachment was never answered: dropped, conn-1 still views it.
+      expect(socket.last("term.detach")).toMatchObject({ terminalId });
+      expect(manager.listTerminalsForUser("user-1", "conn-2")).toEqual([
+        expect.objectContaining({ terminalId, viewerCount: 1, attachedHere: false }),
+      ]);
+    });
+
+    it("a disposed manager is draining and accepts no socket", async () => {
+      expect(manager.isDraining()).toBe(false);
+      manager.dispose();
+      expect(manager.isDraining()).toBe(true);
+      // One-way: a later drain does not move it back.
+      manager.beginDrain();
+      expect(manager.isDraining()).toBe(true);
+      const socket = new FakeSocket();
+      expect(manager.acceptAuthenticatedSocket({ socket, identity })).toBe(false);
+      expect(socket.closes).toEqual([{ code: 1001, reason: "shutdown" }]);
+      expect(socket.last("hello.challenge")).toBeUndefined();
+    });
+
+    it("a hello that never arrives closes the socket at the registration deadline", async () => {
+      vi.useFakeTimers();
+      try {
+        const socket = new FakeSocket();
+        expect(manager.acceptAuthenticatedSocket({ socket, identity })).toBe(true);
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(socket.last("protocol.error")).toMatchObject({
+          message: "Registration was not received in time.",
+        });
+        // A registered session is not closed by it.
+        const registered = await connect();
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(registered.closes).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

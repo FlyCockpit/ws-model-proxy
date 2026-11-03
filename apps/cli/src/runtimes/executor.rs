@@ -366,7 +366,119 @@ struct Record {
     outside_units: bool,
 }
 
+/// A record's phase changes only through these transitions, which keep the
+/// fields that go with it consistent:
+///
+/// - `stopped_at` is `Some` exactly while the phase is `Stopped` (set by
+///   [`Record::mark_stopped`], cleared by every transition out of it);
+/// - a launch step ([`Record::begin_step`]) is `Starting` with both health
+///   counters reset;
+/// - a pending stop is `Stopping`;
+/// - a health result never moves a `Stopped` record (nothing serves there; a
+///   stray check must not turn a proven stop `Unhealthy`).
 impl Record {
+    /// A record for a step seen for the first time: nothing observed yet.
+    fn new(job: &Job) -> Self {
+        Self {
+            job: job.clone(),
+            phase: InstancePhase::Unknown,
+            invocations: BTreeMap::new(),
+            pending: None,
+            completed: BTreeMap::new(),
+            observed_step: job.step_id.clone(),
+            observed_hash: job.intent_hash.clone(),
+            consecutive_health_failures: 0,
+            consecutive_health_successes: 0,
+            stopped_at: None,
+            outside_units: false,
+        }
+    }
+
+    /// Every phase change goes through here: leaving `Stopped` forgets when it stopped.
+    fn set_phase(&mut self, phase: InstancePhase) {
+        if phase != InstancePhase::Stopped {
+            self.stopped_at = None;
+        }
+        self.phase = phase;
+    }
+
+    /// `job` is about to run (its intent is persisted next): it is pending, and a launch
+    /// starts afresh (`Starting`, health counters reset) while a stop is `Stopping`.
+    /// Read-only checks leave the phase alone.
+    fn begin_step(&mut self, job: &Job) {
+        self.pending = Some(job.clone());
+        match job.action {
+            JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin => {
+                self.set_phase(InstancePhase::Starting);
+                self.consecutive_health_failures = 0;
+                self.consecutive_health_successes = 0;
+            }
+            JobPhase::Stop => self.set_phase(InstancePhase::Stopping),
+            JobPhase::Readiness | JobPhase::Health | JobPhase::Status => {}
+        }
+    }
+
+    /// An operator step is pending before its person runs it: `Stopping` for a stop,
+    /// else `Starting`. The counters stay: the step runs through [`Record::begin_step`]
+    /// once its command succeeded, and [`Record::restore`] undoes this.
+    fn begin_operator_step(&mut self, job: &Job) {
+        self.pending = Some(job.clone());
+        self.set_phase(if job.action == JobPhase::Stop {
+            InstancePhase::Stopping
+        } else {
+            InstancePhase::Starting
+        });
+    }
+
+    /// An operator step's command ran but did not succeed: what it left is unresolved.
+    fn abandon_ran(&mut self, pending: Option<Job>) {
+        self.pending = pending;
+        self.set_phase(InstancePhase::Unknown);
+    }
+
+    /// Undo [`Record::begin_operator_step`] for a command that never ran.
+    fn restore(&mut self, mark: OperatorMark) {
+        self.pending = mark.pending;
+        self.phase = mark.phase;
+        self.stopped_at = mark.stopped_at;
+        self.job = mark.job;
+        self.outside_units = mark.outside_units;
+    }
+
+    /// Readiness answered while the serving process is confirmed.
+    fn mark_ready(&mut self) {
+        self.set_phase(InstancePhase::Ready);
+    }
+
+    /// One health probe's result, with hysteresis: `Ready` after `success_threshold`
+    /// healthy probes in a row, `Unhealthy` after `failure_threshold` misses in a row.
+    /// A `Stopped` record keeps its phase and counters.
+    fn health_result(&mut self, healthy: bool, failure_threshold: u8, success_threshold: u8) {
+        if self.phase == InstancePhase::Stopped {
+            return;
+        }
+        if healthy {
+            self.consecutive_health_failures = 0;
+            self.consecutive_health_successes = self.consecutive_health_successes.saturating_add(1);
+            if self.consecutive_health_successes >= u32::from(success_threshold) {
+                self.set_phase(InstancePhase::Ready);
+            }
+        } else {
+            self.consecutive_health_successes = 0;
+            self.consecutive_health_failures = self.consecutive_health_failures.saturating_add(1);
+            if self.consecutive_health_failures >= u32::from(failure_threshold) {
+                self.set_phase(InstancePhase::Unhealthy);
+            }
+        }
+    }
+
+    /// The stop is proven (`now`): the units are forgotten, the record is `Stopped`.
+    fn mark_stopped(&mut self, now: u64) {
+        self.clear_invocations();
+        self.phase = InstancePhase::Stopped;
+        self.stopped_at = Some(now);
+    }
+
     /// The run is proven stopped: its units are forgotten, but not that a step of it ran
     /// outside them.
     fn clear_invocations(&mut self) {
@@ -463,6 +575,7 @@ fn admissible(record: &Record, job: &Job) -> Result<()> {
 pub struct OperatorMark {
     created: bool,
     phase: InstancePhase,
+    stopped_at: Option<u64>,
     pending: Option<Job>,
     job: Job,
     outside_units: bool,
@@ -630,6 +743,7 @@ impl Executor {
                 let mark = OperatorMark {
                     created: false,
                     phase: record.phase,
+                    stopped_at: record.stopped_at,
                     pending: record.pending.clone(),
                     job: record.job.clone(),
                     outside_units: record.outside_units,
@@ -640,37 +754,20 @@ impl Executor {
                     record.job = job.clone();
                     record.outside_units = false;
                 }
-                record.pending = Some(job.clone());
-                record.phase = if job.action == JobPhase::Stop {
-                    InstancePhase::Stopping
-                } else {
-                    InstancePhase::Starting
-                };
+                record.begin_operator_step(job);
                 mark
             }
             None => {
                 if job.action == JobPhase::Stop {
                     return Err(JobError::InstanceUnknown);
                 }
-                self.state.records.insert(
-                    key.clone(),
-                    Record {
-                        job: job.clone(),
-                        phase: InstancePhase::Starting,
-                        invocations: BTreeMap::new(),
-                        pending: Some(job.clone()),
-                        completed: BTreeMap::new(),
-                        observed_step: job.step_id.clone(),
-                        observed_hash: job.intent_hash.clone(),
-                        consecutive_health_failures: 0,
-                        consecutive_health_successes: 0,
-                        stopped_at: None,
-                        outside_units: false,
-                    },
-                );
+                let mut record = Record::new(job);
+                record.begin_operator_step(job);
+                self.state.records.insert(key.clone(), record);
                 OperatorMark {
                     created: true,
                     phase: InstancePhase::Unknown,
+                    stopped_at: None,
                     pending: None,
                     job: job.clone(),
                     outside_units: false,
@@ -705,15 +802,11 @@ impl Executor {
             return;
         }
         if ran {
-            record.pending = mark.pending;
-            record.phase = InstancePhase::Unknown;
+            record.abandon_ran(mark.pending);
         } else if mark.created && record.invocations.is_empty() && record.completed.is_empty() {
             self.state.records.remove(&key);
         } else {
-            record.pending = mark.pending;
-            record.phase = mark.phase;
-            record.job = mark.job;
-            record.outside_units = mark.outside_units;
+            record.restore(mark);
         }
         if let Err(error) = self.persist() {
             tracing::warn!(error = %format!("{error:#}"), "clearing an operator step failed");
@@ -858,22 +951,7 @@ impl Executor {
                 return Err(fail(JobError::InstanceUnknown));
             }
             admitted = true;
-            self.state.records.insert(
-                key.clone(),
-                Record {
-                    job: job.clone(),
-                    phase: InstancePhase::Unknown,
-                    invocations: BTreeMap::new(),
-                    pending: None,
-                    completed: BTreeMap::new(),
-                    observed_step: job.step_id.clone(),
-                    observed_hash: job.intent_hash.clone(),
-                    consecutive_health_failures: 0,
-                    consecutive_health_successes: 0,
-                    stopped_at: None,
-                    outside_units: false,
-                },
-            );
+            self.state.records.insert(key.clone(), Record::new(job));
         }
         let record = self.state.records.get_mut(&key).context("record")?;
         if matches!(job.action, JobPhase::Prepare | JobPhase::Start) {
@@ -883,20 +961,7 @@ impl Executor {
             }
             record.job = job.clone();
         }
-        record.pending = Some(job.clone());
-        match job.action {
-            JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin => {
-                record.phase = InstancePhase::Starting;
-                record.consecutive_health_failures = 0;
-                record.consecutive_health_successes = 0;
-                record.stopped_at = None;
-            }
-            JobPhase::Stop => {
-                record.phase = InstancePhase::Stopping;
-                record.stopped_at = None;
-            }
-            _ => {}
-        }
+        record.begin_step(job);
         // Durable intent BEFORE any external effect.
         if let Err(error) = self.persist() {
             if admitted {
@@ -1011,7 +1076,11 @@ impl Executor {
                     }
                     anyhow::bail!("serving process unconfirmed");
                 }
-                self.state.records.get_mut(&key).context("record")?.phase = InstancePhase::Ready;
+                self.state
+                    .records
+                    .get_mut(&key)
+                    .context("record")?
+                    .mark_ready();
                 Outcome::ok(false)
             }
             JobPhase::Status => anyhow::bail!("a status probe is answered by the stop proof"),
@@ -1036,22 +1105,11 @@ impl Executor {
                 let healthy = miss.is_none();
                 if job.action == JobPhase::Health {
                     let (failure_threshold, success_threshold) = job.health_thresholds();
-                    let record = self.state.records.get_mut(&key).context("record")?;
-                    if healthy {
-                        record.consecutive_health_failures = 0;
-                        record.consecutive_health_successes =
-                            record.consecutive_health_successes.saturating_add(1);
-                        if record.consecutive_health_successes >= u32::from(success_threshold) {
-                            record.phase = InstancePhase::Ready;
-                        }
-                    } else {
-                        record.consecutive_health_successes = 0;
-                        record.consecutive_health_failures =
-                            record.consecutive_health_failures.saturating_add(1);
-                        if record.consecutive_health_failures >= u32::from(failure_threshold) {
-                            record.phase = InstancePhase::Unhealthy;
-                        }
-                    }
+                    self.state
+                        .records
+                        .get_mut(&key)
+                        .context("record")?
+                        .health_result(healthy, failure_threshold, success_threshold);
                 }
                 miss.map_or_else(|| Outcome::ok(false), Outcome::unhealthy)
             }
@@ -1235,9 +1293,7 @@ impl Executor {
         let Some(record) = self.state.records.get_mut(&key) else {
             return Ok(Outcome::ok(true));
         };
-        record.clear_invocations();
-        record.phase = InstancePhase::Stopped;
-        record.stopped_at = Some(now);
+        record.mark_stopped(now);
         self.complete(job, Outcome::ok(true))
     }
 
@@ -1337,9 +1393,7 @@ impl Executor {
         runtime.forget_slice(&rank_slice(job), deadline);
         let now = (self.clock)();
         let record = self.state.records.get_mut(&key).context("record")?;
-        record.clear_invocations();
-        record.phase = InstancePhase::Stopped;
-        record.stopped_at = Some(now);
+        record.mark_stopped(now);
         Ok(Some(Outcome::ok(true)))
     }
 

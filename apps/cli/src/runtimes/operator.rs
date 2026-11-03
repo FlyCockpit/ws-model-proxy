@@ -350,6 +350,19 @@ pub trait OperatorLink {
 /// How often a waiting step looks at its cancel flag.
 const CANCEL_POLL: Duration = Duration::from_millis(200);
 
+/// A step's runner thread waiting on its operator terminal. The wait ends on `ExitedOk`
+/// (check the proof) or `Closed` / a dropped channel (abandon).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperatorWait {
+    /// On the confirm screen; a cancel asks the relay loop to close it.
+    Confirming,
+    /// Cancelled: the close was asked once and is not asked again. Enter may still have
+    /// raced it.
+    CloseAsked,
+    /// A person pressed Enter and the command runs: a cancel never cuts it off.
+    Accepted,
+}
+
 /// One interactive step under its rank's locks (`super::runner`).
 ///
 /// Status first: a start or after-join whose service is already alive, or a
@@ -408,14 +421,13 @@ pub fn run_operator<R: Runtime>(
         executor.abandon_operator(&job, mark, false);
         return Some(Outcome::failed(error));
     }
-    let mut accepted = false;
-    let mut close_asked = false;
+    let mut wait = OperatorWait::Confirming;
     let ended_ok = loop {
         let event = match events.recv_timeout(CANCEL_POLL) {
             Ok(event) => event,
             Err(RecvTimeoutError::Disconnected) => break false,
             Err(RecvTimeoutError::Timeout) => {
-                if accepted || close_asked || !cancel.load(Ordering::SeqCst) {
+                if wait != OperatorWait::Confirming || !cancel.load(Ordering::SeqCst) {
                     continue;
                 }
                 // An Enter already queued wins over the cancel.
@@ -423,20 +435,21 @@ pub fn run_operator<R: Runtime>(
                     Ok(event) => event,
                     Err(_) => {
                         link.close_if_confirming();
-                        close_asked = true;
+                        wait = OperatorWait::CloseAsked;
                         continue;
                     }
                 }
             }
         };
         match event {
-            OperatorEvent::Accepted => accepted = true,
+            // Also after a close was asked: Enter raced it, and the run is not cut off.
+            OperatorEvent::Accepted => wait = OperatorWait::Accepted,
             OperatorEvent::ExitedOk => break true,
             OperatorEvent::Closed => break false,
         }
     };
     if !ended_ok {
-        executor.abandon_operator(&job, mark, accepted);
+        executor.abandon_operator(&job, mark, wait == OperatorWait::Accepted);
         return None;
     }
     // A stop's command ran in the terminal; `OperatorRan` never repeats it.

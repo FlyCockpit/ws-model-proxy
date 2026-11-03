@@ -35,6 +35,7 @@ import {
   nodeCommandSelect,
   settleNodeCommand,
 } from "../lib/node-command-settle";
+import { nodeIsLive } from "../lib/node-liveness";
 import { notFound, refuse, refuseAbout } from "../lib/refuse";
 import { NODE_COMMAND_GET_WAIT_MAX_MS, runtimeTextIssue } from "../lib/runtime-spec";
 
@@ -100,6 +101,7 @@ async function fullControlNode(
       trust: true,
       trustLowerRequestedAt: true,
       connection: true,
+      lastHeartbeatAt: true,
       commandMaxMs: true,
       features: true,
       nodeInfo: true,
@@ -114,7 +116,8 @@ async function fullControlNode(
       "FORBIDDEN",
     );
   }
-  if (!allowOffline && node.connection !== "ONLINE") {
+  // Live operations need a live session: a row left ONLINE with a stale heartbeat has none.
+  if (!allowOffline && !nodeIsLive(node, new Date())) {
     throw refuseAbout("node_offline", node.id, `Node ${node.slug} is offline.`, "CONFLICT");
   }
   return node;

@@ -13,8 +13,10 @@ import {
   abandonTargetRecoveryTrial,
   claimTargetRecoveryTrial,
   settleTargetRecoveryTrial,
+  targetDueWhere,
 } from "@ws-model-proxy/api/lib/pool-routing";
 import prisma from "@ws-model-proxy/db";
+import { createSerialTask, type SerialTask } from "../serial-task.js";
 
 export const TARGET_RECOVERY_PROBE_TIMEOUT_MS = 20_000;
 export const TARGET_RECOVERY_IDLE_POLL_MS = 1_000;
@@ -55,51 +57,50 @@ export type TargetRecoverySchedulerDependencies = {
   }): Promise<boolean>;
 };
 
+/**
+ * Recovery passes on a {@link createSerialTask}: one at a time, every pass from a timer, a wake
+ * during a pass (or a superseded probe) asks for one more right after it, and while this process
+ * owns node sessions the next pass is due `idlePollMs` after the last one ends.
+ */
 export class TargetRecoveryScheduler {
-  private timer: Timer | null = null;
-  private running = false;
-  private stopped = false;
-  private wakeRequested = false;
   private readonly now: () => Date;
-  private readonly setTimer: (callback: () => void, ms: number) => Timer;
-  private readonly clearTimer: (timer: Timer) => void;
+  private readonly task: SerialTask;
 
   constructor(private readonly dependencies: TargetRecoverySchedulerDependencies) {
     this.now = dependencies.now ?? (() => new Date());
-    this.setTimer = dependencies.setTimer ?? ((callback, ms) => setTimeout(callback, ms));
-    this.clearTimer = dependencies.clearTimer ?? ((timer) => clearTimeout(timer));
+    this.task = createSerialTask({
+      run: () => this.run(),
+      // A transient database failure must not become an unhandled rejection; the next
+      // bounded pass retries the scan.
+      onError: () => undefined,
+      // Every pass starts from a timer, never inside the caller (a node registration).
+      minIntervalMs: 0,
+      nextPassMs: () =>
+        this.ownedNodeIds().length > 0
+          ? (dependencies.idlePollMs ?? TARGET_RECOVERY_IDLE_POLL_MS)
+          : null,
+      timers: {
+        setTimeout: (callback, ms) =>
+          dependencies.setTimer ? dependencies.setTimer(callback, ms) : setTimeout(callback, ms),
+        clearTimeout: (timer) =>
+          dependencies.clearTimer ? dependencies.clearTimer(timer) : clearTimeout(timer),
+      },
+    });
   }
 
   /** Start or promptly rescan after a local node session is registered. */
   wake() {
-    if (this.stopped) return;
-    if (![...this.dependencies.getOwnedNodeIds()].length) {
-      if (this.timer) this.clearTimer(this.timer);
-      this.timer = null;
-      return;
-    }
-    if (this.running) {
-      this.wakeRequested = true;
-      return;
-    }
-    if (this.timer) this.clearTimer(this.timer);
-    this.timer = null;
-    this.schedule(0);
+    // With no owned node there is nothing to probe; a pending poll finds that and goes idle.
+    if (this.ownedNodeIds().length === 0) return;
+    void this.task.trigger();
   }
 
   stop() {
-    this.stopped = true;
-    if (this.timer) this.clearTimer(this.timer);
-    this.timer = null;
+    void this.task.stop();
   }
 
-  private schedule(delayMs: number) {
-    if (this.stopped || this.timer || this.running) return;
-    this.timer = this.setTimer(() => {
-      this.timer = null;
-      void this.run();
-    }, delayMs);
-    this.timer.unref?.();
+  private ownedNodeIds(): string[] {
+    return [...new Set(this.dependencies.getOwnedNodeIds())];
   }
 
   private owns(nodeId: string): boolean {
@@ -107,62 +108,43 @@ export class TargetRecoveryScheduler {
   }
 
   private async run() {
-    if (this.stopped || this.running) return;
-    this.running = true;
-    try {
-      const ownedIds = [...new Set(this.dependencies.getOwnedNodeIds())];
-      if (ownedIds.length > 0) {
-        const targets = await this.dependencies.listDueTargets(ownedIds, this.now());
-        for (const target of targets) {
-          // A session can be replaced after the query: never probe or write health for a
-          // target whose socket this process no longer owns.
-          if (!this.owns(target.nodeId)) continue;
-          const claim =
-            this.dependencies.claim ??
-            ((executionTargetId: string, now: Date) =>
-              claimTargetRecoveryTrial({ executionTargetId, now }));
-          const trialStartedAt = await claim(target.id, this.now());
-          if (!trialStartedAt) continue;
-          // Every claimed trial ends in settle or abandon.
-          const abandon = () =>
-            (this.dependencies.abandon ?? abandonTargetRecoveryTrial)({
-              executionTargetId: target.id,
-              trialStartedAt,
-              now: this.now(),
-            });
-          try {
-            const healthy = await this.dependencies.probe(target).catch(() => false);
-            if (healthy === "superseded" || !this.owns(target.nodeId)) {
-              await abandon();
-              if (healthy === "superseded") this.wakeRequested = true;
-              continue;
-            }
-            await (this.dependencies.settle ?? settleTargetRecoveryTrial)({
-              executionTargetId: target.id,
-              trialStartedAt,
-              healthy,
-              now: this.now(),
-            });
-          } catch (error) {
-            await abandon().catch(() => false);
-            throw error;
-          }
+    const ownedIds = this.ownedNodeIds();
+    if (ownedIds.length === 0) return;
+    const targets = await this.dependencies.listDueTargets(ownedIds, this.now());
+    for (const target of targets) {
+      // A session can be replaced after the query: never probe or write health for a target
+      // whose socket this process no longer owns.
+      if (!this.owns(target.nodeId)) continue;
+      const claim =
+        this.dependencies.claim ??
+        ((executionTargetId: string, now: Date) =>
+          claimTargetRecoveryTrial({ executionTargetId, now }));
+      const trialStartedAt = await claim(target.id, this.now());
+      if (!trialStartedAt) continue;
+      // Every claimed trial ends in settle or abandon.
+      const abandon = () =>
+        (this.dependencies.abandon ?? abandonTargetRecoveryTrial)({
+          executionTargetId: target.id,
+          trialStartedAt,
+          now: this.now(),
+        });
+      try {
+        const healthy = await this.dependencies.probe(target).catch(() => false);
+        if (healthy === "superseded" || !this.owns(target.nodeId)) {
+          await abandon();
+          // The result said nothing about the target: scan again right after this pass.
+          if (healthy === "superseded") void this.task.trigger();
+          continue;
         }
-      }
-    } catch {
-      // A transient database failure must not become an unhandled rejection; the next
-      // bounded tick retries the scan.
-    } finally {
-      this.running = false;
-      if (this.stopped) {
-        // stop() already cancelled the pending timer.
-      } else if (![...this.dependencies.getOwnedNodeIds()].length) {
-        this.wakeRequested = false;
-      } else if (this.wakeRequested) {
-        this.wakeRequested = false;
-        this.schedule(0);
-      } else {
-        this.schedule(this.dependencies.idlePollMs ?? TARGET_RECOVERY_IDLE_POLL_MS);
+        await (this.dependencies.settle ?? settleTargetRecoveryTrial)({
+          executionTargetId: target.id,
+          trialStartedAt,
+          healthy,
+          now: this.now(),
+        });
+      } catch (error) {
+        await abandon().catch(() => false);
+        throw error;
       }
     }
   }
@@ -184,8 +166,8 @@ export async function listDueOwnedTargetRecoveries(
   const rows = await prisma.executionTarget.findMany({
     where: {
       kind: "INSTANCE_MODEL",
-      health: { in: ["DEGRADED", "UNHEALTHY"] },
-      nextRetryAt: { lte: now },
+      // The same "due" rule the claim applies (`claimTargetRecoveryTrial`).
+      ...targetDueWhere(now),
       RuntimeModel: {
         OR: [
           {

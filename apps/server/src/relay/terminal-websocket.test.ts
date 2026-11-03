@@ -445,7 +445,7 @@ describe("terminal websocket admission", () => {
     ).toBe(200);
   });
 
-  // The shutdown drain flag (RelaySessionManager.relayDrain) refuses a new
+  // The shutdown drain (RelaySessionManager.lifecycle) refuses a new
   // browser terminal upgrade with 503 before any session read, and stays set.
   it("refuses a browser terminal upgrade once the relay drain began, before authenticating", async () => {
     sessions.getSession.mockResolvedValue(browserSession());
@@ -470,7 +470,7 @@ describe("terminal websocket admission", () => {
       expect(relaySessionManager.isDraining()).toBe(true);
     } finally {
       // Test hygiene only: production never clears the flag.
-      Reflect.set(relaySessionManager, "relayDrain", false);
+      Reflect.set(relaySessionManager, "lifecycle", "running");
     }
   });
 
@@ -553,7 +553,7 @@ describe("terminal browser hub", () => {
     // Test hygiene only: closeRelaySessions sets the shutdown drain flag,
     // which production never clears, and a draining server refuses every
     // browser terminal registration.
-    Reflect.set(relaySessionManager, "relayDrain", false);
+    Reflect.set(relaySessionManager, "lifecycle", "running");
   });
 
   function attachBrowser() {

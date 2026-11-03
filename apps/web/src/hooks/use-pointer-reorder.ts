@@ -1,25 +1,16 @@
 import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useRef, useState } from "react";
 
-/** How far a mouse or pen moves before a press becomes a drag (px). */
-const DRAG_THRESHOLD_PX = 5;
-/** How far a finger may drift during the long press before it counts as a scroll (px). */
-const TOUCH_SLOP_PX = 8;
+import {
+  type ReorderDrag,
+  type ReorderEvent,
+  type ReorderState,
+  reduceReorder,
+  reorderActive,
+  reorderDrag,
+} from "@/lib/pointer-reorder-state";
 
-export type ReorderDrag = { from: number; to: number };
-
-type Gesture = {
-  pointerId: number;
-  from: number;
-  startX: number;
-  startY: number;
-  /** The press became a drag. */
-  started: boolean;
-  /** Item boxes at the start, in list order (the list does not move during a drag). */
-  rects: DOMRect[];
-  timer: ReturnType<typeof setTimeout> | null;
-  to: number;
-};
+export type { ReorderDrag } from "@/lib/pointer-reorder-state";
 
 /**
  * Drag-to-reorder for a short list with Pointer Events (mouse, pen and touch), no library.
@@ -41,34 +32,36 @@ export function usePointerReorder({
   touchDelayMs?: number;
 }) {
   const [drag, setDrag] = useState<ReorderDrag | null>(null);
-  const gesture = useRef<Gesture | null>(null);
+  /** The gesture (see pointer-reorder-state.ts); `drag` is what it shows. */
+  const gesture = useRef<ReorderState>({ phase: "idle" });
+  /** A touch's long press, while its press is the gesture. */
+  const longPress = useRef<ReturnType<typeof setTimeout> | null>(null);
   const elements = useRef(new Map<number, HTMLElement>());
-  const swallowClick = useRef(false);
 
-  const clear = () => {
-    const current = gesture.current;
-    if (current?.timer) clearTimeout(current.timer);
-    gesture.current = null;
-    setDrag(null);
-  };
-
-  const begin = (current: Gesture) => {
-    current.started = true;
-    current.rects = [...elements.current.entries()]
+  /** Item boxes now, in list order (the list does not move during a drag). */
+  const measure = () =>
+    [...elements.current.entries()]
       .sort(([left], [right]) => left - right)
       .map(([, element]) => element.getBoundingClientRect());
-    setDrag({ from: current.from, to: current.from });
-  };
 
-  const targetAt = (current: Gesture, x: number, y: number) => {
-    const point = axis === "x" ? x : y;
-    const { rects } = current;
-    for (const [index, rect] of rects.entries()) {
-      const end = axis === "x" ? rect.right : rect.bottom;
-      // The first item whose far edge is past the pointer; past the last, the last.
-      if (point < end || index === rects.length - 1) return index;
+  /** Run `event` through the gesture; returns whether to swallow it (a drag's click). */
+  const dispatch = (event: ReorderEvent): boolean => {
+    const previous = gesture.current;
+    const transition = reduceReorder(previous, event, axis);
+    const next = transition.state;
+    gesture.current = next;
+    if (next !== previous) {
+      // The press the long press was for is over (or became a drag).
+      if (previous.phase === "pressing" && longPress.current) {
+        clearTimeout(longPress.current);
+        longPress.current = null;
+      }
+      const before = reorderDrag(previous);
+      const after = reorderDrag(next);
+      if (before?.from !== after?.from || before?.to !== after?.to) setDrag(after);
     }
-    return current.from;
+    if (transition.move) onMove(transition.move.from, transition.move.to);
+    return transition.swallowClick === true;
   };
 
   /** The item's element, measured for the drop place (the whole row or tab). */
@@ -81,7 +74,7 @@ export function usePointerReorder({
     // A touch drag must not scroll the page or the strip. React's touch listeners are
     // passive, so this one is added here (non-passive) and only cancels once dragging.
     const blockScroll = (event: TouchEvent) => {
-      if (gesture.current?.started) event.preventDefault();
+      if (gesture.current.phase === "dragging") event.preventDefault();
     };
     element.addEventListener("touchmove", blockScroll, { passive: false });
     return () => {
@@ -94,71 +87,52 @@ export function usePointerReorder({
   const handleProps = (index: number) => ({
     onPointerDown: (event: ReactPointerEvent<HTMLElement>) => {
       if (event.button !== 0) return;
-      // A press that never got its release (it ended outside the page) gives way.
-      if (gesture.current) clear();
-      const current: Gesture = {
+      const touch = event.pointerType === "touch";
+      dispatch({
+        type: "down",
         pointerId: event.pointerId,
-        from: index,
-        startX: event.clientX,
-        startY: event.clientY,
-        started: false,
-        rects: [],
-        timer: null,
-        to: index,
-      };
-      gesture.current = current;
+        index,
+        x: event.clientX,
+        y: event.clientY,
+        immediate: touch && touchDelayMs <= 0,
+        measure,
+      });
       event.currentTarget.setPointerCapture?.(event.pointerId);
-      if (event.pointerType === "touch" && touchDelayMs > 0) {
-        current.timer = setTimeout(() => {
-          current.timer = null;
-          if (gesture.current === current) begin(current);
+      const press = gesture.current;
+      if (touch && press.phase === "pressing") {
+        longPress.current = setTimeout(() => {
+          longPress.current = null;
+          dispatch({ type: "longPress", press, measure });
         }, touchDelayMs);
-      } else if (event.pointerType === "touch") {
-        begin(current);
       }
     },
     onPointerMove: (event: ReactPointerEvent<HTMLElement>) => {
-      const current = gesture.current;
-      if (!current || current.pointerId !== event.pointerId) return;
-      const distance = Math.hypot(event.clientX - current.startX, event.clientY - current.startY);
-      if (!current.started) {
-        if (event.pointerType === "touch") {
-          // Moving before the long press ends is a scroll, not a drag.
-          if (distance > TOUCH_SLOP_PX) clear();
-          return;
-        }
-        if (distance < DRAG_THRESHOLD_PX) return;
-        begin(current);
-      }
-      const to = targetAt(current, event.clientX, event.clientY);
-      if (to !== current.to) {
-        current.to = to;
-        setDrag({ from: current.from, to });
-      }
+      dispatch({
+        type: "move",
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        touch: event.pointerType === "touch",
+        measure,
+      });
     },
     onPointerUp: (event: ReactPointerEvent<HTMLElement>) => {
-      const current = gesture.current;
-      if (!current || current.pointerId !== event.pointerId) return;
-      if (current.started) {
-        swallowClick.current = true;
-        if (current.to !== current.from) onMove(current.from, current.to);
-      }
-      clear();
+      dispatch({ type: "up", pointerId: event.pointerId });
     },
-    onPointerCancel: () => clear(),
+    onPointerCancel: () => {
+      dispatch({ type: "cancel" });
+    },
     onLostPointerCapture: () => {
-      if (gesture.current && !gesture.current.started) return;
-      clear();
+      dispatch({ type: "lostCapture" });
     },
     onClickCapture: (event: ReactMouseEvent<HTMLElement>) => {
-      if (!swallowClick.current) return;
-      swallowClick.current = false;
+      if (!dispatch({ type: "click" })) return;
       event.preventDefault();
       event.stopPropagation();
     },
     onContextMenu: (event: ReactMouseEvent<HTMLElement>) => {
       // A long press on touch opens no menu while it may become a drag.
-      if (gesture.current) event.preventDefault();
+      if (reorderActive(gesture.current)) event.preventDefault();
     },
   });
 

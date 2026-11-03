@@ -15,7 +15,8 @@
  *   4. the current version of every server-origin STARTABLE runtime of the owner (newest first).
  *
  * Nothing is sent to a node that is Relay only (or has a lowering pending): its set is frozen.
- * One operation per node is in flight; a sync asked for meanwhile runs after its final answer.
+ * One operation per node is in flight; a sync asked for meanwhile runs after its final answer
+ * (the per-node phases are {@link NodeSyncState}).
  */
 import { randomBytes } from "node:crypto";
 import { graphWrite } from "@ws-model-proxy/api/lib/graph-write";
@@ -329,15 +330,51 @@ export type DefineOutcome = {
   held: HeldDefinition[];
 };
 
-type InFlight = {
+type Waiter = (outcome: DefineOutcome | null) => void;
+
+/** One complete operation sent (or being built) for one session of a node. */
+type Operation = {
   opId: string;
   /** The session the operation was sent to; answers and losses of other sessions are ignored. */
   connectionGeneration: number;
+  /** The whole-operation deadline. */
   timer: ReturnType<typeof setTimeout>;
   results: Map<string, DefineEntryResult>;
-  waiters: Array<(outcome: DefineOutcome | null) => void>;
-  again: boolean;
+  waiters: Waiter[];
 };
+
+/**
+ * Where one node's definition sync is. A node with no entry is idle with no unanswered
+ * operation. `unanswered` counts operations in a row the current session never answered (the
+ * node expects a retry of the whole operation, at most {@link DEFINE_TIMEOUT_RETRIES} times).
+ *
+ *   idle ──sync──▶ building ──frames sent──▶ awaiting_answer ──final answer──▶ idle
+ *   building | awaiting_answer ──sync──▶ (same, with `rerun` waiters: one more run afterwards)
+ *   awaiting_answer ──deadline──▶ retry_backoff{timer} ──timer──▶ building (same session only)
+ *   any ──disconnect of that session / new session──▶ idle (timers cancelled)
+ */
+type NodeSyncState =
+  | { phase: "idle"; unanswered: number }
+  | {
+      phase: "building" | "awaiting_answer";
+      op: Operation;
+      unanswered: number;
+      /** A sync asked for meanwhile: runs after this one, and these waiters get its answer. */
+      rerun: Waiter[] | null;
+    }
+  | {
+      phase: "retry_backoff";
+      /** The session the retry is for: it is dropped if that session is gone. */
+      connectionGeneration: number;
+      timer: ReturnType<typeof setTimeout>;
+      unanswered: number;
+    };
+
+type OperatingState = Extract<NodeSyncState, { phase: "building" | "awaiting_answer" }>;
+
+function isOperating(state: NodeSyncState | undefined): state is OperatingState {
+  return state?.phase === "building" || state?.phase === "awaiting_answer";
+}
 
 export type PushDefinitionsResult = Array<{
   nodeId: string;
@@ -352,41 +389,74 @@ export function createRuntimeSync(
 ) {
   const operationTimeoutMs = options.operationTimeoutMs ?? DEFINE_OPERATION_TIMEOUT_MS;
   const answerWaitMs = options.answerWaitMs ?? DEFINE_ANSWER_WAIT_MS;
-  const inFlight = new Map<string, InFlight>();
-  /** Later syncs asked for while one is in flight wait for the one that runs after it. */
-  const queuedWaiters = new Map<string, Array<(outcome: DefineOutcome | null) => void>>();
-  /** Unanswered operations in a row per node: the node expects a retry of the whole operation. */
-  const timeouts = new Map<string, number>();
+  const nodes = new Map<string, NodeSyncState>();
+  const retryBaseMs = options.retryBaseMs ?? DEFINE_RETRY_BASE_MS;
 
-  /** A timed-out operation is sent again (same session, still Full control), with backoff. */
-  const retryAfterTimeout = (nodeId: string, connectionGeneration: number) => {
-    const count = timeouts.get(nodeId) ?? 0;
-    if (count >= DEFINE_TIMEOUT_RETRIES) return;
-    timeouts.set(nodeId, count + 1);
-    const timer = setTimeout(
-      () => {
-        const session = relay.nodeSession(nodeId);
-        if (session?.connectionGeneration === connectionGeneration && session.trust === "full")
-          void syncNode(nodeId);
-      },
-      (options.retryBaseMs ?? DEFINE_RETRY_BASE_MS) * 2 ** count,
-    );
-    timer.unref?.();
+  const currentOp = (nodeId: string): Operation | null => {
+    const state = nodes.get(nodeId);
+    return isOperating(state) ? state.op : null;
   };
 
-  const drainQueued = (nodeId: string) => {
-    const queued = queuedWaiters.get(nodeId) ?? [];
-    queuedWaiters.delete(nodeId);
-    for (const waiter of queued) waiter(null);
+  const setIdle = (nodeId: string, unanswered: number) => {
+    const state = nodes.get(nodeId);
+    if (state?.phase === "retry_backoff") clearTimeout(state.timer);
+    if (unanswered === 0) nodes.delete(nodeId);
+    else nodes.set(nodeId, { phase: "idle", unanswered });
   };
 
-  /** Ends exactly this operation (a no-op once another one owns the node's slot). */
-  const finish = (nodeId: string, op: InFlight, outcome: DefineOutcome | null) => {
-    if (inFlight.get(nodeId) !== op) return;
-    inFlight.delete(nodeId);
+  const resolveAll = (waiters: readonly Waiter[], outcome: DefineOutcome | null) => {
+    for (const waiter of waiters) waiter(outcome);
+  };
+
+  /**
+   * Ends exactly this operation (a no-op once another one owns the node's slot): its waiters get
+   * `outcome`, and a rerun asked for meanwhile starts. `next` says what follows: the answer was
+   * stored (`answered`), it timed out (`unanswered`), or it was cut short (`dropped`). With
+   * `keepRerun: false` the rerun waiters are handed back instead of starting a run.
+   */
+  const finish = (
+    nodeId: string,
+    op: Operation,
+    outcome: DefineOutcome | null,
+    next: "answered" | "unanswered" | "dropped",
+    keepRerun = true,
+  ): Waiter[] => {
+    const state = nodes.get(nodeId);
+    if (!isOperating(state) || state.op !== op) return [];
     clearTimeout(op.timer);
-    for (const waiter of op.waiters) waiter(outcome);
-    if (op.again) void syncNode(nodeId);
+    const rerun = state.rerun;
+    const prior = state.unanswered;
+    const unanswered =
+      next === "answered"
+        ? 0
+        : next === "unanswered"
+          ? Math.min(prior + 1, DEFINE_TIMEOUT_RETRIES)
+          : prior;
+    if (next === "unanswered" && prior < DEFINE_TIMEOUT_RETRIES && !(keepRerun && rerun)) {
+      // A timed-out operation is sent again (same session, still Full control), with backoff.
+      const connectionGeneration = op.connectionGeneration;
+      const timer = setTimeout(
+        () => {
+          const current = nodes.get(nodeId);
+          if (current?.phase !== "retry_backoff" || current.timer !== timer) return;
+          const session = relay.nodeSession(nodeId);
+          if (session?.connectionGeneration === connectionGeneration && session.trust === "full")
+            void syncNode(nodeId);
+          else setIdle(nodeId, current.unanswered);
+        },
+        retryBaseMs * 2 ** prior,
+      );
+      timer.unref?.();
+      nodes.set(nodeId, { phase: "retry_backoff", connectionGeneration, timer, unanswered });
+    } else {
+      setIdle(nodeId, unanswered);
+    }
+    resolveAll(op.waiters, outcome);
+    if (!rerun) return [];
+    if (!keepRerun) return rerun;
+    // The rerun is the retry a timeout asks for, too.
+    void syncNode(nodeId, rerun);
+    return [];
   };
 
   /**
@@ -394,38 +464,35 @@ export function createRuntimeSync(
    * control). Resolves with the node's answer, or null (offline, Relay only, replaced, not
    * answered in time). Never rejects.
    */
-  async function syncNode(nodeId: string): Promise<DefineOutcome | null> {
-    const running = inFlight.get(nodeId);
-    if (running) {
-      running.again = true;
+  async function syncNode(
+    nodeId: string,
+    inherited: readonly Waiter[] = [],
+  ): Promise<DefineOutcome | null> {
+    const current = nodes.get(nodeId);
+    if (isOperating(current)) {
       return new Promise((resolve) => {
-        const list = queuedWaiters.get(nodeId) ?? [];
-        list.push(resolve);
-        queuedWaiters.set(nodeId, list);
+        current.rerun = [...(current.rerun ?? []), ...inherited, resolve];
       });
     }
     const session = relay.nodeSession(nodeId);
     if (session?.trust !== "full") {
-      drainQueued(nodeId);
+      resolveAll(inherited, null);
       return null;
     }
-    const waiters = queuedWaiters.get(nodeId) ?? [];
-    queuedWaiters.delete(nodeId);
+    // A pending retry is superseded by this run (it never stacks a second operation).
+    if (current?.phase === "retry_backoff") clearTimeout(current.timer);
+    // Counted per session: `nodeReady` resets it for a new one.
+    const unanswered = current?.unanswered ?? 0;
     // Claim the slot before the first await so concurrent callers queue behind it.
-    const op: InFlight = {
+    const op: Operation = {
       opId: `define-${randomBytes(9).toString("hex")}`,
       connectionGeneration: session.connectionGeneration,
-      timer: setTimeout(() => {
-        if (inFlight.get(nodeId) !== op) return;
-        finish(nodeId, op, null);
-        retryAfterTimeout(nodeId, op.connectionGeneration);
-      }, operationTimeoutMs),
+      timer: setTimeout(() => finish(nodeId, op, null, "unanswered"), operationTimeoutMs),
       results: new Map(),
-      waiters,
-      again: false,
+      waiters: [...inherited],
     };
     op.timer.unref?.();
-    inFlight.set(nodeId, op);
+    nodes.set(nodeId, { phase: "building", op, unanswered, rerun: null });
     const answer = new Promise<DefineOutcome | null>((resolve) => op.waiters.push(resolve));
     try {
       const owner = await prisma.node.findUnique({
@@ -433,7 +500,7 @@ export function createRuntimeSync(
         select: { userId: true },
       });
       if (!owner) {
-        finish(nodeId, op, null);
+        finish(nodeId, op, null, "dropped");
         return answer;
       }
       // Read and sent under the owner's fence, which every claim and step writer and every
@@ -443,7 +510,7 @@ export function createRuntimeSync(
       await graphWrite([owner.userId], async (tx) => {
         const state = await loadNodeDefinitionState(nodeId, tx);
         // Replaced meanwhile (a new session took the slot): this operation is over.
-        if (inFlight.get(nodeId) !== op) return;
+        if (currentOp(nodeId) !== op) return;
         // The definitions are read under the node's owner (`loadNodeDefinitionState`); the live
         // session must be that owner's node too (defence in depth).
         if (
@@ -451,7 +518,7 @@ export function createRuntimeSync(
           state.userId !== owner.userId ||
           !nodeOwnerMatches(session, state.userId, "definition_sync")
         ) {
-          finish(nodeId, op, null);
+          finish(nodeId, op, null, "dropped");
           return;
         }
         const frames = buildCompleteOperation({
@@ -469,20 +536,22 @@ export function createRuntimeSync(
             ownerCheck: "definition_sync",
           });
           if (!sent) {
-            finish(nodeId, op, null);
-            break;
+            finish(nodeId, op, null, "dropped");
+            return;
           }
         }
+        const sending = nodes.get(nodeId);
+        if (isOperating(sending) && sending.op === op) sending.phase = "awaiting_answer";
       });
     } catch (error) {
       console.error("[runtime-sync] building the definition sync failed", errorName(error));
-      finish(nodeId, op, null);
+      finish(nodeId, op, null, "dropped");
     }
     return answer;
   }
 
   const handleResult = async (ref: NodeSessionRef, frame: DefineResultFrame) => {
-    const op = inFlight.get(ref.nodeId);
+    const op = currentOp(ref.nodeId);
     if (!op || op.opId !== frame.opId || op.connectionGeneration !== ref.connectionGeneration)
       return;
     for (const result of frame.results) op.results.set(result.versionId, result);
@@ -520,17 +589,25 @@ export function createRuntimeSync(
     } catch (error) {
       console.error("[runtime-sync] storing the held set failed", errorName(error));
     }
-    if (stored) timeouts.delete(ref.nodeId);
-    finish(ref.nodeId, op, stored ? { results: op.results, held } : null);
+    // An answer that was not stored keeps the unanswered count (as a dropped operation).
+    finish(
+      ref.nodeId,
+      op,
+      stored ? { results: op.results, held } : null,
+      stored ? "answered" : "dropped",
+    );
   };
 
-  /** Ends the node's operation if it was sent to this session. */
+  /** The session is gone: its operation ends, and so does a retry pending for it. */
   const finishForSession = (ref: NodeSessionRef) => {
-    const op = inFlight.get(ref.nodeId);
-    if (op && op.connectionGeneration === ref.connectionGeneration) {
-      op.again = false;
-      finish(ref.nodeId, op, null);
-      drainQueued(ref.nodeId);
+    const state = nodes.get(ref.nodeId);
+    if (isOperating(state) && state.op.connectionGeneration === ref.connectionGeneration) {
+      resolveAll(finish(ref.nodeId, state.op, null, "dropped", false), null);
+    } else if (
+      state?.phase === "retry_backoff" &&
+      state.connectionGeneration === ref.connectionGeneration
+    ) {
+      setIdle(ref.nodeId, state.unanswered);
     }
   };
 
@@ -542,15 +619,18 @@ export function createRuntimeSync(
     // is not stored, so the server cannot prove "nothing differs" without asking.
     definitionSync: async (ref) => (ref.trust === "full" ? "expect" : "none"),
     nodeReady: (ref) => {
-      // A new session: an operation sent to an earlier one will never be answered.
-      timeouts.delete(ref.nodeId);
-      const stale = inFlight.get(ref.nodeId);
-      if (stale && stale.connectionGeneration !== ref.connectionGeneration) {
-        stale.again = false;
-        finish(ref.nodeId, stale, null);
-      }
-      if (ref.trust === "full") void syncNode(ref.nodeId);
-      else drainQueued(ref.nodeId);
+      // A new session: an operation sent to an earlier one will never be answered, and a retry
+      // pending for it is void. Syncs asked for meanwhile get the new session's answer.
+      const state = nodes.get(ref.nodeId);
+      let inherited: Waiter[] = [];
+      if (isOperating(state) && state.op.connectionGeneration !== ref.connectionGeneration)
+        inherited = finish(ref.nodeId, state.op, null, "dropped", false);
+      const settled = nodes.get(ref.nodeId);
+      // Its unanswered count belongs to the old session.
+      if (!isOperating(settled)) setIdle(ref.nodeId, 0);
+      else settled.unanswered = 0;
+      if (ref.trust === "full") void syncNode(ref.nodeId, inherited);
+      else resolveAll(inherited, null);
     },
     nodeDisconnected: finishForSession,
     // Unfrozen: the server's current set replaces the frozen one.

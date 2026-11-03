@@ -1,3 +1,4 @@
+import { createSerialTask } from "../serial-task.js";
 import { expireProviderAttempts } from "./provider-attempt-runtime.js";
 
 const EXPIRY_INTERVAL_MS = 5_000;
@@ -15,20 +16,13 @@ export function startProviderAttemptExpiry(
   expire: () => Promise<unknown> = expireProviderAttempts,
   intervalMs = EXPIRY_INTERVAL_MS,
 ): () => void {
-  let running = false;
-  const run = async () => {
-    if (running) return;
-    running = true;
-    try {
-      await expire();
-    } catch {
-      console.warn("[provider-attempt] expiry sweep failed");
-    } finally {
-      running = false;
-    }
-  };
-  const timer = setInterval(() => void run(), intervalMs);
-  timer.unref?.();
-  void run();
-  return () => clearInterval(timer);
+  // A sweep that is still running when the interval fires is not queued again.
+  const task = createSerialTask({
+    run: expire,
+    overlap: "drop",
+    intervalMs,
+    onError: () => console.warn("[provider-attempt] expiry sweep failed"),
+  });
+  task.start();
+  return () => void task.stop();
 }

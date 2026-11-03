@@ -314,7 +314,7 @@ fn a_relay_only_node_attaches_to_the_confirm_screen_and_reads_keys_itself() {
     let frames = type_keys(&mut terminals, &mut a, b"ls -la; whoami");
     assert!(results(&frames).is_empty());
     assert!(
-        terminals.sessions[MULTI_TERMINAL].pty.is_none(),
+        terminals.sessions[MULTI_TERMINAL].pty().is_none(),
         "no process yet"
     );
 
@@ -475,8 +475,7 @@ fn a_stop_closes_confirm_screens_but_never_a_running_command() {
     assert!(terminals.sessions.contains_key(MULTI_TERMINAL));
     assert!(events.try_recv().is_err());
     let pid = terminals.sessions[MULTI_TERMINAL]
-        .pty
-        .as_ref()
+        .pty()
         .and_then(|pty| pty.pid)
         .expect("running command pid");
     assert!(!process_dead(pid), "the stop must leave the command alive");

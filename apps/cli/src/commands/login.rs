@@ -182,9 +182,9 @@ pub fn run(args: &Args) -> Result<()> {
             EnrollOutcome::Refused(refusal) => anyhow::bail!(refusal_message(&refusal)),
         }
     };
+    // Read before asking, so the prompt promises nothing it cannot do. Only a
+    // preview: the decision is made again under the config lock below.
     let leftover = prior != Prior::SameServer && frozen_exists();
-    // Checked before asking, so the prompt promises nothing it cannot do;
-    // checked again under the lock.
     let clear_refusal = if leftover {
         leftover_clear_refusal()
     } else {
@@ -200,19 +200,19 @@ pub fn run(args: &Args) -> Result<()> {
     };
     // A fresh enrollment's explicit Full choice clears a Relay-only setting
     // an earlier enrollment left, unless a running relay would undo it.
-    let wants_clear = leftover && explicit && trust == TrustValue::Full;
-    let mut clear_refused = false;
-    if wants_clear && let Some(reason) = clear_refusal {
+    let clear = ClearRequest::new(
+        leftover && explicit && trust == TrustValue::Full,
+        clear_refusal,
+    );
+    if let ClearRequest::Refused(reason) = clear {
         not_clearing(reason)?;
-        clear_refused = true;
     }
-    let may_clear = wants_clear && !clear_refused;
     // Not asked when the node will stay Relay only (rechecked under the lock),
     // nor from a process wsmp started while terminals are off: that "yes" would
     // only be skipped (also rechecked under the lock).
     let before = Config::load()?;
     let mut terminal_skipped = false;
-    let human_terminal = if lowering(&before, prior, may_clear) == Lowering::Keep {
+    let human_terminal = if lowering(&before, prior, clear.may_clear()) == Lowering::Keep {
         choose_human_terminal(args, TrustValue::Relay)?
     } else if let Some(reason) = started_by_wsmp
         .filter(|_| args.human_terminal.is_none() && asks(args) && !before.allow_human_terminal)
@@ -225,8 +225,7 @@ pub fn run(args: &Args) -> Result<()> {
     };
     // Set only when this re-login changed it: a running relay needs a restart.
     let human_terminal_changed;
-    let kept_relay;
-    let mut cleared = false;
+    let resolution;
     {
         let _lock = ConfigLock::exclusive()?;
         let mut config = Config::load()?;
@@ -239,50 +238,55 @@ pub fn run(args: &Args) -> Result<()> {
         }
         human_terminal_changed = config.server_url.is_some()
             && human_terminal.is_some_and(|allow| allow != config.allow_human_terminal);
-        let mut clear = false;
-        let mut chosen = match lowering(&config, prior, may_clear) {
-            Lowering::Keep => TrustValue::Relay,
-            Lowering::Clear => match leftover_clear_refusal() {
-                None => {
-                    clear = true;
-                    trust
-                }
-                Some(reason) => {
-                    not_clearing(reason)?;
-                    clear_refused = true;
-                    TrustValue::Relay
-                }
-            },
-            Lowering::None => trust,
-        };
-        if chosen == TrustValue::Relay {
+        // The one decision: the frozen copy and the saved trust as they are
+        // now, under the lock.
+        let mut decided = TrustResolution::resolve(
+            lowering(&config, prior, clear.may_clear()),
+            prior,
+            clear,
+            leftover_clear_refusal,
+        );
+        if let TrustResolution::StaysRelay(StaysRelay::ClearRefusedNow(reason)) = decided {
+            not_clearing(reason)?;
+        }
+        if decided.saved_trust(trust) == TrustValue::Relay {
             // The marker first, then the config (as every lowering does).
             crate::runtime_store::freeze()?;
+        }
+        // The config and the credential are two files, and a relay pairs the
+        // config's server with whatever credential is on disk. So another
+        // server's credential goes first: a failure from here on leaves no
+        // credential (run login again), never this server's URL with another
+        // server's credential.
+        if credential_is_for_another_server(crate::state::load_node_credential(), &server_url) {
+            crate::state::remove_node_credential()
+                .context("removing the earlier server's node credential")?;
         }
         config.server_url = Some(server_url.clone());
         config.public_origin = (public_origin != url_origin).then(|| public_origin.clone());
         config.cli_slug = Some(enrolled.slug.clone());
-        config.trust = Some(chosen);
+        config.trust = Some(decided.saved_trust(trust));
         if let Some(allow) = human_terminal {
             config.allow_human_terminal = allow;
         }
         config.save()?;
         // The marker goes only after the config is saved: until then (or
         // when removing it fails) the node stays Relay only.
-        if clear {
-            match crate::runtime_store::unfreeze() {
-                Ok(()) => cleared = true,
+        if decided == TrustResolution::Clearing {
+            decided = match crate::runtime_store::unfreeze() {
+                Ok(()) => TrustResolution::Cleared,
                 Err(error) => {
                     output::diagnostic(format!(
                         "warning: clearing the earlier Relay-only setting failed ({error:#})"
                     ))?;
-                    chosen = TrustValue::Relay;
-                    config.trust = Some(chosen);
+                    let failed = TrustResolution::StaysRelay(StaysRelay::ClearFailed);
+                    config.trust = Some(failed.saved_trust(trust));
                     config.save()?;
+                    failed
                 }
-            }
+            };
         }
-        kept_relay = chosen != trust;
+        resolution = decided;
     }
     save_node_credential(&NodeCredential {
         node_id: enrolled.node_id.clone(),
@@ -290,18 +294,8 @@ pub fn run(args: &Args) -> Result<()> {
         server: server_url.clone(),
         credential: enrolled.credential.clone(),
     })?;
-    if cleared {
-        output::diagnostic(
-            "cleared the Relay-only setting an earlier enrollment left on this machine",
-        )?;
-    } else if kept_relay {
-        output::diagnostic(if prior == Prior::SameServer {
-            "this node stays Relay only: it was lowered on this machine before; raise it with `wsmp trust full` on a terminal"
-        } else if clear_refused {
-            "this node stays Relay only; raise it with `wsmp trust full` on a terminal"
-        } else {
-            "this node stays Relay only: an earlier enrollment on this machine was lowered; pass `--trust full` to clear that, or raise it with `wsmp trust full` on a terminal"
-        })?;
+    if let Some(line) = resolution.message(trust) {
+        output::diagnostic(line)?;
     }
     let config = Config::load_required()?;
     let trust = crate::trust::configured(&config);
@@ -657,6 +651,127 @@ fn not_clearing(reason: &str) -> Result<()> {
     ))
 }
 
+/// Whether this login asks to clear an earlier enrollment's lowering, as
+/// known before asking anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearRequest {
+    /// Nothing to clear, or nobody explicitly chose Full.
+    None,
+    /// An explicit Full choice, refused for this reason (said once).
+    Refused(&'static str),
+    /// An explicit Full choice nothing refused (yet: rechecked under the lock).
+    Requested,
+}
+
+impl ClearRequest {
+    fn new(wants_clear: bool, refusal: Option<&'static str>) -> Self {
+        match (wants_clear, refusal) {
+            (false, _) => Self::None,
+            (true, Some(reason)) => Self::Refused(reason),
+            (true, None) => Self::Requested,
+        }
+    }
+
+    fn may_clear(self) -> bool {
+        self == Self::Requested
+    }
+}
+
+/// Why the node stays Relay only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaysRelay {
+    /// A same-server re-login keeps a person's lowering.
+    LoweredHere,
+    /// A fresh enrollment keeps an earlier enrollment's lowering: nobody
+    /// explicitly chose Full.
+    Leftover,
+    /// Clearing was refused before asking (already said).
+    ClearRefused,
+    /// Clearing was refused under the lock, for this reason (to be said).
+    ClearRefusedNow(&'static str),
+    /// Removing the frozen copy failed after the config was saved.
+    ClearFailed,
+}
+
+/// How a login settles trust against an earlier lowering. Decided once,
+/// under the config lock; the final line comes from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustResolution {
+    /// The chosen trust stands (Full, or Relay chosen by the person or the server).
+    AsChosen,
+    /// Full, clearing the leftover lowering once the config is saved.
+    Clearing,
+    /// Full, and the leftover lowering is gone.
+    Cleared,
+    /// Relay only, whatever was chosen.
+    StaysRelay(StaysRelay),
+}
+
+impl TrustResolution {
+    /// `refusal_now` is asked only when clearing is still on the table.
+    fn resolve(
+        lowering: Lowering,
+        prior: Prior,
+        clear: ClearRequest,
+        refusal_now: impl FnOnce() -> Option<&'static str>,
+    ) -> Self {
+        match lowering {
+            Lowering::None => Self::AsChosen,
+            Lowering::Keep => Self::StaysRelay(match (prior, clear) {
+                (Prior::SameServer, _) => StaysRelay::LoweredHere,
+                (_, ClearRequest::Refused(_)) => StaysRelay::ClearRefused,
+                _ => StaysRelay::Leftover,
+            }),
+            Lowering::Clear => match refusal_now() {
+                None => Self::Clearing,
+                Some(reason) => Self::StaysRelay(StaysRelay::ClearRefusedNow(reason)),
+            },
+        }
+    }
+
+    /// The trust `config.json` gets.
+    fn saved_trust(self, chosen: TrustValue) -> TrustValue {
+        match self {
+            Self::AsChosen | Self::Clearing | Self::Cleared => chosen,
+            Self::StaysRelay(_) => TrustValue::Relay,
+        }
+    }
+
+    /// The line saying what happened to an earlier lowering, if anything did.
+    fn message(self, chosen: TrustValue) -> Option<&'static str> {
+        match self {
+            Self::Cleared => {
+                Some("cleared the Relay-only setting an earlier enrollment left on this machine")
+            }
+            Self::AsChosen | Self::Clearing => None,
+            // Relay was chosen anyway: nothing was kept against the choice.
+            Self::StaysRelay(_) if chosen == TrustValue::Relay => None,
+            Self::StaysRelay(StaysRelay::LoweredHere) => Some(
+                "this node stays Relay only: it was lowered on this machine before; raise it with `wsmp trust full` on a terminal",
+            ),
+            Self::StaysRelay(
+                StaysRelay::ClearRefused | StaysRelay::ClearRefusedNow(_) | StaysRelay::ClearFailed,
+            ) => Some("this node stays Relay only; raise it with `wsmp trust full` on a terminal"),
+            Self::StaysRelay(StaysRelay::Leftover) => Some(
+                "this node stays Relay only: an earlier enrollment on this machine was lowered; pass `--trust full` to clear that, or raise it with `wsmp trust full` on a terminal",
+            ),
+        }
+    }
+}
+
+/// Whether the saved credential belongs to a server other than `server_url`
+/// (so it must not stay beside a config naming `server_url`). An unreadable
+/// one is never used, so it is left for the new credential to overwrite.
+fn credential_is_for_another_server(
+    saved: Result<Option<NodeCredential>>,
+    server_url: &str,
+) -> bool {
+    match saved {
+        Ok(Some(credential)) => origin_of(&credential.server) != origin_of(server_url),
+        Ok(None) | Err(_) => false,
+    }
+}
+
 /// The browser terminal setting to write: `Some` sets it, `None` keeps the
 /// saved one. Never asked at Relay only, where terminals cannot open.
 fn choose_human_terminal(args: &Args, trust: TrustValue) -> Result<Option<bool>> {
@@ -1005,6 +1120,88 @@ mod tests {
             assert_eq!(lowering_with(true, prior, relay, false), Lowering::Keep);
             assert_eq!(lowering_with(true, prior, relay, true), Lowering::Clear);
         }
+    }
+
+    #[test]
+    fn trust_resolution_follows_the_lowering_decided_under_the_lock() {
+        let never = || -> Option<&'static str> { panic!("only a Clear rechecks") };
+        let full = TrustValue::Full;
+        let relay = TrustValue::Relay;
+        // Nothing to keep: the chosen trust stands, silently.
+        let r = TrustResolution::resolve(Lowering::None, Prior::Stale, ClearRequest::None, never);
+        assert_eq!(r, TrustResolution::AsChosen);
+        assert_eq!(r.saved_trust(full), full);
+        assert_eq!(r.message(full), None);
+        // A same-server lowering is kept against a Full choice.
+        let r =
+            TrustResolution::resolve(Lowering::Keep, Prior::SameServer, ClearRequest::None, never);
+        assert_eq!(r, TrustResolution::StaysRelay(StaysRelay::LoweredHere));
+        assert_eq!(r.saved_trust(full), relay);
+        assert!(
+            r.message(full)
+                .unwrap()
+                .contains("lowered on this machine before")
+        );
+        // Nothing to say when Relay was the choice anyway.
+        assert_eq!(r.message(relay), None);
+        // A fresh enrollment's leftover, kept without an explicit Full choice.
+        let r = TrustResolution::resolve(Lowering::Keep, Prior::Stale, ClearRequest::None, never);
+        assert_eq!(r, TrustResolution::StaysRelay(StaysRelay::Leftover));
+        assert!(r.message(full).unwrap().contains("pass `--trust full`"));
+        // Refused before asking: the short line (the reason was said then).
+        let r = TrustResolution::resolve(
+            Lowering::Keep,
+            Prior::None,
+            ClearRequest::new(true, Some("a relay is running here")),
+            never,
+        );
+        assert_eq!(r, TrustResolution::StaysRelay(StaysRelay::ClearRefused));
+        assert_eq!(
+            r.message(full),
+            Some("this node stays Relay only; raise it with `wsmp trust full` on a terminal")
+        );
+        // Clear asks again under the lock.
+        let requested = ClearRequest::new(true, None);
+        assert!(requested.may_clear());
+        let r = TrustResolution::resolve(Lowering::Clear, Prior::Stale, requested, || None);
+        assert_eq!(r, TrustResolution::Clearing);
+        assert_eq!(r.saved_trust(full), full);
+        assert_eq!(r.message(full), None);
+        assert!(
+            TrustResolution::Cleared
+                .message(full)
+                .unwrap()
+                .starts_with("cleared")
+        );
+        let r = TrustResolution::resolve(Lowering::Clear, Prior::Stale, requested, || {
+            Some("started late")
+        });
+        assert_eq!(
+            r,
+            TrustResolution::StaysRelay(StaysRelay::ClearRefusedNow("started late"))
+        );
+        assert_eq!(r.saved_trust(full), relay);
+        // A failed clear does not tell the person to pass the flag they passed.
+        let failed = TrustResolution::StaysRelay(StaysRelay::ClearFailed);
+        assert!(!failed.message(full).unwrap().contains("--trust full"));
+    }
+
+    #[test]
+    fn another_servers_credential_is_removed_before_the_config_names_this_one() {
+        let here = "https://models.example.com";
+        assert!(!credential_is_for_another_server(Ok(None), here));
+        assert!(!credential_is_for_another_server(
+            Err(anyhow::anyhow!("0.3 format")),
+            here
+        ));
+        assert!(!credential_is_for_another_server(
+            Ok(Some(credential("https://models.example.com/"))),
+            here
+        ));
+        assert!(credential_is_for_another_server(
+            Ok(Some(credential("https://old.example"))),
+            here
+        ));
     }
 
     #[test]

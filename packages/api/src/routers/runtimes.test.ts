@@ -206,6 +206,8 @@ beforeEach(() => {
   // The definitions nodes require (`requiredDefinitionsByNode`): none unless a test says so.
   db.instanceRank.findMany.mockResolvedValue([]);
   db.instanceStep.findMany.mockResolvedValue([]);
+  // Step writes (`endSteps` reads how many ended): none matched unless a test says so.
+  db.instanceStep.updateMany.mockResolvedValue({ count: 0 });
   // The batched physical launches (`physicalLaunchIntents`: an agent's placement reads the nodes
   // they name): none unless a test says so.
   db.$queryRaw.mockResolvedValue([] as never);

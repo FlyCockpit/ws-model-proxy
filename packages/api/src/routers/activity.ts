@@ -16,6 +16,7 @@ import { callableIdOf } from "../lib/access-views";
 import { loadAgentNames } from "../lib/agent-names";
 import { programOfSubject } from "../lib/command-audit";
 import { runMetricsQuery } from "../lib/metrics-query";
+import { stepNeedsPersonWhere } from "../lib/operator-need";
 import { overviewSummary } from "../lib/overview-summary";
 
 type RequestRow = z.infer<typeof requestRowSchema>;
@@ -322,17 +323,7 @@ const needsYou = {
           // The step waiting for its person: its terminal (open or closed), a hold, or a
           // person's run past its timeout.
           Steps: {
-            where: {
-              OR: [
-                { state: "AWAITING_OPERATOR" },
-                { state: "PENDING", operatorHold: { not: null } },
-                {
-                  state: "RUNNING",
-                  operatorAcceptedAt: { not: null },
-                  deadline: { lte: now },
-                },
-              ],
-            },
+            where: stepNeedsPersonWhere(now),
             orderBy: { createdAt: "asc" },
             select: { id: true },
             take: 1,

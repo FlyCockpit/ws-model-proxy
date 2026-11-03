@@ -133,6 +133,67 @@ describe("useMcpReauthSignOut", () => {
   });
 });
 
+describe("useMcpReauthSignOut status", () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it("moves idle -> signing -> done, with the flags derived from that one status", async () => {
+    let release: (() => void) | null = null;
+    signOutMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({ data: {}, error: null });
+        }),
+    );
+    const { result } = renderHookWithClient();
+    expect(result.current.status).toBe("idle");
+    let flight: Promise<void> = Promise.resolve();
+    act(() => {
+      flight = result.current.signOutForReauth();
+    });
+    expect(result.current.status).toBe("signing");
+    expect(result.current.isSigningOut).toBe(true);
+    expect(result.current.signOutFailed).toBe(false);
+    await act(async () => {
+      release?.();
+      await flight;
+    });
+    expect(result.current.status).toBe("done");
+    expect(result.current.isSigningOut).toBe(false);
+    expect(result.current.signOutFailed).toBe(false);
+  });
+
+  it("moves to failed, then a retry passes through signing again (never failed and signing at once)", async () => {
+    signOutMock.mockResolvedValueOnce({ data: null, error: {} });
+    const { result } = renderHookWithClient();
+    await act(async () => {
+      await result.current.signOutForReauth();
+    });
+    expect(result.current.status).toBe("failed");
+
+    let release: (() => void) | null = null;
+    signOutMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({ data: {}, error: null });
+        }),
+    );
+    let flight: Promise<void> = Promise.resolve();
+    act(() => {
+      flight = result.current.signOutForReauth();
+    });
+    expect(result.current.status).toBe("signing");
+    expect(result.current.signOutFailed).toBe(false);
+    await act(async () => {
+      release?.();
+      await flight;
+    });
+    expect(result.current.status).toBe("done");
+  });
+});
+
 describe("tombstone-probe query scoping (R83/R84 F5, QueryClient level)", () => {
   afterEach(() => {
     cleanup();

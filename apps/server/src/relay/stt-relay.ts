@@ -255,14 +255,41 @@ export function sttTargetRefusal(
   return null;
 }
 
+/**
+ * One CLI-side session. `active` while a relay session owns it (whether it is opening or open
+ * is that session's state, never the leg's); `closing` once retired, waiting for `stt.closed`.
+ */
 type Leg = {
   sessionId: string;
   link: SttRelayLink;
   handle: string;
-  state: "opening" | "open" | "closing";
+  state: "active" | "closing";
   owner: SttRelaySession | null;
   timer: Timer | null;
 };
+
+/** What an attached session knows about its leg's member. */
+type Attached = {
+  leg: Leg;
+  adapter: RealtimeTranscriptionAdapter;
+  maxItemSeconds: number;
+};
+
+/**
+ * The relay session's life. The leg and what was negotiated for it exist only while attached,
+ * so "open without a leg" or a stale adapter after a failed open cannot be represented.
+ * - `opening`: `stt.open` sent; `resolve` answers the caller's `attach()`.
+ * - `open`: `stt.opened` seen; `held` sends nothing until {@link SttRelaySession.releaseHold}.
+ */
+type RelaySessionState =
+  | { kind: "detached" }
+  | (Attached & {
+      kind: "opening";
+      holdUntilReleased: boolean;
+      resolve: (result: SttAttachResult) => void;
+    })
+  | (Attached & { kind: "open"; held: boolean })
+  | { kind: "ended" };
 
 /** Legs by relay session id and by CLI connection. */
 class LegRegistry {
@@ -412,11 +439,7 @@ type ConsumeMark =
   | { kind: "commit"; itemSeq: number; controls: number };
 
 export class SttRelaySession {
-  private state: "detached" | "opening" | "open" | "ended" = "detached";
-  private leg: Leg | null = null;
-  private attachResolve: ((result: SttAttachResult) => void) | null = null;
-  private adapter: RealtimeTranscriptionAdapter | null = null;
-  private maxItemSeconds = 0;
+  private state: RelaySessionState = { kind: "detached" };
 
   private readonly queue: QueueEntry[] = [];
   private pendingAudio = 0;
@@ -428,8 +451,6 @@ export class SttRelaySession {
   private busyTimer: Timer | null = null;
   private expiryTimer: Timer | null = null;
   private pumping = false;
-  /** Opened, but nothing is sent until the caller's send claim commits ({@link releaseHold}). */
-  private held = false;
   /** Set from `opened` until the awaiting caller has seen the `opened` result. */
   private openedUnobserved = false;
   /** Absolute end of the session; its clock starts with the first `stt.open` sent. */
@@ -463,8 +484,25 @@ export class SttRelaySession {
     this.openConfig = wireConfig(config);
   }
 
-  get status(): "detached" | "opening" | "open" | "ended" {
-    return this.state;
+  get status(): RelaySessionState["kind"] {
+    return this.state.kind;
+  }
+
+  /** The leg this session currently owns (opening or open). */
+  private get leg(): Leg | null {
+    const state = this.state;
+    return state.kind === "opening" || state.kind === "open" ? state.leg : null;
+  }
+
+  /** The open state, when the session is open; read fresh, never narrowed across calls. */
+  private openState(): Extract<RelaySessionState, { kind: "open" }> | null {
+    return this.state.kind === "open" ? this.state : null;
+  }
+
+  /** The item length limit of the member this session is attached to (0 when detached). */
+  private get maxItemSeconds(): number {
+    const state = this.state;
+    return state.kind === "opening" || state.kind === "open" ? state.maxItemSeconds : 0;
   }
   /** The item new audio belongs to. */
   get openItemSeq(): number {
@@ -506,8 +544,8 @@ export class SttRelaySession {
       holdUntilReleased?: boolean;
     } = {},
   ): Promise<SttAttachResult> {
-    if (this.state === "ended") return Promise.resolve({ status: "ended" });
-    if (this.state !== "detached") throw new Error("The session is already attached.");
+    if (this.state.kind === "ended") return Promise.resolve({ status: "ended" });
+    if (this.state.kind !== "detached") throw new Error("The session is already attached.");
     if (this.remainingSessionMs() < STT_MAX_SESSION_MS_MIN) {
       // A failover this late would open a session the CLI must end at once.
       this.finish({ cause: "expired", failure: "timeout" }, null);
@@ -545,7 +583,7 @@ export class SttRelaySession {
       sessionId: newSessionId(),
       link,
       handle: target.handle,
-      state: "opening",
+      state: "active",
       owner: this,
       timer: null,
     };
@@ -584,11 +622,6 @@ export class SttRelaySession {
       );
     }
     this.registry.add(leg);
-    this.leg = leg;
-    this.state = "opening";
-    this.held = options.holdUntilReleased === true;
-    this.adapter = realtime.adapter;
-    this.maxItemSeconds = maxItemSeconds;
     // A non-finite budget (NaN, Infinity) falls back to the default; it must
     // never become an immediate timer.
     const requested = options.openTimeoutMs;
@@ -600,13 +633,20 @@ export class SttRelaySession {
       this.openFailed(leg, { reason: "timeout", failure: "timeout" }, "timeout"),
     );
     return new Promise((resolve) => {
-      this.attachResolve = resolve;
+      this.state = {
+        kind: "opening",
+        leg,
+        adapter: realtime.adapter,
+        maxItemSeconds,
+        holdUntilReleased: options.holdUntilReleased === true,
+        resolve,
+      };
     });
   }
 
   /** Copies `pcm` (raw s16le, 24 kHz mono); the caller may reuse it. */
   appendAudio(pcm: Uint8Array): SttAppendResult {
-    if (this.state === "ended") return { ok: false, reason: "ended" };
+    if (this.state.kind === "ended") return { ok: false, reason: "ended" };
     if (pcm.byteLength === 0) return { ok: false, reason: "empty" };
     if (pcm.byteLength % 2 !== 0) return { ok: false, reason: "odd_length" };
     if (pcm.byteLength > STT_APPEND_MAX_BYTES) return { ok: false, reason: "too_large" };
@@ -645,7 +685,7 @@ export class SttRelaySession {
 
   /** Ends the open item for transcription. */
   commit(): SttItemResult {
-    if (this.state === "ended") return { ok: false, reason: "ended" };
+    if (this.state.kind === "ended") return { ok: false, reason: "ended" };
     if (!this.openHasAudio) return { ok: false, reason: "empty" };
     if (this.items.size - 1 >= STT_PENDING_ITEMS_MAX)
       return { ok: false, reason: "too_many_items" };
@@ -662,7 +702,7 @@ export class SttRelaySession {
 
   /** Discards the open item; it uses up its number. Its unsent audio is dropped here. */
   clear(): SttItemResult {
-    if (this.state === "ended") return { ok: false, reason: "ended" };
+    if (this.state.kind === "ended") return { ok: false, reason: "ended" };
     const refused = this.controlRefusal();
     if (refused) return refused;
     const itemSeq = this.openSeq;
@@ -682,11 +722,13 @@ export class SttRelaySession {
 
   /** Language or prompt from the next item on. */
   update(config: SttConfig): SttUpdateResult {
-    if (this.state === "ended") return { ok: false, reason: "ended" };
+    if (this.state.kind === "ended") return { ok: false, reason: "ended" };
     // Checked against the wire schema before it is queued: a config the
     // encoder would refuse must never reach the queue.
     if (!sttConfigSchema.safeParse(config).success) return { ok: false, reason: "invalid" };
-    if (this.adapter === "vllm" && this.state !== "detached" && !configEmpty(config)) {
+    const attachedAdapter =
+      this.state.kind === "opening" || this.state.kind === "open" ? this.state.adapter : null;
+    if (attachedAdapter === "vllm" && !configEmpty(config)) {
       return { ok: false, reason: "unsupported" };
     }
     if (this.controlBacklogged()) return { ok: false, reason: "control_backlog" };
@@ -697,8 +739,9 @@ export class SttRelaySession {
 
   /** The send claim committed: what queued while held goes out now. */
   releaseHold() {
-    if (!this.held) return;
-    this.held = false;
+    const open = this.openState();
+    if (!open?.held) return;
+    open.held = false;
     this.pump();
   }
 
@@ -712,20 +755,14 @@ export class SttRelaySession {
    * run unauthorized.
    */
   cancelOpening() {
-    const leg = this.leg;
-    if (!leg) return;
-    if (leg.state === "opening") {
-      this.openFailed(leg, { reason: "aborted", failure: "cancelled" }, "cancelled");
+    const state = this.state;
+    if (state.kind === "opening") {
+      this.openFailed(state.leg, { reason: "aborted", failure: "cancelled" }, "cancelled");
       return;
     }
-    if (this.state !== "open") return;
-    if (this.held && this.seq === 0 && this.controlsSent === 0) {
-      this.registry.retire(leg, "cancelled");
-      this.leg = null;
-      this.state = "detached";
-      this.held = false;
-      this.adapter = null;
-      this.maxItemSeconds = 0;
+    if (state.kind !== "open") return;
+    if (state.held && this.seq === 0 && this.controlsSent === 0) {
+      this.detach(state.leg, "cancelled");
       return;
     }
     this.close("access_denied");
@@ -745,7 +782,7 @@ export class SttRelaySession {
 
   onLegFrame(leg: Leg, message: SttClientMessage) {
     if (this.leg !== leg) return;
-    if (leg.state === "opening") {
+    if (this.state.kind === "opening") {
       switch (message.type) {
         case "stt.opened":
           this.opened(leg);
@@ -803,7 +840,7 @@ export class SttRelaySession {
   /** A malformed frame named this session's leg. */
   onLegMalformed(leg: Leg) {
     if (this.leg !== leg) return;
-    if (leg.state === "opening") {
+    if (this.state.kind === "opening") {
       this.openFailed(
         leg,
         { reason: "protocol_error", failure: "protocol_error" },
@@ -817,7 +854,7 @@ export class SttRelaySession {
   /** The CLI connection is gone; the leg is already forgotten. */
   onLinkLost(leg: Leg) {
     if (this.leg !== leg) return;
-    if (leg.state === "opening") {
+    if (this.state.kind === "opening") {
       this.openFailed(leg, { reason: "disconnected", failure: "disconnected" }, null);
     } else {
       this.finish({ cause: "disconnected", failure: "disconnected" }, null);
@@ -827,7 +864,7 @@ export class SttRelaySession {
   /** The endpoint left the CLI's inventory. */
   onEndpointGone(leg: Leg) {
     if (this.leg !== leg) return;
-    if (leg.state === "opening") {
+    if (this.state.kind === "opening") {
       this.openFailed(leg, { reason: "endpoint_unavailable", failure: "not_found" }, "not_found");
     } else {
       this.finish({ cause: "endpoint_unavailable", failure: "not_found" }, "not_found");
@@ -866,16 +903,21 @@ export class SttRelaySession {
   }
 
   private opened(leg: Leg) {
+    const opening = this.state;
+    if (opening.kind !== "opening" || opening.leg !== leg) return;
     if (leg.timer) clearTimeout(leg.timer);
     leg.timer = null;
-    leg.state = "open";
-    this.state = "open";
-    const resolve = this.attachResolve;
-    this.attachResolve = null;
-    resolve?.({
+    this.state = {
+      kind: "open",
+      leg,
+      adapter: opening.adapter,
+      maxItemSeconds: opening.maxItemSeconds,
+      held: opening.holdUntilReleased,
+    };
+    opening.resolve({
       status: "opened",
-      adapter: this.adapter ?? "segmented",
-      maxItemSeconds: this.maxItemSeconds,
+      adapter: opening.adapter,
+      maxItemSeconds: opening.maxItemSeconds,
     });
     // The caller's `await attach()` continuation is queued by `resolve`; this
     // job runs after it. An end before then (the first send failing) defers
@@ -898,15 +940,16 @@ export class SttRelaySession {
     result: { reason: SttOpenFailureReason; failure: RelayFailure; message?: string },
     notify: RelayFailure | null,
   ) {
-    if (this.leg !== leg) return;
+    const opening = this.state;
+    if (opening.kind !== "opening" || opening.leg !== leg) return;
+    this.detach(leg, notify);
+    opening.resolve({ status: "failed", ...result });
+  }
+
+  /** Back to `detached` with the queue intact: the leg is retired with everything it carried. */
+  private detach(leg: Leg, notify: RelayFailure | null) {
     this.registry.retire(leg, notify);
-    this.leg = null;
-    this.state = "detached";
-    this.adapter = null;
-    this.maxItemSeconds = 0;
-    const resolve = this.attachResolve;
-    this.attachResolve = null;
-    resolve?.({ status: "failed", ...result });
+    this.state = { kind: "detached" };
   }
 
   private protocolError() {
@@ -1068,7 +1111,7 @@ export class SttRelaySession {
     this.backlogged = false;
     if (this.stallTimer) clearTimeout(this.stallTimer);
     this.stallTimer = null;
-    if (this.state === "ended") return;
+    if (this.status === "ended") return;
     try {
       this.consumer.onDrain();
     } catch (error) {
@@ -1078,10 +1121,11 @@ export class SttRelaySession {
 
   /** Sends queued audio within credit, coalesced, and commands in order. */
   private pump() {
-    if (this.pumping || this.held || this.state !== "open" || !this.leg) return;
+    const open = this.openState();
+    if (this.pumping || !open || open.held) return;
     this.pumping = true;
     try {
-      this.pumpLoop(this.leg);
+      this.pumpLoop(open.leg);
     } catch (error) {
       // An invariant broke (a frame the encoder refused). End this session;
       // never throw out of a timer or a relay frame handler.
@@ -1096,7 +1140,7 @@ export class SttRelaySession {
   }
 
   private pumpLoop(leg: Leg) {
-    while (this.state === "open" && this.leg === leg) {
+    while (this.openState()?.leg === leg) {
       const head = this.queue[0];
       if (!head) return;
       if (leg.link.bufferedAmount() > STT_RELAY_BUFFER_LIMIT) {
@@ -1179,8 +1223,9 @@ export class SttRelaySession {
    * `stt.close{notify}`; without it the CLI already ended the leg.
    */
   private finish(end: SttSessionEnd, notify: RelayFailure | null) {
-    if (this.state === "ended") return;
-    this.state = "ended";
+    const ending = this.state;
+    if (ending.kind === "ended") return;
+    this.state = { kind: "ended" };
     for (const timer of [this.stallTimer, this.flushTimer, this.busyTimer, this.expiryTimer]) {
       if (timer) clearTimeout(timer);
     }
@@ -1190,15 +1235,11 @@ export class SttRelaySession {
     this.pendingControls = 0;
     this.marks.length = 0;
     this.framesInFlight = 0;
-    this.held = false;
     this.items.clear();
-    const leg = this.leg;
-    this.leg = null;
-    if (leg) this.registry.retire(leg, notify);
+    if (ending.kind === "opening" || ending.kind === "open")
+      this.registry.retire(ending.leg, notify);
     this.hub.forget(this);
-    const resolve = this.attachResolve;
-    this.attachResolve = null;
-    resolve?.({ status: "ended" });
+    if (ending.kind === "opening") ending.resolve({ status: "ended" });
     const notifyEnd = () => {
       try {
         this.consumer.onEnd(end);

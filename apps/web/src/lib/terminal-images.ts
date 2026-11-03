@@ -162,29 +162,59 @@ export function terminalImagePasteText(path: string, paste?: string): string {
   return /^[A-Za-z0-9_./-]+$/.test(path) ? `${path} ` : `'${path.replaceAll("'", "'\\''")}' `;
 }
 
+/**
+ * One upload's offer to the node, from the first chunk to its paste:
+ * - `uploading`: chunks are going out; if it stops before the end, it is cancelled.
+ * - `offered`: the node saved the image and the caller holds its paste text.
+ * - `cancelled`: a cancel was sent (once): nothing more is said about this id.
+ */
+type TerminalImageOffer = "uploading" | "offered" | "cancelled";
+
+/** Where the upload in progress is in its stop-and-wait loop. */
+type TerminalImageUploadStep =
+  | { kind: "sending" }
+  | { kind: "awaitingAck"; received: number; settle: (result: TerminalImageReply | Error) => void }
+  /** Its attach ended (`abort`): it stops at its next check and never returns a paste. */
+  | { kind: "aborted" };
+
+type TerminalImageUpload = { id: string; step: TerminalImageUploadStep };
+
+/**
+ * The viewer's image transfer:
+ * - `unsupported`: the CLI has not announced image support (an older CLI); nothing is sent.
+ * - `idle`: supported, no upload in progress.
+ * - `uploading`: one upload in progress (stop-and-wait: one chunk out at a time).
+ */
+export type TerminalImageTransferState =
+  | { kind: "unsupported" }
+  | { kind: "idle" }
+  | { kind: "uploading"; upload: TerminalImageUpload };
+
 /** One stop-and-wait upload per attached viewer, with no automatic replay of writes. */
 export class TerminalImageTransfer {
-  supported = false;
-  private busy = false;
-  private cancelled = false;
-  private pending: {
-    id: string;
-    received: number;
-    resolve: (reply: TerminalImageReply) => void;
-    reject: (error: Error) => void;
-  } | null = null;
+  private state: TerminalImageTransferState = { kind: "unsupported" };
 
+  /** The CLI announced image support on this attach. */
+  markSupported(): void {
+    if (this.state.kind === "unsupported") this.state = { kind: "idle" };
+  }
+
+  /** The attach ended: the upload in progress (if any) fails at once and returns no paste. */
   abort(): void {
-    this.cancelled = true;
-    this.pending?.reject(new Error("unavailable"));
+    if (this.state.kind !== "uploading") return;
+    const upload = this.state.upload;
+    const step = upload.step;
+    upload.step = { kind: "aborted" };
+    if (step.kind === "awaitingAck") step.settle(new Error("unavailable"));
   }
 
   receive(reply: TerminalImageReply): void {
-    const pending = this.pending;
-    if (!pending || pending.id !== reply.id) return;
-    if (reply.error) pending.reject(new Error(reply.error));
-    else if (reply.received !== pending.received) pending.reject(new Error("invalid"));
-    else pending.resolve(reply);
+    if (this.state.kind !== "uploading") return;
+    const step = this.state.upload.step;
+    if (step.kind !== "awaitingAck" || this.state.upload.id !== reply.id) return;
+    if (reply.error) step.settle(new Error(reply.error));
+    else if (reply.received !== step.received) step.settle(new Error("invalid"));
+    else step.settle(reply);
   }
 
   async upload(
@@ -193,19 +223,18 @@ export class TerminalImageTransfer {
     isCurrent: () => boolean,
     progress: (percent: number) => void,
   ): Promise<TerminalImageAttachment> {
-    if (!this.supported) throw new Error("update");
-    if (this.busy) throw new Error("busy");
+    if (this.state.kind === "unsupported") throw new Error("update");
+    if (this.state.kind === "uploading") throw new Error("busy");
     if (file.size < 1 || file.size > TERMINAL_IMAGE_MAX_BYTES) throw new Error("too_large");
     const format = terminalImageFormat(file.type);
     const random = crypto.getRandomValues(new Uint8Array(16));
     const id = Array.from(random, (byte) => byte.toString(16).padStart(2, "0")).join("");
-    this.cancelled = false;
-    this.busy = true;
-    let completed = false;
-    let cancelSent = false;
+    const upload: TerminalImageUpload = { id, step: { kind: "sending" } };
+    this.state = { kind: "uploading", upload };
+    let offer: TerminalImageOffer = "uploading";
     const cancel = () => {
-      if (cancelSent || !isCurrent()) return;
-      cancelSent = true;
+      if (offer === "cancelled" || !isCurrent()) return;
+      offer = "cancelled";
       // IDs isolate this offer from later uploads, even if disposal is late.
       try {
         send(encodeTerminalImageControl(TERMINAL_IMAGE_CANCEL, id));
@@ -213,38 +242,41 @@ export class TerminalImageTransfer {
         /* Detach or offer expiry also cleans it up. */
       }
     };
+    const stopped = () => upload.step.kind === "aborted" || !isCurrent();
     try {
       for (let offset = 0; offset < file.size; offset += TERMINAL_IMAGE_CHUNK_BYTES) {
-        if (this.cancelled || !isCurrent()) throw new Error("unavailable");
+        if (stopped()) throw new Error("unavailable");
         const data = new Uint8Array(
           await file.slice(offset, offset + TERMINAL_IMAGE_CHUNK_BYTES).arrayBuffer(),
         );
-        if (this.cancelled || !isCurrent()) throw new Error("unavailable");
+        if (stopped()) throw new Error("unavailable");
         const received = offset + data.length;
         const reply = await new Promise<TerminalImageReply>((resolve, reject) => {
           const timer = setTimeout(
-            () => finish(new Error("timeout")),
+            () => settle(new Error("timeout")),
             TERMINAL_IMAGE_ACK_TIMEOUT_MS,
           );
-          const finish = (result: TerminalImageReply | Error) => {
+          const settle = (result: TerminalImageReply | Error) => {
             clearTimeout(timer);
-            this.pending = null;
+            if (upload.step.kind === "awaitingAck" && upload.step.settle === settle) {
+              upload.step = { kind: "sending" };
+            }
             if (result instanceof Error) reject(result);
             else resolve(result);
           };
-          this.pending = { id, received, resolve: finish, reject: finish };
+          upload.step = { kind: "awaitingAck", received, settle };
           try {
             send(encodeTerminalImageChunk({ id, total: file.size, offset, format, data }));
           } catch {
-            finish(new Error("unavailable"));
+            settle(new Error("unavailable"));
           }
         });
-        if (this.cancelled || !isCurrent()) throw new Error("unavailable");
+        if (stopped()) throw new Error("unavailable");
         progress(Math.round((received / file.size) * 100));
         if (received === file.size) {
           if (!reply.path) throw new Error("invalid");
           const text = terminalImagePasteText(reply.path, reply.paste);
-          completed = true;
+          offer = "offered";
           return { id, text, cancel };
         }
         if (reply.path) throw new Error("invalid");
@@ -253,8 +285,10 @@ export class TerminalImageTransfer {
       }
       throw new Error("invalid");
     } finally {
-      this.busy = false;
-      if (!completed) cancel();
+      if (this.state.kind === "uploading" && this.state.upload === upload) {
+        this.state = { kind: "idle" };
+      }
+      if (offer === "uploading") cancel();
     }
   }
 }

@@ -879,6 +879,9 @@ function agentUpdateAuthorityRefusal(
   generation: number,
 ): RefusalReason | null {
   if (!locked) return "trust_relay";
+  // The stored connection as a fence (which connection is current), not as liveness: a stale
+  // heartbeat does not change the generation, and the live session gate below is the authority
+  // on whether the node is reachable (`nodeLiveness` is for readers without a session).
   if (locked.connection !== "ONLINE" || locked.connectionGeneration !== generation)
     return "node_offline";
   const gate = liveAgentUpdateGate({ ...locked, userId }, live, generation);

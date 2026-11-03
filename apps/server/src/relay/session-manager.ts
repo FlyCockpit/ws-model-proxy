@@ -30,6 +30,14 @@
  *   `closeSessionsForRevokedCredentials({ ids })`, `closeSessionsForNodes(nodeIds)`,
  *   `beginDrain`, `isDraining`, `closeIdleRelaySessions`, `closeRelaySessions`,
  *   `checkStaleSessions`, `dispose`.
+ *
+ * State machines (each in its own module, moved only by its transitions):
+ * - A node socket's handshake phase and the manager's running / draining / disposed lifecycle:
+ *   `session-phase.ts`. Readiness is read in one place (`liveNode`, `readyNode`).
+ * - An interactive step's operator terminal (spawning / awaiting / running / cancelling, the
+ *   running stage owning its acceptance retry): `operator-step.ts`.
+ * - A terminal's phase (pending / opening / open, with an open deadline) and its viewers
+ *   (pending / attached): `terminal-record.ts`.
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { evaluateEngineLoad } from "@ws-model-proxy/api/lib/engine-load";
@@ -84,13 +92,22 @@ import {
   createRoutingEvaluationState,
   historyEngineFacts,
   MetricRoutingEvaluator,
-  type RoutingEvaluationState,
   type RuntimeLoadReading,
 } from "./metric-routing-evaluator.js";
 import { type NodeAuditOutcome, recordNodeAuditEvent } from "./node-audit.js";
 import type { NodeIdentity } from "./node-credential-auth.js";
 import { observeNodeMetricsRollup } from "./node-metrics-rollup.js";
 import { type NodeOwnerCheck, nodeOwnerMatches } from "./node-owner.js";
+import {
+  acceptanceRetryOf,
+  advanceOperatorStep,
+  endAcceptanceRetry,
+  newOperatorStep,
+  type OperatorAcceptanceRetry,
+  type OperatorStep,
+  operatorStepLive,
+  startAcceptanceRetry,
+} from "./operator-step.js";
 import {
   binaryFrameTarget,
   describeRelayControlParseError,
@@ -128,6 +145,22 @@ import {
   writeNodeTelemetry,
 } from "./registration.js";
 import { observeRuntimeLoadRollup } from "./runtime-load-rollup.js";
+import {
+  acknowledgeHello,
+  advanceLifecycle,
+  awaitingHello,
+  beginRegistration,
+  closePhase,
+  installRegistered,
+  liveNode,
+  type ManagerLifecycle,
+  preRegistration,
+  type RegisteredNode,
+  readyNode,
+  registeredNode,
+  type SessionPhase,
+  type TerminalIdentity,
+} from "./session-phase.js";
 import type { SttConfig } from "./stt-protocol.js";
 import {
   type SttClientMessage,
@@ -143,6 +176,20 @@ import {
   TARGET_RECOVERY_PROBE_TIMEOUT_MS,
   TargetRecoveryScheduler,
 } from "./target-recovery.js";
+import {
+  attachedViewer,
+  attachedViewers,
+  connViewerIds,
+  holdsTerminalSlot,
+  mintViewerId,
+  openDeadlinePassed,
+  pendingViewer,
+  pendingViewers,
+  TERMINAL_PENDING_TTL_MS,
+  type TerminalRecord,
+  terminalConnIds,
+  viewerIdForConn,
+} from "./terminal-record.js";
 
 export { NODE_INFO_MIN_INTERVAL_MS };
 
@@ -170,7 +217,6 @@ type NodeMetricsFrame = NodeFrame<"node.metrics">;
 type NodeInfoFrame = NodeFrame<"node.info">;
 type RuntimeLoadFrame = NodeFrame<"runtime.load">;
 type TerminalHandshakeIdentity = NonNullable<ServerFrame<"term.open">["identity"]>;
-type TerminalIdentity = NonNullable<NodeFrame<"hello">["node"]["terminalIdentity"]>;
 
 // Per-request outbound request-body stream. The server holds the remaining body chunks and
 // only emits them while the node has granted credits, so a slow upstream on one request pauses
@@ -211,67 +257,10 @@ export type TrackedFileOp = {
   markLost(cause: FileOpLossCause): void;
 };
 
-/** One browser tab's attachment to a terminal. `connId` is the browser socket. */
-type TerminalViewer = { connId: string; attachedAt: number };
-type TerminalPendingViewer = { connId: string; requestedAt: number };
+export type { TerminalRecord } from "./terminal-record.js";
 
-/** A browser shell on a node (multi-viewer: every node frame names its viewer). */
-export type TerminalRecord = {
-  terminalId: string;
-  userId: string;
-  nodeId: string;
-  cols: number;
-  rows: number;
-  /** Attached viewers by server-minted viewer id. */
-  viewers: Map<string, TerminalViewer>;
-  /** Viewers waiting for the node (approval, or term.opened / term.attached). */
-  pendingViewers: Map<string, TerminalPendingViewer>;
-  /** Reported by the node with term.writer. */
-  writerViewerId: string | null;
-  phase: "pending" | "opening" | "open";
-  createdAt: number;
-  /**
-   * Set for the operator terminal of an interactive runtime step (spec §4.7): opened by the
-   * node for a `runtime.job` this server sent, attached only by a ticket from
-   * `runtimes.steps.attach`, allowed at Relay only too, never listed with the browser shells
-   * and never counted against their limits. Null for a browser shell.
-   */
-  operator: OperatorTerminalInfo | null;
-};
-
-/** What the relay knows about an operator terminal (no command text). */
-export type OperatorTerminalInfo = {
-  stepId: string;
-  instanceId: string;
-  rank: number;
-  /** `spawning` until `awaiting_operator`; `running` once the person pressed Enter. */
-  state: "spawning" | "awaiting" | "running";
-};
-
-/**
- * One interactive step this session sent with an operator terminal, by step id, from the send
- * until its final result, `operator_closed`, a replacement or the session's end. It outlives
- * the terminal record: the node ends the terminal (`term.exit`) before its final result.
- */
 /** What closing a step's operator terminal found (`closeOperatorStep`). */
 export type OperatorCloseAnswer = "unopened" | "closed" | "running" | "absent";
-
-type OperatorStepTracker = {
-  stepId: string;
-  instanceId: string;
-  rank: number;
-  phase: RuntimeJobFrame["phase"];
-  intentHash: string;
-  ownerEpoch: string;
-  terminalId: string;
-  userId: string;
-  nodeId: string;
-  state: OperatorTerminalInfo["state"];
-  /** `operator_running` was seen for this terminal. */
-  accepted: boolean;
-  /** The server closed the terminal; only the node's answer to that close still routes. */
-  cancelled: boolean;
-};
 
 /**
  * Interactive steps one session may track at once. The engine opens at most 4 operator
@@ -283,16 +272,6 @@ export const OPERATOR_STEPS_PER_SESSION = 16;
 export const OPERATOR_ACCEPT_RETRIES = 6;
 /** The first retry's delay; each next one doubles (1 s ... 32 s). */
 export const OPERATOR_ACCEPT_RETRY_MS = 1_000;
-
-/**
- * A pending redelivery of one step's failed `operator_running`. `timer` is null while a
- * redelivery is in flight; the chain owns the map entry until it ends or is cancelled.
- */
-type OperatorAcceptanceRetry = {
-  terminalId: string;
-  attempt: number;
-  timer: ReturnType<typeof setTimeout> | null;
-};
 
 export type TerminalWriterLabel = "you" | "other" | "none";
 
@@ -367,7 +346,6 @@ export function terminalLimitReached(counts: { user: number; node: number }): bo
 /** Attached viewers plus pending approvals per terminal. */
 export const TERMINAL_VIEWER_LIMIT = 8;
 const NODE_SEALED_BUFFER_LIMIT = 1024 * 1024;
-const TERMINAL_PENDING_TTL_MS = 2 * 60 * 1000;
 /**
  * `node.metrics` frames closer together than this are dropped. The node keeps them at least
  * 5 s apart; the margin absorbs network jitter.
@@ -604,27 +582,19 @@ type SessionState = {
 
   connectedAt: Date;
   lastHeartbeatAt: Date;
-  nodeId: string | null;
-  slug: string | null;
   /**
-   * The node's connection generation this session was accepted under. A disconnect write
-   * presents it and is refused once the node has accepted a later connection.
+   * The handshake phase (`session-phase.ts`): the challenge nonce and registration deadline
+   * before registration, the node's identity once registered, whether `hello.ok` was sent.
+   * Moved only by the phase transitions; read through `liveNode` / `readyNode` /
+   * `registeredNode`.
    */
-  connectionGeneration: number | null;
-  registered: boolean;
-  /** `hello.ok` was sent: lane frames (`sendToNode`) may follow; nothing but hello before. */
-  helloAcked: boolean;
-  protocolVersion: string | null;
-  nodeVersion: string | null;
+  phase: SessionPhase;
   /** Effective trust: only `syncTrust` raises it; anything may lower it (fail closed). */
   trust: NodeTrustWire;
   /** What the node itself last reported (hello, `node.state`): Full needs it Full too. */
   reportedTrust: NodeTrustWire;
   /** The pending lowering a `trust.lower` was sent for (its request time), not to repeat it. */
   trustLowerSentFor: string | null;
-  features: NodeFeatures | null;
-  terminalPublicKey: string | null;
-  terminalIdentity: TerminalIdentity | null;
   servedHandles: Set<string>;
   inventory: InventoryAssembly | null;
   /** Inventory snapshots completed on this session (each one's publication order). */
@@ -632,23 +602,15 @@ type SessionState = {
   /** The newest completed snapshot whose answer was applied (published or refused). */
   inventoryPublished: number;
   terminalsById: Map<string, TerminalRecord>;
-  /** Interactive steps sent with an operator terminal, by step id. */
-  operatorSteps: Map<string, OperatorStepTracker>;
+  /** Interactive steps sent with an operator terminal, by step id (each owns its retry chain). */
+  operatorSteps: Map<string, OperatorStep>;
   /**
    * Per `instanceId:rank`, the highest runs whose start-phase job and run-ending stop this
    * session sent: a job they make stale is not delivered (`staleRunJob`).
    */
   runDeliveries: RunDeliveries;
-  /**
-   * The one retry chain of a failed `operator_running` write, by step id
-   * (`retryOperatorAcceptance`). Cancelled with the session's interactive work and by `dispose`.
-   */
-  acceptanceRetries: Map<string, OperatorAcceptanceRetry>;
   /** In-flight node file ops by op id (answers route only to the session that got the op). */
   filesById: Map<string, TrackedFileOp>;
-  unauthenticatedTimer: ReturnType<typeof setTimeout>;
-  /** One-shot nonce from `hello.challenge`; consumed when hello is verified. */
-  helloNonce: string | null;
   bodyStreamsByRequest: Map<string, OutboundBodyStream>;
   nodeInfoAcceptedAtMs: number | null;
   nodeMetrics: {
@@ -661,7 +623,6 @@ type SessionState = {
   runtimeLoad: Map<string, LiveRuntimeLoadEntry>;
   malformedTelemetryLoggedAtMs: number | null;
   malformedSttLoggedAtMs: number | null;
-  routingEvaluation: RoutingEvaluationState | null;
 };
 
 export type ActiveRelayResponseHandlers = {
@@ -694,49 +655,6 @@ type ResolvedInstance = {
     loadSignals: string[];
   };
 };
-
-function mintViewerId(terminal?: TerminalRecord): string {
-  for (;;) {
-    const viewerId = randomBytes(16).toString("base64url");
-    if (!terminal || (!terminal.viewers.has(viewerId) && !terminal.pendingViewers.has(viewerId))) {
-      return viewerId;
-    }
-  }
-}
-
-/** Distinct browser sockets that hold or wait for this terminal. */
-function terminalConnIds(terminal: TerminalRecord): string[] {
-  const connIds = new Set<string>();
-  for (const viewer of terminal.viewers.values()) connIds.add(viewer.connId);
-  for (const pending of terminal.pendingViewers.values()) connIds.add(pending.connId);
-  return [...connIds];
-}
-
-/** The (terminal, browser socket) -> viewer ids lookup, derived from the viewer maps. */
-function connViewerIds(terminal: TerminalRecord, connId: string): string[] {
-  const viewerIds: string[] = [];
-  for (const [viewerId, viewer] of terminal.viewers) {
-    if (viewer.connId === connId) viewerIds.push(viewerId);
-  }
-  for (const [viewerId, pending] of terminal.pendingViewers) {
-    if (pending.connId === connId) viewerIds.push(viewerId);
-  }
-  return viewerIds;
-}
-
-function attachedViewerIdForConn(terminal: TerminalRecord, connId: string): string | null {
-  for (const [viewerId, viewer] of terminal.viewers) {
-    if (viewer.connId === connId) return viewerId;
-  }
-  return null;
-}
-
-function pendingViewerIdForConn(terminal: TerminalRecord, connId: string): string | null {
-  for (const [viewerId, pending] of terminal.pendingViewers) {
-    if (pending.connId === connId) return viewerId;
-  }
-  return null;
-}
 
 function isSttClientMessage(message: NodeToServerControlFrame): message is SttClientMessage {
   return message.type.startsWith("stt.");
@@ -825,9 +743,6 @@ export class RelaySessionManager {
   >();
   private affinityResetTimer: ReturnType<typeof setInterval> | undefined;
   private affinityResetRecoveryRunning = false;
-  private affinityResetClosed = false;
-  /** `dispose` ran: no acceptance retry is scheduled any more. */
-  private acceptanceRetriesClosed = false;
   private affinityResetWrites = new Set<Promise<void>>();
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByNodeId = new Map<string, SessionState>();
@@ -861,13 +776,30 @@ export class RelaySessionManager {
   private frameHandlers: NodeFrameHandlers = {};
   private relayAttemptStarter: RelayAttemptStarter | null = null;
   /**
-   * Shutdown drain flag, shared by the relay and the browser terminal hub. Set by
-   * {@link beginDrain} and again by {@link closeIdleRelaySessions} / {@link closeRelaySessions};
-   * one-way. While set: new relay and browser terminal upgrades answer 503, no new model
-   * request is sent, a node socket closes once its last model request finishes, and a socket
-   * whose authentication finished after the drain began is closed on open.
+   * The manager's lifecycle (`session-phase.ts`), one-way: `running`, then `draining` from
+   * {@link beginDrain} (again by {@link closeIdleRelaySessions} / {@link closeRelaySessions}),
+   * then `disposed` from {@link dispose}, which implies the drain. Shared by the relay and the
+   * browser terminal hub. Once draining: new relay and browser terminal upgrades answer 503, no
+   * new model request is sent, a node socket closes once its last model request finishes, a
+   * socket whose authentication finished after the drain began is closed on open, and the
+   * affinity reset recovery is stopped. Once disposed, no acceptance retry is scheduled either.
    */
-  private relayDrain = false;
+  private lifecycle: ManagerLifecycle = "running";
+
+  /** The drain began (or the manager was disposed): see {@link lifecycle}. */
+  private get relayDrain(): boolean {
+    return this.lifecycle !== "running";
+  }
+
+  /** Affinity reset recovery stopped (with the drain). */
+  private get affinityResetClosed(): boolean {
+    return this.lifecycle !== "running";
+  }
+
+  /** `dispose` ran: no acceptance retry is scheduled any more. */
+  private get acceptanceRetriesClosed(): boolean {
+    return this.lifecycle === "disposed";
+  }
   /** Live speech-to-text sessions; each registered node session is one link. */
   private readonly stt = new SttRelayHub({
     resolveLink: (nodeId, handle) => this.resolveSttLink(nodeId, handle),
@@ -906,15 +838,11 @@ export class RelaySessionManager {
   sendToNode(nodeId: string, frame: ServerToNodeControlFrame, guard: SendGuard = {}): boolean {
     if (this.relayDrain) return false;
     const session = this.sessionsByNodeId.get(nodeId);
-    if (
-      !session?.registered ||
-      !session.helloAcked ||
-      session.socket.readyState !== WS_READY_STATE_OPEN
-    )
-      return false;
+    const node = session ? this.laneNode(session) : null;
+    if (!session || !node) return false;
     if (
       guard.connectionGeneration !== undefined &&
-      session.connectionGeneration !== guard.connectionGeneration
+      node.connectionGeneration !== guard.connectionGeneration
     )
       return false;
     if (guard.requireFullTrust && session.trust !== "full") return false;
@@ -967,17 +895,17 @@ export class RelaySessionManager {
     selfUpdate: NodeSelfUpdate | null;
   } | null {
     const session = this.sessionsByNodeId.get(nodeId);
-    if (!session?.registered || !session.helloAcked || session.connectionGeneration === null)
-      return null;
+    const node = session ? readyNode(session.phase) : null;
+    if (!session || !node) return null;
     return {
       userId: session.identity.userId,
-      connectionGeneration: session.connectionGeneration,
+      connectionGeneration: node.connectionGeneration,
       trust: session.trust,
       operatorTerminals: this.operatorTerminalsAllowed(session),
-      terminalShells: session.features?.terminals.shells ?? [],
-      jobReservations: session.features?.jobReservations === true,
-      rankIdle: session.features?.rankIdle === true,
-      selfUpdate: session.features?.selfUpdate ?? null,
+      terminalShells: node.features.terminals.shells ?? [],
+      jobReservations: node.features.jobReservations === true,
+      rankIdle: node.features.rankIdle === true,
+      selfUpdate: node.features.selfUpdate ?? null,
     };
   }
 
@@ -989,11 +917,7 @@ export class RelaySessionManager {
    * browser-shell switch.
    */
   private operatorTerminalsAllowed(session: SessionState): boolean {
-    return (
-      session.registered &&
-      session.features?.operatorTerminals === true &&
-      session.terminalPublicKey !== null
-    );
+    return liveNode(session.phase)?.features.operatorTerminals === true;
   }
 
   /** Whether the node's session can track one more operator terminal. */
@@ -1002,7 +926,7 @@ export class RelaySessionManager {
     if (!session) return false;
     return (
       session.operatorSteps.size < OPERATOR_STEPS_PER_SESSION ||
-      [...session.operatorSteps.values()].some((tracker) => tracker.cancelled)
+      [...session.operatorSteps.values()].some((step) => !operatorStepLive(step))
     );
   }
 
@@ -1015,24 +939,25 @@ export class RelaySessionManager {
    */
   private sendOperatorJob(session: SessionState, job: RuntimeJobFrame, encoded: string): boolean {
     const operator = job.operator;
-    const nodeId = session.nodeId;
-    if (!operator || !nodeId || !this.operatorTerminalsAllowed(session)) return false;
+    const node = liveNode(session.phase);
+    if (!operator || !node || !this.operatorTerminalsAllowed(session)) return false;
+    const nodeId = node.nodeId;
     const terminalId = operator.terminalId;
     const previous = session.operatorSteps.get(job.stepId);
     const repeat =
       previous !== undefined &&
-      !previous.cancelled &&
+      operatorStepLive(previous) &&
       previous.terminalId === terminalId &&
       previous.intentHash === job.intentHash &&
       previous.ownerEpoch === job.ownerEpoch &&
       previous.instanceId === job.instanceId &&
       previous.rank === job.rank &&
-      session.terminalsById.get(terminalId)?.operator?.stepId === job.stepId;
-    let evict: OperatorStepTracker | null = null;
+      session.terminalsById.get(terminalId)?.operator === previous;
+    let evict: OperatorStep | null = null;
     if (!repeat) {
       if (this.hasTerminal(terminalId) || this.operatorTerminalTracked(terminalId)) return false;
       if (previous === undefined && session.operatorSteps.size >= OPERATOR_STEPS_PER_SESSION) {
-        evict = [...session.operatorSteps.values()].find((tracker) => tracker.cancelled) ?? null;
+        evict = [...session.operatorSteps.values()].find((step) => !operatorStepLive(step)) ?? null;
         if (evict === null) return false;
       }
     }
@@ -1044,7 +969,7 @@ export class RelaySessionManager {
     if (repeat) return true;
     if (evict !== null) this.forgetOperatorStep(session, evict);
     if (previous !== undefined) this.replaceOperatorStep(session, previous);
-    session.operatorSteps.set(job.stepId, {
+    const step = newOperatorStep({
       stepId: job.stepId,
       instanceId: job.instanceId,
       rank: job.rank,
@@ -1054,10 +979,8 @@ export class RelaySessionManager {
       terminalId,
       userId: session.identity.userId,
       nodeId,
-      state: "spawning",
-      accepted: false,
-      cancelled: false,
     });
+    session.operatorSteps.set(job.stepId, step);
     session.terminalsById.set(terminalId, {
       terminalId,
       userId: session.identity.userId,
@@ -1065,42 +988,37 @@ export class RelaySessionManager {
       cols: 80,
       rows: 24,
       viewers: new Map(),
-      pendingViewers: new Map(),
       writerViewerId: null,
-      phase: "opening",
+      // The step's lifecycle ends it, not a deadline.
+      phase: { kind: "opening", expiresAt: null },
       createdAt: Date.now(),
-      operator: {
-        stepId: job.stepId,
-        instanceId: job.instanceId,
-        rank: job.rank,
-        state: "spawning",
-      },
+      operator: step,
     });
     return true;
   }
 
   private operatorTerminalTracked(terminalId: string): boolean {
     for (const session of this.sessionsByNodeId.values())
-      for (const tracker of session.operatorSteps.values())
-        if (tracker.terminalId === terminalId) return true;
+      for (const step of session.operatorSteps.values())
+        if (step.terminalId === terminalId) return true;
     return false;
   }
 
   private auditOperator(
-    tracker: OperatorStepTracker,
+    step: OperatorStep,
     outcome: NodeAuditOutcome,
     options: { actor?: "USER" | "SYSTEM"; exitCode?: number } = {},
   ) {
     const now = new Date();
     recordNodeAuditEvent({
-      userId: tracker.userId,
-      nodeId: tracker.nodeId,
+      userId: step.userId,
+      nodeId: step.nodeId,
       actor: options.actor ?? "SYSTEM",
       kind: "operator_terminal",
-      subject: `step:${tracker.phase}`,
-      instanceId: tracker.instanceId,
-      stepId: tracker.stepId,
-      rank: tracker.rank,
+      subject: `step:${step.phase}`,
+      instanceId: step.instanceId,
+      stepId: step.stepId,
+      rank: step.rank,
       ...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
       outcome,
       startedAt: now,
@@ -1109,27 +1027,26 @@ export class RelaySessionManager {
   }
 
   /**
-   * The one way a step's tracker leaves the session (final, close, replacement, eviction): it
-   * also ends that terminal's acceptance retry, so finished work never keeps a timer or a map
-   * entry, and a redelivery still in flight finds its chain gone and stops.
+   * The one way a step leaves the session (final, close, replacement, eviction): it also ends
+   * its acceptance retry, so finished work never keeps a timer, and a redelivery still in
+   * flight finds its chain gone and stops.
    */
-  private forgetOperatorStep(session: SessionState, tracker: OperatorStepTracker) {
-    if (session.operatorSteps.get(tracker.stepId) === tracker)
-      session.operatorSteps.delete(tracker.stepId);
-    this.cancelOperatorAcceptanceRetry(session, tracker.stepId, tracker.terminalId);
+  private forgetOperatorStep(session: SessionState, step: OperatorStep) {
+    if (session.operatorSteps.get(step.stepId) === step) session.operatorSteps.delete(step.stepId);
+    endAcceptanceRetry(step);
   }
 
   /**
    * A new terminal replaced this step's terminal: forget the old one, end its record and close
    * it on the node (a person's run in it, if any, is left alone there).
    */
-  private replaceOperatorStep(session: SessionState, tracker: OperatorStepTracker) {
-    this.forgetOperatorStep(session, tracker);
-    if (tracker.state !== "spawning" && !tracker.cancelled) this.auditOperator(tracker, "closed");
-    const terminal = session.terminalsById.get(tracker.terminalId);
+  private replaceOperatorStep(session: SessionState, step: OperatorStep) {
+    this.forgetOperatorStep(session, step);
+    const live = operatorStepLive(step);
+    if (live && step.stage.kind !== "spawning") this.auditOperator(step, "closed");
+    const terminal = session.terminalsById.get(step.terminalId);
     if (terminal?.operator) this.closeTerminal(session, terminal, true);
-    else if (!tracker.cancelled)
-      this.sendControl(session, { type: "term.close", terminalId: tracker.terminalId });
+    else if (live) this.sendControl(session, { type: "term.close", terminalId: step.terminalId });
   }
 
   /**
@@ -1146,15 +1063,15 @@ export class RelaySessionManager {
     const progress = (RUNTIME_JOB_OPERATOR_STATUSES as readonly string[]).includes(result.status);
     const terminalId = result.terminalId;
     if (terminalId === undefined) return !progress;
-    const tracker = session.operatorSteps.get(result.stepId);
+    const step = session.operatorSteps.get(result.stepId);
     const matches =
-      tracker !== undefined &&
-      tracker.terminalId === terminalId &&
-      tracker.intentHash === result.intentHash &&
-      tracker.ownerEpoch === result.ownerEpoch &&
-      tracker.instanceId === result.instanceId &&
-      tracker.rank === result.rank;
-    if (!matches || tracker === undefined) {
+      step !== undefined &&
+      step.terminalId === terminalId &&
+      step.intentHash === result.intentHash &&
+      step.ownerEpoch === result.ownerEpoch &&
+      step.instanceId === result.instanceId &&
+      step.rank === result.rank;
+    if (!matches || step === undefined) {
       // A terminal this session no longer tracks (replaced, or never sent) must not stay open
       // on the node. Only this session's state is consulted.
       if (
@@ -1168,7 +1085,8 @@ export class RelaySessionManager {
     }
     const record = session.terminalsById.get(terminalId);
     const terminal = record?.operator ? record : undefined;
-    if (tracker.cancelled) {
+    const stage = step.stage.kind;
+    if (stage === "cancelling") {
       // Only the node's answer to the server's own close still matters. A screen that came up
       // after the close is closed again; a run that won the race is left to finish on the node.
       if (result.status === "awaiting_operator") {
@@ -1177,38 +1095,36 @@ export class RelaySessionManager {
       }
       if (result.status === "operator_running") return false;
       if (result.status === "running") return true;
-      this.forgetOperatorStep(session, tracker);
+      this.forgetOperatorStep(session, step);
       return true;
     }
     switch (result.status) {
       case "awaiting_operator": {
-        if (tracker.state === "spawning") this.auditOperator(tracker, "opened");
         // The node shows the confirm screen once per terminal; a repeat re-reports it.
-        if (tracker.state === "running") return false;
-        tracker.state = "awaiting";
-        if (terminal?.operator) {
-          terminal.phase = "open";
-          terminal.operator.state = "awaiting";
+        if (stage === "running") return false;
+        if (stage === "spawning") {
+          this.auditOperator(step, "opened");
+          advanceOperatorStep(step, "awaiting");
         }
+        if (terminal) terminal.phase = { kind: "open" };
         return true;
       }
       case "operator_running": {
-        if (tracker.state === "spawning") return false;
-        if (tracker.state === "awaiting")
-          this.auditOperator(tracker, "accepted", { actor: "USER" });
-        tracker.state = "running";
-        tracker.accepted = true;
-        if (terminal?.operator) terminal.operator.state = "running";
+        if (stage === "spawning") return false;
+        if (stage === "awaiting") {
+          this.auditOperator(step, "accepted", { actor: "USER" });
+          advanceOperatorStep(step, "running");
+        }
         return true;
       }
       case "operator_closed": {
-        this.forgetOperatorStep(session, tracker);
-        if (tracker.state !== "spawning") {
-          if (result.exitCode !== undefined || tracker.accepted)
-            this.auditOperator(tracker, "closed", {
+        this.forgetOperatorStep(session, step);
+        if (stage !== "spawning") {
+          if (result.exitCode !== undefined || stage === "running")
+            this.auditOperator(step, "closed", {
               ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
             });
-          else this.auditOperator(tracker, "declined", { actor: "USER" });
+          else this.auditOperator(step, "declined", { actor: "USER" });
         }
         if (terminal) this.closeTerminal(session, terminal, false);
         return true;
@@ -1216,16 +1132,16 @@ export class RelaySessionManager {
       case "running":
         return true;
       default: {
-        this.forgetOperatorStep(session, tracker);
+        this.forgetOperatorStep(session, step);
         const outcome: NodeAuditOutcome =
           result.status === "succeeded"
-            ? tracker.accepted
+            ? stage === "running"
               ? "completed"
               : "auto_settled"
-            : tracker.state === "spawning"
+            : stage === "spawning"
               ? "refused"
               : "failed";
-        this.auditOperator(tracker, outcome);
+        this.auditOperator(step, outcome);
         // The node ends the terminal before its final answer; a record still here is stale.
         if (terminal) this.closeTerminal(session, terminal, true);
         return true;
@@ -1238,8 +1154,8 @@ export class RelaySessionManager {
    * `keepRunning` leaves a terminal whose command already runs alone (answer `running`): a
    * person's run is never cut off. The node's `operator_closed` still reaches the engine.
    * `unopened`: closed while its confirm screen was not up yet (nobody can attach before
-   * `awaiting_operator` reaches this tracker, so nothing ran); `closed`: closed after it came
-   * up (a person may have pressed Enter just before the close); `absent`: no tracker here
+   * `awaiting_operator` reaches this step, so nothing ran); `closed`: closed after it came
+   * up (a person may have pressed Enter just before the close); `absent`: no step here
    * (another process holds the session, or it is gone): nothing known.
    */
   closeOperatorStep(
@@ -1247,11 +1163,11 @@ export class RelaySessionManager {
     options: { keepRunning?: boolean; actor?: "USER" | "SYSTEM" } = {},
   ): OperatorCloseAnswer {
     for (const session of this.sessionsByNodeId.values()) {
-      const tracker = session.operatorSteps.get(stepId);
-      if (tracker === undefined || tracker.cancelled) continue;
-      if (options.keepRunning === true && tracker.state === "running") return "running";
-      const unopened = tracker.state === "spawning";
-      this.cancelOperatorStep(session, tracker, options.actor ?? "SYSTEM");
+      const step = session.operatorSteps.get(stepId);
+      if (step === undefined || !operatorStepLive(step)) continue;
+      if (options.keepRunning === true && step.stage.kind === "running") return "running";
+      const unopened = step.stage.kind === "spawning";
+      this.cancelOperatorStep(session, step, options.actor ?? "SYSTEM");
       return unopened ? "unopened" : "closed";
     }
     return "absent";
@@ -1259,16 +1175,16 @@ export class RelaySessionManager {
 
   /**
    * Close an operator terminal no step owns any more (the engine dropped an answer naming it):
-   * its tracker is cancelled, or the node is told directly when nothing tracks it.
+   * its step is cancelled, or the node is told directly when nothing tracks it.
    */
   closeOperatorTerminal(nodeId: string, terminalId: string) {
     const session = this.sessionsByNodeId.get(nodeId);
     if (!session) return;
-    const tracker = [...session.operatorSteps.values()].find(
+    const step = [...session.operatorSteps.values()].find(
       (candidate) => candidate.terminalId === terminalId,
     );
-    if (tracker) {
-      if (!tracker.cancelled) this.cancelOperatorStep(session, tracker, "SYSTEM");
+    if (step) {
+      if (operatorStepLive(step)) this.cancelOperatorStep(session, step, "SYSTEM");
       return;
     }
     const terminal = session.terminalsById.get(terminalId);
@@ -1309,23 +1225,18 @@ export class RelaySessionManager {
   cancelOperatorTerminalsForUser(userId: string) {
     for (const session of this.sessionsByNodeId.values()) {
       if (session.identity.userId !== userId) continue;
-      for (const tracker of [...session.operatorSteps.values()])
-        if (!tracker.cancelled) this.cancelOperatorStep(session, tracker, "SYSTEM");
+      for (const step of [...session.operatorSteps.values()])
+        if (operatorStepLive(step)) this.cancelOperatorStep(session, step, "SYSTEM");
     }
   }
 
-  private cancelOperatorStep(
-    session: SessionState,
-    tracker: OperatorStepTracker,
-    actor: "USER" | "SYSTEM",
-  ) {
-    if (tracker.state !== "spawning") this.auditOperator(tracker, "cancelled", { actor });
-    tracker.cancelled = true;
-    // A cancelled run no longer has an acceptance to deliver.
-    this.cancelOperatorAcceptanceRetry(session, tracker.stepId, tracker.terminalId);
-    const terminal = session.terminalsById.get(tracker.terminalId);
+  /** The server closes the step's terminal: `cancelling` (which ends its acceptance retry). */
+  private cancelOperatorStep(session: SessionState, step: OperatorStep, actor: "USER" | "SYSTEM") {
+    if (step.stage.kind !== "spawning") this.auditOperator(step, "cancelled", { actor });
+    advanceOperatorStep(step, "cancelling");
+    const terminal = session.terminalsById.get(step.terminalId);
     if (terminal?.operator) this.closeTerminal(session, terminal, true);
-    else this.sendControl(session, { type: "term.close", terminalId: tracker.terminalId });
+    else this.sendControl(session, { type: "term.close", terminalId: step.terminalId });
   }
 
   /**
@@ -1338,21 +1249,22 @@ export class RelaySessionManager {
     userId: string,
   ): { nodeId: string; terminalId: string; state: "awaiting" | "running" } | null {
     for (const session of this.sessionsByNodeId.values()) {
-      const tracker = session.operatorSteps.get(stepId);
-      if (!tracker || tracker.cancelled || tracker.userId !== userId) continue;
+      const step = session.operatorSteps.get(stepId);
+      if (!step || !operatorStepLive(step) || step.userId !== userId) continue;
       // The node holding the terminal is the step owner's (defence in depth).
       if (!nodeOwnerMatches({ userId: session.identity.userId }, userId, "operator_attach"))
         return null;
       if (!this.operatorTerminalsAllowed(session) || this.relayDrain) return null;
-      const terminal = session.terminalsById.get(tracker.terminalId);
-      if (!terminal?.operator || terminal.phase !== "open" || terminal.userId !== userId)
+      const terminal = session.terminalsById.get(step.terminalId);
+      if (
+        terminal?.operator !== step ||
+        terminal.phase.kind !== "open" ||
+        terminal.userId !== userId
+      )
         return null;
-      if (terminal.operator.state === "spawning") return null;
-      return {
-        nodeId: terminal.nodeId,
-        terminalId: terminal.terminalId,
-        state: terminal.operator.state,
-      };
+      const stage = step.stage.kind;
+      if (stage !== "awaiting" && stage !== "running") return null;
+      return { nodeId: terminal.nodeId, terminalId: terminal.terminalId, state: stage };
     }
     return null;
   }
@@ -1383,7 +1295,7 @@ export class RelaySessionManager {
     const row = await readNodeTrust(nodeId);
     const session = this.sessionsByNodeId.get(nodeId);
     if (!session || !row || !this.isCurrent(session)) return;
-    if (session.connectionGeneration !== row.connectionGeneration) return;
+    if (liveNode(session.phase)?.connectionGeneration !== row.connectionGeneration) return;
     const lowerPending = row.trustLowerRequestedAt !== null;
     const loweredMeanwhile = (this.trustLowerings.get(nodeId) ?? 0) !== lowerings;
     const next: NodeTrustWire =
@@ -1401,7 +1313,7 @@ export class RelaySessionManager {
     if (
       requestedAt !== null &&
       session.reportedTrust === "full" &&
-      session.helloAcked &&
+      readyNode(session.phase) !== null &&
       session.trustLowerSentFor !== requestedAt
     ) {
       // Recorded only once written: an unsent lowering is sent again by the next sync (a
@@ -1481,33 +1393,24 @@ export class RelaySessionManager {
       return false;
     }
     const helloNonce = randomBytes(16).toString("base64url");
-    const unauthenticatedTimer = setTimeout(() => {
+    const registrationDeadline = setTimeout(() => {
       const session = this.sessionsBySocket.get(socket);
-      if (!session?.registered) {
+      if (session && preRegistration(session.phase)) {
         closeWithProtocolError(socket, "malformed", "Registration was not received in time.");
         void this.removeSession(socket, new Date());
       }
     }, RELAY_UNREGISTERED_STALE_AFTER_MS);
-    unauthenticatedTimer.unref?.();
+    registrationDeadline.unref?.();
 
     this.sessionsBySocket.set(socket, {
       socket,
       identity,
       connectedAt: now,
       lastHeartbeatAt: now,
-      nodeId: null,
-      slug: null,
-      connectionGeneration: null,
-      registered: false,
-      helloAcked: false,
-      protocolVersion: null,
-      nodeVersion: null,
+      phase: awaitingHello(helloNonce, registrationDeadline),
       trust: "relay",
       reportedTrust: "relay",
       trustLowerSentFor: null,
-      features: null,
-      terminalPublicKey: null,
-      terminalIdentity: null,
       servedHandles: new Set(),
       inventory: null,
       inventoryCompleted: 0,
@@ -1516,10 +1419,7 @@ export class RelaySessionManager {
       operatorSteps: new Map(),
       runDeliveries: { started: new Map(), ended: new Map() },
       nodeStateQueue: Promise.resolve(),
-      acceptanceRetries: new Map(),
       filesById: new Map(),
-      unauthenticatedTimer,
-      helloNonce,
       bodyStreamsByRequest: new Map(),
       nodeInfoAcceptedAtMs: null,
       nodeMetrics: null,
@@ -1528,7 +1428,6 @@ export class RelaySessionManager {
       runtimeLoad: new Map(),
       malformedTelemetryLoggedAtMs: null,
       malformedSttLoggedAtMs: null,
-      routingEvaluation: null,
     });
     if (socket.readyState === WS_READY_STATE_OPEN) {
       socket.send(
@@ -1542,25 +1441,51 @@ export class RelaySessionManager {
     return true;
   }
 
+  /**
+   * The node a registered session is for, as the lane handlers see it. Also for a session that
+   * closed after registering (its disconnect handler names it); null before registration.
+   */
   private sessionRef(session: SessionState): NodeSessionRef | null {
-    if (!session.registered || !session.nodeId || !session.slug) return null;
-    if (session.connectionGeneration === null) return null;
+    const node = registeredNode(session.phase);
+    if (!node) return null;
     return {
-      nodeId: session.nodeId,
+      nodeId: node.nodeId,
       userId: session.identity.userId,
-      slug: session.slug,
-      connectionGeneration: session.connectionGeneration,
+      slug: node.slug,
+      connectionGeneration: node.connectionGeneration,
       trust: session.trust,
     };
   }
 
+  /** The node id a session registered for (kept after it closed), or null. */
+  private sessionNodeId(session: SessionState): string | null {
+    return registeredNode(session.phase)?.nodeId ?? null;
+  }
+
   /** The session currently serving its node (not replaced, not detached). */
   private isCurrent(session: SessionState): boolean {
+    const node = liveNode(session.phase);
     return (
+      node !== null &&
       this.sessionsBySocket.get(session.socket) === session &&
-      !!session.nodeId &&
-      this.sessionsByNodeId.get(session.nodeId) === session
+      this.sessionsByNodeId.get(node.nodeId) === session
     );
+  }
+
+  /**
+   * Readiness, in one place. Lane frames (`sendToNode`) need `hello.ok` sent and an open socket.
+   * Node-initiated work (model requests, live speech-to-text, file ops, terminals) needs only the
+   * installed session and an open socket: the node answers it from registration on (wsmp
+   * handles these frames whether or not its `hello.ok` arrived yet).
+   */
+  private laneNode(session: SessionState): RegisteredNode | null {
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) return null;
+    return readyNode(session.phase);
+  }
+
+  private openNode(session: SessionState): RegisteredNode | null {
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) return null;
+    return liveNode(session.phase);
   }
 
   async handleTextFrame(socket: RelaySocket, frame: string, now = new Date()) {
@@ -1568,7 +1493,7 @@ export class RelaySessionManager {
     if (!session) return;
     // A hello that is not 3.0 gets a message it can print (an "upgrade wsmp" text), not an
     // opaque schema rejection.
-    if (!session.registered && helloNeedsUpgrade(frame)) {
+    if (preRegistration(session.phase) && helloNeedsUpgrade(frame)) {
       const rejected = rejectedHelloFacts(frame);
       const reason = refusedRelayProtocolReason(rejected.protocolVersion);
       const code = reason === "cli_too_new" ? "upgrade_server" : "upgrade_cli";
@@ -1600,7 +1525,7 @@ export class RelaySessionManager {
         console.error("[relay] control frame schema rejected", description.issues);
         // An older wsmp build of this protocol: tell it to upgrade (it prints the message and
         // stops) and show the node as needing an upgrade, instead of an opaque "malformed".
-        if (!session.registered && isCurrentProtocolHello(frame)) {
+        if (preRegistration(session.phase) && isCurrentProtocolHello(frame)) {
           closeWithProtocolError(socket, "upgrade_cli", RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE);
           await recordRejectedNodeHello(session.identity, rejectedHelloFacts(frame), now).catch(
             (recordError: unknown) => {
@@ -1620,7 +1545,7 @@ export class RelaySessionManager {
 
     if (message.type === "hello") {
       // A wsmp older than self-update: refused by capability (it could never take an update).
-      if (!session.registered && !helloCanSelfUpdate(message)) {
+      if (preRegistration(session.phase) && !helloCanSelfUpdate(message)) {
         console.error("[relay] refused a hello without self-update", { code: "upgrade_cli" });
         closeWithProtocolError(socket, "upgrade_cli", RELAY_SELF_UPDATE_REQUIRED_MESSAGE);
         await recordRejectedNodeHello(session.identity, rejectedHelloFacts(frame), now).catch(
@@ -1635,7 +1560,9 @@ export class RelaySessionManager {
       return;
     }
 
-    if (!session.registered || !session.nodeId) {
+    // Node frames are accepted from registration on (wsmp sends none before its `hello.ok`).
+    const node = liveNode(session.phase);
+    if (!node) {
       closeWithProtocolError(
         socket,
         "malformed",
@@ -1650,7 +1577,7 @@ export class RelaySessionManager {
         session.lastHeartbeatAt = now;
         // Same durable fence as the disconnect: only while the row still describes THIS
         // session's connection.
-        await writeNodeHeartbeat(session.nodeId, session.connectionGeneration, now).catch(
+        await writeNodeHeartbeat(node.nodeId, node.connectionGeneration, now).catch(
           (error: unknown) => console.error("[relay] heartbeat write failed", errorName(error)),
         );
         this.sendControl(session, {
@@ -1660,7 +1587,7 @@ export class RelaySessionManager {
         });
         // Reconcile with what is stored: a lowering another server process committed reaches
         // this session within a heartbeat.
-        if (session.helloAcked) void this.syncTrust(session.nodeId);
+        if (readyNode(session.phase)) void this.syncTrust(node.nodeId);
         return;
       }
       case "node.state": {
@@ -1737,9 +1664,10 @@ export class RelaySessionManager {
           await this.routeToHandler(session, message);
           return;
         }
-        if (await this.routeToHandler(session, message))
-          this.cancelOperatorAcceptanceRetry(session, message.stepId, message.terminalId);
-        else this.retryOperatorAcceptance(session, message);
+        if (await this.routeToHandler(session, message)) {
+          const step = this.runningOperatorStep(session, message.stepId, message.terminalId);
+          if (step) endAcceptanceRetry(step);
+        } else this.retryOperatorAcceptance(session, message);
         return;
       case "runtime.define.result":
       case "runtime.detected":
@@ -1753,7 +1681,7 @@ export class RelaySessionManager {
       default:
         // Live speech-to-text. Frames for sessions this node does not hold are dropped.
         if (isSttClientMessage(message)) {
-          this.stt.handleClientFrame(this.sttLinkFor(session), message);
+          this.stt.handleClientFrame(this.sttLinkFor(session, node), message);
         }
     }
   }
@@ -1831,8 +1759,9 @@ export class RelaySessionManager {
    * engine records it the next time it asks about the step (`closeOperatorStep` answers
    * `running`). Nothing is ever cut off or replayed on the node.
    *
-   * One chain per step: a repeated failed `operator_running` for a step that already has one
-   * joins it (no new timer); one for another terminal of that step replaces it. A delivered
+   * One chain per step, owned by the step's `running` stage (`operator-step.ts`): a repeated
+   * failed `operator_running` for a step that already has one joins it (no new timer); another
+   * terminal of that step is a new step, whose replacement ended the old chain. A delivered
    * repeat ends it, and so does the end of its run here: a final, a close, a replacement or a
    * cancel (`forgetOperatorStep`, `cancelOperatorStep`). Teardown of the session's interactive
    * work and `dispose` cancel every chain.
@@ -1845,30 +1774,29 @@ export class RelaySessionManager {
     if (terminalId === undefined || this.acceptanceRetriesClosed || !this.isCurrent(session))
       return;
     // An initial delivery that failed after its run ended (final, close, replacement) starts
-    // nothing: only a run this session still tracks has an acceptance to retry.
-    if (!this.operatorRunTracked(session, message.stepId, terminalId)) return;
-    const existing = session.acceptanceRetries.get(message.stepId);
-    if (existing !== undefined) {
-      if (existing.terminalId === terminalId) return;
-      this.cancelOperatorAcceptanceRetry(session, message.stepId);
-    }
-    const chain: OperatorAcceptanceRetry = { terminalId, attempt: 0, timer: null };
-    session.acceptanceRetries.set(message.stepId, chain);
-    this.scheduleOperatorAcceptance(session, message, chain);
+    // nothing: only a run this session still tracks has an acceptance to retry. A step that
+    // already has a chain keeps it (no new timer).
+    const step = this.runningOperatorStep(session, message.stepId, terminalId);
+    if (!step) return;
+    const chain = startAcceptanceRetry(step);
+    if (chain) this.scheduleOperatorAcceptance(session, message, step, chain);
   }
 
   private scheduleOperatorAcceptance(
     session: SessionState,
     message: NodeFrame<"runtime.job.result">,
+    step: OperatorStep,
     chain: OperatorAcceptanceRetry,
   ): void {
+    // The chain is live while its step still runs it here: anything that ends the run ends it.
     const owned = () =>
       !this.acceptanceRetriesClosed &&
-      session.acceptanceRetries.get(message.stepId) === chain &&
+      session.operatorSteps.get(step.stepId) === step &&
+      acceptanceRetryOf(step) === chain &&
       this.isCurrent(session);
     if (!owned()) return;
     if (chain.attempt >= OPERATOR_ACCEPT_RETRIES) {
-      session.acceptanceRetries.delete(message.stepId);
+      endAcceptanceRetry(step);
       console.error("[relay] operator acceptance not recorded after retries");
       return;
     }
@@ -1876,18 +1804,14 @@ export class RelaySessionManager {
       () => {
         chain.timer = null;
         if (!owned()) return;
-        if (!this.operatorRunTracked(session, message.stepId, chain.terminalId)) {
-          session.acceptanceRetries.delete(message.stepId);
-          return;
-        }
         void this.routeToHandler(session, message).then((delivered) => {
           if (!owned()) return;
           if (delivered) {
-            session.acceptanceRetries.delete(message.stepId);
+            endAcceptanceRetry(step);
             return;
           }
           chain.attempt += 1;
-          this.scheduleOperatorAcceptance(session, message, chain);
+          this.scheduleOperatorAcceptance(session, message, step, chain);
         });
       },
       OPERATOR_ACCEPT_RETRY_MS * 2 ** chain.attempt,
@@ -1895,45 +1819,33 @@ export class RelaySessionManager {
     chain.timer.unref?.();
   }
 
-  /** Whether this session still tracks a live, accepted run of that step in that terminal. */
-  private operatorRunTracked(session: SessionState, stepId: string, terminalId: string): boolean {
-    const tracker = session.operatorSteps.get(stepId);
-    return (
-      tracker !== undefined &&
-      !tracker.cancelled &&
-      tracker.state === "running" &&
-      tracker.terminalId === terminalId
-    );
+  /** The step this session tracks as a live, accepted run in that terminal. */
+  private runningOperatorStep(
+    session: SessionState,
+    stepId: string,
+    terminalId: string | undefined,
+  ): OperatorStep | null {
+    const step = session.operatorSteps.get(stepId);
+    if (step?.stage.kind !== "running" || step.terminalId !== terminalId) return null;
+    return step;
   }
 
-  /** Ends a step's acceptance retry chain (all of the session's chains without a step id). */
-  private cancelOperatorAcceptanceRetry(
-    session: SessionState,
-    stepId?: string,
-    terminalId?: string,
-  ): void {
-    const ids = stepId === undefined ? [...session.acceptanceRetries.keys()] : [stepId];
-    for (const id of ids) {
-      const chain = session.acceptanceRetries.get(id);
-      if (chain === undefined || (terminalId !== undefined && chain.terminalId !== terminalId))
-        continue;
-      if (chain.timer !== null) clearTimeout(chain.timer);
-      chain.timer = null;
-      session.acceptanceRetries.delete(id);
-    }
+  /** Ends every acceptance retry chain of the session. */
+  private endAcceptanceRetries(session: SessionState): void {
+    for (const step of session.operatorSteps.values()) endAcceptanceRetry(step);
   }
 
   private async handleHello(session: SessionState, message: NodeFrame<"hello">, now: Date) {
     const socket = session.socket;
-    if (session.registered) {
+    // The challenge nonce is consumed here, once: a second hello (also one sent while the first
+    // one's registration still runs) is refused.
+    const nonce = beginRegistration(session);
+    if (nonce === null) {
       closeWithProtocolError(socket, "malformed", "Hello was already received.");
       await this.removeSession(socket, now);
       return;
     }
-    const nonce = session.helloNonce;
-    session.helloNonce = null;
     if (
-      !nonce ||
       !verifyHelloIdentitySignature({
         identityPublicKey: message.node.identityPublicKey,
         signature: message.node.identitySignature,
@@ -1968,7 +1880,8 @@ export class RelaySessionManager {
       });
     } catch (error) {
       // Already detached and closed by whoever detached it.
-      if (this.sessionsBySocket.get(socket) !== session) return;
+      if (session.phase.kind !== "registering" || this.sessionsBySocket.get(socket) !== session)
+        return;
       if (error instanceof RelayRegistrationError && error.code === "identity_mismatch") {
         await recordNodeIdentityRefusal(session.identity, "identity_mismatch", now).catch(
           (refusalError: unknown) =>
@@ -1982,7 +1895,7 @@ export class RelaySessionManager {
       await this.removeSession(socket, now);
       return;
     }
-    if (this.sessionsBySocket.get(socket) !== session) {
+    if (session.phase.kind !== "registering" || this.sessionsBySocket.get(socket) !== session) {
       // Detached while registration ran (socket closed, or its credential revoked). The
       // registration committed ONLINE for a session that no longer exists: put the node back
       // unless another live session owns it.
@@ -1994,39 +1907,37 @@ export class RelaySessionManager {
       return;
     }
     const installed = this.sessionsByNodeId.get(registration.nodeId);
+    const installedNode = installed && installed !== session ? liveNode(installed.phase) : null;
     const knownGeneration = Math.max(
-      installed && installed !== session ? (installed.connectionGeneration ?? 0) : 0,
+      installedNode?.connectionGeneration ?? 0,
       this.latestGenerationByNodeId.get(registration.nodeId) ?? 0,
     );
     if (knownGeneration > registration.connectionGeneration) {
       // Hello results can complete out of order: a later-committed hello already owns the
       // node. No await between this check and the install below.
-      this.sessionsBySocket.delete(socket);
-      clearTimeout(session.unauthenticatedTimer);
+      this.retireSession(session);
       socket.close(1000, "replaced");
       return;
     }
     this.noteConnectionGeneration(registration.nodeId, registration.connectionGeneration);
-    session.nodeId = registration.nodeId;
-    session.slug = registration.slug;
-    session.connectionGeneration = registration.connectionGeneration;
-    session.registered = true;
-    session.protocolVersion = message.protocolVersion;
-    session.nodeVersion = message.node.version ?? null;
+    const node: RegisteredNode = {
+      nodeId: registration.nodeId,
+      slug: registration.slug,
+      connectionGeneration: registration.connectionGeneration,
+      protocolVersion: message.protocolVersion,
+      nodeVersion: message.node.version ?? null,
+      features: message.features,
+      terminalPublicKey: message.node.terminalPublicKey,
+      terminalIdentity: message.node.terminalIdentity ?? null,
+      routingEvaluation: createRoutingEvaluationState(session.identity.userId, registration.nodeId),
+    };
+    installRegistered(session, node);
     // Relay until `syncTrust` reads what is stored (the registration's snapshot may be stale by
     // then: a person may have lowered trust meanwhile).
     session.trust = "relay";
     session.reportedTrust = message.trust.value;
-    session.features = message.features;
-    session.terminalPublicKey = message.node.terminalPublicKey;
-    session.terminalIdentity = message.node.terminalIdentity ?? null;
     session.lastHeartbeatAt = now;
-    session.routingEvaluation = createRoutingEvaluationState(
-      session.identity.userId,
-      registration.nodeId,
-    );
-    clearTimeout(session.unauthenticatedTimer);
-    this.replaceDuplicateSession(session);
+    this.replaceDuplicateSession(session, node);
     this.notifyTerminalListChanged(session.identity.userId);
     // A replaced session publishes nothing (its detach finds the new one installed): one ONLINE
     // event per accepted hello.
@@ -2067,7 +1978,7 @@ export class RelaySessionManager {
       // What this server accepts on top of the released 3.0 node frames.
       features: { execRanWith: true, agentUpdateAvailableVersion: true },
     });
-    session.helloAcked = true;
+    acknowledgeHello(session);
     // Again now it is acknowledged: a lowering pending (or one that came during the awaits
     // above, when nothing but hello could be sent) goes to the node.
     await this.syncTrust(registration.nodeId, { raised: false });
@@ -2086,13 +1997,14 @@ export class RelaySessionManager {
     message: NodeFrame<"node.state">,
     now: Date,
   ) {
-    const nodeId = session.nodeId;
-    if (!nodeId) return;
+    const node = liveNode(session.phase);
+    if (!node) return;
+    const nodeId = node.nodeId;
     let written = false;
     try {
       written = !!(await writeNodeState({
         nodeId,
-        generation: session.connectionGeneration,
+        generation: node.connectionGeneration,
         trust: message.trust.value,
         features: message.features,
         now,
@@ -2103,7 +2015,7 @@ export class RelaySessionManager {
     // The stored trust and features changed (the node's view shows both).
     if (written) publishNodeEvent({ type: "node.trust", userId: session.identity.userId, nodeId });
     if (!this.isCurrent(session)) return;
-    session.features = message.features;
+    node.features = message.features;
     // Fail closed: what was not written (or not for this connection) raises nothing.
     session.reportedTrust = written ? message.trust.value : "relay";
     if (!written && session.trust !== "relay") {
@@ -2123,10 +2035,10 @@ export class RelaySessionManager {
         if (!terminal.operator) this.closeTerminal(session, terminal, true);
     }
     if (!this.operatorTerminalsAllowed(session)) {
-      for (const tracker of [...session.operatorSteps.values()])
-        if (!tracker.cancelled) this.cancelOperatorStep(session, tracker, "SYSTEM");
+      for (const step of [...session.operatorSteps.values()])
+        if (operatorStepLive(step)) this.cancelOperatorStep(session, step, "SYSTEM");
     }
-    const roots = session.features?.files.roots ?? null;
+    const roots = liveNode(session.phase)?.features.files.roots ?? null;
     const lost: FileOpLossCause | null =
       session.trust !== "full"
         ? "trust_relay"
@@ -2284,7 +2196,7 @@ export class RelaySessionManager {
 
   handleBinaryFrame(socket: RelaySocket, frame: ArrayBuffer) {
     const session = this.sessionsBySocket.get(socket);
-    if (!session?.registered) return;
+    if (!session || !liveNode(session.phase)) return;
     try {
       const parsed = parseRelayBinaryFrame(frame);
       if (parsed.metadata.type === "relay.response.body") {
@@ -2317,21 +2229,28 @@ export class RelaySessionManager {
     await this.detachSession(socket, { now, failureClass: "WEBSOCKET_DISCONNECTED" })?.();
   }
 
-  /** Stops background recovery in controlled shutdowns and unit tests. */
+  /**
+   * Stops background recovery in controlled shutdowns and unit tests. Implies the drain (a
+   * disposed manager accepts no socket and sends no new work); the sockets it holds stay until
+   * {@link closeRelaySessions} closes them.
+   */
   dispose() {
+    this.lifecycle = advanceLifecycle(this.lifecycle, "disposed");
     this.stopAffinityResetRecovery();
+    this.stt.closeAll();
     this.targetRecovery.stop();
-    this.acceptanceRetriesClosed = true;
     for (const session of this.sessionsBySocket.values()) {
-      this.cancelOperatorAcceptanceRetry(session);
-      if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
+      this.endAcceptanceRetries(session);
+      const node = registeredNode(session.phase);
+      if (node) this.routingEvaluator.cancel(node.routingEvaluation);
       if (session.inventory) clearTimeout(session.inventory.timer);
-      clearTimeout(session.unauthenticatedTimer);
+      if (session.phase.kind === "awaiting_hello" || session.phase.kind === "registering")
+        clearTimeout(session.phase.deadline);
     }
   }
 
+  /** Called once the lifecycle left `running` (`affinityResetClosed`). */
   private stopAffinityResetRecovery() {
-    this.affinityResetClosed = true;
     clearInterval(this.affinityResetTimer);
     clearInterval(this.affinityObserverTimer);
     for (const job of this.pendingAffinityResets.values()) job.release();
@@ -2349,20 +2268,13 @@ export class RelaySessionManager {
   ): (() => Promise<void>) | null {
     const session = this.sessionsBySocket.get(socket);
     if (!session) return null;
-    this.teardownInteractiveWork(session);
-    clearTimeout(session.unauthenticatedTimer);
-    if (session.inventory) clearTimeout(session.inventory.timer);
-    session.inventory = null;
-    if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
-    this.sessionsBySocket.delete(socket);
-    this.failActiveRequestsForSession(session);
-    this.failSttSessions(session);
-    const nodeId = session.nodeId;
+    this.retireSession(session);
+    const nodeId = this.sessionNodeId(session);
     if (!nodeId || this.sessionsByNodeId.get(nodeId) !== session) return null;
     this.sessionsByNodeId.delete(nodeId);
     this.notifyTerminalListChanged(session.identity.userId);
     const ref = this.sessionRef(session);
-    const connectionGeneration = session.connectionGeneration;
+    const connectionGeneration = ref?.connectionGeneration ?? null;
     const userId = session.identity.userId;
     return async () => {
       try {
@@ -2386,6 +2298,25 @@ export class RelaySessionManager {
         }
       }
     };
+  }
+
+  /**
+   * The one path a session leaves service by (detached, replaced, or refused after its hello):
+   * its interactive work ends, its phase becomes `closed` (registration deadline and routing
+   * verdicts cancelled), its socket is forgotten, and its model requests and live
+   * speech-to-text sessions fail. Leaves `sessionsByNodeId` and the database to the caller.
+   * Idempotent.
+   */
+  private retireSession(session: SessionState) {
+    this.teardownInteractiveWork(session);
+    const { node } = closePhase(session);
+    if (node) this.routingEvaluator.cancel(node.routingEvaluation);
+    if (session.inventory) clearTimeout(session.inventory.timer);
+    session.inventory = null;
+    if (this.sessionsBySocket.get(session.socket) === session)
+      this.sessionsBySocket.delete(session.socket);
+    this.failActiveRequestsForSession(session);
+    this.failSttSessions(session);
   }
 
   /**
@@ -2446,8 +2377,9 @@ export class RelaySessionManager {
     this.noteConnectionGeneration(nodeId, connectionGeneration);
     const owner = this.sessionsByNodeId.get(nodeId);
     if (owner) {
-      if ((owner.connectionGeneration ?? 0) < connectionGeneration)
-        owner.connectionGeneration = connectionGeneration;
+      const node = liveNode(owner.phase);
+      if (node && node.connectionGeneration < connectionGeneration)
+        node.connectionGeneration = connectionGeneration;
       return;
     }
     await this.writeNodeDisconnected(nodeId, {
@@ -2460,8 +2392,7 @@ export class RelaySessionManager {
   async checkStaleSessions(now = new Date()) {
     const staleSessions = [...this.sessionsBySocket.values()].filter(
       (session) =>
-        session.registered &&
-        session.nodeId &&
+        liveNode(session.phase) !== null &&
         now.getTime() - session.lastHeartbeatAt.getTime() > RELAY_STALE_AFTER_MS,
     );
     for (const session of staleSessions) {
@@ -2488,7 +2419,7 @@ export class RelaySessionManager {
 
   /** Refuse new relay and terminal sockets. Synchronous, idempotent and never undone. */
   beginDrain() {
-    this.relayDrain = true;
+    this.lifecycle = advanceLifecycle(this.lifecycle, "draining");
     this.stopAffinityResetRecovery();
     // Live transcription streams cannot be resumed and would hold their node sockets
     // through the whole HTTP drain: they end now (clients reconnect).
@@ -2546,9 +2477,10 @@ export class RelaySessionManager {
     if (session.bodyStreamsByRequest.size > 0) return true;
     const sttLink = this.sttLinks.get(session);
     if (sttLink && this.stt.hasActiveLegs(sttLink)) return true;
-    if (!session.nodeId) return false;
+    const nodeId = this.sessionNodeId(session);
+    if (!nodeId) return false;
     for (const active of this.activeRelayRequests.values()) {
-      if (active.nodeId === session.nodeId) return true;
+      if (active.nodeId === nodeId) return true;
     }
     return false;
   }
@@ -2565,7 +2497,7 @@ export class RelaySessionManager {
     requestId: string,
   ): ActiveRelayRequest | undefined {
     const active = this.activeRelayRequests.get(requestId);
-    if (!active || active.nodeId !== session.nodeId) return undefined;
+    if (!active || active.nodeId !== this.sessionNodeId(session)) return undefined;
     return active;
   }
 
@@ -2748,8 +2680,9 @@ export class RelaySessionManager {
     load: Pick<RuntimeLoadFrame, "handle" | "prefixCacheReset" | "counterEpoch">,
     now: Date,
   ) {
-    const nodeId = session.nodeId;
-    if (!nodeId) return;
+    const node = registeredNode(session.phase);
+    if (!node) return;
+    const nodeId = node.nodeId;
     const key = `${nodeId}\0${load.handle}`;
     if (this.affinityResetClosed) return;
     const previousEpoch = this.kvCounterEpochByInstance.get(key);
@@ -2793,7 +2726,7 @@ export class RelaySessionManager {
       } else {
         this.pendingAffinityResets.set(key, {
           nodeId,
-          connectionGeneration: session.connectionGeneration ?? 0,
+          connectionGeneration: node.connectionGeneration,
           handle: load.handle,
           epoch: load.counterEpoch,
           reset: resetRequested,
@@ -2950,7 +2883,7 @@ export class RelaySessionManager {
    * above the rate limit keep their counter deltas but not their reading.
    */
   private async handleRuntimeLoad(session: SessionState, load: RuntimeLoadFrame, now: Date) {
-    const nodeId = session.nodeId;
+    const nodeId = this.sessionNodeId(session);
     if (!nodeId) return;
     const nowMs = now.getTime();
     const instance = await this.resolveInstance(
@@ -3043,7 +2976,7 @@ export class RelaySessionManager {
     message: NodeInfoFrame | NodeMetricsFrame,
     now: Date,
   ) {
-    const nodeId = session.nodeId;
+    const nodeId = this.sessionNodeId(session);
     if (!nodeId) return;
     const nowMs = now.getTime();
     if (message.type === "node.info") {
@@ -3126,7 +3059,8 @@ export class RelaySessionManager {
   }
 
   private scheduleRoutingEvaluation(session: SessionState) {
-    const state = session.routingEvaluation;
+    // A closed session publishes no more verdicts.
+    const state = liveNode(session.phase)?.routingEvaluation;
     if (!state) return;
     this.routingEvaluator.schedule(state, () => ({
       nodeMetrics:
@@ -3147,7 +3081,7 @@ export class RelaySessionManager {
     const snapshots = new Map<string, LiveNodeTelemetry>();
     for (const nodeId of nodeIds) {
       const session = this.sessionsByNodeId.get(nodeId);
-      if (!session?.registered) continue;
+      if (!session || !liveNode(session.phase)) continue;
       snapshots.set(nodeId, {
         nodeMetrics: session.nodeMetrics?.frame ?? null,
         nodeMetricsReceivedAt: session.nodeMetrics?.receivedAt ?? null,
@@ -3171,7 +3105,7 @@ export class RelaySessionManager {
     const wanted = new Set(instanceIds);
     const readings: LiveRuntimeLoadEntry[] = [];
     for (const session of this.sessionsByNodeId.values()) {
-      if (!session.registered) continue;
+      if (!liveNode(session.phase)) continue;
       for (const entry of session.runtimeLoad.values())
         if (wanted.has(entry.instanceId)) readings.push(entry);
     }
@@ -3181,24 +3115,18 @@ export class RelaySessionManager {
   /** The node's live session state, or null while it has no registered session. */
   getLiveNodeState(nodeId: string): LiveNodeState | null {
     const session = this.sessionsByNodeId.get(nodeId);
-    if (
-      !session?.registered ||
-      !session.slug ||
-      !session.protocolVersion ||
-      !session.features ||
-      !session.terminalPublicKey
-    )
-      return null;
+    const node = session ? liveNode(session.phase) : null;
+    if (!session || !node) return null;
     return {
       nodeId,
       userId: session.identity.userId,
-      slug: session.slug,
-      protocolVersion: session.protocolVersion,
-      nodeVersion: session.nodeVersion,
+      slug: node.slug,
+      protocolVersion: node.protocolVersion,
+      nodeVersion: node.nodeVersion,
       trust: session.trust,
-      features: session.features,
-      terminalPublicKey: session.terminalPublicKey,
-      terminalIdentity: session.terminalIdentity,
+      features: node.features,
+      terminalPublicKey: node.terminalPublicKey,
+      terminalIdentity: node.terminalIdentity,
       servedHandles: [...session.servedHandles],
     };
   }
@@ -3208,8 +3136,9 @@ export class RelaySessionManager {
     let node = 0;
     for (const session of this.sessionsByNodeId.values()) {
       for (const terminal of session.terminalsById.values()) {
-        // Operator terminals have their own limits (the engine's, per node).
-        if (terminal.phase === "pending" || terminal.operator) continue;
+        // Operator terminals have their own limits (the engine's, per node); a shell waiting
+        // for its approval holds no slot.
+        if (!holdsTerminalSlot(terminal)) continue;
         if (terminal.userId === userId) user += 1;
         if (terminal.nodeId === nodeId) node += 1;
       }
@@ -3246,12 +3175,13 @@ export class RelaySessionManager {
         // Operator terminals are reached by step (runtimes.steps.attach), not from this list.
         if (terminal.userId !== userId || terminal.operator) continue;
         const writer = terminal.writerViewerId;
-        const writerConn = writer ? terminal.viewers.get(writer)?.connId : undefined;
+        const writerConn = writer ? attachedViewer(terminal, writer)?.connId : undefined;
+        const viewerCount = attachedViewers(terminal).length;
         terminals.push({
           terminalId: terminal.terminalId,
           nodeId: terminal.nodeId,
-          viewerAttached: terminal.viewers.size > 0,
-          viewerCount: terminal.viewers.size,
+          viewerAttached: viewerCount > 0,
+          viewerCount,
           attachedHere: connId !== undefined && connViewerIds(terminal, connId).length > 0,
           writerHere: connId !== undefined && writerConn === connId,
         });
@@ -3290,13 +3220,11 @@ export class RelaySessionManager {
       return false;
     if (!this.canStartTerminal(session)) return false;
     // Never sent to a node that did not advertise it: an older node refuses unknown fields.
-    if (
-      input.shell !== undefined &&
-      !(session.features?.terminals.shells ?? []).includes(input.shell)
-    )
+    const features = liveNode(session.phase)?.features;
+    if (input.shell !== undefined && !(features?.terminals.shells ?? []).includes(input.shell))
       return false;
     if (this.hasTerminal(input.terminalId)) return false;
-    const approvalRequired = session.features?.terminals.approvalRequired === true;
+    const approvalRequired = features?.terminals.approvalRequired === true;
     const counts = this.terminalCounts(input.userId, input.nodeId);
     if (!approvalRequired && terminalLimitReached(counts)) return false;
     const now = Date.now();
@@ -3307,10 +3235,14 @@ export class RelaySessionManager {
       nodeId: input.nodeId,
       cols: input.cols,
       rows: input.rows,
-      viewers: new Map(),
-      pendingViewers: new Map([[viewerId, { connId: input.connId, requestedAt: now }]]),
+      viewers: new Map([[viewerId, { state: "pending", connId: input.connId, requestedAt: now }]]),
       writerViewerId: null,
-      phase: approvalRequired ? "pending" : "opening",
+      // Either way the node has until the deadline to answer, or the sweep drops it: an open
+      // nobody answers must not hold a limit slot.
+      phase: {
+        kind: approvalRequired ? "pending" : "opening",
+        expiresAt: now + TERMINAL_PENDING_TTL_MS,
+      },
       createdAt: now,
       operator: null,
     };
@@ -3370,8 +3302,8 @@ export class RelaySessionManager {
       session.socket.readyState !== WS_READY_STATE_OPEN
     )
       return { ok: false, error: "offline" };
-    const tracker = session.operatorSteps.get(input.stepId);
-    if (!tracker || tracker.cancelled || tracker.terminalId !== input.terminalId)
+    const step = session.operatorSteps.get(input.stepId);
+    if (!step || !operatorStepLive(step) || step.terminalId !== input.terminalId)
       return { ok: false, error: "not_found" };
     return this.addViewer(session, located.terminal, input);
   }
@@ -3386,14 +3318,18 @@ export class RelaySessionManager {
       identity?: TerminalHandshakeIdentity;
     },
   ): { ok: true; viewerId: string } | { ok: false; error: "not_found" | "limit" } {
-    if (terminal.phase !== "open") return { ok: false, error: "not_found" };
+    if (terminal.phase.kind !== "open") return { ok: false, error: "not_found" };
     // A second attach from the same tab replaces that tab's earlier attachment.
     const previous = connViewerIds(terminal, input.connId);
-    const occupied = terminal.viewers.size + terminal.pendingViewers.size - previous.length;
+    const occupied = terminal.viewers.size - previous.length;
     if (occupied >= TERMINAL_VIEWER_LIMIT) return { ok: false, error: "limit" };
     for (const viewerId of previous) this.removeViewer(session, terminal, viewerId);
     const viewerId = mintViewerId(terminal);
-    terminal.pendingViewers.set(viewerId, { connId: input.connId, requestedAt: Date.now() });
+    terminal.viewers.set(viewerId, {
+      state: "pending",
+      connId: input.connId,
+      requestedAt: Date.now(),
+    });
     this.sendControl(session, {
       type: "term.attach",
       terminalId: terminal.terminalId,
@@ -3435,7 +3371,7 @@ export class RelaySessionManager {
     const located = this.terminalForUser(terminalId, userId);
     if (!located) return "not_found";
     const { session, terminal } = located;
-    const viewerId = pendingViewerIdForConn(terminal, connId);
+    const viewerId = viewerIdForConn(terminal, connId, "pending");
     if (!viewerId) return "not_found";
     if (session.socket.readyState !== WS_READY_STATE_OPEN) return "offline";
     this.sendControl(session, { type: "term.auth", terminalId, viewerId, signature });
@@ -3452,7 +3388,7 @@ export class RelaySessionManager {
   ): "sent" | "missing" | "dropped" {
     const located = this.terminalForUser(terminalId, userId);
     if (!located) return "missing";
-    const viewerId = attachedViewerIdForConn(located.terminal, connId);
+    const viewerId = viewerIdForConn(located.terminal, connId, "attached");
     if (!viewerId) return "missing";
     const allowed = located.terminal.operator
       ? this.operatorTerminalsAllowed(located.session)
@@ -3476,10 +3412,11 @@ export class RelaySessionManager {
   dispatchFileOp(op: TrackedFileOp, frame: ServerFrame<"file.op">, body?: Uint8Array): boolean {
     if (this.relayDrain) return false;
     const session = this.sessionsByNodeId.get(op.nodeId);
-    if (!session?.registered || session.socket.readyState !== WS_READY_STATE_OPEN) return false;
+    const node = session ? this.openNode(session) : null;
+    if (!session || !node) return false;
     // A path or a file's content goes only to a node of the op's owner (node-owner.ts).
     if (!nodeOwnerMatches({ userId: session.identity.userId }, op.userId, "file_op")) return false;
-    const roots = session.features?.files.roots ?? null;
+    const roots = node.features.files.roots ?? null;
     if (session.trust !== "full" || roots === null || roots.length === 0) return false;
     if (session.filesById.has(op.opId)) return false;
     const control = encodeRelayServerControlMessage(frame);
@@ -3532,10 +3469,7 @@ export class RelaySessionManager {
   }) {
     if (this.relayDrain) throw new Error("Node session is disconnected.");
     const session = this.sessionsByNodeId.get(nodeId);
-    if (!session?.registered) throw new Error("Node session is disconnected.");
-    if (session.socket.readyState !== WS_READY_STATE_OPEN) {
-      throw new Error("Node session is disconnected.");
-    }
+    if (!session || !this.openNode(session)) throw new Error("Node session is disconnected.");
     const totalBytes =
       bodySource?.size ?? bodyChunks.reduce((total, chunk) => total + chunk.byteLength, 0);
     const expectBody = (bodySource?.size ?? 0) > 0 || bodyChunks.length > 0;
@@ -3573,7 +3507,8 @@ export class RelaySessionManager {
 
   /** Every 3.0 node answers `countFirst`. */
   supportsCountContext(nodeId: string): boolean {
-    return this.sessionsByNodeId.get(nodeId)?.registered === true;
+    const session = this.sessionsByNodeId.get(nodeId);
+    return session !== undefined && liveNode(session.phase) !== null;
   }
 
   private grantBodyCredits(session: SessionState, requestId: string, credits: number) {
@@ -3599,10 +3534,7 @@ export class RelaySessionManager {
           const next = await stream.iterator?.next();
           // The request can end, or the session be replaced, while `next()` is pending: never
           // emit the late chunk into the old socket or a new stream reusing the request id.
-          if (
-            session.bodyStreamsByRequest.get(requestId) !== stream ||
-            this.sessionsByNodeId.get(session.nodeId ?? "") !== session
-          ) {
+          if (session.bodyStreamsByRequest.get(requestId) !== stream || !this.isCurrent(session)) {
             await closeBodyStream(stream);
             return;
           }
@@ -3680,7 +3612,8 @@ export class RelaySessionManager {
       if (!stream) continue;
       session.bodyStreamsByRequest.delete(requestId);
       void closeBodyStream(stream);
-      if (session.nodeId) nodeIds.add(session.nodeId);
+      const nodeId = this.sessionNodeId(session);
+      if (nodeId) nodeIds.add(nodeId);
     }
     for (const nodeId of nodeIds) this.considerDrainClose(nodeId);
   }
@@ -3709,30 +3642,22 @@ export class RelaySessionManager {
     return [...this.sessionsByNodeId.keys()];
   }
 
-  private replaceDuplicateSession(newSession: SessionState) {
-    if (!newSession.nodeId) return;
-    const existing = this.sessionsByNodeId.get(newSession.nodeId);
+  /** Installs the newly registered session for its node, retiring the one it replaces. */
+  private replaceDuplicateSession(newSession: SessionState, node: RegisteredNode) {
+    const existing = this.sessionsByNodeId.get(node.nodeId);
     if (existing && existing !== newSession) {
       // The new session takes over. Tear the old socket down here: once it leaves
       // sessionsBySocket, its close must not mark the node offline. Every viewer attached
-      // through the old connection hears its terminal's exit.
+      // through the old connection hears its terminal's exit; it publishes no more verdicts.
       const owners = new Set<string>([newSession.identity.userId]);
       for (const terminal of existing.terminalsById.values()) owners.add(terminal.userId);
-      this.teardownInteractiveWork(existing);
-      // A replaced session publishes no more verdicts.
-      if (existing.routingEvaluation) this.routingEvaluator.cancel(existing.routingEvaluation);
-      if (existing.inventory) clearTimeout(existing.inventory.timer);
-      existing.inventory = null;
-      this.failActiveRequestsForSession(existing);
-      this.failSttSessions(existing);
+      this.retireSession(existing);
       existing.socket.close(1000, "replaced");
-      this.sessionsBySocket.delete(existing.socket);
-      clearTimeout(existing.unauthenticatedTimer);
-      this.sessionsByNodeId.set(newSession.nodeId, newSession);
+      this.sessionsByNodeId.set(node.nodeId, newSession);
       for (const userId of owners) this.notifyTerminalListChanged(userId);
       return;
     }
-    this.sessionsByNodeId.set(newSession.nodeId, newSession);
+    this.sessionsByNodeId.set(node.nodeId, newSession);
   }
 
   /** A live speech-to-text session; the caller attaches it to a candidate instance. */
@@ -3748,22 +3673,24 @@ export class RelaySessionManager {
   private resolveSttLink(nodeId: string, handle: string) {
     if (this.relayDrain) return { ok: false as const, reason: "draining" as const };
     const session = this.sessionsByNodeId.get(nodeId);
-    if (!session?.registered || session.socket.readyState !== WS_READY_STATE_OPEN) {
+    if (!session || !this.openNode(session)) {
       return { ok: false as const, reason: "offline" as const };
     }
     if (!session.servedHandles.has(handle)) {
       return { ok: false as const, reason: "endpoint_unavailable" as const };
     }
-    return { ok: true as const, link: this.sttLinkFor(session) };
+    const node = liveNode(session.phase);
+    if (!node) return { ok: false as const, reason: "offline" as const };
+    return { ok: true as const, link: this.sttLinkFor(session, node) };
   }
 
   /** One link per registered node session; a successor session is a new link. */
-  private sttLinkFor(session: SessionState): SttRelayLink {
+  private sttLinkFor(session: SessionState, node: RegisteredNode): SttRelayLink {
     let link = this.sttLinks.get(session);
     if (link) return link;
     const socket = session.socket;
     link = {
-      nodeId: session.nodeId ?? "",
+      nodeId: node.nodeId,
       isOpen: () =>
         socket.readyState === WS_READY_STATE_OPEN && this.sessionsBySocket.get(socket) === session,
       bufferedAmount: () => socket.bufferedAmount ?? 0,
@@ -3787,9 +3714,10 @@ export class RelaySessionManager {
   private failActiveRequestsForSession(session: SessionState) {
     for (const stream of session.bodyStreamsByRequest.values()) void closeBodyStream(stream);
     session.bodyStreamsByRequest.clear();
-    if (!session.nodeId) return;
+    const nodeId = this.sessionNodeId(session);
+    if (!nodeId) return;
     for (const [requestId, activeRequest] of this.activeRelayRequests) {
-      if (activeRequest.nodeId !== session.nodeId) continue;
+      if (activeRequest.nodeId !== nodeId) continue;
       this.activeRelayRequests.delete(requestId);
       activeRequest.onError({
         type: "relay.error",
@@ -3803,10 +3731,7 @@ export class RelaySessionManager {
   /** Browser shells need Full control (a Relay-only node refuses `term.open`) and terminals. */
   private terminalsAllowed(session: SessionState): boolean {
     return (
-      session.registered &&
-      session.trust === "full" &&
-      session.features?.terminals.supported === true &&
-      session.terminalPublicKey !== null
+      session.trust === "full" && liveNode(session.phase)?.features.terminals.supported === true
     );
   }
 
@@ -3831,7 +3756,7 @@ export class RelaySessionManager {
   }
 
   private teardownInteractiveWork(session: SessionState) {
-    this.cancelOperatorAcceptanceRetry(session);
+    this.endAcceptanceRetries(session);
     this.closeAllTerminals(session, true);
     for (const op of [...session.filesById.values()]) {
       this.sendControl(session, { type: "file.cancel", opId: op.opId });
@@ -3859,9 +3784,10 @@ export class RelaySessionManager {
 
   /** Drop one attachment (attached or pending) and tell the node; the rest hear the count. */
   private removeViewer(session: SessionState, terminal: TerminalRecord, viewerId: string): boolean {
-    const wasViewer = terminal.viewers.delete(viewerId);
-    const wasPending = terminal.pendingViewers.delete(viewerId);
-    if (!wasViewer && !wasPending) return false;
+    const removed = terminal.viewers.get(viewerId);
+    if (!removed) return false;
+    terminal.viewers.delete(viewerId);
+    const wasViewer = removed.state === "attached";
     const writerLeft = terminal.writerViewerId === viewerId;
     if (writerLeft) terminal.writerViewerId = null;
     this.sendControl(session, { type: "term.detach", terminalId: terminal.terminalId, viewerId });
@@ -3871,13 +3797,14 @@ export class RelaySessionManager {
 
   /** Tell every attached viewer the count and who is typing. */
   private emitViewers(terminal: TerminalRecord) {
-    if (terminal.viewers.size === 0) return;
+    const attached = attachedViewers(terminal);
+    if (attached.length === 0) return;
     const writer = terminal.writerViewerId;
     terminalBridge?.onTerminalEvent({
       type: "viewers",
       terminalId: terminal.terminalId,
-      count: terminal.viewers.size,
-      recipients: [...terminal.viewers].map(([viewerId, viewer]) => ({
+      count: attached.length,
+      recipients: attached.map(([viewerId, viewer]) => ({
         connId: viewer.connId,
         writer: writer === null ? "none" : writer === viewerId ? "you" : "other",
       })),
@@ -3885,14 +3812,15 @@ export class RelaySessionManager {
   }
 
   /**
-   * Drop approval handshakes that never spawned, and attachments the node never answered.
-   * Pending terminals do not count toward the terminal cap.
+   * Drop browser shells the node never answered before their deadline (an approval that never
+   * spawned, or an open it never confirmed or refused: that one would hold a limit slot), and
+   * attachments the node never answered.
    */
   sweepExpiredPendingTerminals(now = Date.now()) {
     for (const session of this.sessionsByNodeId.values()) {
       for (const terminal of [...session.terminalsById.values()]) {
-        if (terminal.phase === "pending") {
-          if (now - terminal.createdAt < TERMINAL_PENDING_TTL_MS) continue;
+        if (terminal.phase.kind !== "open") {
+          if (!openDeadlinePassed(terminal, now)) continue;
           session.terminalsById.delete(terminal.terminalId);
           // The node may have spawned the shell just before the deadline; a close for a
           // terminal it never opened is a no-op there.
@@ -3907,8 +3835,7 @@ export class RelaySessionManager {
           }
           continue;
         }
-        if (terminal.phase !== "open") continue;
-        for (const [viewerId, pending] of [...terminal.pendingViewers]) {
+        for (const [viewerId, pending] of pendingViewers(terminal)) {
           if (now - pending.requestedAt < TERMINAL_PENDING_TTL_MS) continue;
           this.removeViewer(session, terminal, viewerId);
           terminalBridge?.onTerminalEvent({
@@ -3968,13 +3895,13 @@ export class RelaySessionManager {
       body,
     };
     if (metadata.viewerId !== undefined) {
-      const viewer = terminal.viewers.get(metadata.viewerId);
+      const viewer = attachedViewer(terminal, metadata.viewerId);
       if (!viewer) return;
       terminalBridge?.onTerminalEvent({ ...base, connIds: [viewer.connId] });
       return;
     }
     if (metadata.epoch === undefined) return;
-    const connIds = [...terminal.viewers.values()].map((viewer) => viewer.connId);
+    const connIds = attachedViewers(terminal).map(([, viewer]) => viewer.connId);
     if (connIds.length === 0) return;
     terminalBridge?.onTerminalEvent({ ...base, connIds, epoch: metadata.epoch });
   }
@@ -4005,7 +3932,7 @@ export class RelaySessionManager {
       return;
     }
     if (message.type === "term.input_dropped") {
-      const viewer = message.viewerId ? terminal.viewers.get(message.viewerId) : undefined;
+      const viewer = message.viewerId ? attachedViewer(terminal, message.viewerId) : undefined;
       if (!viewer) return;
       terminalBridge?.onTerminalEvent({
         type: "input_dropped",
@@ -4027,7 +3954,7 @@ export class RelaySessionManager {
     }
     if (message.type === "term.writer") {
       const writer = message.viewerId ?? null;
-      if (writer !== null && !terminal.viewers.has(writer)) return;
+      if (writer !== null && !attachedViewer(terminal, writer)) return;
       if (terminal.writerViewerId === writer) return;
       terminal.writerViewerId = writer;
       this.emitViewers(terminal);
@@ -4039,8 +3966,8 @@ export class RelaySessionManager {
       return;
     }
     if (message.type === "term.pending") {
-      const nodePublicKey = session.terminalPublicKey;
-      const pending = terminal.pendingViewers.get(viewerId);
+      const nodePublicKey = liveNode(session.phase)?.terminalPublicKey;
+      const pending = pendingViewer(terminal, viewerId);
       if (!nodePublicKey || !pending) return;
       terminalBridge?.onTerminalEvent({
         type: "pending",
@@ -4057,25 +3984,28 @@ export class RelaySessionManager {
     if (terminal.operator && message.type === "term.opened") return;
     if (message.type === "term.opened" || message.type === "term.attached") {
       if (message.type === "term.opened") {
-        if (terminal.phase === "open") return;
-        terminal.phase = "open";
+        if (terminal.phase.kind === "open") return;
+        terminal.phase = { kind: "open" };
         if (this.terminalOverLimit(terminal)) {
           this.closeTerminal(session, terminal, true);
           return;
         }
-      } else if (terminal.phase !== "open") {
+      } else if (terminal.phase.kind !== "open") {
         return;
       }
-      const nodePublicKey = session.terminalPublicKey;
+      const nodePublicKey = liveNode(session.phase)?.terminalPublicKey;
       if (!nodePublicKey) {
         this.closeTerminal(session, terminal, true);
         return;
       }
-      const pending = terminal.pendingViewers.get(viewerId);
+      const pending = pendingViewer(terminal, viewerId);
       // The tab may have left while the node was spawning or approving.
       if (!pending) return;
-      terminal.pendingViewers.delete(viewerId);
-      terminal.viewers.set(viewerId, { connId: pending.connId, attachedAt: Date.now() });
+      terminal.viewers.set(viewerId, {
+        state: "attached",
+        connId: pending.connId,
+        attachedAt: Date.now(),
+      });
       // The opener is the first writer. The node confirms with term.writer.
       if (message.type === "term.opened" && terminal.writerViewerId === null) {
         terminal.writerViewerId = viewerId;
@@ -4092,11 +4022,11 @@ export class RelaySessionManager {
       return;
     }
     // term.rejected
-    const target = terminal.pendingViewers.get(viewerId) ?? terminal.viewers.get(viewerId);
-    const wasViewer = terminal.viewers.delete(viewerId);
-    terminal.pendingViewers.delete(viewerId);
+    const target = terminal.viewers.get(viewerId);
+    terminal.viewers.delete(viewerId);
+    const wasViewer = target?.state === "attached";
     if (terminal.writerViewerId === viewerId) terminal.writerViewerId = null;
-    if (terminal.phase !== "open" && !terminal.operator) {
+    if (terminal.phase.kind !== "open" && !terminal.operator) {
       // The open itself was refused: nothing spawned.
       session.terminalsById.delete(terminal.terminalId);
     } else if (wasViewer) {
@@ -4124,7 +4054,7 @@ export class RelaySessionManager {
    * socket takes the protocol-error path. Nothing of the frame is logged but its type.
    */
   private isolateMalformedInteractiveFrame(session: SessionState, frame: string): boolean {
-    if (!session.registered) return false;
+    if (!liveNode(session.phase)) return false;
     let parsed: unknown;
     try {
       parsed = JSON.parse(frame);

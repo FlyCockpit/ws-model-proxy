@@ -2,8 +2,9 @@ import { Button } from "@ws-model-proxy/ui/components/button";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Check, Copy } from "lucide-react";
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
+
+import { useCopyFeedback } from "@/hooks/use-copy-feedback";
 
 /** Copies `value`; a 44px target with a short "copied" state. */
 export function CopyButton({
@@ -17,7 +18,7 @@ export function CopyButton({
   className?: string;
 }) {
   const { t } = useTranslation(["common"]);
-  const [copied, setCopied] = useState(false);
+  const { feedback, copy } = useCopyFeedback(1_500);
   return (
     <Button
       type="button"
@@ -27,17 +28,11 @@ export function CopyButton({
       title={label}
       className={cn("shrink-0", className)}
       onClick={async () => {
-        try {
-          await navigator.clipboard.writeText(value);
-          setCopied(true);
-          toast.success(t("common:actions.copied"));
-          window.setTimeout(() => setCopied(false), 1_500);
-        } catch {
-          toast.error(t("common:somethingWentWrong"));
-        }
+        if (await copy(value)) toast.success(t("common:actions.copied"));
+        else toast.error(t("common:somethingWentWrong"));
       }}
     >
-      {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+      {feedback === "copied" ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
     </Button>
   );
 }

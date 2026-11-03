@@ -1,6 +1,7 @@
 import prisma from "@ws-model-proxy/db";
+import { createSerialTask } from "../serial-task.js";
 import { MODEL_API_RELAY_TIMEOUT_MS } from "./limits.js";
-import { recordRollupsForTransitionedRequests } from "./usage-rollup.js";
+import { transitionRelayRequestTerminal } from "./usage-rollup.js";
 
 export const LOCAL_RELAY_PROCESS_EPOCH = crypto.randomUUID();
 export const LOCAL_RELAY_ATTEMPT_TTL_MS = 2 * 60 * 1000;
@@ -210,12 +211,12 @@ export async function reconcileStaleLocalRelayTelemetry({
       // rollup increment is written in this same transaction only when this repair performed
       // it, so a normal completion that already won is never counted twice.
       if (attempt.purpose === "EXECUTION" && !held.relayRequestIds.has(attempt.requestId)) {
-        const transitioned = await tx.relayRequest.updateMany({
-          where: { id: attempt.requestId, status: "PENDING" },
-          data: { status: "FAILED", completedAt: claimTime, errorClass: "crash_recovered" },
-        });
-        if (transitioned.count === 1)
-          await recordRollupsForTransitionedRequests(tx, [attempt.requestId], claimTime);
+        await transitionRelayRequestTerminal(
+          tx,
+          attempt.requestId,
+          { status: "FAILED", completedAt: claimTime, errorClass: "crash_recovered" },
+          claimTime,
+        );
       }
       return 1;
     });
@@ -234,24 +235,19 @@ export function startRelayTelemetryRecovery({
   retryFinalizations?: () => Promise<unknown>;
   reconcile?: () => Promise<unknown>;
 } = {}) {
-  let running = false;
-  const run = async () => {
-    if (running) return;
-    running = true;
-    try {
+  // A maintenance pass still running when the interval fires is not queued again.
+  const task = createSerialTask({
+    overlap: "drop",
+    intervalMs,
+    run: async () => {
       // Retry first so a recovered finalization records the real status
       // before its attempt could be considered for repair.
       await retryFinalizations();
       await heartbeat();
       await reconcile();
-    } catch {
-      console.warn("[relay-telemetry] lifecycle maintenance failed");
-    } finally {
-      running = false;
-    }
-  };
-  void run();
-  const timer = setInterval(() => void run(), intervalMs);
-  timer.unref?.();
-  return () => clearInterval(timer);
+    },
+    onError: () => console.warn("[relay-telemetry] lifecycle maintenance failed"),
+  });
+  task.start();
+  return () => void task.stop();
 }

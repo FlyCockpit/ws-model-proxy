@@ -13,34 +13,57 @@
 //! dec_ansi_parser) as xterm.js implements them, over code points from a
 //! WHATWG UTF-8 decoder (U+FFFD for invalid input, as `TextDecoder` decodes).
 
-const GROUND: u8 = 0;
-const ESCAPE: u8 = 1;
-const ESCAPE_INTERMEDIATE: u8 = 2;
-const CSI_ENTRY: u8 = 3;
-const CSI_PARAM: u8 = 4;
-const CSI_INTERMEDIATE: u8 = 5;
-const CSI_IGNORE: u8 = 6;
-const OSC_STRING: u8 = 7;
-/// SOS, PM and APC bodies.
-const IGNORED_STRING: u8 = 8;
-const DCS_ENTRY: u8 = 9;
-const DCS_PARAM: u8 = 10;
-const DCS_INTERMEDIATE: u8 = 11;
-const DCS_IGNORE: u8 = 12;
-const DCS_PASSTHROUGH: u8 = 13;
+/// The VT500 parser's states (the subset that decides what is printed).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VtState {
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    CsiEntry,
+    CsiParam,
+    CsiIntermediate,
+    CsiIgnore,
+    OscString,
+    /// SOS, PM and APC bodies.
+    IgnoredString,
+    DcsEntry,
+    DcsParam,
+    DcsIntermediate,
+    DcsIgnore,
+    DcsPassthrough,
+}
+
+impl VtState {
+    /// Whether HT, LF and CR are printed here: in ground and inside an escape
+    /// or CSI sequence, but never inside a string body (OSC, SOS/PM/APC, DCS).
+    fn prints_line_controls(self) -> bool {
+        matches!(
+            self,
+            Self::Ground
+                | Self::Escape
+                | Self::EscapeIntermediate
+                | Self::CsiEntry
+                | Self::CsiParam
+                | Self::CsiIntermediate
+                | Self::CsiIgnore
+        )
+    }
+}
 
 /// The state after an ESC, CAN, SUB or C1 control, which act the same in
 /// every state; `None` for any other code point.
-fn anywhere_transition(code: u32) -> Option<u8> {
+fn anywhere_transition(code: u32) -> Option<VtState> {
+    use VtState::*;
     match code {
-        0x1b => Some(ESCAPE),
-        0x18 | 0x1a => Some(GROUND),
-        0x90 => Some(DCS_ENTRY),
-        0x9b => Some(CSI_ENTRY),
-        0x9d => Some(OSC_STRING),
-        0x98 | 0x9e | 0x9f => Some(IGNORED_STRING),
+        0x1b => Some(Escape),
+        0x18 | 0x1a => Some(Ground),
+        0x90 => Some(DcsEntry),
+        0x9b => Some(CsiEntry),
+        0x9d => Some(OscString),
+        0x98 | 0x9e | 0x9f => Some(IgnoredString),
         // ST and every other C1 control end any sequence.
-        0x80..=0x9f => Some(GROUND),
+        0x80..=0x9f => Some(Ground),
         _ => None,
     }
 }
@@ -51,81 +74,83 @@ fn is_executable(code: u32) -> bool {
 }
 
 /// The state after a printable byte (0x20-0x7e) outside GROUND.
-fn printable_transition(state: u8, code: u32) -> u8 {
+fn printable_transition(state: VtState, code: u32) -> VtState {
+    use VtState::*;
     match state {
-        ESCAPE => match code {
-            0x20..=0x2f => ESCAPE_INTERMEDIATE,
-            0x5b => CSI_ENTRY,
-            0x5d => OSC_STRING,
-            0x50 => DCS_ENTRY,
-            0x58 | 0x5e | 0x5f => IGNORED_STRING,
-            _ => GROUND,
+        Escape => match code {
+            0x20..=0x2f => EscapeIntermediate,
+            0x5b => CsiEntry,
+            0x5d => OscString,
+            0x50 => DcsEntry,
+            0x58 | 0x5e | 0x5f => IgnoredString,
+            _ => Ground,
         },
-        ESCAPE_INTERMEDIATE => {
+        EscapeIntermediate => {
             if code <= 0x2f {
-                ESCAPE_INTERMEDIATE
+                EscapeIntermediate
             } else {
-                GROUND
+                Ground
             }
         }
-        CSI_ENTRY | CSI_PARAM => match code {
-            0x40.. => GROUND,
-            ..=0x2f => CSI_INTERMEDIATE,
-            0x3c..=0x3f if state == CSI_ENTRY => CSI_PARAM,
-            0x3c..=0x3f => CSI_IGNORE,
-            _ => CSI_PARAM,
+        CsiEntry | CsiParam => match code {
+            0x40.. => Ground,
+            ..=0x2f => CsiIntermediate,
+            0x3c..=0x3f if state == CsiEntry => CsiParam,
+            0x3c..=0x3f => CsiIgnore,
+            _ => CsiParam,
         },
-        CSI_INTERMEDIATE => match code {
-            0x40.. => GROUND,
-            ..=0x2f => CSI_INTERMEDIATE,
-            _ => CSI_IGNORE,
+        CsiIntermediate => match code {
+            0x40.. => Ground,
+            ..=0x2f => CsiIntermediate,
+            _ => CsiIgnore,
         },
-        CSI_IGNORE => {
+        CsiIgnore => {
             if code >= 0x40 {
-                GROUND
+                Ground
             } else {
-                CSI_IGNORE
+                CsiIgnore
             }
         }
-        DCS_ENTRY | DCS_PARAM => match code {
-            0x40.. => DCS_PASSTHROUGH,
-            ..=0x2f => DCS_INTERMEDIATE,
-            0x3c..=0x3f if state == DCS_ENTRY => DCS_PARAM,
-            0x3c..=0x3f => DCS_IGNORE,
-            _ => DCS_PARAM,
+        DcsEntry | DcsParam => match code {
+            0x40.. => DcsPassthrough,
+            ..=0x2f => DcsIntermediate,
+            0x3c..=0x3f if state == DcsEntry => DcsParam,
+            0x3c..=0x3f => DcsIgnore,
+            _ => DcsParam,
         },
-        DCS_INTERMEDIATE => match code {
-            0x40.. => DCS_PASSTHROUGH,
-            ..=0x2f => DCS_INTERMEDIATE,
-            _ => DCS_IGNORE,
+        DcsIntermediate => match code {
+            0x40.. => DcsPassthrough,
+            ..=0x2f => DcsIntermediate,
+            _ => DcsIgnore,
         },
         // OSC, SOS/PM/APC, DCS ignore and passthrough bodies run to their end.
-        _ => state,
+        Ground | OscString | IgnoredString | DcsIgnore | DcsPassthrough => state,
     }
 }
 
 /// The state after a non-ASCII printable (U+00A0 and above) outside GROUND.
-fn non_ascii_transition(state: u8) -> u8 {
+fn non_ascii_transition(state: VtState) -> VtState {
+    use VtState::*;
     match state {
-        DCS_ENTRY | DCS_PARAM | DCS_INTERMEDIATE => DCS_IGNORE,
-        CSI_IGNORE | OSC_STRING | IGNORED_STRING | DCS_IGNORE | DCS_PASSTHROUGH => state,
-        _ => GROUND,
+        DcsEntry | DcsParam | DcsIntermediate => DcsIgnore,
+        CsiIgnore | OscString | IgnoredString | DcsIgnore | DcsPassthrough => state,
+        Ground | Escape | EscapeIntermediate | CsiEntry | CsiParam | CsiIntermediate => Ground,
     }
 }
 
-fn next_state(state: u8, code: u32) -> u8 {
+fn next_state(state: VtState, code: u32) -> VtState {
     if let Some(next) = anywhere_transition(code) {
         return next;
     }
     if is_executable(code) {
-        return if state == OSC_STRING && code == 0x07 {
-            GROUND
+        return if state == VtState::OscString && code == 0x07 {
+            VtState::Ground
         } else {
             state
         };
     }
     // DEL is ignored in every state.
-    if code == 0x7f || state == GROUND {
+    if code == 0x7f || state == VtState::Ground {
         return state;
     }
     if code >= 0xa0 {
@@ -135,28 +160,47 @@ fn next_state(state: u8, code: u32) -> u8 {
     }
 }
 
+/// The WHATWG UTF-8 decoder between code points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Utf8 {
+    /// On a character boundary.
+    Idle,
+    /// Inside a multi-byte character: `remaining` continuation bytes to come,
+    /// the next of which must lie in `lower..=upper`.
+    Partial {
+        remaining: u8,
+        code_point: u32,
+        lower: u8,
+        upper: u8,
+    },
+}
+
+impl Utf8 {
+    /// After a lead byte announcing `remaining` continuation bytes.
+    fn lead(remaining: u8, bits: u8, lower: u8, upper: u8) -> Self {
+        Self::Partial {
+            remaining,
+            code_point: u32::from(bits),
+            lower,
+            upper,
+        }
+    }
+}
+
 /// The parser across a byte stream, one byte at a time.
 #[derive(Debug, Clone, Copy)]
 pub struct TerminalByteState {
-    state: u8,
+    state: VtState,
     decoded_any: bool,
-    needed: u8,
-    seen: u8,
-    code_point: u32,
-    lower: u8,
-    upper: u8,
+    utf8: Utf8,
 }
 
 impl Default for TerminalByteState {
     fn default() -> Self {
         Self {
-            state: GROUND,
+            state: VtState::Ground,
             decoded_any: false,
-            needed: 0,
-            seen: 0,
-            code_point: 0,
-            lower: 0x80,
-            upper: 0xbf,
+            utf8: Utf8::Idle,
         }
     }
 }
@@ -164,7 +208,7 @@ impl Default for TerminalByteState {
 impl TerminalByteState {
     /// True in the ground state with no partial character pending.
     pub fn at_boundary(&self) -> bool {
-        self.state == GROUND && self.needed == 0
+        self.state == VtState::Ground && self.utf8 == Utf8::Idle
     }
 
     /// Feeds one byte (WHATWG UTF-8 decoding, U+FFFD for invalid input).
@@ -180,8 +224,8 @@ impl TerminalByteState {
 
     /// WHATWG decoding emits a replacement for an incomplete final character.
     pub fn finish_clean(&mut self, out: &mut String) {
-        if self.needed != 0 {
-            self.reset();
+        if self.utf8 != Utf8::Idle {
+            self.utf8 = Utf8::Idle;
             self.code(0xfffd, &mut |ch| out.push(ch));
         }
     }
@@ -195,8 +239,8 @@ impl TerminalByteState {
             return;
         }
         let printable = (0x20..=0x7e).contains(&code) || code >= 0xa0;
-        if ((self.state == GROUND && printable)
-            || (self.state <= CSI_IGNORE && matches!(code, 0x09 | 0x0a | 0x0d)))
+        if ((self.state == VtState::Ground && printable)
+            || (self.state.prints_line_controls() && matches!(code, 0x09 | 0x0a | 0x0d)))
             && let Some(ch) = char::from_u32(code)
         {
             emit(ch);
@@ -205,60 +249,50 @@ impl TerminalByteState {
     }
 
     fn decode(&mut self, byte: u8, emit: &mut impl FnMut(char)) {
-        if self.needed == 0 {
-            match byte {
+        match self.utf8 {
+            Utf8::Idle => match byte {
                 0x00..=0x7f => self.code(u32::from(byte), emit),
-                0xc2..=0xdf => self.start(1, byte & 0x1f),
+                0xc2..=0xdf => self.utf8 = Utf8::lead(1, byte & 0x1f, 0x80, 0xbf),
                 0xe0..=0xef => {
-                    if byte == 0xe0 {
-                        self.lower = 0xa0;
-                    }
-                    if byte == 0xed {
-                        self.upper = 0x9f;
-                    }
-                    self.start(2, byte & 0x0f);
+                    let lower = if byte == 0xe0 { 0xa0 } else { 0x80 };
+                    let upper = if byte == 0xed { 0x9f } else { 0xbf };
+                    self.utf8 = Utf8::lead(2, byte & 0x0f, lower, upper);
                 }
                 0xf0..=0xf4 => {
-                    if byte == 0xf0 {
-                        self.lower = 0x90;
-                    }
-                    if byte == 0xf4 {
-                        self.upper = 0x8f;
-                    }
-                    self.start(3, byte & 0x07);
+                    let lower = if byte == 0xf0 { 0x90 } else { 0x80 };
+                    let upper = if byte == 0xf4 { 0x8f } else { 0xbf };
+                    self.utf8 = Utf8::lead(3, byte & 0x07, lower, upper);
                 }
                 _ => self.code(0xfffd, emit),
+            },
+            Utf8::Partial {
+                remaining,
+                code_point,
+                lower,
+                upper,
+            } => {
+                if !(lower..=upper).contains(&byte) {
+                    // The character is cut short: a replacement, then the byte
+                    // starts afresh (once: the decoder is idle now).
+                    self.utf8 = Utf8::Idle;
+                    self.code(0xfffd, emit);
+                    self.decode(byte, emit);
+                    return;
+                }
+                let code_point = (code_point << 6) | u32::from(byte & 0x3f);
+                if remaining == 1 {
+                    self.utf8 = Utf8::Idle;
+                    self.code(code_point, emit);
+                } else {
+                    self.utf8 = Utf8::Partial {
+                        remaining: remaining - 1,
+                        code_point,
+                        lower: 0x80,
+                        upper: 0xbf,
+                    };
+                }
             }
-            return;
         }
-        if byte < self.lower || byte > self.upper {
-            self.reset();
-            self.code(0xfffd, emit);
-            self.decode(byte, emit);
-            return;
-        }
-        self.lower = 0x80;
-        self.upper = 0xbf;
-        self.code_point = (self.code_point << 6) | u32::from(byte & 0x3f);
-        self.seen += 1;
-        if self.seen == self.needed {
-            let code_point = self.code_point;
-            self.reset();
-            self.code(code_point, emit);
-        }
-    }
-
-    fn start(&mut self, needed: u8, bits: u8) {
-        self.needed = needed;
-        self.code_point = u32::from(bits);
-    }
-
-    fn reset(&mut self) {
-        self.needed = 0;
-        self.seen = 0;
-        self.code_point = 0;
-        self.lower = 0x80;
-        self.upper = 0xbf;
     }
 }
 
@@ -331,6 +365,70 @@ mod tests {
                 vector.max
             );
         }
+    }
+
+    #[test]
+    fn line_controls_print_outside_string_bodies_only() {
+        use VtState::*;
+        for state in [
+            Ground,
+            Escape,
+            EscapeIntermediate,
+            CsiEntry,
+            CsiParam,
+            CsiIntermediate,
+            CsiIgnore,
+        ] {
+            assert!(state.prints_line_controls(), "{state:?}");
+        }
+        for state in [
+            OscString,
+            IgnoredString,
+            DcsEntry,
+            DcsParam,
+            DcsIntermediate,
+            DcsIgnore,
+            DcsPassthrough,
+        ] {
+            assert!(!state.prints_line_controls(), "{state:?}");
+        }
+        let clean = |bytes: &[u8]| {
+            let mut state = TerminalByteState::default();
+            let mut out = String::new();
+            for &byte in bytes {
+                state.feed_clean(byte, &mut out);
+            }
+            state.finish_clean(&mut out);
+            out
+        };
+        assert_eq!(clean(b"a\x1b[\nb"), "a\n");
+        assert_eq!(clean(b"a\x1b]0;\ntitle\x07b"), "ab");
+    }
+
+    #[test]
+    fn a_cut_character_is_one_replacement_and_the_byte_starts_afresh() {
+        let mut state = TerminalByteState::default();
+        let mut out = String::new();
+        // E2 82 then `A`: U+FFFD for the cut character, then `A` itself.
+        for &byte in b"\xe2\x82A" {
+            state.feed_clean(byte, &mut out);
+        }
+        assert_eq!(out, "\u{fffd}A");
+        assert!(state.at_boundary());
+        // A partial character is no boundary; finishing replaces it.
+        state.feed_clean(0xf0, &mut out);
+        state.feed_clean(0x9f, &mut out);
+        assert!(!state.at_boundary());
+        state.finish_clean(&mut out);
+        assert_eq!(out, "\u{fffd}A\u{fffd}");
+        assert!(state.at_boundary());
+        // E0 needs A0..=BF next: 80 is not a continuation of it.
+        let mut out = String::new();
+        let mut state = TerminalByteState::default();
+        for &byte in b"\xe0\x80" {
+            state.feed_clean(byte, &mut out);
+        }
+        assert_eq!(out, "\u{fffd}\u{fffd}");
     }
 
     #[test]

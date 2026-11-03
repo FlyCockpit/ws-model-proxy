@@ -17,6 +17,8 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const signInEmailMock = vi.hoisted(() => vi.fn());
 const verifyTotpMock = vi.hoisted(() => vi.fn());
+const sendOtpMock = vi.hoisted(() => vi.fn());
+const verifyEmailTransportMock = vi.hoisted(() => vi.fn());
 const navigateMock = vi.hoisted(() => vi.fn());
 const state = vi.hoisted(() => ({
   authStatus: "anonymous" as string,
@@ -42,7 +44,7 @@ vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
 vi.mock("@/lib/auth-client", () => ({
   authClient: {
     signIn: { email: signInEmailMock },
-    twoFactor: { verifyOtp: vi.fn(), verifyTotp: verifyTotpMock, sendOtp: vi.fn() },
+    twoFactor: { verifyOtp: vi.fn(), verifyTotp: verifyTotpMock, sendOtp: sendOtpMock },
   },
 }));
 
@@ -61,7 +63,7 @@ vi.mock("@/utils/orpc", () => ({
         }),
       },
     },
-    auth: {},
+    auth: { verifyEmailTransport: { call: verifyEmailTransportMock } },
   },
 }));
 
@@ -274,5 +276,59 @@ describe("SignInCard mode parity", () => {
       });
       expect(toast.error).not.toHaveBeenCalledWith("auth:errors.invalidTotp");
     });
+  });
+});
+
+describe("SignInCard 2FA challenge state machine", () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    state.config = {};
+  });
+
+  async function openChallenge(user: ReturnType<typeof userEvent.setup>) {
+    signInEmailMock.mockResolvedValueOnce({ data: { twoFactorRedirect: true }, error: null });
+    renderCard();
+    await submitCredentials(user);
+    return screen.findByLabelText("auth:fields.verificationCode");
+  }
+
+  it("Back during an in-flight email send does not reopen the challenge in email mode", async () => {
+    const user = userEvent.setup();
+    state.config = { emailEnabled: true };
+    let resolveSend: (value: { data: unknown; error: null }) => void = () => {};
+    verifyEmailTransportMock.mockResolvedValue({ ok: true });
+    sendOtpMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveSend = resolve;
+      }),
+    );
+    await openChallenge(user);
+
+    await user.click(screen.getByRole("button", { name: "auth:twoFactor.emailMeCode" }));
+    await screen.findByRole("button", { name: "auth:twoFactor.sendingCode" });
+    await user.click(screen.getByRole("button", { name: "auth:twoFactor.back" }));
+    resolveSend({ data: {}, error: null });
+
+    signInEmailMock.mockResolvedValueOnce({ data: { twoFactorRedirect: true }, error: null });
+    await submitCredentials(user);
+    await screen.findByLabelText("auth:fields.verificationCode");
+    expect(screen.getByText("auth:twoFactor.description")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "auth:twoFactor.emailMeCode" })).toBeTruthy();
+    expect(toast.success).not.toHaveBeenCalledWith("auth:twoFactor.codeSent");
+  });
+
+  it("Enter while a verify is in flight does not send a second verify", async () => {
+    const user = userEvent.setup();
+    verifyTotpMock.mockReturnValueOnce(new Promise(() => {}));
+    const input = await openChallenge(user);
+
+    await user.type(input, "123456");
+    await user.keyboard("{Enter}");
+    await screen.findByRole("button", { name: "auth:twoFactor.verifying" });
+    await user.keyboard("{Enter}");
+    await user.click(screen.getByRole("button", { name: "auth:twoFactor.verifying" }));
+
+    expect(verifyTotpMock).toHaveBeenCalledTimes(1);
   });
 });

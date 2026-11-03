@@ -83,6 +83,16 @@ describe("sweepNeedsYouMail", () => {
       needsOperator: { not: null },
       Runtime: { User: { operationalAlerts: true, emailVerified: true } },
     });
+    // Account access active at the sweep's time: an expired temporary ban no longer suppresses
+    // the mail; a ban expiring exactly now still does.
+    expect(where?.Runtime).toEqual({
+      User: {
+        operationalAlerts: true,
+        emailVerified: true,
+        deletionRequestedAt: null,
+        OR: [{ banned: null }, { banned: false }, { banExpires: { lt: now } }],
+      },
+    });
     // Unmarked, or marked for an earlier need: the column is compared with needsOperatorSince.
     expect(where?.OR).toEqual([
       { needsOperatorNotifiedAt: null },
@@ -217,10 +227,12 @@ describe("notifyQueuedCommand", () => {
     await expect(notifyQueuedCommand({ userId: "owner", nodeSlug: "gpu-box", now })).resolves.toBe(
       true,
     );
-    expect(db.user.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({
+    expect(db.user.findFirst.mock.calls[0]?.[0]?.where).toEqual({
       id: "owner",
       operationalAlerts: true,
       emailVerified: true,
+      deletionRequestedAt: null,
+      OR: [{ banned: null }, { banned: false }, { banExpires: { lt: now } }],
     });
     expect(mail.sendEmail.mock.calls[0]?.[0]).toMatchObject({
       to: "o@example.test",

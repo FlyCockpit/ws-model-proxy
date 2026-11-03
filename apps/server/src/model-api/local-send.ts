@@ -1,4 +1,5 @@
 import { embeddingContractsMatch } from "@ws-model-proxy/api/lib/embedding-contract";
+import { nodeIsLive } from "@ws-model-proxy/api/lib/node-liveness";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
@@ -159,7 +160,7 @@ async function checkPermission(tx: Prisma.TransactionClient, input: LocalSendBin
   const node = headNodeId
     ? await tx.node.findUnique({
         where: { id: headNodeId },
-        select: { userId: true, connection: true },
+        select: { userId: true, connection: true, lastHeartbeatAt: true },
       })
     : null;
   if (
@@ -171,7 +172,9 @@ async function checkPermission(tx: Prisma.TransactionClient, input: LocalSendBin
     target.Instance?.handle !== input.handle ||
     target.Instance.phase !== "READY" ||
     headNodeId !== input.nodeId ||
-    node?.connection !== "ONLINE" ||
+    // A row left ONLINE with a stale heartbeat has no session anywhere: no grant.
+    !node ||
+    !nodeIsLive(node, new Date()) ||
     node.userId !== input.engineOwnerUserId
   )
     deny("MEMBER_UNAVAILABLE");

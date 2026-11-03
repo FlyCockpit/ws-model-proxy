@@ -14,6 +14,7 @@
  * locks (local-send.ts, public-overflow.ts).
  */
 import { timingSafeEqual } from "node:crypto";
+import { nodeIsLive } from "@ws-model-proxy/api/lib/node-liveness";
 import type {
   PoolRouteRow,
   TargetFailureClass,
@@ -620,11 +621,15 @@ const TARGET_SELECT = {
         },
       },
       Runtime: {
-        select: { kind: true, nodeId: true, Node: { select: { id: true, connection: true } } },
+        select: {
+          kind: true,
+          nodeId: true,
+          Node: { select: { id: true, connection: true, lastHeartbeatAt: true } },
+        },
       },
       Ranks: {
         where: { rank: 0 },
-        select: { nodeId: true, Node: { select: { connection: true } } },
+        select: { nodeId: true, Node: { select: { connection: true, lastHeartbeatAt: true } } },
       },
     },
   },
@@ -669,9 +674,8 @@ function routeParts(row: TargetSelected, now: Date): TestRoute | null {
   const alwaysOn = instance.Runtime.kind === "ALWAYS_ON";
   const rank0 = instance.Ranks[0];
   const nodeId = alwaysOn ? instance.Runtime.nodeId : (rank0?.nodeId ?? null);
-  const nodeOnline = alwaysOn
-    ? instance.Runtime.Node?.connection === "ONLINE"
-    : rank0?.Node?.connection === "ONLINE";
+  // A row left ONLINE with a stale heartbeat has no session anywhere: never routed to.
+  const nodeOnline = nodeIsLive(alwaysOn ? instance.Runtime.Node : rank0?.Node, now);
   const version = instance.Version;
   return {
     target: {

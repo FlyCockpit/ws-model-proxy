@@ -142,13 +142,113 @@ struct BodyChunk {
     last: bool,
 }
 
+/// Where a live request's body stands, as the main loop routes its frames.
+enum RequestBody {
+    /// The request declared no body: any body frame is a protocol fault.
+    None,
+    /// Chunks feed the worker through this sender. Dropping it before the
+    /// final chunk aborts the upstream request body.
+    Open(SyncSender<BodyChunk>),
+    /// The final chunk went to the worker (the sender is dropped; queued
+    /// chunks still reach it). A chunk after it is dropped with a warning.
+    Complete,
+}
+
 /// Handle the main loop keeps for an in-flight relayed request.
 struct WorkerHandle {
-    /// Sender feeding streamed request-body chunks to the worker. `None` for
-    /// requests without a body. Dropping it aborts the upstream request body.
-    body_tx: Option<SyncSender<BodyChunk>>,
+    body: RequestBody,
     cancellation: CancellationHandle,
     join: JoinHandle<()>,
+}
+
+/// Why a request leaves the live set ([`RelayRequests::retire`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retire {
+    /// Its worker reported `Finished`: joined (it is done).
+    Finished,
+    /// The server cancelled it (`relay.cancel`).
+    Cancelled,
+    /// The node faulted it (`relay.error` already sent or about to be).
+    Faulted,
+}
+
+/// What the main loop knows about one request id.
+enum RequestState<'a> {
+    Live(&'a mut WorkerHandle),
+    /// Retired recently: late frames for it are expected and dropped.
+    Retired,
+    /// Never seen (or retired too long ago to remember).
+    Unknown,
+}
+
+/// Every relayed request of one session: the live ones and the recently
+/// retired ids. One place moves a request from live to retired
+/// ([`Self::retire`]), so every exit records it the same way.
+struct RelayRequests {
+    live: BTreeMap<String, WorkerHandle>,
+    retired: RecentlyFinished,
+}
+
+impl RelayRequests {
+    fn new() -> Self {
+        Self {
+            live: BTreeMap::new(),
+            retired: RecentlyFinished::new(),
+        }
+    }
+
+    /// Frames a worker queued for `request_id` may still go out.
+    fn is_live(&self, request_id: &str) -> bool {
+        self.live.contains_key(request_id)
+    }
+
+    /// Live, or retired recently: a `relay.request` reusing it is a fault.
+    fn in_use(&self, request_id: &str) -> bool {
+        self.is_live(request_id) || self.retired.contains(request_id)
+    }
+
+    fn state(&mut self, request_id: &str) -> RequestState<'_> {
+        if let Some(worker) = self.live.get_mut(request_id) {
+            return RequestState::Live(worker);
+        }
+        if self.retired.contains(request_id) {
+            RequestState::Retired
+        } else {
+            RequestState::Unknown
+        }
+    }
+
+    fn start(&mut self, request_id: String, worker: WorkerHandle) {
+        self.live.insert(request_id, worker);
+    }
+
+    /// Take `request_id` out of the live set for `reason` and remember it,
+    /// so late body chunks the server is still flushing are dropped instead
+    /// of faulted as "before request metadata". Whether it was live.
+    fn retire(&mut self, request_id: &str, reason: Retire) -> bool {
+        self.retired.record(request_id);
+        let Some(worker) = self.live.remove(request_id) else {
+            return false;
+        };
+        match reason {
+            Retire::Finished => {
+                let _ = worker.join.join();
+            }
+            Retire::Cancelled | Retire::Faulted => {
+                worker.cancellation.cancel();
+                drop(worker.body);
+                // Detach: the thread exits once its upstream call unwinds.
+                drop(worker.join);
+            }
+        }
+        true
+    }
+
+    /// Session teardown: cancel every live request without joining, so a
+    /// slow upstream cannot delay reconnection.
+    fn abort_all(&mut self) {
+        abort_all_workers(std::mem::take(&mut self.live));
+    }
 }
 
 /// A cancellation request is idempotent and wakes the async HTTP operation.
@@ -331,8 +431,6 @@ fn streaming_request_body(
     cancellation_rx: watch::Receiver<bool>,
 ) -> impl Stream<Item = std::result::Result<Vec<u8>, io::Error>> + Send + 'static {
     let (body_tx, body_rx) = tokio_mpsc::channel(UPSTREAM_BODY_HANDOFF_CAPACITY);
-    let clean_eof = Arc::new(AtomicBool::new(false));
-    let bridge_clean_eof = Arc::clone(&clean_eof);
     thread::spawn(move || {
         loop {
             if *cancellation_rx.borrow() {
@@ -344,7 +442,9 @@ fn streaming_request_body(
                     // the async handoff. Acknowledging before `blocking_send`
                     // lets the server refill the websocket channel while the
                     // handoff is still full, exceeding the advertised window.
-                    if body_tx.blocking_send(Ok(data)).is_err() {
+                    // The end rides in band with the last chunk: a channel
+                    // that closes without it is a truncated upload.
+                    if body_tx.blocking_send(BodyHandoff { data, last }).is_err() {
                         return;
                     }
                     let ack = NodeFrame::RelayRequestBodyAck {
@@ -364,7 +464,6 @@ fn streaming_request_body(
                         return;
                     }
                     if last {
-                        bridge_clean_eof.store(true, Ordering::SeqCst);
                         return;
                     }
                 }
@@ -378,15 +477,30 @@ fn streaming_request_body(
     });
     TokioBodyStream {
         receiver: body_rx,
-        clean_eof,
-        terminated: false,
+        state: BodyStreamState::Open,
     }
 }
 
+/// One request-body chunk on its way from the bridge thread to the HTTP body.
+struct BodyHandoff {
+    data: Vec<u8>,
+    last: bool,
+}
+
+/// Where the upstream request body stream stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyStreamState {
+    /// More chunks may come.
+    Open,
+    /// The final chunk was yielded: a clean EOF.
+    Ended,
+    /// The channel closed before the final chunk: the error was yielded.
+    Truncated,
+}
+
 struct TokioBodyStream {
-    receiver: tokio_mpsc::Receiver<std::result::Result<Vec<u8>, io::Error>>,
-    clean_eof: Arc<AtomicBool>,
-    terminated: bool,
+    receiver: tokio_mpsc::Receiver<BodyHandoff>,
+    state: BodyStreamState,
 }
 
 impl Stream for TokioBodyStream {
@@ -396,28 +510,34 @@ impl Stream for TokioBodyStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        if self.state != BodyStreamState::Open {
+            return Poll::Ready(None);
+        }
         match self.receiver.poll_recv(cx) {
-            std::task::Poll::Ready(None) if self.clean_eof.load(Ordering::SeqCst) => {
-                std::task::Poll::Ready(None)
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(BodyHandoff { data, last })) => {
+                if last {
+                    self.state = BodyStreamState::Ended;
+                }
+                Poll::Ready(Some(Ok(data)))
             }
-            std::task::Poll::Ready(None) if !self.terminated => {
-                self.terminated = true;
-                std::task::Poll::Ready(Some(Err(io::Error::new(
+            Poll::Ready(None) => {
+                self.state = BodyStreamState::Truncated;
+                Poll::Ready(Some(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "relay request body ended before final chunk",
                 ))))
             }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(item)),
-            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
 
 enum RelaySessionError {
+    /// Lost or refused for now: reconnect after the backoff
+    /// ([`ReconnectBackoff`] decides how long from how far the attempt got).
     Reconnectable {
         error: anyhow::Error,
-        reset_backoff: bool,
     },
     Fatal(anyhow::Error),
     /// A shutdown signal arrived; the session has already cleaned up.
@@ -428,6 +548,96 @@ enum RelaySessionError {
 }
 
 type RelaySessionResult<T> = std::result::Result<T, RelaySessionError>;
+
+/// How far one connection attempt got: what the reconnect backoff reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectProgress {
+    /// Opening the websocket (or no credential to open it with).
+    Connecting,
+    /// The upgrade was accepted.
+    Upgraded,
+    /// `hello.challenge` arrived.
+    Challenged,
+    /// The hello went out; `hello.ok` has not arrived.
+    HelloSent,
+    /// `hello.ok` arrived at `since`.
+    Registered { since: Instant },
+}
+
+/// How long a registered session must have lasted for its end to start the
+/// backoff over. A server that accepts the hello and then drops the node at
+/// once keeps the backoff growing instead of being redialled every second.
+const RELAY_STABLE_SESSION: Duration = Duration::from_secs(30);
+
+impl ConnectProgress {
+    /// The attempt ran a registered session for at least
+    /// [`RELAY_STABLE_SESSION`] by `now`.
+    fn stable_at(self, now: Instant) -> bool {
+        matches!(self, Self::Registered { since } if now.saturating_duration_since(since) >= RELAY_STABLE_SESSION)
+    }
+}
+
+/// How a connection attempt ended, for the backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptEnd {
+    /// No credential to connect with, or the session ended without an error.
+    Retry,
+    /// A reconnectable error, waiting at least `floor` when it carries one.
+    Reconnectable { floor: Option<Duration> },
+    /// A failure fatal to the session that is not a stop: its own, slower
+    /// backoff.
+    Fatal,
+}
+
+/// The relay's reconnect backoff: one place decides every wait.
+///
+/// Reconnects wait 1 s, then twice as long each time, up to 5 minutes; a
+/// session that keeps failing fatally waits 5 s, then twice as long, up to
+/// 5 minutes. Both start over only after an attempt that ran a stable
+/// registered session ([`ConnectProgress::stable_at`]): an error before
+/// `hello.ok` (a refused challenge, a lost socket while registering) never
+/// resets them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconnectBackoff {
+    delay: Duration,
+    fatal_delay: Duration,
+}
+
+impl ReconnectBackoff {
+    fn new() -> Self {
+        Self {
+            delay: RELAY_RECONNECT_INITIAL_DELAY,
+            fatal_delay: RELAY_FATAL_INITIAL_DELAY,
+        }
+    }
+
+    /// The wait before the next attempt, after one that got to `progress`
+    /// and ended as `end` (judged at `now`); grows the backoff for the one
+    /// after.
+    fn next_wait(&mut self, end: AttemptEnd, progress: ConnectProgress, now: Instant) -> Duration {
+        if progress.stable_at(now) {
+            *self = Self::new();
+        }
+        let wait = match end {
+            AttemptEnd::Retry => reconnect_wait(self.delay, None),
+            AttemptEnd::Reconnectable { floor } => {
+                let wait = reconnect_wait(self.delay, floor);
+                if let Some(floor) = floor {
+                    // Grow the backoff from the server's floor, not below it.
+                    self.delay = self.delay.max(floor).min(RELAY_RECONNECT_MAX_DELAY);
+                }
+                wait
+            }
+            AttemptEnd::Fatal => {
+                let wait = reconnect_wait(self.fatal_delay, None);
+                self.fatal_delay = next_reconnect_delay(self.fatal_delay);
+                wait
+            }
+        };
+        self.delay = next_reconnect_delay(self.delay);
+        wait
+    }
+}
 
 pub fn ensure_cli_slug(config: &mut Config) -> Result<String> {
     if let Some(slug) = &config.cli_slug {
@@ -480,16 +690,14 @@ pub fn connect_foreground() -> Result<()> {
     let mut link = NodeLink::new(
         &crate::runtime_store::load_for(startup.trust_value()).unwrap_or_default(),
         updates,
+        startup.trust_snapshot().lowerings,
     )?;
-    let mut reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
-    // Its own backoff: a session that keeps failing the same way waits 5 s,
-    // then twice as long each time, up to 5 minutes.
-    let mut fatal_delay = RELAY_FATAL_INITIAL_DELAY;
+    let mut backoff = ReconnectBackoff::new();
     loop {
         check_shutdown()?;
         let node_slug = ensure_cli_slug(&mut config)?;
-        let credential = match resolve_credential() {
-            Ok(credential) => credential,
+        let mut progress = ConnectProgress::Connecting;
+        let wait = match resolve_credential() {
             // Definitely no credential: stop only where nothing restarts us in
             // a loop (see `stop_on_unusable_credential`).
             Err(error)
@@ -500,97 +708,92 @@ pub fn connect_foreground() -> Result<()> {
                 )));
             }
             Err(error) => {
-                let wait = reconnect_wait(reconnect_delay, None);
+                let wait = backoff.next_wait(AttemptEnd::Retry, progress, Instant::now());
                 tracing::warn!(
                     error = %format!("{error:#}"),
                     retry_delay_secs = wait.as_secs(),
                     "relay credential unavailable; retrying"
                 );
-                wait_for_reconnect(&mut control, &startup, &node_slug, wait, &mut link)?;
-                reconnect_delay = next_reconnect_delay(reconnect_delay);
-                continue;
+                wait
+            }
+            Ok(secret) => {
+                let server_url = config
+                    .server_url
+                    .clone()
+                    .context("this node is not enrolled; run `wsmp login <url> --code <code>`")?;
+                let ws_url = websocket_url(&server_url)?;
+                let auth_value = HeaderValue::from_str(&format!("Bearer {secret}"))
+                    .context("building websocket authorization header")?;
+
+                tracing::info!(url = %ws_url, "connecting relay websocket");
+                let result = run_relay_session(
+                    &config,
+                    &startup,
+                    &node_slug,
+                    &ws_url,
+                    auth_value,
+                    &mut control,
+                    &mut link,
+                    &mut progress,
+                );
+                let now = Instant::now();
+                match result {
+                    Ok(()) => {
+                        let wait = backoff.next_wait(AttemptEnd::Retry, progress, now);
+                        tracing::warn!(
+                            retry_delay_secs = wait.as_secs(),
+                            "relay websocket session ended; reconnecting after backoff"
+                        );
+                        wait
+                    }
+                    Err(RelaySessionError::Reconnectable { error }) => {
+                        let floor = retry_floor(&error);
+                        let wait =
+                            backoff.next_wait(AttemptEnd::Reconnectable { floor }, progress, now);
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            retry_delay_secs = wait.as_secs(),
+                            "relay websocket disconnected; reconnecting after backoff"
+                        );
+                        wait
+                    }
+                    // Only a stop code (a rejected credential, a refused protocol)
+                    // ends the process: the service does not restart it after those.
+                    // Anything else fatal to the session (a frame it cannot read, a
+                    // broken server) reconnects in this process, slower each time,
+                    // instead of exiting into a tight service restart loop.
+                    Err(RelaySessionError::Fatal(error))
+                        if crate::exit::code_for(&error) != crate::exit::ExitCode::Failure =>
+                    {
+                        return Err(error);
+                    }
+                    Err(RelaySessionError::Fatal(error)) => {
+                        let wait = backoff.next_wait(AttemptEnd::Fatal, progress, now);
+                        tracing::error!(
+                            error = %format!("{error:#}"),
+                            retry_delay_secs = wait.as_secs(),
+                            "relay session failed; reconnecting after backoff"
+                        );
+                        wait
+                    }
+                    Err(RelaySessionError::Shutdown(signal)) => {
+                        tracing::info!(signal, "relay stopped cleanly after a shutdown signal");
+                        return Err(crate::shutdown::ShutdownRequested { signal }.into());
+                    }
+                    Err(RelaySessionError::RestartForUpdate) => {
+                        tracing::info!("restarting into the installed update");
+                        return Err(anyhow::anyhow!("restarting into the installed update")
+                            .context(crate::exit::CodedError::new(
+                                crate::exit::ExitCode::RestartForUpdate,
+                            )));
+                    }
+                }
             }
         };
-        let secret = credential;
-        let server_url = config
-            .server_url
-            .clone()
-            .context("this node is not enrolled; run `wsmp login <url> --code <code>`")?;
-        let ws_url = websocket_url(&server_url)?;
-        let auth_value = HeaderValue::from_str(&format!("Bearer {secret}"))
-            .context("building websocket authorization header")?;
-
-        tracing::info!(url = %ws_url, "connecting relay websocket");
-        let mut wait = reconnect_wait(reconnect_delay, None);
-        match run_relay_session(
-            &config,
-            &startup,
-            &node_slug,
-            &ws_url,
-            auth_value,
-            &mut control,
-            &mut link,
-        ) {
-            Ok(()) => {
-                tracing::warn!(
-                    retry_delay_secs = wait.as_secs(),
-                    "relay websocket session ended; reconnecting after backoff"
-                );
-            }
-            Err(RelaySessionError::Reconnectable {
-                error,
-                reset_backoff,
-            }) => {
-                if reset_backoff {
-                    reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
-                    fatal_delay = RELAY_FATAL_INITIAL_DELAY;
-                }
-                let floor = retry_floor(&error);
-                wait = reconnect_wait(reconnect_delay, floor);
-                if let Some(floor) = floor {
-                    // Grow the backoff from the server's floor, not below it.
-                    reconnect_delay = reconnect_delay.max(floor).min(RELAY_RECONNECT_MAX_DELAY);
-                }
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    retry_delay_secs = wait.as_secs(),
-                    "relay websocket disconnected; reconnecting after backoff"
-                );
-            }
-            // Only a stop code (a rejected credential, a refused protocol)
-            // ends the process: the service does not restart it after those.
-            // Anything else fatal to the session (a frame it cannot read, a
-            // broken server) reconnects in this process, slower each time,
-            // instead of exiting into a tight service restart loop.
-            Err(RelaySessionError::Fatal(error))
-                if crate::exit::code_for(&error) != crate::exit::ExitCode::Failure =>
-            {
-                return Err(error);
-            }
-            Err(RelaySessionError::Fatal(error)) => {
-                wait = reconnect_wait(fatal_delay, None);
-                tracing::error!(
-                    error = %format!("{error:#}"),
-                    retry_delay_secs = wait.as_secs(),
-                    "relay session failed; reconnecting after backoff"
-                );
-                fatal_delay = next_reconnect_delay(fatal_delay);
-            }
-            Err(RelaySessionError::Shutdown(signal)) => {
-                tracing::info!(signal, "relay stopped cleanly after a shutdown signal");
-                return Err(crate::shutdown::ShutdownRequested { signal }.into());
-            }
-            Err(RelaySessionError::RestartForUpdate) => {
-                tracing::info!("restarting into the installed update");
-                return Err(
-                    anyhow::anyhow!("restarting into the installed update").context(
-                        crate::exit::CodedError::new(crate::exit::ExitCode::RestartForUpdate),
-                    ),
-                );
-            }
-        }
         wait_for_reconnect(&mut control, &startup, &node_slug, wait, &mut link)?;
-        // Endpoint edits apply on reconnect (hot reload lands with config v3).
+        // Every retry re-reads the config, a credential retry included: a
+        // `wsmp login` meanwhile changes the server URL and node slug, and
+        // endpoint edits apply on reconnect.
         match Config::load_required().and_then(|fresh| fresh.validate().map(|()| fresh)) {
             Ok(fresh) => config = fresh,
             Err(error) => tracing::warn!(
@@ -598,17 +801,19 @@ pub fn connect_foreground() -> Result<()> {
                 "re-reading the config failed; keeping the previous one"
             ),
         }
-        reconnect_delay = next_reconnect_delay(reconnect_delay);
     }
 }
 
 /// What a control request or a hot reload changed, for the live session.
+///
+/// Trust itself is not carried here: the effects of a lowering follow the
+/// daemon's [`crate::startup::TrustAuthority`] (its lowering count against
+/// the one last applied, [`take_lowering`]), so changes that land in any
+/// order in one loop turn end at whatever trust is now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeChange {
-    /// Trust went down to Relay only (persisted and frozen already).
-    Lowered,
-    /// Trust went up to Full control (persisted and unfrozen already).
-    Raised,
+    /// Trust went down or up (persisted already): report `node.state`.
+    Trust,
     /// Features changed (secrets, runtime hosts): report `node.state`.
     Features,
     /// `config.json` turned `allowHumanTerminal` off (latched already).
@@ -626,6 +831,18 @@ fn apply_lower(startup: &TerminalStartup) -> Result<bool> {
     };
     let changed = startup.lower_trust();
     persisted.map(|()| changed)
+}
+
+/// Whether trust was lowered since the lowering count `applied` (and marks
+/// it applied). Every lowering counts, even one raised again since: what was
+/// started under the earlier grant still ends.
+fn take_lowering(applied: &mut u64, startup: &TerminalStartup) -> bool {
+    let now = startup.trust_snapshot().lowerings;
+    if now == *applied {
+        return false;
+    }
+    *applied = now;
+    true
 }
 
 /// Hot reload (every 2 s on a changed `config.json`, and on `Reload`):
@@ -659,7 +876,7 @@ fn reload_config(startup: &TerminalStartup) -> Result<Vec<NodeChange>> {
                 );
             }
             tracing::warn!("config.json lowered this node to Relay only");
-            changes.push(NodeChange::Lowered);
+            changes.push(NodeChange::Trust);
         }
         (TrustValue::Relay, TrustValue::Full) => {
             tracing::warn!(
@@ -720,6 +937,28 @@ impl ConfigWatch {
 }
 
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Everything local that changed since the last look, the same way online
+/// and offline: control requests first, then a hot reload when `config.json`
+/// changed. A failed reload is logged and changes nothing.
+fn local_changes(
+    control: &mut ControlServer,
+    startup: &TerminalStartup,
+    node_slug: &str,
+    connection: &str,
+    watch: &mut ConfigWatch,
+) -> Result<Vec<NodeChange>> {
+    let mut changes = answer_control_requests(control, startup, node_slug, connection)?;
+    if watch.changed() {
+        match reload_config(startup) {
+            Ok(found) => changes.extend(found),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "reloading the config failed");
+            }
+        }
+    }
+    Ok(changes)
+}
 
 fn status_response<'a>(
     startup: &TerminalStartup,
@@ -788,7 +1027,7 @@ fn answer_control_requests(
                 let was_full = startup.full_control();
                 let lowered = apply_lower(startup);
                 if was_full {
-                    changes.push(NodeChange::Lowered);
+                    changes.push(NodeChange::Trust);
                 }
                 let response = match lowered {
                     Ok(true) => {
@@ -836,7 +1075,7 @@ fn answer_control_requests(
                         Ok(()) => {
                             startup.raise_trust();
                             tracing::warn!("`wsmp trust full` raised this node to Full control");
-                            changes.push(NodeChange::Raised);
+                            changes.push(NodeChange::Trust);
                             simple_response(true, "changed", None)
                         }
                         Err(error) => {
@@ -876,23 +1115,13 @@ fn wait_for_reconnect(
                 ),
             );
         }
-        // Trust and features changed while disconnected reach the next hello.
-        let changes = answer_control_requests(control, startup, node_slug, "reconnecting")?;
-        if changes.contains(&NodeChange::Lowered) {
+        // Trust and features changed while disconnected reach the next hello;
+        // only the commands outlive the connection, so a lowering here ends
+        // them (the next session starts with no terminal or file op).
+        let _ = local_changes(control, startup, node_slug, "reconnecting", &mut watch)?;
+        if take_lowering(&mut link.lowerings_applied, startup) {
             let interrupted = link.execs.interrupt_all();
             link.deferred.extend(interrupted);
-        }
-        if watch.changed() {
-            match reload_config(startup) {
-                Ok(changes) if changes.contains(&NodeChange::Lowered) => {
-                    let interrupted = link.execs.interrupt_all();
-                    link.deferred.extend(interrupted);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(error = %format!("{error:#}"), "reloading the config failed");
-                }
-            }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         thread::sleep(remaining.min(Duration::from_millis(100)));
@@ -994,16 +1223,21 @@ impl NodeRuntimes {
 /// command, file op and speech session it started.
 struct Session<'a> {
     worker_tx: SyncSender<FromWorker>,
-    workers: BTreeMap<String, WorkerHandle>,
-    recent_finished: RecentlyFinished,
+    requests: RelayRequests,
     terminals: TerminalRegistry,
     /// Node commands outlive a connection (daemon lifetime, `NodeLink`).
     execs: &'a mut ExecRegistry,
-    /// Command statuses held until this connection is registered.
+    /// Command statuses held until a connection is registered (across
+    /// connections: [`FrameClass::Command`]).
     deferred: &'a mut Vec<OutboundFrame>,
+    /// This connection's own frames held until `hello.ok`, dropped with it
+    /// ([`Gate::Hold`]).
+    held: Vec<OutboundFrame>,
+    /// The lowering count whose effects were applied (`NodeLink`).
+    lowerings_applied: &'a mut u64,
     stt: crate::stt::SttRegistry,
     files: crate::file_relay::FileRelay,
-    registered: bool,
+    phase: SessionPhase,
     telemetry: Option<crate::telemetry::Telemetry>,
     defines: Defines,
     runtimes: NodeRuntimes,
@@ -1019,6 +1253,119 @@ struct Session<'a> {
     update: &'a mut crate::update::agent::DaemonUpdate,
     /// When the node's idleness was last read for a waiting update.
     update_idle_checked: Option<Instant>,
+}
+
+/// Where one relay connection stands. Nothing but the hello may reach the
+/// server before `hello.ok` (it closes the socket otherwise), so every
+/// outbound frame that is not a direct answer to a server frame passes
+/// [`gate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPhase {
+    /// Connected; the hello has not gone out.
+    PreHello,
+    /// The hello went out; `hello.ok` has not arrived.
+    AwaitingHelloOk,
+    /// `hello.ok` arrived at `since`.
+    Registered { since: Instant },
+    /// The session is ending: last frames go out best effort.
+    Closing,
+}
+
+impl SessionPhase {
+    fn is_registered(self) -> bool {
+        matches!(self, Self::Registered { .. })
+    }
+
+    /// The `connection` word `wsmp status` shows.
+    fn connection(self) -> &'static str {
+        if self.is_registered() {
+            "connected"
+        } else {
+            "registering"
+        }
+    }
+}
+
+/// What kind of node frame is about to go out, for [`gate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameClass {
+    /// Heartbeats and telemetry samples: worthless once stale.
+    Periodic,
+    /// `node.state`: the hello reports trust and features, so only a change
+    /// after the hello went out must still reach the server.
+    NodeState,
+    /// Frames of this connection's own work (operator and browser
+    /// terminals, runtime step results): they mean nothing on another
+    /// connection.
+    SessionScoped,
+    /// Command statuses: commands outlive the connection, so do they.
+    Command,
+}
+
+/// What [`gate`] decides for one frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    Send,
+    /// Keep it in this session until `hello.ok` ([`Session::held`]).
+    Hold,
+    /// Keep it for whichever connection registers next ([`Session::deferred`]).
+    Defer,
+    Drop,
+}
+
+/// The one policy for node frames by session phase.
+fn gate(phase: SessionPhase, class: FrameClass) -> Gate {
+    match (phase, class) {
+        (SessionPhase::Registered { .. }, _) => Gate::Send,
+        (_, FrameClass::Periodic) => Gate::Drop,
+        // The hello (still to go out) reports it; a closing session is past caring.
+        (SessionPhase::PreHello | SessionPhase::Closing, FrameClass::NodeState) => Gate::Drop,
+        (SessionPhase::AwaitingHelloOk, FrameClass::NodeState) => Gate::Hold,
+        // Teardown sends terminal ends and interrupted commands best effort.
+        (SessionPhase::Closing, FrameClass::SessionScoped | FrameClass::Command) => Gate::Send,
+        (_, FrameClass::SessionScoped) => Gate::Hold,
+        (_, FrameClass::Command) => Gate::Defer,
+    }
+}
+
+/// Send `frames` as [`gate`] decides for `class` in the session's phase.
+fn emit<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    session: &mut Session,
+    class: FrameClass,
+    frames: Vec<OutboundFrame>,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    if frames.is_empty() {
+        return Ok(());
+    }
+    match gate(session.phase, class) {
+        Gate::Send => send_outbound_frames(socket, frames),
+        Gate::Hold => {
+            session.held.extend(frames);
+            Ok(())
+        }
+        Gate::Defer => {
+            session.deferred.extend(frames);
+            Ok(())
+        }
+        Gate::Drop => Ok(()),
+    }
+}
+
+/// [`emit`] for one control frame.
+fn emit_control<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    session: &mut Session,
+    class: FrameClass,
+    frame: NodeFrame,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    emit(socket, session, class, vec![OutboundFrame::Control(frame)])
 }
 
 /// The command lifetime cap the held node definition sets (24 h without one).
@@ -1050,10 +1397,17 @@ struct NodeLink {
     inventories: Arc<crate::runtimes::inventory::Inventories>,
     /// The update in flight or awaiting confirmation, across reconnects.
     update: crate::update::agent::DaemonUpdate,
+    /// The trust lowering count whose effects were applied, online or off
+    /// ([`take_lowering`]).
+    lowerings_applied: u64,
 }
 
 impl NodeLink {
-    fn new(store: &Store, update: crate::update::agent::DaemonUpdate) -> Result<Self> {
+    fn new(
+        store: &Store,
+        update: crate::update::agent::DaemonUpdate,
+        lowerings_applied: u64,
+    ) -> Result<Self> {
         let (worker_tx, worker_rx) =
             mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
         let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_COMMAND_MAX);
@@ -1088,6 +1442,7 @@ impl NodeLink {
                 .ok(),
             inventories: Arc::new(inventories),
             update,
+            lowerings_applied,
         })
     }
 
@@ -1128,6 +1483,9 @@ fn node_features(startup: &TerminalStartup) -> crate::protocol::runtime_spec::No
     features
 }
 
+/// One relay connection. `progress` says how far it got (the reconnect
+/// backoff reads it), whatever it returns.
+#[allow(clippy::too_many_arguments)]
 fn run_relay_session(
     config: &Config,
     startup: &TerminalStartup,
@@ -1136,6 +1494,7 @@ fn run_relay_session(
     auth_value: HeaderValue,
     control: &mut ControlServer,
     link: &mut NodeLink,
+    progress: &mut ConnectProgress,
 ) -> RelaySessionResult<()> {
     let mut request = ws_url
         .as_str()
@@ -1161,15 +1520,13 @@ fn run_relay_session(
             StopOn::here(),
         ));
     }
+    *progress = ConnectProgress::Upgraded;
     set_socket_timeouts(
         socket.get_mut(),
         RELAY_SOCKET_POLL_INTERVAL,
         Duration::from_secs(5),
     )
-    .map_err(|error| RelaySessionError::Reconnectable {
-        error,
-        reset_backoff: false,
-    })?;
+    .map_err(|error| RelaySessionError::Reconnectable { error })?;
 
     // Created before hello so an early `?` still drops (and kills) every child.
     let worker_tx = link.worker_tx.clone();
@@ -1180,11 +1537,12 @@ fn run_relay_session(
     link.execs.set_report_ran_with(false);
     let mut session = Session {
         worker_tx: worker_tx.clone(),
-        workers: BTreeMap::new(),
-        recent_finished: RecentlyFinished::new(),
+        requests: RelayRequests::new(),
         terminals: TerminalRegistry::with_image_worker(worker_tx.clone(), Arc::clone(&link.images)),
         execs: &mut link.execs,
         deferred: &mut link.deferred,
+        held: Vec::new(),
+        lowerings_applied: &mut link.lowerings_applied,
         // Live speech-to-text sessions; dropping the registry ends them all.
         stt: crate::stt::SttRegistry::new(worker_tx.clone()),
         // Node file ops run on the daemon's file pool, never on this loop;
@@ -1198,9 +1556,9 @@ fn run_relay_session(
             let sink: crate::file_relay::FileSink = Arc::new(move |op_id, frames| {
                 let _ = tx.send(FromWorker::FileFrames { op_id, frames });
             });
-            crate::file_relay::FileRelay::new(runtime, startup.full_control(), sink)
+            crate::file_relay::FileRelay::new(runtime, startup.trust_authority(), sink)
         },
-        registered: false,
+        phase: SessionPhase::PreHello,
         telemetry: None,
         defines: Defines::default(),
         runtimes: NodeRuntimes::load(startup.trust_value(), &startup.runtime_hosts()),
@@ -1220,6 +1578,7 @@ fn run_relay_session(
         ))
     })?;
     let (nonce, origin) = wait_for_hello_challenge(&mut socket, StopOn::here())?;
+    *progress = ConnectProgress::Challenged;
     check_hello_origin(&origin, &hello_origin, server_url)?;
     let identity_signature = identity
         .sign_hello(&nonce, node_slug, &origin)
@@ -1245,6 +1604,8 @@ fn run_relay_session(
         held_fabrics_hash: session.runtimes.store.fabrics_hash(),
     };
     send_control(&mut socket, &hello, "sending relay hello")?;
+    session.phase = SessionPhase::AwaitingHelloOk;
+    *progress = ConnectProgress::HelloSent;
 
     let mut next_telemetry_sync = Instant::now();
     let mut next_heartbeat =
@@ -1253,10 +1614,14 @@ fn run_relay_session(
         if let Some(signal) = crate::shutdown::requested() {
             break 'session Err(RelaySessionError::Shutdown(signal));
         }
-        if session.registered && !session.deferred.is_empty() {
-            // Commands that ended (or were interrupted) while disconnected.
+        if session.phase.is_registered() {
+            // Commands that ended (or were interrupted) while disconnected,
+            // then this connection's frames held until `hello.ok`.
             let pending = std::mem::take(session.deferred);
-            if let Err(error) = send_outbound_frames(&mut socket, pending) {
+            let held = std::mem::take(&mut session.held);
+            if let Err(error) = send_outbound_frames(&mut socket, pending)
+                .and_then(|()| send_outbound_frames(&mut socket, held))
+            {
                 break Err(error);
             }
         }
@@ -1270,17 +1635,18 @@ fn run_relay_session(
             break Err(error);
         }
         let now = Instant::now();
-        if let Err(error) = send_outbound_frames(&mut socket, session.terminals.poll(now)) {
+        let terminal_frames = session.terminals.poll(now);
+        if let Err(error) = emit(
+            &mut socket,
+            &mut session,
+            FrameClass::SessionScoped,
+            terminal_frames,
+        ) {
             break Err(error);
         }
         let ended = session.execs.poll(now);
-        if session.registered {
-            if let Err(error) = send_outbound_frames(&mut socket, ended) {
-                break Err(error);
-            }
-        } else {
-            // Nothing but hello before `hello.ok`.
-            session.deferred.extend(ended);
+        if let Err(error) = emit(&mut socket, &mut session, FrameClass::Command, ended) {
+            break Err(error);
         }
         let endpoints = session.runtimes.endpoints();
         let stt_frames = session.stt.poll(now, || endpoints.clone());
@@ -1290,28 +1656,20 @@ fn run_relay_session(
         if let Err(error) = send_file_frames(&mut socket, session.files.expire_stale(now)) {
             break Err(error);
         }
-        let connection = if session.registered {
-            "connected"
-        } else {
-            "registering"
-        };
-        let mut changes = match answer_control_requests(control, startup, node_slug, connection) {
+        let changes = match local_changes(
+            control,
+            startup,
+            node_slug,
+            session.phase.connection(),
+            &mut config_watch,
+        ) {
             Ok(changes) => changes,
             Err(error) => break Err(RelaySessionError::Fatal(error)),
         };
-        if config_watch.changed() {
-            match reload_config(startup) {
-                Ok(found) => changes.extend(found),
-                Err(error) => tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "reloading the config failed"
-                ),
-            }
-        }
         if let Err(error) = apply_node_changes(&mut socket, startup, &mut session, &changes) {
             break Err(error);
         }
-        if session.registered && Instant::now() >= next_telemetry_sync {
+        if session.phase.is_registered() && Instant::now() >= next_telemetry_sync {
             let endpoints = session.runtimes.endpoints();
             match session.telemetry.as_ref() {
                 Some(telemetry) => telemetry.set_endpoints(&endpoints),
@@ -1325,7 +1683,9 @@ fn run_relay_session(
             sync_metric_commands(&mut session);
             next_telemetry_sync = Instant::now() + TELEMETRY_SYNC_INTERVAL;
         }
-        if session.registered && Instant::now() >= next_heartbeat {
+        if gate(session.phase, FrameClass::Periodic) == Gate::Send
+            && Instant::now() >= next_heartbeat
+        {
             let heartbeat = NodeFrame::Heartbeat {
                 id: next_id("heartbeat"),
                 sent_at: None,
@@ -1346,39 +1706,40 @@ fn run_relay_session(
                 tracing::warn!(?frame, "relay websocket closed by server");
                 Err(RelaySessionError::Reconnectable {
                     error: anyhow::anyhow!("relay websocket closed by server"),
-                    reset_backoff: true,
                 })
             }
             Ok(Message::Ping(bytes)) => socket
                 .send(Message::Pong(bytes))
-                .map_err(|error| websocket_session_error(error, "sending relay pong", true)),
+                .map_err(|error| websocket_session_error(error, "sending relay pong")),
             Ok(Message::Pong(_)) => Ok(()),
             Ok(Message::Frame(_)) => Ok(()),
             Err(tungstenite::Error::Io(err)) if read_poll_woke(&err) => Ok(()),
-            Err(err) => Err(websocket_session_error(
-                err,
-                "reading relay websocket",
-                true,
-            )),
+            Err(err) => Err(websocket_session_error(err, "reading relay websocket")),
         };
         if let Err(error) = outcome {
             break Err(error);
         }
     };
 
+    if let SessionPhase::Registered { since } = session.phase {
+        *progress = ConnectProgress::Registered { since };
+    }
+    session.phase = SessionPhase::Closing;
     session.update.on_session_end();
     // Stops the sampling thread; a scrape in flight finishes on its own.
     drop(session.telemetry.take());
-    let _ = send_outbound_frames(&mut socket, session.terminals.kill_all());
+    let killed = session.terminals.kill_all();
+    let _ = emit(&mut socket, &mut session, FrameClass::SessionScoped, killed);
     // Commands outlive a reconnect; a shutdown ends them (interrupted).
     if crate::shutdown::requested().is_some() {
-        let _ = send_outbound_frames(&mut socket, session.execs.kill_all());
+        let killed = session.execs.kill_all();
+        let _ = emit(&mut socket, &mut session, FrameClass::Command, killed);
     }
     // In-flight file ops are cancelled; their results are dropped.
     session.files.cancel_all();
     // The server fails these sessions itself when the relay drops.
     session.stt.abort_all();
-    abort_all_workers(std::mem::take(&mut session.workers));
+    session.requests.abort_all();
     let result = settle_after_shutdown(result, crate::shutdown::requested());
     if matches!(
         result,
@@ -1439,14 +1800,10 @@ fn flush_through_interrupts<S: io::Read + io::Write>(socket: &mut tungstenite::W
 fn abort_all_workers(workers: BTreeMap<String, WorkerHandle>) {
     for (_, worker) in workers {
         worker.cancellation.cancel();
-        drop(worker.body_tx);
+        drop(worker.body);
         // Detach: the thread exits once its upstream call unwinds.
         drop(worker.join);
     }
-}
-
-fn worker_frame_is_current(workers: &BTreeMap<String, WorkerHandle>, request_id: &str) -> bool {
-    workers.contains_key(request_id)
 }
 
 fn drain_worker_output<S>(
@@ -1463,23 +1820,17 @@ where
                 // A cancellation removes the live handle before acknowledging
                 // it. Suppress any racing worker frame already queued behind
                 // that cancellation so cancelled requests never complete late.
-                if !worker_frame_is_current(&session.workers, &request_id) {
+                if !session.requests.is_live(&request_id) {
                     continue;
                 }
                 match frame {
                     WsFrame::Text(text) => socket.send(Message::Text(text.into())),
                     WsFrame::Binary(bytes) => socket.send(Message::Binary(bytes.into())),
                 }
-                .map_err(|error| websocket_session_error(error, "sending relay frame", true))?;
+                .map_err(|error| websocket_session_error(error, "sending relay frame"))?;
             }
             Ok(FromWorker::Finished(request_id)) => {
-                // Remember the id so late body chunks the server is still
-                // flushing get dropped silently instead of faulted as
-                // "before request metadata".
-                session.recent_finished.record(&request_id);
-                if let Some(worker) = session.workers.remove(&request_id) {
-                    let _ = worker.join.join();
-                }
+                session.requests.retire(&request_id, Retire::Finished);
             }
             Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
                 send_outbound_frames(socket, session.terminals.on_bytes(&terminal_id, &bytes))?;
@@ -1512,11 +1863,12 @@ where
             }
             // A frame queued by a closed session's worker never precedes
             // this session's hello.
-            Ok(FromWorker::Telemetry(_)) if !session.registered => {}
             Ok(FromWorker::Telemetry(text)) => {
-                socket
-                    .send(Message::Text(text.into()))
-                    .map_err(|error| websocket_session_error(error, "sending telemetry", true))?;
+                if gate(session.phase, FrameClass::Periodic) == Gate::Send {
+                    socket
+                        .send(Message::Text(text.into()))
+                        .map_err(|error| websocket_session_error(error, "sending telemetry"))?;
+                }
             }
             Ok(FromWorker::FileFrames { op_id, frames }) => {
                 // Cancelled or torn-down ops are no longer pending: drop them.
@@ -1622,12 +1974,14 @@ where
             features,
             ..
         } => {
-            if session.registered {
+            if session.phase.is_registered() {
                 return Err(RelaySessionError::Fatal(anyhow::anyhow!(
                     "duplicate relay registration acknowledgement"
                 )));
             }
-            session.registered = true;
+            session.phase = SessionPhase::Registered {
+                since: Instant::now(),
+            };
             // Optional node frame fields go only to a server that said it accepts them.
             session
                 .execs
@@ -1648,10 +2002,9 @@ where
             if code == ProtocolErrorCode::Internal {
                 return Err(RelaySessionError::Reconnectable {
                     error: anyhow::anyhow!("relay protocol error: {message}"),
-                    reset_backoff: false,
                 });
             }
-            if session.registered {
+            if session.phase.is_registered() {
                 return Err(RelaySessionError::Fatal(anyhow::anyhow!(
                     "relay protocol error: {message}"
                 )));
@@ -1785,11 +2138,7 @@ where
             tracing::warn!(request_id, ?reason, "relay request cancelled");
             // Cancelled request: any body chunks still in flight are late, not
             // premature — drop them silently rather than faulting them.
-            session.recent_finished.record(&request_id);
-            if let Some(worker) = session.workers.remove(&request_id) {
-                worker.cancellation.cancel();
-                drop(worker.body_tx);
-                drop(worker.join);
+            if session.requests.retire(&request_id, Retire::Cancelled) {
                 send_control(
                     socket,
                     &NodeFrame::RelayCancelled { request_id },
@@ -1815,8 +2164,7 @@ where
                 config,
                 &session.runtimes.targets,
                 &session.worker_tx,
-                &mut session.workers,
-                &session.recent_finished,
+                &mut session.requests,
                 RelayRequest {
                     request_id,
                     method: match method {
@@ -2016,13 +2364,18 @@ where
         );
     }
     tracing::warn!(id, "a person lowered this node to Relay only");
-    apply_node_changes(socket, startup, session, &[NodeChange::Lowered])
+    apply_node_changes(socket, startup, session, &[NodeChange::Trust])
 }
 
 /// Session effects of a trust or feature change, then `node.state`.
 /// Lowering ends every Full-only session: commands (whole process tree,
 /// reported `interrupted`), browser terminals and file ops, and switches the
 /// held set to the frozen copy.
+///
+/// The lowering is read from the daemon's trust ([`take_lowering`]), not
+/// from `changes`: a raise and a lowering in one loop turn, in any order,
+/// end every session the lowering revoked, and the file relay admits by the
+/// trust as it is now.
 fn apply_node_changes<S>(
     socket: &mut tungstenite::WebSocket<S>,
     startup: &TerminalStartup,
@@ -2032,32 +2385,21 @@ fn apply_node_changes<S>(
 where
     S: std::io::Read + std::io::Write,
 {
-    if changes.is_empty() {
+    let lowered = take_lowering(session.lowerings_applied, startup);
+    if changes.is_empty() && !lowered {
         return Ok(());
     }
-    if changes.contains(&NodeChange::Lowered) {
-        session.files.lower_trust();
+    session.files.on_trust_changed();
+    if lowered {
         let interrupted = session.execs.interrupt_all();
         // Operator terminals are allowed at Relay only: they stay.
-        if session.registered {
-            send_outbound_frames(socket, session.terminals.on_trust_lowered())?;
-            send_outbound_frames(socket, interrupted)?;
-        } else {
-            let _ = session.terminals.on_trust_lowered();
-            session.deferred.extend(interrupted);
-        }
-    }
-    if changes.contains(&NodeChange::HumanTerminalsDisabled)
-        && !changes.contains(&NodeChange::Lowered)
-    {
+        let closed = session.terminals.on_trust_lowered();
+        emit(socket, session, FrameClass::SessionScoped, closed)?;
+        emit(socket, session, FrameClass::Command, interrupted)?;
+    } else if changes.contains(&NodeChange::HumanTerminalsDisabled) {
         // Operator terminals do not need the switch: they stay.
         let closed = session.terminals.on_human_terminals_disabled();
-        if session.registered {
-            send_outbound_frames(socket, closed)?;
-        }
-    }
-    if changes.contains(&NodeChange::Raised) {
-        session.files.raise_trust();
+        emit(socket, session, FrameClass::SessionScoped, closed)?;
     }
     // Trust changes switch the held set; host changes re-check addresses.
     session
@@ -2067,10 +2409,7 @@ where
         .execs
         .set_command_max(command_max(&session.runtimes.store));
     sync_metric_commands(session);
-    if !session.registered {
-        return Ok(());
-    }
-    send_control(socket, &node_state(startup), "reporting the node state")
+    emit_control(socket, session, FrameClass::NodeState, node_state(startup))
 }
 
 /// `runtime.job`: render from the held/frozen definition and run it off this
@@ -2244,11 +2583,16 @@ where
                 Some(operator_ticket(&job, operator, &rendered))
             }
         };
+        // Live speech-to-text sessions on the instance end before its stop
+        // runs, and none opens there meanwhile.
+        let ended = stt_step_submitting(&mut session.stt, &job);
+        send_stt_frames(socket, &mut session.stt, ended)?;
         let submitted = match (session.runner.as_ref(), ticket) {
             (Some(runner), Some(ticket)) => runner.submit_operator(rendered, ticket),
             (Some(runner), None) => runner.submit(rendered),
             (None, _) => Err(anyhow::anyhow!("runtime steps are unavailable")),
         };
+        stt_step_submitted(&mut session.stt, &job, submitted.is_ok());
         if let Err(error) = submitted {
             if let Some(terminal_id) = &terminal_id {
                 session.terminals.release_operator(terminal_id);
@@ -2261,6 +2605,52 @@ where
             );
         }
         Ok(())
+    }
+}
+
+/// What a runtime step about to be submitted does to live speech-to-text:
+/// a stop ends the sessions on its instance's endpoint (its handle) and
+/// marks the endpoint, so none opens there until the stop is settled
+/// ([`crate::stt::SttRegistry::endpoint_stopping`]). Every rank's stop marks
+/// the handle; only the node running rank 0 serves it, and the endpoint
+/// check drops a mark on an endpoint this node does not serve.
+fn stt_step_submitting(
+    stt: &mut crate::stt::SttRegistry,
+    job: &crate::protocol::frames::RuntimeJob,
+) -> Vec<NodeFrame> {
+    if job.phase == JobPhase::Stop {
+        stt.endpoint_stopping(&job.handle, &job.step_id)
+    } else {
+        Vec::new()
+    }
+}
+
+/// After the runner took (`admitted`) or refused a runtime step: a refused
+/// stop leaves its endpoint serving; an admitted start lifts the stop mark,
+/// at once if the stop is done, else when it finishes.
+fn stt_step_submitted(
+    stt: &mut crate::stt::SttRegistry,
+    job: &crate::protocol::frames::RuntimeJob,
+    admitted: bool,
+) {
+    match job.phase {
+        JobPhase::Stop if !admitted => stt.stop_failed(&job.step_id),
+        JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin if admitted => {
+            stt.endpoint_starting(&job.handle);
+        }
+        _ => {}
+    }
+}
+
+/// A runtime step its runner thread is done with: a stop that succeeded
+/// may let a waiting start take sessions again; one that failed (or whose
+/// operator terminal closed without success) leaves its endpoint serving.
+/// Any other step's id names no mark.
+fn stt_step_ended(stt: &mut crate::stt::SttRegistry, ended: &crate::runtimes::runner::StepEnded) {
+    if ended.succeeded {
+        stt.stop_finished(&ended.step_id);
+    } else {
+        stt.stop_failed(&ended.step_id);
     }
 }
 
@@ -2336,6 +2726,11 @@ fn operator_ids(
 }
 
 /// Step results and instance observations from the runner.
+///
+/// Operator terminal frames and step results are this connection's own
+/// ([`FrameClass::SessionScoped`]): one that lands between the hello and
+/// `hello.ok` is held until `hello.ok` (it used to be dropped there, which
+/// lost a step result the server was waiting for).
 fn drain_runner<S>(
     socket: &mut tungstenite::WebSocket<S>,
     session: &mut Session,
@@ -2343,43 +2738,52 @@ fn drain_runner<S>(
 where
     S: std::io::Read + std::io::Write,
 {
+    use crate::runtimes::runner::{OperatorRequest, Update};
     while let Some(update) = session
         .runner
         .as_ref()
         .and_then(|runner| runner.try_update())
     {
-        if let Some(request) = update.operator {
-            use crate::runtimes::runner::OperatorRequest;
-            let frames = match request {
-                OperatorRequest::Open(open) => session.terminals.open_operator(*open),
-                OperatorRequest::CloseIfConfirming { terminal_id } => {
-                    session.terminals.close_operator_if_confirming(&terminal_id)
-                }
-            };
-            if session.registered {
-                send_outbound_frames(socket, frames)?;
+        match update {
+            Update::Operator(request) => {
+                let frames = match request {
+                    OperatorRequest::Open(open) => session.terminals.open_operator(*open),
+                    OperatorRequest::CloseIfConfirming { terminal_id } => {
+                        session.terminals.close_operator_if_confirming(&terminal_id)
+                    }
+                };
+                emit(socket, session, FrameClass::SessionScoped, frames)?;
             }
-            continue;
+            Update::Observation {
+                generation,
+                result,
+                ended,
+                instances,
+            } => {
+                if generation > session.observed_generation {
+                    session.observed_generation = generation;
+                    session.runtimes.set_instances(instances);
+                }
+                if let Some(ended) = &ended {
+                    stt_step_ended(&mut session.stt, ended);
+                }
+                // An operator step's runner thread is done with its terminal id.
+                if let Some(NodeFrame::RuntimeJobResult {
+                    terminal_id: Some(terminal_id),
+                    ..
+                }) = &result
+                {
+                    session.terminals.release_operator(terminal_id);
+                }
+                if let Some(result) = result {
+                    emit_control(socket, session, FrameClass::SessionScoped, result)?;
+                }
+                // `hello.ok` sends one anyway.
+                if session.phase.is_registered() {
+                    send_inventory(session);
+                }
+            }
         }
-        if update.generation > session.observed_generation {
-            session.observed_generation = update.generation;
-            session.runtimes.set_instances(update.instances);
-        }
-        // An operator step's runner thread is done with its terminal id.
-        if let Some(NodeFrame::RuntimeJobResult {
-            terminal_id: Some(terminal_id),
-            ..
-        }) = &update.result
-        {
-            session.terminals.release_operator(terminal_id);
-        }
-        if !session.registered {
-            continue;
-        }
-        if let Some(result) = &update.result {
-            send_control(socket, result, "sending a runtime job result")?;
-        }
-        send_inventory(session);
     }
     Ok(())
 }
@@ -2509,8 +2913,7 @@ fn start_relay_request<S>(
     config: &Config,
     targets: &BTreeMap<String, Target>,
     worker_tx: &SyncSender<FromWorker>,
-    workers: &mut BTreeMap<String, WorkerHandle>,
-    recent_finished: &RecentlyFinished,
+    requests: &mut RelayRequests,
     request: RelayRequest,
 ) -> RelaySessionResult<()>
 where
@@ -2534,7 +2937,7 @@ where
     // would corrupt the routing maps (the `workers` insert below would orphan the
     // first worker's handle); a ring hit means the server is reusing a just-
     // finished id, which it never legitimately does. Fault both without spawning.
-    if workers.contains_key(&request_id) || recent_finished.contains(&request_id) {
+    if requests.in_use(&request_id) {
         send_relay_error(
             socket,
             &request_id,
@@ -2629,10 +3032,10 @@ where
                 cancellation_rx,
             );
         });
-        workers.insert(
+        requests.start(
             request_id,
             WorkerHandle {
-                body_tx: Some(body_tx),
+                body: RequestBody::Open(body_tx),
                 cancellation,
                 join: handle,
             },
@@ -2644,15 +3047,15 @@ where
     let thread_tx = worker_tx.clone();
     let thread_cancellation = cancellation.clone();
 
-    let (body_tx, body_rx) = if expect_body {
+    let (body, body_rx) = if expect_body {
         // The server may send every credited chunk before this just-spawned
         // worker gets scheduled. Credits are returned only after a chunk has
         // entered the async handoff, keeping the total unacknowledged burst
         // bounded by the negotiated window.
         let (tx, rx) = mpsc::sync_channel::<BodyChunk>(REQUEST_BODY_INGRESS_CAPACITY);
-        (Some(tx), Some(rx))
+        (RequestBody::Open(tx), Some(rx))
     } else {
-        (None, None)
+        (RequestBody::None, None)
     };
 
     let handle = thread::spawn(move || {
@@ -2665,10 +3068,10 @@ where
         );
     });
 
-    workers.insert(
+    requests.start(
         request_id,
         WorkerHandle {
-            body_tx,
+            body,
             cancellation,
             join: handle,
         },
@@ -2708,7 +3111,7 @@ where
     };
     socket
         .send(Message::Text(text.into()))
-        .map_err(|error| websocket_session_error(error, "sending a speech-to-text frame", true))
+        .map_err(|error| websocket_session_error(error, "sending a speech-to-text frame"))
 }
 
 fn send_stt_frames<S>(
@@ -2876,44 +3279,52 @@ where
     };
 
     let last = is_final == Some(true);
-    let workers = &mut session.workers;
-    let recent_finished = &mut session.recent_finished;
-
-    let Some(worker) = workers.get(&request_id) else {
-        // The worker is gone. Distinguish "already finished" (a fast upstream
-        // responded and was reaped before the server flushed the body tail)
-        // from a genuinely unknown id: the former is expected and dropped
-        // silently, only the latter is a protocol violation.
-        if recent_finished.contains(&request_id) {
+    let requests = &mut session.requests;
+    let worker = match requests.state(&request_id) {
+        RequestState::Live(worker) => worker,
+        // A fast upstream responded and was reaped before the server
+        // flushed the body tail: expected, dropped silently.
+        RequestState::Retired => {
             tracing::debug!(
                 request_id = request_id,
                 "dropping late relay body chunk for an already-finished request"
             );
             return Ok(());
         }
-        send_relay_error(
-            socket,
-            &request_id,
-            RelayFailure::ProtocolError,
-            Some("request body chunk arrived before request metadata".to_string()),
-            None,
-        )?;
-        return Ok(());
-    };
-    let Some(body_tx) = worker.body_tx.as_ref() else {
-        // Body frame for a request that declared no body.
-        if let Some(worker) = workers.remove(&request_id) {
-            worker.cancellation.cancel();
+        // Only a genuinely unknown id is a protocol violation.
+        RequestState::Unknown => {
+            send_relay_error(
+                socket,
+                &request_id,
+                RelayFailure::ProtocolError,
+                Some("request body chunk arrived before request metadata".to_string()),
+                None,
+            )?;
+            return Ok(());
         }
-        recent_finished.record(&request_id);
-        send_relay_error(
-            socket,
-            &request_id,
-            RelayFailure::ProtocolError,
-            Some("unexpected request body chunk for a body-less request".to_string()),
-            None,
-        )?;
-        return Ok(());
+    };
+    let body_tx = match &worker.body {
+        RequestBody::Open(body_tx) => body_tx,
+        RequestBody::Complete => {
+            // The server never sends past `isFinal`; nothing reads it.
+            tracing::warn!(
+                request_id = request_id,
+                "dropping a relay body chunk after the final one"
+            );
+            return Ok(());
+        }
+        RequestBody::None => {
+            // Body frame for a request that declared no body.
+            requests.retire(&request_id, Retire::Faulted);
+            send_relay_error(
+                socket,
+                &request_id,
+                RelayFailure::ProtocolError,
+                Some("unexpected request body chunk for a body-less request".to_string()),
+                None,
+            )?;
+            return Ok(());
+        }
     };
 
     tracing::debug!(
@@ -2923,18 +3334,17 @@ where
     );
 
     match deliver_body_chunk(body_tx, body, last) {
-        BodyRoute::Delivered => Ok(()),
-        BodyRoute::WorkerGone => {
-            // Upstream already finished or rejected the request early; drop
-            // further body frames. The worker reports the terminal outcome.
+        BodyRoute::Delivered | BodyRoute::WorkerGone => {
+            // Gone: upstream already finished or rejected the request early;
+            // further body frames drop and the worker reports the outcome.
+            if last {
+                // Queued chunks still reach the worker after the sender drops.
+                worker.body = RequestBody::Complete;
+            }
             Ok(())
         }
         BodyRoute::OverCredit => {
-            if let Some(worker) = workers.remove(&request_id) {
-                worker.cancellation.cancel();
-                drop(worker.body_tx);
-            }
-            recent_finished.record(&request_id);
+            requests.retire(&request_id, Retire::Faulted);
             send_relay_error(
                 socket,
                 &request_id,
@@ -3090,31 +3500,85 @@ fn run_upstream_worker(
     cancellation_rx: watch::Receiver<bool>,
 ) {
     let request_id = spec.request_id.clone();
+    let mut phase = ResponsePhase::Requesting;
     let result = upstream_runtime().and_then(|runtime| {
-        runtime.block_on(execute_upstream(spec, body_rx, &tx, cancellation_rx))
+        runtime.block_on(execute_upstream_tracked(
+            spec,
+            body_rx,
+            &tx,
+            cancellation_rx,
+            &mut phase,
+        ))
     });
     if !cancellation.cancelled.load(Ordering::SeqCst)
         && let Err(error) = result
+        && let Some(frame) = upstream_failure_frame(&request_id, phase)
     {
-        tracing::warn!(error = %error, "relay upstream request failed");
-        let _ = worker_send_control(
-            &tx,
-            &NodeFrame::RelayError {
-                request_id: request_id.clone(),
-                failure: RelayFailure::Transport,
-                message: Some("upstream request failed".to_string()),
-                upstream_status_code: None,
-            },
-        );
+        match phase {
+            ResponsePhase::Requesting => {
+                tracing::warn!(error = %error, "relay upstream request failed");
+            }
+            _ => tracing::warn!(
+                error = %error,
+                ?phase,
+                "relay upstream response failed after its headers"
+            ),
+        }
+        let _ = worker_send_control(&tx, &frame);
     }
     let _ = tx.send(FromWorker::Finished(request_id));
 }
 
+/// How far a relayed response got: what a failure ends it with
+/// ([`upstream_failure_frame`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsePhase {
+    /// No `relay.response.headers` went out yet.
+    Requesting,
+    /// Headers went out; body chunks are streaming.
+    Streaming,
+    /// The final (empty) body chunk went out; `relay.complete` has not.
+    BodyEnded,
+    /// `relay.complete` went out: the request is settled.
+    Completed,
+}
+
+/// The frame that ends a failed upstream request, by how far its response
+/// got. The server settles a request on `relay.error` in any phase before
+/// `relay.complete` (headers already sent or not), so every phase but
+/// [`ResponsePhase::Completed`] gets the same `transport` error as before.
+fn upstream_failure_frame(request_id: &str, phase: ResponsePhase) -> Option<NodeFrame> {
+    match phase {
+        ResponsePhase::Requesting | ResponsePhase::Streaming | ResponsePhase::BodyEnded => {
+            Some(NodeFrame::RelayError {
+                request_id: request_id.to_string(),
+                failure: RelayFailure::Transport,
+                message: Some("upstream request failed".to_string()),
+                upstream_status_code: None,
+            })
+        }
+        ResponsePhase::Completed => None,
+    }
+}
+
+/// [`execute_upstream_tracked`] when the caller does not need the phase.
+#[cfg(test)]
 async fn execute_upstream(
     spec: UpstreamRequestSpec,
     body_rx: Option<Receiver<BodyChunk>>,
     tx: &SyncSender<FromWorker>,
+    cancellation_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut phase = ResponsePhase::Requesting;
+    execute_upstream_tracked(spec, body_rx, tx, cancellation_rx, &mut phase).await
+}
+
+async fn execute_upstream_tracked(
+    spec: UpstreamRequestSpec,
+    body_rx: Option<Receiver<BodyChunk>>,
+    tx: &SyncSender<FromWorker>,
     mut cancellation_rx: watch::Receiver<bool>,
+    phase: &mut ResponsePhase,
 ) -> Result<()> {
     let url = endpoint_url(&spec.base_url, &spec.path)?;
     let client = upstream_http_client()?;
@@ -3285,7 +3749,7 @@ async fn execute_upstream(
         _ = cancellation_rx.changed() => Ok(()),
         response = response.send() => {
             let response = response.context("forwarding relay request to upstream endpoint")?;
-            relay_response_back(response, &spec, tx, &mut cancellation_rx).await
+            relay_response_back(response, &spec, tx, &mut cancellation_rx, phase).await
         }
     }
 }
@@ -3296,6 +3760,7 @@ async fn relay_response_back(
     spec: &UpstreamRequestSpec,
     tx: &SyncSender<FromWorker>,
     cancellation_rx: &mut watch::Receiver<bool>,
+    phase: &mut ResponsePhase,
 ) -> Result<()> {
     let status = response.status().as_u16();
     let headers = response
@@ -3316,6 +3781,7 @@ async fn relay_response_back(
             headers,
         },
     )?;
+    *phase = ResponsePhase::Streaming;
 
     let mut response = response;
     let mut usage_tail = Vec::new();
@@ -3337,6 +3803,7 @@ async fn relay_response_back(
         is_final: Some(true),
     };
     worker_send_binary(tx, &metadata, &[])?;
+    *phase = ResponsePhase::BodyEnded;
     // Preserve provider usage while attaching separate `cl100k_base` metrics
     // for comparable cross-model Chat Test TPS. A bounded collector returns
     // `None` rather than retaining a huge response.
@@ -3350,6 +3817,7 @@ async fn relay_response_back(
             metrics,
         },
     )?;
+    *phase = ResponsePhase::Completed;
     Ok(())
 }
 
@@ -3861,9 +4329,7 @@ where
                     encode_binary_frame(&metadata, &body).map_err(RelaySessionError::Fatal)?;
                 socket
                     .send(Message::Binary(encoded.into()))
-                    .map_err(|error| {
-                        websocket_session_error(error, "sending a file op frame", true)
-                    })?;
+                    .map_err(|error| websocket_session_error(error, "sending a file op frame"))?;
             }
         }
     }
@@ -3888,7 +4354,7 @@ where
                 socket
                     .send(Message::Binary(encoded.into()))
                     .map_err(|error| {
-                        websocket_session_error(error, "sending terminal or exec frame", true)
+                        websocket_session_error(error, "sending terminal or exec frame")
                     })?;
             }
         }
@@ -3976,7 +4442,6 @@ fn unrecoverable(
                 delay: RELAY_RECONNECT_MAX_DELAY,
                 source: RetryFloorSource::Refusal,
             }),
-            reset_backoff: false,
         }
     }
 }
@@ -4050,7 +4515,6 @@ where
                     "the server sent no hello.challenge within {} s (a server older than relay protocol {RELAY_PROTOCOL_VERSION} never does; upgrade it if this repeats)",
                     HELLO_CHALLENGE_TIMEOUT.as_secs()
                 ),
-                reset_backoff: false,
             });
         }
         if let Some(signal) = crate::shutdown::requested() {
@@ -4068,7 +4532,6 @@ where
                     if code == ProtocolErrorCode::Internal {
                         return Err(RelaySessionError::Reconnectable {
                             error: anyhow::anyhow!("relay protocol error: {message}"),
-                            reset_backoff: false,
                         });
                     }
                     return Err(hello_rejection(&message, Some(&code), stop));
@@ -4084,14 +4547,13 @@ where
                     }
                     return Err(RelaySessionError::Reconnectable {
                         error: anyhow::anyhow!("invalid hello.challenge frame: {error}"),
-                        reset_backoff: false,
                     });
                 }
             },
             Ok(Message::Ping(bytes)) => {
                 socket
                     .send(Message::Pong(bytes))
-                    .map_err(|error| websocket_session_error(error, "sending relay pong", true))?;
+                    .map_err(|error| websocket_session_error(error, "sending relay pong"))?;
             }
             Ok(Message::Pong(_) | Message::Frame(_)) => {}
             Ok(Message::Binary(_)) => {
@@ -4103,16 +4565,11 @@ where
                 tracing::warn!(?frame, "relay websocket closed by server before hello");
                 return Err(RelaySessionError::Reconnectable {
                     error: anyhow::anyhow!("relay websocket closed before hello.challenge"),
-                    reset_backoff: false,
                 });
             }
             Err(tungstenite::Error::Io(err)) if read_poll_woke(&err) => {}
             Err(err) => {
-                return Err(websocket_session_error(
-                    err,
-                    "reading hello.challenge",
-                    true,
-                ));
+                return Err(websocket_session_error(err, "reading hello.challenge"));
             }
         }
     }
@@ -4129,7 +4586,7 @@ where
     let text = encode_control(message).map_err(RelaySessionError::Fatal)?;
     socket
         .send(Message::Text(text.into()))
-        .map_err(|error| websocket_session_error(error, context, true))
+        .map_err(|error| websocket_session_error(error, context))
 }
 
 /// Set by the systemd unit `wsmp service install` writes, which also lists
@@ -4322,10 +4779,7 @@ fn relay_connect_error(error: tungstenite::Error, stop: StopOn) -> RelaySessionE
                 crate::exit::ExitCode::CredentialRejected,
             )))
         } else {
-            RelaySessionError::Reconnectable {
-                error: rejected,
-                reset_backoff: false,
-            }
+            RelaySessionError::Reconnectable { error: rejected }
         };
     }
     if let tungstenite::Error::Http(response) = &error
@@ -4364,22 +4818,16 @@ fn relay_connect_error(error: tungstenite::Error, stop: StopOn) -> RelaySessionE
             }),
             None => error,
         },
-        reset_backoff: false,
     }
 }
 
-fn websocket_session_error(
-    error: tungstenite::Error,
-    context: &'static str,
-    reset_backoff: bool,
-) -> RelaySessionError {
+fn websocket_session_error(error: tungstenite::Error, context: &'static str) -> RelaySessionError {
     match error {
         error @ (tungstenite::Error::ConnectionClosed
         | tungstenite::Error::AlreadyClosed
         | tungstenite::Error::Io(_)
         | tungstenite::Error::Tls(_)) => RelaySessionError::Reconnectable {
             error: anyhow::Error::new(error).context(context),
-            reset_backoff,
         },
         error => RelaySessionError::Fatal(anyhow::Error::new(error).context(context)),
     }
@@ -4676,23 +5124,88 @@ mod tests {
         });
     }
 
-    #[test]
-    fn cancelled_worker_suppresses_queued_late_frames() {
+    fn idle_worker(body: RequestBody) -> (WorkerHandle, CancellationHandle) {
         let (cancellation, _receiver) = CancellationHandle::new();
-        let mut workers = BTreeMap::new();
-        workers.insert(
-            "request-1".to_string(),
+        (
             WorkerHandle {
-                body_tx: None,
-                cancellation,
+                body,
+                cancellation: cancellation.clone(),
                 join: thread::spawn(|| {}),
             },
-        );
-        assert!(worker_frame_is_current(&workers, "request-1"));
-        let worker = workers.remove("request-1").expect("live worker");
-        assert!(worker.cancellation.cancel());
-        drop(worker.join);
-        assert!(!worker_frame_is_current(&workers, "request-1"));
+            cancellation,
+        )
+    }
+
+    #[test]
+    fn cancelled_worker_suppresses_queued_late_frames() {
+        let mut requests = RelayRequests::new();
+        let (worker, cancellation) = idle_worker(RequestBody::None);
+        requests.start("request-1".to_string(), worker);
+        assert!(requests.is_live("request-1"));
+        assert!(requests.retire("request-1", Retire::Cancelled));
+        assert!(cancellation.cancelled.load(Ordering::SeqCst));
+        assert!(!requests.is_live("request-1"));
+        // Retired: in use (a reuse is a fault), and late frames are expected.
+        assert!(requests.in_use("request-1"));
+        assert!(matches!(requests.state("request-1"), RequestState::Retired));
+        assert!(matches!(requests.state("other"), RequestState::Unknown));
+        // A second retire finds nothing live (no second `relay.cancelled`).
+        assert!(!requests.retire("request-1", Retire::Cancelled));
+    }
+
+    #[test]
+    fn every_retire_reason_records_the_id_and_only_finished_joins() {
+        for reason in [Retire::Finished, Retire::Cancelled, Retire::Faulted] {
+            let mut requests = RelayRequests::new();
+            let (worker, cancellation) = idle_worker(RequestBody::None);
+            requests.start("r".to_string(), worker);
+            assert!(requests.retire("r", reason));
+            assert!(matches!(requests.state("r"), RequestState::Retired));
+            assert_eq!(
+                cancellation.cancelled.load(Ordering::SeqCst),
+                reason != Retire::Finished,
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// A chunk after `isFinal` is dropped (nothing reads it any more) and
+    /// changes nothing: no fault, the request stays live.
+    #[test]
+    fn a_body_chunk_after_the_final_one_is_dropped() {
+        let mut socket = sink_socket();
+        let mut requests = RelayRequests::new();
+        let (tx, rx) = mpsc::sync_channel::<BodyChunk>(REQUEST_BODY_INGRESS_CAPACITY);
+        let (worker, _cancellation) = idle_worker(RequestBody::Open(tx));
+        requests.start("req-1".to_string(), worker);
+        let chunk = |data: &[u8], last: bool, requests: &mut RelayRequests| {
+            let RequestState::Live(worker) = requests.state("req-1") else {
+                panic!("live");
+            };
+            match &worker.body {
+                RequestBody::Open(body_tx) => {
+                    assert!(matches!(
+                        deliver_body_chunk(body_tx, data.to_vec(), last),
+                        BodyRoute::Delivered
+                    ));
+                    if last {
+                        worker.body = RequestBody::Complete;
+                    }
+                    true
+                }
+                _ => false,
+            }
+        };
+        assert!(chunk(b"a", false, &mut requests));
+        assert!(chunk(b"b", true, &mut requests));
+        assert!(!chunk(b"late", false, &mut requests));
+        // Both chunks still reach the worker after the sender dropped.
+        assert_eq!(rx.recv().expect("first").data, b"a");
+        let last = rx.recv().expect("last");
+        assert!(last.last);
+        assert!(rx.recv().is_err());
+        assert!(requests.is_live("req-1"));
+        assert!(socket.get_mut().written.is_empty());
     }
 
     #[test]
@@ -4823,7 +5336,6 @@ mod tests {
     fn session_errors_after_a_shutdown_signal_end_as_shutdown() {
         let interrupted = || RelaySessionError::Reconnectable {
             error: anyhow::Error::new(io::Error::from(io::ErrorKind::Interrupted)),
-            reset_backoff: true,
         };
         assert!(matches!(
             settle_after_shutdown::<()>(Err(interrupted()), Some(15)),
@@ -4879,10 +5391,7 @@ mod tests {
             let mut socket = challenge_socket(message);
             assert!(matches!(
                 wait_for_hello_challenge(&mut socket, StopOn::ALL),
-                Err(RelaySessionError::Reconnectable {
-                    reset_backoff: false,
-                    ..
-                })
+                Err(RelaySessionError::Reconnectable { .. })
             ));
         }
     }
@@ -4895,10 +5404,7 @@ mod tests {
         ));
         assert!(matches!(
             wait_for_hello_challenge(&mut socket, StopOn::ALL),
-            Err(RelaySessionError::Reconnectable {
-                reset_backoff: false,
-                ..
-            })
+            Err(RelaySessionError::Reconnectable { .. })
         ));
         let mut socket = challenge_socket(Message::Text(
             r#"{"type":"protocol.error","failure":"protocol_error","message":"Registration was not received in time."}"#
@@ -5167,28 +5673,18 @@ mod tests {
         let config = Config::default();
         let (worker_tx, _worker_rx) =
             mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
-        let mut workers = BTreeMap::<String, WorkerHandle>::new();
-        let recent_finished = RecentlyFinished::new();
+        let mut requests = RelayRequests::new();
 
         // Seed a live worker for "req-1".
-        let (cancellation, _cancellation_rx) = CancellationHandle::new();
-        let join = thread::spawn(|| {});
-        workers.insert(
-            "req-1".to_string(),
-            WorkerHandle {
-                body_tx: None,
-                cancellation,
-                join,
-            },
-        );
+        let (worker, _cancellation) = idle_worker(RequestBody::None);
+        requests.start("req-1".to_string(), worker);
 
         let result = start_relay_request(
             &mut socket,
             &config,
             &BTreeMap::new(),
             &worker_tx,
-            &mut workers,
-            &recent_finished,
+            &mut requests,
             RelayRequest {
                 request_id: "req-1".to_string(),
                 method: "POST".to_string(),
@@ -5205,7 +5701,7 @@ mod tests {
         assert!(result.is_ok(), "start_relay_request should not error");
 
         // No second worker spawned: the map still holds exactly the seeded entry.
-        assert_eq!(workers.len(), 1);
+        assert_eq!(requests.live.len(), 1);
         // A protocol error frame was written back to the socket.
         let written = &socket.get_ref().written;
         assert!(!written.is_empty());
@@ -5220,17 +5716,15 @@ mod tests {
         let config = Config::default();
         let (worker_tx, _worker_rx) =
             mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
-        let mut workers = BTreeMap::<String, WorkerHandle>::new();
-        let mut recent_finished = RecentlyFinished::new();
-        recent_finished.record("req-done");
+        let mut requests = RelayRequests::new();
+        requests.retired.record("req-done");
 
         let result = start_relay_request(
             &mut socket,
             &config,
             &BTreeMap::new(),
             &worker_tx,
-            &mut workers,
-            &recent_finished,
+            &mut requests,
             RelayRequest {
                 request_id: "req-done".to_string(),
                 method: "POST".to_string(),
@@ -5246,7 +5740,7 @@ mod tests {
         );
         assert!(result.is_ok(), "start_relay_request should not error");
 
-        assert!(workers.is_empty());
+        assert!(requests.live.is_empty());
         assert!(!socket.get_ref().written.is_empty());
     }
 
@@ -6291,6 +6785,134 @@ mod tests {
         }
     }
 
+    /// The instance `stop_job` names, served as a live STT endpoint, and another.
+    fn stt_endpoints() -> Vec<crate::config::EndpointConfig> {
+        use crate::stt::tests::{endpoint, segmented};
+        vec![
+            endpoint(
+                "i-abcdefabcdef",
+                "http://127.0.0.1:9",
+                segmented(None, None),
+            ),
+            endpoint(
+                "i-000000000000",
+                "http://127.0.0.1:9",
+                segmented(None, None),
+            ),
+        ]
+    }
+
+    fn opens(
+        stt: &mut crate::stt::SttRegistry,
+        managed: &[crate::config::EndpointConfig],
+        n: u8,
+        slug: &str,
+    ) -> bool {
+        use crate::stt::tests::{open, session_id};
+        stt.handle(open(&session_id(n), slug), managed, Instant::now())
+            .is_empty()
+    }
+
+    fn job_in(phase: JobPhase, step_id: &str) -> crate::protocol::frames::RuntimeJob {
+        crate::protocol::frames::RuntimeJob {
+            step_id: step_id.into(),
+            phase,
+            ..stop_job(false)
+        }
+    }
+
+    fn ended(step_id: &str, succeeded: bool) -> crate::runtimes::runner::StepEnded {
+        crate::runtimes::runner::StepEnded {
+            step_id: step_id.into(),
+            succeeded,
+        }
+    }
+
+    #[test]
+    fn a_stop_job_ends_the_stt_sessions_on_its_instance_before_it_runs() {
+        use crate::stt::tests::{is_error, registry, session_id};
+        let (mut stt, _rx) = registry();
+        let managed = stt_endpoints();
+        assert!(opens(&mut stt, &managed, 1, "i-abcdefabcdef"));
+        assert!(opens(&mut stt, &managed, 2, "i-000000000000"));
+        let stop = stop_job(false);
+        let frames = stt_step_submitting(&mut stt, &stop);
+        assert_eq!(frames.len(), 1);
+        assert!(is_error(
+            &frames[0],
+            crate::protocol::RelayFailure::NotFound
+        ));
+        assert!(!stt.is_live(&session_id(1)));
+        assert!(stt.is_live(&session_id(2)), "another instance's session");
+        stt_step_submitted(&mut stt, &stop, true);
+        assert!(
+            !opens(&mut stt, &managed, 3, "i-abcdefabcdef"),
+            "no session opens while the stop runs"
+        );
+        // Other steps change nothing: no sessions end, no mark.
+        for phase in [JobPhase::Status, JobPhase::Health, JobPhase::Readiness] {
+            assert!(stt_step_submitting(&mut stt, &job_in(phase, "probe")).is_empty());
+        }
+        assert!(stt.is_live(&session_id(2)));
+        stt.abort_all();
+    }
+
+    #[test]
+    fn a_refused_or_failed_stop_lifts_its_stt_mark() {
+        let (mut stt, _rx) = crate::stt::tests::registry();
+        let managed = stt_endpoints();
+        // The runner refuses the stop: its endpoint still serves.
+        let stop = stop_job(false);
+        stt_step_submitting(&mut stt, &stop);
+        stt_step_submitted(&mut stt, &stop, false);
+        assert!(opens(&mut stt, &managed, 1, "i-abcdefabcdef"));
+        // The stop runs and fails (or its operator terminal closes).
+        let stop = job_in(JobPhase::Stop, "step2");
+        stt_step_submitting(&mut stt, &stop);
+        stt_step_submitted(&mut stt, &stop, true);
+        stt_step_ended(&mut stt, &ended("other", false));
+        assert!(!opens(&mut stt, &managed, 2, "i-abcdefabcdef"));
+        stt_step_ended(&mut stt, &ended("step2", false));
+        assert!(opens(&mut stt, &managed, 3, "i-abcdefabcdef"));
+        stt.abort_all();
+    }
+
+    #[test]
+    fn a_start_after_a_stop_takes_stt_sessions_once_the_stop_is_done() {
+        let (mut stt, _rx) = crate::stt::tests::registry();
+        let managed = stt_endpoints();
+        // A start admitted while the stop runs waits for it.
+        let stop = stop_job(false);
+        stt_step_submitting(&mut stt, &stop);
+        stt_step_submitted(&mut stt, &stop, true);
+        let start = job_in(JobPhase::Start, "start1");
+        stt_step_submitting(&mut stt, &start);
+        stt_step_submitted(&mut stt, &start, true);
+        assert!(!opens(&mut stt, &managed, 1, "i-abcdefabcdef"));
+        // A re-delivery of the stop keeps the start waiting.
+        stt_step_submitting(&mut stt, &stop);
+        stt_step_submitted(&mut stt, &stop, true);
+        // The start's own result names no mark.
+        stt_step_ended(&mut stt, &ended("start1", true));
+        assert!(!opens(&mut stt, &managed, 2, "i-abcdefabcdef"));
+        stt_step_ended(&mut stt, &ended("step1", true));
+        assert!(opens(&mut stt, &managed, 3, "i-abcdefabcdef"));
+
+        // A stop that finished first: a refused start keeps the mark, an
+        // admitted prepare lifts it.
+        let stop = job_in(JobPhase::Stop, "step2");
+        stt_step_submitting(&mut stt, &stop);
+        stt_step_submitted(&mut stt, &stop, true);
+        stt_step_ended(&mut stt, &ended("step2", true));
+        assert!(!opens(&mut stt, &managed, 4, "i-abcdefabcdef"));
+        let prepare = job_in(JobPhase::Prepare, "prep1");
+        stt_step_submitted(&mut stt, &prepare, false);
+        assert!(!opens(&mut stt, &managed, 5, "i-abcdefabcdef"));
+        stt_step_submitted(&mut stt, &prepare, true);
+        assert!(opens(&mut stt, &managed, 6, "i-abcdefabcdef"));
+        stt.abort_all();
+    }
+
     fn recorded(interactive_stop: bool) -> Job {
         let mut commands = serde_json::json!({
             "start": "sudo systemctl start x", "stop": "sudo systemctl stop x",
@@ -6449,5 +7071,176 @@ mod tests {
             )),
             ["secret.result"]
         );
+    }
+
+    /// Backoff after attempts that never registered keeps growing, whatever
+    /// failed (a lost socket while registering used to reset it, which
+    /// redialled a refusing server every second).
+    #[test]
+    fn the_backoff_grows_through_errors_before_hello_ok() {
+        let now = Instant::now();
+        let mut backoff = ReconnectBackoff::new();
+        for progress in [
+            ConnectProgress::Connecting,
+            ConnectProgress::Upgraded,
+            ConnectProgress::Challenged,
+            ConnectProgress::HelloSent,
+            ConnectProgress::Registered { since: now },
+        ] {
+            let before = backoff.delay;
+            let wait = backoff.next_wait(AttemptEnd::Reconnectable { floor: None }, progress, now);
+            assert!(
+                wait <= before && wait >= before.mul_f64(0.8),
+                "{progress:?}"
+            );
+            assert_eq!(backoff.delay, next_reconnect_delay(before), "{progress:?}");
+        }
+        assert_eq!(backoff.delay, Duration::from_secs(32));
+        assert_eq!(backoff.fatal_delay, RELAY_FATAL_INITIAL_DELAY);
+    }
+
+    #[test]
+    fn a_stable_registered_session_starts_the_backoff_over() {
+        let since = Instant::now();
+        let mut backoff = ReconnectBackoff {
+            delay: RELAY_RECONNECT_MAX_DELAY,
+            fatal_delay: RELAY_RECONNECT_MAX_DELAY,
+        };
+        // Registered, but dropped before it was stable: no reset.
+        let short = since + RELAY_STABLE_SESSION - Duration::from_secs(1);
+        let progress = ConnectProgress::Registered { since };
+        assert!(!progress.stable_at(short));
+        backoff.next_wait(AttemptEnd::Retry, progress, short);
+        assert_eq!(backoff.delay, RELAY_RECONNECT_MAX_DELAY);
+        // Stable: both backoffs start over, then grow for the next attempt.
+        let stable = since + RELAY_STABLE_SESSION;
+        let wait = backoff.next_wait(AttemptEnd::Reconnectable { floor: None }, progress, stable);
+        assert!(wait <= RELAY_RECONNECT_INITIAL_DELAY);
+        assert_eq!(backoff.delay, RELAY_RECONNECT_INITIAL_DELAY * 2);
+        assert_eq!(backoff.fatal_delay, RELAY_FATAL_INITIAL_DELAY);
+    }
+
+    #[test]
+    fn the_backoff_honours_floors_and_keeps_its_fatal_track() {
+        let now = Instant::now();
+        let mut backoff = ReconnectBackoff::new();
+        let floor = Duration::from_secs(120);
+        let wait = backoff.next_wait(
+            AttemptEnd::Reconnectable { floor: Some(floor) },
+            ConnectProgress::Connecting,
+            now,
+        );
+        assert!(wait >= floor && wait <= floor.mul_f64(1.1));
+        // Grown from the floor.
+        assert_eq!(backoff.delay, floor * 2);
+        let mut backoff = ReconnectBackoff::new();
+        let wait = backoff.next_wait(AttemptEnd::Fatal, ConnectProgress::HelloSent, now);
+        assert!(wait <= RELAY_FATAL_INITIAL_DELAY);
+        assert_eq!(backoff.fatal_delay, RELAY_FATAL_INITIAL_DELAY * 2);
+        assert_eq!(backoff.delay, RELAY_RECONNECT_INITIAL_DELAY * 2);
+    }
+
+    #[test]
+    fn the_frame_gate_sends_only_the_hello_before_hello_ok() {
+        let registered = SessionPhase::Registered {
+            since: Instant::now(),
+        };
+        let classes = [
+            FrameClass::Periodic,
+            FrameClass::NodeState,
+            FrameClass::SessionScoped,
+            FrameClass::Command,
+        ];
+        for class in classes {
+            assert_eq!(gate(registered, class), Gate::Send, "{class:?}");
+            assert_ne!(gate(SessionPhase::PreHello, class), Gate::Send, "{class:?}");
+            assert_ne!(
+                gate(SessionPhase::AwaitingHelloOk, class),
+                Gate::Send,
+                "{class:?}"
+            );
+        }
+        // The hello carries trust; a change after it waits for `hello.ok`.
+        assert_eq!(
+            gate(SessionPhase::PreHello, FrameClass::NodeState),
+            Gate::Drop
+        );
+        assert_eq!(
+            gate(SessionPhase::AwaitingHelloOk, FrameClass::NodeState),
+            Gate::Hold
+        );
+        // Step results and terminal frames wait in the session; command
+        // statuses wait for whichever connection registers.
+        assert_eq!(
+            gate(SessionPhase::AwaitingHelloOk, FrameClass::SessionScoped),
+            Gate::Hold
+        );
+        assert_eq!(
+            gate(SessionPhase::AwaitingHelloOk, FrameClass::Command),
+            Gate::Defer
+        );
+        assert_eq!(
+            gate(SessionPhase::Closing, FrameClass::Periodic),
+            Gate::Drop
+        );
+        assert_eq!(gate(SessionPhase::Closing, FrameClass::Command), Gate::Send);
+        assert_eq!(SessionPhase::AwaitingHelloOk.connection(), "registering");
+        assert_eq!(registered.connection(), "connected");
+    }
+
+    /// F-trust: `wsmp trust full` then `wsmp trust relay` drained in one
+    /// loop turn (or a raise and a hot-reload lowering) end at Relay only,
+    /// and file ops are refused: the file relay reads the daemon's trust, so
+    /// no change applied after the other can leave it at Full control.
+    #[test]
+    fn a_raise_then_a_lowering_in_one_turn_leaves_file_ops_refused() {
+        let config = Config::default();
+        let startup = TerminalStartup::from_key(
+            crate::terminal_crypto::CliTerminalKey::generate().expect("key"),
+            &config,
+        );
+        let mut applied = startup.trust_snapshot().lowerings;
+        let policy = crate::file_ops::Policy::from_environment(vec![std::env::temp_dir()], false)
+            .with_euid(1000);
+        let runtime = Arc::new(crate::file_relay::FileRuntime::new(
+            crate::file_ops::FileOps::new(policy, crate::file_ops::EtagKey::random()),
+        ));
+        let sink: crate::file_relay::FileSink = Arc::new(|_, _| {});
+        let mut files = crate::file_relay::FileRelay::new(runtime, startup.trust_authority(), sink);
+        let stat = |files: &mut crate::file_relay::FileRelay, n: u8| {
+            use base64::Engine;
+            let id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([n; 16]);
+            let frames = files.handle_op(
+                &id,
+                "stat",
+                serde_json::json!({ "path": std::env::temp_dir() }),
+                None,
+            );
+            frames.iter().any(|frame| {
+                matches!(
+                    frame,
+                    crate::file_relay::FileFrame::Control(message)
+                        if serde_json::to_value(message).expect("json")["reason"] == "trust_relay"
+                )
+            })
+        };
+        assert!(stat(&mut files, 1), "Relay only at start");
+
+        // Raised, then lowered, then the session applies the turn's changes.
+        assert!(startup.raise_trust());
+        assert!(startup.lower_trust());
+        assert!(take_lowering(&mut applied, &startup));
+        files.on_trust_changed();
+        assert_eq!(startup.trust_value(), TrustValue::Relay);
+        assert!(stat(&mut files, 2), "the lowering applied last wins");
+
+        // Raised, lowered, then raised again: Full control, and the lowering still counts.
+        assert!(startup.raise_trust());
+        assert!(startup.lower_trust());
+        assert!(startup.raise_trust());
+        assert!(take_lowering(&mut applied, &startup));
+        assert!(!take_lowering(&mut applied, &startup), "applied once");
+        files.on_trust_changed();
+        assert!(!stat(&mut files, 3), "raised last: admitted");
     }
 }

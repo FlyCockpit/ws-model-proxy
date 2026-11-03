@@ -417,6 +417,33 @@ describe("realtime transcription session: setup and routing", () => {
     expect(t.router.failures).toEqual([]);
   });
 
+  it("releases a trial claimed after the client hung up, and the lease once", async () => {
+    let answer: ((value: Date | null) => void) | undefined;
+    const released = vi.fn();
+    const t = setup({
+      initialModel: "whisper",
+      hooks: { admit: async () => ({ ok: true, lease: { release: released } }) },
+    });
+    const recovering = t.link("cli-recovering");
+    t.router.claimTrial = () =>
+      new Promise<Date | null>((resolve) => {
+        answer = resolve;
+      });
+    t.router.result = {
+      ok: true,
+      candidates: [{ ...candidate("cli-recovering"), trial: { degradedFallback: true } }],
+    };
+    t.session.start();
+    await vi.advanceTimersByTimeAsync(0);
+    t.session.clientClosed();
+    expect(released).toHaveBeenCalledTimes(1);
+    answer?.(new Date("2026-01-01T00:00:00.000Z"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.router.released).toEqual([["cli-recovering", "unused"]]);
+    expect(released).toHaveBeenCalledTimes(1);
+    expect(recovering.opens()).toEqual([]);
+  });
+
   it("moves on when claiming a trial fails", async () => {
     const t = setup({ initialModel: "whisper" });
     const recovering = t.link("cli-recovering");

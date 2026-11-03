@@ -146,7 +146,7 @@ fn serve(mut stream: TcpStream, reply: &Reply, seen: &Mutex<Seen>) {
     let _ = stream.write_all(response.as_bytes());
 }
 
-fn endpoint(
+pub(crate) fn endpoint(
     slug: &str,
     base_url: &str,
     realtime: Option<RealtimeTranscriptionProfile>,
@@ -169,7 +169,7 @@ fn endpoint(
     }
 }
 
-fn segmented(
+pub(crate) fn segmented(
     max_item_seconds: Option<u32>,
     max_sessions: Option<u32>,
 ) -> Option<RealtimeTranscriptionProfile> {
@@ -180,7 +180,7 @@ fn segmented(
     })
 }
 
-fn open(session_id: &str, slug: &str) -> SttServerMessage {
+pub(crate) fn open(session_id: &str, slug: &str) -> SttServerMessage {
     SttServerMessage::Open {
         session_id: session_id.to_string(),
         handle: slug.to_string(),
@@ -196,12 +196,12 @@ fn open(session_id: &str, slug: &str) -> SttServerMessage {
     }
 }
 
-fn session_id(n: u8) -> String {
+pub(crate) fn session_id(n: u8) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([n; 16])
 }
 
-fn registry() -> (SttRegistry, Receiver<FromWorker>) {
+pub(crate) fn registry() -> (SttRegistry, Receiver<FromWorker>) {
     let (tx, rx) = mpsc::sync_channel(64);
     (SttRegistry::new(tx), rx)
 }
@@ -240,7 +240,7 @@ fn has_event(predicate: impl Fn(&SttEvent) -> bool) -> impl Fn(&[NodeFrame]) -> 
     move |sent| events(sent).into_iter().any(&predicate)
 }
 
-fn is_error(message: &NodeFrame, expected: RelayFailure) -> bool {
+pub(crate) fn is_error(message: &NodeFrame, expected: RelayFailure) -> bool {
     matches!(message, NodeFrame::SttError { failure, .. } if *failure == expected)
 }
 
@@ -1059,6 +1059,49 @@ fn queued_commands_are_bounded_per_session() {
         "{refused:?}"
     );
     assert!(!registry.is_live(SESSION));
+}
+
+#[test]
+fn a_stop_mark_moves_through_its_states() {
+    let (mut registry, _rx) = registry();
+    let mark = |registry: &SttRegistry| {
+        registry
+            .stopping
+            .get("inst-a")
+            .map(|mark| format!("{mark:?}"))
+    };
+    registry.endpoint_stopping("inst-a", "step-1");
+    assert_eq!(
+        mark(&registry).as_deref(),
+        Some(r#"Running { step_id: "step-1" }"#)
+    );
+    // A start while the stop runs waits for it; a second start changes nothing.
+    registry.endpoint_starting("inst-a");
+    registry.endpoint_starting("inst-a");
+    assert_eq!(
+        mark(&registry).as_deref(),
+        Some(r#"StartWaiting { step_id: "step-1" }"#)
+    );
+    // The stop finishing lifts it.
+    registry.stop_finished("step-1");
+    assert_eq!(mark(&registry), None);
+    // A stop that finishes first stays (also when told twice) until a start.
+    registry.endpoint_stopping("inst-a", "step-2");
+    registry.stop_finished("step-2");
+    registry.stop_finished("step-2");
+    assert_eq!(
+        mark(&registry).as_deref(),
+        Some(r#"Finished { step_id: "step-2" }"#)
+    );
+    registry.endpoint_starting("inst-a");
+    assert_eq!(mark(&registry), None);
+    // A failed stop lifts it in any state; another step's failure does not.
+    registry.endpoint_stopping("inst-a", "step-3");
+    registry.endpoint_starting("inst-a");
+    registry.stop_failed("step-other");
+    assert!(mark(&registry).is_some());
+    registry.stop_failed("step-3");
+    assert_eq!(mark(&registry), None);
 }
 
 #[test]

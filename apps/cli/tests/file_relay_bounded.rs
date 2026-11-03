@@ -116,7 +116,7 @@ fn slow_file_ops_never_stall_the_relay_loop() {
     let sink: FileSink = Arc::new(move |id, frames| {
         let _ = tx.lock().expect("tx").send((id, frames));
     });
-    let mut relay = FileRelay::new(runtime, true, sink);
+    let mut relay = FileRelay::new(runtime, wsmp::startup::TrustAuthority::new(true), sink);
 
     // A large file to hash for real: `stat` with `hash` reads all of it.
     let big = dir.path().join("big.bin");

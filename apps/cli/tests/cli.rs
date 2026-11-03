@@ -2884,12 +2884,9 @@ impl DeadmanFixture {
             deadline: 1,
             deadman_at: Some(1),
             attempts: 1,
-            phase: state::Phase::Swapped,
+            lifecycle: state::Lifecycle::Swapped,
             reason: None,
             detail: None,
-            reported: false,
-            rolling_back: false,
-            restart_pending: false,
             updated_at: "2026-10-31T00:00:00Z".into(),
         };
         state::save(&state_dir.join("update"), &current).expect("fixture");
@@ -3043,7 +3040,7 @@ fn the_dead_mans_scheduled_program_finishes_a_rollback_cut_short_after_the_resto
     let mut node = DeadmanFixture::new(true);
     let job = node.arm();
     // What the interrupted run did: intent saved, then the restore, then it died.
-    node.current.rolling_back = true;
+    node.current.begin_rollback().unwrap();
     wsmp::update::state::save(&node.state.join("update"), &node.current).unwrap();
     let layout = wsmp::update::install::Layout {
         recovery: node.current.recovery_path.clone().unwrap(),

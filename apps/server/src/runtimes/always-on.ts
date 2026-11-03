@@ -35,6 +35,7 @@ import {
   graphWrite,
   runtimeCapacityFences,
 } from "@ws-model-proxy/api/lib/graph-write";
+import { type AlwaysOnPhase, alwaysOnPhaseData } from "@ws-model-proxy/api/lib/instance-phase";
 import { storedRequestCompat } from "@ws-model-proxy/api/lib/request-compat";
 import { runtimeLaunchHash } from "@ws-model-proxy/api/lib/runtime-launch-hash";
 import {
@@ -56,7 +57,7 @@ import type { AlwaysOnInventory } from "../relay/frames.js";
 import type { NodeSessionRef } from "../relay/session-manager.js";
 
 type Tx = Prisma.TransactionClient;
-type Phase = "READY" | "UNHEALTHY" | "UNAVAILABLE";
+type Phase = AlwaysOnPhase;
 type ModelType = "LLM" | "EMBEDDINGS" | "TRANSCRIPTION";
 
 /** The always-on instance phase a node status means (§3.7). */
@@ -488,11 +489,7 @@ async function observeInstance(
   if (instance.phase !== phase)
     await tx.runtimeInstance.update({
       where: { id: instance.id },
-      data: {
-        phase,
-        phaseChangedAt: now,
-        phaseReason: phase === "READY" ? null : `node_${entry.status}`,
-      },
+      data: alwaysOnPhaseData(phase, phase === "READY" ? null : `node_${entry.status}`, now),
     });
 }
 
@@ -602,7 +599,7 @@ async function removeUnreported(ref: NodeSessionRef, reported: ReadonlySet<strin
             { phaseReason: { not: NODE_REMOVED } },
           ],
         },
-        data: { phase: "UNAVAILABLE", phaseReason: NODE_REMOVED, phaseChangedAt: new Date() },
+        data: alwaysOnPhaseData("UNAVAILABLE", NODE_REMOVED, new Date()),
       });
       if (marked.count > 0)
         log(`node-origin runtime "${runtime.slug}" is no longer reported but a profile pins it`);

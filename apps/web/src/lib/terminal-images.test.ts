@@ -26,7 +26,7 @@ describe("terminal image uploads", () => {
     "cancels an unused offer once, only while its session is current (%s)",
     async (stillCurrent) => {
       const transfer = new TerminalImageTransfer();
-      transfer.supported = true;
+      transfer.markSupported();
       let current = true;
       const cancelledIds: string[] = [];
       const offered = await transfer.upload(
@@ -49,7 +49,7 @@ describe("terminal image uploads", () => {
 
   it("rejects a node error without producing a paste", async () => {
     const transfer = new TerminalImageTransfer();
-    transfer.supported = true;
+    transfer.markSupported();
     const progress = vi.fn();
     await expect(
       transfer.upload(
@@ -72,7 +72,7 @@ describe("terminal image uploads", () => {
   it("times out after 15 seconds without an acknowledgement and can retry", async () => {
     vi.useFakeTimers();
     const transfer = new TerminalImageTransfer();
-    transfer.supported = true;
+    transfer.markSupported();
     let sent: (() => void) | undefined;
     const started = new Promise<void>((resolve) => {
       sent = resolve;
@@ -178,7 +178,7 @@ describe("terminal image uploads", () => {
 
   it("waits for every chunk acknowledgement before returning the saved path", async () => {
     const transfer = new TerminalImageTransfer();
-    transfer.supported = true;
+    transfer.markSupported();
     const file = new File([new Uint8Array(TERMINAL_IMAGE_CHUNK_BYTES + 8)], "image.png", {
       type: "image/png",
     });
@@ -211,7 +211,7 @@ describe("terminal image uploads", () => {
 
   it("never returns a paste after the session disconnects", async () => {
     const transfer = new TerminalImageTransfer();
-    transfer.supported = true;
+    transfer.markSupported();
     await expect(
       transfer.upload(
         new File(["png"], "image.png", { type: "image/png" }),

@@ -184,11 +184,10 @@ export function transitionTargetHealthAfterRetryableFailure({
   const cooldownUntil = new Date(
     now.getTime() + targetRecoveryDelayMs(consecutiveRetryableFailures),
   );
+  // A failure in the half-open state (or of a due open target's trial) re-opens the circuit.
+  const breaker = targetBreakerState(target, now);
   const failedHalfOpenTrial =
-    target.health === "HALF_OPEN" ||
-    (target.health === "UNHEALTHY" &&
-      target.nextRetryAt !== null &&
-      target.nextRetryAt.getTime() <= now.getTime());
+    breaker.kind === "half_open" || (breaker.kind === "open" && breaker.due);
   return {
     health:
       failedHalfOpenTrial ||
@@ -225,6 +224,121 @@ export function targetTrialLive(startedAt: Date | null, now: Date): boolean {
   return startedAt !== null && startedAt.getTime() > now.getTime() - TARGET_HALF_OPEN_LEASE_MS;
 }
 
+// ── The target circuit breaker ──
+//
+// `execution_target` encodes its breaker in `health` + `nextRetryAt` + `halfOpenTrialStartedAt`.
+// {@link targetBreakerState} is the one derivation every in-memory reader uses, and the
+// `target*Where` builders below are its SQL forms for the readers that filter in the database
+// (their parity is pinned by tests), so the rule lives in one place.
+
+/** A claimed half-open trial: `live` while its lease has not lapsed ({@link targetTrialLive}). */
+export type TargetHalfOpenTrial = { startedAt: Date; live: boolean };
+
+/**
+ * - `closed`: healthy, or not yet judged (UNKNOWN);
+ * - `degraded` / `open` (DEGRADED / UNHEALTHY): cooling down until `retryAt`, then `due` for a
+ *   half-open trial (a missing `retryAt` is never due);
+ * - `half_open`: a trial is claimed (`trial`), or the state is half-open with no claim (`null`,
+ *   claimable like a lapsed one).
+ */
+export type TargetBreakerState =
+  | { kind: "closed" }
+  | { kind: "degraded"; retryAt: Date | null; due: boolean }
+  | { kind: "open"; retryAt: Date | null; due: boolean }
+  | { kind: "half_open"; trial: TargetHalfOpenTrial | null };
+
+type TargetBreakerColumns = Pick<
+  TargetHealthSnapshot,
+  "health" | "nextRetryAt" | "halfOpenTrialStartedAt"
+>;
+
+/** The one derivation of {@link TargetBreakerState} from the target's health columns. */
+export function targetBreakerState(target: TargetBreakerColumns, now: Date): TargetBreakerState {
+  switch (target.health) {
+    case "HEALTHY":
+    case "UNKNOWN":
+      return { kind: "closed" };
+    case "HALF_OPEN": {
+      const startedAt = target.halfOpenTrialStartedAt;
+      return {
+        kind: "half_open",
+        trial: startedAt ? { startedAt, live: targetTrialLive(startedAt, now) } : null,
+      };
+    }
+    case "DEGRADED":
+    case "UNHEALTHY": {
+      const retryAt = target.nextRetryAt;
+      const due = retryAt !== null && retryAt.getTime() <= now.getTime();
+      return { kind: target.health === "DEGRADED" ? "degraded" : "open", retryAt, due };
+    }
+  }
+}
+
+/** A half-open trial is in flight (claimed, lease live): nobody else may route or settle it. */
+export function targetTrialInFlight(state: TargetBreakerState): boolean {
+  return state.kind === "half_open" && state.trial?.live === true;
+}
+
+/** The half-open trial is exactly the one claimed at `trialStartedAt` (its owner's fence). */
+export function targetTrialHeldBy(state: TargetBreakerState, trialStartedAt: Date): boolean {
+  return (
+    state.kind === "half_open" && state.trial?.startedAt.getTime() === trialStartedAt.getTime()
+  );
+}
+
+const lapsedTrialCutoff = (now: Date) => new Date(now.getTime() - TARGET_HALF_OPEN_LEASE_MS);
+
+/** SQL form of "no trial in flight" (`!targetTrialInFlight`). */
+export function targetNoTrialInFlightWhere(now: Date) {
+  return {
+    OR: [
+      { health: { not: "HALF_OPEN" as const } },
+      { halfOpenTrialStartedAt: null },
+      { halfOpenTrialStartedAt: { lte: lapsedTrialCutoff(now) } },
+    ],
+  };
+}
+
+/** SQL form of "degraded or open, and due" (what a recovery probe may claim). */
+export function targetDueWhere(now: Date) {
+  return {
+    health: { in: ["DEGRADED" as const, "UNHEALTHY" as const] },
+    nextRetryAt: { lte: now },
+  };
+}
+
+/** SQL form of "open (UNHEALTHY) and still cooling down" (not due). */
+export function targetOpenCoolingDownWhere(now: Date) {
+  return {
+    health: "UNHEALTHY" as const,
+    OR: [{ nextRetryAt: null }, { nextRetryAt: { gt: now } }],
+  };
+}
+
+/** SQL form of "degraded or open, and still cooling down" (not due). */
+export function targetCoolingDownWhere(now: Date) {
+  return {
+    health: { in: ["DEGRADED" as const, "UNHEALTHY" as const] },
+    OR: [{ nextRetryAt: null }, { nextRetryAt: { gt: now } }],
+  };
+}
+
+/**
+ * SQL form of `targetRoutingHealth(target, now, allowDegraded) === "HALF_OPEN"`: a request may
+ * claim the half-open trial (due and open; half-open with no live trial; due and degraded with
+ * `allowDegraded`).
+ */
+export function targetHalfOpenClaimableWhere(now: Date, allowDegraded: boolean) {
+  return {
+    OR: [
+      { health: "UNHEALTHY" as const, nextRetryAt: { lte: now } },
+      { health: "HALF_OPEN" as const, halfOpenTrialStartedAt: null },
+      { health: "HALF_OPEN" as const, halfOpenTrialStartedAt: { lte: lapsedTrialCutoff(now) } },
+      ...(allowDegraded ? [{ health: "DEGRADED" as const, nextRetryAt: { lte: now } }] : []),
+    ],
+  };
+}
+
 /**
  * How a target may be routed now: `HEALTHY` (healthy or not yet judged), `HALF_OPEN` (its
  * recovery window is open and no trial is in flight: one request may claim the trial with
@@ -236,14 +350,18 @@ export function targetRoutingHealth(
   now: Date,
   allowDegraded: boolean,
 ): "HEALTHY" | "HALF_OPEN" | null {
-  if (target.health === "HEALTHY" || target.health === "UNKNOWN") return "HEALTHY";
-  if (target.health === "HALF_OPEN")
-    return targetTrialLive(target.halfOpenTrialStartedAt, now) ? null : "HALF_OPEN";
-  const due = target.nextRetryAt !== null && target.nextRetryAt.getTime() <= now.getTime();
-  // With no healthy alternative, a due degraded route gets its half-open request.
-  if (target.health === "DEGRADED" && allowDegraded && due) return "HALF_OPEN";
-  if (target.health === "UNHEALTHY" && due) return "HALF_OPEN";
-  return null;
+  const breaker = targetBreakerState(target, now);
+  switch (breaker.kind) {
+    case "closed":
+      return "HEALTHY";
+    case "half_open":
+      return breaker.trial?.live ? null : "HALF_OPEN";
+    case "degraded":
+      // With no healthy alternative, a due degraded route gets its half-open request.
+      return allowDegraded && breaker.due ? "HALF_OPEN" : null;
+    case "open":
+      return breaker.due ? "HALF_OPEN" : null;
+  }
 }
 
 export function routablePoolRoutes({
@@ -385,13 +503,7 @@ export function buildPoolRouteSequence({
 function targetOutcomeFence(trialStartedAt: Date | null, now: Date) {
   if (trialStartedAt)
     return { health: "HALF_OPEN" as const, halfOpenTrialStartedAt: trialStartedAt };
-  return {
-    OR: [
-      { health: { not: "HALF_OPEN" as const } },
-      { halfOpenTrialStartedAt: null },
-      { halfOpenTrialStartedAt: { lte: new Date(now.getTime() - TARGET_HALF_OPEN_LEASE_MS) } },
-    ],
-  };
+  return targetNoTrialInFlightWhere(now);
 }
 
 const HEALTH_SELECT = {
@@ -433,10 +545,10 @@ export async function recordTargetRelayFailure({
       select: HEALTH_SELECT,
     });
     if (!target) return { retryable: true, update: null };
+    const breaker = targetBreakerState(target, now);
     const owned = trialStartedAt
-      ? target.health === "HALF_OPEN" &&
-        target.halfOpenTrialStartedAt?.getTime() === trialStartedAt.getTime()
-      : !(target.health === "HALF_OPEN" && targetTrialLive(target.halfOpenTrialStartedAt, now));
+      ? targetTrialHeldBy(breaker, trialStartedAt)
+      : !targetTrialInFlight(breaker);
     if (!owned) return { retryable: true, update: null };
     const update = transitionTargetHealthAfterRetryableFailure({ target, failureClass, now });
     const result = await prisma.executionTarget.updateMany({
@@ -475,8 +587,7 @@ export async function claimTargetRecoveryTrial({
   const result = await prisma.executionTarget.updateMany({
     where: {
       id: executionTargetId,
-      health: { in: ["DEGRADED", "UNHEALTHY"] },
-      nextRetryAt: { lte: now },
+      ...targetDueWhere(now),
     },
     data: { health: "HALF_OPEN", halfOpenTrialStartedAt: now },
   });
@@ -499,11 +610,7 @@ export async function settleTargetRecoveryTrial({
     where: { id: executionTargetId },
     select: HEALTH_SELECT,
   });
-  if (
-    target?.health !== "HALF_OPEN" ||
-    target.halfOpenTrialStartedAt?.getTime() !== trialStartedAt.getTime()
-  )
-    return false;
+  if (!target || !targetTrialHeldBy(targetBreakerState(target, now), trialStartedAt)) return false;
   const data = healthy
     ? resetTargetHealth()
     : transitionTargetHealthAfterRetryableFailure({ target, failureClass: "TRANSPORT", now });
@@ -542,20 +649,7 @@ export async function markTargetHalfOpenTrial({
   now?: Date;
 }): Promise<number> {
   const result = await prisma.executionTarget.updateMany({
-    where: {
-      id: executionTargetId,
-      OR: [
-        { health: "UNHEALTHY", nextRetryAt: { lte: now } },
-        { health: "HALF_OPEN", halfOpenTrialStartedAt: null },
-        {
-          health: "HALF_OPEN",
-          halfOpenTrialStartedAt: { lte: new Date(now.getTime() - TARGET_HALF_OPEN_LEASE_MS) },
-        },
-        ...(allowDegradedFallback
-          ? [{ health: "DEGRADED" as const, nextRetryAt: { lte: now } }]
-          : []),
-      ],
-    },
+    where: { id: executionTargetId, ...targetHalfOpenClaimableWhere(now, allowDegradedFallback) },
     data: { health: "HALF_OPEN", halfOpenTrialStartedAt: now },
   });
   return result.count;
@@ -637,8 +731,7 @@ export async function markTargetsForNodeUnavailable({
   // A target cooling down for a real failure keeps its class and cooldown.
   const notRealFailureCoolingDown = {
     NOT: {
-      health: { in: ["UNHEALTHY" as const, "DEGRADED" as const] },
-      nextRetryAt: { gt: now },
+      ...targetCoolingDownWhere(now),
       lastFailureClass: { not: null, notIn: [...nodeUnavailableFailureClasses] },
     },
   };
@@ -734,9 +827,8 @@ export async function markTargetsDueAfterNodeReconnect({
   now?: Date;
 }): Promise<number> {
   const eligible = {
-    health: "UNHEALTHY" as const,
+    ...targetOpenCoolingDownWhere(now),
     lastFailureClass: { in: [...nodeUnavailableFailureClasses] },
-    nextRetryAt: { gt: now },
   };
   const targets = await prisma.executionTarget.findMany({
     where: { ...eligible, ...targetsOnNode(nodeId) },

@@ -2,8 +2,9 @@ import { Button } from "@ws-model-proxy/ui/components/button";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Check, Copy } from "lucide-react";
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
+
+import { useCopyFeedback } from "@/hooks/use-copy-feedback";
 
 import type { NodeSummary } from "./node-types";
 
@@ -77,16 +78,10 @@ export function NodeFlags({
 /** A shell command with a copy button (44px target). */
 export function CommandBlock({ command, label }: { command: string; label?: string }) {
   const { t } = useTranslation(["dashboard", "errors"]);
-  const [copied, setCopied] = useState(false);
+  const { feedback, copy: copyText } = useCopyFeedback(2_000);
   const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(command);
-      setCopied(true);
-      toast.success(t("dashboard:nodes.copied"));
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      toast.error(t("errors:couldNotCopy"));
-    }
+    if (await copyText(command)) toast.success(t("dashboard:nodes.copied"));
+    else toast.error(t("errors:couldNotCopy"));
   };
   return (
     <div className="flex min-w-0 items-start gap-2 rounded-md border bg-muted/40 p-2">
@@ -104,7 +99,7 @@ export function CommandBlock({ command, label }: { command: string; label?: stri
         onClick={copy}
         aria-label={t("dashboard:nodes.copy")}
       >
-        {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+        {feedback === "copied" ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
       </Button>
     </div>
   );

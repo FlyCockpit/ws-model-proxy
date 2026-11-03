@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::output;
 use crate::protocol::frames::{InstallMethod, UpdatePhase, UpdateReason};
 use crate::update::flow::{self, Ended, Machine, Progress, Request, Rollback};
-use crate::update::state::{self, Origin, Phase};
+use crate::update::state::{self, Lifecycle, Origin};
 
 #[derive(Debug, clap::Args)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -245,7 +245,7 @@ fn update(args: &Args) -> Result<()> {
         tracing::warn!(error = %format!("{error:#}"), "looking at an earlier update failed");
     }
     if let Some(previous) = state::load(&update_dir)?
-        && previous.phase.in_progress()
+        && previous.in_progress()
     {
         anyhow::bail!(
             "update `{}` to {} has not confirmed yet; wait for it (`wsmp update status`)",
@@ -364,9 +364,9 @@ fn update(args: &Args) -> Result<()> {
 /// simply in place, and the update is done.
 fn settle_without_service(update_dir: &std::path::Path) -> Result<()> {
     if let Some(mut done) = state::load(update_dir)?
-        && done.phase == Phase::Swapped
+        && done.lifecycle == Lifecycle::Swapped
     {
-        done.advance(Phase::Confirmed)?;
+        done.confirm()?;
         state::save(update_dir, &done)?;
     }
     Ok(())
@@ -479,7 +479,7 @@ fn status(json: bool) -> Result<()> {
             "last update: {} to {} ({:?}{})",
             last.from_version,
             last.to_version,
-            last.phase,
+            last.phase(),
             last.detail
                 .as_deref()
                 .map(|detail| format!(": {}", crate::display_escape::escape_single_line(detail)))
@@ -684,7 +684,7 @@ mod tests {
     fn unconfirmed(root: &std::path::Path) -> (PathBuf, FakeScheduler, state::UpdateState) {
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).expect("bin");
-        let mut current = state::sample(&bin, Phase::Swapped);
+        let mut current = state::sample(&bin, state::Phase::Swapped);
         std::fs::write(&current.live_path, "new wsmp 0.4.3\n").expect("live");
         std::fs::write(&current.prev_path, "old wsmp 0.4.2\n").expect("prev");
         current.to_sha256 =
@@ -782,8 +782,8 @@ mod tests {
             state::load(&update_dir)
                 .expect("load")
                 .expect("state")
-                .phase,
-            Phase::RolledBack
+                .phase(),
+            state::Phase::RolledBack
         );
         // Restarted and its job removed: the program goes too.
         assert!(!program.exists());

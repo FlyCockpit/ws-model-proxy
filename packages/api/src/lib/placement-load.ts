@@ -11,6 +11,7 @@ import { occupiesNodesWhere } from "./instance-occupancy";
 import { physicalLaunchIntents } from "./instance-run";
 import { launchCapabilities } from "./launch-capabilities";
 import { requiredDefinitionsByNode } from "./node-definitions";
+import { nodeIsLive } from "./node-liveness";
 import type {
   PlacementContext,
   PlacementFabric,
@@ -28,6 +29,7 @@ export const PLACEMENT_NODE_SELECT = {
   id: true,
   slug: true,
   connection: true,
+  lastHeartbeatAt: true,
   trust: true,
   trustChangedAt: true,
   trustLowerRequestedAt: true,
@@ -50,6 +52,8 @@ export type PlacementNodeRow = {
   id: string;
   slug: string;
   connection: "ONLINE" | "OFFLINE";
+  /** Absent: none recorded (the hello's row is live). */
+  lastHeartbeatAt?: Date | null;
   trust: "RELAY" | "FULL" | null;
   trustChangedAt: Date | null;
   trustLowerRequestedAt: Date | null;
@@ -114,7 +118,11 @@ export function placementNodeOf(
   return {
     id: row.id,
     slug: row.slug,
-    online: row.connection === "ONLINE",
+    // A row left ONLINE with a stale heartbeat has no session anywhere: nothing is placed there.
+    online: nodeIsLive(
+      { connection: row.connection, lastHeartbeatAt: row.lastHeartbeatAt ?? null },
+      now,
+    ),
     trust: effectiveTrust(row),
     held: row.holdAt !== null,
     labels: row.labels,

@@ -39,6 +39,7 @@ import {
   routingRulesFromRows,
 } from "@ws-model-proxy/api/lib/metric-routing";
 import prisma from "@ws-model-proxy/db";
+import { createSerialTask, type SerialTask } from "../serial-task.js";
 
 /** Minimum gap between two evaluations of one node. */
 export const ROUTING_EVALUATION_MIN_INTERVAL_MS = 1_000;
@@ -63,11 +64,13 @@ export type RoutingEvaluationState = {
   /** The node's owner (only their instances run on it). */
   userId: string;
   nodeId: string;
-  lastRunAtMs: number | null;
-  timer: ReturnType<typeof setTimeout> | null;
-  running: boolean;
-  rerun: boolean;
-  closed: boolean;
+  /**
+   * The session's evaluation loop (idle | scheduled | running | running_rerun | stopped), made by
+   * the evaluator on the first `schedule` or `cancel`.
+   */
+  task: SerialTask | null;
+  /** The live inputs of the latest `schedule` call; each pass reads them when it starts. */
+  inputs: (() => RoutingEvaluationInputs) | null;
   written: Map<string, { key: string; writtenAtMs: number; epoch: number }>;
   /** Pairs successfully published by this session, including idle successor fences. */
   probed: Set<string>;
@@ -86,6 +89,11 @@ export function combineWithEngineLoad(
   return { verdict: "full", ruleStates: rules.ruleStates, expiresAt };
 }
 
+/** The session ended (`cancel`): no pass starts and a pass in flight publishes nothing more. */
+export function evaluationClosed(state: RoutingEvaluationState): boolean {
+  return state.task?.phase === "stopped";
+}
+
 export function createRoutingEvaluationState(
   userId: string,
   nodeId: string,
@@ -94,11 +102,8 @@ export function createRoutingEvaluationState(
     publisherId: randomUUID(),
     userId,
     nodeId,
-    lastRunAtMs: null,
-    timer: null,
-    running: false,
-    rerun: false,
-    closed: false,
+    task: null,
+    inputs: null,
     written: new Map(),
     probed: new Set(),
   };
@@ -227,49 +232,29 @@ export class MetricRoutingEvaluator {
 
   /** Request an evaluation; coalesced to one run per node per second. */
   schedule(state: RoutingEvaluationState, inputs: () => RoutingEvaluationInputs): void {
-    if (state.closed) return;
-    if (state.running) {
-      state.rerun = true;
-      return;
-    }
-    if (state.timer) return;
-    const nowMs = this.clock().getTime();
-    const waitMs =
-      state.lastRunAtMs === null
-        ? 0
-        : Math.max(0, state.lastRunAtMs + ROUTING_EVALUATION_MIN_INTERVAL_MS - nowMs);
-    state.timer = setTimeout(() => {
-      state.timer = null;
-      void this.run(state, inputs);
-    }, waitMs);
-    state.timer.unref?.();
+    state.inputs = inputs;
+    void this.taskOf(state).trigger();
   }
 
   /** The session ended: drop any pending run. Written verdicts expire on their own. */
   cancel(state: RoutingEvaluationState): void {
-    state.closed = true;
-    if (state.timer) clearTimeout(state.timer);
-    state.timer = null;
+    void this.taskOf(state).stop();
   }
 
-  async run(state: RoutingEvaluationState, inputs: () => RoutingEvaluationInputs): Promise<void> {
-    if (state.closed) return;
-    state.running = true;
-    state.lastRunAtMs = this.clock().getTime();
-    try {
-      await this.evaluate(state, inputs());
-    } catch (error) {
-      console.error(
-        "[relay] metric routing evaluation failed",
-        error instanceof Error ? error.name : typeof error,
-      );
-    } finally {
-      state.running = false;
-      if (state.rerun && !state.closed) {
-        state.rerun = false;
-        this.schedule(state, inputs);
-      }
-    }
+  private taskOf(state: RoutingEvaluationState): SerialTask {
+    state.task ??= createSerialTask({
+      minIntervalMs: ROUTING_EVALUATION_MIN_INTERVAL_MS,
+      now: () => this.clock().getTime(),
+      run: async () => {
+        if (state.inputs) await this.evaluate(state, state.inputs());
+      },
+      onError: (error) =>
+        console.error(
+          "[relay] metric routing evaluation failed",
+          error instanceof Error ? error.name : typeof error,
+        ),
+    });
+    return state.task;
   }
 
   async evaluate(state: RoutingEvaluationState, inputs: RoutingEvaluationInputs): Promise<void> {
@@ -304,7 +289,7 @@ export class MetricRoutingEvaluator {
         },
       },
     });
-    if (state.closed) return;
+    if (evaluationClosed(state)) return;
     const nowMs = now.getTime();
     const nodeSeries = inputs.nodeMetrics
       ? nodeMetricSeries(inputs.nodeMetrics.sample, inputs.nodeMetrics.receivedAt, now)
@@ -373,7 +358,7 @@ export class MetricRoutingEvaluator {
           expiresAt: evaluation.expiresAt,
         };
         // The session ended while an earlier write was in flight: publish nothing more.
-        if (state.closed) return;
+        if (evaluationClosed(state)) return;
         if (await this.publish(member.id, target.id, data)) {
           state.probed.add(pair);
           // A rule-less pair's NONE fence never gates and needs no refresh.

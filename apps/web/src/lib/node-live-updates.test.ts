@@ -1,17 +1,63 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  NODE_LIVE_OFF,
+  type NodeLiveEventKind,
+  type NodeLiveState,
   nodeLiveInterval,
-  nodeLiveReconnectDelayMs,
+  nodeLiveTransition,
   parseNodeLiveEvent,
 } from "./node-live-updates";
 
-describe("nodeLiveReconnectDelayMs", () => {
-  it("doubles from 0.5 s to 15 s, plus up to 250 ms of jitter", () => {
-    expect([0, 1, 2, 5, 10].map((attempt) => nodeLiveReconnectDelayMs(attempt, () => 0))).toEqual([
-      500, 1_000, 2_000, 15_000, 15_000,
-    ]);
-    expect(nodeLiveReconnectDelayMs(0, () => 0.999)).toBe(749);
+const run = (events: NodeLiveEventKind[], from: NodeLiveState = NODE_LIVE_OFF) =>
+  events.reduce(nodeLiveTransition, from);
+
+const DOWN: NodeLiveState = { status: "down", notice: false };
+const NOTICED: NodeLiveState = { status: "down", notice: true };
+
+describe("nodeLiveTransition", () => {
+  it("connects, goes live, and goes down on a failure", () => {
+    expect(run(["connecting"])).toEqual({ status: "connecting", notice: false });
+    expect(run(["connecting", "opened"])).toEqual({ status: "live", notice: false });
+    expect(run(["connecting", "opened", "failed"])).toEqual(DOWN);
+    expect(run(["connecting", "failed"])).toEqual(DOWN);
+  });
+
+  it("stays down (keeping its notice) while reconnect attempts fail, and clears it once live", () => {
+    expect(run(["connecting", "failed", "connecting"])).toEqual(DOWN);
+    expect(run(["connecting", "failed", "noticeDue", "connecting", "failed"])).toEqual(NOTICED);
+    expect(run(["noticeDue", "connecting", "opened"], NOTICED)).toEqual({
+      status: "live",
+      notice: false,
+    });
+  });
+
+  it("sets the notice only while down", () => {
+    for (const state of [
+      NODE_LIVE_OFF,
+      run(["connecting"]),
+      run(["connecting", "opened"]),
+      run(["connecting", "unauthorized"]),
+    ])
+      expect(nodeLiveTransition(state, "noticeDue")).toBe(state);
+    expect(nodeLiveTransition(DOWN, "noticeDue")).toEqual(NOTICED);
+  });
+
+  it("keeps unauthorized until off, from any active state", () => {
+    for (const from of [run(["connecting"]), run(["connecting", "opened"]), DOWN, NOTICED]) {
+      const stopped = nodeLiveTransition(from, "unauthorized");
+      expect(stopped).toEqual({ status: "unauthorized", notice: false });
+      for (const event of ["connecting", "opened", "failed", "noticeDue"] as const)
+        expect(nodeLiveTransition(stopped, event)).toBe(stopped);
+      expect(nodeLiveTransition(stopped, "off")).toEqual(NODE_LIVE_OFF);
+    }
+  });
+
+  it("ignores late reports while off, and goes off from anywhere", () => {
+    for (const event of ["opened", "failed", "noticeDue", "unauthorized"] as const)
+      expect(nodeLiveTransition(NODE_LIVE_OFF, event)).toBe(NODE_LIVE_OFF);
+    for (const from of [run(["connecting"]), run(["connecting", "opened"]), NOTICED])
+      expect(nodeLiveTransition(from, "off")).toEqual(NODE_LIVE_OFF);
   });
 });
 

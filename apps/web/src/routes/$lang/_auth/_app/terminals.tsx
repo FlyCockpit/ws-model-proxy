@@ -53,6 +53,7 @@ import {
   TERMINAL_COPY_MODES,
   TERMINAL_SHIFT_ENTER_MODES,
 } from "@/lib/terminal-settings";
+import { tabApprovalCode, tabEnded, tabRejection } from "@/lib/terminal-tab-status";
 import { TERMINAL_CHROME_VARS } from "@/lib/terminal-theme";
 import { followSize, writerStatusKey } from "@/lib/terminal-writer";
 import { useNodeLive } from "@/stores/node-live";
@@ -86,6 +87,7 @@ const KNOWN_REJECTIONS: ReadonlySet<string> = new Set([
   "ticket_invalid",
   "bad_handshake",
   "step_detached",
+  "browser_identity_unavailable",
 ]);
 
 /**
@@ -108,7 +110,7 @@ function TerminalsPage() {
   const slugOf = (nodeId: string) => nodes.data?.nodes.find((node) => node.id === nodeId)?.slug;
   // A ticket is used up by its open: take one only once the socket and identity are ready, so
   // the open goes out at once (and a queued command is never decided for nothing).
-  const ready = sessions.status === "open" && sessions.identityReady;
+  const ready = sessions.status === "open" && sessions.identityStatus !== "loading";
   const hasTabs = sessions.tabs.length > 0;
   // Maximize applies only while there is a terminal to show.
   const maximized = useUiPreferences((prefs) => prefs.terminalMaximized) && hasTabs;
@@ -302,7 +304,7 @@ function TerminalWorkspace({
                   >
                     <span>{tabName(tab)}</span>
                     <span className="text-xs text-muted-foreground">
-                      {t(`terminals:phase.${tab.phase}`)}
+                      {t(`terminals:phase.${tab.status.phase}`)}
                     </span>
                   </Button>
                 ))}
@@ -474,9 +476,10 @@ function SettingsRadioItem({ value, title, help }: { value: string; title: strin
 
 function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) {
   const { t } = useTranslation(["terminals", "dashboard"]);
-  const ended = tab.phase === "exited" || tab.phase === "rejected";
+  const ended = tabEnded(tab.status);
   const trust: CliTrust | undefined = sessions.cliTrust[tab.cliDeviceId];
-  const changed = tab.rejectionReason === "identity_changed" && trust?.status === "changed";
+  const changed = tabRejection(tab.status) === "identity_changed" && trust?.status === "changed";
+  const approvalCode = tabApprovalCode(tab.status);
   const trustNewKey = async () => {
     if (trust?.status !== "changed") return;
     if (!(await sessions.trustNewKey(tab.cliDeviceId, trust))) {
@@ -491,10 +494,10 @@ function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) 
         </p>
         <TabActions sessions={sessions} tab={tab} ended={ended} />
       </div>
-      {tab.approvalCode && tab.phase === "opening" ? (
+      {approvalCode ? (
         <p className="min-w-0 break-words">
           {t("terminals:approvalNeeded", {
-            command: `${APPROVAL_COMMAND_PREFIX} ${tab.approvalCode}`,
+            command: `${APPROVAL_COMMAND_PREFIX} ${approvalCode}`,
           })}
         </p>
       ) : null}
@@ -511,21 +514,23 @@ function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) 
 /** The tab's one-line status: how it ended, why it was refused, or who is typing. */
 function TabStatusMessage({ tab }: { tab: TerminalTab }) {
   const { t } = useTranslation(["terminals", "dashboard"]);
-  const writerKey = tab.phase === "live" ? writerStatusKey(tab.writer) : null;
-  if (tab.phase === "exited") {
-    return tab.exitCode !== null
-      ? t("terminals:exitedWithCode", { code: tab.exitCode })
+  const status = tab.status;
+  if (status.phase === "exited") {
+    if (status.cause === "gone") return t("terminals:exitedGone");
+    return status.exitCode !== null
+      ? t("terminals:exitedWithCode", { code: status.exitCode })
       : t("terminals:exitedPlain");
   }
-  if (tab.phase === "rejected") {
-    const reason = tab.rejectionReason ?? tab.error;
-    if (!reason) return null;
+  if (status.phase === "rejected") {
+    const reason = status.reason;
     return KNOWN_REJECTIONS.has(reason)
       ? t(`terminals:rejection.${reason}`)
       : t("terminals:rejection.other", { reason });
   }
   if (tab.ending === "failed") return t("terminals:endFailed");
+  const writerKey = status.phase === "live" ? writerStatusKey(tab.writer) : null;
   return [
+    status.phase === "live" && status.inputDropped ? t("terminals:inputDropped") : null,
     writerKey ? t(writerKey) : null,
     tab.viewerCount > 1
       ? t("dashboard:terminals.status.viewers", { count: tab.viewerCount })
@@ -797,9 +802,7 @@ function WaitingStep({
     ? (instance?.ranks.find((rank) => rank.nodeNumber === step.nodeNumber)?.nodeId ?? null)
     : null;
   // This page already views the step's terminal: Open terminal shows that tab.
-  const openTab = sessions.tabs.find(
-    (tab) => tab.stepId === item.stepId && tab.phase !== "exited" && tab.phase !== "rejected",
-  );
+  const openTab = sessions.tabs.find((tab) => tab.stepId === item.stepId && !tabEnded(tab.status));
   const invalidate = async () => {
     await Promise.all([
       // The list and the nav badge.

@@ -156,16 +156,22 @@ impl SttRegistry {
     /// A deployment stop for `endpoint_slug` is about to run: its sessions
     /// end now (`not_found`, "model_unavailable") and no new one opens there
     /// until a start job for it arrives, the endpoint leaves the snapshot, or
-    /// the stop (`step_id`) is refused or fails ([`Self::stop_failed`]).
+    /// the stop (`step_id`) is refused or fails ([`Self::stop_failed`]). A
+    /// re-delivery of the stop already marking the endpoint keeps the mark as
+    /// it is (a start already waiting on it still waits).
     pub fn endpoint_stopping(&mut self, endpoint_slug: &str, step_id: &str) -> Vec<NodeFrame> {
-        self.stopping.insert(
-            endpoint_slug.to_string(),
-            StopMark {
-                step_id: step_id.to_string(),
-                start_waiting: false,
-                stop_done: false,
-            },
-        );
+        if self
+            .stopping
+            .get(endpoint_slug)
+            .is_none_or(|mark| mark.step_id() != step_id)
+        {
+            self.stopping.insert(
+                endpoint_slug.to_string(),
+                StopMark::Running {
+                    step_id: step_id.to_string(),
+                },
+            );
+        }
         let ids: Vec<String> = self
             .sessions
             .iter()
@@ -185,31 +191,45 @@ impl SttRegistry {
         let Some(mark) = self.stopping.get_mut(endpoint_slug) else {
             return;
         };
-        if mark.stop_done {
-            self.stopping.remove(endpoint_slug);
-        } else {
-            mark.start_waiting = true;
+        match mark {
+            StopMark::Finished { .. } => {
+                self.stopping.remove(endpoint_slug);
+            }
+            StopMark::Running { step_id } => {
+                *mark = StopMark::StartWaiting {
+                    step_id: std::mem::take(step_id),
+                };
+            }
+            StopMark::StartWaiting { .. } => {}
         }
     }
 
     /// The stop step `step_id` finished. If a start is already waiting, the
-    /// endpoint may take sessions again once that start makes it ready;
-    /// otherwise the mark stays until a start arrives or the endpoint leaves
-    /// the snapshot.
+    /// mark goes now: the endpoint takes sessions again as soon as the
+    /// snapshot lists it (once that start has made it ready). Otherwise the
+    /// mark stays until a start arrives or the endpoint leaves the snapshot.
     pub fn stop_finished(&mut self, step_id: &str) {
         self.stopping.retain(|_, mark| {
-            if mark.step_id != step_id {
+            if mark.step_id() != step_id {
                 return true;
             }
-            mark.stop_done = true;
-            !mark.start_waiting
+            match mark {
+                StopMark::Running { step_id } => {
+                    *mark = StopMark::Finished {
+                        step_id: std::mem::take(step_id),
+                    };
+                    true
+                }
+                StopMark::StartWaiting { .. } => false,
+                StopMark::Finished { .. } => true,
+            }
         });
     }
 
     /// The deployment step `step_id` was refused or failed. If it was a
     /// stop, its endpoint is still serving, so it takes sessions again.
     pub fn stop_failed(&mut self, step_id: &str) {
-        self.stopping.retain(|_, mark| mark.step_id != step_id);
+        self.stopping.retain(|_, mark| mark.step_id() != step_id);
     }
 
     pub fn len(&self) -> usize {
@@ -739,13 +759,29 @@ fn emit_event(tx: &SyncSender<FromWorker>, session_id: &str, event: SttEvent) ->
     )
 }
 
-/// A stop job's mark on its endpoint.
-struct StopMark {
-    step_id: String,
-    /// A start job for the endpoint arrived while the stop still ran.
-    start_waiting: bool,
+/// A stop job's mark on its endpoint: while it is there, the endpoint takes
+/// no new session. A start that arrives after the stop finished, or a stop
+/// that finishes after a start arrived, lifts it (as do a failed stop and
+/// the endpoint leaving the snapshot).
+#[derive(Debug, PartialEq, Eq)]
+enum StopMark {
+    /// The stop step runs; no start has arrived.
+    Running { step_id: String },
+    /// The stop step runs and a start for the endpoint arrived: the mark
+    /// goes when the stop finishes.
+    StartWaiting { step_id: String },
     /// The stop step finished (succeeded); a later start lifts the mark.
-    stop_done: bool,
+    Finished { step_id: String },
+}
+
+impl StopMark {
+    fn step_id(&self) -> &str {
+        match self {
+            Self::Running { step_id }
+            | Self::StartWaiting { step_id }
+            | Self::Finished { step_id } => step_id,
+        }
+    }
 }
 
 /// One running session thread, counted until the thread itself ends.
@@ -1032,4 +1068,4 @@ impl Turn {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

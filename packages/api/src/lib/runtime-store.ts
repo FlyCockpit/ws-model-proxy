@@ -9,6 +9,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { z } from "zod";
 import type { runtimeAdvancedPatchSchema, runtimeLimitsPatchSchema } from "../contracts/advanced";
 import { type CallerActor } from "./caller-actor";
+import { instancePhaseData } from "./instance-phase";
 import { resolveRun } from "./instance-run";
 import { refuseAbout } from "./refuse";
 import { applyJsonPatch } from "./registry-view";
@@ -251,17 +252,13 @@ export async function markInstancesStopping(
   // unprepared restart is read from its operation (`resolveRun`), which this write replaces.
   // (The ids are the owner's: every caller reads them under the owner's fence.)
   for (const instanceId of instanceIds) await resolveRun(tx, instanceId);
+  const change = { to: "STOPPING", reason, desiredState: "STOPPED" } as const;
   const result = await tx.runtimeInstance.updateMany({
+    // A stop request supersedes any phase of a managed instance (`instanceTransitionFrom`):
+    // desired RUNNING is the whole guard (an always-on instance, desired null, never stops).
     where: { id: { in: [...instanceIds] }, userId, desiredState: "RUNNING" },
-    data: {
-      desiredState: "STOPPED",
-      phase: "STOPPING",
-      phaseChangedAt: new Date(),
-      phaseReason: reason,
-      needsOperator: null,
-      needsOperatorSince: null,
-      operationId,
-    },
+    // Every phase-scoped column follows STOPPING (a backed-off restart's `nextRestartAt` too).
+    data: { ...instancePhaseData(change, new Date()), operationId },
   });
   return result.count;
 }
@@ -324,23 +321,25 @@ export async function writePlannedStarts(
       // The run being replaced, read before this restart is written (a row from before runs
       // existed is bootstrapped from its steps now, not from the restart below).
       await resolveRun(tx, start.instanceId);
+      // A new run: every phase-scoped column starts over (the need, the restart budget and
+      // backoff, unavailability and health), on the plan's fabric. Desired RUNNING.
       await tx.runtimeInstance.update({
         where: { id: start.instanceId },
         data: {
+          ...instancePhaseData(
+            {
+              to: "STARTING",
+              run: "new",
+              reason: input.phaseReason ?? "restart_requested",
+              fabricId: start.fabric?.fabricId ?? null,
+              restartBudget: "reset",
+            },
+            now,
+          ),
           versionId: start.versionId,
           launchVersionId: start.versionId,
           operationId: input.operationId,
           startedBy: input.startedBy,
-          desiredState: "RUNNING",
-          phase: "STARTING",
-          phaseChangedAt: now,
-          phaseReason: input.phaseReason ?? "restart_requested",
-          needsOperator: null,
-          needsOperatorSince: null,
-          restartsInWindow: 0,
-          restartWindowStartedAt: null,
-          nextRestartAt: null,
-          fabricId: start.fabric?.fabricId ?? null,
         },
       });
       // Each rank takes the new version's resources (and the GPUs the plan picked), with the

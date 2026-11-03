@@ -1,0 +1,463 @@
+=== Server-armed-plain
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 0,
+  "attempts": 0,
+  "phase": "armed",
+  "reported": false,
+  "updatedAt": ""
+}
+=== Server-armed-full
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "armed",
+  "reported": false,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Server-swapped-plain
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 0,
+  "attempts": 0,
+  "phase": "swapped",
+  "reported": false,
+  "updatedAt": ""
+}
+=== Server-swapped-full
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "swapped",
+  "reported": false,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Server-rolling-back
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "swapped",
+  "reported": false,
+  "rollingBack": true,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Server-confirmed-false
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "confirmed",
+  "reported": false,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Server-failed-false
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "failed",
+  "reason": "internal",
+  "detail": "why \"quoted\"",
+  "reported": false,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Server-rolledback-false-false
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "rolled_back",
+  "detail": "log tail",
+  "reported": false,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Server-rolledback-false-true
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "rolled_back",
+  "detail": "log tail",
+  "reported": false,
+  "restartPending": true,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Server-confirmed-true
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "confirmed",
+  "reported": true,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Server-failed-true
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "failed",
+  "reason": "internal",
+  "detail": "why \"quoted\"",
+  "reported": true,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Server-rolledback-true-false
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "rolled_back",
+  "detail": "log tail",
+  "reported": true,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Server-rolledback-true-true
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "rolled_back",
+  "detail": "log tail",
+  "reported": true,
+  "restartPending": true,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Cli-armed-plain
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "cli",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 0,
+  "attempts": 0,
+  "phase": "armed",
+  "reported": false,
+  "updatedAt": ""
+}
+=== Cli-armed-full
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "cli",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "armed",
+  "reported": false,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Cli-swapped-plain
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "cli",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 0,
+  "attempts": 0,
+  "phase": "swapped",
+  "reported": false,
+  "updatedAt": ""
+}
+=== Cli-swapped-full
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "cli",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "swapped",
+  "reported": false,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Cli-rolling-back
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "cli",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "swapped",
+  "reported": false,
+  "rollingBack": true,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Cli-confirmed-false
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "cli",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "confirmed",
+  "reported": false,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Cli-failed-false
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "cli",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "failed",
+  "reason": "internal",
+  "detail": "why \"quoted\"",
+  "reported": false,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Cli-rolledback-false-false
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "cli",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "rolled_back",
+  "detail": "log tail",
+  "reported": false,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== Cli-rolledback-false-true
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "cli",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "recoveryPath": "/d/.wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "deadmanAt": 1800000090,
+  "attempts": 2,
+  "phase": "rolled_back",
+  "detail": "log tail",
+  "reported": false,
+  "restartPending": true,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}
+=== homebrew-swapped
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "server",
+  "strategy": "homebrew",
+  "fromVersion": "0.4.2",
+  "toVersion": "0.4.3",
+  "toSha256": "abababababababababababababababababababababababababababababababab",
+  "livePath": "/d/wsmp",
+  "prevPath": "/d/wsmp.prev",
+  "failedPath": "/d/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1800000090,
+  "attempts": 2,
+  "phase": "swapped",
+  "reported": false,
+  "updatedAt": "2026-11-03T00:00:00Z"
+}

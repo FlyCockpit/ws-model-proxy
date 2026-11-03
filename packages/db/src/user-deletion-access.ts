@@ -11,6 +11,8 @@
  * own session hook, which clears an expired ban) can all rewrite them.
  */
 
+import type { Prisma } from "../prisma/generated/client";
+
 /** The ban-relevant subset of a Better Auth / Prisma user row. */
 export interface BannableUser {
   banned?: boolean | null;
@@ -64,4 +66,47 @@ export type PoolOwnerAccessRow = {
  */
 export function poolOwnerActive(owner: PoolOwnerAccessRow, now: Date): boolean {
   return !userCredentialAccessBlocked(owner, now);
+}
+
+// ── The same rules as Prisma filters ──
+//
+// Queries that pick users (or rows through a user relation) in the database must apply exactly
+// the predicates above, boundary included: a ban whose expiry is EXACTLY `now` is still active.
+// Every such filter is built here so the in-memory and SQL forms cannot drift apart.
+
+/** Users whose ban is active at `now` (the SQL form of {@link isUserBanned}). */
+export function userBanActiveWhere(now: Date) {
+  return {
+    banned: true,
+    OR: [{ banExpires: null }, { banExpires: { gte: now } }],
+  } satisfies Prisma.UserWhereInput;
+}
+
+/** Users whose ban is NOT active at `now`: never banned, unbanned, or an expired ban. */
+export function userBanInactiveWhere(now: Date) {
+  return {
+    OR: [{ banned: null }, { banned: false }, { banExpires: { lt: now } }],
+  } satisfies Prisma.UserWhereInput;
+}
+
+/**
+ * Users whose access is blocked at `now` (the SQL form of {@link userCredentialAccessBlocked}):
+ * a deletion is pending, or a ban is active.
+ */
+export function userAccessBlockedWhere(now: Date) {
+  return {
+    OR: [{ deletionRequestedAt: { not: null } }, userBanActiveWhere(now)],
+  } satisfies Prisma.UserWhereInput;
+}
+
+/**
+ * Users whose access is active at `now` (the SQL form of `!userCredentialAccessBlocked`): no
+ * deletion pending and no active ban. Spread it into a where (it sets `deletionRequestedAt` and
+ * `OR`), or nest it under `AND` when the where has its own `OR`.
+ */
+export function userAccessActiveWhere(now: Date) {
+  return {
+    deletionRequestedAt: null,
+    ...userBanInactiveWhere(now),
+  } satisfies Prisma.UserWhereInput;
 }

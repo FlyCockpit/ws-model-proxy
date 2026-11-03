@@ -139,6 +139,7 @@ import {
   kvEvictionResetMs,
   observeKvEviction,
 } from "./kv-eviction-feedback.js";
+import { leaseOwnership } from "./lease-ownership.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
   MODEL_API_RELAY_TIMEOUT_MS,
@@ -4523,11 +4524,9 @@ async function relayPool({
           }
         })()
       : null;
-    let localCapacityReleased = false;
+    const localCapacity = leaseOwnership(releaseLocalCapacity);
     const releaseProviderCapacity = async () => {
-      if (localCapacityReleased) return;
-      localCapacityReleased = true;
-      await releaseLocalCapacity();
+      await localCapacity.release();
     };
     const providerRequest = {
       // Provider configuration and budgets belong to the pool owner. The
@@ -4732,11 +4731,9 @@ async function relayPool({
         return operationFailureResponse(operation, failure);
       }
     }
-    let callerLeaseReleased = false;
+    const callerLeaseOwnership = leaseOwnership(() => callerLease.release());
     const releaseCallerLease = () => {
-      if (callerLeaseReleased) return;
-      callerLeaseReleased = true;
-      callerLease.release();
+      callerLeaseOwnership.release();
     };
     // Terminal transition for a dispatched external attempt. Registered only
     // once the response has actually committed to the client (or when a
@@ -4836,9 +4833,13 @@ async function relayPool({
         result = ownResult;
       ownKeyOutcome = result === ownResult;
       if (!result.dispatched) {
-        // Hand the caller lease back to the local path that owned it.
-        if (outerCallerLease && !localCapacityReleased) {
-          callerLeaseReleased = true;
+        // Hand the caller lease back to the local path that owned it (while that path still
+        // holds its local capacity); every later releaseCallerLease() is then a no-op here.
+        if (
+          outerCallerLease &&
+          localCapacity.state === "owned" &&
+          callerLeaseOwnership.transfer()
+        ) {
           globalLease = outerCallerLease;
         } else releaseCallerLease();
         externalFailure = ownKeyOutcome ? result.providerFailure : undefined;
@@ -8821,11 +8822,9 @@ async function relayBoundProviderResponse(input: {
     }).catch(metadataUpdateError);
     return openAiFailureJsonResponse(failure);
   }
-  let callerLeaseReleased = false;
+  const callerLeaseOwnership = leaseOwnership(() => callerLease.release());
   const releaseCallerLease = () => {
-    if (callerLeaseReleased) return;
-    callerLeaseReleased = true;
-    callerLease.release();
+    callerLeaseOwnership.release();
   };
   const maxOutput = input.contextInput?.max_output_tokens;
   // An omitted limit is unknown, not zero: liability then comes from the

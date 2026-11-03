@@ -26,6 +26,8 @@ fn runtime(euid: u32, allow_root: bool) -> Arc<FileRuntime> {
 struct Harness {
     relay: FileRelay,
     rx: Receiver<(String, Vec<FileFrame>)>,
+    /// The trust the relay reads (the daemon's `TrustAuthority`).
+    trust: Arc<crate::startup::TrustAuthority>,
 }
 
 fn harness_with(runtime: Arc<FileRuntime>, full_control: bool) -> Harness {
@@ -34,9 +36,11 @@ fn harness_with(runtime: Arc<FileRuntime>, full_control: bool) -> Harness {
     let sink: FileSink = Arc::new(move |op_id, frames| {
         let _ = tx.lock().expect("sink").send((op_id, frames));
     });
+    let trust = crate::startup::TrustAuthority::new(full_control);
     Harness {
-        relay: FileRelay::new(runtime, full_control, sink),
+        relay: FileRelay::new(runtime, Arc::clone(&trust), sink),
         rx,
+        trust,
     }
 }
 
@@ -540,6 +544,56 @@ fn a_write_waits_for_its_body_then_runs_with_base64_content() {
             .handle_body(&op_id(6), b"again".to_vec())
             .is_empty()
     );
+}
+
+/// Trust is read from the daemon's authority on every op, never cached: a
+/// raise then a lowering applied in either order leaves the relay at
+/// whatever trust is now, and the lowering cancels a write waiting for its
+/// body even when trust was raised again before the relay looked.
+#[test]
+fn file_ops_follow_the_final_trust_whatever_order_changes_land_in() {
+    let dir = tempfile::tempdir().expect("dir");
+    let file = dir.path().join("w.txt");
+    let mut harness = harness_with(runtime(1000, false), false);
+    // Raised, then lowered in the same loop turn: Relay only.
+    assert!(harness.trust.raise());
+    assert!(harness.trust.lower());
+    harness.relay.on_trust_changed();
+    let frames = harness.relay.handle_op(
+        &op_id(1),
+        "stat",
+        json!({ "path": path_str(dir.path()) }),
+        None,
+    );
+    assert_eq!(only_control(&frames)["reason"], "trust_relay");
+
+    // Raised: admitted, and a write waits for its body.
+    assert!(harness.trust.raise());
+    assert!(
+        harness
+            .relay
+            .handle_op(
+                &op_id(2),
+                "write",
+                json!({ "path": path_str(&file) }),
+                Some(1)
+            )
+            .is_empty()
+    );
+    assert_eq!(harness.relay.pending_len(), 1);
+    // Lowered and raised again before the relay was told: the write
+    // admitted under the old grant is cancelled, its body dropped.
+    assert!(harness.trust.lower());
+    assert!(harness.trust.raise());
+    assert!(
+        harness
+            .relay
+            .handle_body(&op_id(2), b"x".to_vec())
+            .is_empty()
+    );
+    assert_eq!(harness.relay.pending_len(), 0);
+    assert!(harness.rx.try_recv().is_err());
+    assert!(!file.exists());
 }
 
 #[test]

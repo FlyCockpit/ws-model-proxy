@@ -222,7 +222,7 @@ describe("relay upgrade during shutdown", () => {
 
   afterEach(() => {
     // Test hygiene only: production never clears the flag.
-    Reflect.set(relaySessionManager, "relayDrain", false);
+    Reflect.set(relaySessionManager, "lifecycle", "running");
   });
 
   const sessionCount = () =>
