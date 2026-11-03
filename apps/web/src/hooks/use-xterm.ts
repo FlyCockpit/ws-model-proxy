@@ -415,6 +415,7 @@ export function useXterm(options: XtermOptions): {
         for (const file of files) {
           const upload = handlersRef.current.onImage;
           if (!upload) throw new Error("unavailable");
+          // react-doctor-disable-next-line react-doctor/async-await-in-loop -- images paste one after another, in the order given: each path is typed only after the previous one was sent, and the first failure stops the rest
           const attachment = await upload(file);
           const paste: ImagePaste = { attachment, sent: null };
           let forwarded = false;

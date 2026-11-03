@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useParams, useRouter } from "@tanstack/react-router";
+import { useRouter } from "@tanstack/react-router";
 import {
   Select,
   SelectContent,
@@ -26,9 +26,6 @@ export default function LanguageSwitcherSelect() {
   const { i18n, t } = useTranslation();
   const { trigger } = useHaptics();
   const router = useRouter();
-  // `strict: false` so the switcher renders under any matched route — the
-  // top-level `/` redirect briefly mounts without `lang` in scope.
-  const params = useParams({ strict: false });
   const { state, meta } = useAuthSession();
 
   // Silent server-side sync of the signed-in user's preference. The router's
@@ -53,7 +50,11 @@ export default function LanguageSwitcherSelect() {
     // Swap the `lang` param in-place; preserve the current pathname suffix,
     // search, and hash. `to: "."` resolves to the active route, so the
     // updated `params` rebuild the URL with the new locale prefix.
-    const currentLang = isSupportedLocale(params.lang) ? params.lang : null;
+    // Read at click time (every match carries the full path params), so the switcher does not
+    // re-render on each navigation. The top-level `/` redirect briefly has no `lang` in scope.
+    const params = router.state.matches.at(-1)?.params;
+    const lang = params && "lang" in params ? params.lang : undefined;
+    const currentLang = isSupportedLocale(lang) ? lang : null;
     if (currentLang) {
       void router.navigate({
         to: ".",

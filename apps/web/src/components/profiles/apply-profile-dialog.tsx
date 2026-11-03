@@ -131,6 +131,16 @@ export function ApplyProfileDialog({
   );
 }
 
+/**
+ * A React key for one start of a preview (the list is the server's, shown as is and never
+ * reordered): its version and instance plus where it lands. Every start takes its own ports, so no two
+ * starts of one preview share both.
+ */
+function startKey(start: StartPreview["starts"][number]): string {
+  const placements = start.placements.map((placement) => `${placement.nodeId}:${placement.port}`);
+  return `${start.versionId}/${start.instanceId ?? "new"}@${placements.join(",")}`;
+}
+
 function PreviewSummary({
   preview,
   profile,
@@ -183,8 +193,8 @@ function PreviewSummary({
           <p className="text-muted-foreground">{t("dashboard:profiles.apply.nothingToStart")}</p>
         ) : (
           <ul className="space-y-0.5">
-            {preview.starts.map((start, index) => (
-              <li key={`${start.versionId}-${index}`}>
+            {preview.starts.map((start) => (
+              <li key={startKey(start)}>
                 <span className="font-medium">{runtimeSlug(start.runtimeId)}</span>{" "}
                 {versionNumber(start.versionId) !== null ? (
                   <span className="text-muted-foreground">

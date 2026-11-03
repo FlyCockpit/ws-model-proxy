@@ -19,6 +19,7 @@ import { useTranslation } from "react-i18next";
 
 import { FieldErrors } from "@/components/field-errors";
 import { NativeSelect } from "@/components/native-select";
+import { useRowKeys } from "@/components/runtimes/use-row-keys";
 import { SegmentedControl } from "@/components/segmented-control";
 import { type FieldGroupOf, withFieldGroup } from "@/hooks/use-app-form";
 import {
@@ -354,6 +355,7 @@ function ModelsSection({
   id: (name: string) => string;
 }) {
   const { t } = useTranslation(["dashboard"]);
+  const rowKeys = useRowKeys("model-");
   return (
     <Section title={t("dashboard:runtime.specForm.serving")}>
       <div className="grid min-w-0 gap-3 sm:grid-cols-3">
@@ -430,7 +432,10 @@ function ModelsSection({
               </p>
             ) : null}
             {models.state.value.map((_, index) => (
-              <div key={index} className="flex min-w-0 flex-col gap-2 rounded-lg border p-3">
+              <div
+                key={rowKeys.key(index)}
+                className="flex min-w-0 flex-col gap-2 rounded-lg border p-3"
+              >
                 <div className="flex min-w-0 items-end gap-2">
                   <div className="min-w-0 flex-1">
                     <group.Field name={`draft.models[${index}].id`}>
@@ -449,7 +454,10 @@ function ModelsSection({
                     variant="ghost"
                     size="icon-touch"
                     aria-label={t("dashboard:runtime.specForm.removeModel")}
-                    onClick={() => models.removeValue(index)}
+                    onClick={() => {
+                      rowKeys.remove(models.state.value.length, index);
+                      models.removeValue(index);
+                    }}
                   >
                     <Trash2 aria-hidden="true" />
                   </Button>
@@ -757,6 +765,8 @@ function groupSizeOf(value: string): number {
 
 function ResourcesSection({ group, id }: { group: Group; id: (name: string) => string }) {
   const { t } = useTranslation(["dashboard"]);
+  // Rows are ranks (row i is rank i), never removed one by one: the keys stay positional.
+  const rowKeys = useRowKeys("resource-");
   return (
     <Section
       title={t("dashboard:runtime.specForm.resources")}
@@ -766,7 +776,10 @@ function ResourcesSection({ group, id }: { group: Group; id: (name: string) => s
         {(resources) => (
           <>
             {resources.state.value.map((resource, index) => (
-              <div key={index} className="flex min-w-0 flex-col gap-3 rounded-lg border p-3">
+              <div
+                key={rowKeys.key(index)}
+                className="flex min-w-0 flex-col gap-3 rounded-lg border p-3"
+              >
                 <RankTitle index={index} total={resources.state.value.length} />
                 <div className="grid min-w-0 gap-3 sm:grid-cols-2">
                   <group.Field name={`draft.resources[${index}].kind`}>
@@ -880,6 +893,7 @@ function ResourcesSection({ group, id }: { group: Group; id: (name: string) => s
  */
 function ReservationsSection({ group, id }: { group: Group; id: (name: string) => string }) {
   const { t } = useTranslation(["dashboard"]);
+  const rowKeys = useRowKeys("reservation-");
   return (
     <Section
       title={t("dashboard:runtime.specForm.reservations")}
@@ -889,7 +903,10 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
         {(reservations) => (
           <>
             {reservations.state.value.map((reservation, index) => (
-              <div key={index} className="flex min-w-0 flex-col gap-3 rounded-lg border p-3">
+              <div
+                key={rowKeys.key(index)}
+                className="flex min-w-0 flex-col gap-3 rounded-lg border p-3"
+              >
                 <div className="flex min-w-0 items-center justify-between gap-2">
                   <p className="text-sm font-medium">
                     {t("dashboard:runtime.specForm.reservation", { number: index + 1 })}
@@ -901,7 +918,10 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
                     aria-label={t("dashboard:runtime.specForm.removeReservation", {
                       number: index + 1,
                     })}
-                    onClick={() => reservations.removeValue(index)}
+                    onClick={() => {
+                      rowKeys.remove(reservations.state.value.length, index);
+                      reservations.removeValue(index);
+                    }}
                   >
                     <Trash2 aria-hidden="true" className="size-4" />
                   </Button>
@@ -1024,6 +1044,8 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
 
 function CommandsSection({ group, id }: { group: Group; id: (name: string) => string }) {
   const { t } = useTranslation(["dashboard"]);
+  // Rows are ranks (row i is rank i), never removed one by one: the keys stay positional.
+  const rowKeys = useRowKeys("command-");
   return (
     <Section
       title={t("dashboard:runtime.specForm.commands")}
@@ -1033,7 +1055,10 @@ function CommandsSection({ group, id }: { group: Group; id: (name: string) => st
         {(commands) => (
           <>
             {commands.state.value.map((_, index) => (
-              <div key={index} className="flex min-w-0 flex-col gap-3 rounded-lg border p-3">
+              <div
+                key={rowKeys.key(index)}
+                className="flex min-w-0 flex-col gap-3 rounded-lg border p-3"
+              >
                 <RankTitle index={index} total={commands.state.value.length} />
                 {COMMAND_FIELDS.map((name) => (
                   <group.Field key={name} name={`draft.commands[${index}].${name}`}>

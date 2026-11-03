@@ -18,6 +18,7 @@ import { SecretReveal } from "@/components/access/secret-reveal";
 import { FieldErrors } from "@/components/field-errors";
 import { SegmentedControl } from "@/components/segmented-control";
 import { TimeAgo } from "@/components/time-ago";
+import { useClientDateText } from "@/hooks/use-client-date-text";
 import { refusalText } from "@/lib/refusal-text";
 import { isConflict, isNotFound } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
@@ -658,28 +659,35 @@ export function InviteLinkDialog({
   value: InviteLink | null;
   onClose: () => void;
 }) {
-  const { t, i18n } = useTranslation(["access"]);
+  const { t } = useTranslation(["access"]);
   return (
     <ResponsiveDialog
       open={value !== null}
       onOpenChange={(next) => (next ? undefined : onClose())}
       title={t("access:shares.inviteLinkTitle")}
     >
-      {value ? (
-        <SecretReveal
-          value={value.link}
-          title={t("access:shares.inviteLinkTitle")}
-          description={t("access:shares.inviteLinkDescription", {
-            email: value.email,
-            date: new Date(value.expiresAt).toLocaleDateString(i18n.language, {
-              dateStyle: "medium",
-            }),
-          })}
-          copyLabel={t("access:shares.copyInviteLink")}
-          onDone={onClose}
-        />
-      ) : null}
+      {value ? <InviteLinkReveal value={value} onClose={onClose} /> : null}
     </ResponsiveDialog>
+  );
+}
+
+function InviteLinkReveal({ value, onClose }: { value: InviteLink; onClose: () => void }) {
+  const { t, i18n } = useTranslation(["access"]);
+  const expires = useClientDateText(value.expiresAt, {
+    locale: i18n.language,
+    format: { dateStyle: "medium" },
+  });
+  return (
+    <SecretReveal
+      value={value.link}
+      title={t("access:shares.inviteLinkTitle")}
+      description={t("access:shares.inviteLinkDescription", {
+        email: value.email,
+        date: expires.text,
+      })}
+      copyLabel={t("access:shares.copyInviteLink")}
+      onDone={onClose}
+    />
   );
 }
 

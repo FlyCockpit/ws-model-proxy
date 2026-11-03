@@ -31,6 +31,19 @@ export function stopUnprovenReason(rank: Rank): string {
   return rank.lastStopCheck.errorCode ?? "not_stopped";
 }
 
+/**
+ * The agent's evidence entries with keys from their content: the command, numbered when the
+ * same command appears again (entries have no identity of their own).
+ */
+function keyedEvidence(evidence: ReleaseRequest["evidence"]) {
+  const seen = new Map<string, number>();
+  return evidence.map((entry) => {
+    const count = seen.get(entry.command) ?? 0;
+    seen.set(entry.command, count + 1);
+    return { key: `${count}:${entry.command}`, entry };
+  });
+}
+
 function useInvalidateAfterRelease() {
   const queryClient = useQueryClient();
   // Freed capacity changes runtimes (and the instance), nodes, pools and models; Needs you
@@ -268,9 +281,8 @@ function FindingsBody({ request }: { request: ReleaseRequest }) {
       <pre className="max-h-48 min-w-0 overflow-x-auto overflow-y-auto overscroll-contain whitespace-pre-wrap break-words rounded bg-muted p-2 text-xs">
         {request.findings}
       </pre>
-      {request.evidence.map((entry, index) => (
-        // The agent's list never changes while shown; entries have no identity of their own.
-        <div key={index} className="flex min-w-0 flex-col gap-1">
+      {keyedEvidence(request.evidence).map(({ key, entry }) => (
+        <div key={key} className="flex min-w-0 flex-col gap-1">
           <p className="text-xs text-muted-foreground">
             {t("dashboard:runtime.releaseUnproven.request.command")}
           </p>

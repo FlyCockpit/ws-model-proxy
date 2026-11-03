@@ -37,6 +37,7 @@ export function useMcpPageContinue(
 ) {
   useEffect(() => {
     if (!shouldContinue) return;
+    // react-doctor-disable-next-line react-doctor/no-pass-data-to-parent -- `assign` is the document navigation (a test double in tests), not a parent's state setter: leaving the page is the effect
     assign(mcpPageHref(lang, "mcp-consent", window.location.search));
   }, [shouldContinue, lang, assign]);
 }

@@ -6,6 +6,7 @@ import {
   TERMINAL_BROWSER_JSON_LIMIT,
   TERMINAL_BROWSER_JSON_WINDOW_MS,
 } from "@ws-model-proxy/config/terminal-socket-policy";
+import { createRef, type Ref, useImperativeHandle } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { TerminalClientMessage } from "@/lib/terminal-protocol";
@@ -82,29 +83,21 @@ function BurstProbe({ count }: { count: number }) {
   );
 }
 
-/** Exposes `send` so a test can drive it and read what it reports. */
-function SendProbe({
-  onReady,
-}: {
-  onReady: (send: (message: TerminalClientMessage) => TerminalSendResult) => void;
-}) {
+type SendHandle = { send: (message: TerminalClientMessage) => TerminalSendResult };
+
+/** Exposes `send` through its ref so a test can drive it and read what it reports. */
+function SendProbe({ ref }: { ref: Ref<SendHandle> }) {
   const socket = useTerminalSocket(true, {
     onMessage: () => undefined,
     onSealed: () => undefined,
   });
-  onReady(socket.send);
+  useImperativeHandle(ref, () => ({ send: socket.send }), [socket.send]);
   return null;
 }
 
 function renderSend() {
-  let send: ((message: TerminalClientMessage) => TerminalSendResult) | null = null;
-  render(
-    <SendProbe
-      onReady={(value) => {
-        send = value;
-      }}
-    />,
-  );
+  const probe = createRef<SendHandle>();
+  render(<SendProbe ref={probe} />);
   const socket = MockWebSocket.instances[0];
   if (!socket) throw new Error("no socket");
   socket.open();
@@ -114,8 +107,8 @@ function renderSend() {
     socket,
     texts,
     send: (message: TerminalClientMessage) => {
-      if (!send) throw new Error("not rendered");
-      return send(message);
+      if (!probe.current) throw new Error("not rendered");
+      return probe.current.send(message);
     },
   };
 }

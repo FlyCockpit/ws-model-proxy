@@ -33,6 +33,7 @@ import { StatusPill } from "@/components/status-pill";
 import { WideContent } from "@/components/wide-content";
 import { callSnippet, type SnippetKind, snippetKinds } from "@/lib/call-snippets";
 import { formatMs } from "@/lib/format-metrics";
+import { COMPACT_COUNT, numberFormat } from "@/lib/intl-format";
 import {
   MEMBER_STATUS_TONE,
   type PoolMemberView,
@@ -187,7 +188,7 @@ function StatsRow({ poolId }: { poolId: string }) {
     }),
   );
   const none = t("dashboard:overview.kpi.none");
-  const count = new Intl.NumberFormat(lang, { notation: "compact", maximumFractionDigits: 1 });
+  const count = numberFormat(lang, COMPACT_COUNT);
   if (stats.isPending)
     return (
       <div className="grid min-w-0 grid-cols-2 gap-3 md:grid-cols-4" aria-hidden="true">
@@ -472,9 +473,11 @@ function MembersCard({ pool }: { pool: PoolView }) {
             write(
               () => update.mutateAsync({ poolId: pool.id, members: { add: [member] } }),
               t("dashboard:pool.memberAdded"),
-            ).then((ok) => {
-              if (ok) setChoice("");
-            });
+            )
+              .then((ok) => {
+                if (ok) setChoice("");
+              })
+              .catch((error: unknown) => toast.error(refusalText(error)));
           }}
         >
           <div className="min-w-0 flex-1 space-y-1.5">

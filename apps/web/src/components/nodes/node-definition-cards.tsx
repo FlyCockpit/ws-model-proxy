@@ -378,7 +378,24 @@ export function MetricCommandsCard({ node }: { node: NodeDetail }) {
   );
 }
 
-type FabricRow = { name: string; ip: string };
+/**
+ * Rows of the fabric and GPU editors carry a React key of their own (never submitted), so
+ * removing a row keeps every other row's element. Saved rows are keyed by position (the same on
+ * every render, as `useForm` compares its defaults); rows added here get a fresh key.
+ */
+type RowKey = { key: string };
+let addedRows = 0;
+
+function addedRowKey(): string {
+  addedRows += 1;
+  return `added-${addedRows}`;
+}
+
+type FabricRow = RowKey & { name: string; ip: string };
+
+function fabricMemberships(rows: readonly FabricRow[]): Array<{ name: string; ip: string }> {
+  return rows.map(({ name, ip }) => ({ name, ip }));
+}
 
 export function NodeFabricsCard({ node }: { node: NodeDetail }) {
   const { t } = useTranslation(["dashboard", "common"]);
@@ -386,13 +403,17 @@ export function NodeFabricsCard({ node }: { node: NodeDetail }) {
   const update = useUpdateNode("dashboard:nodes.definition.saved");
   const form = useForm({
     defaultValues: {
-      fabrics: node.fabrics.map((fabric) => ({ name: fabric.name, ip: fabric.ip })) as FabricRow[],
+      fabrics: node.fabrics.map(
+        (fabric, index): FabricRow => ({ key: `saved-${index}`, name: fabric.name, ip: fabric.ip }),
+      ),
     },
     validators: {
       onChange: z
-        .object({ fabrics: z.array(z.object({ name: z.string(), ip: z.string() })) })
+        .object({
+          fabrics: z.array(z.object({ key: z.string(), name: z.string(), ip: z.string() })),
+        })
         .superRefine((value, ctx) => {
-          if (!nodeFabricMembershipsSchema.safeParse(value.fabrics).success)
+          if (!nodeFabricMembershipsSchema.safeParse(fabricMemberships(value.fabrics)).success)
             ctx.addIssue({
               code: "custom",
               path: ["fabrics"],
@@ -401,7 +422,7 @@ export function NodeFabricsCard({ node }: { node: NodeDetail }) {
         }),
     },
     onSubmit: async ({ value }) => {
-      await update.mutateAsync({ nodeId: node.id, fabrics: value.fabrics });
+      await update.mutateAsync({ nodeId: node.id, fabrics: fabricMemberships(value.fabrics) });
     },
   });
 
@@ -444,8 +465,8 @@ export function NodeFabricsCard({ node }: { node: NodeDetail }) {
             <form.Field name="fabrics" mode="array">
               {(field) => (
                 <div className="space-y-2">
-                  {field.state.value.map((_, index) => (
-                    <div key={index} className="flex min-w-0 flex-wrap items-end gap-2">
+                  {field.state.value.map((row, index) => (
+                    <div key={row.key} className="flex min-w-0 flex-wrap items-end gap-2">
                       <form.Field name={`fabrics[${index}].name`}>
                         {(sub) => (
                           <div className="min-w-0 flex-1 space-y-1">
@@ -495,7 +516,7 @@ export function NodeFabricsCard({ node }: { node: NodeDetail }) {
                       type="button"
                       variant="outline"
                       className="min-h-[44px]"
-                      onClick={() => field.pushValue({ name: "", ip: "" })}
+                      onClick={() => field.pushValue({ key: addedRowKey(), name: "", ip: "" })}
                     >
                       <Plus aria-hidden="true" />
                       {t("dashboard:nodes.fabrics.addRow")}
@@ -510,7 +531,9 @@ export function NodeFabricsCard({ node }: { node: NodeDetail }) {
                           type="button"
                           variant="ghost"
                           className="min-h-[44px]"
-                          onClick={() => field.pushValue({ name: "", ip: suggestion.ip })}
+                          onClick={() =>
+                            field.pushValue({ key: addedRowKey(), name: "", ip: suggestion.ip })
+                          }
                         >
                           {t("dashboard:nodes.fabrics.suggestion", {
                             ip: suggestion.ip,
@@ -560,15 +583,14 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
       memoryGb: declared?.memoryGb === undefined ? "" : String(declared.memoryGb),
       reservedMemoryGb:
         declared?.reservedMemoryGb === undefined ? "" : String(declared.reservedMemoryGb),
-      gpus: (declared?.gpus ?? []).map(
-        (gpu): GpuRow => ({
-          vendor: gpu.vendor,
-          index: String(gpu.index),
-          name: gpu.name ?? "",
-          unified: gpu.unified === true,
-          vramGb: gpu.vramGb === undefined ? "" : String(gpu.vramGb),
-        }),
-      ),
+      gpus: (declared?.gpus ?? []).map((gpu, index): GpuRow & RowKey => ({
+        key: `saved-${index}`,
+        vendor: gpu.vendor,
+        index: String(gpu.index),
+        name: gpu.name ?? "",
+        unified: gpu.unified === true,
+        vramGb: gpu.vramGb === undefined ? "" : String(gpu.vramGb),
+      })),
     },
     validators: {
       onChange: z
@@ -578,6 +600,7 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
           reservedMemoryGb: z.string(),
           gpus: z.array(
             z.object({
+              key: z.string(),
               vendor: z.enum(GPU_VENDORS),
               index: z.string(),
               name: z.string(),
@@ -742,7 +765,7 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
                 <div className="space-y-2">
                   <p className="text-sm font-medium">{t("dashboard:nodes.hardware.gpus")}</p>
                   {field.state.value.map((row, index) => (
-                    <div key={index} className="flex min-w-0 flex-wrap items-end gap-2">
+                    <div key={row.key} className="flex min-w-0 flex-wrap items-end gap-2">
                       <form.Field name={`gpus[${index}].vendor`}>
                         {(sub) => (
                           <div className="w-28 space-y-1">
@@ -854,6 +877,7 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
                     className="min-h-[44px]"
                     onClick={() =>
                       field.pushValue({
+                        key: addedRowKey(),
                         vendor: "nvidia",
                         index: String(field.state.value.length),
                         name: "",

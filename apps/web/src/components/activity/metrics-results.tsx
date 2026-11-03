@@ -1,22 +1,25 @@
 import type { Metric } from "@ws-model-proxy/api/contracts/metrics";
-import { type ChartConfig, ChartContainer } from "@ws-model-proxy/ui/components/chart";
+import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { type ComponentProps, lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
-import { CartesianGrid, Line, LineChart, Tooltip, XAxis, YAxis } from "recharts";
 
 import { WideContent } from "@/components/wide-content";
+
 import {
   type ChartRow,
   formatMetricValue,
   isCustomMetric,
   type MetricStep,
 } from "@/lib/activity-metrics";
+import { dateTimeFormat } from "@/lib/intl-format";
 
 /** One line of the chart and one column of the table. */
 export type MetricsColumn = { key: string; label: string };
 
-const PALETTE_SIZE = 8;
+/** Colors repeat after this many lines (dashed from then on). */
+export const PALETTE_SIZE = 8;
 
-function colorOf(index: number): string {
+export function colorOf(index: number): string {
   return `var(--chart-${(index % PALETTE_SIZE) + 1})`;
 }
 
@@ -35,126 +38,35 @@ export function useMetricFormatter(): (metric: Metric, value: number) => string 
     );
 }
 
-function useTimeFormatter(step: MetricStep): (time: number) => string {
+// Day buckets start at UTC midnight (steps count from the epoch): label them in UTC so they do
+// not read as the day before west of Greenwich.
+const DAY_LABEL: Intl.DateTimeFormatOptions = { month: "short", day: "numeric", timeZone: "UTC" };
+const TIME_LABEL: Intl.DateTimeFormatOptions = {
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+};
+
+export function useTimeFormatter(step: MetricStep): (time: number) => string {
   const { i18n } = useTranslation();
-  const format = new Intl.DateTimeFormat(
-    i18n.language,
-    // Day buckets start at UTC midnight (steps count from the epoch): label them in UTC so
-    // they do not read as the day before west of Greenwich.
-    step === "1d"
-      ? { month: "short", day: "numeric", timeZone: "UTC" }
-      : { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" },
-  );
+  const format = dateTimeFormat(i18n.language, step === "1d" ? DAY_LABEL : TIME_LABEL);
   return (time) => format.format(time);
 }
 
-export function MetricsChart({
-  rows,
-  columns,
-  metric,
-  step,
-}: {
-  rows: readonly ChartRow[];
-  columns: readonly MetricsColumn[];
-  metric: Metric;
-  step: MetricStep;
-}) {
-  const { t } = useTranslation(["activity"]);
-  const label = useMetricLabel();
-  const formatValue = useMetricFormatter();
-  const formatTime = useTimeFormatter(step);
-  const config: ChartConfig = Object.fromEntries(
-    columns.map((column, index) => [column.key, { label: column.label, color: colorOf(index) }]),
-  );
+/** The chart, loaded on first use: Recharts is large and only this view needs it. */
+const LazyMetricsChart = lazy(() =>
+  import("./metrics-chart").then((module) => ({ default: module.MetricsChart })),
+);
+
+export function MetricsChart(props: ComponentProps<typeof LazyMetricsChart>) {
   return (
-    <div className="flex min-w-0 flex-col gap-3">
-      <WideContent>
-        <ChartContainer
-          config={config}
-          role="img"
-          aria-label={t("activity:metrics.chartLabel", {
-            metric: label(metric),
-            count: columns.length,
-          })}
-          className="aspect-auto h-64 w-full min-w-[480px] sm:h-80"
-        >
-          <LineChart
-            data={[...rows]}
-            // The table view is the accessible form; the chart stays an image.
-            accessibilityLayer={false}
-            margin={{ top: 8, right: 12, bottom: 0, left: 4 }}
-          >
-            <CartesianGrid vertical={false} />
-            <XAxis
-              dataKey="time"
-              type="number"
-              scale="time"
-              domain={["dataMin", "dataMax"]}
-              tickFormatter={formatTime}
-              tickLine={false}
-              axisLine={false}
-              minTickGap={32}
-            />
-            <YAxis
-              tickFormatter={(value: number) => formatValue(metric, value)}
-              tickLine={false}
-              axisLine={false}
-              width={72}
-            />
-            <Tooltip
-              labelFormatter={(time) => (typeof time === "number" ? formatTime(time) : "")}
-              formatter={(value, name) => [
-                typeof value === "number" ? formatValue(metric, value) : "—",
-                columns.find((column) => column.key === name)?.label ?? String(name),
-              ]}
-              contentStyle={{
-                background: "var(--popover)",
-                color: "var(--popover-foreground)",
-                border: "1px solid var(--border)",
-                borderRadius: "0.5rem",
-              }}
-            />
-            {columns.map((column, index) => (
-              <Line
-                key={column.key}
-                dataKey={column.key}
-                name={column.key}
-                type="monotone"
-                stroke={`var(--color-${column.key})`}
-                strokeDasharray={index >= PALETTE_SIZE ? "4 3" : undefined}
-                strokeWidth={2}
-                dot={false}
-                isAnimationActive={false}
-              />
-            ))}
-          </LineChart>
-        </ChartContainer>
-      </WideContent>
-      {columns.length > 1 ? (
-        <ul className="flex min-w-0 flex-wrap gap-x-4 gap-y-1 text-xs" aria-hidden="true">
-          {columns.map((column, index) => (
-            <li key={column.key} className="flex min-w-0 items-center gap-1.5">
-              <svg viewBox="0 0 16 4" className="h-1 w-4 shrink-0" aria-hidden="true">
-                <line
-                  x1={0}
-                  x2={16}
-                  y1={2}
-                  y2={2}
-                  stroke={colorOf(index)}
-                  strokeWidth={4}
-                  strokeDasharray={index >= PALETTE_SIZE ? "4 3" : undefined}
-                />
-              </svg>
-              <span className="min-w-0 break-all">{column.label}</span>
-            </li>
-          ))}
-        </ul>
-      ) : null}
-    </div>
+    <Suspense fallback={<Skeleton aria-hidden="true" className="h-64 w-full sm:h-80" />}>
+      <LazyMetricsChart {...props} />
+    </Suspense>
   );
 }
 
-/** The chart's values as a table: buckets with any value, one column per series. */
 export function MetricsTable({
   rows,
   columns,

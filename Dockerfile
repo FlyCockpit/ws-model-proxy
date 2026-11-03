@@ -95,23 +95,18 @@ ARG BUILD_VERSION=""
 ENV BUILD_VERSION=$BUILD_VERSION
 
 # --- Turborepo Remote Cache ---
-# Shipped present-but-inert: with both empty (the default on a fresh clone),
-# turbo reports NotLinked and the build runs normally with local cache only —
-# no error, no behavior change ("just skips"). Set TURBO_TOKEN + TURBO_TEAM
-# (BOTH required; a token alone is ignored) to make `turbo build` replay cached
-# app outputs from Vercel's free remote cache. Pass them explicitly as build
-# args when your platform does not forward build-time env vars, e.g.
-# `docker build --build-arg TURBO_TOKEN=… --build-arg TURBO_TEAM=…`. Self-host
-# instead? add a matching `ARG TURBO_API=""` here and point it at your cache
-# (see the pattern doc). Builder stage ONLY — the final runner stage is
-# FROM base and never inherits these ENVs, so the token never ships in the
-# image.
-ARG TURBO_TOKEN=""
+# Optional and off by default: with no token, turbo reports NotLinked and the build runs
+# normally with its local cache only. To replay cached app outputs from a remote cache, set
+# BOTH a team and a token (a token alone is ignored). The token is a BuildKit secret, never a
+# build arg (build args are recorded in the image history):
+#   docker build --secret id=turbo_token,env=TURBO_TOKEN --build-arg TURBO_TEAM=… .
+# The secret exists only for the build command below; no layer, ENV or later stage keeps it.
+# Self-host the cache? add a matching `ARG TURBO_API=""` and pass it on the same command.
 ARG TURBO_TEAM=""
-ENV TURBO_TOKEN=$TURBO_TOKEN \
-    TURBO_TEAM=$TURBO_TEAM
-
-RUN pnpm turbo build --filter=server --filter=web
+RUN --mount=type=secret,id=turbo_token,required=false \
+    TURBO_TOKEN="$(cat /run/secrets/turbo_token 2>/dev/null || true)" \
+    TURBO_TEAM="$TURBO_TEAM" \
+    pnpm turbo build --filter=server --filter=web
 
 # Verify build outputs exist
 RUN test -f apps/server/dist/index.mjs && test -d apps/web/dist/client && test -d apps/web/dist/server

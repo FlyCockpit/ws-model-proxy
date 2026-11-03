@@ -19,6 +19,7 @@ export function FillMeter({
   return (
     <div className={cn("flex min-w-0 items-center gap-2", className)}>
       <div
+        // react-doctor-disable-next-line react-doctor/prefer-tag-over-role -- a native <meter> draws its own bar, styled differently per browser (and recoloured by low/high/optimum); this one is the app's themed track and fill, with the same ARIA meter semantics.
         role="meter"
         aria-label={ariaLabel ?? label}
         aria-valuemin={0}

@@ -693,6 +693,8 @@ function NodePicker({
   onChange: (next: string[]) => void;
 }) {
   const { t } = useTranslation(["dashboard"]);
+  /** One slot per rank: the rank (its position) is the slot's identity, not the node in it. */
+  const slots = value.map((nodeId, rank) => ({ nodeId, rank, id: `start-node-${rank}` }));
   return (
     <div className="flex min-w-0 flex-col gap-3">
       {groupSize > 1 ? (
@@ -700,20 +702,19 @@ function NodePicker({
           {t("dashboard:runtime.nodePicker.multiHint", { count: groupSize })}
         </p>
       ) : null}
-      {value.map((nodeId, index) => {
-        const id = `start-node-${index}`;
+      {slots.map(({ nodeId, rank, id }) => {
         return (
-          <div key={index} className="space-y-1.5">
+          <div key={id} className="space-y-1.5">
             <Label htmlFor={id}>
               {groupSize > 1
-                ? t("dashboard:runtime.nodePicker.rank", { number: index + 1 })
+                ? t("dashboard:runtime.nodePicker.rank", { number: rank + 1 })
                 : t("dashboard:runtime.startOn")}
             </Label>
             <NativeSelect
               id={id}
               value={nodeId}
               onChange={(event) =>
-                onChange(value.map((item, at) => (at === index ? event.target.value : item)))
+                onChange(value.map((item, at) => (at === rank ? event.target.value : item)))
               }
             >
               <option value="">{t("dashboard:runtime.anyNode")}</option>

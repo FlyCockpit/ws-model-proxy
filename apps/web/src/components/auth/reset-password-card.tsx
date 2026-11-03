@@ -47,7 +47,8 @@ export function ResetPasswordCard({
   error: string | undefined;
 }) {
   const { t } = useTranslation(["auth"]);
-  const [token] = useState(searchToken);
+  // A snapshot on purpose: the route's token disappears once the address bar is cleaned.
+  const [initialToken] = useState(searchToken);
   const [tokenRejected, setTokenRejected] = useState(false);
 
   const backToLogin = (
@@ -63,7 +64,7 @@ export function ResetPasswordCard({
     </div>
   );
 
-  if (error || !token || tokenRejected) {
+  if (error || !initialToken || tokenRejected) {
     return (
       <div ref={stripTokenRef} className="contents">
         <AuthCard
@@ -91,7 +92,7 @@ export function ResetPasswordCard({
       >
         <ResetPasswordForm
           lang={lang}
-          token={token}
+          token={initialToken}
           onTokenRejected={() => setTokenRejected(true)}
         />
         {backToLogin}

@@ -639,6 +639,7 @@ function AddPathForm({
 }) {
   const { t } = useTranslation(["dashboard"]);
   const listId = useId();
+  const taken = new Set(existing);
   const form = useForm({
     defaultValues: { path: "" },
     validators: {
@@ -685,7 +686,7 @@ function AddPathForm({
               </Button>
             </div>
             <datalist id={listId}>
-              {SEMANTIC_FIELDS.filter((path) => !existing.includes(path)).map((path) => (
+              {SEMANTIC_FIELDS.filter((path) => !taken.has(path)).map((path) => (
                 <option key={path} value={path} />
               ))}
             </datalist>

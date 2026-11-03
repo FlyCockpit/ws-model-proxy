@@ -7,7 +7,7 @@ import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { useState } from "react";
+import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
@@ -53,8 +53,9 @@ export function NewPoolDialog({
   const { t } = useTranslation(["dashboard", "common"]);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  // The slug follows the name (and a picked model) until the person edits it.
-  const [slugEdited, setSlugEdited] = useState(false);
+  // The slug follows the name (and a picked model) until the person edits it. Only the
+  // handlers read it, so a ref: editing the slug does not need a re-render of its own.
+  const slugEdited = useRef(false);
   const runtimes = useQuery({ ...orpc.runtimes.list.queryOptions(), enabled: open });
   const { create } = useCreatePool();
   const setMode = useMutation({
@@ -160,7 +161,7 @@ export function NewPoolDialog({
     if (name === "" || suggested.includes(name)) {
       const suggestion = nameFromModel(next.model);
       form.setFieldValue("name", suggestion);
-      if (!slugEdited) form.setFieldValue("slug", slugify(suggestion));
+      if (!slugEdited.current) form.setFieldValue("slug", slugify(suggestion));
     }
   };
 
@@ -260,7 +261,7 @@ export function NewPoolDialog({
                 onBlur={field.handleBlur}
                 onChange={(event) => {
                   field.handleChange(event.target.value);
-                  if (!slugEdited) form.setFieldValue("slug", slugify(event.target.value));
+                  if (!slugEdited.current) form.setFieldValue("slug", slugify(event.target.value));
                 }}
                 className="h-11"
               />
@@ -277,7 +278,7 @@ export function NewPoolDialog({
                 value={field.state.value}
                 onBlur={field.handleBlur}
                 onChange={(event) => {
-                  setSlugEdited(true);
+                  slugEdited.current = true;
                   field.handleChange(event.target.value);
                 }}
                 className="h-11 font-mono"

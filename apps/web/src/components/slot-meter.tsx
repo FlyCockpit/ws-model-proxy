@@ -32,6 +32,7 @@ export function SlotMeter({
     <div className={cn("flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1", className)}>
       {slots ? (
         <div
+          // react-doctor-disable-next-line react-doctor/prefer-tag-over-role -- a native <meter> renders no children, and this meter is drawn as one segment per slot plus "kept" overlays.
           role="meter"
           aria-label={keptLabel ? `${label}, ${keptLabel}` : label}
           aria-valuemin={0}

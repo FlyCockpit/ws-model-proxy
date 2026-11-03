@@ -25,6 +25,7 @@ import z from "zod";
 
 import { FieldErrors } from "@/components/field-errors";
 import { NativeSelect } from "@/components/native-select";
+import { useRowKeys } from "@/components/runtimes/use-row-keys";
 import { rejectedDefinesWarning } from "@/lib/define-rejections";
 import {
   draftToReader,
@@ -49,17 +50,19 @@ type ReaderValues = ReaderDraft & { check: string };
 /** Reader issues at the input that owns them (`map[2].series`), or `check`. */
 function readerIssues(values: ReaderValues, base: MetricsReader | undefined) {
   const issues: Array<{ path: Array<string | number>; message: string }> = [];
+  // The first row of each signal (a later row with the same signal is a duplicate).
+  const firstRow = new Map<string, number>();
   values.map.forEach((row, index) => {
-    if (values.map.findIndex((other) => other.signal === row.signal) !== index)
-      issues.push({ path: ["map", index, "signal"], message: "duplicate" });
+    if (!firstRow.has(row.signal)) firstRow.set(row.signal, index);
+    else issues.push({ path: ["map", index, "signal"], message: "duplicate" });
   });
   const parsed = metricsReaderSchema.optional().safeParse(draftToReader(values, base));
   if (!parsed.success)
     for (const issue of parsed.error.issues) {
       const [head, signal, field] = issue.path;
       const message = specIssueText(issue);
-      const row = values.map.findIndex((item) => item.signal === signal);
-      if (head === "map" && row >= 0 && typeof field === "string")
+      const row = typeof signal === "string" ? firstRow.get(signal) : undefined;
+      if (head === "map" && row !== undefined && typeof field === "string")
         issues.push({ path: ["map", row, field], message });
       else if (typeof head === "string" && head !== "map" && head !== "kind")
         issues.push({ path: [head], message });
@@ -89,6 +92,7 @@ export function MetricsReaderCard({
   const { t } = useTranslation(["dashboard", "common"]);
   const queryClient = useQueryClient();
   const [preset, setPreset] = useState<"" | ReaderPresetId>("");
+  const rowKeys = useRowKeys("reader-map-");
   const update = useMutation({
     ...orpc.runtimes.update.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
@@ -226,7 +230,7 @@ export function MetricsReaderCard({
               </p>
               {map.state.value.map((_, index) => (
                 <div
-                  key={index}
+                  key={rowKeys.key(index)}
                   className="grid min-w-0 gap-3 rounded-lg border p-3 sm:grid-cols-2"
                 >
                   <form.Field name={`map[${index}].signal`}>
@@ -301,7 +305,10 @@ export function MetricsReaderCard({
                       type="button"
                       variant="ghost"
                       size="touch"
-                      onClick={() => map.removeValue(index)}
+                      onClick={() => {
+                        rowKeys.remove(map.state.value.length, index);
+                        map.removeValue(index);
+                      }}
                     >
                       <Trash2 aria-hidden="true" />
                       {t("dashboard:runtime.reader.removeSignal")}

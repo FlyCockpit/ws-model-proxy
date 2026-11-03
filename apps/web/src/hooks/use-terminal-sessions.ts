@@ -2050,13 +2050,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       reconcileListedTerminals,
       refuseSubstitutedKey,
       requestClose,
-      requestList,
       retireAfterDrain,
       retryTab,
       sendClose,
       setView,
       tabByTerminal,
-      viewOf,
     ],
   );
 
@@ -2248,6 +2246,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         if (pending.epoch === undefined) continue;
         const route = classifyBroadcastEpoch(decoded.epoch, pending.epoch);
         if (route === "queue") session.future.push(pending);
+        // react-doctor-disable-next-line react-doctor/async-await-in-loop -- queued broadcast frames open one at a time in seq order: each advances session.output.recvSeq, which the next one is checked against
         else if (route === "open") await openBroadcast(session, pending);
       }
     },

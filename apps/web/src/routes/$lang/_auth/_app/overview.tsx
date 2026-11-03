@@ -23,6 +23,7 @@ import { StatusPill } from "@/components/status-pill";
 import { TimeAgo } from "@/components/time-ago";
 import { useOfferWelcome } from "@/hooks/use-welcome-offer";
 import { formatMs, formatShare } from "@/lib/format-metrics";
+import { COMPACT_COUNT, numberFormat } from "@/lib/intl-format";
 import { WELCOME_STEPS, type WelcomeStep } from "@/lib/welcome-steps";
 import { orpc } from "@/utils/orpc";
 
@@ -367,7 +368,7 @@ function AliasShadowsCard({ lang, aliases }: { lang: string; aliases: Aliases | 
 function KpiGrid({ kpis, lang, range }: { kpis: Summary["kpis"]; lang: string; range: Range }) {
   const { t } = useTranslation(["dashboard"]);
   const none = t("dashboard:overview.kpi.none");
-  const count = new Intl.NumberFormat(lang, { notation: "compact", maximumFractionDigits: 1 });
+  const count = numberFormat(lang, COMPACT_COUNT);
   const tiles = [
     { key: "requests", value: count.format(kpis.requests) },
     {
@@ -510,7 +511,7 @@ function PoolCards({
   range: Range;
 }) {
   const { t } = useTranslation(["dashboard"]);
-  const count = new Intl.NumberFormat(lang);
+  const count = numberFormat(lang);
   return (
     <section className="flex min-w-0 flex-col gap-3" aria-labelledby="overview-pools">
       <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-2">

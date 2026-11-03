@@ -1,4 +1,5 @@
 import { useTranslation } from "react-i18next";
+import { relativeTimeFormat } from "@/lib/intl-format";
 
 const UNITS: Array<[Intl.RelativeTimeFormatUnit, number]> = [
   ["year", 365 * 24 * 3600],
@@ -10,6 +11,8 @@ const UNITS: Array<[Intl.RelativeTimeFormatUnit, number]> = [
 ];
 
 /** Relative time ("8 seconds ago") with the exact time in the element's title and datetime. */
+const RELATIVE: Intl.RelativeTimeFormatOptions = { numeric: "auto" };
+
 export function TimeAgo({
   value,
   now = Date.now(),
@@ -23,10 +26,7 @@ export function TimeAgo({
   if (Number.isNaN(date.getTime())) return <span>{t("dashboard:time.never")}</span>;
   const seconds = Math.round((date.getTime() - now) / 1000);
   const [unit, size] = UNITS.find(([, span]) => Math.abs(seconds) >= span) ?? ["second", 1];
-  const text = new Intl.RelativeTimeFormat(i18n.language, { numeric: "auto" }).format(
-    Math.round(seconds / size),
-    unit,
-  );
+  const text = relativeTimeFormat(i18n.language, RELATIVE).format(Math.round(seconds / size), unit);
   return (
     <time
       dateTime={date.toISOString()}

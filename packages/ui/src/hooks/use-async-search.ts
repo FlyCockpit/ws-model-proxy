@@ -33,27 +33,28 @@ function useAsyncSearch<T>(
 
   React.useEffect(() => {
     const abortController = new AbortController();
+    // Set only by this run's cleanup, so a superseded search never writes its results or clears
+    // the loading flag the next search set.
+    let cancelled = false;
 
     async function search() {
       setIsLoading(true);
       try {
         const data = await onSearch(debouncedQuery, abortController.signal);
-        if (!abortController.signal.aborted) {
-          setResults(data);
-        }
+        if (!cancelled) setResults(data);
       } catch {
-        if (!abortController.signal.aborted) {
-          setResults([]);
-        }
+        if (!cancelled) setResults([]);
       } finally {
-        if (!abortController.signal.aborted) {
-          setIsLoading(false);
-        }
+        // react-doctor-disable-next-line react-doctor/no-loading-flag-reset-outside-finally -- it is in the finally; only a cancelled (superseded) run skips it, since the next run owns the flag
+        if (!cancelled) setIsLoading(false);
       }
     }
 
-    search();
-    return () => abortController.abort();
+    void search();
+    return () => {
+      cancelled = true;
+      abortController.abort();
+    };
   }, [debouncedQuery, onSearch]);
 
   return { results, isLoading };

@@ -46,6 +46,7 @@ import { z } from "zod";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { SegmentedControl } from "@/components/segmented-control";
+import { useClientDateText } from "@/hooks/use-client-date-text";
 import { useHaptics } from "@/hooks/use-haptics";
 import { useNamespaceT } from "@/i18n/use-namespace-t";
 import { orpc } from "@/utils/orpc";
@@ -273,9 +274,7 @@ function AdminUsers() {
                       </p>
                       <p className="mt-0.5 truncate text-xs text-muted-foreground">
                         {user.email} · {t("admin:users.joined")}{" "}
-                        <time dateTime={new Date(user.createdAt).toISOString()}>
-                          {new Date(user.createdAt).toLocaleDateString()}
-                        </time>
+                        <JoinedDate value={user.createdAt} />
                         {user.banReason ? ` · ${user.banReason}` : ""}
                       </p>
                     </div>
@@ -406,6 +405,16 @@ function UserActions({
       </DropdownMenuContent>
     </DropdownMenu>
   );
+}
+
+/**
+ * The join date in the browser's locale and timezone. The server has neither, so it renders the
+ * UTC calendar date and the browser swaps in its own text after hydration, keeping the two
+ * renders identical while hydrating.
+ */
+function JoinedDate({ value }: { value: Date | string }) {
+  const { text, iso } = useClientDateText(value);
+  return <time dateTime={iso}>{text}</time>;
 }
 
 function RolePill({ isAdmin }: { isAdmin: boolean }) {

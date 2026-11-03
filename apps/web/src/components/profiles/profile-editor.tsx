@@ -440,7 +440,7 @@ export function ProfileEditor({
                             {(sub) => (
                               <ItemNodesField
                                 index={index}
-                                owned={nodes.filter((node) => ownedIds.includes(node.id))}
+                                owned={ownedNodes(nodes, ownedIds)}
                                 value={sub.state.value}
                                 onChange={sub.handleChange}
                               />
@@ -615,6 +615,12 @@ function ItemVersionField({
 }
 
 /** Where one line may run: some of the profile's nodes, or none checked for any of them. */
+/** The nodes among `nodes` whose ids are in `ownedIds`, in `nodes` order. */
+function ownedNodes(nodes: readonly NodeSummary[], ownedIds: readonly string[]): NodeSummary[] {
+  const owned = new Set(ownedIds);
+  return nodes.filter((node) => owned.has(node.id));
+}
+
 function ItemNodesField({
   index,
   owned,
@@ -628,6 +634,7 @@ function ItemNodesField({
 }) {
   const { t } = useTranslation(["dashboard"]);
   if (owned.length === 0) return null;
+  const selected = new Set(value);
   return (
     <fieldset className="w-full min-w-0 space-y-1">
       <legend className="text-sm font-medium">{t("dashboard:profiles.editor.itemNodes")}</legend>
@@ -640,7 +647,7 @@ function ItemNodesField({
           >
             <Checkbox
               id={`item-node-${index}-${node.id}`}
-              checked={value.includes(node.id)}
+              checked={selected.has(node.id)}
               onCheckedChange={(checked) =>
                 onChange(
                   checked ? [...value, node.id] : value.filter((nodeId) => nodeId !== node.id),
@@ -652,7 +659,7 @@ function ItemNodesField({
         ))}
       </div>
       <p className="text-xs text-muted-foreground">
-        {value.some((nodeId) => owned.some((node) => node.id === nodeId))
+        {owned.some((node) => selected.has(node.id))
           ? t("dashboard:profiles.editor.itemNodesSome")
           : t("dashboard:profiles.editor.itemNodesAny")}
       </p>

@@ -243,9 +243,11 @@ function CloudSettings({ pool }: { pool: PoolView }) {
                     { providerModelId: choice },
                   ],
                 }),
-              ).then((ok) => {
-                if (ok) setChoice("");
-              });
+              )
+                .then((ok) => {
+                  if (ok) setChoice("");
+                })
+                .catch((error: unknown) => toast.error(refusalText(error)));
             }}
           >
             <div className="min-w-0 flex-1 space-y-1.5">
