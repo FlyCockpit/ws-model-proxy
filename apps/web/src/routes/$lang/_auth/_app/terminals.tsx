@@ -35,6 +35,8 @@ import { TerminalPane } from "@/components/terminal-pane";
 import { TimeAgo } from "@/components/time-ago";
 import { WideContent } from "@/components/wide-content";
 import { useHideAppChrome } from "@/hooks/use-hide-app-chrome";
+import { type ReorderDrag, usePointerReorder } from "@/hooks/use-pointer-reorder";
+import { useTerminalLayout } from "@/hooks/use-terminal-layout";
 import {
   type OpenTicketInput,
   type TerminalTab,
@@ -42,6 +44,7 @@ import {
 } from "@/hooks/use-terminal-sessions";
 import { nodeLiveInterval } from "@/lib/node-live-updates";
 import { refusalText } from "@/lib/refusal-text";
+import { applySavedOrder, moveItem } from "@/lib/saved-order";
 import type { CliTrust } from "@/lib/terminal-cli-identity";
 import { typableCommand } from "@/lib/terminal-protocol";
 import {
@@ -160,6 +163,18 @@ function TerminalsPage() {
 const SHORT_SECTION_HIDDEN = "[@container(max-height:32rem)]:hidden";
 
 const tabIdOf = (localId: string) => `terminal-tab-${localId}`;
+const nodeHandleIdOf = (nodeId: string) => `terminal-node-move-${nodeId}`;
+
+/** Where a drag would drop, beside the item at `index` (none on the dragged one itself). */
+function dropMarkOf(drag: ReorderDrag | null, index: number): "before" | "after" | null {
+  if (!drag || drag.to !== index || drag.from === index) return null;
+  return drag.to < drag.from ? "before" : "after";
+}
+
+/** Focus an element after React has moved it (a moved element can lose focus). */
+function refocus(id: string) {
+  requestAnimationFrame(() => document.getElementById(id)?.focus());
+}
 const panelIdOf = (localId: string) => `terminal-panel-${localId}`;
 
 function TerminalWorkspace({
@@ -172,14 +187,41 @@ function TerminalWorkspace({
   maximized: boolean;
 }) {
   const { t } = useTranslation(["terminals", "dashboard"]);
-  const { tabs, activeLocalId } = sessions;
+  const { activeLocalId } = sessions;
+  const layout = useTerminalLayout();
+  // The person's saved order (terminal ids); new tabs and tabs still opening follow it.
+  const tabs = applySavedOrder(sessions.tabs, (tab) => tab.terminalId, layout.tabOrder);
   const active = tabs.find((tab) => tab.localId === activeLocalId) ?? null;
+  const [announcement, setAnnouncement] = useState("");
+  const tabName = (tab: TerminalTab) => slugOf(tab.cliDeviceId) ?? t("terminals:unknownNode");
+  const moveTab = (from: number, to: number) => {
+    const moved = tabs[from];
+    if (!moved || to < 0 || to >= tabs.length || to === from) return;
+    layout.saveTabOrder(moveItem(tabs, from, to).map((tab) => tab.terminalId));
+    setAnnouncement(
+      t("terminals:order.moved", { name: tabName(moved), position: to + 1, count: tabs.length }),
+    );
+  };
+  const reorder = usePointerReorder({ axis: "x", onMove: moveTab });
   // Select text is the session hook's: it pauses that tab's input, and switching or closing tabs
   // ends it there.
   const selecting = active !== null && sessions.selectingLocalId === active.localId;
   const [focusRequest, setFocusRequest] = useState(0);
   // Arrow keys, Home and End move between tabs (the tabs pattern); focus stays on the tab list.
+  // With Alt+Shift, Left and Right move the focused tab itself.
   const onTabKeyDown = (event: KeyboardEvent, index: number) => {
+    const current = tabs[index];
+    if (
+      current &&
+      event.altKey &&
+      event.shiftKey &&
+      (event.key === "ArrowLeft" || event.key === "ArrowRight")
+    ) {
+      event.preventDefault();
+      moveTab(index, index + (event.key === "ArrowLeft" ? -1 : 1));
+      refocus(tabIdOf(current.localId));
+      return;
+    }
     const last = tabs.length - 1;
     const next =
       event.key === "ArrowRight"
@@ -228,6 +270,8 @@ function TerminalWorkspace({
                 {tabs.map((tab, index) => (
                   <Button
                     key={tab.localId}
+                    ref={reorder.itemRef(index)}
+                    {...reorder.handleProps(index)}
                     id={tabIdOf(tab.localId)}
                     type="button"
                     role="tab"
@@ -236,7 +280,16 @@ function TerminalWorkspace({
                     tabIndex={tab.localId === activeLocalId ? 0 : -1}
                     variant={tab.localId === activeLocalId ? "secondary" : "ghost"}
                     size="touch"
-                    className="shrink-0 font-mono"
+                    aria-keyshortcuts="Alt+Shift+ArrowLeft Alt+Shift+ArrowRight"
+                    title={tabs.length > 1 ? t("terminals:order.moveTabHint") : undefined}
+                    className={cn(
+                      "shrink-0 select-none font-mono [-webkit-touch-callout:none]",
+                      reorder.drag?.from === index && "opacity-50",
+                      dropMarkOf(reorder.drag, index) === "before" &&
+                        "shadow-[inset_2px_0_0_0_var(--primary)]",
+                      dropMarkOf(reorder.drag, index) === "after" &&
+                        "shadow-[inset_-2px_0_0_0_var(--primary)]",
+                    )}
                     // Mouse down does not move focus to the tab; the click decides where it goes.
                     onMouseDown={(event) => event.preventDefault()}
                     onClick={(event) => {
@@ -247,13 +300,16 @@ function TerminalWorkspace({
                     }}
                     onKeyDown={(event) => onTabKeyDown(event, index)}
                   >
-                    <span>{slugOf(tab.cliDeviceId) ?? t("terminals:unknownNode")}</span>
+                    <span>{tabName(tab)}</span>
                     <span className="text-xs text-muted-foreground">
                       {t(`terminals:phase.${tab.phase}`)}
                     </span>
                   </Button>
                 ))}
               </WideContent>
+              <span className="sr-only" role="status" aria-live="polite">
+                {announcement}
+              </span>
               <TerminalToolbar
                 maximized={maximized}
                 selecting={selecting}
@@ -268,7 +324,9 @@ function TerminalWorkspace({
               style={TERMINAL_CHROME_VARS}
               className="relative min-h-0 w-full min-w-0 flex-1 overflow-hidden rounded-md bg-(--term-bg)"
             >
-              {tabs.map((tab) => (
+              {/* Panes stay in session order: they are stacked, and moving one would move its
+                  xterm. Only the tab strip follows the saved order. */}
+              {sessions.tabs.map((tab) => (
                 <TerminalPane
                   key={tab.localId}
                   localId={tab.localId}
@@ -518,7 +576,22 @@ function TerminalNodes({ ready, openTerminal }: { ready: boolean; openTerminal: 
       onError: (error) => toast.error(refusalText(error)),
     }),
   );
-  const list = nodes.data?.nodes ?? [];
+  const layout = useTerminalLayout();
+  const list = applySavedOrder(nodes.data?.nodes ?? [], (node) => node.id, layout.nodeOrder);
+  const [announcement, setAnnouncement] = useState("");
+  const moveNode = (from: number, to: number) => {
+    const moved = list[from];
+    if (!moved || to < 0 || to >= list.length || to === from) return;
+    layout.saveNodeOrder(moveItem(list, from, to).map((node) => node.id));
+    setAnnouncement(
+      t("terminals:order.moved", {
+        name: moved.name ?? moved.slug,
+        position: to + 1,
+        count: list.length,
+      }),
+    );
+  };
+  const reorder = usePointerReorder({ axis: "y", onMove: moveNode, touchDelayMs: 0 });
   const eligible = list.filter(
     (node) =>
       node.trust.effective === "FULL" && !node.trust.lowerPending && node.connection === "ONLINE",
@@ -542,10 +615,28 @@ function TerminalNodes({ ready, openTerminal }: { ready: boolean; openTerminal: 
             {eligible.length === 0 ? (
               <p className="pb-2 text-sm text-muted-foreground">{t("terminals:noFullNodes")}</p>
             ) : null}
-            {list.map((node) => (
+            <p className="sr-only" role="status" aria-live="polite">
+              {announcement}
+            </p>
+            {list.map((node, index) => (
               <TerminalNodeRow
                 key={node.id}
                 node={node}
+                reorder={
+                  list.length > 1
+                    ? {
+                        rowRef: reorder.itemRef(index),
+                        handleId: nodeHandleIdOf(node.id),
+                        handleProps: reorder.handleProps(index),
+                        onStep: (delta) => {
+                          moveNode(index, index + delta);
+                          refocus(nodeHandleIdOf(node.id));
+                        },
+                        dragging: reorder.drag?.from === index,
+                        dropMark: dropMarkOf(reorder.drag, index),
+                      }
+                    : undefined
+                }
                 ready={ready}
                 busy={openTicket.isPending}
                 opening={openTicket.isPending && openTicket.variables?.nodeId === node.id}

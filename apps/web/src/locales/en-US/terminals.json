@@ -205,5 +205,12 @@
     "done": "Done",
     "label": "Terminal text",
     "wideLabel": "Long lines of terminal text"
+  },
+  "order": {
+    "moved": "Moved {{name}} to position {{position}} of {{count}}.",
+    "moveNode": "Move {{node}}",
+    "moveNodeHint": "Drag to reorder, or focus and press the up and down arrows. Your order is saved to your account.",
+    "moveTabHint": "Drag to reorder, or press Alt+Shift with the left and right arrows. Your order is saved to your account.",
+    "saveFailed": "Could not save your order. Try again."
   }
 }

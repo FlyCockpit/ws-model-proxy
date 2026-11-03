@@ -103,3 +103,45 @@ describe("TerminalNodeRow", () => {
     expect(screen.getByText("terminals:relayOnly")).toBeTruthy();
   });
 });
+
+describe("TerminalNodeRow reorder handle", () => {
+  const reorder = (onStep: (delta: -1 | 1) => void) => ({
+    rowRef: () => undefined,
+    handleId: "handle-node-1",
+    handleProps: {
+      onPointerDown: vi.fn(),
+      onPointerMove: vi.fn(),
+      onPointerUp: vi.fn(),
+      onPointerCancel: vi.fn(),
+      onLostPointerCapture: vi.fn(),
+    },
+    onStep,
+    dragging: false,
+    dropMark: null,
+  });
+
+  it("shows no handle without reorder", () => {
+    render(<TerminalNodeRow node={node()} ready busy={false} opening={false} onOpen={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /terminals:order.moveNode/ })).toBeNull();
+  });
+
+  it("moves the row with the up and down arrows on its handle", () => {
+    const onStep = vi.fn();
+    render(
+      <TerminalNodeRow
+        node={node()}
+        ready
+        busy={false}
+        opening={false}
+        onOpen={vi.fn()}
+        reorder={reorder(onStep)}
+      />,
+    );
+    const handle = screen.getByRole("button", { name: "terminals:order.moveNode:box" });
+    expect(handle.id).toBe("handle-node-1");
+    fireEvent.keyDown(handle, { key: "ArrowDown" });
+    fireEvent.keyDown(handle, { key: "ArrowUp" });
+    fireEvent.keyDown(handle, { key: "ArrowLeft" });
+    expect(onStep.mock.calls).toEqual([[1], [-1]]);
+  });
+});

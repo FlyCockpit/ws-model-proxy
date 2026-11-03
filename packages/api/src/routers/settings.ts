@@ -101,6 +101,17 @@ async function changeSlug(context: SignedInContext, slug: string, data: UserFiel
   }
 }
 
+const TERMINAL_LAYOUT_SELECT = { terminalTabOrder: true, terminalNodeOrder: true } as const;
+
+function terminalLayoutView(row: { terminalTabOrder: string[]; terminalNodeOrder: string[] }) {
+  return { tabs: row.terminalTabOrder, nodes: row.terminalNodeOrder };
+}
+
+/** The ids in their first positions: a repeated id keeps only its first place. */
+function uniqueIds(ids: readonly string[]): string[] {
+  return [...new Set(ids)];
+}
+
 /** Per-person settings (server settings are `adminSettings`). */
 export const settingsRouter = {
   get: contractProcedure(c.get).handler(async ({ context }) =>
@@ -126,6 +137,27 @@ export const settingsRouter = {
     });
     return settingsView(row);
   }),
+  terminalLayout: {
+    get: contractProcedure(c.terminalLayout.get).handler(async ({ context }) => {
+      const row = await prisma.user.findUnique({
+        where: { id: context.session.user.id },
+        select: TERMINAL_LAYOUT_SELECT,
+      });
+      if (!row) throw new ORPCError("UNAUTHORIZED");
+      return terminalLayoutView(row);
+    }),
+    update: contractProcedure(c.terminalLayout.update).handler(async ({ input, context }) => {
+      const row = await prisma.user.update({
+        where: { id: context.session.user.id },
+        data: {
+          ...(input.tabs !== undefined ? { terminalTabOrder: uniqueIds(input.tabs) } : {}),
+          ...(input.nodes !== undefined ? { terminalNodeOrder: uniqueIds(input.nodes) } : {}),
+        },
+        select: TERMINAL_LAYOUT_SELECT,
+      });
+      return terminalLayoutView(row);
+    }),
+  },
   onboarding: {
     complete: contractProcedure(c.onboarding.complete).handler(async ({ context }) => {
       // Idempotent: the first completion time is kept.

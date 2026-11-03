@@ -32,6 +32,11 @@ model User {
   operationalAlerts          Boolean   @default(true)
   /// Set when the onboarding checklist was dismissed or completed.
   onboardingDoneAt           DateTime?
+  /// The person's order on the Terminals page, kept across sign-ins and devices: terminal ids
+  /// for the tabs and node ids for the node list, first first (at most 200 each). Ids not listed
+  /// follow in their usual order; ids that no longer exist are ignored.
+  terminalTabOrder           String[]  @default([])
+  terminalNodeOrder          String[]  @default([])
 
   sessions               Session[]
   accounts               Account[]
