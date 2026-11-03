@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
+import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
   CardContent,
@@ -9,6 +9,7 @@ import {
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useTranslation } from "react-i18next";
 

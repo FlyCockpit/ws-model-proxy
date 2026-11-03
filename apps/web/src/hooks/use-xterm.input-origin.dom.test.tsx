@@ -15,7 +15,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished,
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
 }));
 

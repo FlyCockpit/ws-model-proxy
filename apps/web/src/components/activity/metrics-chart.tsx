@@ -3,11 +3,9 @@ import { type ChartConfig, ChartContainer } from "@ws-model-proxy/ui/components/
 import { useTranslation } from "react-i18next";
 // react-doctor-disable-next-line react-doctor/prefer-dynamic-import -- this module is the lazy chunk: metrics-results.tsx imports it with React.lazy
 import { CartesianGrid, Line, LineChart, Tooltip, XAxis, YAxis } from "recharts";
-
+import { colorOf, PALETTE_SIZE } from "@/components/activity/metrics-colors";
 import {
-  colorOf,
   type MetricsColumn,
-  PALETTE_SIZE,
   useMetricFormatter,
   useMetricLabel,
   useTimeFormatter,

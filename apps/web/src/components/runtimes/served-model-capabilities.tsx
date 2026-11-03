@@ -4,7 +4,7 @@ import { MODEL_CAPABILITIES, type ModelCapabilityWire } from "@ws-model-proxy/ap
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";

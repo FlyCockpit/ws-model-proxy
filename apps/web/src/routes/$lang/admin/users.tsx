@@ -33,9 +33,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@ws-model-proxy/ui/components/select";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { useDebounce } from "@ws-model-proxy/ui/hooks/use-async-search";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import type { TFunction } from "i18next";
 import { Archive, ArchiveRestore, Copy, MoreVertical, Plus, Shield, Trash } from "lucide-react";

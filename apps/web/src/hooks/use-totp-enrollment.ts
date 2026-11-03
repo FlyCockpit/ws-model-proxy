@@ -1,4 +1,4 @@
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useState } from "react";
 
 import { authClient } from "@/lib/auth-client";

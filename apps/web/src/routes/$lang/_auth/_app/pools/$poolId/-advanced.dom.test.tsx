@@ -35,7 +35,7 @@ vi.mock("react-i18next", () => ({
   }),
 }));
 
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: (message: string) => state.toastError(message) },
 }));
 

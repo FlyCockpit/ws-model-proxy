@@ -9,7 +9,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 

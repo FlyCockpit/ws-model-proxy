@@ -12,9 +12,9 @@ import {
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Pencil, Trash2 } from "lucide-react";
 import { useState } from "react";

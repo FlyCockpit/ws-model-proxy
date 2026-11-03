@@ -18,8 +18,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@ws-model-proxy/ui/components/dropdown-menu";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Maximize2, Minimize2, Settings2, TextSelect, X } from "lucide-react";
 import { type KeyboardEvent, useState } from "react";

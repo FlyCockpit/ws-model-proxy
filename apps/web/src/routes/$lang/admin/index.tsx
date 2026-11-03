@@ -1,5 +1,4 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { buttonVariants } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
   CardContent,
@@ -7,6 +6,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
+import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Activity, Settings, Users } from "lucide-react";
 import { useTranslation } from "react-i18next";

@@ -16,13 +16,6 @@ import { dateTimeFormat } from "@/lib/intl-format";
 /** One line of the chart and one column of the table. */
 export type MetricsColumn = { key: string; label: string };
 
-/** Colors repeat after this many lines (dashed from then on). */
-export const PALETTE_SIZE = 8;
-
-export function colorOf(index: number): string {
-  return `var(--chart-${(index % PALETTE_SIZE) + 1})`;
-}
-
 /** A metric's localized name (`custom:<name>` metrics are shown as named on the node). */
 export function useMetricLabel(): (metric: Metric) => string {
   const { t } = useTranslation(["activity"]);

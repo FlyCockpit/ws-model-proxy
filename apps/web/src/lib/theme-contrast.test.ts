@@ -67,7 +67,7 @@ function contrast(a: Rgb, b: Rgb): number {
 const AA = 4.5;
 
 const buttonSource = readFileSync(
-  resolve(import.meta.dirname, "../../../../packages/ui/src/components/button.tsx"),
+  resolve(import.meta.dirname, "../../../../packages/ui/src/lib/button-variants.ts"),
   "utf8",
 );
 
@@ -76,7 +76,7 @@ function linkHoverAlpha(prefix: "" | "dark:"): number {
   const match = new RegExp(`(?:^|[\\s"])${prefix}\\[a\\]:hover:bg-primary/(\\d+)`).exec(
     buttonSource,
   );
-  if (!match) throw new Error(`no ${prefix}[a]:hover:bg-primary/NN in button.tsx`);
+  if (!match) throw new Error(`no ${prefix}[a]:hover:bg-primary/NN in button-variants.ts`);
   return Number(match[1]) / 100;
 }
 

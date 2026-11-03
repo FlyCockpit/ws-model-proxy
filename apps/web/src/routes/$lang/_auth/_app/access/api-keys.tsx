@@ -2,8 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Card, CardContent } from "@ws-model-proxy/ui/components/card";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { KeyRound, Plus } from "lucide-react";
 import { useState } from "react";
@@ -12,11 +12,8 @@ import { useTranslation } from "react-i18next";
 import { EndpointCard } from "@/components/access/api-endpoint-card";
 import { ConfirmAction } from "@/components/access/confirm-action";
 import { CreateApiKeyDialog } from "@/components/access/create-api-key-dialog";
-import {
-  CredentialDatesList,
-  CredentialStatusBadge,
-  credentialStatus,
-} from "@/components/access/credential-meta";
+import { CredentialDatesList, CredentialStatusBadge } from "@/components/access/credential-meta";
+import { credentialStatus } from "@/components/access/credential-meta-utils";
 import { InlineRetry } from "@/components/inline-retry";
 import { PageHeading } from "@/components/page-stub";
 import { orpc } from "@/utils/orpc";

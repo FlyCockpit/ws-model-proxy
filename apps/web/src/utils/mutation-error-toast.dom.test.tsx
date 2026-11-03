@@ -4,11 +4,11 @@ import { QueryClient, QueryClientProvider, useMutation } from "@tanstack/react-q
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
 }));
 
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import i18next from "i18next";
 import enErrors from "@/locales/en-US/errors.json";
 

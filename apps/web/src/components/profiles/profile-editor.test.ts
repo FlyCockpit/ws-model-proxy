@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@/utils/orpc", () => ({ orpc: {} }));
 
-import { PROFILE_SLUG_PATTERN, slugFromName } from "./profile-editor";
+import { PROFILE_SLUG_PATTERN } from "./profile-editor";
+import { slugFromName } from "./profile-editor-utils";
 
 describe("slugFromName", () => {
   it.each([

@@ -7,7 +7,7 @@ import { useTranslation } from "react-i18next";
 
 import { EndpointCard } from "@/components/access/api-endpoint-card";
 import { CreateApiKeyDialog } from "@/components/access/create-api-key-dialog";
-import { credentialStatus } from "@/components/access/credential-meta";
+import { credentialStatus } from "@/components/access/credential-meta-utils";
 import { InlineRetry } from "@/components/inline-retry";
 import { orpc } from "@/utils/orpc";
 

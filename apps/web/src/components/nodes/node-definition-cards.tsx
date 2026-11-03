@@ -31,8 +31,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@ws-model-proxy/ui/components/select";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { Plus, RefreshCw, Trash } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
@@ -41,10 +41,11 @@ import { Help } from "@/components/help";
 import { specIssueText } from "@/lib/spec-issue-text";
 import { orpc } from "@/utils/orpc";
 
-import { parseLabels } from "./add-node-dialog";
+import { parseLabels } from "./add-node-dialog-utils";
 import { type GpuRow, KINDS, type Kind, toDeclaration } from "./declared-hardware";
 import { FieldError } from "./field-error";
-import { formatGb, StatusPill } from "./node-badges";
+import { StatusPill } from "./node-badges";
+import { formatGb } from "./node-badges-utils";
 import type { NodeDetail } from "./node-types";
 import { refusalToastOptions } from "./refusal";
 

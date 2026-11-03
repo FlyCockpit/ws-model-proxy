@@ -12,8 +12,8 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -21,7 +21,7 @@ import { AddToSharedPool } from "@/components/access/contribute";
 import { CopyableCode } from "@/components/copy-button";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
-import { formatGb } from "@/components/nodes/node-badges";
+import { formatGb } from "@/components/nodes/node-badges-utils";
 import { InstanceLoad } from "@/components/runtimes/instance-load";
 import {
   HeldUntilConfirmed,

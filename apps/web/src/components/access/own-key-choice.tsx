@@ -1,8 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useTranslation } from "react-i18next";
 
 import { NativeSelect } from "@/components/native-select";

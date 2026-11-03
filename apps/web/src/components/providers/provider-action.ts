@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useTranslation } from "react-i18next";
 
 import { refusalText } from "@/lib/refusal-text";

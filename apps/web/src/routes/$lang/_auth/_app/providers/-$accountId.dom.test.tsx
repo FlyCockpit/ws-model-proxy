@@ -86,7 +86,7 @@ vi.mock("react-i18next", () => ({
       options && !("defaultValue" in options) ? `${key}(${JSON.stringify(options)})` : key,
   }),
 }));
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
 vi.mock("@ws-model-proxy/ui/components/responsive-dialog", () => ({

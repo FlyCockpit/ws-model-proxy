@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({ toast: { error: vi.fn() } }));
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({ toast: { error: vi.fn() } }));
 vi.mock("@/utils/friendly-error", () => ({
   friendly: (_error: unknown, fallback?: string) => fallback ?? "generic",
 }));

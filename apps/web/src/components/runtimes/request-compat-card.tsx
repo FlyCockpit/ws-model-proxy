@@ -38,7 +38,7 @@ import {
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import type { TFunction } from "i18next";
 import { Plus, Trash2, X } from "lucide-react";
 import { type ReactNode, useId, useState } from "react";

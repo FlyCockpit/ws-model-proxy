@@ -20,7 +20,8 @@ import { WideContent } from "@/components/wide-content";
 import { collapseUnchanged, type DiffHunkLine, diffLines, stableJsonLines } from "@/lib/line-diff";
 import { orpc } from "@/utils/orpc";
 
-type VersionDetail = Awaited<ReturnType<AppRouterClient["runtimes"]["versions"]["get"]>>;
+import { versionDocument } from "./version-history-utils";
+
 type VersionSummary = Awaited<
   ReturnType<AppRouterClient["runtimes"]["versions"]["list"]>
 >["items"][number];
@@ -42,28 +43,6 @@ function keyedHunkLines(lines: readonly DiffHunkLine[]) {
     if (line.kind !== "remove") after += step;
     return { key, line };
   });
-}
-
-/** Settings changed from automatic: the effective value of every override. */
-function overrides(view: Record<string, { effective: unknown; source: string } | undefined>) {
-  return Object.fromEntries(
-    Object.entries(view).flatMap(([key, value]) =>
-      value?.source === "override" ? [[key, value.effective]] : [],
-    ),
-  );
-}
-
-/** What a version defines, as the diff shows it (limits and advanced: overrides only). */
-export function versionDocument(version: VersionDetail | null): unknown {
-  if (!version) return {};
-  return {
-    spec: version.spec,
-    limits: overrides(version.limits as Record<string, { effective: unknown; source: string }>),
-    advanced: overrides(
-      version.advanced as unknown as Record<string, { effective: unknown; source: string }>,
-    ),
-    compat: version.compat,
-  };
 }
 
 /**

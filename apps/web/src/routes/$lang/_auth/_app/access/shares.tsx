@@ -5,8 +5,8 @@ import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -15,16 +15,12 @@ import z from "zod";
 import { ConfirmAction } from "@/components/access/confirm-action";
 import { OwnKeyChoice } from "@/components/access/own-key-choice";
 import {
-  announceShared,
   CapLine,
   type InviteLink,
   InviteLinkDialog,
   InviteRow,
   PermissionCheckbox,
   Permissions,
-  PRIORITY_CHOICES,
-  type PriorityChoice,
-  priorityItems,
   RuntimeShareRow,
   ShareByMeRow,
   ShareEmpty,
@@ -33,6 +29,12 @@ import {
   useCreatePoolShare,
   useInvalidateShares,
 } from "@/components/access/pool-shares";
+import {
+  announceShared,
+  PRIORITY_CHOICES,
+  type PriorityChoice,
+  priorityItems,
+} from "@/components/access/pool-shares-utils";
 import { InlineRetry } from "@/components/inline-retry";
 import { PageHeading } from "@/components/page-stub";
 import { SegmentedControl } from "@/components/segmented-control";

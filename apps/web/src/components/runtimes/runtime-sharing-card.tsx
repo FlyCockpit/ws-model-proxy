@@ -11,18 +11,18 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
 import {
-  announceShared,
   type InviteLink,
   InviteLinkDialog,
   RuntimeShareRow,
   useInvalidateShares,
 } from "@/components/access/pool-shares";
+import { announceShared } from "@/components/access/pool-shares-utils";
 import { FieldErrors } from "@/components/field-errors";
 import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";

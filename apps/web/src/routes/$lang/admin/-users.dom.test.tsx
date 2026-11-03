@@ -26,7 +26,7 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
 }));
 
@@ -98,7 +98,7 @@ vi.mock("@/utils/orpc", () => {
   };
 });
 
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { createAppMutationCache } from "@/utils/mutation-error-toast";
 import { Route } from "./users";
 

@@ -9,11 +9,11 @@ vi.mock("@/lib/auth-client", () => ({
   authClient: { twoFactor: { enable: enableMock } },
 }));
 
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
 
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 
 import { useTotpEnrollment } from "./use-totp-enrollment";
 

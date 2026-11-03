@@ -7,8 +7,8 @@ import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Switch } from "@ws-model-proxy/ui/components/switch";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
@@ -23,6 +23,14 @@ import { refusalText } from "@/lib/refusal-text";
 import { isConflict, isNotFound } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
+import {
+  announceShared,
+  PRIORITY_CHOICES,
+  type PriorityChoice,
+  priorityItems,
+  priorityLabel,
+} from "./pool-shares-utils";
+
 /**
  * Pool and runtime shares and invites, shared by Access → Shares (everything), a pool's Sharing
  * tab (that pool only) and a runtime's sharing card. Every write here is people-only (a
@@ -35,8 +43,6 @@ export type InviteView = SharesList["invites"][number];
 export type InviteLink = { email: string; link: string; expiresAt: string };
 type CreateShareInput = Parameters<AppRouterClient["access"]["shares"]["create"]>[0];
 
-export const PRIORITY_CHOICES = ["POOL", "BACKGROUND", "NORMAL", "HIGH"] as const;
-export type PriorityChoice = (typeof PRIORITY_CHOICES)[number];
 const MONEY = /^(0|[1-9][0-9]{0,20})(\.[0-9]{1,9})?$/;
 const CURRENCY = /^[A-Z]{3}$/;
 
@@ -100,41 +106,6 @@ export function useCreatePoolShare(onLink: (link: InviteLink) => void) {
     return true;
   };
   return { submit, isPending: create.isPending };
-}
-
-/** What a share or invite answer tells the owner: shared, e-mailed, or a link to copy. */
-export function announceShared(
-  result:
-    | { kind: "share" }
-    | { kind: "invite"; invite: { expiresAt: string }; link: string | null },
-  email: string,
-  t: (key: string, options?: Record<string, unknown>) => string,
-  onLink: (link: InviteLink) => void,
-) {
-  if (result.kind === "share") toast.success(t("access:shares.shared", { email }));
-  else if (result.link) onLink({ email, link: result.link, expiresAt: result.invite.expiresAt });
-  else toast.success(t("access:shares.invited", { email }));
-}
-
-function priorityLabel(
-  t: (key: string) => string,
-  priority: ShareView["priorityClass"] | PriorityChoice,
-) {
-  switch (priority) {
-    case null:
-    case "POOL":
-      return t("access:shares.priorityPool");
-    case "BACKGROUND":
-      return t("access:shares.priorityBackground");
-    case "NORMAL":
-      return t("access:shares.priorityNormal");
-    case "HIGH":
-      return t("access:shares.priorityHigh");
-  }
-}
-
-export function priorityItems(t: (key: string) => string) {
-  return PRIORITY_CHOICES.map((value) => ({ value, label: priorityLabel(t, value) }));
 }
 
 /** What an invite or share names: a pool's callable id, or a runtime definition. */

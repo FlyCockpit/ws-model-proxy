@@ -15,8 +15,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@ws-model-proxy/ui/components/dialog";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import type { TFunction } from "i18next";
 import { Check, CircleAlert, Download, Info, Loader2, Undo2 } from "lucide-react";

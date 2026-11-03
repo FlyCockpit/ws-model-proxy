@@ -10,7 +10,7 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { ShieldCheck, ShieldOff } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";

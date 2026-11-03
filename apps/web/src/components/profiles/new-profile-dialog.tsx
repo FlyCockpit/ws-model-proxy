@@ -21,7 +21,8 @@ import type { NodeSummary } from "@/components/nodes/node-types";
 import { refusalToastOptions } from "@/components/nodes/refusal";
 import { orpc } from "@/utils/orpc";
 
-import { PROFILE_SLUG_PATTERN, slugFromName } from "./profile-editor";
+import { PROFILE_SLUG_PATTERN } from "./profile-editor";
+import { slugFromName } from "./profile-editor-utils";
 
 /** Name and nodes first; the editor adds what runs there. */
 export function NewProfileDialog({

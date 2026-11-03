@@ -9,15 +9,12 @@ vi.mock("react-i18next", () => ({
     i18n: { language: "en-US" },
   }),
 }));
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
 
-import {
-  OperatorStepItem,
-  type OperatorStepView,
-  operatorStepStatusKey,
-} from "./operator-step-item";
+import { OperatorStepItem } from "./operator-step-item";
+import { type OperatorStepView, operatorStepStatusKey } from "./operator-step-item-utils";
 
 afterEach(cleanup);
 

@@ -1,6 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
+import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
   CardContent,
@@ -10,7 +10,8 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";

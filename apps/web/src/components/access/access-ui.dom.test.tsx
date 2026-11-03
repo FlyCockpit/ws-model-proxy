@@ -5,9 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en-US" } }),
 }));
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({ toast: { success: vi.fn() } }));
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({ toast: { success: vi.fn() } }));
 
-import { credentialStatus, expiryFromChoice } from "./credential-meta";
+import { credentialStatus, expiryFromChoice } from "./credential-meta-utils";
 import { SecretReveal } from "./secret-reveal";
 
 afterEach(cleanup);

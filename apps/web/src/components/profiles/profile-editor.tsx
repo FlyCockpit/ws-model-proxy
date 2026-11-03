@@ -19,7 +19,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@ws-model-proxy/ui/components/select";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { Plus, Trash } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -46,16 +46,6 @@ type ItemRow = {
   nodeIds: string[];
 };
 type HoldRow = { nodeId: string; note: string };
-
-/** A slug from a name: "Evening gaming" → "evening-gaming". */
-export function slugFromName(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^[^a-z]+/, "")
-    .replace(/-+$/, "")
-    .slice(0, 41);
-}
 
 export function ProfileEditor({
   profile,

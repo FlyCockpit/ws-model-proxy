@@ -30,7 +30,7 @@ vi.mock("react-i18next", () => ({
   }),
 }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => async () => undefined }));
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
 vi.mock("@/components/confirm-delete-dialog", () => ({ ConfirmDeleteDialog: () => null }));

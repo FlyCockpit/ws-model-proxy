@@ -1,4 +1,4 @@
-import { buttonVariants } from "@ws-model-proxy/ui/components/button";
+import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";

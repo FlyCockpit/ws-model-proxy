@@ -1,8 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -14,22 +14,12 @@ import { TimeAgo } from "@/components/time-ago";
 import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
+import { stopUnprovenReason } from "./release-unproven-utils";
+
 type Instance = Awaited<ReturnType<AppRouterClient["runtimes"]["get"]>>["instanceList"][number];
-type Rank = Instance["ranks"][number];
 type ReleaseRequest = Awaited<
   ReturnType<AppRouterClient["runtimes"]["releaseRequests"]["list"]>
 >["items"][number];
-
-/**
- * Why the node cannot prove the stop right now, as the server records it on release: the node is
- * gone or offline, else the last automatic check's code (`status_running`, `port_in_use`, ...).
- */
-export function stopUnprovenReason(rank: Rank): string {
-  if (rank.nodeConnection === null) return "node_removed";
-  if (rank.nodeConnection.state === "OFFLINE") return "node_offline";
-  if (rank.lastStopCheck === null) return "no_check";
-  return rank.lastStopCheck.errorCode ?? "not_stopped";
-}
 
 /**
  * The agent's evidence entries with keys from their content: the command, numbered when the

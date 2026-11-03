@@ -10,8 +10,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";

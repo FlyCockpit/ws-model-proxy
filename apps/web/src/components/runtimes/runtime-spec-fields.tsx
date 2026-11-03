@@ -192,6 +192,7 @@ function CheckRow({
  * key of a form made with `useAppForm`. Switching tabs converts between them; parts the form has
  * no inputs for are kept (see `runtime-spec-draft.ts`).
  */
+// react-doctor-disable-next-line react-doctor/only-export-components -- withFieldGroup returns the component itself (React Doctor does not take a customHOCs setting)
 export const RuntimeSpecFields = withFieldGroup({
   defaultValues: editorValues({}) as SpecEditorValues,
   props: {} as { kind: RuntimeKind; idPrefix: string },

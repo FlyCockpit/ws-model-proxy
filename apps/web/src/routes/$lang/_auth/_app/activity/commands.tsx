@@ -2,8 +2,8 @@ import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-q
 import { createFileRoute } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Card, CardContent } from "@ws-model-proxy/ui/components/card";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
