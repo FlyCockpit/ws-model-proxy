@@ -235,22 +235,16 @@ describe("totpEnrollmentTransition", () => {
     expect(enrollment([{ type: "enableFailed", attempt: 1 }], enabling)).toEqual(typed);
   });
 
-  it("bug: cancel during an in-flight enable drops the late success", () => {
-    const cancelled = enrollment([{ type: "cancel" }], enabling);
-    expect(cancelled).toEqual({ kind: "idle" });
-    expect(totpEnrollmentTransition(cancelled, success(1, true))).toBe(cancelled);
-    // Restarting does not let the old attempt land in the new flow either.
-    const restarted = enrollment(
-      [
-        { type: "start" },
-        { type: "passwordChanged", password: "pw2" },
-        { type: "enableStarted", attempt: 2 },
-        success(1, true),
-      ],
-      cancelled,
-    );
-    expect(restarted).toMatchObject({ kind: "password", activity: { attempt: 2 } });
-    expect(enrollment([success(2, true)], restarted)).toMatchObject({ kind: "setup" });
+  it("bug: cancel is refused while an enable is in flight", () => {
+    // The server writes a secret for the in-flight enable regardless; a cancel and
+    // restart could race two enables and show codes for the overwritten secret.
+    expect(totpEnrollmentTransition(enabling, { type: "cancel" })).toBe(enabling);
+    expect(enrollment([success(1, true)], enabling)).toMatchObject({ kind: "setup" });
+  });
+
+  it("a late completion for an attempt that is no longer in flight is ignored", () => {
+    const failed = enrollment([{ type: "enableFailed", attempt: 1 }], enabling);
+    expect(totpEnrollmentTransition(failed, success(1, true))).toBe(failed);
   });
 
   it("bug: cancel clears the typed password", () => {

@@ -200,7 +200,12 @@ function Enable2FASection() {
           >
             {isEnabling ? t("auth:twoFactor.settingUp") : t("auth:twoFactor.continue")}
           </Button>
-          <Button className="min-h-[44px]" variant="ghost" onClick={() => enrollment.cancel()}>
+          <Button
+            className="min-h-[44px]"
+            variant="ghost"
+            onClick={() => enrollment.cancel()}
+            disabled={isEnabling}
+          >
             {t("common:actions.cancel")}
           </Button>
         </div>

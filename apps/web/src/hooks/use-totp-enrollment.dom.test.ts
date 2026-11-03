@@ -216,7 +216,7 @@ describe.each(callSites)(
       expect(hook.result.current.state.kind).toBe(enrolledKind);
     });
 
-    it("cancel during an in-flight enable drops the result and the password", async () => {
+    it("refuses cancel while an enable is in flight, so two enables never race", async () => {
       const pending = deferred<typeof TOTP_RESULT>();
       enableMock.mockReturnValue(pending.promise);
       const { hook } = mountEnrollment(logPrefix, message, confirmBackupCodes);
@@ -228,12 +228,31 @@ describe.each(callSites)(
       });
       act(() => {
         hook.result.current.cancel();
+        hook.result.current.start();
+      });
+      expect(hook.result.current.state).toMatchObject({
+        kind: "password",
+        activity: { kind: "enabling" },
       });
       await act(async () => {
         pending.resolve(TOTP_RESULT);
         await inFlight;
       });
 
+      expect(enableMock).toHaveBeenCalledTimes(1);
+      expect(hook.result.current.state.kind).toBe(enrolledKind);
+    });
+
+    it("cancel after a failed enable drops the password", async () => {
+      enableMock.mockResolvedValue({ data: null, error: { message: "nope" } });
+      const { hook } = mountEnrollment(logPrefix, message, confirmBackupCodes);
+      typePassword(hook);
+      await act(async () => {
+        await hook.result.current.enable();
+      });
+      act(() => {
+        hook.result.current.cancel();
+      });
       expect(hook.result.current.state).toEqual({ kind: "idle" });
       act(() => {
         hook.result.current.start();

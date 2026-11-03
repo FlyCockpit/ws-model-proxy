@@ -181,9 +181,11 @@ export function totpEnrollmentTransition(
       if (state.kind !== "idle") return state;
       return { kind: "password", password: "", activity: { kind: "idle" } };
     case "cancel":
-      // Cancelling drops the typed password and any in-flight enable: its
-      // completion no longer matches and is ignored.
-      if (state.kind !== "password") return state;
+      // Cancelling drops the typed password. It is refused while an enable is in
+      // flight: the server writes a new secret for that request whatever the page
+      // does, so cancelling and starting again could let two enables race and leave
+      // the shown QR code and backup codes for a secret the server overwrote.
+      if (state.kind !== "password" || state.activity.kind === "enabling") return state;
       return initialTotpEnrollmentState;
     case "passwordChanged":
       if (state.kind !== "password") return state;
