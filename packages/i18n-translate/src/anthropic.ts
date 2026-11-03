@@ -26,7 +26,7 @@ export class AnthropicDirectProvider implements TranslationProvider {
     const response = await this.client.messages.create({
       model,
       max_tokens: MAX_OUTPUT_TOKENS,
-      temperature: 0,
+      // No temperature: API version 2026-10-21 (SDK 1.x) rejects sampling parameters.
       system,
       messages: [{ role: "user", content: user }],
     });

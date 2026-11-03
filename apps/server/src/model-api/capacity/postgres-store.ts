@@ -455,6 +455,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             // AdmissionAttempt.schedule); never a process clock. The hardening
             // check keeps deadlineAt >= enqueuedAt: an attempt already past
             // its deadline expires at once, so its anchor is never used.
+            // biome-ignore lint/complexity/useMathMinMax: Dates; Math.min would return a number.
             enqueuedAt: attempt.deadlineAt < now ? attempt.deadlineAt : now,
             deadlineAt: attempt.deadlineAt,
             connectionOwner: attempt.connectionOwner,
@@ -625,8 +626,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           // may contribute and whose account is active.
           const share = member.Share;
           if (
-            !share ||
-            !share.canContribute ||
+            !share?.canContribute ||
             share.poolId !== attempt.poolId ||
             share.granteeUserId !== target.userId ||
             userCredentialAccessBlocked(share.Grantee, new Date())

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { readdirSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -14,7 +14,7 @@ import { mcpPageHref } from "./mcp-oauth-search";
  * R83/R84 F1): transitions between the MCP login and consent pages must keep
  * the RAW query string byte-identical, because the signed OAuth transaction
  * (repeated `ba_param` keys + `sig`) IS the URL. The probes run the INSTALLED
- * @better-auth/oauth-provider@1.7.3 `setSignedOAuthQueryParameterNames` /
+ * @better-auth/oauth-provider `setSignedOAuthQueryParameterNames` /
  * `buildSignedOAuthQuery` (the exact producer/consumer pair the browser flow
  * uses) against both the CHOSEN mechanism (raw search → history-layer
  * navigation) and the REJECTED mechanism (TanStack parse→stringify round
@@ -22,23 +22,44 @@ import { mcpPageHref } from "./mcp-oauth-search";
  */
 
 type SignedQueryModule = {
-  a: (params: URLSearchParams) => void; // setSignedOAuthQueryParameterNames
-  t: (search: string) => string | undefined; // buildSignedOAuthQuery
+  setNames: (params: URLSearchParams) => void; // setSignedOAuthQueryParameterNames
+  build: (search: string) => string | undefined; // buildSignedOAuthQuery
 };
+
+/** `{ a as b, c as d }` export/import lists, as `name -> alias` (or `alias -> name`). */
+function bindings(list: string): Map<string, string> {
+  return new Map(
+    list.split(",").map((entry) => {
+      const [local = "", exported = local] = entry.trim().split(/\s+as\s+/);
+      return [local.trim(), exported.trim()] as const;
+    }),
+  );
+}
 
 async function loadInstalledSignedQueryModule(): Promise<SignedQueryModule> {
   const require = createRequire(import.meta.url);
-  // The dist chunk name carries a content hash; resolve the package's
-  // ./client export (stable in the exports map) and locate the chunk next to
-  // it — the same two functions the installed client plugin imports.
+  // The two functions live in a private dist chunk whose file name and export letters change
+  // between releases. Follow the package's stable ./client export to the chunk it imports
+  // buildSignedOAuthQuery from, then read the letters from that chunk's export list.
   const clientPath = require.resolve("@better-auth/oauth-provider/client");
   const distDir = dirname(clientPath);
-  const chunk = readdirSync(distDir).find((name) =>
-    /^signed-query-[A-Za-z0-9_-]+\.mjs$/.test(name),
+  const client = readFileSync(clientPath, "utf8");
+  const imported = [...client.matchAll(/import\s*\{([^}]*)\}\s*from\s*"\.\/([^"]+)"/g)].find(
+    ([, list]) => list?.includes("buildSignedOAuthQuery"),
   );
-  if (!chunk) throw new Error("installed signed-query chunk not found");
-  const module = await import(pathToFileURL(join(distDir, chunk)).href);
-  return module as SignedQueryModule;
+  const chunkFile = imported?.[2];
+  if (!chunkFile) throw new Error("installed signed-query chunk not found");
+  const chunkPath = join(distDir, chunkFile);
+  const exportList = /export\s*\{([^}]*)\}/.exec(readFileSync(chunkPath, "utf8"))?.[1] ?? "";
+  const exported = bindings(exportList);
+  const buildName = exported.get("buildSignedOAuthQuery");
+  const setNamesName = exported.get("setSignedOAuthQueryParameterNames");
+  if (!buildName || !setNamesName) throw new Error("installed signed-query exports not found");
+  const module = (await import(pathToFileURL(chunkPath).href)) as Record<string, unknown>;
+  return {
+    setNames: module[setNamesName] as SignedQueryModule["setNames"],
+    build: module[buildName] as SignedQueryModule["build"],
+  };
 }
 
 /** A REAL Better Auth signed query: repeated ba_param keys + sig + ba_iat. */
@@ -51,7 +72,7 @@ async function buildRealSignedQuery(): Promise<string> {
   params.set("code_challenge", "cc-S0meL0ngCh4llenge");
   params.set("ba_iat", "1758100000000");
   params.set("sig", "sig-SECRET-value");
-  signed.a(params);
+  signed.setNames(params);
   return params.toString();
 }
 
@@ -90,7 +111,7 @@ describe("raw-query MCP page transitions (R83/R84 F1)", () => {
     // The INSTALLED buildSignedOAuthQuery (what oauthProviderClient()'s fetch
     // plugin runs over window.location.search) still sees the original
     // client_id/scope/sig — repeated ba_param keys intact.
-    const oauthQuery = signedQuery.t(window.location.search);
+    const oauthQuery = signedQuery.build(window.location.search);
     expect(oauthQuery).toBeDefined();
     const params = new URLSearchParams(oauthQuery ?? "");
     expect(params.get("client_id")).toBe("mcp-client-1");

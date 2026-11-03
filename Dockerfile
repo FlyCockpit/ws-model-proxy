@@ -1,4 +1,4 @@
-FROM node:24-slim AS base
+FROM node:26-slim AS base
 
 ARG APT_CACHE_DATE=static
 
@@ -6,8 +6,8 @@ ARG APT_CACHE_DATE=static
 #   - openssl: required by Prisma query engine
 #   - postgresql-client: provides psql, used by docker-entrypoint.sh to hold a
 #     Postgres advisory lock around `prisma db push` (multi-replica safety).
-# `apt-get upgrade` pulls the latest Debian 12 security patches for packages
-# already in node:24-slim (glibc, libcap2, systemd libs, etc.) — the base image
+# `apt-get upgrade` pulls the latest Debian 13 security patches for packages
+# already in node:26-slim (glibc, libcap2, systemd libs, etc.) — the base image
 # lags the Debian point release, so Trivy fails on fixable HIGH CVEs without it.
 RUN echo "APT cache date: ${APT_CACHE_DATE}" && apt-get update -y && apt-get upgrade -y && apt-get install -y \
   openssl \
@@ -26,7 +26,9 @@ RUN apt-get update -y && apt-get install -y \
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 ENV NODE_OPTIONS="--max-old-space-size=4096"
-RUN corepack enable && corepack prepare pnpm@11.28.5 --activate
+# Node 25+ no longer bundles corepack, so pnpm comes from npm (build stages only).
+# Keep the version equal to package.json's packageManager.
+RUN npm install -g pnpm@12.16.0
 
 # --- Builder stage ---
 # pnpm install runs here with source files present so workspace symlinks resolve correctly
@@ -227,7 +229,7 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh ./scripts/backup.sh
 # Build stages keep npm; this only affects the final runner image.
 RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
-# Drop privileges. The `node` user (uid 1000) ships in node:24-slim. The
+# Drop privileges. The `node` user (uid 1000) ships in node:26-slim. The
 # server only reads /app at runtime; the entrypoint's writes go to /tmp
 # (mktemp) and to Postgres over the network, so no chown of /app is needed.
 USER node

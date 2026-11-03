@@ -30,7 +30,8 @@ const fromDeclaration = (value: Declaration): boolean | null =>
 
 /** The same capabilities, in any order. */
 function sameCapabilities(a: readonly Capability[], b: readonly Capability[]): boolean {
-  return a.length === b.length && a.every((capability) => b.includes(capability));
+  const other = new Set(b);
+  return a.length === b.length && a.every((capability) => other.has(capability));
 }
 
 /**

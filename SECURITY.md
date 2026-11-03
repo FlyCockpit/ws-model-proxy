@@ -16,7 +16,7 @@ Only the latest release is supported.
 
 ## Security controls
 
-- pnpm 11 supply-chain hardening: release-age gate, exotic-subdependency
+- pnpm supply-chain hardening: release-age gate, exotic-subdependency
   blocking, build-script allowlist, and sha512-pinned package manager.
 - SHA-pinned GitHub Actions kept current by Dependabot.
 - Trufflehog verified-secret scanning on every PR.
