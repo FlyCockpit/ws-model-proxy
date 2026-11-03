@@ -257,6 +257,8 @@ type RuntimeModelRow = {
   >;
   capabilities: RuntimeModelRow["detectedCapabilities"];
   capabilitiesOverridden: boolean;
+  declaredTools: boolean | null;
+  declaredReasoning: boolean | null;
   retired: boolean;
   Members: Array<{
     poolId: string;
@@ -275,6 +277,8 @@ function runtimeModelView(model: RuntimeModelRow) {
     detectedCapabilities: effectiveModelCapabilities({ ...model, capabilitiesOverridden: false }),
     capabilities: effectiveModelCapabilities(model),
     capabilitiesOverridden: model.capabilitiesOverridden,
+    tools: model.declaredTools,
+    reasoning: model.declaredReasoning,
     retired: model.retired,
     pools: model.Members.map((member) => ({
       poolId: member.poolId,
@@ -1057,10 +1061,15 @@ export const runtimesRouter = {
         callerActor(context.auth, userId);
         const updated = await prisma.runtimeModel.updateMany({
           where: { id: input.runtimeModelId, userId },
-          data:
-            input.capabilities === null
-              ? { capabilities: [], capabilitiesOverridden: false }
-              : { capabilities: input.capabilities, capabilitiesOverridden: true },
+          data: {
+            ...(input.capabilities === undefined
+              ? {}
+              : input.capabilities === null
+                ? { capabilities: [], capabilitiesOverridden: false }
+                : { capabilities: input.capabilities, capabilitiesOverridden: true }),
+            ...(input.tools === undefined ? {} : { declaredTools: input.tools }),
+            ...(input.reasoning === undefined ? {} : { declaredReasoning: input.reasoning }),
+          },
         });
         if (updated.count === 0) throw notFound("That served model does not exist.");
         return ownedRuntimeModelView(userId, input.runtimeModelId);

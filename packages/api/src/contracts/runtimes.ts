@@ -65,6 +65,20 @@ export const runtimeSlugSchema = slugSchema.refine(
 
 // ── Views ──
 
+/** A served-model capability change sets at least one of capabilities, tools and reasoning. */
+export function changesServedModelCapabilities(input: {
+  capabilities?: unknown;
+  tools?: unknown;
+  reasoning?: unknown;
+}): boolean {
+  return (
+    input.capabilities !== undefined || input.tools !== undefined || input.reasoning !== undefined
+  );
+}
+export const SERVED_MODEL_CAPABILITIES_REQUIRED = {
+  message: "Set capabilities, tools or reasoning.",
+};
+
 export const runtimeModelViewSchema = z
   .object({
     id: idSchema,
@@ -73,6 +87,10 @@ export const runtimeModelViewSchema = z
     detectedCapabilities: z.array(z.enum(MODEL_CAPABILITY)),
     capabilities: z.array(z.enum(MODEL_CAPABILITY)),
     capabilitiesOverridden: z.boolean(),
+    /** The owner's declaration that the model takes tool calls; null: unknown. */
+    tools: z.boolean().nullable(),
+    /** The owner's declaration that the model takes reasoning controls; null: unknown. */
+    reasoning: z.boolean().nullable(),
     retired: z.boolean(),
     /** Pools using this served model (own and contributed). */
     pools: z.array(
@@ -839,13 +857,18 @@ export const runtimesContract = {
       z
         .object({
           runtimeModelId: idSchema,
-          /** null: use the detected capabilities again. */
-          capabilities: z.array(z.enum(MODEL_CAPABILITY)).nullable(),
+          /** null: use the detected capabilities again. Absent: unchanged. */
+          capabilities: z.array(z.enum(MODEL_CAPABILITY)).nullable().optional(),
+          /** Takes tool calls. null: unknown (tool requests still route here). Absent: unchanged. */
+          tools: z.boolean().nullable().optional(),
+          /** Takes reasoning controls. null: unknown. Absent: unchanged. */
+          reasoning: z.boolean().nullable().optional(),
           note: noteSchema.optional(),
         })
-        .strict(),
+        .strict()
+        .refine(changesServedModelCapabilities, SERVED_MODEL_CAPABILITIES_REQUIRED),
       runtimeModelViewSchema,
-      "Override a served model's capabilities.",
+      "Override a served model's capabilities, or declare whether it takes tool calls and reasoning.",
       ["runtime_update"],
     ),
   },

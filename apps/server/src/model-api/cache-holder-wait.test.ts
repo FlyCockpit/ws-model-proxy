@@ -127,6 +127,44 @@ describe("cache holder plan", () => {
       }),
     ).resolves.toBeNull();
   });
+
+  it("never lets a holder ranked below the best class defer a better-ranked member", async () => {
+    const source = speedSource(async () => undefined);
+    // a (declared to take the request's tools) is cold; b (unknown) holds the cache.
+    const ranked = [
+      { poolMemberId: "a", executionTargetId: "t-a", rank: 0 },
+      { poolMemberId: "b", executionTargetId: "t-b", rank: 1 },
+    ];
+    const hit = decision({ prefixDepths: { "t-b": 4 } });
+    const plan = await planCacheHolderWait({
+      decision: hit,
+      candidates: ranked,
+      poolOverrideMs: null,
+      speedSource: source,
+    });
+    expect(plan).toBeNull();
+    expect(spillDelayMs(plan, "a", true, 0)).toBeUndefined();
+    expect(source.tokensPerSecond).not.toHaveBeenCalled();
+  });
+
+  it("plans within the best class and defers worse-ranked members too", async () => {
+    const source = speedSource(async () => undefined);
+    const ranked = [
+      { poolMemberId: "a", executionTargetId: "t-a", rank: 0 },
+      { poolMemberId: "b", executionTargetId: "t-b", rank: 0 },
+      { poolMemberId: "c", executionTargetId: "t-c", rank: 1 },
+    ];
+    const plan = await planCacheHolderWait({
+      decision: decision({ prefixDepths: { "t-b": 4, "t-c": 9 } }),
+      candidates: ranked,
+      poolOverrideMs: null,
+      speedSource: source,
+    });
+    expect(plan?.holderMemberIds).toEqual(new Set(["b"]));
+    expect(spillDelayMs(plan, "a", true, 0)).toBe(CACHE_HOLDER_WAIT_DEFAULT_MS);
+    expect(spillDelayMs(plan, "c", true, 0)).toBe(CACHE_HOLDER_WAIT_DEFAULT_MS);
+    expect(spillDelayMs(plan, "b", true, 0)).toBeUndefined();
+  });
 });
 
 describe("cache holder outcome", () => {

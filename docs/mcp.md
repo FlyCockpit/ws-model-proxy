@@ -439,6 +439,17 @@ or `audio_input`), and may set a
 without models is a **service**: it claims its resources but is never a pool
 member.
 
+Whether a served model takes tool calls and reasoning (thinking) controls is
+not detected: declare it with `runtime_update`'s `modelCapabilities`
+(`{runtimeModelId, tools?, reasoning?}`, each `true`, `false`, or `null` for
+unknown) once you know it, for example from the engine's tool-call parser
+flags. A pool sends tool or reasoning requests to members declared `true`
+first, then to unknown members, and never to a member declared `false` (a
+reasoning effort of `"none"` still reaches it). Directly addressed models are
+not filtered. `runtimes_get` shows the declarations on each
+served model, and `/v1/models` advertises `supports_tools` /
+`supports_reasoning` once they are known.
+
 Put model downloads and other setup in an idempotent `prepare` step, so applying
 a profile on a fresh node fetches weights by itself. A spec is at most 48 KiB as
 canonical JSON and one command at most 4 KiB. `limits` (null: automatic) and

@@ -2135,6 +2135,23 @@
       "detectedList": "Detectadas: {{list}}",
       "useDetected": "Usar las detectadas",
       "saved": "Capacidades guardadas.",
+      "declaration": {
+        "unknown": "Desconocido",
+        "yes": "Sí",
+        "no": "No"
+      },
+      "tools": {
+        "label": "Llamadas a herramientas",
+        "hint": "Los pools envían las solicitudes con herramientas primero a los miembros con Sí, luego a los Desconocidos; nunca a los No.",
+        "yes": "Herramientas",
+        "no": "Sin herramientas"
+      },
+      "reasoning": {
+        "label": "Razonamiento",
+        "hint": "Los pools envían las solicitudes con razonamiento primero a los miembros con Sí, luego a los Desconocidos; nunca a los No. Un esfuerzo de none sí llega a los No.",
+        "yes": "Razonamiento",
+        "no": "Sin razonamiento"
+      },
       "values": {
         "text_generation": "Texto",
         "vision_input": "Imágenes de entrada",

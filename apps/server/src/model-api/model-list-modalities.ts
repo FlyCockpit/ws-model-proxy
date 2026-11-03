@@ -30,6 +30,10 @@ export type ModelListCapabilitiesAdvertisement = {
   audio_translation: boolean;
   /** Live `/v1/realtime?intent=transcription` sessions (a hint; routing decides). */
   realtime_transcription: boolean;
+  /** Tool calls, when the owner declared them; absent is unknown. */
+  tools?: boolean;
+  /** Reasoning (thinking) controls, when the owner declared them; absent is unknown. */
+  reasoning?: boolean;
 };
 
 export type ModelListArchitectureAdvertisement = {
@@ -59,7 +63,32 @@ export type MultimodalFlags = {
    * instance whose target is healthy or not yet judged, and never on `:external`.
    */
   realtimeTranscription?: boolean;
+  /**
+   * Tool calls on a text surface: true when one takes them, false when every one is
+   * declared without them, absent when unknown.
+   */
+  tools?: boolean;
+  /** Reasoning controls, decided like `tools`. */
+  reasoning?: boolean;
 };
+
+/** True when any is true, false when all are known and false, otherwise unknown. */
+function anyKnown(values: ReadonlyArray<boolean | undefined>): boolean | undefined {
+  if (values.some((value) => value === true)) return true;
+  if (values.length > 0 && values.every((value) => value === false)) return false;
+  return undefined;
+}
+
+function declaredFlags(
+  surfaces: ReadonlyArray<{ tools?: boolean; reasoning?: boolean }>,
+): Pick<MultimodalFlags, "tools" | "reasoning"> {
+  const tools = anyKnown(surfaces.map((surface) => surface.tools));
+  const reasoning = anyKnown(surfaces.map((surface) => surface.reasoning));
+  return {
+    ...(tools === undefined ? {} : { tools }),
+    ...(reasoning === undefined ? {} : { reasoning }),
+  };
+}
 
 function realtimeFlag(capabilities: OpenAiCompatibleCapabilities): {
   realtimeTranscription?: true;
@@ -104,6 +133,7 @@ export function multimodalFlagsFromCapabilities(
       audioTranscription,
       audioTranslation,
       ...realtimeFlag(capabilities),
+      ...declaredFlags(enabledSurfaces),
     };
   }
 
@@ -137,6 +167,11 @@ export function multimodalFlagsFromCapabilities(
     audioTranscription,
     audioTranslation,
     ...realtimeFlag(capabilities),
+    ...declaredFlags(
+      [capabilities.chatCompletions, capabilities.responses].filter(
+        (surface): surface is NonNullable<typeof surface> => surface?.supported === true,
+      ),
+    ),
   };
 }
 
@@ -144,7 +179,7 @@ export function unionMultimodalFlags(flags: MultimodalFlags[]): MultimodalFlags 
   if (flags.length === 0) {
     return multimodalFlagsFromCapabilities(null);
   }
-  return flags.reduce(
+  const union = flags.reduce(
     (acc, next) => ({
       ...(acc.embeddings || next.embeddings ? { embeddings: true } : {}),
       text: acc.text || next.text,
@@ -168,6 +203,8 @@ export function unionMultimodalFlags(flags: MultimodalFlags[]): MultimodalFlags 
       audioTranslation: false,
     },
   );
+  // A pool takes tools when any member does; it is known not to only when every member is.
+  return { ...union, ...declaredFlags(flags) };
 }
 
 /**
@@ -185,6 +222,8 @@ export function poolModelListFlags(
       type?: string;
       embeddingContract?: unknown;
       transcriptionProfile?: unknown;
+      tools?: boolean | null;
+      reasoning?: boolean | null;
     };
   }>,
 ): MultimodalFlags {
@@ -200,7 +239,9 @@ export function poolModelListFlags(
 
 /** The flags of a pool's `owner/pool:external` entry: live sessions never take `:external`. */
 export function externalModelListFlags(flags: MultimodalFlags): MultimodalFlags {
-  return { ...flags, realtimeTranscription: false };
+  // A cloud member's tool and reasoning support is the provider's, not the local members'.
+  const { tools: _tools, reasoning: _reasoning, ...rest } = flags;
+  return { ...rest, realtimeTranscription: false };
 }
 
 export function inputModalitiesFromFlags(flags: MultimodalFlags): ModelInputModality[] {
@@ -239,6 +280,8 @@ export function openAiModelListExtensions(flags: MultimodalFlags): {
   supports_audio_transcription: boolean;
   supports_audio_translation: boolean;
   supports_realtime_transcription: boolean;
+  supports_tools?: boolean;
+  supports_reasoning?: boolean;
   capabilities: ModelListCapabilitiesAdvertisement;
   architecture: ModelListArchitectureAdvertisement;
 } {
@@ -252,6 +295,8 @@ export function openAiModelListExtensions(flags: MultimodalFlags): {
     supports_audio_transcription: flags.audioTranscription,
     supports_audio_translation: flags.audioTranslation,
     supports_realtime_transcription: flags.realtimeTranscription === true,
+    ...(flags.tools === undefined ? {} : { supports_tools: flags.tools }),
+    ...(flags.reasoning === undefined ? {} : { supports_reasoning: flags.reasoning }),
     capabilities: {
       embeddings: flags.embeddings === true,
       vision: flags.vision,
@@ -261,6 +306,8 @@ export function openAiModelListExtensions(flags: MultimodalFlags): {
       audio_transcription: flags.audioTranscription,
       audio_translation: flags.audioTranslation,
       realtime_transcription: flags.realtimeTranscription === true,
+      ...(flags.tools === undefined ? {} : { tools: flags.tools }),
+      ...(flags.reasoning === undefined ? {} : { reasoning: flags.reasoning }),
     },
     architecture: {
       input_modalities,

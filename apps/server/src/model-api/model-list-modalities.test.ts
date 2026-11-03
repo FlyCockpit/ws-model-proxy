@@ -235,3 +235,46 @@ describe("poolModelListFlags", () => {
     });
   });
 });
+
+describe("declared tool and reasoning advertisement", () => {
+  const row = (id: string, tools?: boolean | null, reasoning?: boolean | null, active = true) => ({
+    active,
+    model: { id, capabilities: ["TEXT_GENERATION"], tools, reasoning },
+  });
+
+  it("omits the fields while support is unknown", () => {
+    const ext = openAiModelListExtensions(poolModelListFlags([row("a"), row("b", null, null)]));
+    expect(ext).not.toHaveProperty("supports_tools");
+    expect(ext).not.toHaveProperty("supports_reasoning");
+    expect(ext.capabilities).not.toHaveProperty("tools");
+    expect(ext.capabilities).not.toHaveProperty("reasoning");
+  });
+
+  it("advertises a pool as taking tools when any active member does", () => {
+    const ext = openAiModelListExtensions(
+      poolModelListFlags([row("a", false), row("b"), row("c", true, false)]),
+    );
+    expect(ext).toMatchObject({ supports_tools: true, capabilities: { tools: true } });
+    // b's reasoning is unknown, so the pool's is too.
+    expect(ext).not.toHaveProperty("supports_reasoning");
+  });
+
+  it("advertises false only when every active member is declared false", () => {
+    const flags = poolModelListFlags([row("a", false, false), row("b", false, false)]);
+    expect(openAiModelListExtensions(flags)).toMatchObject({
+      supports_tools: false,
+      supports_reasoning: false,
+      capabilities: { tools: false, reasoning: false },
+    });
+    // An inactive member that takes tools does not count.
+    const withInactive = poolModelListFlags([row("a", false), row("b", true, null, false)]);
+    expect(openAiModelListExtensions(withInactive)).toMatchObject({ supports_tools: false });
+  });
+
+  it("does not carry local declarations to the :external entry", () => {
+    const flags = poolModelListFlags([row("a", true, true)]);
+    const ext = openAiModelListExtensions(externalModelListFlags(flags));
+    expect(ext).not.toHaveProperty("supports_tools");
+    expect(ext).not.toHaveProperty("supports_reasoning");
+  });
+});

@@ -27,6 +27,18 @@ A reverse proxy must not buffer that path: Traefik (Dokploy) and Caddy stream it
 If something in front does buffer it, the pages fall back to their old polling, and the Nodes
 and Terminals pages say "Live updates paused".
 
+## Declared tool and reasoning support
+
+A served model can now be declared as taking tool calls and reasoning controls, or not: on the
+runtime page (Capabilities, Change) or with MCP `runtime_update`'s `modelCapabilities`
+(`tools`, `reasoning`). Pools send tool and reasoning requests to members declared with them
+first, then to undeclared (unknown) members as before, and never to members declared without
+them; a reasoning effort of `"none"` still reaches those. `/v1/models` adds
+`supports_tools` / `supports_reasoning` (and `capabilities.tools` / `.reasoning`) once known:
+true for a pool when any active member takes them, false only when every one is declared
+without. The two new `runtime_model` columns need `APPLY_SCHEMA=safe`. No `wsmp` upgrade is
+needed.
+
 ## MCP tool results
 
 - A refusal's text now starts with its reason (`shell_unavailable: Node … has no pwsh …`), for

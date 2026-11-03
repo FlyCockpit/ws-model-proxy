@@ -243,7 +243,7 @@ import {
   withEstimatedUsage,
 } from "./relay-usage-facts.js";
 import { type RelayBodySource } from "./request-body-source.js";
-import { profileSurfaceRequest } from "./request-feature-profiler.js";
+import { profileSurfaceRequest, reasoningOnlyTurnedOff } from "./request-feature-profiler.js";
 import { REQUEST_JSON_DEPTH_ERROR, requestJsonDepthExceeded } from "./request-json-depth.js";
 import {
   type ApiKeyIdentity,
@@ -267,7 +267,10 @@ import {
   storedResponseUnavailable,
   unsupportedCapabilityMessage,
 } from "./responses-storage.js";
-import { servedModelCapabilities } from "./served-model-capabilities.js";
+import {
+  servedModelCapabilities,
+  undeclaredRequestedFeatures,
+} from "./served-model-capabilities.js";
 import {
   isBasicTranscriptionRequest,
   TranscriptionRequestError,
@@ -2155,6 +2158,9 @@ function executionPathForPoolMember(
   const rawRequirements = operation.adaptation
     ? profileSurfaceRequest(operation.adaptation.payload)
     : {};
+  // Local engines ignore an effort of "none", so it reaches a member declared without reasoning.
+  if (operation.adaptation && reasoningOnlyTurnedOff(operation.adaptation.payload))
+    delete rawRequirements.reasoning;
   return resolveExecutionPath({
     capabilities,
     requestedSurface: modelApiSurface(requestedSurface),
@@ -2197,12 +2203,15 @@ function responsesOperationForRelay(
 function canonicalRequestRequirements(
   request: ReturnType<typeof parseCanonicalRequest>,
 ): SurfaceRequestRequirements {
+  // Only adds needs: a false here must not clear what the raw profile found (tool history).
   return {
     stream: request.stream,
-    tools: request.tools.length > 0,
-    inputImages: request.messages.some((message) =>
+    ...(request.tools.length > 0 ? { tools: true } : {}),
+    ...(request.messages.some((message) =>
       message.content.some((content) => content.type === "image"),
-    ),
+    )
+      ? { inputImages: true }
+      : {}),
   };
 }
 
@@ -5437,9 +5446,21 @@ async function relayPool({
     const sequence = buildPoolRouteSequence({ routes, onlineNodeIds, now, alternatives });
     return sequence.ok ? sequence.candidates : [];
   });
+  // Within a protocol class, members declared to take the request's tools / reasoning come
+  // before members whose support is unknown (0-2 undeclared needs).
+  const undeclaredByMember = new Map(
+    eligibleMembers.map((member) => [
+      member.id,
+      undeclaredRequestedFeatures(
+        effectivePoolMemberCapabilities(member),
+        executionByMember.get(member.id)?.requirements,
+      ),
+    ]),
+  );
   const routeModeRank = (candidate: (typeof localRouteCandidates)[number]) => {
     const mode = executionByMember.get(candidate.poolMemberId)?.mode;
-    return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
+    const modeRank = mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
+    return modeRank * 3 + (undeclaredByMember.get(candidate.poolMemberId) ?? 0);
   };
   // Estimates never fail closed; they only prefer members whose full estimate
   // (media included) still fits the same ceiling as admission.
@@ -5458,7 +5479,8 @@ async function relayPool({
       : eligibleMembers.map((member) => member.id),
   );
   const estimateFitRank = (poolMemberId: string) => (estimateFitIds.has(poolMemberId) ? 0 : 1);
-  // PRIMARY members are always local. Native compatibility is the first class;
+  // PRIMARY members are always local. Native compatibility is the first class (and, within it,
+  // declared tool / reasoning support before unknown);
   // member weight remains only as a stable pre-affinity order (new
   // conversations treat weight as a proportional share inside ranking).
   let routeCandidates = [...localRouteCandidates].sort(
@@ -5938,9 +5960,12 @@ async function relayPool({
     try {
       cacheHolderPlan = await planCacheHolderWait({
         decision: affinityDecision,
-        candidates: routeCandidates.map(({ poolMemberId }) => ({
-          poolMemberId,
-          executionTargetId: memberById.get(poolMemberId)?.target.id,
+        // The class rank (protocol mode, then declared tool / reasoning support): a holder
+        // ranked below the best class never defers a better-ranked member.
+        candidates: routeCandidates.map((candidate) => ({
+          poolMemberId: candidate.poolMemberId,
+          executionTargetId: memberById.get(candidate.poolMemberId)?.target.id,
+          rank: routeModeRank(candidate),
         })),
         poolOverrideMs: undefined,
         speedSource: prefillSpeedSource,
