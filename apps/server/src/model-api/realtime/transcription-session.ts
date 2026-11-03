@@ -10,6 +10,7 @@ import {
   type SttSessionEnd,
   type SttSessionEvent,
 } from "../../relay/stt-relay.js";
+import { type CandidateAttempt, candidateAttempt } from "./candidate-attempt.js";
 import {
   audioSeconds,
   clearedEvent,
@@ -376,12 +377,29 @@ const ROUTE_ERRORS: Record<
   },
 };
 
+type SessionCandidateAttempt = CandidateAttempt<RealtimeCandidate, RealtimeCandidateLease>;
+
+/**
+ * The session's life. Routing owns its abort, its deadline timer and the candidate attempt in
+ * flight; an open session owns the attempt it opened on (whose lease it holds until the end).
+ */
+type SessionPhase =
+  | { kind: "awaiting_model" }
+  | {
+      kind: "routing";
+      abort: AbortController;
+      timer: ReturnType<typeof setTimeout>;
+      attempt: SessionCandidateAttempt | null;
+    }
+  | { kind: "open"; attempt: SessionCandidateAttempt }
+  | { kind: "closed" };
+
+type RoutingPhase = Extract<SessionPhase, { kind: "routing" }>;
+
 export class RealtimeTranscriptionSession {
-  private state: "awaiting_model" | "routing" | "open" | "closed" = "awaiting_model";
+  private phase: SessionPhase = { kind: "awaiting_model" };
   private readonly view: RealtimeSessionView;
   private relaySession: SttRelaySession | null = null;
-  private routingAbort: AbortController | null = null;
-  private routingTimer: ReturnType<typeof setTimeout> | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
 
   private readonly deferred: Deferred[] = [];
@@ -395,11 +413,7 @@ export class RealtimeTranscriptionSession {
 
   /** Language/prompt updates received while routing, applied once open (review L1). */
   private readonly heldUpdates: { patch: RealtimeSessionPatch; eventId: string | undefined }[] = [];
-  /** The candidate whose open is in flight, and its admission lease. */
-  private attempting: RealtimeCandidate | null = null;
-  /** The half-open trial the current open attempt holds; settled exactly once. */
-  private trial: { candidate: RealtimeCandidate; startedAt: Date } | null = null;
-  private lease: RealtimeCandidateLease | null = null;
+  /** The candidate the session opened on (reported when it ends). */
   private openedOn: RealtimeCandidate | null = null;
 
   private rateWindowStart = 0;
@@ -430,8 +444,18 @@ export class RealtimeTranscriptionSession {
     this.view = { id: realtimeId("sess"), model: null };
   }
 
-  get status(): "awaiting_model" | "routing" | "open" | "closed" {
-    return this.state;
+  get status(): SessionPhase["kind"] {
+    return this.phase.kind;
+  }
+
+  /** The routing phase while it lasts; read fresh after every await. */
+  private routingPhase(): RoutingPhase | null {
+    return this.phase.kind === "routing" ? this.phase : null;
+  }
+
+  /** Routing is still this run's: not opened, closed, or aborted. */
+  private stillRouting(signal: AbortSignal): boolean {
+    return this.routingPhase() !== null && !signal.aborted;
   }
 
   /** Sends `session.created`; with `?model=` routing starts at once. */
@@ -447,7 +471,7 @@ export class RealtimeTranscriptionSession {
 
   /** One text frame from the client. */
   handleText(text: string) {
-    if (this.state === "closed") return;
+    if (this.status === "closed") return;
     if (!this.admitEventRate()) return;
     const parsed = parseRealtimeClientEvent(text);
     if (!parsed.ok) {
@@ -465,7 +489,7 @@ export class RealtimeTranscriptionSession {
 
   /** Binary frames carry nothing in this protocol. */
   handleBinary() {
-    if (this.state === "closed") return;
+    if (this.status === "closed") return;
     if (!this.admitEventRate()) return;
     this.send(
       errorEvent({
@@ -496,7 +520,7 @@ export class RealtimeTranscriptionSession {
   // ---- client events ----
 
   private apply(event: RealtimeClientEvent) {
-    if (this.state === "closed") return;
+    if (this.status === "closed") return;
     switch (event.type) {
       case "session.update":
         this.applyPatch(event.patch, event.eventId);
@@ -514,7 +538,7 @@ export class RealtimeTranscriptionSession {
   }
 
   private applyPatch(patch: RealtimeSessionPatch, eventId: string | undefined) {
-    const startsRouting = patch.model !== undefined && this.state === "awaiting_model";
+    const startsRouting = patch.model !== undefined && this.status === "awaiting_model";
     if (patch.model !== undefined && !startsRouting && patch.model !== this.view.model) {
       this.clientError({
         code: "invalid_value",
@@ -526,7 +550,7 @@ export class RealtimeTranscriptionSession {
     }
     const languageChanged = patch.language !== undefined && patch.language !== this.view.language;
     const promptChanged = patch.prompt !== undefined && patch.prompt !== this.view.prompt;
-    if ((languageChanged || promptChanged) && this.state === "routing") {
+    if ((languageChanged || promptChanged) && this.status === "routing") {
       // Whether the member takes a language or prompt is known only once it
       // opens; answer then (session.updated or an error), never before.
       if (this.heldUpdates.length >= REALTIME_HELD_UPDATES_MAX) {
@@ -698,23 +722,24 @@ export class RealtimeTranscriptionSession {
       return;
     }
     this.relaySession = created.session;
-    this.state = "routing";
-    this.routingAbort = new AbortController();
-    this.routingTimer = setTimeout(() => {
-      if (this.state !== "routing") return;
-      // The deadline cut an open in flight: that member did not answer in time.
-      const cut = this.attempting;
-      if (cut) this.notifyMemberFailed(cut, "timeout");
-      else this.releaseTrial("unused");
+    const abort = new AbortController();
+    const timer = setTimeout(() => {
+      const routing = this.routingPhase();
+      if (!routing) return;
+      // The deadline cut an open in flight: that member did not answer in time. Anything
+      // else the attempt holds is released by the close below.
+      if (routing.attempt?.stage === "opening")
+        routing.attempt.settleTrial({ kind: "member_failed", failure: "timeout" });
       this.fail(REALTIME_CLOSE_CODES.tryAgainLater, {
         type: "server_error",
         code: "server_busy",
         message: "No live transcription capacity became available in time.",
       });
     }, REALTIME_ROUTING_DEADLINE_MS);
-    this.routingTimer.unref?.();
+    timer.unref?.();
+    this.phase = { kind: "routing", abort, timer, attempt: null };
     const deadline = Date.now() + REALTIME_ROUTING_DEADLINE_MS;
-    void this.route(model, created.session, this.routingAbort.signal, deadline).catch(() => {
+    void this.route(model, created.session, abort.signal, deadline).catch(() => {
       this.fail(REALTIME_CLOSE_CODES.internal, {
         type: "server_error",
         code: "server_error",
@@ -730,7 +755,7 @@ export class RealtimeTranscriptionSession {
     deadline: number,
   ) {
     const route = await this.deps.router.candidates({ model, config: this.config(), signal });
-    if (this.state !== "routing" || signal.aborted) return;
+    if (!this.stillRouting(signal)) return;
     if (!route.ok) {
       const { error, close } = ROUTE_ERRORS[route.code];
       this.fail(close, error);
@@ -743,64 +768,61 @@ export class RealtimeTranscriptionSession {
     for (const candidate of route.candidates) {
       if (attempts >= REALTIME_MAX_OPEN_ATTEMPTS) break;
       const admitted = await this.admit(candidate, signal);
-      if (this.state !== "routing" || signal.aborted) {
-        if (admitted.ok) this.releaseLease(admitted.lease);
+      // From here the attempt owns the lease; every exit below ends it through `end`, and a
+      // session close ends it from `closeWith` (`end` is idempotent).
+      const attempt = admitted.ok ? this.beginAttempt(candidate, admitted.lease) : null;
+      if (!this.stillRouting(signal)) {
+        attempt?.end();
         return;
       }
-      if (!admitted.ok) {
+      if (!attempt) {
         sawCapacity = true;
         continue;
       }
-      this.lease = admitted.lease;
       const budget = Math.min(REALTIME_OPEN_ATTEMPT_MS, deadline - Date.now());
       if (budget < REALTIME_OPEN_ATTEMPT_MIN_MS) {
-        this.releaseLease(this.lease);
-        this.lease = null;
+        attempt.end();
         return; // the routing deadline ends the session
       }
       if (candidate.trial) {
         // A target in its recovery window: this open is its one half-open trial. Another
         // request holding it, or a failed claim, moves on to the next candidate.
         const startedAt = await this.claimTrial(candidate);
-        if (startedAt) this.trial = { candidate, startedAt };
-        if (this.state !== "routing" || signal.aborted) {
-          this.releaseTrial("unused");
-          this.releaseLease(this.lease);
-          this.lease = null;
+        if (startedAt) attempt.trialClaimed(startedAt);
+        if (!this.stillRouting(signal)) {
+          attempt.end();
           return;
         }
         if (!startedAt) {
-          this.releaseLease(this.lease);
-          this.lease = null;
+          attempt.end();
           continue;
         }
       }
-      const attempt: { pending: Promise<SttAttachResult> | null } = { pending: null };
+      const pending: { outcome: Promise<SttAttachResult> | null } = { outcome: null };
       const open = () => {
-        this.attempting = candidate;
+        attempt.opening();
         // With a send claim, nothing is sent after `stt.opened` until the
         // claim commits (security review L2); a failed commit withdraws the
         // opened leg and routing moves on.
-        attempt.pending = relay.attach(candidate, {
+        pending.outcome = relay.attach(candidate, {
           openTimeoutMs: budget,
           holdUntilReleased: Boolean(this.deps.hooks?.authorizeOpen),
         });
       };
       const authorized = await this.authorizeOpen(candidate, open, () => relay.cancelOpening());
       // Awaited directly (review L2): `opened` is seen before any `onEnd`.
-      const outcome = attempt.pending ? await attempt.pending : null;
-      this.attempting = null;
-      if (this.state !== "routing" || signal.aborted || outcome?.status === "ended") {
-        this.releaseTrial(outcome ? "inconclusive" : "unused");
+      const outcome = pending.outcome ? await pending.outcome : null;
+      const trialRelease = outcome ? "inconclusive" : "unused";
+      if (!this.stillRouting(signal) || outcome?.status === "ended") {
+        attempt.end({ kind: "release", outcome: trialRelease });
         return;
       }
       if (!authorized.ok || !outcome) {
-        this.releaseTrial(outcome ? "inconclusive" : "unused");
+        attempt.settleTrial({ kind: "release", outcome: trialRelease });
         // Never left open unauthorized, whatever the claim did with `abort`.
         if (outcome?.status === "opened") relay.cancelOpening();
+        attempt.end();
         if (relay.status === "ended") return;
-        this.releaseLease(this.lease);
-        this.lease = null;
         if (!authorized.ok && authorized.denial === "requester") {
           this.fail(REALTIME_CLOSE_CODES.policy, {
             type: "invalid_request_error",
@@ -818,20 +840,22 @@ export class RealtimeTranscriptionSession {
         continue; // this member is unavailable now; never a health failure
       }
       if (outcome.status === "opened") {
-        this.opened(candidate, outcome);
+        this.opened(attempt, outcome);
         relay.releaseHold();
         return;
       }
-      this.releaseLease(this.lease);
-      this.lease = null;
       tried += 1;
       if (outcome.reason === "not_eligible") notEligible += 1;
       if (openWasAttempted(outcome.reason)) attempts += 1;
       if (outcome.failure === "rate_limited") sawCapacity = true;
-      if (openFailureMarksMember(outcome)) this.notifyMemberFailed(candidate, outcome.failure);
-      else {
+      if (openFailureMarksMember(outcome)) {
+        attempt.end({ kind: "member_failed", failure: outcome.failure });
+      } else {
         // Not the target's fault (configuration, capacity, not eligible): no verdict.
-        this.releaseTrial(openWasAttempted(outcome.reason) ? "inconclusive" : "unused");
+        attempt.end({
+          kind: "release",
+          outcome: openWasAttempted(outcome.reason) ? "inconclusive" : "unused",
+        });
         if (openFailureIsConfiguration(outcome)) {
           const failure = outcome.failure;
           this.hook(() => this.deps.router.memberMisconfigured?.(candidate, failure));
@@ -871,21 +895,42 @@ export class RealtimeTranscriptionSession {
     );
   }
 
-  private opened(
+  /**
+   * A candidate attempt, registered on the routing phase so a session close ends it. On a
+   * session that is no longer routing it is returned unregistered; the caller ends it.
+   */
+  private beginAttempt(
     candidate: RealtimeCandidate,
+    lease: RealtimeCandidateLease,
+  ): SessionCandidateAttempt {
+    const attempt = candidateAttempt(candidate, lease, {
+      releaseLease: (held) => this.hook(() => held.release()),
+      releaseTrial: (target, startedAt, outcome) =>
+        this.hook(() => this.deps.router.releaseTrial?.(target, startedAt, outcome)),
+      memberFailed: (target, failure, trialStartedAt) =>
+        this.hook(() => this.deps.router.memberOpenFailed(target, failure, trialStartedAt)),
+    });
+    const routing = this.routingPhase();
+    if (routing) routing.attempt = attempt;
+    return attempt;
+  }
+
+  private opened(
+    attempt: SessionCandidateAttempt,
     outcome: Extract<SttAttachResult, { status: "opened" }>,
   ) {
-    this.state = "open";
-    this.clearRoutingTimer();
-    this.routingAbort = null;
+    const routing = this.routingPhase();
+    if (routing) clearTimeout(routing.timer);
+    this.phase = { kind: "open", attempt };
+    const candidate = attempt.candidate;
     this.openedOn = candidate;
-    const trialStartedAt = this.takeTrial(candidate);
+    const trialStartedAt = attempt.opened();
     this.hook(() => this.deps.router.memberOpened?.(candidate, trialStartedAt));
     this.hook(() =>
       this.deps.hooks?.opened?.(candidate, {
         adapter: outcome.adapter,
         maxItemSeconds: outcome.maxItemSeconds,
-        lease: this.deps.hooks?.admit ? this.lease : null,
+        lease: this.deps.hooks?.admit ? attempt.lease : null,
       }),
     );
     // Updates held while routing are answered now, in order.
@@ -928,15 +973,6 @@ export class RealtimeTranscriptionSession {
     }
   }
 
-  private releaseLease(lease: RealtimeCandidateLease | null) {
-    if (lease) this.hook(() => lease.release());
-  }
-
-  private notifyMemberFailed(candidate: RealtimeCandidate, failure: RelayFailure) {
-    const trialStartedAt = this.takeTrial(candidate);
-    this.hook(() => this.deps.router.memberOpenFailed(candidate, failure, trialStartedAt));
-  }
-
   private async claimTrial(candidate: RealtimeCandidate): Promise<Date | null> {
     const claim = this.deps.router.claimTrial;
     if (!claim) return null;
@@ -945,21 +981,6 @@ export class RealtimeTranscriptionSession {
     } catch {
       return null; // a failed claim is a busy target: the next candidate is tried
     }
-  }
-
-  /** The trial `candidate`'s attempt holds, handed to exactly one settlement. */
-  private takeTrial(candidate: RealtimeCandidate): Date | null {
-    const trial = this.trial;
-    if (!trial || trial.candidate !== candidate) return null;
-    this.trial = null;
-    return trial.startedAt;
-  }
-
-  private releaseTrial(outcome: RealtimeTrialRelease) {
-    const trial = this.trial;
-    if (!trial) return;
-    this.trial = null;
-    this.hook(() => this.deps.router.releaseTrial?.(trial.candidate, trial.startedAt, outcome));
   }
 
   /** Runs a port callback; a throwing hook never breaks the session. */
@@ -974,7 +995,7 @@ export class RealtimeTranscriptionSession {
   // ---- relay events ----
 
   private onRelayEvent(event: SttSessionEvent) {
-    if (this.state === "closed") return;
+    if (this.status === "closed") return;
     switch (event.kind) {
       case "delta": {
         const record = this.itemRecord(event.itemSeq);
@@ -1031,7 +1052,7 @@ export class RealtimeTranscriptionSession {
   }
 
   private onRelayDrain() {
-    if (this.state === "closed") return;
+    if (this.phase.kind === "closed") return;
     this.backlogged = false;
     // `apply` may close the session or pause again; re-read both each turn.
     while (this.deferred.length > 0 && !this.backlogged && this.status !== "closed") {
@@ -1053,7 +1074,7 @@ export class RealtimeTranscriptionSession {
   }
 
   private onRelayEnd(end: SttSessionEnd) {
-    if (this.state === "closed") return; // we ended it
+    if (this.status === "closed") return; // we ended it
     const mapped = relayEndToClient(end);
     // Items the client knows of (committed, or named by a delta) that will
     // never get a result are failed first; unannounced audio is not an item yet.
@@ -1153,11 +1174,6 @@ export class RealtimeTranscriptionSession {
     this.idleTimer.unref?.();
   }
 
-  private clearRoutingTimer() {
-    if (this.routingTimer) clearTimeout(this.routingTimer);
-    this.routingTimer = null;
-  }
-
   private clientError(error: Omit<RealtimeError, "type">) {
     this.send(errorEvent({ type: "invalid_request_error", ...error }));
   }
@@ -1168,7 +1184,7 @@ export class RealtimeTranscriptionSession {
 
   /** Sends one event unless the client is gone or not reading (slow consumer). */
   private send(event: object) {
-    if (this.state === "closed") return;
+    if (this.status === "closed") return;
     if (this.deps.client.bufferedAmount() > REALTIME_CLIENT_BUFFER_LIMIT) {
       this.closeWith({
         code: REALTIME_CLOSE_CODES.tryAgainLater,
@@ -1205,27 +1221,26 @@ export class RealtimeTranscriptionSession {
     error: Omit<RealtimeError, "eventId"> | null;
     relayReason: RelayFailure | null;
   }) {
-    if (this.state === "closed") return;
-    this.state = "closed";
-    this.clearRoutingTimer();
+    const phase = this.phase;
+    if (phase.kind === "closed") return;
+    this.phase = { kind: "closed" };
+    if (phase.kind === "routing") clearTimeout(phase.timer);
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = null;
-    this.routingAbort?.abort();
-    this.routingAbort = null;
+    if (phase.kind === "routing") phase.abort.abort();
+    const attempt = phase.kind === "routing" || phase.kind === "open" ? phase.attempt : null;
     this.deferred.length = 0;
     this.deferredAudioBytes = 0;
     this.heldUpdates.length = 0;
     this.items.clear();
     // A session that ends (a client hang-up, a policy close) proves nothing about the target:
     // the trial goes back for the next session at once.
-    this.releaseTrial("unused");
-    this.attempting = null;
+    attempt?.settleTrial({ kind: "release", outcome: "unused" });
     const relay = this.relaySession;
     this.relaySession = null;
     if (relay && relayReason && relay.status !== "ended") relay.close(relayReason);
     const sentAudioBytes = relay?.sentAudioBytes ?? 0;
-    this.releaseLease(this.lease);
-    this.lease = null;
+    attempt?.end();
     this.deps.admission.release();
     if (code !== null) {
       if (error) this.rawSend(errorEvent(error));

@@ -18,26 +18,73 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 // Leave transport margin below the browser's 15-second acknowledgement timer.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const OFFER_TIMEOUT: Duration = Duration::from_secs(30);
-const REQUEST_PENDING: u8 = 0;
-const REQUEST_OFFERED: u8 = 1;
-const REQUEST_COMMITTING: u8 = 2;
-const REQUEST_ACCEPTED: u8 = 3;
-const REQUEST_CANCELLED: u8 = 4;
+/// Where one upload request is, shared by the relay loop ([`ImagePending`]) and the worker
+/// ([`Job`], [`Delivery`]).
+///
+/// ```text
+/// Pending --worker reply reaches the relay--> Offered
+/// Offered --next chunk accepted--> Accepted            (a partial upload continues)
+/// Offered --browser pastes the offered path--> Committing --queued--> Accepted
+///                                                         --not queued--> Cancelled
+/// Pending | Offered --timeout, viewer or session gone, request dropped--> Cancelled
+/// ```
+///
+/// `Accepted` and `Cancelled` are final. `Committing` and `Accepted` are never cancelled: the
+/// paste's file must stay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum RequestState {
+    Pending = 0,
+    Offered = 1,
+    Committing = 2,
+    Accepted = 3,
+    Cancelled = 4,
+}
 
-fn cancel_request(state: &AtomicU8) {
-    // Keep cancellation conditional: a paste that is committing or accepted
-    // must retain its files. Use CAS to support Rust 1.88 without fetch_update,
-    // which newer toolchains deprecate in favor of try_update (Rust 1.95).
-    let mut current = state.load(Ordering::Acquire);
-    while matches!(current, REQUEST_PENDING | REQUEST_OFFERED) {
-        match state.compare_exchange_weak(
-            current,
-            REQUEST_CANCELLED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
+impl RequestState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Pending,
+            1 => Self::Offered,
+            2 => Self::Committing,
+            3 => Self::Accepted,
+            // Only this type stores values; treat anything else as final.
+            _ => Self::Cancelled,
+        }
+    }
+}
+
+/// A [`RequestState`] every holder moves only by compare-and-swap, so no transition can
+/// overwrite one another side made first (a cancel never becomes an accept, or back).
+struct RequestCell(AtomicU8);
+
+impl RequestCell {
+    fn new() -> Self {
+        Self(AtomicU8::new(RequestState::Pending as u8))
+    }
+
+    fn load(&self) -> RequestState {
+        RequestState::from_u8(self.0.load(Ordering::Acquire))
+    }
+
+    /// `from` -> `to`; `false` (nothing changed) when it is no longer `from`.
+    fn try_move(&self, from: RequestState, to: RequestState) -> bool {
+        self.0
+            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Cancel a request not yet committed: a paste that is committing or accepted keeps its
+    /// files.
+    fn cancel(&self) {
+        // CAS loop rather than fetch_update, which newer toolchains deprecate in favour of
+        // try_update (Rust 1.95) while the MSRV is 1.88.
+        let mut current = self.load();
+        while matches!(current, RequestState::Pending | RequestState::Offered) {
+            if self.try_move(current, RequestState::Cancelled) {
+                break;
+            }
+            current = self.load();
         }
     }
 }
@@ -67,9 +114,12 @@ pub(crate) struct ImagePending {
     id: [u8; 16],
     session: Arc<AtomicBool>,
     viewer: Arc<AtomicBool>,
-    state: Arc<AtomicU8>,
+    state: Arc<RequestCell>,
     receiver: Receiver<ImageReply>,
     deadline: Instant,
+    /// The reply the relay forwarded, set exactly when this side moved the state
+    /// `Pending -> Offered` (in [`Self::poll`]); `None` before. Later chunks and the paste are
+    /// checked against it.
     offered: RefCell<Option<ImageReply>>,
 }
 
@@ -103,13 +153,7 @@ impl ImagePending {
                 }
                 if self
                     .state
-                    .compare_exchange(
-                        REQUEST_PENDING,
-                        REQUEST_OFFERED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
+                    .try_move(RequestState::Pending, RequestState::Offered)
                 {
                     *self.offered.borrow_mut() = Some(reply.clone());
                     Some(reply)
@@ -132,13 +176,7 @@ impl ImagePending {
             reply.path.is_none() && self.id == chunk.id && reply.received == chunk.offset
         }) && self
             .state
-            .compare_exchange(
-                REQUEST_OFFERED,
-                REQUEST_ACCEPTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+            .try_move(RequestState::Offered, RequestState::Accepted)
     }
 
     pub(crate) fn begin_paste(&self, paste: &super::ImagePaste) -> bool {
@@ -157,30 +195,24 @@ impl ImagePending {
                 || paste.data.as_slice() == bracketed.as_bytes())
             && self
                 .state
-                .compare_exchange(
-                    REQUEST_OFFERED,
-                    REQUEST_COMMITTING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
+                .try_move(RequestState::Offered, RequestState::Committing)
     }
 
-    pub(crate) fn finish_paste(&self, queued: bool) {
-        self.state.store(
-            if queued {
-                REQUEST_ACCEPTED
-            } else {
-                REQUEST_CANCELLED
-            },
-            Ordering::Release,
-        );
+    /// The paste [`Self::begin_paste`] committed was queued for the shell (`Accepted`: its
+    /// file stays) or not (`Cancelled`). Only a committing paste moves; `false` otherwise.
+    pub(crate) fn finish_paste(&self, queued: bool) -> bool {
+        let to = if queued {
+            RequestState::Accepted
+        } else {
+            RequestState::Cancelled
+        };
+        self.state.try_move(RequestState::Committing, to)
     }
 }
 
 impl Drop for ImagePending {
     fn drop(&mut self) {
-        cancel_request(&self.state);
+        self.state.cancel();
     }
 }
 
@@ -190,7 +222,7 @@ struct Job {
     session: Arc<AtomicBool>,
     viewer_id: String,
     viewer: Arc<AtomicBool>,
-    state: Arc<AtomicU8>,
+    state: Arc<RequestCell>,
     deadline: Instant,
     chunk: ImageChunk,
     reply: SyncSender<ImageReply>,
@@ -201,7 +233,7 @@ impl Job {
         Instant::now() < self.deadline
             && self.session.load(Ordering::Acquire)
             && self.viewer.load(Ordering::Acquire)
-            && self.state.load(Ordering::Acquire) != REQUEST_CANCELLED
+            && self.state.load() != RequestState::Cancelled
     }
 }
 
@@ -283,7 +315,7 @@ impl ImageWorker {
             id: chunk.id,
             session: Arc::clone(&session.alive),
             viewer: Arc::clone(viewer),
-            state: Arc::new(AtomicU8::new(REQUEST_PENDING)),
+            state: Arc::new(RequestCell::new()),
             receiver,
             deadline: Instant::now() + REQUEST_TIMEOUT,
             offered: RefCell::new(None),
@@ -331,7 +363,7 @@ struct SessionFiles {
 /// A queued acknowledgement is not yet accepted: its request can still time out.
 struct Delivery {
     viewer_id: String,
-    state: Arc<AtomicU8>,
+    state: Arc<RequestCell>,
     deadline: Instant,
     reply: ImageReply,
 }
@@ -349,12 +381,14 @@ impl Store {
         for session in self.sessions.values_mut() {
             session.deliveries.retain(|delivery| {
                 if now >= delivery.deadline {
-                    cancel_request(&delivery.state);
+                    delivery.state.cancel();
                 }
-                match delivery.state.load(Ordering::Acquire) {
-                    REQUEST_PENDING | REQUEST_OFFERED | REQUEST_COMMITTING => true,
-                    REQUEST_ACCEPTED => false,
-                    _ => {
+                match delivery.state.load() {
+                    RequestState::Pending | RequestState::Offered | RequestState::Committing => {
+                        true
+                    }
+                    RequestState::Accepted => false,
+                    RequestState::Cancelled => {
                         session
                             .files
                             .cancel_reply(&delivery.viewer_id, &delivery.reply);
@@ -722,7 +756,7 @@ mod tests {
             session: Arc::clone(&session),
             viewer_id: "alice".into(),
             viewer: Arc::clone(&viewer),
-            state: Arc::new(AtomicU8::new(REQUEST_PENDING)),
+            state: Arc::new(RequestCell::new()),
             deadline: Instant::now() + REQUEST_TIMEOUT,
             chunk: chunk(12),
             reply,
@@ -753,7 +787,7 @@ mod tests {
             session: Arc::new(AtomicBool::new(true)),
             viewer_id: "alice".into(),
             viewer: Arc::new(AtomicBool::new(true)),
-            state: Arc::new(AtomicU8::new(REQUEST_PENDING)),
+            state: Arc::new(RequestCell::new()),
             deadline: Instant::now() + REQUEST_TIMEOUT,
             chunk: chunk(8),
             reply,
@@ -763,7 +797,7 @@ mod tests {
         job.chunk = chunk(8);
         let second = store.receive(&mut job);
         let second_path = std::path::PathBuf::from(second.path.as_ref().expect("second image"));
-        job.state.store(REQUEST_CANCELLED, Ordering::Release);
+        job.state.cancel();
         store.cancel_reply(&job, &second);
         assert!(first_path.exists());
         assert!(!second_path.exists());
@@ -817,6 +851,88 @@ mod tests {
                 .is_none()
         );
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn request_state_moves_only_from_the_state_it_expects() {
+        let state = RequestCell::new();
+        assert_eq!(state.load(), RequestState::Pending);
+        assert!(!state.try_move(RequestState::Offered, RequestState::Committing));
+        assert!(state.try_move(RequestState::Pending, RequestState::Offered));
+        assert!(state.try_move(RequestState::Offered, RequestState::Committing));
+        // A committing paste is never cancelled: its file must stay.
+        state.cancel();
+        assert_eq!(state.load(), RequestState::Committing);
+        assert!(state.try_move(RequestState::Committing, RequestState::Accepted));
+        state.cancel();
+        assert_eq!(state.load(), RequestState::Accepted);
+
+        let offered = RequestCell::new();
+        assert!(offered.try_move(RequestState::Pending, RequestState::Offered));
+        offered.cancel();
+        assert_eq!(offered.load(), RequestState::Cancelled);
+        assert!(!offered.try_move(RequestState::Offered, RequestState::Accepted));
+        assert_eq!(offered.load(), RequestState::Cancelled);
+    }
+
+    #[test]
+    fn finishing_a_paste_never_revives_a_cancelled_request() {
+        let worker = ImageWorker::new();
+        let session = worker.session(Some(quoting()));
+        let viewer = Arc::new(AtomicBool::new(true));
+        let pending = worker
+            .submit(&session, "alice", &viewer, chunk(8))
+            .expect("submit");
+        let reply = wait(&pending);
+        assert!(reply.path.is_some(), "a complete upload offers its path");
+        assert_eq!(pending.state.load(), RequestState::Offered);
+        // Not committed: finishing changes nothing.
+        assert!(!pending.finish_paste(true));
+        assert_eq!(pending.state.load(), RequestState::Offered);
+        pending.state.cancel();
+        // The old unconditional store turned this cancel into an accept.
+        assert!(!pending.finish_paste(true));
+        assert_eq!(pending.state.load(), RequestState::Cancelled);
+        let path = reply.path.expect("path");
+        let text = reply
+            .paste
+            .clone()
+            .unwrap_or_else(|| super::super::paste_text(&path));
+        assert!(
+            !pending.begin_paste(&super::super::ImagePaste {
+                id: [1; 16],
+                data: text.into_bytes(),
+            }),
+            "a cancelled offer cannot be pasted"
+        );
+    }
+
+    #[test]
+    fn a_committed_paste_finishes_once() {
+        let worker = ImageWorker::new();
+        let session = worker.session(Some(quoting()));
+        let viewer = Arc::new(AtomicBool::new(true));
+        let pending = worker
+            .submit(&session, "alice", &viewer, chunk(8))
+            .expect("submit");
+        let reply = wait(&pending);
+        let path = reply.path.clone().expect("path");
+        let text = reply
+            .paste
+            .clone()
+            .unwrap_or_else(|| super::super::paste_text(&path));
+        assert!(pending.begin_paste(&super::super::ImagePaste {
+            id: [1; 16],
+            data: text.into_bytes(),
+        }));
+        assert_eq!(pending.state.load(), RequestState::Committing);
+        assert!(pending.finish_paste(false));
+        assert_eq!(pending.state.load(), RequestState::Cancelled);
+        assert!(
+            !pending.finish_paste(true),
+            "a finished paste stays finished"
+        );
+        assert_eq!(pending.state.load(), RequestState::Cancelled);
     }
 
     #[test]

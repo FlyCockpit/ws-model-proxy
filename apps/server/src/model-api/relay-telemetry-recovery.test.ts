@@ -10,16 +10,23 @@ vi.mock("@ws-model-proxy/env/shared", () => ({
   env: { DATABASE_URL: "postgresql://relay-telemetry-recovery-test", NODE_ENV: "test" },
 }));
 
-const { default: prisma } = await import("@ws-model-proxy/db");
+const { default: prisma, Prisma } = await import("@ws-model-proxy/db");
 const db = prisma as unknown as {
   attempt: { findMany: MockInstance; updateMany: MockInstance };
   attemptEvent: { findFirst: MockInstance; create: MockInstance };
-  relayRequest: { updateMany: MockInstance; findMany: MockInstance };
+  relayRequest: { update: MockInstance; findMany: MockInstance };
   $transaction: MockInstance;
   $queryRaw: MockInstance;
   $executeRaw: MockInstance;
 };
 const recovery = await import("./relay-telemetry-recovery.js");
+
+function recordNotFound() {
+  return new Prisma.PrismaClientKnownRequestError("Record to update not found.", {
+    code: "P2025",
+    clientVersion: "test",
+  });
+}
 
 function attempt(overrides: Record<string, unknown> = {}) {
   return {
@@ -41,7 +48,7 @@ describe("local relay telemetry lifecycle", () => {
     db.attempt.updateMany.mockResolvedValue({ count: 1 });
     db.attemptEvent.findFirst.mockResolvedValue({ sequence: 3 });
     db.attemptEvent.create.mockResolvedValue({ id: "event" });
-    db.relayRequest.updateMany.mockResolvedValue({ count: 1 });
+    db.relayRequest.update.mockResolvedValue({ id: "relay-id" });
   });
 
   it("heartbeats only attempts this process holds in flight", async () => {
@@ -108,7 +115,7 @@ describe("local relay telemetry lifecycle", () => {
     db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:30:00.000Z") }]);
     db.attempt.updateMany.mockResolvedValue({ count: 1 });
     db.attemptEvent.findFirst.mockResolvedValue(null);
-    db.relayRequest.updateMany.mockResolvedValue({ count: 1 });
+    db.relayRequest.update.mockResolvedValue({ id: "relay-id" });
     db.relayRequest.findMany.mockResolvedValue([]);
     await recovery.heartbeatOwnedLocalRelayAttempts(afterDeadline);
     expect(db.attempt.updateMany).not.toHaveBeenCalled();
@@ -130,7 +137,7 @@ describe("local relay telemetry lifecycle", () => {
         }),
       }),
     );
-    expect(db.relayRequest.updateMany).toHaveBeenCalledWith(
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: "relay-id", status: "PENDING" },
         data: expect.objectContaining({ status: "FAILED", errorClass: "crash_recovered" }),
@@ -146,7 +153,7 @@ describe("local relay telemetry lifecycle", () => {
     await expect(recovery.reconcileStaleLocalRelayTelemetry()).resolves.toBe(1);
     // The leaked attempt is closed, but the live attempt owns the request.
     expect(db.attemptEvent.create).toHaveBeenCalledTimes(1);
-    expect(db.relayRequest.updateMany).not.toHaveBeenCalled();
+    expect(db.relayRequest.update).not.toHaveBeenCalled();
     expect(db.attempt.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
@@ -187,42 +194,41 @@ describe("local relay telemetry lifecycle", () => {
       }),
     );
     expect(JSON.stringify(db.attemptEvent.create.mock.calls)).not.toContain("must-not-copy");
-    expect(db.relayRequest.updateMany).toHaveBeenCalledWith(
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ errorClass: "crash_recovered" }) }),
     );
   });
 
   it("records the usage rollup exactly once, only when crash repair performs the transition", async () => {
     db.attempt.findMany.mockResolvedValue([attempt()]);
-    db.relayRequest.findMany.mockResolvedValue([
-      {
-        id: "relay-id",
-        userId: "owner-id",
-        status: "FAILED",
-        source: "API_KEY",
-        route: "local",
-        external: false,
-        rejection: null,
-        startedAt: new Date("2026-08-25T23:50:00.000Z"),
-        completedAt: new Date("2026-08-26T00:00:00.000Z"),
-        durationMs: null,
-        firstClientByteAt: null,
-        queueWaitMs: null,
-        poolId: "pool-id",
-        runtimeModelId: null,
-        selectedTargetId: "target-id",
-        selectedInstanceId: "instance-id",
-        selectedVersionId: null,
-        selectedNodeId: null,
-        selectedProviderModelId: null,
-        attemptCount: 1,
-        promptTokens: null,
-        completionTokens: null,
-        cacheReadTokens: null,
-        cacheWriteTokens: null,
-        usageKnown: false,
-      },
-    ]);
+    // The central terminal transition returns the transitioned row's rollup facts.
+    db.relayRequest.update.mockResolvedValue({
+      id: "relay-id",
+      userId: "owner-id",
+      status: "FAILED",
+      source: "API_KEY",
+      route: "local",
+      external: false,
+      rejection: null,
+      startedAt: new Date("2026-08-25T23:50:00.000Z"),
+      completedAt: new Date("2026-08-26T00:00:00.000Z"),
+      durationMs: null,
+      firstClientByteAt: null,
+      queueWaitMs: null,
+      poolId: "pool-id",
+      runtimeModelId: null,
+      selectedTargetId: "target-id",
+      selectedInstanceId: "instance-id",
+      selectedVersionId: null,
+      selectedNodeId: null,
+      selectedProviderModelId: null,
+      attemptCount: 1,
+      promptTokens: null,
+      completionTokens: null,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      usageKnown: false,
+    });
     db.$executeRaw.mockResolvedValue(1);
     await recovery.reconcileStaleLocalRelayTelemetry();
     expect(db.$executeRaw).toHaveBeenCalledTimes(1);
@@ -234,9 +240,11 @@ describe("local relay telemetry lifecycle", () => {
     db.attempt.findMany.mockResolvedValue([attempt()]);
     db.attempt.updateMany.mockResolvedValue({ count: 1 });
     db.attemptEvent.findFirst.mockResolvedValue(null);
-    db.relayRequest.updateMany.mockResolvedValue({ count: 0 });
+    db.relayRequest.update.mockRejectedValue(recordNotFound());
     await recovery.reconcileStaleLocalRelayTelemetry();
-    expect(db.relayRequest.findMany).not.toHaveBeenCalled();
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "relay-id", status: "PENDING" } }),
+    );
     expect(db.$executeRaw).not.toHaveBeenCalled();
   });
 
@@ -251,7 +259,7 @@ describe("local relay telemetry lifecycle", () => {
     expect(db.attemptEvent.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ attemptId: "attempt-id", sequence: 4, eventType: "repair" }),
     });
-    expect(db.relayRequest.updateMany).not.toHaveBeenCalled();
+    expect(db.relayRequest.update).not.toHaveBeenCalled();
   });
 
   it("does nothing when a concurrent heartbeat wins the expiry race", async () => {
@@ -259,7 +267,7 @@ describe("local relay telemetry lifecycle", () => {
     db.attempt.updateMany.mockResolvedValue({ count: 0 });
     await expect(recovery.reconcileStaleLocalRelayTelemetry()).resolves.toBe(0);
     expect(db.attemptEvent.create).not.toHaveBeenCalled();
-    expect(db.relayRequest.updateMany).not.toHaveBeenCalled();
+    expect(db.relayRequest.update).not.toHaveBeenCalled();
   });
 
   it("selects only expired attempts: foreign epochs, or own attempts no longer held", async () => {

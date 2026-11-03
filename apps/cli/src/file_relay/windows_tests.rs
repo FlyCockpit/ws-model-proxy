@@ -61,7 +61,7 @@ fn fixture() -> Fixture {
         _dir: dir,
         root,
         outside,
-        relay: FileRelay::new(runtime, true, sink),
+        relay: FileRelay::new(runtime, crate::startup::TrustAuthority::new(true), sink),
         rx,
     }
 }

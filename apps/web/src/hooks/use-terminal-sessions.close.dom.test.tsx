@@ -16,7 +16,7 @@ import { useTerminalSessions } from "./use-terminal-sessions";
 // intent has to survive the socket's paced queue being dropped on close.
 vi.mock("@/hooks/use-terminal-crypto", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/use-terminal-crypto")>()),
-  useTerminalIdentity: () => ({ ready: true, publicKey: () => null, sign: async () => null }),
+  useTerminalIdentity: () => ({ status: "ready", publicKey: () => null, sign: async () => null }),
 }));
 
 class FakeWebSocket {

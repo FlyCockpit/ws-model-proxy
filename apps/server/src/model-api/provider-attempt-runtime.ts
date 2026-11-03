@@ -1,6 +1,11 @@
 import prisma from "@ws-model-proxy/db";
 import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
-import { providerHealthCoolingDown } from "./provider-health-state.js";
+import {
+  providerBreakerRefuses,
+  providerBreakerState,
+  providerTrialOwnedBy,
+  providerTrialUnclaimed,
+} from "./provider-health-state.js";
 
 // The product spec requires bounded cooldown/half-open recovery but does not
 // prescribe a duration. Cap both local backoff and untrusted Retry-After at
@@ -67,11 +72,13 @@ export async function heartbeatProviderAttempt(input: {
       }),
     ]);
     const owns = (health: typeof accountHealth) =>
-      health.healthHalfOpenAttemptId === input.attemptId &&
-      health.healthHalfOpenFencingToken === input.fencingToken;
-    const unclaimed = (health: typeof accountHealth) => health.healthHalfOpenAttemptId === null;
+      providerTrialOwnedBy(health, input.attemptId, input.fencingToken);
     const ownsHalfOpen = owns(accountHealth) && owns(modelHealth);
-    if (!ownsHalfOpen && !(unclaimed(accountHealth) && unclaimed(modelHealth))) return false;
+    if (
+      !ownsHalfOpen &&
+      !(providerTrialUnclaimed(accountHealth) && providerTrialUnclaimed(modelHealth))
+    )
+      return false;
     // Evaluate expiry only after every contended ownership lock is held. A
     // timestamp captured before the wait could renew an already-expired lease.
     const now = new Date();
@@ -158,9 +165,10 @@ export async function claimProviderHealthTrial(input: {
       input.fencingToken <= model.healthFencingWatermark
     )
       return "COOLDOWN";
-    const cooldowns = [account, model].filter((health) => health.healthNextRetryAt !== null);
-    if (cooldowns.length === 0) return "READY";
-    if (cooldowns.some((health) => providerHealthCoolingDown(health, now))) return "COOLDOWN";
+    const breakers = [account, model].map((health) => providerBreakerState(health, now));
+    if (breakers.every((breaker) => breaker.kind === "closed")) return "READY";
+    if (breakers.some(providerBreakerRefuses)) return "COOLDOWN";
+    // Half-open with no live trial: this attempt claims it.
     await Promise.all([
       tx.providerAccount.update({
         where: { id: input.providerAccountId, userId: input.userId },
@@ -273,9 +281,8 @@ export async function recordProviderOutcome(input: {
     ]);
     const ownedByAnother = [accountCurrent, current].some(
       (health) =>
-        health.healthHalfOpenAttemptId != null &&
-        (health.healthHalfOpenAttemptId !== input.attemptId ||
-          health.healthHalfOpenFencingToken !== input.fencingToken),
+        !providerTrialUnclaimed(health) &&
+        !providerTrialOwnedBy(health, input.attemptId, input.fencingToken),
     );
     const superseded =
       input.fencingToken !== undefined &&
@@ -392,8 +399,7 @@ export async function releaseProviderHealthTrial(input: {
         }),
       ]);
       const owns = (health: typeof accountOwner) =>
-        health.healthHalfOpenAttemptId === input.attemptId &&
-        health.healthHalfOpenFencingToken === input.fencingToken;
+        providerTrialOwnedBy(health, input.attemptId, input.fencingToken);
       if (!owns(accountOwner) || !owns(modelOwner)) return false;
       const cleared = {
         healthHalfOpenAt: null,

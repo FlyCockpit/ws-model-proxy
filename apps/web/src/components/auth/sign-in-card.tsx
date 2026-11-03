@@ -14,14 +14,20 @@ import { Label } from "@ws-model-proxy/ui/components/label";
 import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 import { AuthFormSkeleton } from "@/components/auth/auth-form-skeleton";
 import { AuthRetryCard } from "@/components/auth/auth-retry-card";
 import { useAuthSession } from "@/hooks/use-auth-session";
+import { useGuardedMachine } from "@/hooks/use-guarded-machine";
 import { authClient } from "@/lib/auth-client";
 import { resolveOauthRedirectUrl } from "@/lib/mcp-oauth-search";
+import {
+  initialSignInTwoFactorState,
+  type SignInTwoFactorEvent,
+  type SignInTwoFactorState,
+  signInTwoFactorTransition,
+} from "@/lib/two-factor-state";
 import { friendly, isRateLimit, isUserDeletionPending } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 import { safeRedirectTo } from "@/utils/safe-redirect";
@@ -100,34 +106,23 @@ function resolveSignInOutcome(
   };
 }
 
-/** The 2FA step's state. It lives in SignInCard so it survives the card switching branches. */
-function useTwoFactorState() {
-  const [needs2FA, setNeeds2FA] = useState(false);
-  const [totpCode, setTotpCode] = useState("");
-  const [isVerifying2FA, setIsVerifying2FA] = useState(false);
-  // Email-OTP challenge: once the user requests a code by email we switch the
-  // verification path from verifyTotp to verifyOtp.
-  const [otpSent, setOtpSent] = useState(false);
-  const [isSendingOtp, setIsSendingOtp] = useState(false);
-  return {
-    needs2FA,
-    setNeeds2FA,
-    totpCode,
-    setTotpCode,
-    isVerifying2FA,
-    setIsVerifying2FA,
-    otpSent,
-    setOtpSent,
-    isSendingOtp,
-    setIsSendingOtp,
-  };
+/**
+ * The 2FA step's state machine (`SignInTwoFactorState`). It lives in
+ * SignInCard so it survives the card switching branches.
+ */
+function useTwoFactorChallenge() {
+  return useGuardedMachine<SignInTwoFactorState, SignInTwoFactorEvent>(
+    initialSignInTwoFactorState,
+    signInTwoFactorTransition,
+  );
 }
 
-type TwoFactorState = ReturnType<typeof useTwoFactorState>;
+type TwoFactorChallenge = ReturnType<typeof useTwoFactorChallenge>;
+type ChallengeState = Extract<SignInTwoFactorState, { kind: "challenge" }>;
 type ResolveOutcome = (data: Record<string, unknown> | undefined) => SignInOutcome;
 
 export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCardProps) {
-  const twoFactor = useTwoFactorState();
+  const twoFactor = useTwoFactorChallenge();
   const { state } = useAuthSession();
   const config = useQuery(orpc.app.config.queryOptions());
   const { t } = useTranslation(["auth", "common"]);
@@ -160,10 +155,11 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
     );
   }
 
-  if (twoFactor.needs2FA) {
+  if (twoFactor.state.kind === "challenge") {
     return (
       <TwoFactorCard
-        twoFactor={twoFactor}
+        challenge={twoFactor.state}
+        machine={twoFactor}
         emailEnabled={emailEnabled}
         resolveOutcome={resolveOutcome}
       />
@@ -180,7 +176,7 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
           <SignInForm
             lang={lang}
             redirectTo={postAuthRedirect}
-            onNeeds2FA={() => twoFactor.setNeeds2FA(true)}
+            onNeeds2FA={() => twoFactor.send({ type: "required" })}
             resolveOutcome={resolveOutcome}
           />
           {/* Reset by email exists only when SMTP is configured (no mail, no link). */}
@@ -240,55 +236,63 @@ function SignInHeader({ mode, mcpDescription }: { mode: SignInMode; mcpDescripti
 }
 
 function TwoFactorCard({
-  twoFactor,
+  challenge,
+  machine,
   emailEnabled,
   resolveOutcome,
 }: {
-  twoFactor: TwoFactorState;
+  challenge: ChallengeState;
+  machine: TwoFactorChallenge;
   emailEnabled: boolean;
   resolveOutcome: ResolveOutcome;
 }) {
   const { t } = useTranslation(["auth"]);
-  const {
-    totpCode,
-    setTotpCode,
-    isVerifying2FA,
-    setIsVerifying2FA,
-    otpSent,
-    setOtpSent,
-    isSendingOtp,
-    setIsSendingOtp,
-    setNeeds2FA,
-  } = twoFactor;
+  const { send, nextAttempt, current } = machine;
 
   const handle2FAVerify = async () => {
-    setIsVerifying2FA(true);
+    const before = current();
+    if (before.kind !== "challenge") return;
+    const attempt = nextAttempt();
+    // Rejected unless the challenge is idle with a full code: no double
+    // submit from Enter + click, and no verify racing an email send.
+    if (!send({ type: "verifyStarted", attempt })) return;
     try {
       // When the user requested an emailed code we verify against the OTP
       // endpoint; otherwise the code is a TOTP from their authenticator app.
-      const result = otpSent
-        ? await authClient.twoFactor.verifyOtp({ code: totpCode })
-        : await authClient.twoFactor.verifyTotp({ code: totpCode });
+      const result =
+        before.method === "email"
+          ? await authClient.twoFactor.verifyOtp({ code: before.code })
+          : await authClient.twoFactor.verifyTotp({ code: before.code });
       if (result.error) {
         console.error("[login.twoFactor.verify]", result.error);
+        if (!send({ type: "verifyFailed", attempt })) return;
         // The 2FA step mints the session, so a pending deletion surfaces here.
         toast.error(
           isRateLimit(result.error) || isUserDeletionPending(result.error)
             ? friendly(result.error)
             : t("auth:errors.invalidTotp"),
         );
-      } else {
-        toast.success(t("auth:signedInSuccess"));
-        const outcome = resolveOutcome(result.data as Record<string, unknown> | undefined);
-        window.location.assign(outcome.url);
+        return;
       }
-    } finally {
-      setIsVerifying2FA(false);
+      if (!send({ type: "verifySucceeded", attempt })) return;
+      toast.success(t("auth:signedInSuccess"));
+      const outcome = resolveOutcome(result.data as Record<string, unknown> | undefined);
+      window.location.assign(outcome.url);
+    } catch (err) {
+      // A thrown request returns the challenge to idle so the user can retry.
+      console.error("[login.twoFactor.verify]", err);
+      send({ type: "verifyFailed", attempt });
     }
   };
 
   const handleSendEmailOtp = async () => {
-    setIsSendingOtp(true);
+    const attempt = nextAttempt();
+    if (!send({ type: "sendStarted", attempt })) return;
+    // After Back (or any newer attempt) the completion no longer matches:
+    // it neither switches a later challenge to email mode nor toasts.
+    const fail = (message: string) => {
+      if (send({ type: "sendFailed", attempt })) toast.error(message);
+    };
     try {
       // Delivery-aware preflight: Better-Auth's send-otp endpoint reports
       // success even when SMTP delivery fails, so verify the transport is
@@ -298,32 +302,35 @@ function TwoFactorCard({
         return { ok: false };
       });
       if (!preflight.ok) {
-        toast.error(t("auth:twoFactor.couldNotSendCode"));
+        fail(t("auth:twoFactor.couldNotSendCode"));
         return;
       }
       const result = await authClient.twoFactor.sendOtp();
       if (result.error) {
         console.error("[login.twoFactor.sendOtp]", result.error);
-        toast.error(
+        fail(
           isRateLimit(result.error) ? friendly(result.error) : t("auth:twoFactor.couldNotSendCode"),
         );
         return;
       }
-      setOtpSent(true);
-      setTotpCode("");
-      toast.success(t("auth:twoFactor.codeSent"));
-    } finally {
-      setIsSendingOtp(false);
+      if (send({ type: "sendSucceeded", attempt })) toast.success(t("auth:twoFactor.codeSent"));
+    } catch (err) {
+      console.error("[login.twoFactor.sendOtp]", err);
+      send({ type: "sendFailed", attempt });
     }
   };
 
+  const { activity, code, method } = challenge;
+  const isVerifying = activity.kind === "verifying" || activity.kind === "redirecting";
   return (
     <div className="flex min-h-[80vh] items-center justify-center px-4">
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
           <CardTitle className="text-2xl">{t("auth:twoFactor.title")}</CardTitle>
           <CardDescription>
-            {otpSent ? t("auth:twoFactor.emailCodeDescription") : t("auth:twoFactor.description")}
+            {method === "email"
+              ? t("auth:twoFactor.emailCodeDescription")
+              : t("auth:twoFactor.description")}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -332,41 +339,30 @@ function TwoFactorCard({
             <Input
               id="totp-code"
               placeholder="000000"
-              value={totpCode}
-              onChange={(e) => setTotpCode(e.target.value)}
+              value={code}
+              onChange={(e) => send({ type: "codeChanged", code: e.target.value })}
               inputMode="numeric"
               autoComplete="one-time-code"
               maxLength={6}
               className="text-center text-lg tracking-widest"
               onKeyDown={(e) => {
-                if (e.key === "Enter" && totpCode.length === 6) {
-                  handle2FAVerify();
-                }
+                if (e.key === "Enter") handle2FAVerify();
               }}
             />
           </div>
           <Button
             className="min-h-[44px] w-full"
             onClick={handle2FAVerify}
-            disabled={totpCode.length !== 6 || isVerifying2FA}
+            disabled={code.length !== 6 || activity.kind !== "idle"}
           >
-            {isVerifying2FA ? t("auth:twoFactor.verifying") : t("auth:twoFactor.verify")}
+            {isVerifying ? t("auth:twoFactor.verifying") : t("auth:twoFactor.verify")}
           </Button>
-          {emailEnabled && (
-            <EmailCodeButton
-              otpSent={otpSent}
-              isSendingOtp={isSendingOtp}
-              onClick={handleSendEmailOtp}
-            />
-          )}
+          {emailEnabled && <EmailCodeButton challenge={challenge} onClick={handleSendEmailOtp} />}
           <Button
             variant="ghost"
             className="min-h-[44px] w-full"
-            onClick={() => {
-              setNeeds2FA(false);
-              setTotpCode("");
-              setOtpSent(false);
-            }}
+            onClick={() => send({ type: "back" })}
+            disabled={isVerifying}
           >
             {t("auth:twoFactor.back")}
           </Button>
@@ -377,25 +373,24 @@ function TwoFactorCard({
 }
 
 function EmailCodeButton({
-  otpSent,
-  isSendingOtp,
+  challenge,
   onClick,
 }: {
-  otpSent: boolean;
-  isSendingOtp: boolean;
+  challenge: ChallengeState;
   onClick: () => void;
 }) {
   const { t } = useTranslation(["auth"]);
+  const isSending = challenge.activity.kind === "sending";
   return (
     <Button
       variant="outline"
       className="min-h-[44px] w-full"
       onClick={onClick}
-      disabled={isSendingOtp}
+      disabled={challenge.activity.kind !== "idle"}
     >
-      {isSendingOtp
+      {isSending
         ? t("auth:twoFactor.sendingCode")
-        : otpSent
+        : challenge.method === "email"
           ? t("auth:twoFactor.resendEmailCode")
           : t("auth:twoFactor.emailMeCode")}
     </Button>

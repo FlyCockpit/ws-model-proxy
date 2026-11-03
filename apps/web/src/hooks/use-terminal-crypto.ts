@@ -633,48 +633,60 @@ async function loadOrCreateIdentity(): Promise<{
   }
 }
 
+/**
+ * This browser's terminal identity (the key that signs approval transcripts):
+ * - `loading`: being read from (or created in) IndexedDB.
+ * - `ready`: loaded; handshakes carry it and approvals are signed with it.
+ * - `failed`: it could not be loaded (storage blocked or broken). Handshakes go out without
+ *   it: a node that requires approval refuses them, and nothing can be signed.
+ */
+export type TerminalIdentityState =
+  | { status: "loading" }
+  | { status: "ready"; privateKey: CryptoKey; publicKeyRaw: Uint8Array }
+  | { status: "failed" };
+
+export type TerminalIdentityStatus = TerminalIdentityState["status"];
+
 export function useTerminalIdentity(): {
-  ready: boolean;
+  status: TerminalIdentityStatus;
+  /** The identity's public key while it is `ready`, else null. */
   publicKey: () => string | null;
-  /** Signs the approval transcript, which binds the server-minted viewer id. */
+  /** Signs the approval transcript, which binds the server-minted viewer id. Null unless ready. */
   sign: (input: ApprovalTranscriptV2Input) => Promise<TerminalIdentityProof | null>;
 } {
-  const privateKeyRef = useRef<CryptoKey | null>(null);
-  const publicKeyRawRef = useRef<Uint8Array | null>(null);
-  const [ready, setReady] = useState(false);
+  const [state, setState] = useState<TerminalIdentityState>({ status: "loading" });
+  /** The state as soon as it is known, for the stable callbacks below. */
+  const stateRef = useRef<TerminalIdentityState>(state);
 
   useEffect(() => {
     let cancelled = false;
+    const settle = (next: TerminalIdentityState) => {
+      if (cancelled) return;
+      stateRef.current = next;
+      setState(next);
+    };
     void loadOrCreateIdentity()
-      .then((identity) => {
-        if (cancelled) return;
-        privateKeyRef.current = identity.privateKey;
-        publicKeyRawRef.current = identity.publicKeyRaw;
-        setReady(true);
-      })
-      .catch(() => {
-        if (!cancelled) setReady(true);
-      });
+      .then((identity) => settle({ status: "ready", ...identity }))
+      .catch(() => settle({ status: "failed" }));
     return () => {
       cancelled = true;
     };
   }, []);
 
   const publicKey = useCallback(() => {
-    const raw = publicKeyRawRef.current;
-    return raw ? bytesToBase64Url(raw) : null;
+    const current = stateRef.current;
+    return current.status === "ready" ? bytesToBase64Url(current.publicKeyRaw) : null;
   }, []);
 
   const sign = useCallback(async (input: ApprovalTranscriptV2Input) => {
-    const privateKey = privateKeyRef.current;
-    const publicKeyRaw = publicKeyRawRef.current;
-    if (!privateKey || !publicKeyRaw) return null;
-    const signature = await signApprovalTranscriptV2(privateKey, input);
+    const current = stateRef.current;
+    if (current.status !== "ready") return null;
+    const signature = await signApprovalTranscriptV2(current.privateKey, input);
     return {
-      publicKey: bytesToBase64Url(publicKeyRaw),
+      publicKey: bytesToBase64Url(current.publicKeyRaw),
       signature: bytesToBase64Url(signature),
     };
   }, []);
 
-  return { ready, publicKey, sign };
+  return { status: state.status, publicKey, sign };
 }

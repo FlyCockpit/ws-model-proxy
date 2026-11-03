@@ -3,6 +3,7 @@ import type { ActiveRelayResponseHandlers } from "../relay/session-manager.js";
 import { CapacityLeaseLostError } from "./capacity/lease-loss.js";
 import {
   RELAY_RESPONSE_QUEUE_MAX_BYTES,
+  relayBodyEnd,
   sanitizeNativeResponseHeaders,
   startRelayAttempt,
 } from "./relay-executor.js";
@@ -371,5 +372,152 @@ describe("an unobserved attempt failure never becomes an unhandled rejection", (
     expect(manager.registerRelayResponseHandlers).not.toHaveBeenCalled();
     expect(manager.cancelRelayRequest).not.toHaveBeenCalled();
     expect(manager.completeRelayRequest).not.toHaveBeenCalled();
+  });
+});
+
+describe("relay attempt state machine", () => {
+  function headers(handlers: ActiveRelayResponseHandlers, requestId: string, status = 200) {
+    handlers.onHeaders({
+      type: "relay.response.headers",
+      requestId,
+      status,
+      headers: [["content-type", "text/event-stream"]],
+    });
+  }
+  function body(handlers: ActiveRelayResponseHandlers, requestId: string, text: string) {
+    handlers.onBody(new TextEncoder().encode(text), {
+      type: "relay.response.body",
+      requestId,
+      chunkId: "0",
+    });
+  }
+
+  it("ends a body cleanly only when it is whole or its reader walked away", () => {
+    const dispatching = { phase: "dispatching" } as const;
+    const streaming = { phase: "streaming", status: 200 } as const;
+    for (const cause of [
+      "completed",
+      "caller_cancelled",
+      "consumer_cancelled",
+      "interrupted",
+    ] as const) {
+      expect(relayBodyEnd(dispatching, cause)).toBe("reject_started");
+    }
+    expect(relayBodyEnd(streaming, "completed")).toBe("close");
+    expect(relayBodyEnd(streaming, "caller_cancelled")).toBe("close");
+    expect(relayBodyEnd(streaming, "consumer_cancelled")).toBe("none");
+    expect(relayBodyEnd(streaming, "interrupted")).toBe("error");
+  });
+
+  it("fails a duplicate headers frame as a protocol error instead of reclassifying the status", async () => {
+    const { manager, attempt, handlers } = harness();
+    headers(handlers, attempt.requestId, 200);
+    const started = await attempt.started;
+    handlers.onHeaders({
+      type: "relay.response.headers",
+      requestId: attempt.requestId,
+      status: 500,
+      headers: [],
+    });
+    await expect(attempt.terminal).resolves.toMatchObject({
+      ok: false,
+      failure: "protocol_error",
+      upstreamStatusCode: 200,
+    });
+    await expect(started.body.getReader().read()).rejects.toThrow("protocol_error");
+    expect(manager.cancelRelayRequest).toHaveBeenCalledWith({
+      nodeId: "cli-1",
+      requestId: attempt.requestId,
+      reason: "protocol_error",
+    });
+    // A later complete frame cannot settle it again.
+    handlers.onComplete({ type: "relay.complete", requestId: attempt.requestId });
+    expect(manager.completeRelayRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails body bytes that arrive before headers as a protocol error", async () => {
+    const { manager, attempt, handlers } = harness();
+    body(handlers, attempt.requestId, "orphan");
+    await expect(attempt.started).rejects.toThrow("protocol_error");
+    await expect(attempt.terminal).resolves.toMatchObject({
+      failure: "protocol_error",
+      responseBytes: 0,
+    });
+    expect(manager.cancelRelayRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "protocol_error" }),
+    );
+    // Headers after settlement are ignored.
+    headers(handlers, attempt.requestId);
+    expect(manager.completeRelayRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("errors a committed body cut off by a timeout instead of ending it cleanly", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const { attempt, handlers } = harness();
+      headers(handlers, attempt.requestId);
+      const { body: stream } = await attempt.started;
+      body(handlers, attempt.requestId, "data: partial");
+      vi.advanceTimersByTime(30_000);
+      const reader = stream.getReader();
+      await expect(reader.read()).resolves.toMatchObject({ done: false });
+      await expect(reader.read()).rejects.toThrow("timeout");
+      await expect(attempt.terminal).resolves.toMatchObject({
+        failure: "timeout",
+        upstreamStatusCode: 200,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("errors a committed body cut off by relay.error or a node cancel", async () => {
+    const failed = harness();
+    headers(failed.handlers, failed.attempt.requestId);
+    const failedBody = (await failed.attempt.started).body;
+    failed.handlers.onError({
+      type: "relay.error",
+      requestId: failed.attempt.requestId,
+      failure: "disconnected",
+      message: "node went away",
+    });
+    await expect(failedBody.getReader().read()).rejects.toThrow("disconnected");
+
+    const cancelled = harness();
+    headers(cancelled.handlers, cancelled.attempt.requestId);
+    const cancelledBody = (await cancelled.attempt.started).body;
+    cancelled.handlers.onCancelled({
+      type: "relay.cancelled",
+      requestId: cancelled.attempt.requestId,
+    });
+    await expect(cancelledBody.getReader().read()).rejects.toThrow("cancelled");
+  });
+
+  it("ends the body cleanly when the caller itself cancels or aborts", async () => {
+    const cancelled = harness();
+    headers(cancelled.handlers, cancelled.attempt.requestId);
+    const cancelledBody = (await cancelled.attempt.started).body;
+    cancelled.attempt.cancel("protocol_error");
+    await expect(cancelledBody.getReader().read()).resolves.toMatchObject({ done: true });
+
+    const client = new AbortController();
+    const aborted = harness(client.signal);
+    headers(aborted.handlers, aborted.attempt.requestId);
+    const abortedBody = (await aborted.attempt.started).body;
+    client.abort();
+    await expect(abortedBody.getReader().read()).resolves.toMatchObject({ done: true });
+    await expect(aborted.attempt.terminal).resolves.toMatchObject({ failure: "cancelled" });
+  });
+
+  it("ends a complete upstream error answer cleanly", async () => {
+    const { attempt, handlers } = harness();
+    headers(handlers, attempt.requestId, 503);
+    const { body: stream } = await attempt.started;
+    body(handlers, attempt.requestId, "overloaded");
+    handlers.onComplete({ type: "relay.complete", requestId: attempt.requestId });
+    const reader = stream.getReader();
+    await reader.read();
+    await expect(reader.read()).resolves.toMatchObject({ done: true });
+    await expect(attempt.terminal).resolves.toMatchObject({ failure: "upstream_5xx" });
   });
 });

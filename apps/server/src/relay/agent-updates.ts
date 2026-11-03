@@ -21,6 +21,7 @@ import {
 import type { NodeSelfUpdate } from "@ws-model-proxy/api/lib/runtime-spec";
 import { env } from "@ws-model-proxy/env/server";
 import type { CliInstallSource, CliReleaseManifest } from "../node-http.js";
+import { createSerialTask } from "../serial-task.js";
 import { SERVER_VERSION } from "../version.js";
 import type {
   NodeToServerControlFrame,
@@ -78,9 +79,6 @@ export function createAgentUpdates(relay: RelayPort, deps: AgentUpdateDeps = {})
       ? deps.source()
       : (await nodeHttp()).cliInstallSource(env.WMP_CLI_SOURCE_REV, env.WMP_CLI_RELEASE_BASE_URL);
   const origin = deps.origin ?? (() => env.BETTER_AUTH_URL);
-  let timer: ReturnType<typeof setInterval> | null = null;
-  let running: Promise<void> | null = null;
-  let again = false;
   let ticks = 0;
 
   const port: AgentUpdatePort = {
@@ -140,36 +138,32 @@ export function createAgentUpdates(relay: RelayPort, deps: AgentUpdateDeps = {})
     wake: () => wake(),
   };
 
-  /** One pass: deadlines, then every running batch. Passes never overlap. */
-  async function tick(): Promise<void> {
-    if (running) {
-      again = true;
-      return running;
-    }
-    running = (async () => {
-      do {
-        again = false;
-        const now = new Date();
-        try {
-          await expireAgentUpdates(now);
-          await advanceAgentUpdateBatches(port, origin(), now);
-          ticks += 1;
-          if (ticks % PRUNE_EVERY_TICKS === 0) await pruneAgentUpdates(now);
-        } catch (error) {
-          console.error(
-            "[agent-update] tick failed",
-            error instanceof Error ? error.constructor.name : typeof error,
-          );
-        }
-      } while (again);
-    })().finally(() => {
-      running = null;
-    });
-    return running;
+  /**
+   * One pass: deadlines, then every running batch. Passes never overlap; a wake during a pass
+   * asks for one more, and nothing runs once stopped.
+   */
+  const task = createSerialTask({
+    intervalMs: deps.tickMs ?? AGENT_UPDATE_TICK_MS,
+    run: async () => {
+      const now = new Date();
+      await expireAgentUpdates(now);
+      await advanceAgentUpdateBatches(port, origin(), now);
+      ticks += 1;
+      if (ticks % PRUNE_EVERY_TICKS === 0) await pruneAgentUpdates(now);
+    },
+    onError: (error) =>
+      console.error(
+        "[agent-update] tick failed",
+        error instanceof Error ? error.constructor.name : typeof error,
+      ),
+  });
+
+  function tick(): Promise<void> {
+    return task.trigger();
   }
 
   function wake(): void {
-    void tick();
+    void task.trigger();
   }
 
   const handlers: Pick<NodeFrameHandlers, "agent.update.progress"> = {
@@ -198,15 +192,10 @@ export function createAgentUpdates(relay: RelayPort, deps: AgentUpdateDeps = {})
     handlers,
     tick,
     start(): void {
-      if (timer) return;
-      timer = setInterval(wake, deps.tickMs ?? AGENT_UPDATE_TICK_MS);
-      timer.unref?.();
-      wake();
+      task.start();
     },
-    async stop(): Promise<void> {
-      if (timer) clearInterval(timer);
-      timer = null;
-      await running;
+    stop(): Promise<void> {
+      return task.stop();
     },
   };
 }

@@ -682,6 +682,51 @@ enum Agent {
     Absent,
 }
 
+/// Where a [`restart_launch_agent`] stands.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchdPhase {
+    /// launchd has the agent and was not seen without it during this
+    /// restart: it may run a definition older than the file.
+    Loaded,
+    /// launchd said it does not have the agent: whatever it has after this
+    /// was loaded from the file as it is now. `bootstrap` runs only here.
+    SeenAbsent,
+}
+
+/// One try of a polled `launchctl` step.
+#[cfg(any(target_os = "macos", test))]
+enum Polled<T> {
+    Done(T),
+    /// No answer yet, and why (the error if time runs out).
+    Again(anyhow::Error),
+}
+
+/// Tries `attempt` until it is done, pausing [`LAUNCHD_POLL_FIRST`] between
+/// tries and doubling that up to [`LAUNCHD_POLL_MAX`]. Once no more than the
+/// next pause is left before `deadline`, `timed_out` turns the last try's
+/// error into the answer. An `Err` from `attempt` ends the poll at once.
+#[cfg(any(target_os = "macos", test))]
+fn poll_launchd<T>(
+    launchctl: &mut dyn Launchctl,
+    deadline: std::time::Instant,
+    mut attempt: impl FnMut(&mut dyn Launchctl) -> Result<Polled<T>>,
+    timed_out: impl FnOnce(anyhow::Error) -> anyhow::Error,
+) -> Result<T> {
+    let mut pause = LAUNCHD_POLL_FIRST;
+    loop {
+        let error = match attempt(launchctl)? {
+            Polled::Done(value) => return Ok(value),
+            Polled::Again(error) => error,
+        };
+        if deadline.saturating_duration_since(launchctl.now()) <= pause {
+            return Err(timed_out(error));
+        }
+        launchctl.sleep(pause);
+        pause = (pause * 2).min(LAUNCHD_POLL_MAX);
+    }
+}
+
 /// `Ok` for a `launchctl` call that exited 0; its output otherwise.
 #[cfg(any(target_os = "macos", test))]
 fn launchctl_ok(args: &[&str], ran: crate::update::deadman::Exited) -> Result<()> {
@@ -756,35 +801,37 @@ fn restart_launch_agent(
     // Whether launchd has the agent, asked again (with the same backoff)
     // while `print` gives no answer; an error when none came by the deadline.
     let look = |launchctl: &mut dyn Launchctl| -> Result<Agent> {
-        let mut pause = LAUNCHD_POLL_FIRST;
-        loop {
-            let time = left(launchctl);
-            let error = if time.is_zero() {
-                anyhow::anyhow!("no time was left to run `launchctl print {agent}`")
-            } else {
-                match launchctl.run(&["print", agent], time) {
-                    Ok(ran) => match ran.code {
-                        Some(0) => return Ok(Agent::Loaded),
-                        Some(LAUNCHCTL_NOT_LOADED) => return Ok(Agent::Absent),
-                        _ => launchctl_failed(&["print", agent], &ran),
-                    },
-                    Err(error) => error,
+        poll_launchd(
+            launchctl,
+            deadline,
+            |launchctl| {
+                let time = left(launchctl);
+                if time.is_zero() {
+                    return Ok(Polled::Again(anyhow::anyhow!(
+                        "no time was left to run `launchctl print {agent}`"
+                    )));
                 }
-            };
-            if left(launchctl) <= pause {
-                return Err(error.context(format!(
+                Ok(match launchctl.run(&["print", agent], time) {
+                    Ok(ran) => match ran.code {
+                        Some(0) => Polled::Done(Agent::Loaded),
+                        Some(LAUNCHCTL_NOT_LOADED) => Polled::Done(Agent::Absent),
+                        _ => Polled::Again(launchctl_failed(&["print", agent], &ran)),
+                    },
+                    Err(error) => Polled::Again(error),
+                })
+            },
+            |error| {
+                error.context(format!(
                     "launchd did not say whether it has the relay service `{agent}` loaded; {recovery}"
-                )));
-            }
-            launchctl.sleep(pause);
-            pause = (pause * 2).min(LAUNCHD_POLL_MAX);
-        }
+                ))
+            },
+        )
     };
-    let was_loaded = look(launchctl)? == Agent::Loaded;
-    // Set once launchd has said it does not have the agent: whatever it has
-    // after that was loaded from the file as it is now.
-    let mut seen_absent = !was_loaded;
-    if how == Restart::Reloaded && was_loaded {
+    let mut phase = match look(launchctl)? {
+        Agent::Loaded => LaunchdPhase::Loaded,
+        Agent::Absent => LaunchdPhase::SeenAbsent,
+    };
+    if how == Restart::Reloaded && phase == LaunchdPhase::Loaded {
         // launchd runs the plist it loaded, never the file as it is now:
         // `bootout` and `bootstrap` make it read the file again.
         let bootout = launchctl
@@ -797,61 +844,62 @@ fn restart_launch_agent(
                     "unloading the relay service `{agent}`: it still runs the definition launchd loaded; {recovery}"
                 )));
             }
-            seen_absent = true;
+        } else {
+            poll_launchd(
+                launchctl,
+                deadline,
+                |launchctl| {
+                    Ok(match look(launchctl)? {
+                        Agent::Absent => Polled::Done(()),
+                        Agent::Loaded => Polled::Again(anyhow::anyhow!("still loaded")),
+                    })
+                },
+                |_| {
+                    anyhow::anyhow!(
+                        "launchd was still unloading the relay service `{agent}` when the restart ran out of time; {recovery}"
+                    )
+                },
+            )?;
         }
-        let mut pause = LAUNCHD_POLL_FIRST;
-        while !seen_absent {
-            if look(launchctl)? == Agent::Absent {
-                seen_absent = true;
-                break;
-            }
-            let time = left(launchctl);
-            anyhow::ensure!(
-                time > pause,
-                "launchd was still unloading the relay service `{agent}` when the restart ran out of time; {recovery}"
-            );
-            launchctl.sleep(pause);
-            pause = (pause * 2).min(LAUNCHD_POLL_MAX);
-        }
+        phase = LaunchdPhase::SeenAbsent;
     }
-    // An installed agent that is not loaded (booted out) is loaded first:
-    // `kickstart` fails on it (exit 113), where systemd and Task Scheduler
-    // start a stopped service.
-    if how == Restart::Reloaded || !was_loaded {
-        anyhow::ensure!(
-            seen_absent,
-            "launchd was not seen to unload the relay service `{agent}`; {recovery}"
-        );
-        let mut pause = LAUNCHD_POLL_FIRST;
-        loop {
-            let time = left(launchctl);
-            let error = if time.is_zero() {
-                anyhow::anyhow!("no time was left to run `launchctl bootstrap`")
-            } else {
-                let args = ["bootstrap", domain, file];
-                match launchctl
-                    .run(&args, time)
-                    .and_then(|ran| launchctl_ok(&args, ran))
-                {
-                    Ok(()) => break,
-                    Err(error) => error,
+    // From here on a `Reloaded` restart is always `SeenAbsent`. An installed
+    // agent that is not loaded (booted out) is loaded first: `kickstart`
+    // fails on it (exit 113), where systemd and Task Scheduler start a
+    // stopped service.
+    if phase == LaunchdPhase::SeenAbsent {
+        poll_launchd(
+            launchctl,
+            deadline,
+            |launchctl| {
+                let time = left(launchctl);
+                let error = if time.is_zero() {
+                    anyhow::anyhow!("no time was left to run `launchctl bootstrap`")
+                } else {
+                    let args = ["bootstrap", domain, file];
+                    match launchctl
+                        .run(&args, time)
+                        .and_then(|ran| launchctl_ok(&args, ran))
+                    {
+                        Ok(()) => return Ok(Polled::Done(())),
+                        Err(error) => error,
+                    }
+                };
+                // Loaded after all (launchd can report an error for a load it
+                // made, or another `bootstrap` won): since launchd said it did
+                // not have the agent, this is the file as it is now. Restart it
+                // below.
+                if look(launchctl)? == Agent::Loaded {
+                    return Ok(Polled::Done(()));
                 }
-            };
-            // Loaded after all (launchd can report an error for a load it
-            // made, or another `bootstrap` won): since launchd said it did
-            // not have the agent, this is the file as it is now. Restart it
-            // below.
-            if look(launchctl)? == Agent::Loaded {
-                break;
-            }
-            if left(launchctl) <= pause {
-                return Err(error.context(format!(
+                Ok(Polled::Again(error))
+            },
+            |error| {
+                error.context(format!(
                     "launchd did not load the relay service `{file}`, so the relay is not running; {recovery}"
-                )));
-            }
-            launchctl.sleep(pause);
-            pause = (pause * 2).min(LAUNCHD_POLL_MAX);
-        }
+                ))
+            },
+        )?;
     }
     let time = left(launchctl);
     anyhow::ensure!(

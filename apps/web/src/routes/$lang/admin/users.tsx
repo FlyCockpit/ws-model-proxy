@@ -47,6 +47,7 @@ import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { SegmentedControl } from "@/components/segmented-control";
 import { useClientDateText } from "@/hooks/use-client-date-text";
+import { useCopyFeedback } from "@/hooks/use-copy-feedback";
 import { useHaptics } from "@/hooks/use-haptics";
 import { useNamespaceT } from "@/i18n/use-namespace-t";
 import { orpc } from "@/utils/orpc";
@@ -709,18 +710,12 @@ function RevealInviteDialog({
   reveal: { email: string; tempPassword: string; emailSent: boolean } | null;
   onClose: () => void;
 }) {
-  const [copied, setCopied] = useState(false);
+  const { feedback, copy } = useCopyFeedback(2_000);
   const { t } = useTranslation(["admin", "common", "errors"]);
   const onCopy = async () => {
     if (!reveal) return;
-    try {
-      await navigator.clipboard.writeText(reveal.tempPassword);
-      setCopied(true);
-      toast.success(t("admin:users.passwordCopied"));
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      toast.error(t("errors:couldNotCopy"));
-    }
+    if (await copy(reveal.tempPassword)) toast.success(t("admin:users.passwordCopied"));
+    else toast.error(t("errors:couldNotCopy"));
   };
   return (
     <Dialog
@@ -755,7 +750,7 @@ function RevealInviteDialog({
             >
               <Copy className="size-4" />{" "}
               <span className="sr-only">
-                {copied ? t("common:actions.copied") : t("common:actions.copy")}
+                {feedback === "copied" ? t("common:actions.copied") : t("common:actions.copy")}
               </span>
             </Button>
           </div>

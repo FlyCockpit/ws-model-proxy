@@ -20,6 +20,7 @@ import {
   OCCUPANCY_SELECT,
 } from "../lib/instance-occupancy";
 import { readLiveLoad } from "../lib/live-load";
+import { endSteps } from "../lib/operator-need";
 import { PlacementPlanner } from "../lib/placement";
 import { loadPlacementContext } from "../lib/placement-load";
 import {
@@ -1021,16 +1022,13 @@ export const runtimesRouter = {
                   finishedAt: now,
                 },
               });
-          // Stops not yet sent for those ranks are not needed any more.
-          await tx.instanceStep.updateMany({
-            where: {
-              instanceId: instance.id,
-              rank: { in: marked },
-              phase: "STOP",
-              state: "PENDING",
-              attempts: 0,
-            },
-            data: { state: "CANCELLED", operatorHold: null },
+          // Stops not yet sent for those ranks are not needed any more: a held one takes its
+          // hold (and the STEP need it raised) with it.
+          await endSteps(tx, {
+            instanceId: instance.id,
+            where: { rank: { in: marked }, phase: "STOP", state: "PENDING", attempts: 0 },
+            data: { state: "CANCELLED" },
+            now,
           });
           // The engine recomputes the instance's need (and settles it) on its next pass.
           return operation.id;

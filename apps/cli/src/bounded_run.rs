@@ -194,39 +194,65 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
     lock_registry(&ACTIVE)
 }
 
-/// The shutdown check that comes BEFORE anything is spawned: `false` when
-/// the process is already exiting (nothing is started). On `true` the run
-/// is counted as spawning until [`register`] or [`spawn_failed`].
-fn begin_spawn() -> bool {
+/// A run counted as spawning: between the shutdown check and its
+/// registration, so shutdown waits for it. Registering redeems it (under the
+/// registry lock that records the run); dropping it on any other path (an
+/// early return, a failed spawn, a panic) stops counting it, so no path can
+/// leave shutdown waiting for a run that never registers.
+#[must_use = "a run is counted as spawning until its ticket is registered or dropped"]
+struct SpawnTicket {
+    shared: &'static Mutex<Registry>,
+    redeemed: bool,
+}
+
+impl SpawnTicket {
+    /// Stop counting the run, through the registry lock the caller holds.
+    fn redeem(mut self, registry: &mut Registry) {
+        registry.spawning = registry.spawning.saturating_sub(1);
+        self.redeemed = true;
+    }
+}
+
+impl Drop for SpawnTicket {
+    fn drop(&mut self) {
+        if !self.redeemed {
+            let mut registry = lock_registry(self.shared);
+            registry.spawning = registry.spawning.saturating_sub(1);
+        }
+    }
+}
+
+/// The shutdown check that comes BEFORE anything is spawned: `None` when
+/// the process is already exiting (nothing is started). Otherwise the run
+/// is counted as spawning while the [`SpawnTicket`] lives.
+fn begin_spawn() -> Option<SpawnTicket> {
     begin_spawn_in(&ACTIVE)
 }
 
-fn begin_spawn_in(shared: &'static Mutex<Registry>) -> bool {
+fn begin_spawn_in(shared: &'static Mutex<Registry>) -> Option<SpawnTicket> {
     let mut registry = lock_registry(shared);
     if registry.closed {
-        return false;
+        return None;
     }
     registry.spawning += 1;
-    true
-}
-
-fn spawn_failed() {
-    let mut registry = registry();
-    registry.spawning = registry.spawning.saturating_sub(1);
+    Some(SpawnTicket {
+        shared,
+        redeemed: false,
+    })
 }
 
 /// Record a live run. `false` when the process began exiting after
 /// [`begin_spawn`]: the group is killed here (under the lock on Unix, so
 /// `kill_all_active` never returns before it), and the caller gives up.
 #[cfg(unix)]
-fn register(pid: u32, guard: Option<Process>) -> bool {
-    register_in(&ACTIVE, pid, guard)
+fn register(ticket: SpawnTicket, pid: u32, guard: Option<Process>) -> bool {
+    register_in(ticket, pid, guard)
 }
 
 #[cfg(unix)]
-fn register_in(shared: &'static Mutex<Registry>, pid: u32, guard: Option<Process>) -> bool {
-    let mut registry = lock_registry(shared);
-    registry.spawning = registry.spawning.saturating_sub(1);
+fn register_in(ticket: SpawnTicket, pid: u32, guard: Option<Process>) -> bool {
+    let mut registry = lock_registry(ticket.shared);
+    ticket.redeem(&mut registry);
     if registry.closed {
         #[cfg(unix)]
         kill_run(pid, guard);
@@ -247,22 +273,22 @@ fn unregister(pid: u32) {
 /// a job. No job operation acquires the registry or budget lock. Job operations
 /// hold their lock only for nonblocking OS calls, never for a wait or pipe read.
 #[cfg(windows)]
-fn register_job_in(shared: &'static Mutex<Registry>, job: JobTree) -> Option<JobRegistration> {
+fn register_job_in(ticket: SpawnTicket, job: JobTree) -> Option<JobRegistration> {
+    let shared = ticket.shared;
     let mut registry = lock_registry(shared);
     let token = registry.next_token.checked_add(1);
-    if registry.closed || token.is_none() {
+    let Some(token) = token.filter(|_| !registry.closed) else {
         // Exhaustion must fail closed rather than wrap and reuse an identity.
         registry.closed = true;
         drop(registry);
         kill_group(&job);
         // Keep this run counted as spawning until its job has been signalled.
-        lock_registry(shared).spawning -= 1;
+        drop(ticket);
         return None;
-    }
-    let token = token?;
+    };
     registry.next_token = token;
     registry.groups.insert(token, job);
-    registry.spawning -= 1;
+    ticket.redeem(&mut registry);
     Some(JobRegistration { shared, token })
 }
 
@@ -620,10 +646,12 @@ fn run_inner(
     let Some(permit) = admit() else {
         return Err(RunError::Resources);
     };
-    // Shutdown check first: after `kill_all_active` nothing is started.
-    if !begin_spawn() {
+    // Shutdown check first: after `kill_all_active` nothing is started. Every
+    // return before the registration below drops the ticket, which stops
+    // counting this run as spawning.
+    let Some(ticket) = begin_spawn() else {
         return Err(RunError::Cancelled);
-    }
+    };
     let mut command = Command::new(program);
     match args {
         Args::List(args) => {
@@ -676,7 +704,6 @@ fn run_inner(
         command.process_group(0);
     }
     if cancelled() || Instant::now() >= deadline {
-        spawn_failed();
         return Err(if cancelled() {
             RunError::Cancelled
         } else {
@@ -686,18 +713,12 @@ fn run_inner(
     #[cfg(not(windows))]
     let mut child = match crate::subreaper::spawn(|| command.spawn(), |child| Some(child.id())) {
         Ok(child) => child,
-        Err(_) => {
-            spawn_failed();
-            return Err(RunError::Spawn);
-        }
+        Err(_) => return Err(RunError::Spawn),
     };
     #[cfg(windows)]
     let mut child = match crate::job_tree::spawn_hidden(command) {
         Ok(child) => child,
-        Err(_) => {
-            spawn_failed();
-            return Err(RunError::Spawn);
-        }
+        Err(_) => return Err(RunError::Spawn),
     };
     #[cfg(not(windows))]
     let pid = child.id();
@@ -706,9 +727,9 @@ fn run_inner(
     #[cfg(not(windows))]
     let guard = session.then(|| Process::of(pid));
     #[cfg(not(windows))]
-    let registered = register(pid, guard);
+    let registered = register(ticket, pid, guard);
     #[cfg(windows)]
-    let registration = register_job_in(&ACTIVE, child.job());
+    let registration = register_job_in(ticket, child.job());
     #[cfg(windows)]
     let registered = registration.is_some();
     #[cfg(windows)]
@@ -1539,9 +1560,9 @@ mod tests {
                 .read_marker()
                 .parse()
                 .expect("first grandchild PID");
-            assert!(begin_spawn_in(shared));
+            let ticket = begin_spawn_in(shared).expect("admission open");
             let first_registration =
-                register_job_in(shared, first.job()).expect("first registration");
+                register_job_in(ticket, first.job()).expect("first registration");
             if root_reaped {
                 assert!(wait_for_exit(
                     &mut first,
@@ -1555,11 +1576,11 @@ mod tests {
                 .parse()
                 .expect("second grandchild PID");
             assert_eq!(second.job().id(), second.id(), "default diagnostic PID");
-            assert!(begin_spawn_in(shared));
+            let ticket = begin_spawn_in(shared).expect("admission open");
             let reused_pid_job = second.job().with_test_pid(first.id());
             assert_eq!(reused_pid_job.id(), first.id(), "forced PID reuse seam");
             let second_registration =
-                register_job_in(shared, reused_pid_job).expect("second registration");
+                register_job_in(ticket, reused_pid_job).expect("second registration");
             assert_ne!(first_registration.token, second_registration.token);
             assert_eq!(
                 lock_registry(shared).groups.len(),
@@ -1609,8 +1630,8 @@ mod tests {
                     &|| false
                 ));
             }
-            assert!(begin_spawn_in(shared));
-            let registration = register_job_in(shared, child.job()).expect("registration");
+            let ticket = begin_spawn_in(shared).expect("admission open");
+            let registration = register_job_in(ticket, child.job()).expect("registration");
             let (release, holder) = held_job(child.job());
             let started = Instant::now();
             let result = finish_job(
@@ -1648,11 +1669,11 @@ mod tests {
         let shared = fresh_job_registry();
         assert_eq!(lock_registry(shared).next_token, 0, "default token seed");
         lock_registry(shared).next_token = u64::MAX;
-        assert!(begin_spawn_in(shared));
+        let ticket = begin_spawn_in(shared).expect("admission open");
         let tree = crate::windows_test_tree::Tree::new();
         let child = job_tree(&tree);
-        assert!(register_job_in(shared, child.job()).is_none());
-        assert!(!begin_spawn_in(shared));
+        assert!(register_job_in(ticket, child.job()).is_none());
+        assert!(begin_spawn_in(shared).is_none());
         assert!(lock_registry(shared).groups.is_empty());
         assert_eq!(lock_registry(shared).spawning, 0);
         crate::windows_test_tree::assert_dead(child.id());
@@ -1665,10 +1686,10 @@ mod tests {
         for panic_hook in [false, true] {
             let tree = Tree::new();
             let shared = fresh_job_registry();
-            assert!(begin_spawn_in(shared));
+            let ticket = begin_spawn_in(shared).expect("admission open");
             let child = job_tree(&tree);
             let grandchild = tree.read_marker().parse().expect("grandchild PID");
-            let _registration = register_job_in(shared, child.job()).expect("registration");
+            let _registration = register_job_in(ticket, child.job()).expect("registration");
             thread::spawn(move || {
                 if panic_hook {
                     kill_all_for_panic_in(shared);
@@ -1680,7 +1701,7 @@ mod tests {
             .expect("shutdown thread");
             assert_dead(grandchild);
             assert_dead(child.id());
-            assert!(!begin_spawn_in(shared));
+            assert!(begin_spawn_in(shared).is_none());
             // The owner is still live: its Drop did not cause the tree kill.
             drop(child);
         }
@@ -1692,7 +1713,7 @@ mod tests {
         use crate::windows_test_tree::{Tree, assert_dead};
         let tree = Tree::new();
         let shared = fresh_job_registry();
-        assert!(begin_spawn_in(shared));
+        let ticket = begin_spawn_in(shared).expect("admission open");
         let child = job_tree(&tree);
         let grandchild = tree.read_marker().parse().expect("grandchild PID");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1706,7 +1727,7 @@ mod tests {
             thread::sleep(REAP_POLL);
         }
         assert!(done_rx.try_recv().is_err(), "shutdown missed mid-spawn run");
-        assert!(register_job_in(shared, child.job()).is_none());
+        assert!(register_job_in(ticket, child.job()).is_none());
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("shutdown bounded");
@@ -1836,6 +1857,37 @@ mod tests {
         })))
     }
 
+    /// Every way out between the shutdown check and the registration (an early
+    /// return, a failed spawn, a panic) stops counting the run, so shutdown
+    /// never waits out its bound for a run that will not register.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_gives_up_before_registering_never_holds_up_shutdown() {
+        let shared = fresh_registry();
+        let returned = begin_spawn_in(shared).expect("admission open");
+        let panicked = begin_spawn_in(shared).expect("admission open");
+        assert_eq!(lock_registry(shared).spawning, 2);
+        drop(returned);
+        assert_eq!(lock_registry(shared).spawning, 1);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ticket = panicked;
+            panic!("mid-spawn");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(lock_registry(shared).spawning, 0);
+        let started = Instant::now();
+        kill_all_in(shared);
+        assert!(started.elapsed() < SHUTDOWN_SPAWN_WAIT);
+        // A registered run is counted once, not again when its ticket goes.
+        let shared = fresh_registry();
+        let ticket = begin_spawn_in(shared).expect("admission open");
+        let mut child = own_group_sleeper();
+        assert!(register_in(ticket, child.id(), None));
+        assert_eq!(lock_registry(shared).spawning, 0);
+        kill_all_in(shared);
+        let _ = child.wait();
+    }
+
     #[cfg(unix)]
     fn own_group_sleeper() -> Child {
         use std::os::unix::process::CommandExt;
@@ -1854,7 +1906,7 @@ mod tests {
     #[test]
     fn a_run_mid_spawn_is_killed_by_its_registration_and_shutdown_waits_for_it() {
         let shared = fresh_registry();
-        assert!(begin_spawn_in(shared));
+        let ticket = begin_spawn_in(shared).expect("admission open");
         let mut child = own_group_sleeper();
         let pid = child.id();
         let exiting = thread::spawn(move || {
@@ -1866,7 +1918,7 @@ mod tests {
         thread::sleep(Duration::from_millis(300));
         assert!(child.try_wait().expect("try_wait").is_none());
         assert!(
-            !register_in(shared, pid, None),
+            !register_in(ticket, pid, None),
             "registration after the exit began must be refused"
         );
         let waited = exiting.join().expect("shutdown thread");
@@ -1880,7 +1932,10 @@ mod tests {
             assert!(Instant::now() < deadline, "the mid-spawn child survived");
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(!begin_spawn_in(shared), "nothing starts after the exit");
+        assert!(
+            begin_spawn_in(shared).is_none(),
+            "nothing starts after the exit"
+        );
     }
 
     /// A registered run whose direct child left its process group (here: it
@@ -1890,10 +1945,10 @@ mod tests {
     #[test]
     fn exit_kills_a_registered_child_that_is_not_a_group_leader() {
         let shared = fresh_registry();
-        assert!(begin_spawn_in(shared));
+        let ticket = begin_spawn_in(shared).expect("admission open");
         // No `process_group(0)`: the child shares this test's group.
         let mut child = Command::new("sleep").arg("30").spawn().expect("sleep");
-        assert!(register_in(shared, child.id(), None));
+        assert!(register_in(ticket, child.id(), None));
         kill_all_in(shared);
         let deadline = Instant::now() + Duration::from_secs(3);
         while child.try_wait().expect("try_wait").is_none() {
@@ -1908,9 +1963,9 @@ mod tests {
     #[test]
     fn the_panic_hook_kills_registered_runs_and_never_hangs_on_a_held_lock() {
         let shared = fresh_registry();
-        assert!(begin_spawn_in(shared));
+        let ticket = begin_spawn_in(shared).expect("admission open");
         let mut child = own_group_sleeper();
-        assert!(register_in(shared, child.id(), None));
+        assert!(register_in(ticket, child.id(), None));
         kill_all_for_panic_in(shared);
         let deadline = Instant::now() + Duration::from_secs(3);
         while child.try_wait().expect("try_wait").is_none() {

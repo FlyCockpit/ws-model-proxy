@@ -573,6 +573,51 @@ describe("createRuntimeSync sessions", () => {
     expect(sent).toHaveLength(4);
   });
 
+  function retrySetup(operationTimeoutMs: number, retryBaseMs: number) {
+    const sent: ServerToNodeControlFrame[] = [];
+    const session = { userId: "user-1", connectionGeneration: 4, trust: "full" as const };
+    const sync = createRuntimeSync(
+      {
+        sendToNode: (_n, frame) => {
+          sent.push(frame);
+          return true;
+        },
+        nodeSession: () => ({ ...session }),
+        getOnlineNodeIds: () => ["node-1"],
+      },
+      { operationTimeoutMs, retryBaseMs },
+    );
+    return { sent, sync };
+  }
+
+  it("cancels a pending retry when its session disconnects", async () => {
+    mockNode();
+    db.runtimeVersion.findMany.mockResolvedValue([]);
+    const { sent, sync } = retrySetup(5, 40);
+    expect(await sync.syncNode("node-1")).toBeNull();
+    expect(sent).toHaveLength(1);
+    // The operation timed out and a retry is pending; the session goes away.
+    sync.handlers.nodeDisconnected?.(ref);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(sent).toHaveLength(1);
+  });
+
+  it("a sync during the retry backoff replaces the retry instead of stacking a second one", async () => {
+    mockNode();
+    db.runtimeVersion.findMany.mockResolvedValue([]);
+    const { sent, sync } = retrySetup(150, 400);
+    expect(await sync.syncNode("node-1")).toBeNull();
+    // Superseding sync: sent at once; the retry timer it replaced never fires.
+    const second = sync.syncNode("node-1");
+    await vi.waitFor(() => expect(sent).toHaveLength(2));
+    const op = sent[1]?.type === "runtime.define" ? sent[1].opId : "";
+    await sync.handlers["runtime.define.result"]?.(ref, final(op));
+    expect(await second).toMatchObject({ held: [] });
+    // Past the moment the replaced retry would have fired.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(sent).toHaveLength(2);
+  });
+
   it("drops an operation whose session was replaced while it loaded", async () => {
     mockNode();
     const pending: Array<(rows: never[]) => void> = [];

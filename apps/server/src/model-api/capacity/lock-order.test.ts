@@ -203,6 +203,8 @@ const GRAPH_WRITERS: Record<string, string> = {
     "M: a claim's release (proven stop or a person's release without proof) and its release requests, inside the caller's graphWrite (owner fence, then the instance's capacity fence); the request sweep writes only claim_release_request, which no fence covers",
   "packages/api/src/lib/instance-run.ts":
     "M: an instance's run (runGeneration: a legacy row's bootstrap, and beginRun at a restart), inside the caller's graphWrite (owner fence, then the instance's capacity fence; runGeneration is a policy column of the fence)",
+  "packages/api/src/lib/operator-need.ts":
+    "M: a step's terminal write (endSteps: state, error, hold) and the instance's needsOperator, inside the caller's graphWrite (owner fence, then the instance's capacity fence)",
   "packages/api/src/lib/reservations.ts":
     "M: an instance's retake by a new run (its rank claims through the caller's write, its reservations, its pending release requests) and the drop of superseded reservation rows when a later START is claimed, inside the caller's graphWrite (owner fence, then the instance's capacity fence)",
   "packages/api/src/lib/runtime-store.ts":

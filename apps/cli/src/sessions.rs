@@ -977,18 +977,19 @@ struct PtyRuntime {
     /// It runs a launch guard (an operator command): close sends it SIGTERM and never kills its
     /// session, so its lock outlasts what the command started.
     guarded: bool,
-    /// Exit status and the instant `poll` reaped the shell. The terminal
-    /// closes on PTY EOF or [`TERMINAL_OUTPUT_DRAIN`] later.
-    exited: Option<(Option<i32>, Option<i32>, Instant)>,
     /// Dropped after `shutdown_pty` has killed and reaped the session.
     _tracked: Option<LiveChildGuard>,
 }
 
+/// End a terminal's process and its session. `exited`: the status `poll` already reaped
+/// ([`TerminalPhase::Exited`]); `None` while it runs.
 #[cfg(unix)]
-fn shutdown_pty(mut runtime: PtyRuntime) -> (Option<i32>, Option<i32>) {
+fn shutdown_pty(
+    mut runtime: PtyRuntime,
+    exited: Option<(Option<i32>, Option<i32>)>,
+) -> (Option<i32>, Option<i32>) {
     runtime.stop.store(true, Ordering::SeqCst);
     runtime.input.close();
-    let exited = runtime.exited.map(|(code, signal, _)| (code, signal));
     if runtime.guarded {
         return shutdown_guard_pty(runtime, exited);
     }
@@ -1042,8 +1043,6 @@ struct PtyRuntime {
     writer: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
-    /// As on Unix: the shell's status and when `poll` saw it exit.
-    exited: Option<(Option<i32>, Option<i32>, Instant)>,
     /// Lets a forced shutdown end the job from another thread.
     _tracked: LiveChildGuard,
 }
@@ -1072,11 +1071,14 @@ impl PtyRuntime {
     }
 }
 
+/// As on Unix: `exited` is the status `poll` (or the EOF) already read.
 #[cfg(windows)]
-fn shutdown_pty(mut runtime: PtyRuntime) -> (Option<i32>, Option<i32>) {
+fn shutdown_pty(
+    mut runtime: PtyRuntime,
+    exited: Option<(Option<i32>, Option<i32>)>,
+) -> (Option<i32>, Option<i32>) {
     runtime.stop.store(true, Ordering::SeqCst);
     runtime.input.close();
-    let exited = runtime.exited.map(|(code, signal, _)| (code, signal));
     // Ending the job breaks both pipes, so neither thread stays blocked.
     // A failure here leaves the kill to the child's drop, which retries.
     let _ = runtime
@@ -1294,21 +1296,121 @@ struct TerminalSession {
     /// The viewer that most recently typed.
     writer: Option<String>,
     pty_size: (u16, u16),
-    out: Option<OutputKey>,
-    /// Set when the viewer set becomes empty; drives the idle close.
-    detached_at: Option<Instant>,
+    out: OutputKey,
+    /// Whether anyone views it; a detached browser shell closes after the idle limit.
+    attachment: Attachment,
     scrollback: VecDeque<u8>,
-    pty: Option<PtyRuntime>,
+    phase: TerminalPhase,
     /// Set iff this is the operator terminal of an interactive runtime step
-    /// (`operator`): no PTY until a person accepts on the confirm screen.
+    /// (`operator`): it starts [`TerminalPhase::Confirming`] and gets a PTY only when a
+    /// person accepts. A browser shell starts [`TerminalPhase::Running`] and is never
+    /// `Confirming`.
     operator: Option<operator::OperatorState>,
 }
 
+/// Where a terminal's process is in its life. The terminal leaves the registry when it
+/// closes, so there is no closed phase.
+///
+/// ```text
+/// Confirming --Enter (operator only)--> Running --poll reaps it (or Windows EOF)--> Exited
+/// any phase --close, PTY EOF, decline, idle, shutdown--> closed (removed)
+/// Exited --TERMINAL_OUTPUT_DRAIN--> closed (removed)
+/// ```
+enum TerminalPhase {
+    /// An operator terminal on its confirm screen: no process yet. The writer's keys go to
+    /// the confirm screen; a resize only records the size.
+    Confirming,
+    /// The PTY's process runs and takes viewer input.
+    Running(PtyRuntime),
+    /// The process exited with `status`, seen at `at`. Input is dropped; the terminal closes
+    /// on PTY EOF or [`TERMINAL_OUTPUT_DRAIN`] after `at` (a background job may hold the PTY
+    /// open after the shell is gone), and reports `status`.
+    Exited {
+        pty: PtyRuntime,
+        status: (Option<i32>, Option<i32>),
+        at: Instant,
+    },
+}
+
+/// Whether a terminal has viewers. Kept in step with `TerminalSession::viewers` by
+/// [`TerminalSession::add_viewer`] and [`TerminalSession::take_viewer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attachment {
+    Attached,
+    /// No viewer since `since` (an operator terminal opens this way).
+    Detached {
+        since: Instant,
+    },
+}
+
 impl TerminalSession {
-    /// Whether viewer keystrokes may reach the PTY now: not once the shell
-    /// has exited.
+    /// Whether viewer keystrokes may reach the PTY now: not on a confirm screen and not once
+    /// the shell has exited.
     fn accepts_input(&self) -> bool {
-        self.pty.as_ref().is_some_and(|pty| pty.exited.is_none())
+        matches!(self.phase, TerminalPhase::Running(_))
+    }
+
+    /// The terminal's PTY, running or exited (none on a confirm screen).
+    fn pty(&self) -> Option<&PtyRuntime> {
+        match &self.phase {
+            TerminalPhase::Confirming => None,
+            TerminalPhase::Running(pty) | TerminalPhase::Exited { pty, .. } => Some(pty),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn pty_mut(&mut self) -> Option<&mut PtyRuntime> {
+        match &mut self.phase {
+            TerminalPhase::Confirming => None,
+            TerminalPhase::Running(pty) | TerminalPhase::Exited { pty, .. } => Some(pty),
+        }
+    }
+
+    /// Running -> Exited, with the status read at `at`. Any other phase is left as it is.
+    fn mark_exited(&mut self, status: (Option<i32>, Option<i32>), at: Instant) {
+        let phase = std::mem::replace(&mut self.phase, TerminalPhase::Confirming);
+        self.phase = match phase {
+            TerminalPhase::Running(pty) => TerminalPhase::Exited { pty, status, at },
+            other => other,
+        };
+    }
+
+    /// End the process (if one ever ran). `ran`: a PTY existed; the status is its exit.
+    fn shut_down(
+        self,
+    ) -> (
+        bool,
+        (Option<i32>, Option<i32>),
+        Option<operator::OperatorState>,
+    ) {
+        let (ran, status) = match self.phase {
+            TerminalPhase::Confirming => (false, (None, None)),
+            TerminalPhase::Running(pty) => (true, shutdown_pty(pty, None)),
+            TerminalPhase::Exited { pty, status, .. } => (true, shutdown_pty(pty, Some(status))),
+        };
+        (ran, status, self.operator)
+    }
+
+    fn add_viewer(&mut self, viewer_key: String, viewer: Viewer) {
+        self.viewers.insert(viewer_key, viewer);
+        self.attachment = Attachment::Attached;
+    }
+
+    /// Remove a viewer; the last one leaving starts the idle clock.
+    fn take_viewer(&mut self, viewer_id: &str, now: Instant) -> Option<Viewer> {
+        let viewer = self.viewers.remove(viewer_id)?;
+        if self.viewers.is_empty() {
+            self.attachment = Attachment::Detached { since: now };
+        }
+        Some(viewer)
+    }
+
+    /// A browser shell nobody has viewed for `limit`. An operator step may wait for its
+    /// person indefinitely.
+    fn idle_for(&self, now: Instant, limit: Duration) -> bool {
+        self.operator.is_none()
+            && matches!(self.attachment, Attachment::Detached { since }
+                if now.saturating_duration_since(since) >= limit)
     }
 
     /// One v2 frame under a viewer's pairwise CLI->browser key.
@@ -1356,7 +1458,7 @@ impl TerminalSession {
         if self.viewers.is_empty() {
             return None;
         }
-        let out = self.out.as_mut()?;
+        let out = &mut self.out;
         let plaintext = match terminal_crypto::encode_plaintext_v2(message) {
             Ok(plaintext) => plaintext,
             Err(error) => {
@@ -1385,10 +1487,7 @@ impl TerminalSession {
 
     /// The current output key, unicast to one viewer.
     fn key_frame(&mut self, terminal_id: &str, viewer_id: &str) -> Option<OutboundFrame> {
-        let (epoch, key) = {
-            let out = self.out.as_ref()?;
-            (out.epoch, out.key)
-        };
+        let (epoch, key) = (self.out.epoch, self.out.key);
         let mut message = TermPlaintextV2::OutputKey { epoch, key };
         let frame = self.seal_unicast(terminal_id, viewer_id, &message);
         if let TermPlaintextV2::OutputKey { key, .. } = &mut message {
@@ -1431,10 +1530,7 @@ impl TerminalSession {
     /// Next epoch with a fresh key. Every remaining viewer gets the new key
     /// unicast here, before any later broadcast uses it.
     fn rotate(&mut self, terminal_id: &str) -> anyhow::Result<Vec<OutboundFrame>> {
-        let Some(out) = self.out.as_mut() else {
-            return Ok(Vec::new());
-        };
-        out.rotate()?;
+        self.out.rotate()?;
         let ids = self.viewers.keys().cloned().collect::<Vec<_>>();
         Ok(ids
             .iter()
@@ -1524,7 +1620,7 @@ pub(crate) struct TerminalRegistry {
     /// The state dir from the last successful `term.auth`, for approval re-checks.
     state_dir: Option<PathBuf>,
     next_approval_check: Option<Instant>,
-    shut_down: bool,
+    lifecycle: Lifecycle,
     /// A test's shell in place of the login shell or the node's default.
     shell: Option<(String, Vec<String>)>,
     /// Operator terminals submitted to a runner thread and not yet opened, and
@@ -1564,7 +1660,7 @@ impl TerminalRegistry {
             idle_limit: DEFAULT_IDLE,
             state_dir: None,
             next_approval_check: None,
-            shut_down: false,
+            lifecycle: Lifecycle::Open,
             shell: None,
             operators: operator::OperatorBook::default(),
         }
@@ -1608,10 +1704,9 @@ impl TerminalRegistry {
     }
 
     pub(crate) fn kill_all(&mut self) -> Vec<OutboundFrame> {
-        if self.shut_down {
+        if !self.lifecycle.shut_down() {
             return Vec::new();
         }
-        self.shut_down = true;
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         let mut frames = Vec::new();
         for id in ids {
@@ -1627,6 +1722,10 @@ impl TerminalRegistry {
         state_dir: Option<&Path>,
         handshake: TermHandshake<'_>,
     ) -> Vec<OutboundFrame> {
+        // After `kill_all` no shell spawns (and none queues for an approval).
+        if self.lifecycle.is_shut_down() {
+            return vec![*handshake_rejected(&handshake, REASON_SPAWN_FAILED)];
+        }
         if self.sessions.contains_key(handshake.terminal_id) {
             return vec![*handshake_rejected(&handshake, REASON_ALREADY_OPEN)];
         }
@@ -1661,6 +1760,10 @@ impl TerminalRegistry {
     ) -> Vec<OutboundFrame> {
         let terminal_id = handshake.terminal_id;
         let viewer_id = handshake.viewer_id;
+        // Also reached from `auth` for an open approved after the shutdown began.
+        if self.lifecycle.is_shut_down() {
+            return vec![*handshake_rejected(handshake, REASON_SPAWN_FAILED)];
+        }
         if self.human_count() >= startup.max_terminals() {
             return vec![*handshake_rejected(handshake, REASON_LIMIT)];
         }
@@ -1697,7 +1800,7 @@ impl TerminalRegistry {
             }
         };
         let out = match OutputKey::first() {
-            Ok(out) => Some(out),
+            Ok(out) => out,
             Err(error) => {
                 tracing::warn!(error = %error, terminal_id, "generating a terminal output key failed");
                 return vec![*handshake_rejected(handshake, REASON_SPAWN_FAILED)];
@@ -1742,9 +1845,10 @@ impl TerminalRegistry {
             writer: viewer_id.map(str::to_string),
             pty_size: (prepared.cols, prepared.rows),
             out,
-            detached_at: None,
+            // The opener views it.
+            attachment: Attachment::Attached,
             scrollback: VecDeque::new(),
-            pty: Some(pty),
+            phase: TerminalPhase::Running(pty),
             operator: None,
         };
         let mut frames = vec![OutboundFrame::Control(NodeFrame::TermOpened {
@@ -2011,11 +2115,10 @@ impl TerminalRegistry {
         if session.viewers.contains_key(viewer_key) {
             return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
         }
-        session.viewers.insert(
+        session.add_viewer(
             viewer_key.to_string(),
             Viewer::new(keys, None, approved_identity),
         );
-        session.detached_at = None;
         let mut frames = vec![OutboundFrame::Control(NodeFrame::TermAttached {
             terminal_id: terminal_id.to_string(),
             viewer_id: viewer_id.map(str::to_string),
@@ -2073,7 +2176,7 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Vec::new();
         };
-        if session.viewers.remove(viewer_id).is_none() {
+        if session.take_viewer(viewer_id, Instant::now()).is_none() {
             return Vec::new();
         }
         self.image_pending
@@ -2085,9 +2188,6 @@ impl TerminalRegistry {
         if session.writer.as_deref() == Some(viewer_id) {
             session.writer = None;
             frames.push(term_writer(terminal_id, None));
-        }
-        if session.viewers.is_empty() {
-            session.detached_at = Some(Instant::now());
         }
         match session.rotate(terminal_id) {
             Ok(key_frames) => frames.extend(key_frames),
@@ -2101,17 +2201,14 @@ impl TerminalRegistry {
 
     /// End the terminal now.
     pub(crate) fn close(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
-        let Some(mut session) = self.sessions.remove(terminal_id) else {
+        let Some(session) = self.sessions.remove(terminal_id) else {
             return Vec::new();
         };
         self.image_pending.retain(|(id, _), _| id != terminal_id);
-        let (ran, status) = match session.pty.take() {
-            Some(pty) => (true, shutdown_pty(pty)),
-            None => (false, (None, None)),
-        };
+        let (ran, status, operator) = session.shut_down();
         let mut frames = vec![term_exit(terminal_id, status)];
         // An operator terminal answers for its step after its exit.
-        if let Some(state) = session.operator.take() {
+        if let Some(state) = operator {
             frames.extend(state.ended(ran, status));
         }
         frames
@@ -2445,16 +2542,13 @@ impl TerminalRegistry {
         // shell's exit code. Read it before the close ends the job; the
         // process may take a moment to be marked exited.
         #[cfg(windows)]
-        if let Some(pty) = self
-            .sessions
-            .get_mut(terminal_id)
-            .and_then(|session| session.pty.as_mut())
-            && pty.exited.is_none()
+        if let Some(session) = self.sessions.get_mut(terminal_id)
+            && let TerminalPhase::Running(pty) = &mut session.phase
         {
             let until = Instant::now() + Duration::from_millis(250);
             loop {
-                if let Some((code, signal)) = pty.reap() {
-                    pty.exited = Some((code, signal, Instant::now()));
+                if let Some(status) = pty.reap() {
+                    session.mark_exited(status, Instant::now());
                     break;
                 }
                 if Instant::now() >= until {
@@ -2492,14 +2586,7 @@ impl TerminalRegistry {
         let expired = self
             .sessions
             .iter()
-            .filter(|(_, session)| {
-                // An operator step may wait for its person indefinitely.
-                session.operator.is_none()
-                    && session.viewers.is_empty()
-                    && session.detached_at.is_some_and(|detached| {
-                        now.saturating_duration_since(detached) >= self.idle_limit
-                    })
-            })
+            .filter(|(_, session)| session.idle_for(now, self.idle_limit))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in expired {
@@ -2516,17 +2603,14 @@ impl TerminalRegistry {
     fn close_exited_shells(&mut self, now: Instant) -> Vec<OutboundFrame> {
         let mut drained = Vec::new();
         for (terminal_id, session) in &mut self.sessions {
-            let Some(pty) = session.pty.as_mut() else {
-                continue;
-            };
-            if pty.exited.is_none()
-                && let Some((code, signal)) = pty.reap()
+            if let TerminalPhase::Running(pty) = &mut session.phase
+                && let Some(status) = pty.reap()
             {
-                pty.exited = Some((code, signal, now));
+                session.mark_exited(status, now);
             }
-            if pty.exited.is_some_and(|(_, _, at)| {
-                now.saturating_duration_since(at) >= TERMINAL_OUTPUT_DRAIN
-            }) {
+            if let TerminalPhase::Exited { at, .. } = session.phase
+                && now.saturating_duration_since(at) >= TERMINAL_OUTPUT_DRAIN
+            {
                 drained.push(terminal_id.clone());
             }
         }
@@ -2578,7 +2662,7 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get(terminal_id) else {
             return Err(std::io::Error::other("terminal is closed"));
         };
-        let Some(pty) = session.pty.as_ref() else {
+        let Some(pty) = session.pty() else {
             return Err(std::io::Error::other("terminal is closed"));
         };
         pty.push_input(bytes)
@@ -2588,15 +2672,11 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Err(std::io::Error::other("terminal is closed"));
         };
-        if session.confirming() {
+        match session.pty() {
             // No PTY yet: the size waits for the command's PTY.
-            session.pty_size = (cols, rows);
-            return Ok(());
+            None => {}
+            Some(pty) => pty.resize(cols, rows)?,
         }
-        let Some(pty) = session.pty.as_mut() else {
-            return Err(std::io::Error::other("terminal is closed"));
-        };
-        pty.resize(cols, rows)?;
         session.pty_size = (cols, rows);
         Ok(())
     }
@@ -2766,7 +2846,6 @@ fn spawn_pty(
         pid,
         leader,
         guarded,
-        exited: None,
         _tracked: tracked,
     })
 }
@@ -2882,7 +2961,6 @@ fn spawn_conpty(
         writer: Some(writer_thread),
         reader: Some(reader_thread),
         stop,
-        exited: None,
         _tracked: tracked,
     })
 }
@@ -2927,9 +3005,11 @@ impl OutputRing {
 }
 
 struct ExecSession {
-    child: Option<ExecChild>,
-    stdout_thread: Option<JoinHandle<()>>,
-    stderr_thread: Option<JoinHandle<()>>,
+    child: ExecChild,
+    /// Reader threads exit on their own and are never joined: a grandchild that left the
+    /// process group may still hold a pipe.
+    _stdout_thread: JoinHandle<()>,
+    _stderr_thread: JoinHandle<()>,
     stop: Arc<AtomicBool>,
     /// The end of this command's lifetime: its `timeout_ms`, capped by the
     /// node's `command_max_ms`.
@@ -2940,18 +3020,152 @@ struct ExecSession {
     stdout_mask: StreamMasker,
     stderr_mask: StreamMasker,
     output: OutputRing,
-    stdout_done: bool,
-    stderr_done: bool,
-    timed_out: bool,
-    finished: bool,
+    pipes: ExecPipes,
+    phase: ExecPhase,
     pid: u32,
     /// Its start time, read once at spawn (the leader may be reaped later).
     start_ticks: Option<u64>,
-    /// Exit status and the instant `try_wait` reaped the direct child.
-    reaped: Option<(Option<i32>, Option<i32>, Instant)>,
     _tracked: LiveChildGuard,
     /// The PowerShell script the command runs, removed with the session.
     _script: Option<ScriptFile>,
+}
+
+/// A process's exit code and signal, as [`status_parts`] reads them.
+type ExitParts = (Option<i32>, Option<i32>);
+
+/// Which of a command's output pipes reached EOF. Pipes close independently of the process
+/// (`sleep >/dev/null` closes both and keeps running), so they are not part of [`ExecPhase`].
+#[derive(Default)]
+struct ExecPipes {
+    stdout: bool,
+    stderr: bool,
+}
+
+impl ExecPipes {
+    fn drained(&self) -> bool {
+        self.stdout && self.stderr
+    }
+}
+
+/// Where a running command is in its life. A session leaves the registry when it completes,
+/// so there is no "finished" phase: late reader bytes or EOFs for its id find nothing.
+///
+/// ```text
+/// Running --deadline, not reaped--> TimedOut --reaped--> Reaped { timed_out: true }
+/// Running --deadline, reaped at once------------------> Reaped { timed_out: true }
+/// Running --reaped----------------------------------> Reaped { timed_out: false }
+/// Reaped --both pipes closed, or EXEC_OUTPUT_DRAIN--> completed (removed)
+/// any phase --cancel or shutdown--> completed (removed)
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecPhase {
+    /// The direct child runs and its deadline has not passed.
+    Running,
+    /// The deadline passed and the node killed the process group, but the direct child is not
+    /// reaped yet. Its pid is still ours, so a later kill may signal it.
+    TimedOut,
+    /// `try_wait` reaped the direct child at `at`. Its pid may name another process now and is
+    /// never signalled again; the output drains until both pipes close or
+    /// [`EXEC_OUTPUT_DRAIN`] passes. `timed_out`: the node killed it at its deadline. A child
+    /// reaped before its deadline stays `timed_out: false` if the deadline passes while its
+    /// output drains.
+    Reaped {
+        status: ExitParts,
+        at: Instant,
+        timed_out: bool,
+    },
+}
+
+impl ExecPhase {
+    /// The direct child is reaped: its pid must not be signalled.
+    fn reaped(&self) -> bool {
+        matches!(self, Self::Reaped { .. })
+    }
+
+    /// The node already ended the command at its deadline.
+    fn timed_out(&self) -> bool {
+        matches!(
+            self,
+            Self::TimedOut
+                | Self::Reaped {
+                    timed_out: true,
+                    ..
+                }
+        )
+    }
+
+    /// Why the command ended when `requested` ends it now ([`EndCause::Exited`] when it
+    /// completes on its own).
+    ///
+    /// Precedence: a timeout the node already acted on wins (the command was killed at its
+    /// deadline, before any later cancel or shutdown), then the requested cause (a cancel or
+    /// a shutdown cuts the output drain short, so it is reported even after the child
+    /// exited), then a plain exit.
+    fn end_cause(&self, requested: EndCause) -> EndCause {
+        if self.timed_out() {
+            EndCause::TimedOut
+        } else {
+            requested
+        }
+    }
+}
+
+impl ExecSession {
+    /// End the command's process tree. The leader's pid is signalled directly only until it
+    /// is reaped (a reaped pid may name another process).
+    fn kill_tree(&mut self) {
+        kill_exec(self.pid, Some(&mut self.child), !self.phase.reaped());
+    }
+
+    /// The direct child's exit status: the one already reaped, or what reaping it now gives.
+    fn reap_now(&mut self) -> ExitParts {
+        match self.phase {
+            ExecPhase::Reaped { status, .. } => status,
+            ExecPhase::Running | ExecPhase::TimedOut => reap_child(&mut self.child),
+        }
+    }
+
+    /// One `poll` step: kill at the deadline, reap, and say whether the command is complete
+    /// (its status and why it ended).
+    fn advance(&mut self, now: Instant) -> Option<(ExitParts, EndCause)> {
+        match self.phase {
+            ExecPhase::Running if now >= self.deadline => {
+                self.kill_tree();
+                let status = reap_child(&mut self.child);
+                self.phase = if status.0.is_some() || status.1.is_some() {
+                    ExecPhase::Reaped {
+                        status,
+                        at: now,
+                        timed_out: true,
+                    }
+                } else {
+                    ExecPhase::TimedOut
+                };
+            }
+            ExecPhase::Running | ExecPhase::TimedOut => {
+                if let Ok(Some(status)) = self.child.try_wait() {
+                    // The direct child is already reaped. Kill grandchildren
+                    // that stayed in its group, without signalling the pid
+                    // itself again.
+                    #[cfg(not(windows))]
+                    kill_exec(self.pid, None, false);
+                    #[cfg(windows)]
+                    kill_exec(self.pid, Some(&mut self.child), false);
+                    self.phase = ExecPhase::Reaped {
+                        status: status_parts(status),
+                        at: now,
+                        timed_out: self.phase.timed_out(),
+                    };
+                }
+            }
+            ExecPhase::Reaped { .. } => {}
+        }
+        let ExecPhase::Reaped { status, at, .. } = self.phase else {
+            return None;
+        };
+        let waited = now.saturating_duration_since(at) >= EXEC_OUTPUT_DRAIN;
+        (self.pipes.drained() || waited).then(|| (status, self.phase.end_cause(EndCause::Exited)))
+    }
 }
 
 /// A command's script file, removed when dropped.
@@ -2997,13 +3211,33 @@ enum EndCause {
     Interrupted,
 }
 
+/// A registry's own life. It takes new work while `Open`; `kill_all` moves it to `ShutDown`
+/// once, for good: it then starts nothing more (no command, shell or operator terminal) and
+/// only answers for what it already knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lifecycle {
+    Open,
+    ShutDown,
+}
+
+impl Lifecycle {
+    fn is_shut_down(self) -> bool {
+        self == Self::ShutDown
+    }
+
+    /// Move to `ShutDown`. `false`: it already was (a second `kill_all` does nothing).
+    fn shut_down(&mut self) -> bool {
+        std::mem::replace(self, Self::ShutDown) == Self::Open
+    }
+}
+
 pub(crate) struct ExecRegistry {
     sessions: BTreeMap<String, ExecSession>,
     ended: VecDeque<(String, EndedCommand)>,
     tx: SyncSender<FromWorker>,
     /// The node's `command_max_ms`: no command lives longer.
     command_max: Duration,
-    shut_down: bool,
+    lifecycle: Lifecycle,
     /// `node-commands.json`: the commands running now, so a daemon that died
     /// can report them `interrupted` (and end their process groups) when it
     /// starts again. `None` in tests that do not persist.
@@ -3098,7 +3332,7 @@ impl ExecRegistry {
             ended: VecDeque::new(),
             tx,
             command_max,
-            shut_down: false,
+            lifecycle: Lifecycle::Open,
             table: None,
             scripts: std::env::temp_dir().join(format!("wsmp-exec-scripts-{}", std::process::id())),
             report_ran_with: false,
@@ -3178,7 +3412,7 @@ impl ExecRegistry {
     }
 
     fn save_table(&self) {
-        if self.shut_down {
+        if self.lifecycle.is_shut_down() {
             // `kill_all` wrote the rows the next daemon reports.
             return;
         }
@@ -3215,10 +3449,9 @@ impl ExecRegistry {
     /// the next daemon reports them `interrupted` too, in case this
     /// connection could not.
     pub(crate) fn kill_all(&mut self) -> Vec<OutboundFrame> {
-        if self.shut_down {
+        if !self.lifecycle.shut_down() {
             return Vec::new();
         }
-        self.shut_down = true;
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         let rows: Vec<RunningCommand> = self
             .sessions
@@ -3261,6 +3494,12 @@ impl ExecRegistry {
     ) -> Vec<OutboundFrame> {
         if !valid_id(command_id) {
             return vec![exec_rejected(command_id, REASON_BAD_COMMAND)];
+        }
+        // After `kill_all` nothing new starts: such a command would run unrecorded (the table
+        // is final) and outlive the shutdown.
+        if self.lifecycle.is_shut_down() {
+            tracing::warn!(command_id, "rejecting an exec after shutdown");
+            return vec![exec_rejected(command_id, REASON_SPAWN_FAILED)];
         }
         // Commands run only at Full control.
         if !startup.full_control() {
@@ -3406,9 +3645,6 @@ impl ExecRegistry {
         let Some(session) = self.sessions.get_mut(command_id) else {
             return;
         };
-        if session.finished {
-            return;
-        }
         let masked = if stderr {
             session.stderr_mask.push(bytes)
         } else {
@@ -3421,14 +3657,11 @@ impl ExecRegistry {
         let Some(session) = self.sessions.get_mut(command_id) else {
             return;
         };
-        if session.finished {
-            return;
-        }
         let masked = if stderr {
-            session.stderr_done = true;
+            session.pipes.stderr = true;
             session.stderr_mask.finish()
         } else {
-            session.stdout_done = true;
+            session.pipes.stdout = true;
             session.stdout_mask.finish()
         };
         // Pipes can close while the process is still running (`sleep
@@ -3440,84 +3673,26 @@ impl ExecRegistry {
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         let mut frames = Vec::new();
         for id in ids {
-            let action = {
-                let Some(session) = self.sessions.get_mut(&id) else {
-                    continue;
-                };
-                if session.finished {
-                    continue;
-                }
-                let timed_out = now >= session.deadline;
-                if timed_out && !session.timed_out {
-                    session.timed_out = true;
-                    // A reaped child's pid may name another process now.
-                    kill_exec(
-                        session.pid,
-                        session.child.as_mut(),
-                        session.reaped.is_none(),
-                    );
-                    let status = reap_child(session.child.as_mut());
-                    if status.0.is_some() || status.1.is_some() {
-                        session.reaped = Some((status.0, status.1, now));
-                    }
-                } else if session.reaped.is_none()
-                    && let Some(Some(status)) = session
-                        .child
-                        .as_mut()
-                        .and_then(|child| child.try_wait().ok())
-                {
-                    let parts = status_parts(status);
-                    // The direct child is already reaped. Kill grandchildren
-                    // that stayed in its group, without signalling the pid
-                    // itself again.
-                    #[cfg(not(windows))]
-                    kill_exec(session.pid, None, false);
-                    #[cfg(windows)]
-                    kill_exec(session.pid, session.child.as_mut(), false);
-                    session.reaped = Some((parts.0, parts.1, now));
-                }
-                let Some((code, signal, reaped_at)) = session.reaped else {
-                    continue;
-                };
-                let drained = session.stdout_done && session.stderr_done;
-                let waited = now.saturating_duration_since(reaped_at) >= EXEC_OUTPUT_DRAIN;
-                if drained || waited {
-                    let cause = if session.timed_out {
-                        EndCause::TimedOut
-                    } else {
-                        EndCause::Exited
-                    };
-                    Some(((code, signal), cause))
-                } else {
-                    None
-                }
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
             };
-            if let Some((parts, cause)) = action {
-                frames.extend(self.complete(&id, parts, cause));
+            if let Some((status, cause)) = session.advance(now) {
+                frames.extend(self.complete(&id, status, cause));
             }
         }
         frames
     }
 
-    fn finish(&mut self, command_id: &str, cause: EndCause) -> Vec<OutboundFrame> {
+    /// End a command now (`requested`: a cancel or a shutdown). The cause reported follows
+    /// [`ExecPhase::end_cause`].
+    fn finish(&mut self, command_id: &str, requested: EndCause) -> Vec<OutboundFrame> {
         let Some(session) = self.sessions.get_mut(command_id) else {
             return Vec::new();
         };
-        if session.finished {
-            return Vec::new();
-        }
         session.stop.store(true, Ordering::SeqCst);
-        kill_exec(
-            session.pid,
-            session.child.as_mut(),
-            session.reaped.is_none(),
-        );
-        let status = reap_child(session.child.as_mut());
-        let cause = if session.timed_out {
-            EndCause::TimedOut
-        } else {
-            cause
-        };
+        session.kill_tree();
+        let status = session.reap_now();
+        let cause = session.phase.end_cause(requested);
         self.complete(command_id, status, cause)
     }
 
@@ -3541,13 +3716,7 @@ impl ExecRegistry {
             };
             session.output.push(&masked);
         }
-        session.finished = true;
         session.stop.store(true, Ordering::SeqCst);
-        // Reader threads exit on their own. Joining them can block if a
-        // grandchild that left the process group still holds a pipe.
-        drop(session.stdout_thread.take());
-        drop(session.stderr_thread.take());
-        drop(session.child.take());
         let (state, exit_code) = match cause {
             EndCause::Cancelled => (ExecState::Cancelled, None),
             EndCause::TimedOut => (ExecState::TimedOut, None),
@@ -3623,10 +3792,7 @@ fn with_tail(mut status: ExecStatus, output: &OutputRing, max: usize) -> ExecSta
     }
 }
 
-fn reap_child(child: Option<&mut ExecChild>) -> (Option<i32>, Option<i32>) {
-    let Some(child) = child else {
-        return (None, None);
-    };
+fn reap_child(child: &mut ExecChild) -> (Option<i32>, Option<i32>) {
     for _ in 0..32 {
         if let Ok(Some(status)) = child.try_wait() {
             return status_parts(status);
@@ -3935,9 +4101,9 @@ fn spawn_exec(
     );
     let started = std::time::SystemTime::now();
     Ok(ExecSession {
-        child: Some(child),
-        stdout_thread: Some(stdout_thread),
-        stderr_thread: Some(stderr_thread),
+        child,
+        _stdout_thread: stdout_thread,
+        _stderr_thread: stderr_thread,
         stop,
         deadline: Instant::now() + lifetime,
         started_at: crate::telemetry::rfc3339(started),
@@ -3945,13 +4111,10 @@ fn spawn_exec(
         stdout_mask: StreamMasker::new(command),
         stderr_mask: StreamMasker::new(command),
         output: OutputRing::default(),
-        stdout_done: false,
-        stderr_done: false,
-        timed_out: false,
-        finished: false,
+        pipes: ExecPipes::default(),
+        phase: ExecPhase::Running,
         pid,
         start_ticks: process_start_ticks(pid),
-        reaped: None,
         _tracked: tracked,
         _script: script,
     })
@@ -4365,6 +4528,82 @@ mod tests {
         ));
         drop(execs);
         drop(rx);
+    }
+
+    #[test]
+    fn exec_end_cause_precedence() {
+        let at = Instant::now();
+        let reaped = |timed_out| ExecPhase::Reaped {
+            status: (Some(3), None),
+            at,
+            timed_out,
+        };
+        for requested in [EndCause::Exited, EndCause::Cancelled, EndCause::Interrupted] {
+            // A timeout the node already acted on wins over a later cancel or shutdown.
+            assert!(ExecPhase::TimedOut.end_cause(requested) == EndCause::TimedOut);
+            assert!(reaped(true).end_cause(requested) == EndCause::TimedOut);
+            // Otherwise the requested cause wins, even over an exit still draining.
+            assert!(ExecPhase::Running.end_cause(requested) == requested);
+            assert!(reaped(false).end_cause(requested) == requested);
+        }
+        // Only an unreaped leader is signalled by pid.
+        assert!(!ExecPhase::Running.reaped());
+        assert!(!ExecPhase::TimedOut.reaped());
+        assert!(reaped(false).reaped());
+    }
+
+    #[test]
+    fn exec_start_after_kill_all_is_refused() {
+        let (tx, _rx) = channel();
+        let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
+        assert!(execs.kill_all().is_empty());
+        let rejected = execs.start_text(
+            &enabled_startup(false),
+            "late",
+            slow_command(),
+            None,
+            TEST_TIMEOUT_MS,
+        );
+        assert!(matches!(
+            &rejected[..],
+            [OutboundFrame::Control(NodeFrame::ExecRejected { command_id, reason })]
+                if command_id == "late" && reason == REASON_SPAWN_FAILED
+        ));
+        assert!(execs.sessions.is_empty(), "nothing runs after the shutdown");
+        assert!(
+            execs.kill_all().is_empty(),
+            "a second shutdown does nothing"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_exec_reaped_before_its_deadline_is_not_timed_out_while_it_drains() {
+        let (tx, _rx) = channel();
+        let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
+        execs.start_text(&enabled_startup(false), "quick", "exit 3", None, 2_000);
+        // Reap it before its deadline; its pipe EOFs are never fed, so it waits to drain.
+        let until = Instant::now() + Duration::from_secs(1);
+        while !execs.sessions["quick"].phase.reaped() {
+            assert!(execs.poll(Instant::now()).is_empty(), "it waits to drain");
+            assert!(Instant::now() < until, "the command never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ExecPhase::Reaped { at, .. } = execs.sessions["quick"].phase else {
+            unreachable!("checked above");
+        };
+        let deadline = execs.sessions["quick"].deadline;
+        assert!(deadline > at, "reaped before its deadline");
+        // The deadline passes while the output drains: the exit is still reported.
+        let frames = execs.poll(deadline.max(at + EXEC_OUTPUT_DRAIN));
+        assert!(
+            matches!(
+                &frames[..],
+                [OutboundFrame::Control(NodeFrame::ExecStatus(status))]
+                    if status.state == ExecState::Failed && status.exit_code == Some(3)
+            ),
+            "the exit is reported, not a timeout"
+        );
     }
 
     #[test]
@@ -5241,20 +5480,14 @@ mod tests {
     fn pty_size(terminals: &TerminalRegistry) -> (u16, u16) {
         // The helper owns the console; the registry's record is what it sent.
         let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
-        assert!(session.pty.is_some(), "pty");
+        assert!(session.pty().is_some(), "pty");
         session.pty_size
     }
 
     #[cfg(unix)]
     fn pty_size(terminals: &TerminalRegistry) -> (u16, u16) {
         let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
-        let size = session
-            .pty
-            .as_ref()
-            .expect("pty")
-            .master
-            .get_size()
-            .expect("size");
+        let size = session.pty().expect("pty").master.get_size().expect("size");
         assert_eq!(session.pty_size, (size.cols, size.rows));
         (size.cols, size.rows)
     }
@@ -5619,7 +5852,7 @@ mod tests {
         );
         let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
         assert!(session.viewers.is_empty());
-        assert!(session.detached_at.is_some());
+        assert!(matches!(session.attachment, Attachment::Detached { .. }));
         // With no viewers, output is only recorded.
         assert!(terminals.on_bytes(MULTI_TERMINAL, b"quiet").is_empty());
     }
@@ -5678,6 +5911,48 @@ mod tests {
             controls(&frames)[0],
             NodeFrame::TermExit { terminal_id, .. } if terminal_id == MULTI_TERMINAL
         ));
+    }
+
+    #[test]
+    fn a_reattached_terminal_is_not_idle() {
+        const IDLE_LIMIT: Duration = Duration::from_secs(60);
+        let (tx, _rx) = channel();
+        let mut terminals = sleeping_registry(tx, IDLE_LIMIT, 30);
+        let startup = enabled_startup(false);
+        let mut a = TestViewer::new(1);
+        let mut b = TestViewer::new(2);
+        open_viewer(&mut terminals, &startup, &mut a);
+        terminals.detach(MULTI_TERMINAL, Some(&a.id));
+        assert!(matches!(
+            terminals.sessions[MULTI_TERMINAL].attachment,
+            Attachment::Detached { .. }
+        ));
+        attach_viewer(&mut terminals, &startup, &mut b);
+        assert_eq!(
+            terminals.sessions[MULTI_TERMINAL].attachment,
+            Attachment::Attached
+        );
+        assert!(terminals.poll(Instant::now() + IDLE_LIMIT * 2).is_empty());
+        assert!(terminals.sessions.contains_key(MULTI_TERMINAL));
+    }
+
+    #[test]
+    fn no_terminal_opens_after_kill_all() {
+        let (tx, _rx) = channel();
+        let mut terminals = multi_registry(tx);
+        let startup = enabled_startup(false);
+        assert!(terminals.kill_all().is_empty());
+        let viewer = TestViewer::new(1);
+        let frames = terminals.open(&startup, None, viewer.handshake(MULTI_TERMINAL, 80, 24));
+        assert_eq!(
+            rejection(&frames),
+            Some((Some(viewer.id.clone()), REASON_SPAWN_FAILED.to_string()))
+        );
+        assert!(terminals.sessions.is_empty(), "nothing spawned");
+        assert!(
+            terminals.kill_all().is_empty(),
+            "a second shutdown does nothing"
+        );
     }
 
     #[test]
@@ -5923,8 +6198,7 @@ mod tests {
         {
             let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
             let raw = session
-                .pty
-                .as_ref()
+                .pty()
                 .expect("pty")
                 .master
                 .as_raw_fd()
@@ -5959,7 +6233,7 @@ mod tests {
         let shell_running = terminals
             .sessions
             .get_mut(MULTI_TERMINAL)
-            .and_then(|session| session.pty.as_mut())
+            .and_then(|session| session.pty_mut())
             .expect("pty")
             .child
             .try_wait()
@@ -6096,7 +6370,7 @@ mod tests {
             terminals
                 .sessions
                 .get("guard")
-                .and_then(|session| session.pty.as_ref())
+                .and_then(|session| session.pty())
                 .is_some_and(|pty| pty.guarded)
         );
         let wait_for = |path: &Path| {
@@ -6175,7 +6449,7 @@ mod tests {
         let shell = terminals
             .sessions
             .get("jobs")
-            .and_then(|session| session.pty.as_ref())
+            .and_then(|session| session.pty())
             .and_then(|pty| pty.pid)
             .expect("shell pid");
         let read_pid = |path: &Path| {
@@ -6420,7 +6694,7 @@ mod tests {
         let shell = terminals
             .sessions
             .get("forced")
-            .and_then(|session| session.pty.as_ref())
+            .and_then(|session| session.pty())
             .and_then(|pty| pty.pid)
             .expect("shell pid");
         let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);

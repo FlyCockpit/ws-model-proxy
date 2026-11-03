@@ -20,17 +20,21 @@ use crate::protocol::frames::{InstanceRecord, JobError, NodeFrame};
 /// Steps running at once.
 const RUNNING_MAX: usize = 32;
 
-/// What a finished step (or an observation pass) reports.
+/// What the runner tells the relay loop.
 #[derive(Debug)]
-pub struct Update {
-    /// Observations are ordered: an older one never replaces a newer one.
-    pub generation: u64,
-    pub result: Option<NodeFrame>,
-    /// Every instance rank this node knows, verified against the machine.
-    pub instances: Vec<(Job, InstanceRecord)>,
+#[allow(clippy::large_enum_variant)] // `NodeFrame` is large; the old struct always carried one.
+pub enum Update {
     /// An operator step asks the relay loop for its terminal (no result and
     /// no observation ride along).
-    pub operator: Option<OperatorRequest>,
+    Operator(OperatorRequest),
+    /// A finished step (with its result) or an observation pass (without).
+    Observation {
+        /// Observations are ordered: an older one never replaces a newer one.
+        generation: u64,
+        result: Option<NodeFrame>,
+        /// Every instance rank this node knows, verified against the machine.
+        instances: Vec<(Job, InstanceRecord)>,
+    },
 }
 
 /// What an operator step's runner thread asks of the relay loop.
@@ -87,9 +91,16 @@ fn key_name(job: &Job) -> Option<String> {
     ok.then(|| format!("{}-r{}", job.instance_id, job.rank))
 }
 
-/// One step in flight on a rank: its cancel flag, its dispatch (step id and
-/// operator terminal id), and whether it may launch (a start phase).
-type InFlight = (Arc<AtomicBool>, String, bool);
+/// One step in flight on a rank.
+#[derive(Debug)]
+struct InFlight {
+    /// Its cancel flag; also what names it ([`forget_step`]).
+    cancel: Arc<AtomicBool>,
+    /// Its dispatch: step id and operator terminal id.
+    dispatch: String,
+    /// Whether it may launch a process (a start phase, [`may_launch`]).
+    launches: bool,
+}
 
 /// The phases that may launch a process (the server's `RUN_START_PHASES`).
 fn may_launch(phase: crate::protocol::frames::JobPhase) -> bool {
@@ -108,7 +119,7 @@ fn forget_step(
 ) {
     let mut running = running.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(flags) = running.get_mut(key) {
-        flags.retain(|(flag, _, _)| !Arc::ptr_eq(flag, cancel));
+        flags.retain(|step| !Arc::ptr_eq(&step.cancel, cancel));
         if flags.is_empty() {
             running.remove(key);
         }
@@ -136,7 +147,7 @@ fn rank_idle_given(
     running.get(key).is_none_or(|flags| {
         flags
             .iter()
-            .all(|(flag, _, launches)| !*launches || flag.load(Ordering::SeqCst))
+            .all(|step| !step.launches || step.cancel.load(Ordering::SeqCst))
     })
 }
 
@@ -240,11 +251,10 @@ impl Runner {
             .spawn(move || {
                 let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
                 let instances = observe_all_idle(&dir, &keys, &running);
-                let _ = tx.send(Update {
+                let _ = tx.send(Update::Observation {
                     generation,
                     result: None,
                     instances,
-                    operator: None,
                 });
             });
     }
@@ -324,7 +334,7 @@ impl Runner {
                 forget_step(&running, &key, &cancel);
                 let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
                 let instances = observe_all_idle(&dir, &keys, &running);
-                let _ = tx.send(Update {
+                let _ = tx.send(Update::Observation {
                     generation,
                     result: outcome.map(|outcome| {
                         let mut frame = result_frame_for(&job, &outcome, terminal_id.as_deref());
@@ -339,7 +349,6 @@ impl Runner {
                         frame
                     }),
                     instances,
-                    operator: None,
                 });
                 active.fetch_sub(1, Ordering::SeqCst);
             });
@@ -367,15 +376,19 @@ fn admit_step(
     launches: bool,
     cancel: &Arc<AtomicBool>,
 ) -> bool {
-    if flags.iter().any(|(_, other, _)| *other == dispatch) {
+    if flags.iter().any(|step| step.dispatch == dispatch) {
         return false;
     }
     if stop {
-        for (flag, _, _) in flags.iter() {
-            flag.store(true, Ordering::SeqCst);
+        for step in flags.iter() {
+            step.cancel.store(true, Ordering::SeqCst);
         }
     }
-    flags.push((Arc::clone(cancel), dispatch, launches));
+    flags.push(InFlight {
+        cancel: Arc::clone(cancel),
+        dispatch,
+        launches,
+    });
     true
 }
 
@@ -430,24 +443,16 @@ impl OperatorLink for RunnerLink<'_> {
             events,
         };
         self.tx
-            .send(Update {
-                generation: 0,
-                result: None,
-                instances: Vec::new(),
-                operator: Some(OperatorRequest::Open(Box::new(open))),
-            })
+            .send(Update::Operator(OperatorRequest::Open(Box::new(open))))
             .map_err(|_| JobError::SessionDisconnected)
     }
 
     fn close_if_confirming(&self) {
-        let _ = self.tx.send(Update {
-            generation: 0,
-            result: None,
-            instances: Vec::new(),
-            operator: Some(OperatorRequest::CloseIfConfirming {
+        let _ = self
+            .tx
+            .send(Update::Operator(OperatorRequest::CloseIfConfirming {
                 terminal_id: self.ticket.ids.terminal_id.clone(),
-            }),
-        });
+            }));
     }
 }
 

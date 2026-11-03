@@ -1,6 +1,16 @@
 import type { Terminal } from "@xterm/xterm";
 
 import { claimTouchMouse, type TouchGrant } from "@/lib/terminal-touch-mouse";
+import {
+  moveTouchPhase,
+  releaseTouchPhase,
+  startTouchPhase,
+  type TouchPhase,
+  type TouchRelease,
+  touchLive,
+  touchTaken,
+  voidTouchPhase,
+} from "@/lib/terminal-touch-phase";
 
 /**
  * Touch scrolling for the browser terminal. xterm 6 has no touch handling of its own, so a swipe
@@ -240,27 +250,14 @@ export type TouchScrollWiring = {
 
 /**
  * One touch, from the touchstart that put its finger down until no finger is left. Everything the
- * touch may do is decided from this record: an interaction ending or a second finger anywhere on
- * the page sets `void`, and nothing else carries its authority.
+ * touch may do is decided from its `phase` (terminal-touch-phase.ts): an interaction ending or a
+ * second finger anywhere on the page makes it `void`, and nothing else carries its authority.
  */
 type LiveTouch = {
   /** The `Touch.identifier` of its finger, to find that finger's lift in a touchend. */
   identifier: number;
   gesture: TouchScrollGesture;
-  /** It may scroll the pane: enabled when it started, and since. */
-  owned: boolean;
-  /**
-   * The pane took it (it moved past the slop while the pane's, or it stopped a coasting scroll):
-   * its moves are cancelled, so its release is cancelled too.
-   */
-  claimed: boolean;
-  /**
-   * Ended by `cancel()` (the interaction changed under it) or by a second finger: it scrolls no
-   * more, is no tap, and every one of its releases is cancelled.
-   */
-  void: boolean;
-  /** No finger of it is down any more. */
-  ended: boolean;
+  phase: TouchPhase;
 };
 
 /**
@@ -277,7 +274,7 @@ type LiveTouch = {
  *   carry the touch's own finger (no position to check: no tap). Its release is cancelled: no
  *   compatibility mousedown or click (no click report, no writer claim, no focus).
  */
-type Release = "tap" | "native" | "cancel";
+type Release = TouchRelease;
 
 /**
  * Turn one-finger vertical swipes in `container` into wheel scrolling of `term`. `enabled` is
@@ -322,7 +319,7 @@ export function wireTouchScroll(
     if (frame !== null) cancelFrame(frame);
     frame = null;
     tap = null;
-    if (touch) touch.void = true;
+    if (touch) touch.phase = voidTouchPhase(touch.phase);
   };
 
   const runMomentum = (momentum: TouchScrollMomentum, at: TouchPoint) => {
@@ -338,18 +335,18 @@ export function wireTouchScroll(
     frame = requestFrame(tick);
   };
 
-  /** The decision for one finger lifting (touchend) or the browser taking the touch (touchcancel). */
-  const releaseOf = (event: TouchEvent): Release => {
+  /**
+   * The decision for one finger lifting (touchend) or the browser taking the touch (touchcancel),
+   * and the touch's phase after it: void while a finger is still down (of this touch, or one that
+   * went down outside the pane) or once the browser took it; ended at its last finger. Whether it
+   * coasts on is decided at that last finger.
+   */
+  const releaseOf = (event: TouchEvent): { release: Release; coasts: boolean } => {
     const live = touch;
     // A finger of a touch this wiring did not see start, or saw end: not this interaction's.
     // (A touch that outlived this pane's element gets no touchend here at all; its mouse events
     // find no grant here and are held back by the document's owner instead.)
-    if (!live || live.ended) return "cancel";
-    // A finger is still down (of this touch, or one that went down outside the pane), or the
-    // browser took the touch: more than a one-finger tap, for the rest of the touch.
-    if (event.touches.length > 0 || event.type === "touchcancel") live.void = true;
-    if (live.void || live.claimed) return "cancel";
-    if (live.gesture.moved) return "native";
+    if (!live) return { release: "cancel", coasts: false };
     // Where the finger lifted decides too: the browser may deliver no move for it at all (or only
     // one under the slop, the rest coalesced into the touchend), so a tap is checked against the
     // touchend's own coordinates for this touch's finger, matched by identifier. A finger that
@@ -357,13 +354,22 @@ export function wireTouchScroll(
     const lifted = Array.from(event.changedTouches).find(
       (point) => point.identifier === live.identifier,
     );
-    if (!lifted || !live.gesture.withinSlop({ x: lifted.clientX, y: lifted.clientY }))
-      return "cancel";
-    return "tap";
+    const next = releaseTouchPhase(live.phase, {
+      fingersLeft: event.touches.length,
+      cancelled: event.type === "touchcancel",
+      moved: live.gesture.moved,
+      liftedWithinSlop:
+        !!lifted && live.gesture.withinSlop({ x: lifted.clientX, y: lifted.clientY }),
+    });
+    live.phase = next.phase;
+    return { release: next.release, coasts: next.coasts };
   };
   /** Every lift: decided first, whichever finger it is; then, at the last finger, the touch ends. */
   const onRelease = (event: TouchEvent) => {
-    const release = releaseOf(event);
+    const live = touch;
+    // Seen ending before this lift: nothing of it coasts again.
+    const wasLive = live !== null && touchLive(live.phase);
+    const { release, coasts } = releaseOf(event);
     if (release === "cancel") {
       if (event.cancelable) event.preventDefault();
     } else if (release === "tap") {
@@ -372,11 +378,9 @@ export function wireTouchScroll(
       tap = { at: now() };
       options.onTap?.();
     }
-    const live = touch;
-    if (!live || live.ended || event.touches.length > 0) return;
-    live.ended = true;
+    if (!live || !wasLive || event.touches.length > 0) return;
     // A scroll the pane had, released fast, coasts on.
-    if (live.void || !live.claimed || !live.owned || !options.enabled()) return;
+    if (!coasts || !options.enabled()) return;
     const momentum = live.gesture.end(now());
     if (momentum) runMomentum(momentum, live.gesture.start);
   };
@@ -385,7 +389,8 @@ export function wireTouchScroll(
   // A new touch anywhere also ends the last tap's turn: mouse events after this are not that tap's.
   const onAnyTouchStart = (event: TouchEvent) => {
     tap = null;
-    if (touch && !touch.ended && event.touches.length > 1) touch.void = true;
+    if (touch && touchLive(touch.phase) && event.touches.length > 1)
+      touch.phase = voidTouchPhase(touch.phase);
   };
   /**
    * What lets a mouse event a touch made act here: this pane decided that touch was a tap (or, for
@@ -405,11 +410,11 @@ export function wireTouchScroll(
     if (tap !== null && now() - tap.at <= TAP_MOUSE_WINDOW_MS) return tap;
     if (event.type !== "contextmenu") return null;
     // A live long press: focus only (see above), never a tap's click or copy window.
-    return touch !== null && !touch.ended && !touch.void ? touch : null;
+    return touch !== null && touchLive(touch.phase) && touch.phase.kind !== "void" ? touch : null;
   };
 
   const onTouchStart = (event: TouchEvent) => {
-    const live = touch && !touch.ended ? touch : null;
+    const live = touch && touchLive(touch.phase) ? touch : null;
     const coasting = frame !== null;
     // A new touch, or another finger of this one: the interaction so far ends here.
     cancel();
@@ -421,30 +426,31 @@ export function wireTouchScroll(
       touch = null;
       return;
     }
-    const owned = options.enabled();
     // Disabled, the finger is still followed to tell a tap from a drag, but scrolls nothing.
+    // Stopping a coasting scroll is a stop, as a native scroll's is, not a tap. Two fingers at
+    // once (one may have started outside the pane): never this pane's scroll.
     touch = {
       identifier: first.identifier,
       gesture: new TouchScrollGesture({ x: first.clientX, y: first.clientY }, now()),
-      owned,
-      // Stopping a coasting scroll is a stop, as a native scroll's is, not a tap.
-      claimed: coasting && owned,
-      // Two fingers at once (one may have started outside the pane): never this pane's scroll.
-      void: event.touches.length !== 1,
-      ended: false,
+      phase: startTouchPhase({
+        enabled: options.enabled(),
+        coasting,
+        fingers: event.touches.length,
+      }),
     };
   };
   const onTouchMove = (event: TouchEvent) => {
     const live = touch;
-    if (!live || live.ended) return;
+    if (!live || !touchLive(live.phase)) return;
     // A second finger, even one that went down outside the pane (its touchstart never came
     // here): the touch is void for the rest of its life, also once back to one finger.
-    if (event.touches.length !== 1) live.void = true;
+    if (event.touches.length !== 1) live.phase = voidTouchPhase(live.phase);
     const point = event.touches[0];
     if (!point) return;
-    if (live.void) {
+    if (live.phase.kind === "void") {
       // A drag the pane took stays out of the page; a pinch stays the browser's.
-      if (live.claimed && event.touches.length === 1 && event.cancelable) event.preventDefault();
+      if (live.phase.claimed && event.touches.length === 1 && event.cancelable)
+        event.preventDefault();
       return;
     }
     const lines = live.gesture.move(
@@ -452,15 +458,19 @@ export function wireTouchScroll(
       now(),
       lineHeightOf(term),
     );
-    if (live.owned && !options.enabled()) live.owned = false;
+    // Touch stopping being the pane's drops its scroll; past the slop the pane takes it.
+    live.phase = moveTouchPhase(live.phase, {
+      enabled: options.enabled(),
+      pastSlop: live.gesture.moved,
+    });
     // Under the slop it may still be a tap: cancelling a move there could cancel the tap's click
     // (and the keyboard it opens). touch-action on the pane keeps the browser from panning.
-    if (!live.gesture.moved || !(live.owned || live.claimed)) return;
+    if (!live.gesture.moved || !touchTaken(live.phase)) return;
     // Past the slop the drag is the pane's: the browser pans nothing on either axis, even once
     // the drag has been cancelled (it started as the pane's, and stays out of the page).
     if (event.cancelable) event.preventDefault();
-    live.claimed = true;
-    if (live.owned && live.gesture.scrolling) scrollTerminalLines(term, lines, live.gesture.start);
+    if (live.phase.kind === "claimed" && live.gesture.scrolling)
+      scrollTerminalLines(term, lines, live.gesture.start);
   };
   // A hidden page runs no frames: a scroll queued now would arrive in a burst on return.
   const onVisibilityChange = () => {

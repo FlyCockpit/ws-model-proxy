@@ -13,6 +13,7 @@ import {
   abandonTargetRecoveryTrial,
   claimTargetRecoveryTrial,
   settleTargetRecoveryTrial,
+  targetDueWhere,
 } from "@ws-model-proxy/api/lib/pool-routing";
 import prisma from "@ws-model-proxy/db";
 
@@ -184,8 +185,8 @@ export async function listDueOwnedTargetRecoveries(
   const rows = await prisma.executionTarget.findMany({
     where: {
       kind: "INSTANCE_MODEL",
-      health: { in: ["DEGRADED", "UNHEALTHY"] },
-      nextRetryAt: { lte: now },
+      // The same "due" rule the claim applies (`claimTargetRecoveryTrial`).
+      ...targetDueWhere(now),
       RuntimeModel: {
         OR: [
           {

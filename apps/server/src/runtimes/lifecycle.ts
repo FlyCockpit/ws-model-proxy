@@ -29,6 +29,11 @@ import { releaseClaim, sweepReleaseRequests } from "@ws-model-proxy/api/lib/clai
 import { sameStoredInstanceFacts, storedInstanceFacts } from "@ws-model-proxy/api/lib/engine-facts";
 import { graphWrite, instanceCapacityFences } from "@ws-model-proxy/api/lib/graph-write";
 import {
+  assertInstanceTransition,
+  type InstancePhaseChange,
+  instancePhaseData,
+} from "@ws-model-proxy/api/lib/instance-phase";
+import {
   fresh,
   isLeadingStop,
   mayHaveRunAfterRequeue,
@@ -39,6 +44,14 @@ import {
   resolveRun,
   startsUnresolved,
 } from "@ws-model-proxy/api/lib/instance-run";
+import { nodeUnreachableSince } from "@ws-model-proxy/api/lib/node-liveness";
+import {
+  endedNeverSentOr,
+  endSteps,
+  operatorStepWaiting,
+  syncNeedsOperator,
+  writeOperatorNeed,
+} from "@ws-model-proxy/api/lib/operator-need";
 import {
   CURRENT_RESERVATION_WHERE,
   dropSupersededHolds,
@@ -73,6 +86,7 @@ import type {
   SendGuard,
 } from "../relay/session-manager.js";
 import { applyAlwaysOnInventory, instanceStoredFacts } from "./always-on.js";
+import { SerialTicker } from "./serial-ticker.js";
 import {
   GENERATION_STRIDE,
   generationSteps,
@@ -280,15 +294,6 @@ function commandAuthor(editor: "USER" | "AGENT" | "SYSTEM"): "user" | "agent" | 
   return editor === "USER" ? "user" : editor === "AGENT" ? "agent" : "unknown";
 }
 
-/**
- * A person's accepted interactive run past its timeout, of any run: it is never cut off, its
- * person is asked to look at it (`needsOperator` STEP, needsYou), and the deadline sweep skips
- * it once that need is raised.
- */
-function overdueAcceptedRun(now: Date): Prisma.InstanceStepWhereInput {
-  return { state: "RUNNING", operatorAcceptedAt: { not: null }, deadline: { lte: now } };
-}
-
 /** A step as `afterStep` needs it. */
 type FinishedStep = {
   /** A stop proof names its step: `releaseClaim` checks it belongs to the claim's run. */
@@ -482,24 +487,6 @@ function isStartPhase(phase: string): boolean {
   return (START_PHASES as readonly string[]).includes(phase);
 }
 
-/** A node session sends a heartbeat at least this often; older means the node is gone. */
-const HEARTBEAT_STALE_MS = 3 * 60_000;
-
-/**
- * Since when a node is offline, or null when it is online: OFFLINE rows since their
- * disconnect; ONLINE rows whose heartbeat went stale (a server that stopped abruptly never
- * wrote the disconnect) since their last heartbeat.
- */
-function offlineSinceOf(
-  node: { connection: string; lastDisconnectedAt: Date | null; lastHeartbeatAt: Date | null },
-  now: Date,
-): Date | null {
-  if (node.connection === "OFFLINE") return node.lastDisconnectedAt ?? new Date(0);
-  if (node.lastHeartbeatAt && node.lastHeartbeatAt.getTime() < now.getTime() - HEARTBEAT_STALE_MS)
-    return node.lastHeartbeatAt;
-  return null;
-}
-
 function errorName(error: unknown): string {
   return error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error;
 }
@@ -510,9 +497,11 @@ export class RuntimeLifecycle {
     .toString("base64url")
     .replace(/[^A-Za-z0-9]/g, "x")}`;
   private timer: ReturnType<typeof setInterval> | null = null;
-  private running: Promise<void> | null = null;
-  private again = false;
-  private stopped = false;
+  /** One tick at a time (idle, running, running with a rerun, stopped: `./serial-ticker.ts`). */
+  private readonly ticker = new SerialTicker(
+    () => this.tick(),
+    (error: unknown) => console.error("[lifecycle] tick failed", errorName(error)),
+  );
   private readonly now: () => Date;
   private readonly startedAt = Date.now();
   /** Each batched sweep's page cursor (`./sweep.ts`): every matching row is reached. */
@@ -533,6 +522,11 @@ export class RuntimeLifecycle {
     this.now = options.now ?? (() => new Date());
   }
 
+  /** Whether `stop()` was called (no tick starts on its own any more). */
+  private get stopped(): boolean {
+    return this.ticker.state === "stopped";
+  }
+
   start() {
     if (this.timer || this.stopped) return;
     this.timer = setInterval(() => this.wake(), TICK_MS);
@@ -541,37 +535,22 @@ export class RuntimeLifecycle {
   }
 
   async stop() {
-    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    await this.running;
+    await this.ticker.stop();
   }
 
   /** Runs a tick now (or right after the current one). */
   wake() {
-    if (this.stopped) return;
-    if (this.running) {
-      this.again = true;
-      return;
-    }
-    this.running = this.tick()
-      .catch((error: unknown) => console.error("[lifecycle] tick failed", errorName(error)))
-      .finally(() => {
-        this.running = null;
-        if (this.again) {
-          this.again = false;
-          this.wake();
-        }
-      });
+    this.ticker.wake();
   }
 
-  /** Joins the current tick and runs one more (tests, operational probes). */
+  /**
+   * Runs one tick after the current one, never beside it (tests, operational probes), and
+   * settles with it.
+   */
   async runOnce() {
-    await this.running;
-    this.running = this.tick().finally(() => {
-      this.running = null;
-    });
-    await this.running;
+    await this.ticker.runOnce();
   }
 
   /** `Context.services.dispatchRuntimeOperation`: the operation committed; act on it now. */
@@ -800,17 +779,41 @@ export class RuntimeLifecycle {
    * cancelled; the stop steps follow in `settleStopping`.
    */
   private async gangStop(tx: Tx, instance: InstanceRow, reason: string) {
-    await tx.runtimeInstance.update({
-      where: { id: instance.id },
-      data: {
-        phase: "STOPPING",
-        phaseReason: reason,
-        phaseChangedAt: this.now(),
-        needsOperator: null,
-        needsOperatorSince: null,
-      },
+    // The desired state is kept (an always-on instance, desired null, never gang-stops: refused).
+    await this.writePhase(tx, instance, {
+      to: "STOPPING",
+      reason,
+      desiredState: instance.desiredState ?? "RUNNING",
     });
-    await this.settleStopping(tx, { ...instance, phase: "STOPPING", phaseReason: reason });
+    // As just written (the need cleared): the stop rules compare their need with the stored one.
+    await this.settleStopping(tx, {
+      ...instance,
+      phase: "STOPPING",
+      phaseReason: reason,
+      needsOperator: null,
+      needsOperatorSince: null,
+      nextRestartAt: null,
+      unavailableSince: null,
+      unhealthySince: null,
+    });
+  }
+
+  /**
+   * The one phase write of a managed instance (`lib/instance-phase.ts`): the move is checked
+   * against the phase read under this write's fences, and every phase-scoped column follows the
+   * target phase. Returns what it wrote (`extra`: columns of the same write outside the phase).
+   */
+  private async writePhase(
+    tx: Tx,
+    instance: { id: string; phase: string; desiredState: string | null },
+    change: InstancePhaseChange,
+    now: Date = this.now(),
+    extra: Prisma.RuntimeInstanceUncheckedUpdateInput = {},
+  ) {
+    assertInstanceTransition(instance, change);
+    const columns = instancePhaseData(change, now);
+    await tx.runtimeInstance.update({ where: { id: instance.id }, data: { ...columns, ...extra } });
+    return columns;
   }
 
   /**
@@ -885,27 +888,30 @@ export class RuntimeLifecycle {
       },
       data: { errorCode: null },
     });
-    await tx.instanceStep.updateMany({
-      where: {
-        instanceId: instance.id,
-        state: "PENDING",
-        phase: { in: [...START_PHASES, "HEALTH"] },
-        attempts: 0,
-      },
-      data: { state: "CANCELLED", operatorHold: null },
+    // The need is decided below (or by settleStopped) from what is left.
+    await endSteps(tx, {
+      instanceId: instance.id,
+      where: { state: "PENDING", phase: { in: [...START_PHASES, "HEALTH"] }, attempts: 0 },
+      data: { state: "CANCELLED" },
+      now,
+      need: "caller",
     });
-    await tx.instanceStep.updateMany({
-      where: {
-        instanceId: instance.id,
-        state: "PENDING",
-        phase: { in: [...START_PHASES, "HEALTH"] },
-      },
-      data: { state: "FAILED", errorCode: "stopped", operatorHold: null },
+    await endSteps(tx, {
+      instanceId: instance.id,
+      where: { state: "PENDING", phase: { in: [...START_PHASES, "HEALTH"] } },
+      data: { state: "FAILED", errorCode: "stopped" },
+      now,
+      need: "caller",
     });
     // Interactive start steps still waiting for their person (or whose terminal is still
     // coming up) never run now: their terminals close. A person's run in progress is left to
     // answer; the instance's stops wait behind it (dispatch).
-    await this.settleOperatorSteps(tx, instance.id, START_PHASES, "stopped");
+    const operatorSettled = await this.settleOperatorSteps(
+      tx,
+      instance.id,
+      START_PHASES,
+      "stopped",
+    );
     const launch = launchOf(instance);
     // This run's gang stops (not its leading stop, not status probes).
     const stopSteps = await tx.instanceStep.findMany({
@@ -983,11 +989,14 @@ export class RuntimeLifecycle {
       : (await this.operatorStepWaiting(tx, instance.id))
         ? "STEP"
         : null;
-    if (instance.needsOperator !== need)
-      await tx.runtimeInstance.update({
-        where: { id: instance.id },
-        data: { needsOperator: need, needsOperatorSince: need ? now : null },
-      });
+    // Compared with the stored need: settling operator steps above may have changed it.
+    await writeOperatorNeed(
+      tx,
+      instance.id,
+      need,
+      now,
+      operatorSettled > 0 ? undefined : instance.needsOperator,
+    );
   }
 
   /**
@@ -1054,7 +1063,7 @@ export class RuntimeLifecycle {
       where: { id: nodeId },
       select: { connection: true, lastDisconnectedAt: true, lastHeartbeatAt: true },
     });
-    const since = node ? offlineSinceOf(node, this.now()) : null;
+    const since = node ? nodeUnreachableSince(node, this.now()) : null;
     return since !== null && since.getTime() <= this.now().getTime() - ms;
   }
 
@@ -1062,43 +1071,30 @@ export class RuntimeLifecycle {
   private async settleStopped(tx: Tx, instance: InstanceRow, now: Date) {
     // Interactive stops still waiting for their person have nothing left to stop.
     await this.settleOperatorSteps(tx, instance.id, ["STOP"], "superseded");
-    // Nothing is left to stop: pending stops are not needed any more (re-queued ones fail).
-    await tx.instanceStep.updateMany({
-      where: { instanceId: instance.id, phase: "STOP", state: "PENDING", attempts: 0 },
-      data: { state: "CANCELLED", operatorHold: null },
+    // Nothing is left to stop: pending stops are not needed any more (re-queued ones fail). The
+    // phase write below decides the need.
+    await endSteps(tx, {
+      instanceId: instance.id,
+      where: { phase: "STOP", state: "PENDING", attempts: 0 },
+      data: { state: "CANCELLED" },
+      now,
+      need: "caller",
     });
-    await tx.instanceStep.updateMany({
-      where: { instanceId: instance.id, phase: "STOP", state: "PENDING" },
-      data: { state: "FAILED", errorCode: "superseded", operatorHold: null },
+    await endSteps(tx, {
+      instanceId: instance.id,
+      where: { phase: "STOP", state: "PENDING" },
+      data: { state: "FAILED", errorCode: "superseded" },
+      now,
+      need: "caller",
     });
+    // The stop's reason is kept on STOPPED (and on a terminal start error's FAILED).
+    const reason = instance.phaseReason;
     if (instance.desiredState !== "RUNNING") {
-      await tx.runtimeInstance.update({
-        where: { id: instance.id },
-        data: {
-          phase: "STOPPED",
-          phaseChangedAt: now,
-          fabricId: null,
-          needsOperator: null,
-          needsOperatorSince: null,
-          nextRestartAt: null,
-          unavailableSince: null,
-        },
-      });
+      await this.writePhase(tx, instance, { to: "STOPPED", reason, after: { kind: "stay" } }, now);
       return;
     }
-    if (instance.phaseReason !== null && TERMINAL_START_ERRORS.has(instance.phaseReason)) {
-      await tx.runtimeInstance.update({
-        where: { id: instance.id },
-        data: {
-          phase: "FAILED",
-          phaseChangedAt: now,
-          fabricId: null,
-          nextRestartAt: null,
-          unavailableSince: null,
-          needsOperator: null,
-          needsOperatorSince: null,
-        },
-      });
+    if (reason !== null && TERMINAL_START_ERRORS.has(reason)) {
+      await this.writePhase(tx, instance, { to: "FAILED", reason }, now);
       return;
     }
     const launch = launchOf(instance);
@@ -1112,18 +1108,12 @@ export class RuntimeLifecycle {
       );
     if (interactiveStart) {
       // Owner decision: an interactive start is never restarted automatically.
-      await tx.runtimeInstance.update({
-        where: { id: instance.id },
-        data: {
-          phase: "STOPPED",
-          phaseChangedAt: now,
-          fabricId: null,
-          nextRestartAt: null,
-          unavailableSince: null,
-          needsOperator: "RESTART",
-          needsOperatorSince: now,
-        },
-      });
+      await this.writePhase(
+        tx,
+        instance,
+        { to: "STOPPED", reason, after: { kind: "restart_by_person" } },
+        now,
+      );
       return;
     }
     const budget = advancedInt(instance, "restartBudget");
@@ -1133,36 +1123,31 @@ export class RuntimeLifecycle {
       now.getTime() - instance.restartWindowStartedAt.getTime() < windowMs;
     const used = windowOpen ? instance.restartsInWindow : 0;
     if (used >= budget) {
-      await tx.runtimeInstance.update({
-        where: { id: instance.id },
-        data: {
-          phase: "FAILED",
-          phaseReason: "restart_budget_exhausted",
-          phaseChangedAt: now,
-          fabricId: null,
-          nextRestartAt: null,
-          unavailableSince: null,
-          needsOperator: null,
-          needsOperatorSince: null,
-        },
-      });
+      await this.writePhase(
+        tx,
+        instance,
+        { to: "FAILED", reason: "restart_budget_exhausted" },
+        now,
+      );
       return;
     }
     const backoff = Math.min(RESTART_BACKOFF_BASE_MS * 2 ** used, RESTART_BACKOFF_MAX_MS);
-    await tx.runtimeInstance.update({
-      where: { id: instance.id },
-      data: {
-        phase: "STOPPED",
-        phaseChangedAt: now,
-        fabricId: null,
-        unavailableSince: null,
-        needsOperator: null,
-        needsOperatorSince: null,
-        restartsInWindow: used,
-        restartWindowStartedAt: windowOpen ? instance.restartWindowStartedAt : now,
-        nextRestartAt: new Date(now.getTime() + backoff),
+    await this.writePhase(
+      tx,
+      instance,
+      {
+        to: "STOPPED",
+        reason,
+        after: {
+          kind: "restart_at",
+          at: new Date(now.getTime() + backoff),
+          restartsInWindow: used,
+          restartWindowStartedAt:
+            windowOpen && instance.restartWindowStartedAt ? instance.restartWindowStartedAt : now,
+        },
       },
-    });
+      now,
+    );
   }
 
   /** (RUNNING, STOPPED) past `nextRestartAt`: retake the claims and start a new generation. */
@@ -1227,15 +1212,7 @@ export class RuntimeLifecycle {
       reservationsOf(instance).some((reservation) => reservation.nodeId === null)
     ) {
       // A rank's (or reservation's) node was deleted: nothing to restart on.
-      await tx.runtimeInstance.update({
-        where: { id: instance.id },
-        data: {
-          phase: "FAILED",
-          phaseReason: "node_deleted",
-          phaseChangedAt: now,
-          nextRestartAt: null,
-        },
-      });
+      await this.writePhase(tx, instance, { to: "FAILED", reason: "node_deleted" }, now);
       return;
     }
     // Its claims were released while it backed off: another start may have taken the room.
@@ -1322,20 +1299,22 @@ export class RuntimeLifecycle {
         }
       },
     });
-    await tx.runtimeInstance.update({
-      where: { id: instance.id },
-      data: {
-        phase: "STARTING",
-        phaseReason: "restarting",
-        phaseChangedAt: now,
-        nextRestartAt: null,
-        restartsInWindow: { increment: 1 },
+    await this.writePhase(
+      tx,
+      instance,
+      {
+        to: "STARTING",
+        run: "new",
+        reason: "restarting",
         // The fabric the plan chose (a multi-node instance; `settleStopped` cleared the old
         // one), as a start's (`writePlannedStarts`): its steps resolve the head address on it.
         // No fabric fits: the planner refused above and the restart waits.
         fabricId: plan?.start.fabric?.fabricId ?? null,
+        // An automatic restart spends one of the window's budget.
+        restartBudget: "spend",
       },
-    });
+      now,
+    );
     const fresh = await tx.runtimeInstance.findUniqueOrThrow({
       where: { id: instance.id },
       include: INSTANCE_INCLUDE,
@@ -1395,21 +1374,18 @@ export class RuntimeLifecycle {
       select: { id: true, connection: true, lastDisconnectedAt: true, lastHeartbeatAt: true },
     });
     const onlineIds = new Set(
-      rows.filter((node) => offlineSinceOf(node, now) === null).map((node) => node.id),
+      rows.filter((node) => nodeUnreachableSince(node, now) === null).map((node) => node.id),
     );
     const offline = watched.filter((nodeId) => !onlineIds.has(nodeId));
     if (offline.length > 0 && now.getTime() - this.startedAt < STARTUP_GRACE_MS) return;
     if (offline.length > 0 || deleted) {
       if (instance.phase !== "UNAVAILABLE") {
-        await tx.runtimeInstance.update({
-          where: { id: instance.id },
-          data: {
-            phase: "UNAVAILABLE",
-            phaseReason: "node_offline",
-            phaseChangedAt: now,
-            unavailableSince: instance.unavailableSince ?? now,
-          },
-        });
+        await this.writePhase(
+          tx,
+          instance,
+          { to: "UNAVAILABLE", reason: "node_offline", since: instance.unavailableSince },
+          now,
+        );
         return;
       }
       const since = instance.unavailableSince ?? instance.phaseChangedAt;
@@ -1430,15 +1406,12 @@ export class RuntimeLifecycle {
       const ready = await tx.instanceStep.count({
         where: { instanceId: instance.id, generation: run, phase: "READINESS", state: "SUCCEEDED" },
       });
-      await tx.runtimeInstance.update({
-        where: { id: instance.id },
-        data: {
-          phase: ready ? "READY" : "STARTING",
-          phaseReason: null,
-          phaseChangedAt: now,
-          unavailableSince: null,
-        },
-      });
+      await this.writePhase(
+        tx,
+        instance,
+        ready ? { to: "READY", via: "recovered" } : { to: "STARTING", run: "resume" },
+        now,
+      );
       return;
     }
     if (instance.phase === "UNHEALTHY" && instance.unhealthySince) {
@@ -1665,7 +1638,7 @@ export class RuntimeLifecycle {
     const instance = step.Instance;
     const intent = stepIntentSchema.safeParse(step.intent);
     if (!intent.success) {
-      await this.failStep(tx, step.id, "bad_job");
+      await this.failStep(tx, step, "bad_job");
       await this.afterStep(tx, step, false, "bad_job");
       return null;
     }
@@ -1674,14 +1647,12 @@ export class RuntimeLifecycle {
     // claims; the current run's own steps (its leading stop first) take over.
     const run = await resolveRun(tx, instance.id);
     if (!owned(step, run)) {
-      await tx.instanceStep.updateMany({
+      await endSteps(tx, {
+        instanceId: instance.id,
         where: { id: step.id, state: "PENDING" },
-        data:
-          step.attempts === 0
-            ? { state: "CANCELLED", operatorHold: null }
-            : { state: "FAILED", errorCode: "superseded", operatorHold: null },
+        data: endedNeverSentOr(step.attempts, "superseded"),
+        now,
       });
-      if (step.operatorHold !== null) await this.syncNeedsOperator(tx, instance.id);
       return null;
     }
     // A stop for a claim released meanwhile has nothing to stop (a leading stop of a new run
@@ -1693,14 +1664,12 @@ export class RuntimeLifecycle {
         claim === "RELEASED" ||
         (step.phase === "STATUS" && !statusProbeWanted(instance, claim))
       ) {
-        await tx.instanceStep.updateMany({
+        await endSteps(tx, {
+          instanceId: instance.id,
           where: { id: step.id, state: "PENDING" },
-          data:
-            step.attempts === 0
-              ? { state: "CANCELLED", operatorHold: null }
-              : { state: "FAILED", errorCode: "released", operatorHold: null },
+          data: endedNeverSentOr(step.attempts, "released"),
+          now,
         });
-        if (step.operatorHold !== null) await this.syncNeedsOperator(tx, instance.id);
         return null;
       }
     }
@@ -1750,7 +1719,7 @@ export class RuntimeLifecycle {
           (row) => row.Node === null || effectiveTrust(row.Node) !== "FULL",
         ))
     ) {
-      await this.failStep(tx, step.id, "trust_relay");
+      await this.failStep(tx, step, "trust_relay");
       await this.afterStep(tx, step, false, "trust_relay");
       return null;
     }
@@ -1764,7 +1733,7 @@ export class RuntimeLifecycle {
       session.rankIdle !== true ||
       (startPhase && stepJobReservations(intent.data) && session.jobReservations !== true)
     ) {
-      await this.failStep(tx, step.id, CLI_UPGRADE_REQUIRED);
+      await this.failStep(tx, step, CLI_UPGRADE_REQUIRED);
       await this.afterStep(tx, step, false, CLI_UPGRADE_REQUIRED);
       return null;
     }
@@ -1861,7 +1830,7 @@ export class RuntimeLifecycle {
         headAddr = member?.ip ?? null;
       }
       if (!headAddr) {
-        await this.failStep(tx, step.id, "bad_job");
+        await this.failStep(tx, step, "bad_job");
         await this.afterStep(tx, step, false, "bad_job");
         return null;
       }
@@ -1941,17 +1910,19 @@ export class RuntimeLifecycle {
     );
   }
 
-  private async failStep(tx: Tx, stepId: string, code: string) {
-    await tx.instanceStep.updateMany({
-      where: { id: stepId, state: { in: ["PENDING", "RUNNING"] } },
+  private async failStep(tx: Tx, step: { id: string; instanceId: string }, code: string) {
+    // A held step failed here takes its hold (and the need it raised) with it.
+    await endSteps(tx, {
+      instanceId: step.instanceId,
+      where: { id: step.id, state: { in: ["PENDING", "RUNNING"] } },
       data: {
         state: "FAILED",
         errorCode: code,
         deadline: null,
         leaseExpiresAt: null,
-        operatorHold: null,
         operatorTerminalId: null,
       },
+      now: this.now(),
     });
   }
 
@@ -1960,7 +1931,7 @@ export class RuntimeLifecycle {
   /**
    * Whether a step waits for its person: of the instance's current run, an interactive step
    * AWAITING_OPERATOR (terminal open or closed), a held one, or a person's run past its
-   * timeout; of any run, a person's accepted run past its timeout (`overdueAcceptedRun`).
+   * timeout; of any run, a person's accepted run past its timeout (`overdueAcceptedRunWhere`, `lib/operator-need.ts`).
    * An earlier run's screens never raise (or keep) the need: whatever answers them, the
    * successor's need is computed from its own steps. An earlier run's accepted command still
    * runs on the node and the successor's stops wait behind it, so once it is past its timeout
@@ -1968,50 +1939,16 @@ export class RuntimeLifecycle {
    * the step's answer still changes nothing about the successor). The need also takes the step
    * out of the deadline sweep, which never cuts a person's run off.
    */
-  private async operatorStepWaiting(tx: Tx, instanceId: string): Promise<boolean> {
-    const run = await resolveRun(tx, instanceId);
-    const waiting = await tx.instanceStep.count({
-      where: {
-        instanceId,
-        OR: [
-          {
-            generation: run,
-            OR: [{ state: "AWAITING_OPERATOR" }, { state: "PENDING", operatorHold: { not: null } }],
-          },
-          overdueAcceptedRun(this.now()),
-        ],
-      },
-    });
-    return waiting > 0;
+  private operatorStepWaiting(tx: Tx, instanceId: string): Promise<boolean> {
+    return operatorStepWaiting(tx, instanceId, this.now());
   }
 
   /**
    * `needsOperator` STEP while a step waits for its person; it clears when none does. MARK_STOPPED
-   * (only while STOPPING, see settleStopping) and RESTART are kept.
+   * (only while STOPPING, see settleStopping) and RESTART are kept (`lib/operator-need.ts`).
    */
-  private async syncNeedsOperator(tx: Tx, instanceId: string) {
-    const instance = await tx.runtimeInstance.findUnique({
-      where: { id: instanceId },
-      select: { needsOperator: true },
-    });
-    // MARK_STOPPED and RESTART are decided by the stop and restart rules, never by a step.
-    if (
-      !instance ||
-      instance.needsOperator === "MARK_STOPPED" ||
-      instance.needsOperator === "RESTART"
-    )
-      return;
-    const waiting = await this.operatorStepWaiting(tx, instanceId);
-    const need = waiting
-      ? "STEP"
-      : instance.needsOperator === "STEP"
-        ? null
-        : instance.needsOperator;
-    if (need === instance.needsOperator) return;
-    await tx.runtimeInstance.update({
-      where: { id: instanceId },
-      data: { needsOperator: need, needsOperatorSince: need ? this.now() : null },
-    });
+  private syncNeedsOperator(tx: Tx, instanceId: string): Promise<void> {
+    return syncNeedsOperator(tx, instanceId, this.now());
   }
 
   /** Record (once) why a PENDING interactive step is held; the instance needs its person. */
@@ -2089,7 +2026,7 @@ export class RuntimeLifecycle {
    * pressed Enter) while this database has no acceptance (its write failed, R5-B-1). The
    * acceptance is recorded now, as `operatorProgress` would have (RUNNING, accepted, the step's
    * deadline counted from when its screen came up), so its stops keep waiting for it and, past its timeout, its
-   * person is asked whatever run it belongs to (`overdueAcceptedRun`). Only the step's own
+   * person is asked whatever run it belongs to (`overdueAcceptedRunWhere`, `lib/operator-need.ts`). Only the step's own
    * physical bookkeeping changes: no run, claim or successor state.
    */
   private async closeOperatorKeepingRun(
@@ -2451,7 +2388,8 @@ export class RuntimeLifecycle {
       const closed = await this.closeOperatorKeepingRun(tx, step, "USER");
       if (closed === "running") throw new OperatorStepError("running");
       const attempts = attemptsAfterServerClose(step, closed);
-      const changed = await tx.instanceStep.updateMany({
+      const changed = await endSteps(tx, {
+        instanceId,
         where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
         data: {
           state: "FAILED",
@@ -2459,12 +2397,11 @@ export class RuntimeLifecycle {
           attempts,
           deadline: null,
           leaseExpiresAt: null,
-          operatorHold: null,
           operatorTerminalId: null,
         },
+        now: this.now(),
       });
-      if (changed.count === 0) throw new OperatorStepError("not_waiting");
-      await this.syncNeedsOperator(tx, instanceId);
+      if (changed === 0) throw new OperatorStepError("not_waiting");
       await this.afterStep(tx, step, false, OPERATOR_CANCELLED);
     });
     this.wake();
@@ -2641,7 +2578,8 @@ export class RuntimeLifecycle {
         step.state === "PENDING"
           ? step.attempts
           : attemptsAfterServerClose(step, closed ?? undefined);
-      const changed = await tx.instanceStep.updateMany({
+      const changed = await endSteps(tx, {
+        instanceId,
         where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
         data: {
           state: attempts === 0 ? "CANCELLED" : "FAILED",
@@ -2649,11 +2587,11 @@ export class RuntimeLifecycle {
           attempts,
           deadline: null,
           leaseExpiresAt: null,
-          operatorHold: null,
           operatorTerminalId: null,
         },
+        now,
       });
-      if (changed.count === 0) continue;
+      if (changed === 0) continue;
       if (step.phase === "STOP") stopCancelled = true;
       // Only this run's start stops the instance; an older run's step is just cancelled.
       else if (isStartPhase(step.phase) && step.generation === generation) startCancelled = true;
@@ -2963,22 +2901,9 @@ export class RuntimeLifecycle {
       },
     });
     if (unfinished > 0) return;
-    await tx.runtimeInstance.update({
-      where: { id: instanceId },
-      data: {
-        phase: "READY",
-        phaseReason: null,
-        phaseChangedAt: now,
-        lastHealthAt: now,
-        healthFailures: 0,
-        healthSuccesses: 0,
-        unhealthySince: null,
-        healthDetail: null,
-        unavailableSince: null,
-        needsOperator: null,
-        needsOperatorSince: null,
-      },
-    });
+    await this.writePhase(tx, instance, { to: "READY", via: "readiness" }, now);
+    // Its start steps all answered: only a person's overdue run (of any run) still needs them.
+    await this.syncNeedsOperator(tx, instanceId);
     await registerExecutionTargets(tx, instance);
   }
 
@@ -2993,29 +2918,27 @@ export class RuntimeLifecycle {
     const now = this.now();
     const failures = success ? 0 : instance.healthFailures + 1;
     const successes = success ? instance.healthSuccesses + 1 : 0;
-    let phase = instance.phase;
-    if (phase === "READY" && failures >= launch.health.failureThreshold) phase = "UNHEALTHY";
-    if (phase === "UNHEALTHY" && successes >= launch.health.successThreshold) phase = "READY";
+    const counters = { healthFailures: failures, healthSuccesses: successes, lastHealthAt: now };
+    const change: InstancePhaseChange | null =
+      instance.phase === "READY" && failures >= launch.health.failureThreshold
+        ? { to: "UNHEALTHY", detail }
+        : instance.phase === "UNHEALTHY" && successes >= launch.health.successThreshold
+          ? { to: "READY", via: "health" }
+          : null;
+    if (change) {
+      await this.writePhase(tx, instance, change, now, counters);
+      return;
+    }
     await tx.runtimeInstance.update({
       where: { id: instance.id },
       data: {
-        healthFailures: failures,
-        healthSuccesses: successes,
-        lastHealthAt: now,
+        ...counters,
         // Why the last probe failed, kept while the instance is UNHEALTHY; READY clears it.
-        ...(phase === "UNHEALTHY"
+        ...(instance.phase === "UNHEALTHY"
           ? success
             ? {}
             : { healthDetail: detail }
           : { healthDetail: null }),
-        ...(phase !== instance.phase
-          ? {
-              phase,
-              phaseChangedAt: now,
-              phaseReason: phase === "UNHEALTHY" ? "health_failed" : null,
-              unhealthySince: phase === "UNHEALTHY" ? now : null,
-            }
-          : {}),
       },
     });
   }

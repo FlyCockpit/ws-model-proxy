@@ -42,11 +42,67 @@ pub struct TerminalStartup {
     shells: Vec<crate::shells::Shell>,
 }
 
-/// The daemon's trust: the one value every lowering changes
-/// ([`TerminalStartup::lower_trust`]), and how many lowerings there were.
+/// The daemon's trust: one atomic word holding both whether the node is at
+/// Full control and how many lowerings there were (`(lowerings << 1) | full`),
+/// so every reader sees the two together. The one source of truth for trust:
+/// the file relay, sessions and update workers read it here at the moment of
+/// each step instead of keeping a copy of their own.
 pub struct TrustAuthority {
-    full: std::sync::atomic::AtomicBool,
-    lowerings: std::sync::atomic::AtomicU64,
+    state: std::sync::atomic::AtomicU64,
+}
+
+/// One consistent reading of [`TrustAuthority`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustSnapshot {
+    /// Lowerings so far (every lowering counts, whether it changed trust or not).
+    pub lowerings: u64,
+    pub full: bool,
+}
+
+impl TrustSnapshot {
+    fn decode(state: u64) -> Self {
+        Self {
+            lowerings: state >> 1,
+            full: state & 1 == 1,
+        }
+    }
+}
+
+impl TrustAuthority {
+    pub fn new(full: bool) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            state: std::sync::atomic::AtomicU64::new(u64::from(full)),
+        })
+    }
+
+    pub fn snapshot(&self) -> TrustSnapshot {
+        TrustSnapshot::decode(self.state.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Full control right now.
+    pub fn full_control(&self) -> bool {
+        self.snapshot().full
+    }
+
+    /// Relay only and one more lowering, in one atomic step. Returns whether
+    /// the node was at Full control.
+    pub fn lower(&self) -> bool {
+        let previous = self
+            .state
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |state| Some((state >> 1).saturating_add(1) << 1),
+            )
+            .unwrap_or_else(|state| state);
+        TrustSnapshot::decode(previous).full
+    }
+
+    /// Full control (the lowering count stays). Returns whether it changed.
+    pub fn raise(&self) -> bool {
+        let previous = self.state.fetch_or(1, std::sync::atomic::Ordering::SeqCst);
+        !TrustSnapshot::decode(previous).full
+    }
 }
 
 /// Full control as one piece of work started under it
@@ -63,25 +119,18 @@ impl TrustWatch {
     /// The node was lowered since this watch was taken (even if it was
     /// raised again since), or it is not at Full control now.
     pub fn revoked(&self) -> bool {
-        !self
-            .authority
-            .full
-            .load(std::sync::atomic::Ordering::SeqCst)
-            || self
-                .authority
-                .lowerings
-                .load(std::sync::atomic::Ordering::SeqCst)
-                != self.lowerings
+        self.authority.snapshot()
+            != TrustSnapshot {
+                lowerings: self.lowerings,
+                full: true,
+            }
     }
 
     /// Test-only: a watch on a daemon at Full control that nothing lowers.
     #[cfg(test)]
     pub fn full_for_tests() -> Self {
         Self {
-            authority: std::sync::Arc::new(TrustAuthority {
-                full: std::sync::atomic::AtomicBool::new(true),
-                lowerings: std::sync::atomic::AtomicU64::new(0),
-            }),
+            authority: TrustAuthority::new(true),
             lowerings: 0,
         }
     }
@@ -115,12 +164,7 @@ impl TerminalStartup {
             key,
             identity: None,
             allow_human_terminal: std::sync::atomic::AtomicBool::new(config.allow_human_terminal),
-            trust: std::sync::Arc::new(TrustAuthority {
-                full: std::sync::atomic::AtomicBool::new(
-                    crate::trust::at_startup(config) == TrustValue::Full,
-                ),
-                lowerings: std::sync::atomic::AtomicU64::new(0),
-            }),
+            trust: TrustAuthority::new(crate::trust::at_startup(config) == TrustValue::Full),
             require_terminal_approval: config.require_terminal_approval,
             max_terminals: usize::try_from(config.effective_max_terminals()).unwrap_or(usize::MAX),
             allow_file_tools_as_root: config.allow_file_tools_as_root,
@@ -171,21 +215,13 @@ impl TerminalStartup {
     /// [`TrustWatch`] taken before this call is revoked when it returns, for
     /// good: a later [`Self::raise_trust`] does not give it back.
     pub fn lower_trust(&self) -> bool {
-        self.trust
-            .lowerings
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.trust
-            .full
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        self.trust.lower()
     }
 
     /// Full control again: only after `wsmp trust full` passed the control
     /// socket's peer check and was persisted. Returns whether trust changed.
     pub fn raise_trust(&self) -> bool {
-        !self
-            .trust
-            .full
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        self.trust.raise()
     }
 
     /// A handle on this daemon's trust for work that runs on its own thread
@@ -193,12 +229,20 @@ impl TerminalStartup {
     /// happens to trust after that. Take it before checking Full control.
     pub fn trust_watch(&self) -> TrustWatch {
         TrustWatch {
-            lowerings: self
-                .trust
-                .lowerings
-                .load(std::sync::atomic::Ordering::SeqCst),
+            lowerings: self.trust.snapshot().lowerings,
             authority: std::sync::Arc::clone(&self.trust),
         }
+    }
+
+    /// The daemon's trust authority, for what must read trust live on every
+    /// step (the file relay) instead of keeping a copy.
+    pub fn trust_authority(&self) -> std::sync::Arc<TrustAuthority> {
+        std::sync::Arc::clone(&self.trust)
+    }
+
+    /// Trust and the lowering count, read together.
+    pub fn trust_snapshot(&self) -> TrustSnapshot {
+        self.trust.snapshot()
     }
 
     pub fn runtime_hosts(&self) -> Vec<String> {
@@ -216,7 +260,7 @@ impl TerminalStartup {
 
     /// Full control: definitions, commands, file ops and browser terminals.
     pub fn full_control(&self) -> bool {
-        self.trust.full.load(std::sync::atomic::Ordering::SeqCst)
+        self.trust.full_control()
     }
 
     /// The hello / `node.state` trust: frozen exactly at Relay only.
@@ -474,6 +518,39 @@ mod tests {
         // A watch taken at Relay only never holds.
         assert!(startup.lower_trust());
         assert!(startup.trust_watch().revoked());
+    }
+
+    /// Trust and the lowering count are one value: every reading sees both
+    /// as one change left them, and every lowering counts.
+    #[test]
+    fn the_trust_snapshot_reads_trust_and_lowerings_together() {
+        let authority = TrustAuthority::new(false);
+        assert_eq!(
+            authority.snapshot(),
+            TrustSnapshot {
+                lowerings: 0,
+                full: false
+            }
+        );
+        assert!(authority.raise());
+        assert!(!authority.raise());
+        assert!(authority.lower());
+        assert!(!authority.lower(), "already Relay only");
+        assert_eq!(
+            authority.snapshot(),
+            TrustSnapshot {
+                lowerings: 2,
+                full: false
+            }
+        );
+        assert!(authority.raise());
+        assert_eq!(
+            authority.snapshot(),
+            TrustSnapshot {
+                lowerings: 2,
+                full: true
+            }
+        );
     }
 
     #[test]

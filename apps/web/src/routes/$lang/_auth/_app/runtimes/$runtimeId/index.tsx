@@ -14,7 +14,7 @@ import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
-import { useState } from "react";
+import { useReducer, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { AddToSharedPool } from "@/components/access/contribute";
@@ -40,6 +40,13 @@ import {
   withReservation,
 } from "@/lib/refusal-text";
 import { slugify } from "@/lib/slugify";
+import {
+  pickProblemOf,
+  START_FLOW_INITIAL,
+  shownPreview,
+  startFlowReducer,
+  startTarget,
+} from "@/lib/start-flow";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/runtimes/$runtimeId/")({
@@ -474,37 +481,56 @@ function StartDialog({
   const groupSize = runtime.current.spec.launch?.groupSize ?? 1;
   // One node per rank, in rank order; all empty: the planner picks.
   const [nodeIds, setNodeIds] = useState<string[]>(() => Array(groupSize).fill(""));
-  const [preview, setPreview] = useState<StartPreview | null>(null);
-  const start = useMutation({
+  const [flow, dispatch] = useReducer(startFlowReducer<StartPreview>, START_FLOW_INITIAL);
+  const previewCall = useMutation({
+    ...orpc.runtimes.start.mutationOptions(),
+    meta: { skipGlobalErrorToast: true },
+  });
+  const confirmCall = useMutation({
     ...orpc.runtimes.start.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
   });
   const chosen = nodeIds.filter((nodeId) => nodeId !== "");
   const pickProblem = pickProblemOf(chosen, groupSize);
-  const target = startTarget(instanceId, chosen, groupSize);
+  const preview = shownPreview(flow);
+  const busy = flow.kind === "previewing" || flow.kind === "confirming" || flow.kind === "done";
 
   const requestPreview = async () => {
+    // The preview is tagged with the target it plans; a reply for an older pick is dropped.
+    const target = startTarget(instanceId, chosen, groupSize);
+    dispatch({ type: "previewRequested", target });
     try {
-      const result = await start.mutateAsync({ runtimeId: runtime.id, ...target, preview: true });
-      if (result.mode === "preview") setPreview(result.preview);
+      const result = await previewCall.mutateAsync({
+        runtimeId: runtime.id,
+        ...target,
+        preview: true,
+      });
+      if (result.mode === "preview")
+        dispatch({ type: "previewResolved", target, preview: result.preview });
+      else dispatch({ type: "previewFailed", target });
     } catch (error) {
+      dispatch({ type: "previewFailed", target });
       toast.error(refusalText(error));
     }
   };
   const confirm = async () => {
-    if (!preview) return;
+    if (flow.kind !== "previewed") return;
+    // Confirm exactly what was previewed: its target with its fingerprint.
+    const { target, preview: confirmed } = flow;
+    dispatch({ type: "confirmRequested" });
     try {
-      await start.mutateAsync({
+      await confirmCall.mutateAsync({
         runtimeId: runtime.id,
         ...target,
-        fingerprint: preview.fingerprint,
+        fingerprint: confirmed.fingerprint,
       });
+      dispatch({ type: "confirmSucceeded" });
       await invalidate();
       toast.success(t("dashboard:runtime.startRequested"));
       onClose();
     } catch (error) {
       toast.error(refusalText(error));
-      setPreview(null);
+      dispatch({ type: "confirmFailed" });
     }
   };
 
@@ -522,15 +548,11 @@ function StartDialog({
             {t("common:actions.cancel")}
           </Button>
           {preview && preview.refusals.length === 0 ? (
-            <Button size="touch" disabled={start.isPending} onClick={confirm}>
+            <Button size="touch" disabled={busy} onClick={confirm}>
               {t("dashboard:runtime.confirmStart")}
             </Button>
           ) : (
-            <Button
-              size="touch"
-              disabled={start.isPending || pickProblem !== null}
-              onClick={requestPreview}
-            >
+            <Button size="touch" disabled={busy || pickProblem !== null} onClick={requestPreview}>
               {t("dashboard:runtime.preview")}
             </Button>
           )}
@@ -543,9 +565,10 @@ function StartDialog({
             groupSize={groupSize}
             nodes={nodes.data.nodes}
             value={nodeIds}
+            disabled={flow.kind === "confirming" || flow.kind === "done"}
             onChange={(next) => {
               setNodeIds(next);
-              setPreview(null);
+              dispatch({ type: "picked" });
             }}
           />
         ) : null}
@@ -636,19 +659,6 @@ function StartPreviewDetails({
   );
 }
 
-/** Ranks are picked all or none, each on its own node. */
-function pickProblemOf(chosen: string[], groupSize: number) {
-  return chosen.length > 0 && chosen.length < groupSize
-    ? "pickEveryRank"
-    : new Set(chosen).size < chosen.length
-      ? "pickDistinct"
-      : null;
-}
-
-function startTarget(instanceId: string | undefined, chosen: string[], groupSize: number) {
-  return instanceId ? { instanceId } : chosen.length === groupSize ? { nodeIds: chosen } : {};
-}
-
 const LIVE_PHASES = new Set<Instance["phase"]>(["STARTING", "READY", "UNHEALTHY", "UNAVAILABLE"]);
 
 /**
@@ -705,11 +715,13 @@ function NodePicker({
   groupSize,
   nodes,
   value,
+  disabled,
   onChange,
 }: {
   groupSize: number;
   nodes: ReadonlyArray<{ id: string; slug: string; name: string | null }>;
   value: readonly string[];
+  disabled?: boolean;
   onChange: (next: string[]) => void;
 }) {
   const { t } = useTranslation(["dashboard"]);
@@ -733,6 +745,7 @@ function NodePicker({
             <NativeSelect
               id={id}
               value={nodeId}
+              disabled={disabled}
               onChange={(event) =>
                 onChange(value.map((item, at) => (at === rank ? event.target.value : item)))
               }

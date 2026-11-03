@@ -175,6 +175,58 @@ function failureForHttpStatus(status: number): RelayFailure | null {
   return null;
 }
 
+/**
+ * The lifecycle of one relay attempt. `dispatching` until the node's response headers arrive,
+ * `streaming` (with the upstream status those headers carried) while body frames flow, and
+ * `settled` once a terminal is known. Settled is final: every later frame is ignored.
+ */
+export type RelayAttemptState =
+  | { phase: "dispatching" }
+  | { phase: "streaming"; status: number }
+  | { phase: "settled"; upstreamStatusCode: number | null };
+
+/**
+ * Why an attempt settled, as far as its response body is concerned.
+ * - `completed`: the node reported `relay.complete`; the body is whole.
+ * - `caller_cancelled`: the caller (cancel(), or a non-lease abort) walked away from the body.
+ * - `consumer_cancelled`: the body stream itself was cancelled or already errored.
+ * - `interrupted`: anything else (timeout, relay.error, node cancel, disconnect, lost lease,
+ *   protocol violation) — the body, if any, is truncated.
+ */
+export type RelayAttemptSettleCause =
+  | "completed"
+  | "caller_cancelled"
+  | "consumer_cancelled"
+  | "interrupted";
+
+/**
+ * How the response body ends when an attempt settles from `from`.
+ * Before headers nobody holds the body: `started` rejects. After headers, the body ends cleanly
+ * only when it is whole or its reader walked away; a truncated body errors, so a client never
+ * mistakes it for a complete response (clean EOF).
+ */
+export function relayBodyEnd(
+  from: Exclude<RelayAttemptState, { phase: "settled" }>,
+  cause: RelayAttemptSettleCause,
+): "reject_started" | "close" | "error" | "none" {
+  if (from.phase === "dispatching") return "reject_started";
+  switch (cause) {
+    case "completed":
+    case "caller_cancelled":
+      return "close";
+    case "consumer_cancelled":
+      return "none";
+    case "interrupted":
+      return "error";
+  }
+}
+
+function upstreamStatusOf(state: RelayAttemptState): number | null {
+  if (state.phase === "streaming") return state.status;
+  if (state.phase === "settled") return state.upstreamStatusCode;
+  return null;
+}
+
 export function startRelayAttempt({
   requestId = crypto.randomUUID(),
   manager,
@@ -246,30 +298,40 @@ export function startRelayAttempt({
     };
   }
 
-  let responseController: ReadableStreamDefaultController<Uint8Array> | null = null;
-  let upstreamStatusCode: number | null = null;
-  let terminalSettled = false;
-  let headersResolved = false;
-  let responseStreamCancelled = false;
+  // One explicit state per attempt. Every handler reads it and every transition goes through
+  // `finish` (to settled) or `onHeaders` (dispatching -> streaming), so a frame that arrives
+  // in the wrong phase is a visible protocol violation instead of a silent overwrite.
+  let state: RelayAttemptState = { phase: "dispatching" };
   let responseBytes = 0;
   let requestBytes = 0;
   const usageRecorder = new ResponseUsageRecorder();
 
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  // A truncated body errors only once the reader has drained what was already delivered:
+  // `controller.error` would otherwise discard queued output the node did send.
+  let errorAfterDrain: Error | null = null;
   const responseBody = new ReadableStream<Uint8Array>(
     {
       start(controller) {
-        responseController = controller;
+        streamController = controller;
+      },
+      pull(controller) {
+        if (errorAfterDrain && controller.desiredSize === RELAY_RESPONSE_QUEUE_MAX_BYTES) {
+          controller.error(errorAfterDrain);
+        }
       },
       cancel() {
-        responseStreamCancelled = true;
-        finish({
-          ok: false,
-          failure: "cancelled",
-          httpStatusCode: 499,
-          upstreamStatusCode,
-          usage: null,
-          metrics: null,
-        });
+        finish(
+          {
+            ok: false,
+            failure: "cancelled",
+            httpStatusCode: 499,
+            upstreamStatusCode: upstreamStatusOf(state),
+            usage: null,
+            metrics: null,
+          },
+          "consumer_cancelled",
+        );
         manager.cancelRelayRequest({ nodeId, requestId, reason: "cancelled" });
       },
     },
@@ -278,49 +340,79 @@ export function startRelayAttempt({
       size: (chunk) => chunk.byteLength,
     },
   );
+  // `start` runs synchronously inside the constructor.
+  if (!streamController) throw new Error("relay response stream did not start");
+  const responseController = streamController;
 
   const timeout = setTimeout(() => {
     manager.cancelRelayRequest({ nodeId, requestId, reason: "timeout" });
-    finish({
-      ok: false,
-      failure: "timeout",
-      httpStatusCode: 504,
-      upstreamStatusCode,
-      usage: null,
-      metrics: null,
-    });
+    finish(
+      {
+        ok: false,
+        failure: "timeout",
+        httpStatusCode: 504,
+        upstreamStatusCode: upstreamStatusOf(state),
+        usage: null,
+        metrics: null,
+      },
+      "interrupted",
+    );
   }, timeoutMs);
 
   const abort = () => {
     // The wire protocol has no lease-loss reason: the CLI only needs to stop.
     manager.cancelRelayRequest({ nodeId, requestId, reason: "cancelled" });
-    finish({
-      ok: false,
-      ...abortedRelayFailure(abortSignal),
-      upstreamStatusCode,
-      usage: null,
-      metrics: null,
-    });
+    const aborted = abortedRelayFailure(abortSignal);
+    finish(
+      {
+        ok: false,
+        ...aborted,
+        upstreamStatusCode: upstreamStatusOf(state),
+        usage: null,
+        metrics: null,
+      },
+      // A lost lease is a server failure; any other abort is the caller walking away.
+      aborted.failure === "capacity_lease_lost" ? "interrupted" : "caller_cancelled",
+    );
   };
   abortSignal?.addEventListener("abort", abort, { once: true });
 
-  function finish(result: Omit<RelayAttemptTerminal, "responseBytes" | "requestBytes">) {
-    if (terminalSettled) return;
-    terminalSettled = true;
+  /** A node frame that is not legal in the current phase: stop the node and fail the attempt. */
+  function protocolViolation() {
+    manager.cancelRelayRequest({ nodeId, requestId, reason: "protocol_error" });
+    finish(
+      {
+        ok: false,
+        failure: "protocol_error",
+        httpStatusCode: null,
+        upstreamStatusCode: upstreamStatusOf(state),
+        usage: null,
+        metrics: null,
+      },
+      "interrupted",
+    );
+  }
+
+  function finish(
+    result: Omit<RelayAttemptTerminal, "responseBytes" | "requestBytes">,
+    cause: RelayAttemptSettleCause,
+  ) {
+    if (state.phase === "settled") return;
+    const from = state;
+    state = { phase: "settled", upstreamStatusCode: result.upstreamStatusCode };
     clearTimeout(timeout);
     abortSignal?.removeEventListener("abort", abort);
     manager.completeRelayRequest(requestId);
-    // A lost lease after headers is a server error: the body must end in an
-    // error, never a clean (truncated) EOF.
-    if (
-      (result.ok || headersResolved) &&
-      !responseStreamCancelled &&
-      result.failure !== "capacity_lease_lost"
-    ) {
-      responseController?.close();
-    } else {
-      started.reject(new Error(result.failure ?? "unknown"));
-      responseController?.error(new Error(result.failure ?? "unknown"));
+    const end = relayBodyEnd(from, cause);
+    if (end === "reject_started") started.reject(new Error(result.failure ?? "unknown"));
+    if (end === "close") responseController.close();
+    else if (end === "reject_started")
+      responseController.error(new Error(result.failure ?? "unknown"));
+    else if (end === "error") {
+      const error = new Error(result.failure ?? "unknown");
+      if (responseController.desiredSize === RELAY_RESPONSE_QUEUE_MAX_BYTES) {
+        responseController.error(error);
+      } else errorAfterDrain = error;
     }
     const usageSample = responseBytes > 0 ? usageRecorder.sample() : null;
     terminal.resolve({
@@ -337,14 +429,17 @@ export function startRelayAttempt({
 
   const handlers: ActiveRelayResponseHandlers = {
     onRequestBodySent(byteLength) {
-      if (!terminalSettled) requestBytes += byteLength;
+      if (state.phase !== "settled") requestBytes += byteLength;
     },
     onCountResult(message) {
-      if (!terminalSettled) onCountResult?.(message);
+      if (state.phase !== "settled") onCountResult?.(message);
     },
     onHeaders(message) {
-      headersResolved = true;
-      upstreamStatusCode = message.status;
+      if (state.phase === "settled") return;
+      // Headers arrive exactly once; a second set would silently change the status the
+      // attempt is classified by after the caller already committed to the first.
+      if (state.phase === "streaming") return protocolViolation();
+      state = { phase: "streaming", status: message.status };
       const responseHeaders = sanitizeNativeResponseHeaders(message.headers);
       if (!responseHeaders.has("content-type")) {
         responseHeaders.set("content-type", "application/json; charset=utf-8");
@@ -356,62 +451,76 @@ export function startRelayAttempt({
       });
     },
     onBody(chunk) {
-      if (terminalSettled) return;
+      if (state.phase === "settled") return;
+      // Body bytes have no response to belong to until headers arrive.
+      if (state.phase === "dispatching") return protocolViolation();
       const bodyChunk = new Uint8Array(chunk);
-      const available = responseController?.desiredSize;
-      if (available !== null && available !== undefined && bodyChunk.byteLength > available) {
+      const available = responseController.desiredSize;
+      if (available !== null && bodyChunk.byteLength > available) {
         manager.cancelRelayRequest({ nodeId, requestId, reason: "cancelled" });
         // Headers may already have committed a 2xx response. Error the body so
         // a slow caller observes truncation instead of receiving a clean EOF.
-        responseStreamCancelled = true;
-        responseController?.error(new Error("relay response buffer limit exceeded"));
-        finish({
-          ok: false,
-          failure: "cancelled",
-          httpStatusCode: 499,
-          upstreamStatusCode,
-          usage: null,
-          metrics: null,
-        });
+        responseController.error(new Error("relay response buffer limit exceeded"));
+        finish(
+          {
+            ok: false,
+            failure: "cancelled",
+            httpStatusCode: 499,
+            upstreamStatusCode: state.status,
+            usage: null,
+            metrics: null,
+          },
+          "consumer_cancelled",
+        );
         return;
       }
       responseBytes += bodyChunk.byteLength;
       usageRecorder.push(bodyChunk);
       onResponseBodyChunk?.(bodyChunk);
-      responseController?.enqueue(bodyChunk);
+      responseController.enqueue(bodyChunk);
     },
     onComplete(message) {
-      const failure =
-        upstreamStatusCode === null ? "protocol_error" : failureForHttpStatus(upstreamStatusCode);
-      finish({
-        ok: failure === null,
-        failure,
-        httpStatusCode: upstreamStatusCode,
-        upstreamStatusCode,
-        usage: message.usage ?? null,
-        metrics: message.metrics ?? null,
-      });
+      if (state.phase === "settled") return;
+      const status = upstreamStatusOf(state);
+      const failure = status === null ? "protocol_error" : failureForHttpStatus(status);
+      finish(
+        {
+          ok: failure === null,
+          failure,
+          httpStatusCode: status,
+          upstreamStatusCode: status,
+          usage: message.usage ?? null,
+          metrics: message.metrics ?? null,
+        },
+        "completed",
+      );
     },
     onError(message) {
-      upstreamStatusCode = message.upstreamStatusCode ?? upstreamStatusCode;
-      finish({
-        ok: false,
-        failure: message.failure,
-        httpStatusCode: null,
-        upstreamStatusCode,
-        usage: null,
-        metrics: null,
-      });
+      if (state.phase === "settled") return;
+      finish(
+        {
+          ok: false,
+          failure: message.failure,
+          httpStatusCode: null,
+          upstreamStatusCode: message.upstreamStatusCode ?? upstreamStatusOf(state),
+          usage: null,
+          metrics: null,
+        },
+        "interrupted",
+      );
     },
     onCancelled() {
-      finish({
-        ok: false,
-        failure: "cancelled",
-        httpStatusCode: 499,
-        upstreamStatusCode,
-        usage: null,
-        metrics: null,
-      });
+      finish(
+        {
+          ok: false,
+          failure: "cancelled",
+          httpStatusCode: 499,
+          upstreamStatusCode: upstreamStatusOf(state),
+          usage: null,
+          metrics: null,
+        },
+        "interrupted",
+      );
     },
   };
 
@@ -434,14 +543,17 @@ export function startRelayAttempt({
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
     const failure: RelayFailure = message.includes("disconnected") ? "disconnected" : "transport";
-    finish({
-      ok: false,
-      failure,
-      httpStatusCode: null,
-      upstreamStatusCode,
-      usage: null,
-      metrics: null,
-    });
+    finish(
+      {
+        ok: false,
+        failure,
+        httpStatusCode: null,
+        upstreamStatusCode: upstreamStatusOf(state),
+        usage: null,
+        metrics: null,
+      },
+      "interrupted",
+    );
   }
 
   return {
@@ -450,16 +562,19 @@ export function startRelayAttempt({
     terminal: terminal.promise,
     cancel(reason) {
       // A settled attempt is over on the node too: a second cancel frame would be noise.
-      if (terminalSettled) return;
+      if (state.phase === "settled") return;
       manager.cancelRelayRequest({ nodeId, requestId, reason });
-      finish({
-        ok: false,
-        failure: reason,
-        httpStatusCode: null,
-        upstreamStatusCode,
-        usage: null,
-        metrics: null,
-      });
+      finish(
+        {
+          ok: false,
+          failure: reason,
+          httpStatusCode: null,
+          upstreamStatusCode: upstreamStatusOf(state),
+          usage: null,
+          metrics: null,
+        },
+        "caller_cancelled",
+      );
     },
   };
 }

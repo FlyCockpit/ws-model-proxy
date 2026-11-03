@@ -1309,3 +1309,62 @@ describe("security review fixes", () => {
     expect(consumer.events.at(-1)).toMatchObject({ kind: "delta", itemSeq: 1 });
   });
 });
+
+describe("session state carries its leg", () => {
+  it("forgets a withdrawn vllm member's adapter and ignores its leg afterwards", async () => {
+    const { hub, link, create } = setup();
+    const a = link("cli-a");
+    const b = link("cli-b");
+    const { session, consumer } = create();
+    const first = session.attach(target("cli-a", { capabilities: VLLM }), {
+      holdUntilReleased: true,
+    });
+    const legA = String(session.relaySessionId);
+    frame(a, hub, { type: "stt.opened", sessionId: legA });
+    expect(await first).toMatchObject({ status: "opened", adapter: "vllm" });
+    // Attached to vllm: a language is refused.
+    expect(session.update({ language: "en" })).toEqual({ ok: false, reason: "unsupported" });
+    session.cancelOpening();
+    expect(session.status).toBe("detached");
+    expect(session.relaySessionId).toBeNull();
+    // Detached again: nothing of the vllm member remains.
+    expect(session.update({ language: "en" })).toEqual({ ok: true });
+    // The withdrawn leg is closing; its late frames reach nobody.
+    frame(a, hub, {
+      type: "stt.event",
+      sessionId: legA,
+      event: { kind: "delta", itemSeq: 0, text: "x" },
+    });
+    expect(consumer.events).toEqual([]);
+
+    const second = session.attach(target("cli-b"));
+    frame(b, hub, { type: "stt.opened", sessionId: String(session.relaySessionId) });
+    expect(await second).toEqual({ status: "opened", adapter: "segmented", maxItemSeconds: 10 });
+    expect(session.status).toBe("open");
+  });
+
+  it("a refused open detaches with no leg, and an end while opening resolves the attach", async () => {
+    const { hub, link, create } = setup();
+    const a = link("cli-a");
+    const { session, consumer } = create();
+    const refused = session.attach(target("cli-a", { capabilities: VLLM }));
+    frame(a, hub, {
+      type: "stt.error",
+      sessionId: String(session.relaySessionId),
+      failure: "upstream_5xx",
+    });
+    expect(await refused).toMatchObject({ status: "failed", reason: "refused" });
+    expect(session.status).toBe("detached");
+    expect(session.relaySessionId).toBeNull();
+    expect(session.update({ prompt: "names" })).toEqual({ ok: true });
+
+    const pending = session.attach(target("cli-a"));
+    expect(session.status).toBe("opening");
+    session.close();
+    expect(await pending).toEqual({ status: "ended" });
+    expect(session.status).toBe("ended");
+    expect(session.relaySessionId).toBeNull();
+    expect(consumer.ends).toEqual([{ cause: "consumer", failure: "cancelled" }]);
+    expect(hub.stats().sessions).toBe(0);
+  });
+});

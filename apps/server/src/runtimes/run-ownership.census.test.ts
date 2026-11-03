@@ -511,15 +511,17 @@ const CENSUS: Record<string, [number, string]> = {
     1,
     "Always-on instance: no run, ranks or steps.",
   ],
-  [`${AO} | observeInstance | runtimeInstance.update | opaque`]: [1, "Always-on status (no run)."],
-  [`${AO} | observeInstance | runtimeInstance.update | phase`]: [1, "Always-on status (no run)."],
+  [`${AO} | observeInstance | runtimeInstance.update | opaque`]: [
+    2,
+    "Always-on engine facts and status (`alwaysOnPhaseData`: phase and reason only; no run).",
+  ],
   [`${AO} | removeUnreported | runtimeInstance.deleteMany | delete`]: [
     1,
     "An always-on instance the node no longer reports (no run, ranks or steps).",
   ],
-  [`${AO} | removeUnreported | runtimeInstance.updateMany | phase`]: [
+  [`${AO} | removeUnreported | runtimeInstance.updateMany | opaque`]: [
     1,
-    "Always-on status (no run).",
+    "Always-on status (`alwaysOnPhaseData` UNAVAILABLE node_removed; no run).",
   ],
   [`${AO} | upsertNodeOrigin | runtimeInstance.create | phase`]: [1, "Always-on instance: no run."],
   [`${AO} | upsertNodeOrigin | runtimeInstance.updateMany | other`]: [
@@ -530,10 +532,6 @@ const CENSUS: Record<string, [number, string]> = {
     2,
     "A stopped answer that proved nothing (the node's rank was not idle): a status probe is marked launch_pending (errorCode only); a leading stop goes back to PENDING and is sent again shortly (its run's starts wait for it). No claim or run change.",
   ],
-  [`${LC} | afterStep | runtimeInstance.update | phase`]: [
-    1,
-    "READY after this run's READINESS (gated: `owned` returns first for an earlier run's step).",
-  ],
   [`${LC} | applyJobResult | instanceStep.updateMany | opaque`]: [
     1,
     "Physical bookkeeping of the answered step (retry to PENDING); effects go through afterStep's gate.",
@@ -542,17 +540,13 @@ const CENSUS: Record<string, [number, string]> = {
     1,
     "The answered step's own result (state, error, deadline); effects on the run go through afterStep's `owned` gate.",
   ],
-  [`${LC} | cancelStep | instanceStep.updateMany | other`]: [
-    1,
-    "A person cancels a step that waits for them (FAILED operator_cancelled); never an accepted run.",
-  ],
   [`${LC} | claimStep | instanceRank.updateMany | other`]: [
     1,
     "The rank's blockedBy list (what its start waits for); no claim state.",
   ],
   [`${LC} | claimStep | instanceStep.updateMany | other`]: [
-    3,
-    "Claiming a step after claimStep's gates (lease, attempt, terminal), or settling an earlier run's step (`owned` false).",
+    1,
+    "Claiming a step after claimStep's gates (lease, attempt, terminal); an earlier run's step (`owned` false) ends through endSteps.",
   ],
   [`${LC} | clearOperatorHold | instanceStep.updateMany | other`]: [
     1,
@@ -574,21 +568,9 @@ const CENSUS: Record<string, [number, string]> = {
     1,
     "Named exemption: an inactive owner's unanswerable stop marks HELD_UNKNOWN (current state, never a release).",
   ],
-  [`${LC} | drainInstance | instanceStep.updateMany | other`]: [
-    1,
-    "An inactive owner's waiting steps end (FAILED owner_inactive); a person's run is left alone.",
-  ],
   [`${LC} | expireSteps | instanceStep.updateMany | other`]: [
     1,
     "A step past its deadline fails (job_deadline); a person's accepted run is never expired.",
-  ],
-  [`${LC} | failStep | instanceStep.updateMany | other`]: [
-    1,
-    "A step fails (state, error); afterStep's gate decides any effect on the run.",
-  ],
-  [`${LC} | gangStop | runtimeInstance.update | phase`]: [
-    1,
-    "STOPPING: ends the current run (no new run).",
   ],
   [`${LC} | insertSteps | instanceStep.create | generation,phase`]: [
     1,
@@ -658,10 +640,6 @@ const CENSUS: Record<string, [number, string]> = {
     1,
     "Retake refused: waiting_<reason> and the 30 s retry; no run, phase or claim.",
   ],
-  [`${LC} | retake | runtimeInstance.update | phase`]: [
-    2,
-    "FAILED (node deleted), or STARTING after retakeInstanceClaims began the run in this transaction.",
-  ],
   [`${LC} | runtimeInventory | runtimeInstance.update | other`]: [
     1,
     "Inventory heartbeat (lastHealthAt) after the inventoryEvidence gate.",
@@ -670,37 +648,21 @@ const CENSUS: Record<string, [number, string]> = {
     1,
     "Ends steps waiting for their person (CANCELLED/FAILED); a person's run is left alone and recorded (R5-B-1).",
   ],
-  [`${LC} | settleStopped | instanceStep.updateMany | other`]: [
-    2,
-    "The stopped run's waiting steps end (state, error, hold).",
-  ],
-  [`${LC} | settleStopped | runtimeInstance.update | phase`]: [
-    5,
-    "STOPPED / FAILED: the run ended (no new run).",
-  ],
   [`${LC} | settleStopping | instanceStep.updateMany | other`]: [
-    3,
-    "Stopping: the run's waiting steps end or carry the stop's error code.",
-  ],
-  [`${LC} | settleStopping | runtimeInstance.update | other`]: [
     1,
-    "needsOperator MARK_STOPPED while a stop cannot be proven (attention only).",
+    "Stopping: a held step's hold code is cleared (its end goes through endSteps).",
   ],
   [`${LC} | settleSupersededOperator | instanceStep.updateMany | other`]: [
     1,
     "An earlier run's screen ends (FAILED superseded / CANCELLED); nothing for the successor.",
   ],
-  [`${LC} | syncNeedsOperator | runtimeInstance.update | other`]: [
-    1,
-    "needsOperator / needsOperatorSince (attention only; it authorizes nothing).",
-  ],
   [`${LC} | undeliver | instanceStep.updateMany | opaque`]: [
     1,
     "The frame never left: back to PENDING.",
   ],
-  [`${LC} | watchInstance | runtimeInstance.update | phase`]: [
-    2,
-    "Named exemption: same-run UNAVAILABLE and recovery (READY only with this run's READINESS); the run is resolved first.",
+  [`${LC} | writePhase | runtimeInstance.update | opaque`]: [
+    1,
+    "The one managed phase write (`lib/instance-phase.ts`: the move asserted, the columns built). Its callers are pinned (CONSUMERS): STOPPING (gangStop), STOPPED / FAILED (settleStopped, retake's node_deleted), STARTING after retakeInstanceClaims began the run (retake), READY after this run's READINESS (afterStep, after `owned`), health (recordHealth), and the named exemption of same-run UNAVAILABLE and recovery (watchInstance, run resolved first).",
   ],
   "packages/api/src/lib/claim-release.ts | releaseClaim | instanceRank.updateMany | claim": [
     1,
@@ -744,6 +706,14 @@ const CENSUS: Record<string, [number, string]> = {
   ],
   "packages/api/src/lib/needs-you-mail.ts | sweepNeedsYouMail | runtimeInstance.updateMany | other":
     [3, "Needs-you e-mail bookkeeping (notified at, failures)."],
+  "packages/api/src/lib/operator-need.ts | endSteps | instanceStep.updateMany | opaque": [
+    1,
+    "The one terminal write of a step (CANCELLED / FAILED with its hold cleared; `data` is the caller's end, never a claim, run or generation). Its callers are pinned (CONSUMERS).",
+  ],
+  "packages/api/src/lib/operator-need.ts | writeOperatorNeed | runtimeInstance.update | other": [
+    1,
+    "needsOperator / needsOperatorSince (attention only; it authorizes nothing).",
+  ],
   "packages/api/src/lib/overview-summary.ts | histogramColumns | Prisma.raw | opaque": [
     3,
     "Histogram columns from fixed lists (read-only overview).",
@@ -776,17 +746,17 @@ const CENSUS: Record<string, [number, string]> = {
     2,
     "Marks a replaced run's rows superseded (supersededGeneration): they keep holding until its STOP is proven.",
   ],
-  "packages/api/src/lib/runtime-store.ts | markInstancesStopping | runtimeInstance.updateMany | phase":
-    [1, "STOPPING (no new run); the runs were resolved first."],
+  "packages/api/src/lib/runtime-store.ts | markInstancesStopping | runtimeInstance.updateMany | opaque":
+    [1, "STOPPING (`instancePhaseData`; no new run); the runs were resolved first."],
   "packages/api/src/lib/runtime-store.ts | writePlannedStarts | instanceRank.update | opaque": [
     1,
     "Inside retakeInstanceClaims's writeRanks (the run was begun first).",
   ],
   "packages/api/src/lib/runtime-store.ts | writePlannedStarts | runtimeInstance.create | phase,runGeneration":
     [1, "A new instance at run 1 (its ranks and reservations nested, of that run)."],
-  "packages/api/src/lib/runtime-store.ts | writePlannedStarts | runtimeInstance.update | phase": [
+  "packages/api/src/lib/runtime-store.ts | writePlannedStarts | runtimeInstance.update | opaque": [
     1,
-    "STARTING; retakeInstanceClaims begins the run in the same transaction.",
+    "STARTING (`instancePhaseData`, a new run); retakeInstanceClaims begins the run in the same transaction.",
   ],
   "packages/api/src/routers/runtimes.ts | createRuntime | runtimeInstance.create | phase": [
     1,
@@ -799,10 +769,6 @@ const CENSUS: Record<string, [number, string]> = {
   "packages/api/src/routers/runtimes.ts | markStopped | instanceRank.updateMany | claim": [
     1,
     "Named exemption: a person marks a STOPPING rank HELD_UNKNOWN (never a release).",
-  ],
-  "packages/api/src/routers/runtimes.ts | markStopped | instanceStep.updateMany | other": [
-    1,
-    "A person marks a stop: the rank's waiting stop steps end (state, hold).",
   ],
   "packages/api/src/routers/runtimes.ts | update | runtimeInstance.updateMany | other": [
     2,
@@ -985,8 +951,17 @@ const GATES: Array<[file: string, fn: string, gate: string]> = [
   [LC, "applyJobResult", "settleSupersededOperator"],
   [LC, "inventoryEvidence", "owned"],
   [LC, "inventoryEvidence", "fresh"],
-  [LC, "operatorStepWaiting", "resolveRun"],
-  [LC, "operatorStepWaiting", "overdueAcceptedRun"],
+  ["packages/api/src/lib/operator-need.ts", "operatorStepWaiting", "resolveRun"],
+  ["packages/api/src/lib/operator-need.ts", "operatorStepWaiting", "stepNeedsPersonWhere"],
+  ["packages/api/src/lib/operator-need.ts", "stepNeedsPersonWhere", "overdueAcceptedRunWhere"],
+  ["packages/api/src/lib/operator-need.ts", "endSteps", "syncNeedsOperator"],
+  // Every phase write checks its move and builds its columns in one place.
+  [LC, "writePhase", "assertInstanceTransition"],
+  [LC, "writePhase", "instancePhaseData"],
+  ["packages/api/src/lib/runtime-store.ts", "markInstancesStopping", "instancePhaseData"],
+  ["packages/api/src/lib/runtime-store.ts", "writePlannedStarts", "instancePhaseData"],
+  [AO, "observeInstance", "alwaysOnPhaseData"],
+  [AO, "removeUnreported", "alwaysOnPhaseData"],
   [LC, "watchInstance", "resolveRun"],
   [LC, "prepareStarts", "resolveRun"],
   [LC, "reopenStep", "owned"],
@@ -1027,8 +1002,8 @@ const CONSUMERS: Array<[call: string, sites: string[]]> = [
   [
     "syncNeedsOperator",
     [
+      `${LC} | afterStep`,
       `${LC} | applyJobResult`,
-      `${LC} | cancelStep`,
       `${LC} | claimStep`,
       `${LC} | clearOperatorHold`,
       `${LC} | closeOperatorKeepingRun`,
@@ -1041,6 +1016,32 @@ const CONSUMERS: Array<[call: string, sites: string[]]> = [
       `${LC} | reopenStep`,
       `${LC} | settleOperatorSteps`,
       `${LC} | settleSupersededOperator`,
+      // The engine's own delegate to `lib/operator-need.ts`.
+      `${LC} | syncNeedsOperator`,
+    ],
+  ],
+  // Who changes a managed instance's phase (the one write, `writePhase`), each after its gate.
+  [
+    "writePhase",
+    [
+      `${LC} | afterStep`,
+      `${LC} | gangStop`,
+      `${LC} | recordHealth`,
+      `${LC} | retake`,
+      `${LC} | settleStopped`,
+      `${LC} | watchInstance`,
+    ],
+  ],
+  // Who ends steps (the one terminal write, `lib/operator-need.ts` `endSteps`) in the engine.
+  [
+    "endSteps",
+    [
+      `${LC} | cancelStep`,
+      `${LC} | claimStep`,
+      `${LC} | drainInstance`,
+      `${LC} | failStep`,
+      `${LC} | settleStopped`,
+      `${LC} | settleStopping`,
     ],
   ],
   // The engine asks the relay about an operator step only through the reconciling helper (the

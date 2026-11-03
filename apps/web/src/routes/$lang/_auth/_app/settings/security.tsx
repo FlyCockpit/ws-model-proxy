@@ -16,8 +16,15 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
+import { useGuardedMachine } from "@/hooks/use-guarded-machine";
 import { useTotpEnrollment } from "@/hooks/use-totp-enrollment";
 import { authClient } from "@/lib/auth-client";
+import {
+  type DisableTwoFactorEvent,
+  type DisableTwoFactorState,
+  disableTwoFactorTransition,
+  initialDisableTwoFactorState,
+} from "@/lib/two-factor-state";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/settings/security")({
@@ -144,47 +151,29 @@ function ChangePasswordCard() {
 }
 
 function Enable2FASection() {
-  const [step, setStep] = useState<"idle" | "password" | "setup" | "verify">("idle");
-  const [verifyCode, setVerifyCode] = useState("");
-  const [isVerifying, setIsVerifying] = useState(false);
   const { t } = useTranslation(["settings", "auth", "common"]);
-
-  const { password, setPassword, totpURI, backupCodes, isLoading, enable } = useTotpEnrollment({
-    couldNotStartSetupMessage: t("settings:security.couldNotStartSetup"),
-    logLabel: "settings.security.twoFactor.enable",
-    onEnabled: () => setStep("setup"),
+  const enrollment = useTotpEnrollment({
+    messages: {
+      couldNotStartSetup: t("settings:security.couldNotStartSetup"),
+      invalidCode: t("auth:errors.invalidTotp"),
+      enabled: t("settings:security.enabledSuccess"),
+    },
+    logPrefix: "settings.security.twoFactor",
+    confirmBackupCodes: true,
+    onVerified: () => window.location.reload(),
   });
+  const { state } = enrollment;
 
-  const handleVerify = async () => {
-    setIsVerifying(true);
-    try {
-      const result = await authClient.twoFactor.verifyTotp({
-        code: verifyCode,
-      });
-      if (result.error) {
-        console.error("[settings.security.twoFactor.verifyTotp]", result.error);
-        toast.error(t("auth:errors.invalidTotp"));
-        return;
-      }
-      toast.success(t("settings:security.enabledSuccess"));
-      window.location.reload();
-    } catch (err) {
-      console.error("[settings.security.twoFactor.verifyTotp]", err);
-      toast.error(t("auth:errors.invalidTotp"));
-    } finally {
-      setIsVerifying(false);
-    }
-  };
-
-  if (step === "idle") {
+  if (state.kind === "idle") {
     return (
-      <Button className="min-h-[44px]" onClick={() => setStep("password")}>
+      <Button className="min-h-[44px]" onClick={() => enrollment.start()}>
         {t("settings:security.enable2FA")}
       </Button>
     );
   }
 
-  if (step === "password") {
+  if (state.kind === "password") {
+    const isEnabling = state.activity.kind === "enabling";
     return (
       <div className="space-y-4 max-w-sm">
         <p className="text-sm text-muted-foreground">
@@ -196,18 +185,22 @@ function Enable2FASection() {
             id="confirm-password"
             type="password"
             autoComplete="current-password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            value={state.password}
+            onChange={(e) => enrollment.setPassword(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") enable();
+              if (e.key === "Enter") enrollment.enable();
             }}
           />
         </div>
         <div className="flex gap-2">
-          <Button className="min-h-[44px]" onClick={enable} disabled={!password || isLoading}>
-            {isLoading ? t("auth:twoFactor.settingUp") : t("auth:twoFactor.continue")}
+          <Button
+            className="min-h-[44px]"
+            onClick={() => enrollment.enable()}
+            disabled={!state.password || isEnabling}
+          >
+            {isEnabling ? t("auth:twoFactor.settingUp") : t("auth:twoFactor.continue")}
           </Button>
-          <Button className="min-h-[44px]" variant="ghost" onClick={() => setStep("idle")}>
+          <Button className="min-h-[44px]" variant="ghost" onClick={() => enrollment.cancel()}>
             {t("common:actions.cancel")}
           </Button>
         </div>
@@ -215,24 +208,25 @@ function Enable2FASection() {
     );
   }
 
-  if (step === "setup") {
+  if (state.kind === "setup") {
     return (
       <div className="space-y-4 max-w-sm">
         <TwoFactorSetupDetails
-          backupCodes={backupCodes}
+          backupCodes={state.backupCodes}
           backupCodesLabel={t("settings:security.saveBackupCodes")}
           manualPrompt={t("settings:security.addKeyToApp")}
           qrPrompt={t("settings:security.scanQrPrompt")}
-          totpURI={totpURI}
+          totpURI={state.totpURI}
         />
 
-        <Button className="min-h-[44px]" onClick={() => setStep("verify")}>
+        <Button className="min-h-[44px]" onClick={() => enrollment.saveBackupCodes()}>
           {t("settings:security.savedBackupCodes")}
         </Button>
       </div>
     );
   }
 
+  const isVerifying = state.activity.kind !== "idle";
   return (
     <div className="space-y-4 max-w-sm">
       <p className="text-sm text-muted-foreground">{t("settings:security.verifyPrompt")}</p>
@@ -241,21 +235,21 @@ function Enable2FASection() {
         <Input
           id="setup-verify-code"
           placeholder="000000"
-          value={verifyCode}
-          onChange={(e) => setVerifyCode(e.target.value)}
+          value={state.code}
+          onChange={(e) => enrollment.setCode(e.target.value)}
           inputMode="numeric"
           autoComplete="one-time-code"
           maxLength={6}
           className="text-center text-lg tracking-widest"
           onKeyDown={(e) => {
-            if (e.key === "Enter" && verifyCode.length === 6) handleVerify();
+            if (e.key === "Enter") enrollment.verify();
           }}
         />
       </div>
       <Button
         className="min-h-[44px]"
-        onClick={handleVerify}
-        disabled={verifyCode.length !== 6 || isVerifying}
+        onClick={() => enrollment.verify()}
+        disabled={state.code.length !== 6 || isVerifying}
       >
         {isVerifying ? t("auth:twoFactor.verifying") : t("settings:security.verifyAndEnable")}
       </Button>
@@ -264,40 +258,50 @@ function Enable2FASection() {
 }
 
 function Disable2FASection() {
-  const [showConfirm, setShowConfirm] = useState(false);
-  const [password, setPassword] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
+  const { state, send, nextAttempt, current } = useGuardedMachine<
+    DisableTwoFactorState,
+    DisableTwoFactorEvent
+  >(initialDisableTwoFactorState, disableTwoFactorTransition);
   const { t } = useTranslation(["settings", "auth", "common"]);
 
   const handleDisable = async () => {
-    setIsLoading(true);
+    const before = current();
+    if (before.kind !== "confirm") return;
+    const attempt = nextAttempt();
+    // Rejected while a disable is in flight or the password is empty.
+    if (!send({ type: "disableStarted", attempt })) return;
+    const fail = () => {
+      if (send({ type: "disableFailed", attempt })) {
+        toast.error(t("settings:security.couldNotDisable"));
+      }
+    };
     try {
       const result = await authClient.twoFactor.disable({
-        password,
+        password: before.password,
       });
       if (result.error) {
         console.error("[settings.security.twoFactor.disable]", result.error);
-        toast.error(t("settings:security.couldNotDisable"));
+        fail();
         return;
       }
+      send({ type: "disableSucceeded", attempt });
       toast.success(t("settings:security.disabledSuccess"));
       window.location.reload();
     } catch (err) {
       console.error("[settings.security.twoFactor.disable]", err);
-      toast.error(t("settings:security.couldNotDisable"));
-    } finally {
-      setIsLoading(false);
+      fail();
     }
   };
 
-  if (!showConfirm) {
+  if (state.kind === "closed") {
     return (
-      <Button className="min-h-[44px]" variant="outline" onClick={() => setShowConfirm(true)}>
+      <Button className="min-h-[44px]" variant="outline" onClick={() => send({ type: "open" })}>
         {t("settings:security.disable2FA")}
       </Button>
     );
   }
 
+  const isBusy = state.activity.kind !== "idle";
   return (
     <div className="space-y-4 max-w-sm">
       <p className="text-sm text-muted-foreground">{t("settings:security.disablePrompt")}</p>
@@ -307,8 +311,8 @@ function Disable2FASection() {
           id="disable-password"
           type="password"
           autoComplete="current-password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
+          value={state.password}
+          onChange={(e) => send({ type: "passwordChanged", password: e.target.value })}
           onKeyDown={(e) => {
             if (e.key === "Enter") handleDisable();
           }}
@@ -319,11 +323,16 @@ function Disable2FASection() {
           className="min-h-[44px]"
           variant="destructive"
           onClick={handleDisable}
-          disabled={!password || isLoading}
+          disabled={!state.password || isBusy}
         >
-          {isLoading ? t("settings:security.disabling") : t("settings:security.disable")}
+          {isBusy ? t("settings:security.disabling") : t("settings:security.disable")}
         </Button>
-        <Button className="min-h-[44px]" variant="ghost" onClick={() => setShowConfirm(false)}>
+        <Button
+          className="min-h-[44px]"
+          variant="ghost"
+          onClick={() => send({ type: "cancel" })}
+          disabled={isBusy}
+        >
           {t("common:actions.cancel")}
         </Button>
       </div>

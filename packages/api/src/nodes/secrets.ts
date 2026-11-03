@@ -10,6 +10,7 @@ import type { Context } from "../context";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { nodesContract as c } from "../contracts/nodes";
 import { assertMayWrite, callerActor } from "../lib/caller-actor";
+import { nodeIsLive } from "../lib/node-liveness";
 import type { NodeSecretWriteResult } from "../lib/node-relay-services";
 import { notFound, refuseAbout } from "../lib/refuse";
 import { nodeFeaturesSchema } from "../lib/runtime-spec";
@@ -23,6 +24,7 @@ async function secretTarget(context: SignedInContext, nodeId: string) {
     select: {
       id: true,
       connection: true,
+      lastHeartbeatAt: true,
       trust: true,
       trustChangedAt: true,
       trustLowerRequestedAt: true,
@@ -35,7 +37,8 @@ async function secretTarget(context: SignedInContext, nodeId: string) {
       node.id,
       "This node is Relay only: set the secret with `wsmp secret set NAME` on the node.",
     );
-  if (node.connection !== "ONLINE")
+  // A secret goes only over a live session: a row left ONLINE with a stale heartbeat has none.
+  if (!nodeIsLive(node, new Date()))
     throw refuseAbout(
       "node_offline",
       node.id,

@@ -3,7 +3,7 @@
 //! healthy, and reporting how an update ended after a restart.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -159,8 +159,8 @@ fn progress_frame(
 fn report_frame(state: &UpdateState) -> NodeFrame {
     progress_frame(
         &state.update_id,
-        state.phase.wire(),
-        if matches!(state.phase, state::Phase::Failed) {
+        state.phase().wire(),
+        if state.phase() == state::Phase::Failed {
             Some(state.reason.unwrap_or(UpdateReason::Internal))
         } else {
             None
@@ -175,20 +175,122 @@ enum Event {
     Restart,
 }
 
+/// Where the worker is, as the relay loop sees it: whether it waits for the node to go idle,
+/// and whether the relay holds new work (from the last idle check to the restart, the relay
+/// starts no runtime launch and no node command, so the node stays idle).
+///
+/// ```text
+/// Preparing ──begin_wait──▶ WaitingIdle ──end_wait──▶ Preparing     (a self-replace, before its download)
+/// Preparing ──hold──▶ Holding ──begin_wait──▶ HoldingWaitingIdle ──end_wait──▶ Holding
+/// Holding ──release──▶ Preparing                                     (that wait timed out or was stopped)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum WorkerStage {
+    /// Downloading, verifying, unpacking: the node may be busy.
+    Preparing = 0,
+    /// Waiting for the node to go idle; new work is not held.
+    WaitingIdle = 1,
+    /// The last idle check: new work is held while it waits for the node to go idle again.
+    HoldingWaitingIdle = 2,
+    /// New work is held (the node was idle at the last check): the swap and the restart.
+    Holding = 3,
+}
+
+impl WorkerStage {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::WaitingIdle,
+            2 => Self::HoldingWaitingIdle,
+            3 => Self::Holding,
+            _ => Self::Preparing,
+        }
+    }
+
+    fn wants_idle(self) -> bool {
+        matches!(self, Self::WaitingIdle | Self::HoldingWaitingIdle)
+    }
+
+    fn holds_new_work(self) -> bool {
+        matches!(self, Self::HoldingWaitingIdle | Self::Holding)
+    }
+
+    fn begin_wait(self) -> Option<Self> {
+        match self {
+            Self::Preparing => Some(Self::WaitingIdle),
+            Self::Holding => Some(Self::HoldingWaitingIdle),
+            Self::WaitingIdle | Self::HoldingWaitingIdle => None,
+        }
+    }
+
+    fn end_wait(self) -> Option<Self> {
+        match self {
+            Self::WaitingIdle => Some(Self::Preparing),
+            Self::HoldingWaitingIdle => Some(Self::Holding),
+            Self::Preparing | Self::Holding => None,
+        }
+    }
+
+    fn hold(self) -> Option<Self> {
+        match self {
+            Self::Preparing => Some(Self::Holding),
+            _ => None,
+        }
+    }
+
+    fn release(self) -> Option<Self> {
+        match self {
+            Self::Holding => Some(Self::Preparing),
+            _ => None,
+        }
+    }
+}
+
+/// A [`WorkerStage`] the worker moves and the relay loop reads, one atomic value (the two never
+/// disagree about waiting and holding).
+struct AtomicStage(AtomicU8);
+
+impl AtomicStage {
+    fn new() -> Self {
+        Self(AtomicU8::new(WorkerStage::Preparing as u8))
+    }
+
+    fn load(&self) -> WorkerStage {
+        WorkerStage::from_u8(self.0.load(Ordering::SeqCst))
+    }
+
+    /// Move by `step`; a move `step` does not allow from the current stage changes nothing
+    /// (and is logged: the worker's own sequence never asks for one).
+    fn advance(&self, step: fn(WorkerStage) -> Option<WorkerStage>, what: &str) -> bool {
+        let moved = self
+            .0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                step(WorkerStage::from_u8(value)).map(|next| next as u8)
+            })
+            .is_ok();
+        if !moved {
+            tracing::warn!(stage = ?self.load(), what, "the update worker cannot move here");
+        }
+        moved
+    }
+
+    #[cfg(test)]
+    fn set(&self, stage: WorkerStage) {
+        self.0.store(stage as u8, Ordering::SeqCst);
+    }
+}
+
 /// What the worker and the relay loop share.
 struct Shared {
     /// No runtime instance runs (set by the relay loop while the worker waits).
     no_instances: AtomicBool,
     /// No node command runs.
     no_commands: AtomicBool,
-    /// The worker waits for the node to go idle.
-    waiting: AtomicBool,
+    /// Whether the worker waits for the node to go idle, and whether new work is held.
+    stage: AtomicStage,
     /// The owner forced the update (`force`): the server stops the instances
     /// through its own stop operations; node commands are not waited for.
     force: AtomicBool,
-    /// From the last idle check to the restart: the relay starts no runtime
-    /// launch and no node command, so the node stays idle.
-    hold: AtomicBool,
     /// The node lost Full control (seen by the relay loop's poll): the update
     /// stops at its next step.
     lowered: AtomicBool,
@@ -203,9 +305,8 @@ impl Shared {
         Self {
             no_instances: AtomicBool::new(false),
             no_commands: AtomicBool::new(false),
-            waiting: AtomicBool::new(false),
+            stage: AtomicStage::new(),
             force: AtomicBool::new(false),
-            hold: AtomicBool::new(false),
             lowered: AtomicBool::new(false),
             trust,
         }
@@ -275,25 +376,55 @@ impl Progress for Sink {
     }
 }
 
+/// What the relay is doing about updates.
+///
+/// ```text
+/// Idle ──request──▶ Installing ──swapped──▶ Restarting
+///                      └──stopped──▶ Idle
+/// (start) AwaitingConfirm ──confirmed / not ours──▶ Idle
+///                        └──rolled back first──▶ Restarting
+/// ```
+enum Tracking {
+    /// No update runs here (one may have ended: a repeat of its `agent.update` reports it).
+    Idle,
+    /// A worker installs one.
+    Installing(Worker),
+    /// This build is an update that has not confirmed yet: it confirms once the session is
+    /// healthy.
+    AwaitingConfirm(Box<UpdateState>),
+    /// The relay exits for its service to start the build that is now live (the new one, or
+    /// the previous one after a rollback). Nothing else starts meanwhile.
+    Restarting,
+}
+
+/// The relay's session with the server, as updates see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Connection {
+    /// No session, or one that has not had `hello.ok` yet: progress waits in the outbox.
+    Disconnected,
+    Registered {
+        /// The session's definitions are in sync (none to sync, or a complete sync applied).
+        synced: bool,
+        /// This session's server said at `hello.ok` that a refusal may carry
+        /// `availableVersion` (`features.agentUpdateAvailableVersion`). Until then, and with
+        /// any other server, the field is left out: an older server's strict schema would
+        /// refuse the whole frame.
+        available_version_accepted: bool,
+    },
+}
+
 /// The relay's update tracker; one per daemon, across reconnects.
 pub struct DaemonUpdate {
     started: Instant,
-    awaiting: Option<UpdateState>,
-    registered: bool,
-    synced: bool,
-    worker: Option<Worker>,
+    tracking: Tracking,
+    connection: Connection,
     /// Progress frames that wait for a registered session.
     outbox: Vec<NodeFrame>,
-    restart: bool,
     /// The update this relay is installing or has installed (a repeat of its
     /// `agent.update` is never refused).
     current_id: Option<String>,
     /// SHA-256 of this binary, read at start while an update is in flight.
     own_sha256: Option<String>,
-    /// This session's server said at `hello.ok` that a refusal may carry `availableVersion`
-    /// (`features.agentUpdateAvailableVersion`). Until then, and with any other server, the
-    /// field is left out: an older server's strict schema would refuse the whole frame.
-    available_version_accepted: bool,
 }
 
 impl DaemonUpdate {
@@ -303,15 +434,11 @@ impl DaemonUpdate {
     pub fn start() -> Result<Self> {
         let mut tracker = Self {
             started: Instant::now(),
-            awaiting: None,
-            registered: false,
-            synced: false,
-            worker: None,
+            tracking: Tracking::Idle,
+            connection: Connection::Disconnected,
             outbox: Vec::new(),
-            restart: false,
             current_id: None,
             own_sha256: None,
-            available_version_accepted: false,
         };
         let Ok(update_dir) = super::update_dir() else {
             return Ok(tracker);
@@ -319,7 +446,7 @@ impl DaemonUpdate {
         if state::load(&update_dir)
             .ok()
             .flatten()
-            .is_some_and(|current| current.phase.in_progress())
+            .is_some_and(|current| current.in_progress())
         {
             tracker.own_sha256 = own_sha256();
         }
@@ -343,12 +470,12 @@ impl DaemonUpdate {
                     "this build is an update that has not confirmed yet"
                 );
                 tracker.current_id = Some(state.update_id.clone());
-                tracker.awaiting = Some(state);
+                tracker.tracking = Tracking::AwaitingConfirm(Box::new(state));
             }
             // Sent after each `hello.ok` until the server acknowledges it.
             Ok(OnStart::Report(state)) => tracing::info!(
                 update_id = state.update_id,
-                phase = ?state.phase,
+                phase = ?state.phase(),
                 "an update ended; reporting it"
             ),
             Ok(OnStart::RolledBackSelf) => {
@@ -394,17 +521,20 @@ impl DaemonUpdate {
         if self.current_id.as_deref() == Some(frame.update_id.as_str()) || recorded() {
             return self.repeat(&frame);
         }
-        if self.worker.is_some() {
-            return refuse(
-                UpdateReason::InProgress,
-                "another update is in progress on this node".into(),
-            );
-        }
-        if self.awaiting.is_some() || self.restart {
-            return refuse(
-                UpdateReason::InProgress,
-                "the last update has not confirmed yet".into(),
-            );
+        match self.tracking {
+            Tracking::Idle => {}
+            Tracking::Installing(_) => {
+                return refuse(
+                    UpdateReason::InProgress,
+                    "another update is in progress on this node".into(),
+                );
+            }
+            Tracking::AwaitingConfirm(_) | Tracking::Restarting => {
+                return refuse(
+                    UpdateReason::InProgress,
+                    "the last update has not confirmed yet".into(),
+                );
+            }
         }
         // Lowered since the watch was taken (after `gate` read Full control).
         let gate = &Gate {
@@ -444,7 +574,7 @@ impl DaemonUpdate {
         match spawned {
             Ok(_) => {
                 self.current_id = Some(update_id);
-                self.worker = Some(Worker { rx, shared });
+                self.tracking = Tracking::Installing(Worker { rx, shared });
                 Vec::new()
             }
             Err(error) => refuse(
@@ -458,19 +588,20 @@ impl DaemonUpdate {
     /// that still waits for idleness; an update that ended is reported again;
     /// otherwise nothing (the progress already on its way says it).
     fn repeat(&mut self, frame: &UpdateFrame) -> Vec<NodeFrame> {
-        if let Some(worker) = &self.worker {
-            if frame.force {
-                worker.shared.force.store(true, Ordering::SeqCst);
+        match &self.tracking {
+            Tracking::Installing(worker) => {
+                if frame.force {
+                    worker.shared.force.store(true, Ordering::SeqCst);
+                }
+                return Vec::new();
             }
-            return Vec::new();
-        }
-        if self.awaiting.is_some() || self.restart {
-            return Vec::new();
+            Tracking::AwaitingConfirm(_) | Tracking::Restarting => return Vec::new(),
+            Tracking::Idle => {}
         }
         super::update_dir()
             .ok()
             .and_then(|dir| state::load(&dir).ok().flatten())
-            .filter(|current| current.update_id == frame.update_id && !current.phase.in_progress())
+            .filter(|current| current.update_id == frame.update_id && !current.in_progress())
             .map(|current| vec![report_frame(&current)])
             .unwrap_or_default()
     }
@@ -478,22 +609,28 @@ impl DaemonUpdate {
     /// From the last idle check to the restart into a new build: start no
     /// runtime launch and no node command (they would end at the restart).
     pub fn holds_new_work(&self) -> bool {
-        self.restart
-            || self
-                .worker
-                .as_ref()
-                .is_some_and(|worker| worker.shared.hold.load(Ordering::SeqCst))
+        match &self.tracking {
+            Tracking::Restarting => true,
+            Tracking::Installing(worker) => worker.shared.stage.load().holds_new_work(),
+            Tracking::Idle | Tracking::AwaitingConfirm(_) => false,
+        }
     }
 
     /// The worker waits for the node to go idle: the relay loop reports idleness.
     pub fn wants_idle(&self) -> bool {
-        self.worker
-            .as_ref()
-            .is_some_and(|worker| worker.shared.waiting.load(Ordering::SeqCst))
+        self.worker()
+            .is_some_and(|worker| worker.shared.stage.load().wants_idle())
+    }
+
+    fn worker(&self) -> Option<&Worker> {
+        match &self.tracking {
+            Tracking::Installing(worker) => Some(worker),
+            _ => None,
+        }
     }
 
     pub fn set_idle(&self, no_instances: bool, no_commands: bool) {
-        if let Some(worker) = &self.worker {
+        if let Some(worker) = self.worker() {
             worker
                 .shared
                 .no_instances
@@ -507,9 +644,10 @@ impl DaemonUpdate {
 
     /// `available_version`: the server's `hello.ok` `features.agentUpdateAvailableVersion`.
     pub fn on_hello_ok(&mut self, sync: DefinitionSync, available_version: bool) {
-        self.registered = true;
-        self.available_version_accepted = available_version;
-        self.synced = sync == DefinitionSync::None;
+        self.connection = Connection::Registered {
+            synced: sync == DefinitionSync::None,
+            available_version_accepted: available_version,
+        };
         // An update's end, until the server acknowledges it (`agent.update.ack`):
         // a report the server got but did not store is sent again.
         if let Some(ended) = super::update_dir()
@@ -523,15 +661,13 @@ impl DaemonUpdate {
 
     /// A complete definition sync was applied in this session.
     pub fn on_definitions_applied(&mut self) {
-        if self.registered {
-            self.synced = true;
+        if let Connection::Registered { synced, .. } = &mut self.connection {
+            *synced = true;
         }
     }
 
     pub fn on_session_end(&mut self) {
-        self.registered = false;
-        self.synced = false;
-        self.available_version_accepted = false;
+        self.connection = Connection::Disconnected;
     }
 
     /// Frames to send now (only while registered), and whether to exit for
@@ -540,57 +676,64 @@ impl DaemonUpdate {
     /// worker sees a lowering sooner, through its [`TrustWatch`]; this latch
     /// is a second way to the same stop.)
     pub fn poll(&mut self, full_control: bool) -> (Vec<NodeFrame>, bool) {
-        if !full_control && let Some(worker) = &self.worker {
+        if !full_control && let Some(worker) = self.worker() {
             worker.shared.lowered.store(true, Ordering::SeqCst);
         }
-        let mut finished = false;
-        if let Some(worker) = &self.worker {
+        let mut ended = None;
+        if let Tracking::Installing(worker) = &self.tracking {
             loop {
                 match worker.rx.try_recv() {
                     Ok(Event::Frame(frame)) => self.outbox.push(*frame),
                     Ok(Event::Restart) => {
-                        self.restart = true;
-                        finished = true;
+                        ended = Some(Tracking::Restarting);
                         break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        finished = true;
+                        ended = Some(Tracking::Idle);
                         break;
                     }
                 }
             }
         }
-        if finished {
-            self.worker = None;
+        if let Some(next) = ended {
+            self.tracking = next;
         }
-        if self.awaiting.is_some()
-            && self.registered
-            && self.synced
+        if matches!(self.tracking, Tracking::AwaitingConfirm(_))
+            && matches!(self.connection, Connection::Registered { synced: true, .. })
             && self.started.elapsed() >= CONFIRM_ALIVE
         {
             self.confirm_now();
         }
-        let frames = if self.registered {
-            let accepted = self.available_version_accepted;
-            std::mem::take(&mut self.outbox)
+        let frames = match self.connection {
+            Connection::Registered {
+                available_version_accepted,
+                ..
+            } => std::mem::take(&mut self.outbox)
                 .into_iter()
-                .map(|frame| for_server(frame, accepted))
-                .collect()
-        } else {
-            Vec::new()
+                .map(|frame| for_server(frame, available_version_accepted))
+                .collect(),
+            Connection::Disconnected => Vec::new(),
         };
         // Registered: after the frames (`restarting`) went out. Disconnected:
         // at once; the new binary reports on its own session.
+        let registered = matches!(self.connection, Connection::Registered { .. });
         (
             frames,
-            self.restart && (self.outbox.is_empty() || !self.registered),
+            matches!(self.tracking, Tracking::Restarting)
+                && (self.outbox.is_empty() || !registered),
         )
     }
 
+    /// Confirm the build this relay awaits. Until it is confirmed (or found rolled back, or
+    /// not ours), the tracker awaits it again after an error.
     fn confirm_now(&mut self) {
-        let Some(awaiting) = self.awaiting.take() else {
-            return;
+        let awaiting = match std::mem::replace(&mut self.tracking, Tracking::Idle) {
+            Tracking::AwaitingConfirm(awaiting) => awaiting,
+            other => {
+                self.tracking = other;
+                return;
+            }
         };
         let Ok(update_dir) = super::update_dir() else {
             return;
@@ -629,7 +772,7 @@ impl DaemonUpdate {
                     update_id = awaiting.update_id,
                     "the update rolled back before it confirmed; restarting into the previous wsmp"
                 );
-                self.restart = true;
+                self.tracking = Tracking::Restarting;
             }
             Ok(flow::Confirm::NotOurs) => tracing::warn!(
                 update_id = awaiting.update_id,
@@ -638,7 +781,7 @@ impl DaemonUpdate {
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "confirming the update failed");
                 // Try again on the next poll.
-                self.awaiting = Some(awaiting);
+                self.tracking = Tracking::AwaitingConfirm(awaiting);
             }
         }
     }
@@ -654,9 +797,8 @@ impl DaemonUpdate {
         };
         if let Ok(Some(mut current)) = state::load(&update_dir)
             && current.update_id == update_id
-            && current.needs_report()
+            && current.mark_reported()
         {
-            current.reported = true;
             let _ = state::save(&update_dir, &current);
             tracing::info!(update_id, "the server stored how the update ended");
         }
@@ -692,10 +834,17 @@ fn wait_idle(
             && (shared.force.load(Ordering::SeqCst) || shared.no_commands.load(Ordering::SeqCst))
     };
     // The relay loop answers within a poll or two.
-    shared.waiting.store(true, Ordering::SeqCst);
+    shared
+        .stage
+        .advance(WorkerStage::begin_wait, "wait for idle");
+    let end_wait = || {
+        shared
+            .stage
+            .advance(WorkerStage::end_wait, "end the wait for idle")
+    };
     std::thread::sleep(Duration::from_millis(1500));
     if idle() {
-        shared.waiting.store(false, Ordering::SeqCst);
+        end_wait();
         return true;
     }
     progress.report(UpdatePhase::WaitingIdle, None, None);
@@ -703,11 +852,11 @@ fn wait_idle(
     while Instant::now() < until && !stopped() {
         std::thread::sleep(Duration::from_secs(1));
         if idle() {
-            shared.waiting.store(false, Ordering::SeqCst);
+            end_wait();
             return true;
         }
     }
-    shared.waiting.store(false, Ordering::SeqCst);
+    end_wait();
     false
 }
 
@@ -778,7 +927,7 @@ fn run_worker(
         tracing::warn!(error = %format!("{error:#}"), "looking at an earlier update failed");
     }
     if let Ok(Some(current)) = state::load(&update_dir)
-        && current.phase.in_progress()
+        && current.in_progress()
     {
         sink.report(
             UpdatePhase::Refused,
@@ -828,12 +977,14 @@ fn run_worker(
         if host.instances_survive {
             return Ok(());
         }
-        shared.hold.store(true, Ordering::SeqCst);
+        shared.stage.advance(WorkerStage::hold, "hold new work");
         let left = IDLE_WAIT_MAX.saturating_sub(waited_from.elapsed());
         if wait_idle(shared, progress, left, &stopped) {
             return Ok(());
         }
-        shared.hold.store(false, Ordering::SeqCst);
+        shared
+            .stage
+            .advance(WorkerStage::release, "let go of new work");
         // When stopped, the caller's next check refuses with the reason.
         Err("the node did not go idle within 30 minutes".into())
     };
@@ -1724,7 +1875,7 @@ mod tests {
                     seen,
                     [(UpdatePhase::Refused, Some(UpdateReason::InProgress))]
                 );
-                assert_eq!(stored.phase, state::Phase::Armed);
+                assert_eq!(stored.phase(), state::Phase::Armed);
             } else {
                 assert_eq!(
                     seen,
@@ -1734,7 +1885,7 @@ mod tests {
                     ]
                 );
                 assert_eq!(stored.update_id, "ZZZZZZZZZZZZZZZZZZZZZZ");
-                assert_eq!(stored.phase, state::Phase::Failed);
+                assert_eq!(stored.phase(), state::Phase::Failed);
                 assert!(!bin.join("wsmp.new").exists());
             }
         }
@@ -1882,18 +2033,7 @@ mod tests {
             has_live: true,
             under_service: true,
         };
-        let mut tracker = DaemonUpdate {
-            started: Instant::now(),
-            awaiting: None,
-            registered: true,
-            synced: true,
-            worker: None,
-            outbox: Vec::new(),
-            restart: false,
-            current_id: None,
-            own_sha256: None,
-            available_version_accepted: false,
-        };
+        let mut tracker = tracker();
         let reason_of = |frames: Vec<NodeFrame>| match frames.as_slice() {
             [NodeFrame::AgentUpdateProgress { reason, .. }] => *reason,
             other => panic!("{other:?}"),
@@ -1974,8 +2114,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2500));
             assert!(!worker.is_finished(), "{strategy:?}: still waiting");
             assert_eq!(
-                shared.hold.load(Ordering::SeqCst),
-                strategy == UpdateStrategy::Homebrew,
+                shared.stage.load(),
+                if strategy == UpdateStrategy::Homebrew {
+                    WorkerStage::HoldingWaitingIdle
+                } else {
+                    WorkerStage::WaitingIdle
+                },
                 "{strategy:?}"
             );
             let lowered_at = Instant::now();
@@ -1994,8 +2138,9 @@ mod tests {
             );
             worker.join().expect("worker");
             assert!(!restart);
-            assert!(
-                !shared.hold.load(Ordering::SeqCst),
+            assert_eq!(
+                shared.stage.load(),
+                WorkerStage::Preparing,
                 "{strategy:?}: hold let go"
             );
             assert!(!brew.marker("upgraded").exists(), "{strategy:?}");
@@ -2224,24 +2369,23 @@ mod tests {
     fn tracker() -> DaemonUpdate {
         DaemonUpdate {
             started: Instant::now(),
-            awaiting: None,
-            registered: true,
-            synced: true,
-            worker: None,
+            tracking: Tracking::Idle,
+            connection: Connection::Registered {
+                synced: true,
+                available_version_accepted: false,
+            },
             outbox: Vec::new(),
-            restart: false,
             current_id: None,
             own_sha256: None,
-            available_version_accepted: false,
         }
     }
 
     fn waiting_worker(tracker: &mut DaemonUpdate, id: &str) -> (Arc<Shared>, Sender<Event>) {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Shared::default());
-        shared.waiting.store(true, Ordering::SeqCst);
+        shared.stage.set(WorkerStage::WaitingIdle);
         tracker.current_id = Some(id.into());
-        tracker.worker = Some(Worker {
+        tracker.tracking = Tracking::Installing(Worker {
             rx,
             shared: Arc::clone(&shared),
         });
@@ -2283,15 +2427,15 @@ mod tests {
         );
         assert!(shared.force.load(Ordering::SeqCst));
         // A late force once the worker stopped waiting: still no refusal.
-        shared.waiting.store(false, Ordering::SeqCst);
+        assert!(shared.stage.advance(WorkerStage::end_wait, "test"));
+        assert!(!tracker.wants_idle());
         assert!(
             tracker
                 .request(frame(id, true), &gate(), TrustWatch::full_for_tests())
                 .is_empty()
         );
         // Awaiting the restart: the same id gets no answer either.
-        tracker.worker = None;
-        tracker.restart = true;
+        tracker.tracking = Tracking::Restarting;
         assert!(
             tracker
                 .request(frame(id, true), &gate(), TrustWatch::full_for_tests())
@@ -2314,11 +2458,16 @@ mod tests {
         let mut tracker = tracker();
         let (shared, _tx) = waiting_worker(&mut tracker, "AAAAAAAAAAAAAAAAAAAAAA");
         assert!(!tracker.holds_new_work());
-        shared.hold.store(true, Ordering::SeqCst);
+        assert!(shared.stage.advance(WorkerStage::end_wait, "test"));
+        assert!(shared.stage.advance(WorkerStage::hold, "test"));
         assert!(tracker.holds_new_work());
-        tracker.worker = None;
+        assert!(shared.stage.advance(WorkerStage::begin_wait, "test"));
+        assert!(tracker.holds_new_work() && tracker.wants_idle());
+        assert!(shared.stage.advance(WorkerStage::end_wait, "test"));
+        assert!(tracker.holds_new_work() && !tracker.wants_idle());
+        tracker.tracking = Tracking::Idle;
         assert!(!tracker.holds_new_work(), "the worker stopped: no hold");
-        tracker.restart = true;
+        tracker.tracking = Tracking::Restarting;
         assert!(tracker.holds_new_work());
     }
 
@@ -2364,7 +2513,7 @@ mod tests {
     #[test]
     fn the_restart_waits_for_the_progress_only_on_a_live_session() {
         let mut tracker = tracker();
-        tracker.registered = false;
+        tracker.on_session_end();
         let (_shared, tx) = waiting_worker(&mut tracker, "AAAAAAAAAAAAAAAAAAAAAA");
         tx.send(Event::Frame(Box::new(progress_frame(
             "AAAAAAAAAAAAAAAAAAAAAA",
@@ -2377,7 +2526,7 @@ mod tests {
         // Disconnected: restart at once, the progress waits.
         assert_eq!(tracker.poll(true), (Vec::new(), true));
         // Registered: the progress goes out first.
-        tracker.registered = true;
+        tracker.on_hello_ok(DefinitionSync::None, false);
         let (frames, restart) = tracker.poll(true);
         assert_eq!(frames.len(), 1);
         assert!(restart);

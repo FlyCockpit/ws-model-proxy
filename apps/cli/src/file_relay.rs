@@ -39,6 +39,7 @@ use crate::protocol::frames::FileOpKind;
 use crate::protocol::{
     NodeBinaryMetadata, NodeFrame, RELAY_BINARY_CHUNK_MAX_BYTES, RELAY_JSON_CONTROL_MAX_BYTES,
 };
+use crate::startup::{TrustAuthority, TrustSnapshot};
 
 /// Text above this many bytes travels as a binary `file.data` frame.
 pub const INLINE_TEXT_MAX_BYTES: usize = 48 * 1024;
@@ -464,33 +465,39 @@ struct Pending {
 /// Per-session state: the ops in flight and the runtime that runs them.
 pub struct FileRelay {
     runtime: Arc<FileRuntime>,
-    full_control: bool,
+    /// The daemon's trust, read on every op: the relay keeps no copy of it,
+    /// so whatever order trust changes land in, admission sees the final one.
+    trust: Arc<TrustAuthority>,
+    /// The lowering count the pending ops were admitted under. A lowering
+    /// since (even one raised again) cancels them all.
+    lowerings_seen: u64,
     sink: FileSink,
     pending: HashMap<String, Pending>,
 }
 
 impl FileRelay {
-    /// `full_control` is the daemon's trust snapshot; it is checked again on
-    /// every op.
-    pub fn new(runtime: Arc<FileRuntime>, full_control: bool, sink: FileSink) -> Self {
+    pub fn new(runtime: Arc<FileRuntime>, trust: Arc<TrustAuthority>, sink: FileSink) -> Self {
+        let lowerings_seen = trust.snapshot().lowerings;
         Self {
             runtime,
-            full_control,
+            trust,
+            lowerings_seen,
             sink,
             pending: HashMap::new(),
         }
     }
 
-    /// `wsmp trust full`: file ops are allowed again (roots still apply).
-    pub fn raise_trust(&mut self) {
-        self.full_control = true;
-    }
-
-    /// `trust.lower`: refuse every later op (`trust_relay`) and cancel the
-    /// pending ones.
-    pub fn lower_trust(&mut self) {
-        self.full_control = false;
-        self.cancel_all();
+    /// Trust changed: a lowering since the last look (`trust.lower`, `wsmp
+    /// trust relay`, a hot reload) cancels every pending op; later ops are
+    /// admitted by the trust at their own arrival. Also run before every op.
+    /// Returns the trust it read.
+    pub fn on_trust_changed(&mut self) -> TrustSnapshot {
+        let now = self.trust.snapshot();
+        if now.lowerings != self.lowerings_seen {
+            self.lowerings_seen = now.lowerings;
+            self.cancel_all();
+        }
+        now
     }
 
     pub fn pending_len(&self) -> usize {
@@ -510,6 +517,7 @@ impl FileRelay {
             tracing::warn!("dropping a file.op with an invalid opId");
             return Vec::new();
         }
+        let trust = self.on_trust_changed();
         if self.pending.contains_key(op_id) {
             tracing::warn!("dropping a file.op that reuses a pending opId");
             return Vec::new();
@@ -541,7 +549,7 @@ impl FileRelay {
         }
         let policy = self.runtime.policy();
         if let Err(reason) = admit(
-            self.full_control,
+            trust.full,
             policy.roots_configured(),
             policy.euid(),
             policy.allow_root(),
@@ -575,6 +583,8 @@ impl FileRelay {
 
     /// The single binary `file.body` frame of a write.
     pub fn handle_body(&mut self, op_id: &str, body: Vec<u8>) -> Vec<FileFrame> {
+        // A write admitted before a lowering was cancelled with it.
+        self.on_trust_changed();
         let Some(pending) = self.pending.get_mut(op_id) else {
             tracing::debug!("dropping a file.body for an unknown opId");
             return Vec::new();

@@ -1656,3 +1656,109 @@ fn the_next_version_adopts_instances_the_previous_one_started() {
     assert!(stopped.stopped);
     assert!(runtime.units.borrow().is_empty());
 }
+
+#[test]
+fn a_health_check_after_a_proven_stop_leaves_the_rank_stopped() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.clock = || 1_000;
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    assert!(
+        executor
+            .execute(job(JobPhase::Stop), &runtime, deadline())
+            .stopped
+    );
+    // Stray health checks (failureThreshold 2) find nothing serving: they answer so, but
+    // never turn the proven stop `Unhealthy`.
+    for index in 0..3 {
+        let mut health = job(JobPhase::Health);
+        health.step_id = format!("late-h{index}");
+        assert_eq!(
+            executor.execute(health, &runtime, deadline()).error,
+            Some(JobError::HealthFailed)
+        );
+    }
+    let record = &executor.state.records["in1:0"];
+    assert_eq!(record.phase, InstancePhase::Stopped);
+    assert_eq!(record.stopped_at, Some(1_000));
+    assert_eq!(record.consecutive_health_failures, 0);
+    assert_eq!(
+        executor.observations(&runtime, deadline())[0].1.phase,
+        InstancePhase::Stopped
+    );
+    // And it still expires like any verified stop.
+    executor.clock = || 1_000 + STOPPED_RETENTION_SECS;
+    assert!(executor.expired());
+}
+
+#[test]
+fn record_transitions_keep_the_phase_and_its_fields_together() {
+    let start = job(JobPhase::Start);
+    let mut record = Record::new(&start);
+    assert_eq!(record.phase, InstancePhase::Unknown);
+    record.mark_stopped(7);
+    assert_eq!(
+        (record.phase, record.stopped_at),
+        (InstancePhase::Stopped, Some(7))
+    );
+    // Leaving Stopped forgets when it stopped; a launch resets the health counters.
+    record.consecutive_health_failures = 4;
+    record.consecutive_health_successes = 2;
+    record.begin_step(&start);
+    assert_eq!(record.phase, InstancePhase::Starting);
+    assert_eq!(record.stopped_at, None);
+    assert_eq!(
+        record.pending.as_ref().map(|pending| pending.action),
+        Some(JobPhase::Start)
+    );
+    assert_eq!(
+        (
+            record.consecutive_health_failures,
+            record.consecutive_health_successes
+        ),
+        (0, 0)
+    );
+    // Health hysteresis: Unhealthy after two misses, Ready after one success.
+    record.health_result(false, 2, 1);
+    assert_eq!(record.phase, InstancePhase::Starting);
+    record.health_result(false, 2, 1);
+    assert_eq!(record.phase, InstancePhase::Unhealthy);
+    record.health_result(true, 2, 1);
+    assert_eq!(record.phase, InstancePhase::Ready);
+    assert_eq!(record.consecutive_health_failures, 0);
+    // A pending stop is Stopping; a read-only check leaves the phase alone.
+    record.begin_step(&job(JobPhase::Health));
+    assert_eq!(record.phase, InstancePhase::Ready);
+    record.begin_step(&job(JobPhase::Stop));
+    assert_eq!(record.phase, InstancePhase::Stopping);
+    record.mark_stopped(9);
+    // An operator step that never ran is undone exactly, stop time included.
+    let mark = OperatorMark {
+        created: false,
+        phase: record.phase,
+        stopped_at: record.stopped_at,
+        pending: record.pending.clone(),
+        job: record.job.clone(),
+        outside_units: record.outside_units,
+    };
+    record.begin_operator_step(&start);
+    assert_eq!(
+        (record.phase, record.stopped_at),
+        (InstancePhase::Starting, None)
+    );
+    record.restore(mark);
+    assert_eq!(
+        (record.phase, record.stopped_at),
+        (InstancePhase::Stopped, Some(9))
+    );
+    // One that ran is unresolved.
+    record.begin_operator_step(&job(JobPhase::Stop));
+    assert_eq!(record.phase, InstancePhase::Stopping);
+    record.abandon_ran(None);
+    assert_eq!(
+        (record.phase, record.stopped_at, record.pending.is_none()),
+        (InstancePhase::Unknown, None, true)
+    );
+}

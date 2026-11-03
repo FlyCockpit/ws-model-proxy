@@ -66,6 +66,8 @@
   },
   "exitedWithCode": "The shell ended with exit code {{code}}.",
   "exitedPlain": "The shell ended.",
+  "exitedGone": "The terminal is no longer running on the node. It ended, or the node restarted, while this page was away.",
+  "inputDropped": "Some input was not delivered because it was sent too fast.",
   "approvalNeeded": "Approve this terminal on the node: {{command}}",
   "detach": "Stop viewing",
   "closeTab": "Close tab",
@@ -91,7 +93,8 @@
     "ticket_invalid": "This terminal link expired or was already used. Open the terminal again.",
     "bad_handshake": "The secure handshake with the node failed.",
     "other": "The terminal was refused ({{reason}}).",
-    "step_detached": "This terminal was disconnected. Open it again from Steps waiting for you."
+    "step_detached": "This terminal was disconnected. Open it again from Steps waiting for you.",
+    "browser_identity_unavailable": "This browser's terminal identity could not be loaded, and this node requires it. Reload the page to try again."
   },
   "steps": {
     "title": "Steps waiting for you",

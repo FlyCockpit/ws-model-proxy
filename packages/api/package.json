@@ -62,6 +62,15 @@
     "./lib/instance-run": {
       "default": "./src/lib/instance-run.ts"
     },
+    "./lib/instance-phase": {
+      "default": "./src/lib/instance-phase.ts"
+    },
+    "./lib/operator-need": {
+      "default": "./src/lib/operator-need.ts"
+    },
+    "./lib/node-liveness": {
+      "default": "./src/lib/node-liveness.ts"
+    },
     "./lib/node-definitions": {
       "default": "./src/lib/node-definitions.ts"
     },

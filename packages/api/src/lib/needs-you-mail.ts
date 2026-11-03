@@ -23,6 +23,7 @@
 import { DEFAULT_LOCALE, isSupportedLocale } from "@ws-model-proxy/config/locales";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";
+import { userAccessActiveWhere } from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
 import {
   isEmailConfigured,
@@ -78,13 +79,17 @@ export function resetNeedsYouMailLimiter(): void {
   sentAt.clear();
 }
 
-/** Who may get the mail: alerts on, a proved mailbox, not banned, not being deleted. */
-const recipientWhere = {
-  operationalAlerts: true,
-  emailVerified: true,
-  deletionRequestedAt: null,
-  OR: [{ banned: null }, { banned: false }],
-} satisfies Prisma.UserWhereInput;
+/**
+ * Who may get the mail at `now`: alerts on, a proved mailbox, and account access active (not
+ * being deleted, no active ban; an expired temporary ban no longer suppresses the mail).
+ */
+function recipientWhere(now: Date) {
+  return {
+    operationalAlerts: true,
+    emailVerified: true,
+    ...userAccessActiveWhere(now),
+  } satisfies Prisma.UserWhereInput;
+}
 
 type Recipient = { email: string; locale: string };
 
@@ -137,10 +142,11 @@ export async function notifyQueuedCommand(args: {
   now?: Date;
 }): Promise<boolean> {
   if (!isEmailConfigured()) return false;
-  const nowMs = (args.now ?? new Date()).getTime();
+  const now = args.now ?? new Date();
+  const nowMs = now.getTime();
   try {
     const user = await prisma.user.findFirst({
-      where: { id: args.userId, ...recipientWhere },
+      where: { id: args.userId, ...recipientWhere(now) },
       select: { email: true, locale: true },
     });
     if (!user) return false;
@@ -180,7 +186,7 @@ export async function sweepNeedsYouMail(now: Date = new Date()): Promise<number>
         { needsOperatorNotifiedAt: { lt: prisma.runtimeInstance.fields.needsOperatorSince } },
       ],
       ...(limited.length > 0 ? { userId: { notIn: limited } } : {}),
-      Runtime: { User: recipientWhere },
+      Runtime: { User: recipientWhere(now) },
     },
     orderBy: { needsOperatorSince: "asc" },
     take: SWEEP_BATCH,

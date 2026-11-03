@@ -8,9 +8,10 @@ import {
   NODE_LIVE_NOTICE_MS,
   NODE_LIVE_STABLE_MS,
   NODE_LIVE_WATCHDOG_MS,
-  nodeLiveReconnectDelayMs,
+  type NodeLiveEventKind,
   parseNodeLiveEvent,
 } from "@/lib/node-live-updates";
+import { INITIAL_RECONNECT_BACKOFF, planReconnect } from "@/lib/reconnect-backoff";
 import { createSseParser } from "@/lib/sse-parse";
 import { useNodeLive } from "@/stores/node-live";
 
@@ -40,96 +41,124 @@ export function useNodeLiveUpdates(sessionKey: string | null): void {
   // react-doctor-disable-next-line react-doctor/no-fetch-in-effect -- a streaming subscription, not a fetch for data; see above
   useEffect(() => {
     if (!sessionKey || typeof window === "undefined" || typeof fetch !== "function") {
-      useNodeLive.getState().set({ status: "off" });
+      useNodeLive.getState().dispatch("off");
       return undefined;
     }
     return openNodeEventStream(queryClient);
   }, [sessionKey, queryClient]);
 }
 
+/**
+ * The stream's own lifecycle (what it is doing, as opposed to the status pages see):
+ * - `idle`: not started yet.
+ * - `streaming`: an attempt owns `controller`, from the fetch through the read loop. Its
+ *   `watchdog` ends it after {@link NODE_LIVE_WATCHDOG_MS} of silence.
+ * - `waiting`: the reconnect `timer` is armed.
+ * - `stopped`: unauthorized; final until the session changes (a new stream).
+ * - `disposed`: closed by the cleanup.
+ */
+type StreamPhase =
+  | { kind: "idle" }
+  | {
+      kind: "streaming";
+      controller: AbortController;
+      watchdog: ReturnType<typeof setTimeout> | undefined;
+    }
+  | { kind: "waiting"; timer: ReturnType<typeof setTimeout> }
+  | { kind: "stopped" }
+  | { kind: "disposed" };
+
 /** Opens the stream and keeps it open (reconnecting) until the returned function ends it. */
 function openNodeEventStream(queryClient: QueryClient): () => void {
-  let disposed = false;
-  let stopped = false;
-  let attempt = 0;
-  let controller: AbortController | null = null;
-  let retryTimer: ReturnType<typeof setTimeout> | undefined;
-  let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
+  let phase: StreamPhase = { kind: "idle" };
+  let backoff = INITIAL_RECONNECT_BACKOFF;
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // Re-read through a function: `phase` changes across awaits, and TypeScript would otherwise
+  // keep a narrowing from before one.
+  const currentPhase = (): StreamPhase => phase;
 
   const refreshSoon = () => {
     if (flushTimer !== undefined) return;
     flushTimer = setTimeout(() => {
       flushTimer = undefined;
-      if (!disposed) void invalidateNodeLiveQueries(queryClient);
+      if (currentPhase().kind !== "disposed") void invalidateNodeLiveQueries(queryClient);
     }, NODE_LIVE_COALESCE_MS);
   };
 
-  const markLive = () => {
-    clearTimeout(noticeTimer);
-    noticeTimer = undefined;
-    useNodeLive.getState().set({ status: "live" });
-  };
-
-  const markDown = () => {
-    const { notice } = useNodeLive.getState();
-    useNodeLive.getState().set({ status: "down", notice });
-    if (notice || noticeTimer !== undefined) return;
-    noticeTimer = setTimeout(() => {
+  /** Reports to the store; arms the notice on entering `down`, clears it on leaving. */
+  const report = (event: NodeLiveEventKind) => {
+    const store = useNodeLive.getState();
+    const wasDown = store.status === "down";
+    store.dispatch(event);
+    const isDown = useNodeLive.getState().status === "down";
+    if (isDown && !wasDown) {
+      clearTimeout(noticeTimer);
+      noticeTimer = setTimeout(() => {
+        noticeTimer = undefined;
+        useNodeLive.getState().dispatch("noticeDue");
+      }, NODE_LIVE_NOTICE_MS);
+    } else if (!isDown) {
+      clearTimeout(noticeTimer);
       noticeTimer = undefined;
-      if (!disposed && useNodeLive.getState().status === "down")
-        useNodeLive.getState().set({ status: "down", notice: true });
-    }, NODE_LIVE_NOTICE_MS);
+    }
   };
 
   const stop = () => {
-    stopped = true;
-    clearTimeout(noticeTimer);
-    noticeTimer = undefined;
-    useNodeLive.getState().set({ status: "unauthorized" });
+    const current = currentPhase();
+    if (current.kind === "streaming") clearTimeout(current.watchdog);
+    phase = { kind: "stopped" };
+    report("unauthorized");
   };
 
-  const armWatchdog = (current: AbortController) => {
-    clearTimeout(watchdogTimer);
-    watchdogTimer = setTimeout(() => current.abort(), NODE_LIVE_WATCHDOG_MS);
+  const armWatchdog = (streaming: Extract<StreamPhase, { kind: "streaming" }>) => {
+    clearTimeout(streaming.watchdog);
+    streaming.watchdog = setTimeout(() => streaming.controller.abort(), NODE_LIVE_WATCHDOG_MS);
   };
 
+  /** Starts an attempt, from `idle` or `waiting` only (one stream at a time). */
   const connect = async () => {
-    clearTimeout(retryTimer);
-    retryTimer = undefined;
-    if (disposed || stopped || controller) return;
-    const current = new AbortController();
-    controller = current;
-    if (useNodeLive.getState().status !== "down")
-      useNodeLive.getState().set({ status: "connecting" });
+    const before = currentPhase();
+    if (before.kind === "waiting") clearTimeout(before.timer);
+    else if (before.kind !== "idle") return;
+    const streaming: Extract<StreamPhase, { kind: "streaming" }> = {
+      kind: "streaming",
+      controller: new AbortController(),
+      watchdog: undefined,
+    };
+    phase = streaming;
+    const owns = () => currentPhase() === streaming;
+    report("connecting");
     let openedAt: number | null = null;
     // Also bounds a response whose headers never arrive (a buffering proxy).
-    armWatchdog(current);
+    armWatchdog(streaming);
     try {
       const response = await fetch(NODE_EVENTS_PATH, {
         credentials: "same-origin",
         cache: "no-store",
         headers: { Accept: "text/event-stream" },
-        signal: current.signal,
+        signal: streaming.controller.signal,
       });
       if (response.status === 401 || response.status === 403) {
         await response.body?.cancel().catch(() => undefined);
-        stop();
+        if (owns()) stop();
         return;
       }
       if (!response.ok || !response.body) {
         await response.body?.cancel().catch(() => undefined);
         return;
       }
+      if (!owns()) return;
       openedAt = performance.now();
-      markLive();
+      report("opened");
       refreshSoon();
-      armWatchdog(current);
+      armWatchdog(streaming);
       const parser = createSseParser((event) => {
+        if (!owns()) return;
         if (event.event === "unauthorized") {
           stop();
-          current.abort();
+          streaming.controller.abort();
         } else if (event.event === "node" && parseNodeLiveEvent(event.data)) {
           refreshSoon();
         }
@@ -139,26 +168,31 @@ function openNodeEventStream(queryClient: QueryClient): () => void {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        armWatchdog(current);
+        if (owns()) armWatchdog(streaming);
         parser.push(decoder.decode(value, { stream: true }));
       }
     } catch {
       // A network error, the watchdog or the cleanup (an abort): the finally decides.
     } finally {
-      clearTimeout(watchdogTimer);
-      if (controller === current) controller = null;
-      if (!disposed && !stopped) {
-        markDown();
-        if (openedAt !== null && performance.now() - openedAt >= NODE_LIVE_STABLE_MS) attempt = 0;
-        retryTimer = setTimeout(() => void connect(), nodeLiveReconnectDelayMs(attempt));
-        attempt += 1;
+      clearTimeout(streaming.watchdog);
+      // Only an attempt that still owns the stream schedules the next: after a stop or the
+      // cleanup the phase has moved on.
+      if (owns()) {
+        report("failed");
+        const plan = planReconnect(
+          backoff,
+          openedAt === null ? null : performance.now() - openedAt,
+          NODE_LIVE_STABLE_MS,
+        );
+        backoff = plan.backoff;
+        phase = { kind: "waiting", timer: setTimeout(() => void connect(), plan.delayMs) };
       }
     }
   };
 
   // Back online, or back to the tab: no need to wait out the backoff.
   const reconnectNow = () => {
-    if (disposed || stopped || controller) return;
+    if (currentPhase().kind !== "waiting") return;
     if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
     void connect();
   };
@@ -170,15 +204,17 @@ function openNodeEventStream(queryClient: QueryClient): () => void {
 
   void connect();
   return () => {
-    disposed = true;
-    clearTimeout(retryTimer);
-    clearTimeout(watchdogTimer);
+    const last = currentPhase();
+    phase = { kind: "disposed" };
+    if (last.kind === "waiting") clearTimeout(last.timer);
+    if (last.kind === "streaming") {
+      clearTimeout(last.watchdog);
+      last.controller.abort();
+    }
     clearTimeout(flushTimer);
     clearTimeout(noticeTimer);
     window.removeEventListener("online", reconnectNow);
     document.removeEventListener("visibilitychange", onVisibility);
-    controller?.abort();
-    controller = null;
-    useNodeLive.getState().set({ status: "off" });
+    useNodeLive.getState().dispatch("off");
   };
 }

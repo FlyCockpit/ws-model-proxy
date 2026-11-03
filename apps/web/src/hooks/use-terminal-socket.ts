@@ -5,6 +5,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useLatestRef } from "@/hooks/use-latest-ref";
+import { INITIAL_RECONNECT_BACKOFF, planReconnect } from "@/lib/reconnect-backoff";
 import {
   decodeSealedFrame,
   parseTerminalServerMessage,
@@ -189,17 +190,49 @@ function closeOutbox(outbox: Outbox | null) {
   clearOutbox(outbox);
 }
 
-function reconnectDelayMs(attempt: number): number {
-  return Math.min(15_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
-}
-
 /**
  * A socket that stayed open this long resets the reconnect backoff when it
- * closes. Opening alone does not: a relay that accepts and then closes at
- * once (a refused admission, a close right after a reconnect burst) would
- * otherwise be retried every half second forever.
+ * closes (see `lib/reconnect-backoff.ts`): one the relay closes right after
+ * accepting it keeps backing off.
  */
 const RECONNECT_STABLE_MS = TERMINAL_BROWSER_JSON_WINDOW_MS;
+
+/**
+ * The socket's lifecycle inside the hook. `status` is derived from it
+ * (`terminalSocketStatus`); `send` and `sendFrame` only use an `open` one.
+ * - `idle`: disabled, or cleaned up.
+ * - `connecting`: `socket` is opening; `outbox` is its (still unused) queue.
+ * - `open`: `socket` is open since `openedAt` (monotonic) and drains `outbox`.
+ * - `waiting`: the socket closed; the reconnect `timer` is armed.
+ * - `unauthorized`: closed with 4401. Final: no reconnect.
+ */
+type TerminalConnection =
+  | { kind: "idle" }
+  | { kind: "connecting"; socket: WebSocket; outbox: Outbox }
+  | { kind: "open"; socket: WebSocket; outbox: Outbox; openedAt: number }
+  | { kind: "waiting"; timer: number }
+  | { kind: "unauthorized" };
+
+/** The status a connection shows; null keeps the previous one (`idle`). */
+function terminalSocketStatus(connection: TerminalConnection): TerminalSocketStatus | null {
+  switch (connection.kind) {
+    case "idle":
+      return null;
+    case "connecting":
+      return "connecting";
+    case "open":
+      return "open";
+    case "waiting":
+      return "closed";
+    case "unauthorized":
+      return "unauthorized";
+  }
+}
+
+/** The socket a connection owns, if any: its events count only while it does. */
+function connectionSocket(connection: TerminalConnection): WebSocket | null {
+  return connection.kind === "connecting" || connection.kind === "open" ? connection.socket : null;
+}
 
 export function useTerminalSocket(
   enabled: boolean,
@@ -219,54 +252,49 @@ export function useTerminalSocket(
   sendFrame: (frame: ArrayBuffer) => boolean;
 } {
   const handlersRef = useLatestRef(handlers);
-  const socketRef = useRef<WebSocket | null>(null);
-  const outboxRef = useRef<Outbox | null>(null);
+  const connectionRef = useRef<TerminalConnection>({ kind: "idle" });
   const [status, setStatus] = useState<TerminalSocketStatus>("closed");
 
   const send = useCallback((message: TerminalClientMessage): TerminalSendResult => {
-    const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return "closed";
-    const outbox = outboxRef.current;
-    if (!outbox || outbox.socket !== socket) return "closed";
-    return enqueue(outbox, JSON.stringify(message), isIntent(message));
+    const connection = connectionRef.current;
+    if (connection.kind !== "open") return "closed";
+    // A socket that is closing (its close event not yet here) drops the frame:
+    // the drain sees it and empties the queue, and that reports `closed`.
+    return enqueue(connection.outbox, JSON.stringify(message), isIntent(message));
   }, []);
 
   const sendFrame = useCallback((frame: ArrayBuffer) => {
-    const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    const connection = connectionRef.current;
+    if (connection.kind !== "open" || connection.socket.readyState !== WebSocket.OPEN) return false;
     // Sealed frames have their own per-terminal budget on the relay.
-    socket.send(frame);
+    connection.socket.send(frame);
     return true;
   }, []);
 
   useEffect(() => {
     if (!enabled || typeof window === "undefined") return;
-    let disposed = false;
-    let attempt = 0;
-    let timer = 0;
-    let socket: WebSocket | null = null;
+    let backoff = INITIAL_RECONNECT_BACKOFF;
+
+    const moveTo = (next: TerminalConnection) => {
+      connectionRef.current = next;
+      const nextStatus = terminalSocketStatus(next);
+      if (nextStatus !== null) setStatus(nextStatus);
+    };
 
     const connect = () => {
-      if (disposed) return;
-      setStatus("connecting");
-      // The effect cleanup closes the current socket (`socket`) and clears
-      // the reconnect timer.
       const ws = openTerminalSocket();
-      socket = ws;
-      socketRef.current = ws;
-      closeOutbox(outboxRef.current);
       const outbox = newOutbox(ws);
-      outboxRef.current = outbox;
-      let openedAt: number | null = null;
+      moveTo({ kind: "connecting", socket: ws, outbox });
+      const owns = () => connectionSocket(connectionRef.current) === ws;
       ws.onopen = () => {
-        if (disposed || socket !== ws) return;
-        openedAt = performance.now();
-        setStatus("open");
+        const connection = connectionRef.current;
+        if (connection.kind !== "connecting" || connection.socket !== ws) return;
+        moveTo({ kind: "open", socket: ws, outbox, openedAt: performance.now() });
         handlersRef.current.onOpen?.();
         enqueue(outbox, JSON.stringify({ type: "list" }), false);
       };
       ws.onmessage = (event) => {
-        if (disposed || socket !== ws) return;
+        if (!owns()) return;
         if (typeof event.data === "string") {
           try {
             const message = parseTerminalServerMessage(JSON.parse(event.data));
@@ -286,31 +314,36 @@ export function useTerminalSocket(
       };
       ws.onclose = (event) => {
         closeOutbox(outbox);
-        if (socketRef.current === ws) socketRef.current = null;
-        if (disposed) return;
+        const connection = connectionRef.current;
+        // The cleanup (or a newer socket) took over: nothing to report.
+        if (connectionSocket(connection) !== ws) return;
         if (event.code === TERMINAL_UNAUTHORIZED_CLOSE_CODE) {
           // Retrying cannot succeed with this session; stop here.
-          setStatus("unauthorized");
+          moveTo({ kind: "unauthorized" });
           handlersRef.current.onDisconnect?.();
           return;
         }
-        setStatus("closed");
+        const plan = planReconnect(
+          backoff,
+          connection.kind === "open" ? performance.now() - connection.openedAt : null,
+          RECONNECT_STABLE_MS,
+        );
+        backoff = plan.backoff;
+        moveTo({ kind: "waiting", timer: window.setTimeout(connect, plan.delayMs) });
         handlersRef.current.onDisconnect?.();
-        if (openedAt !== null && performance.now() - openedAt >= RECONNECT_STABLE_MS) attempt = 0;
-        timer = window.setTimeout(connect, reconnectDelayMs(attempt));
-        attempt += 1;
       };
     };
 
     connect();
     return () => {
-      disposed = true;
-      window.clearTimeout(timer);
-      socketRef.current = null;
-      closeOutbox(outboxRef.current);
-      outboxRef.current = null;
-      // Closing the page detaches. Do not send close for each terminal.
-      socket?.close();
+      const connection = connectionRef.current;
+      connectionRef.current = { kind: "idle" };
+      if (connection.kind === "waiting") window.clearTimeout(connection.timer);
+      if (connection.kind === "connecting" || connection.kind === "open") {
+        closeOutbox(connection.outbox);
+        // Closing the page detaches. Do not send close for each terminal.
+        connection.socket.close();
+      }
     };
   }, [enabled, handlersRef]);
 

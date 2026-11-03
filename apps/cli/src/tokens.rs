@@ -37,31 +37,51 @@ pub fn standardized_completion_metrics(completion_text: Option<&str>) -> Option<
 #[derive(Debug, Default)]
 pub struct CompletionTextCollector {
     line_buf: Vec<u8>,
-    completion: String,
-    raw_json: Vec<u8>,
-    saw_sse_data: bool,
-    line_overflow: bool,
-    exceeded_limit: bool,
+    mode: CollectorMode,
+}
+
+/// What the collector has learnt about the response so far.
+#[derive(Debug)]
+enum CollectorMode {
+    /// No SSE `data:` line yet: the body is kept whole (up to the cap) in
+    /// case it is one plain JSON completion. `raw_json` is `None` once the
+    /// body outgrew the cap: it can then only still be SSE.
+    Detecting { raw_json: Option<Vec<u8>> },
+    /// An SSE stream: the completion text gathered from its `data:` lines.
+    Sse { completion: String },
+    /// A bounded limit was exceeded: no estimate, and nothing more is parsed.
+    Exceeded,
+}
+
+impl Default for CollectorMode {
+    fn default() -> Self {
+        Self::Detecting {
+            raw_json: Some(Vec::new()),
+        }
+    }
 }
 
 impl CompletionTextCollector {
     pub fn feed(&mut self, chunk: &[u8]) {
-        if !self.saw_sse_data && !self.exceeded_limit {
-            self.push_raw_json(chunk);
+        if let CollectorMode::Detecting { raw_json } = &mut self.mode {
+            // Too big to be one plain JSON completion; an SSE stream may
+            // still follow in the same bytes.
+            if let Some(raw) = raw_json {
+                if chunk.len() > COMPLETION_TEXT_MAX_BYTES.saturating_sub(raw.len()) {
+                    *raw_json = None;
+                } else {
+                    raw.extend_from_slice(chunk);
+                }
+            }
         }
 
         for byte in chunk.iter().copied() {
-            if self.line_overflow {
-                if byte == b'\n' {
-                    self.line_overflow = false;
-                }
-                continue;
+            if matches!(self.mode, CollectorMode::Exceeded) {
+                return;
             }
             if self.line_buf.len() == COMPLETION_TEXT_MAX_BYTES {
-                self.line_buf.clear();
-                self.exceeded_limit = true;
-                self.line_overflow = byte != b'\n';
-                continue;
+                self.exceed();
+                return;
             }
             self.line_buf.push(byte);
             if byte == b'\n' {
@@ -74,26 +94,20 @@ impl CompletionTextCollector {
     /// Returns `None` when the response exceeded a bounded collector limit or
     /// was not a parseable OpenAI-compatible completion.
     pub fn finish(mut self) -> Option<String> {
-        if !self.line_buf.is_empty() && !self.line_overflow {
+        if !self.line_buf.is_empty() && !matches!(self.mode, CollectorMode::Exceeded) {
             let line = std::mem::take(&mut self.line_buf);
             self.consume_line(&line);
         }
-        if self.exceeded_limit {
-            return None;
+        match self.mode {
+            CollectorMode::Detecting { raw_json } => completion_text_from_json_bytes(&raw_json?),
+            CollectorMode::Sse { completion } => Some(completion),
+            CollectorMode::Exceeded => None,
         }
-        if self.completion.is_empty() && !self.saw_sse_data {
-            return completion_text_from_json_bytes(&self.raw_json);
-        }
-        Some(self.completion)
     }
 
-    fn push_raw_json(&mut self, chunk: &[u8]) {
-        let remaining = COMPLETION_TEXT_MAX_BYTES.saturating_sub(self.raw_json.len());
-        if chunk.len() > remaining {
-            self.exceeded_limit = true;
-            return;
-        }
-        self.raw_json.extend_from_slice(chunk);
+    fn exceed(&mut self) {
+        self.line_buf = Vec::new();
+        self.mode = CollectorMode::Exceeded;
     }
 
     fn consume_line(&mut self, line: &[u8]) {
@@ -106,9 +120,10 @@ impl CompletionTextCollector {
         if data.is_empty() || data == b"[DONE]" {
             return;
         }
-        if !self.saw_sse_data {
-            self.saw_sse_data = true;
-            self.raw_json.clear();
+        if matches!(self.mode, CollectorMode::Detecting { .. }) {
+            self.mode = CollectorMode::Sse {
+                completion: String::new(),
+            };
         }
         if let Some(piece) = completion_text_from_json_bytes(data) {
             self.push_completion(&piece);
@@ -116,12 +131,14 @@ impl CompletionTextCollector {
     }
 
     fn push_completion(&mut self, piece: &str) {
-        if piece.len() > COMPLETION_TEXT_MAX_BYTES.saturating_sub(self.completion.len()) {
-            self.completion.clear();
-            self.exceeded_limit = true;
+        let CollectorMode::Sse { completion } = &mut self.mode else {
+            return;
+        };
+        if piece.len() > COMPLETION_TEXT_MAX_BYTES.saturating_sub(completion.len()) {
+            self.exceed();
             return;
         }
-        self.completion.push_str(piece);
+        completion.push_str(piece);
     }
 }
 
@@ -223,6 +240,49 @@ mod tests {
             "x".repeat(COMPLETION_TEXT_MAX_BYTES + 1)
         );
         collector.feed(response.as_bytes());
+        assert_eq!(collector.finish(), None);
+    }
+
+    /// One large HTTP chunk of an ordinary SSE stream (many small events,
+    /// together over the cap) still yields its estimate: only a plain JSON
+    /// body has to fit the cap whole.
+    #[test]
+    fn a_first_chunk_over_the_cap_of_a_valid_sse_stream_still_counts() {
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"ab\"}}]}\n\n";
+        let events = COMPLETION_TEXT_MAX_BYTES / event.len() + 2;
+        let body = event.repeat(events);
+        assert!(body.len() > COMPLETION_TEXT_MAX_BYTES);
+        let mut collector = CompletionTextCollector::default();
+        collector.feed(body.as_bytes());
+        assert_eq!(collector.finish().map(|text| text.len()), Some(events * 2));
+    }
+
+    #[test]
+    fn a_plain_json_body_over_the_cap_has_no_estimate() {
+        let body = format!(
+            "{{\"choices\":[{{\"message\":{{\"content\":\"{}\"}}}}]}}",
+            "x".repeat(COMPLETION_TEXT_MAX_BYTES)
+        );
+        let mut collector = CompletionTextCollector::default();
+        collector.feed(body.as_bytes());
+        assert_eq!(collector.finish(), None);
+        let mut small = CompletionTextCollector::default();
+        small.feed(br#"{"choices":[{"message":{"content":"hi"}}]}"#);
+        assert_eq!(small.finish().as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn nothing_is_parsed_once_the_limit_is_exceeded() {
+        let mut collector = CompletionTextCollector::default();
+        let huge = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+            "x".repeat(COMPLETION_TEXT_MAX_BYTES / 2 + 1)
+        );
+        collector.feed(huge.as_bytes());
+        collector.feed(huge.as_bytes());
+        assert!(matches!(collector.mode, CollectorMode::Exceeded));
+        collector.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n");
+        assert!(collector.line_buf.is_empty());
         assert_eq!(collector.finish(), None);
     }
 

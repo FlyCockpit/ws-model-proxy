@@ -11,14 +11,11 @@ import {
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { toast } from "@ws-model-proxy/ui/lib/toast";
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
 import { useTotpEnrollment } from "@/hooks/use-totp-enrollment";
-import { authClient } from "@/lib/auth-client";
 import { decideProtectedRouteAccess } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
 import { orpc } from "@/utils/orpc";
@@ -90,37 +87,18 @@ function isForbidden(error: unknown): boolean {
 }
 
 function TwoFactorSetupRequired() {
-  const [step, setStep] = useState<"intro" | "setup" | "verify">("intro");
-  const [verifyCode, setVerifyCode] = useState("");
-  const [isVerifying, setIsVerifying] = useState(false);
   const { t } = useTranslation("auth");
-
-  const { password, setPassword, totpURI, backupCodes, isLoading, enable } = useTotpEnrollment({
-    couldNotStartSetupMessage: t("twoFactor.couldNotStartSetup"),
-    logLabel: "_auth.twoFactor.enable",
-    onEnabled: () => setStep("verify"),
+  const enrollment = useTotpEnrollment({
+    messages: {
+      couldNotStartSetup: t("twoFactor.couldNotStartSetup"),
+      invalidCode: t("errors.invalidTotp"),
+      enabled: t("twoFactor.enabledSuccess"),
+    },
+    logPrefix: "_auth.twoFactor",
+    confirmBackupCodes: false,
+    onVerified: () => window.location.reload(),
   });
-
-  const handleVerify = async () => {
-    setIsVerifying(true);
-    try {
-      const result = await authClient.twoFactor.verifyTotp({
-        code: verifyCode,
-      });
-      if (result.error) {
-        console.error("[_auth.twoFactor.verifyTotp]", result.error);
-        toast.error(t("errors.invalidTotp"));
-        return;
-      }
-      toast.success(t("twoFactor.enabledSuccess"));
-      window.location.reload();
-    } catch (err) {
-      console.error("[_auth.twoFactor.verifyTotp]", err);
-      toast.error(t("errors.invalidTotp"));
-    } finally {
-      setIsVerifying(false);
-    }
-  };
+  const { state } = enrollment;
 
   return (
     <div className="flex min-h-[80vh] items-center justify-center px-4">
@@ -130,16 +108,16 @@ function TwoFactorSetupRequired() {
           <CardDescription>{t("twoFactor.requiredDescription")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {step === "intro" && (
+          {state.kind === "idle" && (
             <>
               <p className="text-sm text-muted-foreground">{t("twoFactor.introText")}</p>
-              <Button className="min-h-[44px] w-full" onClick={() => setStep("setup")}>
+              <Button className="min-h-[44px] w-full" onClick={() => enrollment.start()}>
                 {t("twoFactor.setUp")}
               </Button>
             </>
           )}
 
-          {step === "setup" && (
+          {state.kind === "password" && (
             <>
               <p className="text-sm text-muted-foreground">{t("twoFactor.passwordPrompt")}</p>
               <div className="space-y-2">
@@ -148,31 +126,33 @@ function TwoFactorSetupRequired() {
                   id="2fa-password"
                   type="password"
                   autoComplete="current-password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  value={state.password}
+                  onChange={(e) => enrollment.setPassword(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") enable();
+                    if (e.key === "Enter") enrollment.enable();
                   }}
                 />
               </div>
               <Button
                 className="min-h-[44px] w-full"
-                onClick={enable}
-                disabled={!password || isLoading}
+                onClick={() => enrollment.enable()}
+                disabled={!state.password || state.activity.kind === "enabling"}
               >
-                {isLoading ? t("twoFactor.settingUp") : t("twoFactor.continue")}
+                {state.activity.kind === "enabling"
+                  ? t("twoFactor.settingUp")
+                  : t("twoFactor.continue")}
               </Button>
             </>
           )}
 
-          {step === "verify" && (
+          {state.kind === "verify" && (
             <>
               <TwoFactorSetupDetails
-                backupCodes={backupCodes}
+                backupCodes={state.backupCodes}
                 backupCodesLabel={t("twoFactor.backupCodesLabel")}
                 manualPrompt={t("twoFactor.addKeyToApp")}
                 qrPrompt={t("twoFactor.scanQrPrompt")}
-                totpURI={totpURI}
+                totpURI={state.totpURI}
               />
 
               <div className="space-y-2">
@@ -180,23 +160,25 @@ function TwoFactorSetupRequired() {
                 <Input
                   id="verify-code"
                   placeholder="000000"
-                  value={verifyCode}
-                  onChange={(e) => setVerifyCode(e.target.value)}
+                  value={state.code}
+                  onChange={(e) => enrollment.setCode(e.target.value)}
                   inputMode="numeric"
                   autoComplete="one-time-code"
                   maxLength={6}
                   className="text-center text-lg tracking-widest"
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && verifyCode.length === 6) handleVerify();
+                    if (e.key === "Enter") enrollment.verify();
                   }}
                 />
               </div>
               <Button
                 className="min-h-[44px] w-full"
-                onClick={handleVerify}
-                disabled={verifyCode.length !== 6 || isVerifying}
+                onClick={() => enrollment.verify()}
+                disabled={state.code.length !== 6 || state.activity.kind !== "idle"}
               >
-                {isVerifying ? t("twoFactor.verifying") : t("twoFactor.verifyAndEnable")}
+                {state.activity.kind !== "idle"
+                  ? t("twoFactor.verifying")
+                  : t("twoFactor.verifyAndEnable")}
               </Button>
             </>
           )}

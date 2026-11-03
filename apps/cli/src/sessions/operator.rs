@@ -13,7 +13,10 @@
 use std::path::Path;
 use std::sync::mpsc::SyncSender;
 
-use super::{FromWorker, OutboundFrame, TerminalRegistry, TerminalSession, valid_id};
+use super::{
+    Attachment, FromWorker, OutboundFrame, TerminalPhase, TerminalRegistry, TerminalSession,
+    valid_id,
+};
 use crate::protocol::frames::JobStatus;
 use crate::protocol::runtime_spec::CommandShell;
 use crate::protocol::{frames::JobError, operator_terminals_supported};
@@ -36,8 +39,6 @@ pub(super) struct OperatorState {
     #[cfg_attr(unix, allow(dead_code))]
     argv: Option<Vec<String>>,
     events: SyncSender<OperatorEvent>,
-    /// A person accepted and the command's PTY was spawned.
-    running: bool,
 }
 
 impl OperatorState {
@@ -69,43 +70,120 @@ impl OperatorState {
 /// while it is pending or after it ended changes nothing.
 #[derive(Default)]
 pub(crate) struct OperatorBook {
-    /// Terminal id → (step id, cancelled before it opened).
-    pending: std::collections::BTreeMap<String, (String, bool)>,
-    used: std::collections::HashSet<String>,
-    used_order: std::collections::VecDeque<String>,
+    ids: std::collections::HashMap<String, OperatorSlot>,
+    /// Ids in the order they were taken, for forgetting the oldest used ones.
+    order: std::collections::VecDeque<String>,
 }
 
-/// Ids remembered as used (oldest forgotten first; the server never
-/// re-sends one that old).
+/// What this session did with one operator terminal id.
+///
+/// ```text
+/// (new) --reserve--> Reserved --stop, newer dispatch, close, trust lowered--> Cancelled
+/// Reserved | Cancelled --opened, or its runner thread let go--> Used
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OperatorSlot {
+    /// A runner thread has it and may open it.
+    Reserved { step_id: String },
+    /// A runner thread still has it, but it never opens (it answers `operator_closed`).
+    Cancelled { step_id: String },
+    /// It opened or was let go: never again in this session.
+    Used,
+}
+
+impl OperatorSlot {
+    fn pending_step(&self) -> Option<&str> {
+        match self {
+            Self::Reserved { step_id } | Self::Cancelled { step_id } => Some(step_id),
+            Self::Used => None,
+        }
+    }
+}
+
+/// Used ids remembered (oldest forgotten first; the server never
+/// re-sends one that old). Pending ids are never forgotten.
 const USED_IDS_MAX: usize = 4096;
 
 impl OperatorBook {
     fn take(&mut self, terminal_id: &str, step_id: &str) {
-        self.pending
-            .insert(terminal_id.to_string(), (step_id.to_string(), false));
-        if self.used.insert(terminal_id.to_string()) {
-            self.used_order.push_back(terminal_id.to_string());
-            while self.used_order.len() > USED_IDS_MAX {
-                if let Some(old) = self.used_order.pop_front() {
-                    self.used.remove(&old);
+        let slot = OperatorSlot::Reserved {
+            step_id: step_id.to_string(),
+        };
+        if self.ids.insert(terminal_id.to_string(), slot).is_none() {
+            self.order.push_back(terminal_id.to_string());
+            self.forget_oldest();
+        }
+    }
+
+    /// Keep at most [`USED_IDS_MAX`] ids: drop the oldest used ones; an id still pending
+    /// moves to the back.
+    fn forget_oldest(&mut self) {
+        let mut budget = self.order.len();
+        while self.order.len() > USED_IDS_MAX && budget > 0 {
+            budget -= 1;
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            match self.ids.get(&old) {
+                Some(OperatorSlot::Used) => {
+                    self.ids.remove(&old);
                 }
+                Some(_) => self.order.push_back(old),
+                None => {}
             }
         }
     }
 
+    /// Reserved ids not cancelled.
     fn live(&self) -> usize {
-        self.pending
+        self.ids
             .values()
-            .filter(|(_, cancelled)| !cancelled)
+            .filter(|slot| matches!(slot, OperatorSlot::Reserved { .. }))
             .count()
     }
 
+    /// Cancel every pending id `select(terminal_id, step_id)` picks.
     fn cancel_where(&mut self, select: impl Fn(&str, &str) -> bool) {
-        for (terminal_id, (step_id, cancelled)) in &mut self.pending {
-            if select(terminal_id, step_id) {
-                *cancelled = true;
+        for (terminal_id, slot) in &mut self.ids {
+            if let OperatorSlot::Reserved { step_id } = slot
+                && select(terminal_id, step_id)
+            {
+                *slot = OperatorSlot::Cancelled {
+                    step_id: std::mem::take(step_id),
+                };
             }
         }
+    }
+
+    /// Cancel `terminal_id` if it is pending. `false`: it is not.
+    fn cancel(&mut self, terminal_id: &str) -> bool {
+        let Some(slot) = self.ids.get_mut(terminal_id) else {
+            return false;
+        };
+        match slot {
+            OperatorSlot::Reserved { step_id } => {
+                *slot = OperatorSlot::Cancelled {
+                    step_id: std::mem::take(step_id),
+                };
+                true
+            }
+            OperatorSlot::Cancelled { .. } => true,
+            OperatorSlot::Used => false,
+        }
+    }
+
+    /// A pending id ends (it opens now, or its runner thread let go): it is used from now
+    /// on. What it was: `Some(Reserved | Cancelled)`, or `None` when it was not pending.
+    fn settle(&mut self, terminal_id: &str) -> Option<OperatorSlot> {
+        let slot = self.ids.get_mut(terminal_id)?;
+        if *slot == OperatorSlot::Used {
+            return None;
+        }
+        Some(std::mem::replace(slot, OperatorSlot::Used))
+    }
+
+    fn slot(&self, terminal_id: &str) -> Option<&OperatorSlot> {
+        self.ids.get(terminal_id)
     }
 }
 
@@ -135,11 +213,16 @@ fn chunks(bytes: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ {
 impl TerminalSession {
     /// An operator terminal still on its confirm screen.
     pub(super) fn confirming(&self) -> bool {
-        self.operator.as_ref().is_some_and(|state| !state.running)
+        matches!(self.phase, TerminalPhase::Confirming)
+    }
+
+    /// Its step, while it is still on its confirm screen.
+    fn confirming_state(&self) -> Option<&OperatorState> {
+        self.operator.as_ref().filter(|_| self.confirming())
     }
 
     fn screen_bytes(&self) -> Option<Vec<u8>> {
-        let state = self.operator.as_ref().filter(|state| !state.running)?;
+        let state = self.confirming_state()?;
         Some(op::paint(&state.screen, self.pty_size.0, self.pty_size.1))
     }
 
@@ -183,10 +266,10 @@ impl TerminalRegistry {
     pub(crate) fn operator_status(&self, step_id: &str, terminal_id: &str) -> Option<JobStatus> {
         let session = self.sessions.get(terminal_id)?;
         let state = session.operator.as_ref()?;
-        (state.ids.step_id == step_id).then_some(if state.running {
-            JobStatus::OperatorRunning
-        } else {
+        (state.ids.step_id == step_id).then_some(if session.confirming() {
             JobStatus::AwaitingOperator
+        } else {
+            JobStatus::OperatorRunning
         })
     }
 
@@ -206,10 +289,12 @@ impl TerminalRegistry {
         if self.sessions.contains_key(terminal_id) {
             return OperatorDelivery::Clash;
         }
-        match self.operators.pending.get(terminal_id) {
-            Some((pending_step, _)) if pending_step == step_id => OperatorDelivery::Repeat(None),
-            Some(_) => OperatorDelivery::Clash,
-            None if self.operators.used.contains(terminal_id) => OperatorDelivery::Repeat(None),
+        match self.operators.slot(terminal_id) {
+            Some(slot) => match slot.pending_step() {
+                Some(pending_step) if pending_step != step_id => OperatorDelivery::Clash,
+                // Still pending for this step, or it already ended and answered.
+                _ => OperatorDelivery::Repeat(None),
+            },
             None => OperatorDelivery::New,
         }
     }
@@ -233,7 +318,7 @@ impl TerminalRegistry {
         self.operators.cancel_where(|pending_id, pending_step| {
             pending_step == step_id && pending_id != terminal_id
         });
-        if self.shut_down
+        if self.lifecycle.is_shut_down()
             || !operator_terminals_supported()
             || self.operator_count() + self.operators.live() >= MAX_OPERATOR_TERMINALS
         {
@@ -245,22 +330,20 @@ impl TerminalRegistry {
 
     /// The step's runner thread is done with `terminal_id` (or never got it).
     pub(crate) fn release_operator(&mut self, terminal_id: &str) {
-        self.operators.pending.remove(terminal_id);
+        self.operators.settle(terminal_id);
     }
 
     /// A server `term.close`. A terminal still pending never opens; one on
     /// its confirm screen closes; a person's run already under way (Enter
     /// raced the close) is left alone and answers when it ends.
     pub(crate) fn close_from_server(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
-        if let Some((_, cancelled)) = self.operators.pending.get_mut(terminal_id) {
-            *cancelled = true;
+        if self.operators.cancel(terminal_id) {
             return Vec::new();
         }
         if self
             .sessions
             .get(terminal_id)
-            .and_then(|session| session.operator.as_ref())
-            .is_some_and(|state| state.running)
+            .is_some_and(|session| session.operator.is_some() && !session.confirming())
         {
             tracing::info!(terminal_id, "kept a running operator command on a close");
             return Vec::new();
@@ -274,12 +357,11 @@ impl TerminalRegistry {
     /// hears `Closed`.
     pub(crate) fn open_operator(&mut self, open: OperatorOpen) -> Vec<OutboundFrame> {
         let terminal_id = open.ids.terminal_id.clone();
-        let reserved = self
-            .operators
-            .pending
-            .remove(&terminal_id)
-            .is_some_and(|(step_id, cancelled)| step_id == open.ids.step_id && !cancelled);
-        if !reserved || self.sessions.contains_key(&terminal_id) || self.shut_down {
+        let reserved = matches!(
+            self.operators.settle(&terminal_id),
+            Some(OperatorSlot::Reserved { step_id }) if step_id == open.ids.step_id
+        );
+        if !reserved || self.sessions.contains_key(&terminal_id) || self.lifecycle.is_shut_down() {
             tracing::info!(
                 step_id = open.ids.step_id,
                 "an operator terminal was cancelled before it opened"
@@ -316,10 +398,13 @@ impl TerminalRegistry {
                 images: self.image_worker.session(None),
                 writer: None,
                 pty_size: (80, 24),
-                out: Some(out),
-                detached_at: None,
+                out,
+                // Nobody views it until a person attaches (it never idles out).
+                attachment: Attachment::Detached {
+                    since: std::time::Instant::now(),
+                },
                 scrollback: std::collections::VecDeque::new(),
-                pty: None,
+                phase: TerminalPhase::Confirming,
                 operator: Some(OperatorState {
                     ids: open.ids,
                     screen: open.screen,
@@ -327,7 +412,6 @@ impl TerminalRegistry {
                     shell: open.shell,
                     argv: open.argv,
                     events: open.events,
-                    running: false,
                 }),
             },
         );
@@ -340,12 +424,7 @@ impl TerminalRegistry {
         let ids = self
             .sessions
             .iter()
-            .filter(|(_, session)| {
-                session
-                    .operator
-                    .as_ref()
-                    .is_some_and(|state| !state.running && select(state))
-            })
+            .filter(|(_, session)| session.confirming_state().is_some_and(&select))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         ids.iter().flat_map(|id| self.close(id)).collect()
@@ -436,7 +515,7 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get(terminal_id) else {
             return Vec::new();
         };
-        let Some(state) = session.operator.as_ref().filter(|state| !state.running) else {
+        let Some(state) = session.confirming_state() else {
             return Vec::new();
         };
         let (cols, rows) = session.pty_size;
@@ -455,17 +534,16 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Vec::new();
         };
-        let Some(state) = session.operator.as_mut() else {
+        let Some(state) = session.operator.as_ref() else {
             return Vec::new();
         };
-        state.running = true;
         let _ = state.events.try_send(OperatorEvent::Accepted);
         let running = state.ids.result(JobStatus::OperatorRunning, None);
         tracing::info!(
             step_id = state.ids.step_id,
             "a person started an operator command"
         );
-        session.pty = Some(pty);
+        session.phase = TerminalPhase::Running(pty);
         // The command's output starts on a clean screen.
         let clear = b"\x1b[H\x1b[2J";
         super::push_scrollback(&mut session.scrollback, clear);
@@ -540,5 +618,72 @@ fn spawn_operator(
             tx,
             terminal_id,
         ),
+    }
+}
+
+#[cfg(test)]
+mod book_tests {
+    use super::{OperatorBook, OperatorSlot, USED_IDS_MAX};
+
+    fn reserved(step_id: &str) -> OperatorSlot {
+        OperatorSlot::Reserved {
+            step_id: step_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_id_moves_reserved_cancelled_used_and_never_back() {
+        let mut book = OperatorBook::default();
+        book.take("t1", "s1");
+        book.take("t2", "s2");
+        assert_eq!(book.slot("t1"), Some(&reserved("s1")));
+        assert_eq!(book.live(), 2);
+        book.cancel_where(|_, step_id| step_id == "s1");
+        assert_eq!(
+            book.slot("t1"),
+            Some(&OperatorSlot::Cancelled {
+                step_id: "s1".into()
+            })
+        );
+        assert_eq!(book.live(), 1, "a cancelled id holds no slot");
+        assert!(book.cancel("t1"), "still pending (cancelled)");
+        assert!(book.cancel("t2"));
+        assert_eq!(book.live(), 0);
+        assert!(!book.cancel("unknown"));
+        // Opening (or letting go of) a pending id uses it up.
+        assert_eq!(
+            book.settle("t2"),
+            Some(OperatorSlot::Cancelled {
+                step_id: "s2".into()
+            })
+        );
+        assert_eq!(book.slot("t2"), Some(&OperatorSlot::Used));
+        assert_eq!(book.settle("t2"), None, "an id settles once");
+        assert!(!book.cancel("t2"), "a used id is not pending");
+        assert_eq!(book.settle("unknown"), None);
+        assert_eq!(book.slot("unknown"), None, "settling never invents an id");
+    }
+
+    #[test]
+    fn only_used_ids_are_forgotten() {
+        let mut book = OperatorBook::default();
+        book.take("pending", "s");
+        for index in 0..USED_IDS_MAX + 10 {
+            let id = format!("t{index}");
+            book.take(&id, "s");
+            book.settle(&id);
+        }
+        assert_eq!(book.ids.len(), USED_IDS_MAX);
+        assert_eq!(book.order.len(), USED_IDS_MAX);
+        assert_eq!(
+            book.slot("pending"),
+            Some(&reserved("s")),
+            "pending is kept"
+        );
+        assert_eq!(book.slot("t0"), None, "the oldest used id is forgotten");
+        assert_eq!(
+            book.slot(&format!("t{}", USED_IDS_MAX + 9)),
+            Some(&OperatorSlot::Used)
+        );
     }
 }

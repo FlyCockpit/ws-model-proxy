@@ -24,37 +24,46 @@ import { MCP_REAUTH_STATUS_QUERY_KEY } from "@/lib/mcp-oauth-search";
  * - The tombstone-probe query cache is INVALIDATED on successful sign-out
  *   (prefix key), so the next session can never reuse this session's cached
  *   reauth/continue decision.
- * - Single-flight: an in-flight `settled` ref guards re-entry — invoking the
+ * - Single-flight: the status is one `idle | signing | failed | done` union,
+ *   mirrored in a ref so re-entry is refused synchronously — invoking the
  *   callback twice before settlement performs exactly one sign-out call.
+ *   `failed` and `done` are not terminal: a later call is a new flight.
  */
+export type McpReauthSignOutStatus = "idle" | "signing" | "failed" | "done";
+
 export function useMcpReauthSignOut() {
-  const [isSigningOut, setIsSigningOut] = useState(false);
-  const [signOutFailed, setSignOutFailed] = useState(false);
-  const settled = useRef(false);
+  const [status, setStatusState] = useState<McpReauthSignOutStatus>("idle");
+  const statusRef = useRef<McpReauthSignOutStatus>("idle");
   const queryClient = useQueryClient();
 
+  const setStatus = useCallback((next: McpReauthSignOutStatus) => {
+    statusRef.current = next;
+    setStatusState(next);
+  }, []);
+
   const signOutForReauth = useCallback(async () => {
-    if (settled.current) return;
-    settled.current = true;
-    setIsSigningOut(true);
-    setSignOutFailed(false);
+    if (statusRef.current === "signing") return;
+    setStatus("signing");
     try {
       const result = await authClient.signOut({ disableRedirect: true });
       if (result.error) {
         // A failed sign-out leaves the session (and this card) in place; the
         // user can retry. Resolved { error } responses are surfaced to the UI
         // as a localized failure state (R83/R84 F4).
-        setSignOutFailed(true);
+        setStatus("failed");
         return;
       }
       await queryClient.invalidateQueries({ queryKey: [MCP_REAUTH_STATUS_QUERY_KEY] });
+      setStatus("done");
     } catch {
-      setSignOutFailed(true);
-    } finally {
-      setIsSigningOut(false);
-      settled.current = false;
+      setStatus("failed");
     }
-  }, [queryClient]);
+  }, [queryClient, setStatus]);
 
-  return { signOutForReauth, isSigningOut, signOutFailed };
+  return {
+    signOutForReauth,
+    status,
+    isSigningOut: status === "signing",
+    signOutFailed: status === "failed",
+  };
 }

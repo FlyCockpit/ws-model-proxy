@@ -66,6 +66,8 @@
   },
   "exitedWithCode": "La shell terminó con el código de salida {{code}}.",
   "exitedPlain": "La shell terminó.",
+  "exitedGone": "La terminal ya no se ejecuta en el nodo. Terminó, o el nodo se reinició, mientras esta página no estaba conectada.",
+  "inputDropped": "Parte de lo que escribiste no se entregó porque se envió demasiado rápido.",
   "approvalNeeded": "Aprueba esta terminal en el nodo: {{command}}",
   "detach": "Dejar de ver",
   "closeTab": "Cerrar pestaña",
@@ -91,7 +93,8 @@
     "ticket_invalid": "Este enlace de terminal venció o ya se usó. Vuelve a abrir la terminal.",
     "bad_handshake": "Falló el intercambio seguro con el nodo.",
     "other": "La terminal fue rechazada ({{reason}}).",
-    "step_detached": "Esta terminal se desconectó. Ábrela de nuevo desde Pasos que te esperan."
+    "step_detached": "Esta terminal se desconectó. Ábrela de nuevo desde Pasos que te esperan.",
+    "browser_identity_unavailable": "No se pudo cargar la identidad de terminal de este navegador, y este nodo la requiere. Recarga la página para intentarlo de nuevo."
   },
   "steps": {
     "title": "Pasos que te esperan",

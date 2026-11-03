@@ -19,6 +19,7 @@ import { NativeSelect } from "@/components/native-select";
 import { SegmentedControl } from "@/components/segmented-control";
 import { ChatMarkdown } from "@/components/test/chat-markdown";
 import { TestErrorNotice } from "@/components/test/test-error";
+import { useAttachmentQueue } from "@/hooks/use-attachment-queue";
 import { type TestChatMessage, useTestChat } from "@/hooks/use-test-chat";
 import {
   acceptedAttachmentAcceptAttr,
@@ -72,9 +73,9 @@ export function ChatPanel({ target }: { target: TestTarget }) {
   const [reasoning, setReasoning] = useState<ChatTestReasoningSelection>("unset");
   const [maxTokens, setMaxTokens] = useState(DEFAULT_MAX_TOKENS);
   const [system, setSystem] = useState("");
-  const [attachments, setAttachments] = useState<TestAttachment[]>([]);
+  const queue = useAttachmentQueue<TestAttachment>(MAX_ATTACHMENTS_PER_MESSAGE);
+  const attachments = queue.items;
   const [notice, setNotice] = useState<string | null>(null);
-  const [processing, setProcessing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const modalities = attachmentModalitiesFor(target, surface);
   const canAttach = modalities.image || modalities.audio || modalities.video;
@@ -89,6 +90,8 @@ export function ChatPanel({ target }: { target: TestTarget }) {
       onSubmit: z.object({ text: z.string().max(32_000, t("dashboard:test.chat.tooLong")) }),
     },
     onSubmit: async ({ value, formApi }) => {
+      // Files still being read are not part of this message yet (Enter submits even then).
+      if (queue.processing || chat.streaming) return;
       const text = value.text.trim();
       const sent = attachments.filter((attachment) => modalities[attachment.modality]);
       if (sent.length !== attachments.length) {
@@ -104,7 +107,7 @@ export function ChatPanel({ target }: { target: TestTarget }) {
         return;
       }
       setNotice(null);
-      setAttachments([]);
+      queue.clear();
       formApi.reset();
       await chat.send(
         { text, attachments: sent },
@@ -120,68 +123,68 @@ export function ChatPanel({ target }: { target: TestTarget }) {
     },
   });
 
-  const addFiles = async (files: File[]) => {
-    const room = MAX_ATTACHMENTS_PER_MESSAGE - attachments.length;
-    if (room <= 0) {
-      setNotice(t("dashboard:test.chat.attachments.max", { count: MAX_ATTACHMENTS_PER_MESSAGE }));
-      return;
-    }
-    setProcessing(true);
+  /** Reads up to `room` of `files` into attachments, with what went wrong as notice text. */
+  const readFiles = async (files: File[], room: number) => {
     const accepted: TestAttachment[] = [];
     const problems = new Set<string>();
-    try {
-      for (const file of files.slice(0, room)) {
-        const info = attachmentFileInfo(file);
-        if (!info || !modalities[info.modality]) {
-          problems.add(t("dashboard:test.chat.attachments.unsupported"));
-          continue;
-        }
-        if (info.modality === "image") {
-          const result = await processImageFile(file, { maxBytes: attachmentMax });
-          if (!result.ok) {
-            problems.add(
-              result.reason === "oversize"
-                ? t("dashboard:test.chat.attachments.tooLarge", {
-                    size: formatBytes(attachmentMax),
-                  })
-                : result.reason === "unsupported"
-                  ? t("dashboard:test.chat.attachments.unsupported")
-                  : t("dashboard:test.chat.attachments.unreadable", { name: file.name }),
-            );
-            continue;
-          }
-          accepted.push({
-            id: result.image.id,
-            name: file.name,
-            modality: "image",
-            dataUrl: result.image.dataUrl,
-            sizeBytes: result.image.byteSize,
-          });
-          continue;
-        }
-        if (file.size > attachmentMax) {
+    for (const file of files.slice(0, room)) {
+      const info = attachmentFileInfo(file);
+      if (!info || !modalities[info.modality]) {
+        problems.add(t("dashboard:test.chat.attachments.unsupported"));
+        continue;
+      }
+      if (info.modality === "image") {
+        const result = await processImageFile(file, { maxBytes: attachmentMax });
+        if (!result.ok) {
           problems.add(
-            t("dashboard:test.chat.attachments.tooLarge", { size: formatBytes(attachmentMax) }),
+            result.reason === "oversize"
+              ? t("dashboard:test.chat.attachments.tooLarge", {
+                  size: formatBytes(attachmentMax),
+                })
+              : result.reason === "unsupported"
+                ? t("dashboard:test.chat.attachments.unsupported")
+                : t("dashboard:test.chat.attachments.unreadable", { name: file.name }),
           );
           continue;
         }
         accepted.push({
-          id: crypto.randomUUID(),
+          id: result.image.id,
           name: file.name,
-          modality: info.modality,
-          dataUrl: await readFileAsDataUrl(file, info.mime),
-          sizeBytes: file.size,
+          modality: "image",
+          dataUrl: result.image.dataUrl,
+          sizeBytes: result.image.byteSize,
         });
+        continue;
       }
-      if (files.length > room) {
+      if (file.size > attachmentMax) {
         problems.add(
-          t("dashboard:test.chat.attachments.max", { count: MAX_ATTACHMENTS_PER_MESSAGE }),
+          t("dashboard:test.chat.attachments.tooLarge", { size: formatBytes(attachmentMax) }),
         );
+        continue;
       }
-    } finally {
-      setProcessing(false);
+      accepted.push({
+        id: crypto.randomUUID(),
+        name: file.name,
+        modality: info.modality,
+        dataUrl: await readFileAsDataUrl(file, info.mime),
+        sizeBytes: file.size,
+      });
     }
-    setAttachments((current) => [...current, ...accepted]);
+    return { accepted, result: { problems, skipped: files.length > room } };
+  };
+
+  const addFiles = async (files: File[]) => {
+    const maxText = t("dashboard:test.chat.attachments.max", {
+      count: MAX_ATTACHMENTS_PER_MESSAGE,
+    });
+    // Jobs run one at a time, each with the room the ones before it left.
+    const outcome = await queue.add((room) => readFiles(files, room));
+    if (outcome.kind === "full") {
+      setNotice(maxText);
+      return;
+    }
+    const problems = new Set(outcome.result.problems);
+    if (outcome.result.skipped || outcome.overflow) problems.add(maxText);
     setNotice(problems.size > 0 ? [...problems].join(" ") : null);
   };
 
@@ -197,7 +200,7 @@ export function ChatPanel({ target }: { target: TestTarget }) {
     void form.handleSubmit();
   };
 
-  const busy = chat.streaming || processing;
+  const busy = chat.streaming || queue.processing;
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
@@ -322,9 +325,7 @@ export function ChatPanel({ target }: { target: TestTarget }) {
                   aria-label={t("dashboard:test.chat.attachments.remove", {
                     name: attachment.name,
                   })}
-                  onClick={() =>
-                    setAttachments((current) => current.filter((item) => item.id !== attachment.id))
-                  }
+                  onClick={() => queue.remove((item) => item.id === attachment.id)}
                 >
                   <X aria-hidden="true" className="size-4" />
                 </Button>
@@ -375,7 +376,7 @@ export function ChatPanel({ target }: { target: TestTarget }) {
                 disabled={busy}
                 onClick={() => fileInputRef.current?.click()}
               >
-                {processing ? (
+                {queue.processing ? (
                   <Loader2 aria-hidden="true" className="size-4 animate-spin" />
                 ) : (
                   <ImagePlus aria-hidden="true" className="size-4" />

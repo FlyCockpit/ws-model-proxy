@@ -41,8 +41,8 @@ import {
 } from "@/lib/terminal-protocol";
 
 import {
+  BROWSER_IDENTITY_UNAVAILABLE,
   STEP_DETACHED,
-  TERMINAL_GONE,
   type TerminalOutputEvent,
   useTerminalSessions,
 } from "./use-terminal-sessions";
@@ -55,7 +55,7 @@ const socket = vi.hoisted(() => ({
 }));
 
 const identity = vi.hoisted(() => ({
-  ready: true,
+  status: "ready" as "loading" | "ready" | "failed",
   publicKey: () => null,
   sign: async () => null,
 }));
@@ -117,7 +117,7 @@ afterEach(() => {
   cleanup();
   currentCli = null;
   socket.handlers = null;
-  identity.ready = true;
+  identity.status = "ready";
   socket.send.mockReset();
   socket.send.mockImplementation(() => "sent");
   socket.sendFrame.mockReset();
@@ -402,7 +402,7 @@ async function setup(pinStore = createMemoryCliPinStore()) {
     terminals: [listedTerminal(true)],
   });
   const cli = await attachAsCli(VIEWER_ID);
-  await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+  await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
   const tab = view.result.current.tabs[0];
   if (!tab) throw new Error("no tab");
   const events: TerminalOutputEvent[] = [];
@@ -643,7 +643,7 @@ describe("useTerminalSessions (multi-viewer)", () => {
       terminals: [listedTerminal(true)],
     });
     const cli = await attachAsCli(VIEWER_ID);
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     const localId = view.result.current.tabs[0]?.localId ?? "";
     // Output buffered with no pane subscribed yet; then the shell exits.
     await unicast(cli, text("before exit"));
@@ -677,7 +677,7 @@ describe("useTerminalSessions (multi-viewer)", () => {
     message({ type: "detached", terminalId: TERMINAL_ID, reason: "slow" });
     await waitFor(() => expect(sentOfType("attach")).toHaveLength(2), { timeout: 3_000 });
     const next = await attachAsCli(VIEWER_ID, 1);
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     // The new attach's writer, with a measured box: only retirement can stop the old input.
     message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
     act(() => view.result.current.sendResize(localId, 100, 30));
@@ -881,11 +881,15 @@ describe("useTerminalSessions (multi-viewer)", () => {
     const { view } = await setupV2();
     expect(sentOfType("attach")).toHaveLength(1);
     message({ type: "detached", terminalId: TERMINAL_ID, reason: "slow" });
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", error: "slow" });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      status: expect.objectContaining({ phase: "opening", reopen: "slow" }),
+    });
     await waitFor(() => expect(sentOfType("attach")).toHaveLength(2), { timeout: 3_000 });
     await attachAsCli(VIEWER_ID, 1);
     await waitFor(() =>
-      expect(view.result.current.tabs[0]).toMatchObject({ phase: "live", error: null }),
+      expect(view.result.current.tabs[0]).toMatchObject({
+        status: { phase: "live", inputDropped: false },
+      }),
     );
   });
 
@@ -936,6 +940,19 @@ describe("useTerminalSessions End session until the relay confirms", () => {
     expect(view.result.current.tabs).toEqual([]);
   });
 
+  it("shows dropped input on the live tab", async () => {
+    const { view } = await setupV2();
+    message({
+      type: "error",
+      terminalId: TERMINAL_ID,
+      code: "input_dropped",
+      message: "",
+    });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      status: { phase: "live", inputDropped: true },
+    });
+  });
+
   it("attaches again when the relay refuses End session, so the running shell takes keys", async () => {
     const { view, localId } = await setupV2();
     act(() => view.result.current.endSession(localId));
@@ -951,7 +968,7 @@ describe("useTerminalSessions End session until the relay confirms", () => {
     // The ended attach stays ended; a fresh one takes its place.
     await waitFor(() => expect(sentOfType("attach")).toHaveLength(attaches + 1));
     const cli = await attachAsCli(VIEWER_ID, attaches);
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
     socket.sendFrame.mockClear();
     act(() => view.result.current.sendInput(localId, "ls\r"));
@@ -1143,8 +1160,7 @@ describe("useTerminalSessions End session until the relay confirms", () => {
     });
     await waitFor(() =>
       expect(view.result.current.tabs[0]).toMatchObject({
-        phase: "rejected",
-        rejectionReason: "identity_mismatch",
+        status: expect.objectContaining({ phase: "rejected", reason: "identity_mismatch" }),
       }),
     );
     expect(closes()).toHaveLength(1);
@@ -1193,7 +1209,11 @@ describe("useTerminalSessions open refused before the relay read it", () => {
       requestId: second?.requestId,
     });
     expect(view.result.current.tabs).toEqual([
-      expect.objectContaining({ localId: refused.localId, terminalId: null, phase: "opening" }),
+      expect.objectContaining({
+        localId: refused.localId,
+        terminalId: null,
+        status: expect.objectContaining({ phase: "opening" }),
+      }),
       expect.objectContaining({ localId: kept.localId, terminalId: TERMINAL_ID }),
     ]);
     // After a backoff, the refused tab sends its open again.
@@ -1212,8 +1232,7 @@ describe("useTerminalSessions open refused before the relay read it", () => {
     });
     expect(view.result.current.tabs[0]).toMatchObject({
       localId: refused.localId,
-      phase: "rejected",
-      rejectionReason: "invalid",
+      status: expect.objectContaining({ phase: "rejected", reason: "invalid" }),
     });
   });
 });
@@ -1234,7 +1253,10 @@ describe("useTerminalSessions frames a full socket queue refused", () => {
       [listed],
     );
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", terminalId: null });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      status: expect.objectContaining({ phase: "opening" }),
+      terminalId: null,
+    });
     refuse = false;
     await waitFor(() => expect(sentOfType("open")).toHaveLength(2), { timeout: 3000 });
     // The refused open is not waiting for an `opening`: the next one goes to the retry.
@@ -1264,7 +1286,9 @@ describe("useTerminalSessions frames a full socket queue refused", () => {
     await waitFor(() => expect(sentOfType("attach").length).toBe(attaches + 2), {
       timeout: 3000,
     });
-    expect(other.result.current.tabs[0]).toMatchObject({ phase: "opening" });
+    expect(other.result.current.tabs[0]).toMatchObject({
+      status: expect.objectContaining({ phase: "opening" }),
+    });
   });
 });
 
@@ -1311,7 +1335,10 @@ describe("useTerminalSessions open closed before its acknowledgement", () => {
     });
     await settle();
     expect(view.result.current.tabs).toEqual([
-      expect.objectContaining({ localId: kept.localId, phase: "opening" }),
+      expect.objectContaining({
+        localId: kept.localId,
+        status: expect.objectContaining({ phase: "opening" }),
+      }),
     ]);
     expect(sentOfType("close")).toHaveLength(1);
     expect(sentOfType("detach")).toEqual([]);
@@ -1338,12 +1365,12 @@ describe("useTerminalSessions shell exit", () => {
       handlers().onMessage({ type: "exit", terminalId: TERMINAL_ID, exitCode: 0, signal: null });
       handlers().onSealed(late);
     });
-    expect(view.result.current.tabs[0]?.phase).toBe("exited");
+    expect(view.result.current.tabs[0]?.status.phase).toBe("exited");
     // The queued epoch-2 frame opens once the key that follows it is read.
     await waitFor(() => expect(outputText(events)).toBe("hello abdce"));
     await settle();
     expect(outputText(events)).toBe("hello abdce");
-    expect(view.result.current.tabs[0]?.phase).toBe("exited");
+    expect(view.result.current.tabs[0]?.status.phase).toBe("exited");
     // The session is gone: input goes nowhere and later output is dropped.
     act(() => view.result.current.sendInput(localId, "x"));
     await unicast(cli, text("after"));
@@ -1364,7 +1391,7 @@ describe("useTerminalSessions shell exit", () => {
     );
     await waitFor(() => expect(outputText(events)).toBe("last words"));
     await settle();
-    expect(view.result.current.tabs[0]?.phase).toBe("exited");
+    expect(view.result.current.tabs[0]?.status.phase).toBe("exited");
   });
 });
 
@@ -1375,13 +1402,13 @@ describe("useTerminalSessions handshake after the tab ended", () => {
       handlers().onMessage({ type: "exit", terminalId: TERMINAL_ID, exitCode: 0, signal: null }),
     );
     await settle();
-    expect(view.result.current.tabs[0]?.phase).toBe("exited");
+    expect(view.result.current.tabs[0]?.status.phase).toBe("exited");
     const localId = view.result.current.tabs[0]?.localId ?? "";
     act(() => view.result.current.sendInput(localId, "x"));
     await unicast(cli, text("ghost"));
     await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
-    expect(view.result.current.tabs[0]?.phase).toBe("exited");
+    expect(view.result.current.tabs[0]?.status.phase).toBe("exited");
   });
 
   it("does not revive a tab refused during key derivation", async () => {
@@ -1396,8 +1423,7 @@ describe("useTerminalSessions handshake after the tab ended", () => {
     );
     await settle();
     expect(view.result.current.tabs[0]).toMatchObject({
-      phase: "rejected",
-      rejectionReason: "denied",
+      status: expect.objectContaining({ phase: "rejected", reason: "denied" }),
     });
     await unicast(cli, text("ghost"));
     await settle();
@@ -1425,7 +1451,9 @@ describe("useTerminalSessions handshake after the tab ended", () => {
       handlers().onMessage({ type: "detached", terminalId: TERMINAL_ID, reason: null }),
     );
     await settle();
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", error: "detached" });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      status: expect.objectContaining({ phase: "opening", reopen: "detached" }),
+    });
   });
 });
 
@@ -1457,8 +1485,7 @@ describe("useTerminalSessions CLI identity pinning", () => {
     });
     await waitFor(() =>
       expect(view.result.current.tabs[0]).toMatchObject({
-        phase: "rejected",
-        rejectionReason: "identity_changed",
+        status: expect.objectContaining({ phase: "rejected", reason: "identity_changed" }),
       }),
     );
     expect(sentOfType("attach")).toEqual([]);
@@ -1479,7 +1506,7 @@ describe("useTerminalSessions CLI identity pinning", () => {
     expect(pinStore.pins.get(CLI_ID)).toBe(currentCli.identityPublicKey);
     expect(view.result.current.cliTrust[CLI_ID]).toMatchObject({ status: "trusted" });
     await attachAsCli(VIEWER_ID);
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
   });
 
   it("pins nothing when the key changes again while the dialog is open", async () => {
@@ -1529,8 +1556,7 @@ describe("useTerminalSessions CLI identity pinning", () => {
       identityPublicKey: swapped.identityPublicKey,
     });
     expect(view.result.current.tabs[0]).toMatchObject({
-      phase: "rejected",
-      rejectionReason: "identity_changed",
+      status: expect.objectContaining({ phase: "rejected", reason: "identity_changed" }),
     });
     await settle();
     expect(sentOfType("attach")).toEqual([]);
@@ -1554,8 +1580,7 @@ describe("useTerminalSessions CLI identity pinning", () => {
     });
     await waitFor(() =>
       expect(view.result.current.tabs[0]).toMatchObject({
-        phase: "rejected",
-        rejectionReason: "identity_invalid",
+        status: expect.objectContaining({ phase: "rejected", reason: "identity_invalid" }),
       }),
     );
     expect(view.result.current.cliTrust[CLI_ID]).toEqual({ status: "invalid" });
@@ -1589,8 +1614,7 @@ describe("useTerminalSessions CLI identity pinning", () => {
     await attachAsCli(VIEWER_ID, 0, await generateEphemeralHandshake());
     await waitFor(() =>
       expect(view.result.current.tabs[0]).toMatchObject({
-        phase: "rejected",
-        rejectionReason: "identity_mismatch",
+        status: expect.objectContaining({ phase: "rejected", reason: "identity_mismatch" }),
       }),
     );
     expect(sentOfType("detach")).toEqual([{ type: "detach", terminalId: TERMINAL_ID }]);
@@ -1600,7 +1624,7 @@ describe("useTerminalSessions CLI identity pinning", () => {
 
 describe("useTerminalSessions browser identity readiness", () => {
   it("holds automatic attaches until the browser identity loads", async () => {
-    identity.ready = false;
+    identity.status = "loading";
     currentCli = await fakeCli();
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     message({
@@ -1614,12 +1638,14 @@ describe("useTerminalSessions browser identity readiness", () => {
     );
     await settle();
     expect(sentOfType("attach")).toEqual([]);
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", rejectionReason: null });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      status: { phase: "opening", approvalCode: null, reopen: null },
+    });
 
-    identity.ready = true;
+    identity.status = "ready";
     view.rerender();
     await attachAsCli(VIEWER_ID);
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     expect(sentOfType("attach")).toHaveLength(1);
   });
 
@@ -1645,16 +1671,46 @@ describe("useTerminalSessions browser identity readiness", () => {
       approvalCode: null,
     });
     expect(view.result.current.tabs[0]).toMatchObject({
-      phase: "rejected",
-      rejectionReason: "approval_required",
+      status: expect.objectContaining({ phase: "rejected", reason: "approval_required" }),
     });
     // The identity finishes loading.
-    identity.ready = false;
+    identity.status = "loading";
     view.rerender();
-    identity.ready = true;
+    identity.status = "ready";
     view.rerender();
     await attachAsCli(VIEWER_ID, 1);
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
+  });
+
+  it("refuses for a browser identity that failed to load, and never waits for it", async () => {
+    identity.status = "failed";
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    expect(view.result.current.identityStatus).toBe("failed");
+    message({
+      type: "terminals",
+      clis: [await listedCli(currentCli)],
+      terminals: [listedTerminal(true)],
+    });
+    // It will not load later: the attach goes out without it.
+    const first = await waitFor(() => {
+      const entry = sentOfType("attach")[0];
+      if (!entry) throw new Error("no attach");
+      return entry;
+    });
+    expect(first).not.toHaveProperty("identity");
+    message({
+      type: "rejected",
+      terminalId: TERMINAL_ID,
+      reason: "approval_required",
+      approvalCode: null,
+    });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      status: { phase: "rejected", reason: BROWSER_IDENTITY_UNAVAILABLE },
+    });
+    view.rerender();
+    await settle();
+    expect(sentOfType("attach")).toHaveLength(1);
   });
 
   it("does not retry other refusals when the identity loads", async () => {
@@ -1667,13 +1723,15 @@ describe("useTerminalSessions browser identity readiness", () => {
     });
     await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
     message({ type: "rejected", terminalId: TERMINAL_ID, reason: "denied", approvalCode: null });
-    identity.ready = false;
+    identity.status = "loading";
     view.rerender();
-    identity.ready = true;
+    identity.status = "ready";
     view.rerender();
     await settle();
     expect(sentOfType("attach")).toHaveLength(1);
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "rejected" });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      status: expect.objectContaining({ phase: "rejected" }),
+    });
   });
 });
 
@@ -1686,13 +1744,15 @@ describe("useTerminalSessions reconnection", () => {
     // The socket drops while the browser is still deriving the session keys.
     await attachAsCli(VIEWER_ID, 0, undefined, () => handlers().onDisconnect?.());
     await settle();
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening" });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      status: expect.objectContaining({ phase: "opening" }),
+    });
 
     // The next socket lists the terminal again, and the tab reattaches.
     act(() => handlers().onOpen?.());
     message({ type: "terminals", clis: [listed], terminals: [listedTerminal(true)] });
     await attachAsCli(VIEWER_ID, 1);
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
   });
 
   it("drops an identity check that finishes on an earlier socket", async () => {
@@ -1721,7 +1781,9 @@ describe("useTerminalSessions terminals gone while disconnected", () => {
     const { view, localId } = await setup();
     expect(sentOfType("attach")).toHaveLength(1);
     act(() => handlers().onDisconnect?.());
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening" });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      status: expect.objectContaining({ phase: "opening" }),
+    });
 
     act(() => handlers().onOpen?.());
     message({
@@ -1731,8 +1793,7 @@ describe("useTerminalSessions terminals gone while disconnected", () => {
     });
     expect(view.result.current.tabs[0]).toMatchObject({
       localId,
-      phase: "exited",
-      error: TERMINAL_GONE,
+      status: { phase: "exited", cause: "gone" },
     });
     await settle();
     expect(sentOfType("attach")).toHaveLength(1);
@@ -1751,9 +1812,11 @@ describe("useTerminalSessions terminals gone while disconnected", () => {
       clis: [await listedCli(requireCli())],
       terminals: [listedTerminal(true)],
     });
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", error: null });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      status: expect.objectContaining({ phase: "opening", reopen: null }),
+    });
     await attachAsCli(VIEWER_ID, 1);
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
   });
 
   it("does not end a terminal the relay named after the list was requested", async () => {
@@ -1776,8 +1839,7 @@ describe("useTerminalSessions terminals gone while disconnected", () => {
     message({ type: "terminals", clis: [listed], terminals: [] });
     expect(view.result.current.tabs[0]).toMatchObject({
       terminalId: TERMINAL_ID,
-      phase: "opening",
-      error: null,
+      status: expect.objectContaining({ phase: "opening", reopen: null }),
     });
   });
 });
@@ -1798,7 +1860,10 @@ describe("useTerminalSessions CLI list refresh", () => {
     message({ type: "terminals", clis: [await listedCli(currentCli)], terminals: [] });
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
     expect(view.result.current.tabs).toEqual([
-      expect.objectContaining({ cliDeviceId: CLI_ID, phase: "opening", rejectionReason: null }),
+      expect.objectContaining({
+        cliDeviceId: CLI_ID,
+        status: expect.objectContaining({ phase: "opening" }),
+      }),
     ]);
   });
 
@@ -1843,7 +1908,7 @@ describe("useTerminalSessions pushed lists", () => {
 
   it("ends a live tab a pushed snapshot no longer lists", async () => {
     const { view, localId } = await setup();
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     message({
       type: "terminals",
       pushed: true,
@@ -1852,8 +1917,7 @@ describe("useTerminalSessions pushed lists", () => {
     });
     expect(view.result.current.tabs[0]).toMatchObject({
       localId,
-      phase: "exited",
-      error: TERMINAL_GONE,
+      status: { phase: "exited", cause: "gone" },
     });
   });
 
@@ -1862,9 +1926,9 @@ describe("useTerminalSessions pushed lists", () => {
     const listed = await listedCli(currentCli);
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     message({ type: "terminals", clis: [listed], terminals: [listedTerminal(true)] });
-    expect(view.result.current.tabs[0]?.phase).toBe("opening");
+    expect(view.result.current.tabs[0]?.status.phase).toBe("opening");
     message({ type: "terminals", pushed: true, clis: [listed], terminals: [] });
-    expect(view.result.current.tabs[0]?.phase).toBe("opening");
+    expect(view.result.current.tabs[0]?.status.phase).toBe("opening");
   });
 });
 
@@ -1932,7 +1996,7 @@ describe("useTerminalSessions terminal tickets", () => {
   it("types the queued command once the shell shows output, without a newline, once", async () => {
     const view = await openWith("nvidia-smi -L");
     const cli = await openAsCli();
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     // Nothing is typed before the shell printed anything.
     await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
@@ -1946,7 +2010,7 @@ describe("useTerminalSessions terminal tickets", () => {
   it("waits for the shell's first output however long it takes, even when the tab is shown and measured", async () => {
     const view = await openWith("nvidia-smi -L");
     const cli = await openAsCli();
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     const localId = view.result.current.tabs[0]?.localId ?? "";
     // Showing and measuring the tab resumes a command already waiting for quiet, nothing more.
     act(() => view.result.current.sendResize(localId, 100, 30));
@@ -1963,7 +2027,7 @@ describe("useTerminalSessions terminal tickets", () => {
   it("neither types nor retries a pending command once the page unmounts", async () => {
     const view = await openWith("nvidia-smi -L");
     const cli = await openAsCli();
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     useFakeClock();
     await unicast(cli, text("$ "));
     await settle();
@@ -1979,7 +2043,7 @@ describe("useTerminalSessions terminal tickets", () => {
   it("holds the queued command while Select text is on and types it after", async () => {
     const view = await openWith("nvidia-smi -L");
     const cli = await openAsCli();
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     const localId = view.result.current.tabs[0]?.localId ?? "";
     act(() => view.result.current.setSelecting(localId));
     useFakeClock();
@@ -1996,7 +2060,7 @@ describe("useTerminalSessions terminal tickets", () => {
   it("keeps a follower's queued command until its tab is measured, then types it", async () => {
     const view = await openWith("nvidia-smi -L");
     const cli = await openAsCli();
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     const localId = view.result.current.tabs[0]?.localId ?? "";
     message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
     useFakeClock();
@@ -2017,7 +2081,7 @@ describe("useTerminalSessions terminal tickets", () => {
   it("keeps a typed command whose frame was being sealed when the session detached", async () => {
     const view = await openWith("nvidia-smi -L");
     const cli = await openAsCli();
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     const localId = view.result.current.tabs[0]?.localId ?? "";
     act(() => view.result.current.sendResize(localId, 100, 30));
     useFakeClock();
@@ -2050,7 +2114,7 @@ describe("useTerminalSessions terminal tickets", () => {
     vi.useRealTimers();
     await waitFor(() => expect(sentOfType("attach")).toHaveLength(1), { timeout: 3_000 });
     const next = await attachAsCli(VIEWER_ID, 0);
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     await unicast(next, text("$ "));
     await waitFor(
       async () =>
@@ -2074,7 +2138,7 @@ describe("useTerminalSessions terminal tickets", () => {
   it("types only once the shell's output has been quiet for a moment", async () => {
     const view = await openWith("nvidia-smi -L");
     const cli = await openAsCli();
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     useFakeClock();
     await unicast(cli, text("Welcome to desk-01\n"));
     await settle();
@@ -2096,7 +2160,7 @@ describe("useTerminalSessions terminal tickets", () => {
   ])("never types a command that holds %s", async (_label, command) => {
     const view = await openWith(command);
     const cli = await openAsCli();
-    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await waitFor(() => expect(view.result.current.tabs[0]?.status.phase).toBe("live"));
     useFakeClock();
     await unicast(cli, text("$ "));
     await settle();
@@ -2115,8 +2179,7 @@ describe("useTerminalSessions terminal tickets", () => {
       message: "",
     });
     expect(view.result.current.tabs[0]).toMatchObject({
-      phase: "rejected",
-      rejectionReason: "ticket_invalid",
+      status: expect.objectContaining({ phase: "rejected", reason: "ticket_invalid" }),
     });
     // A new socket restarts pending opens; this one has no ticket left to send.
     act(() => handlers().onOpen?.());
@@ -2157,7 +2220,7 @@ describe("useTerminalSessions operator-terminal tabs (runtimes.steps.attach)", (
       await refreshed;
     });
     expect(view.result.current.tabs).toHaveLength(1);
-    expect(view.result.current.tabs[0]?.phase).toBe("opening");
+    expect(view.result.current.tabs[0]?.status.phase).toBe("opening");
   });
 
   it("asks for a fresh attach from the step after a reconnect, never re-attaching by id", async () => {
@@ -2167,8 +2230,7 @@ describe("useTerminalSessions operator-terminal tabs (runtimes.steps.attach)", (
     message({ type: "terminals", clis: [listed], terminals: [] });
     await settle();
     expect(view.result.current.tabs[0]).toMatchObject({
-      phase: "rejected",
-      rejectionReason: STEP_DETACHED,
+      status: expect.objectContaining({ phase: "rejected", reason: STEP_DETACHED }),
     });
     expect(sentOfType("attach")).toEqual([]);
   });

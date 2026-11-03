@@ -1,3 +1,4 @@
+import { targetOpenCoolingDownWhere } from "@ws-model-proxy/api/lib/pool-routing";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import {
   acquireFences,
@@ -8,7 +9,10 @@ import {
   lockCrossCapacityAdmissionRequests,
 } from "@ws-model-proxy/db/capacity-lock-order";
 import { isDbShutdownFenceArmed, runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
-import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
+import {
+  userAccessBlockedWhere,
+  userCredentialAccessBlocked,
+} from "@ws-model-proxy/db/user-deletion-access";
 import {
   type AdmissionSnapshot,
   type GrantPlan,
@@ -849,12 +853,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
                 shareId: { not: null },
                 Share: {
                   is: {
-                    Grantee: {
-                      OR: [
-                        { deletionRequestedAt: { not: null } },
-                        { banned: true, OR: [{ banExpires: null }, { banExpires: { gt: now } }] },
-                      ],
-                    },
+                    // The grantee's account is blocked: pending deletion or an active ban.
+                    Grantee: userAccessBlockedWhere(now),
                   },
                 },
               },
@@ -874,11 +874,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     ).map((row) => row.executionTargetId);
     const unhealthyTargets = queuedTargetIds.length
       ? await tx.executionTarget.findMany({
-          where: {
-            id: { in: queuedTargetIds },
-            health: "UNHEALTHY",
-            nextRetryAt: { gt: now },
-          },
+          where: { id: { in: queuedTargetIds }, ...targetOpenCoolingDownWhere(now) },
           select: { id: true },
         })
       : [];

@@ -4,8 +4,9 @@ import { orpc } from "@/utils/orpc";
 
 /**
  * Pure parts of the node live updates (#255): the stream's path and timings, its event, the
- * queries an event refreshes, and the poll interval pages use while the stream is down. The
- * connection itself is `hooks/use-node-live-updates.ts`.
+ * queries an event refreshes, the stream's status machine, and the poll interval pages use
+ * while the stream is down. The connection itself is `hooks/use-node-live-updates.ts`; its
+ * reconnect backoff is the shared one in `lib/reconnect-backoff.ts`.
  */
 
 export const NODE_EVENTS_PATH = "/api/dashboard/events";
@@ -18,11 +19,6 @@ export const NODE_LIVE_WATCHDOG_MS = 65_000;
 export const NODE_LIVE_STABLE_MS = 30_000;
 /** Down this long before pages say so (a deploy or a brief network drop says nothing). */
 export const NODE_LIVE_NOTICE_MS = 10_000;
-
-/** The terminal socket's backoff: 0.5 s doubling to 15 s, plus up to 250 ms of jitter. */
-export function nodeLiveReconnectDelayMs(attempt: number, random: () => number = Math.random) {
-  return Math.min(15_000, 500 * 2 ** attempt) + Math.floor(random() * 250);
-}
 
 export type NodeLiveEvent = { type: string; nodeId: string };
 
@@ -65,7 +61,67 @@ export function invalidateNodeLiveQueries(queryClient: QueryClient): Promise<voi
   ).then(() => undefined);
 }
 
-export type NodeLiveStatus = "off" | "connecting" | "live" | "down" | "unauthorized";
+/**
+ * The stream's status as pages see it. Every state carries `notice` so a page can select it
+ * alone, but only `down` can have it set: the other states fix it to false.
+ *
+ * - `off`: no stream (signed out, or no `fetch`).
+ * - `connecting`: the first attempt (or one after being live) is in flight.
+ * - `live`: the stream is open.
+ * - `down`: it ended or was refused, and a reconnect is waiting or in flight. `notice`: it has
+ *   been down for {@link NODE_LIVE_NOTICE_MS}, so pages say so.
+ * - `unauthorized`: final until the session changes (the hook then starts again from `off`).
+ */
+export type NodeLiveState =
+  | { status: "off"; notice: false }
+  | { status: "connecting"; notice: false }
+  | { status: "live"; notice: false }
+  | { status: "down"; notice: boolean }
+  | { status: "unauthorized"; notice: false };
+
+export type NodeLiveStatus = NodeLiveState["status"];
+
+/**
+ * What the stream reports. `connecting`: an attempt starts. `opened`: the response is a
+ * stream. `failed`: an attempt or an open stream ended. `noticeDue`: down for
+ * `NODE_LIVE_NOTICE_MS`. `unauthorized`: a 401/403 or an `unauthorized` event. `off`: the
+ * stream was closed (sign-out, unmount).
+ */
+export type NodeLiveEventKind =
+  | "connecting"
+  | "opened"
+  | "failed"
+  | "noticeDue"
+  | "unauthorized"
+  | "off";
+
+export const NODE_LIVE_OFF: NodeLiveState = { status: "off", notice: false };
+
+/**
+ * The status machine. Rules a page relies on:
+ * - A reconnect attempt while down stays `down` (with its notice): pages keep polling and the
+ *   notice does not flicker on every retry.
+ * - `unauthorized` is final: only `off` (the session changed) leaves it.
+ * - `off` only leaves through `connecting`: a late report from a closed stream changes nothing.
+ * - `noticeDue` only sets the notice while still down.
+ */
+export function nodeLiveTransition(state: NodeLiveState, event: NodeLiveEventKind): NodeLiveState {
+  if (event === "off") return NODE_LIVE_OFF;
+  if (state.status === "unauthorized") return state;
+  if (state.status === "off" && event !== "connecting") return state;
+  switch (event) {
+    case "connecting":
+      return state.status === "down" ? state : { status: "connecting", notice: false };
+    case "opened":
+      return { status: "live", notice: false };
+    case "failed":
+      return state.status === "down" ? state : { status: "down", notice: false };
+    case "noticeDue":
+      return state.status === "down" ? { status: "down", notice: true } : state;
+    case "unauthorized":
+      return { status: "unauthorized", notice: false };
+  }
+}
 
 /**
  * A page's poll interval: `whenLive` while the stream is open (false: no poll, the push

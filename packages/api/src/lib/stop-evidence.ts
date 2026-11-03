@@ -1,6 +1,7 @@
 import type { Prisma } from "@ws-model-proxy/db";
 import type { z } from "zod";
 import type { instanceRankViewSchema } from "../contracts/runtimes";
+import { nodeLiveness } from "./node-liveness";
 
 /**
  * What wsmp knows about a stop it could not confirm, for the person deciding whether to mark the
@@ -11,16 +12,14 @@ type RankView = z.infer<typeof instanceRankViewSchema>;
 export type StopCheck = NonNullable<RankView["lastStopCheck"]>;
 export type NodeConnectionView = RankView["nodeConnection"];
 
-/** A node session heartbeats at least this often; older means it is gone (as the lifecycle). */
-const HEARTBEAT_STALE_MS = 3 * 60_000;
-
 export function stopCheckKey(instanceId: string, rank: number): string {
   return `${instanceId}:${rank}`;
 }
 
 /**
- * A node's connection as the lifecycle judges it: an ONLINE row whose heartbeat went stale is
- * offline since that heartbeat (a server that stopped abruptly never wrote the disconnect).
+ * A node's connection as the lifecycle judges it (`nodeLiveness`): an ONLINE row whose heartbeat
+ * went stale is offline since that heartbeat (a server that stopped abruptly never wrote the
+ * disconnect).
  */
 export function nodeConnectionView(
   node: {
@@ -32,11 +31,10 @@ export function nodeConnectionView(
   now: Date = new Date(),
 ): NodeConnectionView {
   if (!node) return null;
-  if (node.connection === "OFFLINE")
-    return { state: "OFFLINE", since: node.lastDisconnectedAt?.toISOString() ?? null };
-  if (node.lastHeartbeatAt && node.lastHeartbeatAt.getTime() < now.getTime() - HEARTBEAT_STALE_MS)
-    return { state: "OFFLINE", since: node.lastHeartbeatAt.toISOString() };
-  return { state: "ONLINE", since: node.lastConnectedAt?.toISOString() ?? null };
+  const liveness = nodeLiveness(node, now);
+  if (liveness.state === "online")
+    return { state: "ONLINE", since: node.lastConnectedAt?.toISOString() ?? null };
+  return { state: "OFFLINE", since: liveness.since?.toISOString() ?? null };
 }
 
 type StepReader = { instanceStep: { findFirst: Prisma.InstanceStepDelegate["findFirst"] } };

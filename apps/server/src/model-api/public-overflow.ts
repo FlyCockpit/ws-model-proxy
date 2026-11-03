@@ -44,6 +44,11 @@ import { capacityLeaseLostSignal } from "./capacity/lease-loss.js";
 import { estimatePayloadTokens } from "./capacity/payload-estimate.js";
 import { type ExternalEgressConsent, isIssuedExternalConsent } from "./external-route.js";
 import {
+  abortedAttemptFactsFor,
+  deriveHeldStreamSettlement,
+  type HeldStreamPhase,
+} from "./held-stream-settlement.js";
+import {
   applyOpenRouterDataCollection,
   mapOpenRouterDataPolicyRefusal,
   type OpenRouterDataCollectionPolicy,
@@ -1501,9 +1506,7 @@ function replaceModel(body: Uint8Array, model: string): Uint8Array {
  * counts against provider health (callers skip health on any abort).
  */
 function abortedAttemptFacts(signal: AbortSignal) {
-  return capacityLeaseLostSignal(signal)
-    ? ({ reason: "CAPACITY_LEASE_LOST", terminalState: "FAILED", budgetReason: "FAILED" } as const)
-    : ({ reason: "CANCELLED", terminalState: "CANCELLED", budgetReason: "CANCELLED" } as const);
+  return abortedAttemptFactsFor(capacityLeaseLostSignal(signal));
 }
 
 function usageInteger(value: unknown): bigint | undefined {
@@ -3707,7 +3710,11 @@ export async function dispatchPublicOverflow(
         resolveTerminal = resolve;
       });
       const httpOk = status >= 200 && status < 400;
-      let clientCancelled = false;
+      // Control flow of the held body. Read through `heldPhase()` after any await: a client
+      // cancel can move it to `client_cancelled` while a pull is suspended.
+      let phase: HeldStreamPhase = { kind: "streaming" };
+      const heldPhase = (): HeldStreamPhase => phase;
+      const clientCancelled = () => heldPhase().kind === "client_cancelled";
       let protocolTerminal = false;
       let protocolFailed = false;
       // Observe the serializer depth bound before durable attempt settlement.
@@ -3725,7 +3732,6 @@ export async function dispatchPublicOverflow(
           depthParser = undefined;
         }
       };
-      let deliveredProtocolTerminal = false;
       let accountingIncomplete = request.stream;
       const terminalDecoder = request.stream ? new SseDecoder() : undefined;
       // Observe every record through EOF, including after a client terminal.
@@ -3741,10 +3747,9 @@ export async function dispatchPublicOverflow(
           stopHeartbeat();
           // Choose one outcome before any health/budget await. A later client
           // disconnect stops delivery without splitting this durable settlement.
-          const cancelledAtSettlement = clientCancelled;
-          const settleFacts = request.signal.aborted ? abortedAttemptFacts(request.signal) : null;
-          const settleCancelled = cancelledAtSettlement && !capacityLeaseLostSignal(request.signal);
-          const transportComplete = streamComplete && (response.complete || protocolTerminal);
+          const cancelledAtSettlement = clientCancelled();
+          const requestAborted = request.signal.aborted;
+          const capacityLeaseLost = capacityLeaseLostSignal(request.signal);
           const surface = nativeSurface ?? request.requestedSurface;
           let nonstreamEnvelope: Record<string, unknown> | undefined;
           if (!request.stream && !nonstreamOverflow) {
@@ -3771,26 +3776,26 @@ export async function dispatchPublicOverflow(
               if (isResponseDepthError(error)) protocolFailed = true;
             }
           }
-          const streamTerminal = !request.stream || protocolTerminal;
-          const providerFailed =
-            protocolFailed ||
-            (!request.stream &&
-              (nonstreamEnvelope?.error != null ||
-                (surface === "anthropic-messages" && nonstreamEnvelope?.type === "error") ||
-                (surface === "openai-responses" &&
-                  ["failed", "cancelled", "incomplete"].includes(
-                    typeof nonstreamEnvelope?.status === "string" ? nonstreamEnvelope.status : "",
-                  ))));
-          const ok =
-            transportComplete &&
-            httpOk &&
-            streamTerminal &&
-            (request.stream || nonstreamEnvelope !== undefined) &&
-            !providerFailed &&
-            !cancelledAtSettlement;
+          // Every outcome below comes from this one derivation, fixed before any await.
+          const settlement = deriveHeldStreamSettlement({
+            stream: request.stream,
+            httpOk,
+            streamComplete,
+            responseComplete: response.complete === true,
+            protocolTerminal,
+            protocolFailed,
+            accountingIncomplete,
+            nonstreamOverflow,
+            nonstreamEnvelope,
+            surface,
+            clientCancelled: cancelledAtSettlement,
+            requestAborted,
+            capacityLeaseLost,
+          });
+          const { ok, observationComplete } = settlement;
           const healthOutcome = providerHealthOutcome(status);
           const attemptAborted =
-            request.signal.aborted || attemptController.signal.aborted || cancelledAtSettlement;
+            requestAborted || attemptController.signal.aborted || cancelledAtSettlement;
           if (!attemptAborted && healthOutcome !== "NEUTRAL") {
             await recordProviderHealth(
               target,
@@ -3843,12 +3848,6 @@ export async function dispatchPublicOverflow(
                   pricing!.confidence === "REPORTED" ? "CALCULATED" : pricing!.confidence,
               } as RawProviderUsage)
             : combinedUsage;
-          const observationComplete =
-            transportComplete &&
-            !accountingIncomplete &&
-            (request.stream
-              ? protocolTerminal && !protocolFailed
-              : nonstreamEnvelope !== undefined && !nonstreamOverflow);
           const usage = observedUsage
             ? {
                 ...observedUsage,
@@ -3870,22 +3869,13 @@ export async function dispatchPublicOverflow(
             requestId: request.requestId,
             attemptId,
             fencingToken,
-            reason: settleCancelled
-              ? "CANCELLED"
-              : (settleFacts?.budgetReason ?? (ok ? "COMPLETED" : "FAILED")),
+            reason: settlement.budgetReason,
             revisionSequence: 1n,
             revisionKind: "SNAPSHOT",
             observationComplete,
             usageSource: usage ? `${upstream.protocol}-response` : "missing-provider-usage",
             usage,
           });
-          const state = settleCancelled
-            ? "CANCELLED"
-            : settleFacts
-              ? settleFacts.terminalState
-              : ok
-                ? "COMPLETED"
-                : "FAILED";
           // If client commitment already began, retain event creation order
           // without ever making client delivery wait for telemetry persistence.
           await firstClientBytePersistence;
@@ -3898,18 +3888,12 @@ export async function dispatchPublicOverflow(
             attemptId,
             fencingToken,
             eventType: "TERMINAL",
-            reason: settleCancelled
-              ? "CANCELLED"
-              : settleFacts
-                ? settleFacts.reason
-                : ok
-                  ? "COMPLETED"
-                  : "FAILED",
+            reason: settlement.eventReason,
             ...providerEventRouting({ request, target, nativeSurface }),
             reservationId: admission.reservationIds[0],
             reservationIds: admission.reservationIds,
             waitDurationMs: providerWaitDurationMs,
-            terminalState: state,
+            terminalState: settlement.terminalState,
             firstClientByteAt,
             streamCommitted: firstClientByteAt !== undefined,
             usage: usage
@@ -3933,25 +3917,29 @@ export async function dispatchPublicOverflow(
       };
       const heldBody = new ReadableStream<Uint8Array>({
         async pull(controller) {
-          if (clientCancelled) return;
-          if (deliveredProtocolTerminal) {
+          const entry = heldPhase();
+          if (entry.kind === "client_cancelled") return;
+          if (entry.kind === "delivered") {
             controller.close();
             return;
           }
           let reachedEof = false;
-          let heldTerminalChunk: Uint8Array | undefined;
-          let postTerminalBytes = 0;
-          let drainDeadline: number | undefined;
           try {
             while (true) {
-              const remainingMs =
-                drainDeadline === undefined ? undefined : drainDeadline - Date.now();
+              const draining = (() => {
+                const current = heldPhase();
+                return current.kind === "draining" ? current : undefined;
+              })();
+              const remainingMs = draining ? draining.deadline - Date.now() : undefined;
               let chunk: ReadableStreamReadResult<Uint8Array> | undefined;
               let drainTimer: ReturnType<typeof setTimeout> | undefined;
               try {
-                if (remainingMs === undefined) {
+                if (!draining || remainingMs === undefined) {
                   chunk = await reader.read();
-                } else if (remainingMs > 0 && postTerminalBytes < POST_TERMINAL_DRAIN_MAX_BYTES) {
+                } else if (
+                  remainingMs > 0 &&
+                  draining.postTerminalBytes < POST_TERMINAL_DRAIN_MAX_BYTES
+                ) {
                   chunk = await Promise.race([
                     reader.read(),
                     new Promise<undefined>((resolve) => {
@@ -3965,7 +3953,7 @@ export async function dispatchPublicOverflow(
               // Cancellation can resolve a read as done while discarding queued
               // records. Client cancel owns settlement; other teardown is an error,
               // even if the upstream transport has already marked itself complete.
-              if (clientCancelled) return;
+              if (clientCancelled()) return;
               // Defense in depth: a response the egress layer already errored is
               // never a clean EOF (natural auto-destruction sets no error).
               if (response.errored) throw response.errored;
@@ -3976,13 +3964,17 @@ export async function dispatchPublicOverflow(
                 );
               }
               if (!chunk) {
+                // Only a draining read stops short of EOF (deadline or byte bound).
+                const terminalChunk = draining?.terminalChunk;
+                if (!terminalChunk) throw new Error("Held provider stream lost its terminal");
                 accountingIncomplete = true;
                 openRouterStreamRecords?.markUnreadable();
+                phase = { kind: "reconciling", terminalChunk };
                 await reconcile(true);
                 await teardownProviderBody(response, reader);
-                if (clientCancelled) return;
-                deliveredProtocolTerminal = true;
-                controller.enqueue(heldTerminalChunk!);
+                if (clientCancelled()) return;
+                phase = { kind: "delivered" };
+                controller.enqueue(terminalChunk);
                 return;
               }
               if (chunk.done) {
@@ -4007,11 +3999,13 @@ export async function dispatchPublicOverflow(
                 }
                 // Do not expose either a streaming terminal event or EOF until
                 // correctness-required settlement and health release are durable.
+                const terminalChunk = draining?.terminalChunk;
+                phase = { kind: "reconciling", terminalChunk };
                 await reconcile(response.complete);
-                if (clientCancelled) return;
-                if (heldTerminalChunk) {
-                  deliveredProtocolTerminal = true;
-                  controller.enqueue(heldTerminalChunk);
+                if (clientCancelled()) return;
+                if (terminalChunk) {
+                  phase = { kind: "delivered" };
+                  controller.enqueue(terminalChunk);
                   return;
                 }
                 if (response.complete || !httpOk) {
@@ -4022,7 +4016,7 @@ export async function dispatchPublicOverflow(
                   );
                 return;
               }
-              if (heldTerminalChunk) postTerminalBytes += chunk.value.byteLength;
+              if (draining) draining.postTerminalBytes += chunk.value.byteLength;
               responseBytes += chunk.value.byteLength;
               observeAdaptedDepth(chunk.value);
               if (!request.stream && !nonstreamOverflow) {
@@ -4043,6 +4037,7 @@ export async function dispatchPublicOverflow(
               // report authoritative usage in terminal events, which may occur
               // after arbitrarily large content deltas.
               usageBytes = retainProviderUsageTail(usageChunks, usageBytes, chunk.value);
+              let firstTerminalTrailingBytes = 0;
               if (terminalDecoder) {
                 terminalDecoder.push(chunk.value, (record, endByteOffset) => {
                   openRouterStreamRecords?.observeData(record.data);
@@ -4054,14 +4049,21 @@ export async function dispatchPublicOverflow(
                   // Include bytes following the first terminal in its own chunk.
                   // Absolute decoder offsets exclude earlier streamed content.
                   if (!protocolTerminal && outcome !== undefined)
-                    postTerminalBytes = responseBytes - endByteOffset;
+                    firstTerminalTrailingBytes = responseBytes - endByteOffset;
                   protocolTerminal ||= outcome !== undefined;
                   protocolFailed ||= outcome === "FAILED";
                 });
               }
               if (protocolTerminal) {
-                heldTerminalChunk ??= chunk.value;
-                drainDeadline ??= Date.now() + POST_TERMINAL_DRAIN_MAX_MS;
+                // terminal seen: hold its chunk and drain (bounded) toward EOF.
+                if (!draining) {
+                  phase = {
+                    kind: "draining",
+                    terminalChunk: chunk.value,
+                    deadline: Date.now() + POST_TERMINAL_DRAIN_MAX_MS,
+                    postTerminalBytes: firstTerminalTrailingBytes,
+                  };
+                }
                 continue;
               }
               controller.enqueue(chunk.value);
@@ -4071,7 +4073,7 @@ export async function dispatchPublicOverflow(
             accountingIncomplete = true;
             openRouterStreamRecords?.markUnreadable();
             await teardownProviderBody(response, reader);
-            if (clientCancelled) return;
+            if (clientCancelled()) return;
             if (reachedEof && reconciliation) {
               // A failed durable success terminal remains ACTIVE for retry or
               // crash repair; never rewrite it as a transport failure.
@@ -4084,18 +4086,18 @@ export async function dispatchPublicOverflow(
                 await reconcile(false);
               } catch (reconcileError) {
                 resolveTerminal({ ok: false, responseBytes });
-                if (!clientCancelled) controller.error(reconcileError);
+                if (!clientCancelled()) controller.error(reconcileError);
                 return;
               }
             }
-            if (!clientCancelled) controller.error(error);
+            if (!clientCancelled()) controller.error(error);
           }
         },
         async cancel(reason) {
           // A rejecting response adapter cancels its source too. That is an
           // upstream failure, while a caller cancellation keeps its own outcome.
-          clientCancelled = !isResponseDepthError(reason);
-          if (!clientCancelled) protocolFailed = true;
+          if (isResponseDepthError(reason)) protocolFailed = true;
+          else phase = { kind: "client_cancelled" };
           await teardownProviderBody(response, reader, reason);
           await reconcile(false).catch(() => resolveTerminal({ ok: false, responseBytes }));
         },

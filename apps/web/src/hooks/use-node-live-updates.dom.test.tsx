@@ -98,7 +98,7 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
   queryClient = new QueryClient();
   invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue(undefined);
-  useNodeLive.getState().set({ status: "off" });
+  useNodeLive.getState().dispatch("off");
 });
 
 afterEach(() => {
@@ -173,6 +173,21 @@ describe("useNodeLiveUpdates", () => {
     await advance();
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(status()).toBe("live");
+  });
+
+  it("does not let a stale refusal from the previous session's stream stop the new one", async () => {
+    responses = [401, "stream"];
+    const view = mount("sess-1");
+    // The session changes before the first stream's 401 is handled.
+    view.rerender(<Harness sessionKey="sess-2" />);
+    await advance(60_000);
+    expect(status()).toBe("live");
+    view.unmount();
+    responses = [401];
+    mount("sess-3");
+    cleanup();
+    await advance(60_000);
+    expect(status()).toBe("off");
   });
 
   it("reconnects with backoff after an ended stream or a refused one, and refreshes again", async () => {

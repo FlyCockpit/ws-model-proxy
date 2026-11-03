@@ -179,10 +179,7 @@ fn image_after_shell_exit_is_rejected_without_starting_file_work() {
         .sessions
         .get_mut(MULTI_TERMINAL)
         .expect("session")
-        .pty
-        .as_mut()
-        .expect("pty")
-        .exited = Some((Some(0), None, Instant::now()));
+        .mark_exited((Some(0), None), Instant::now());
     let label = viewer.id.clone();
     let frames = send(&mut terminals, &mut viewer, &label, &image(8));
     assert_eq!(

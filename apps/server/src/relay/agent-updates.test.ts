@@ -219,4 +219,13 @@ describe("the self-update relay port", () => {
     // The second call joined the first and asked for one more pass.
     expect(order).toEqual(["expire", "batches", "expire", "batches"]);
   });
+
+  it("never ticks again once stopped, even when woken", async () => {
+    const updates = createAgentUpdates(relay(), { manifest: { get: async () => MANIFEST } });
+    await updates.stop();
+    lib.expireAgentUpdates.mockClear();
+    updates.port.wake?.();
+    await updates.tick();
+    expect(lib.expireAgentUpdates).not.toHaveBeenCalled();
+  });
 });

@@ -1062,6 +1062,49 @@ fn queued_commands_are_bounded_per_session() {
 }
 
 #[test]
+fn a_stop_mark_moves_through_its_states() {
+    let (mut registry, _rx) = registry();
+    let mark = |registry: &SttRegistry| {
+        registry
+            .stopping
+            .get("inst-a")
+            .map(|mark| format!("{mark:?}"))
+    };
+    registry.endpoint_stopping("inst-a", "step-1");
+    assert_eq!(
+        mark(&registry).as_deref(),
+        Some(r#"Running { step_id: "step-1" }"#)
+    );
+    // A start while the stop runs waits for it; a second start changes nothing.
+    registry.endpoint_starting("inst-a");
+    registry.endpoint_starting("inst-a");
+    assert_eq!(
+        mark(&registry).as_deref(),
+        Some(r#"StartWaiting { step_id: "step-1" }"#)
+    );
+    // The stop finishing lifts it.
+    registry.stop_finished("step-1");
+    assert_eq!(mark(&registry), None);
+    // A stop that finishes first stays (also when told twice) until a start.
+    registry.endpoint_stopping("inst-a", "step-2");
+    registry.stop_finished("step-2");
+    registry.stop_finished("step-2");
+    assert_eq!(
+        mark(&registry).as_deref(),
+        Some(r#"Finished { step_id: "step-2" }"#)
+    );
+    registry.endpoint_starting("inst-a");
+    assert_eq!(mark(&registry), None);
+    // A failed stop lifts it in any state; another step's failure does not.
+    registry.endpoint_stopping("inst-a", "step-3");
+    registry.endpoint_starting("inst-a");
+    registry.stop_failed("step-other");
+    assert!(mark(&registry).is_some());
+    registry.stop_failed("step-3");
+    assert_eq!(mark(&registry), None);
+}
+
+#[test]
 fn a_start_that_arrives_after_its_stop_finished_lifts_the_mark() {
     // The usual order: the server sends the start after the stop's result.
     // A fast start can republish the endpoint before the snapshot ever drops

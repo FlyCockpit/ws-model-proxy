@@ -9,6 +9,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { effectiveTrust } from "../nodes/trust";
 import { callableIdOf } from "./access-views";
 import { compactNumber } from "./metrics-query";
+import { liveNodeWhere, nodeIsLive } from "./node-liveness";
 import { memberLatencyKey } from "./pool-views";
 import { realTraffic } from "./test-traffic";
 
@@ -185,6 +186,7 @@ export async function overviewSummary(userId: string, range: OverviewRange, now 
         id: true,
         slug: true,
         connection: true,
+        lastHeartbeatAt: true,
         trust: true,
         trustLowerRequestedAt: true,
         trustChangedAt: true,
@@ -204,7 +206,8 @@ export async function overviewSummary(userId: string, range: OverviewRange, now 
       prisma.apiKey.count({
         where: { userId, revokedAt: null, OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] },
       }),
-      prisma.node.count({ where: { userId, connection: "ONLINE" } }),
+      // Online as everywhere else (`nodeLiveness`): a stale heartbeat is not online.
+      prisma.node.count({ where: { userId, ...liveNodeWhere(now) } }),
     ]),
     prisma.$queryRaw<KpiRow[]>`SELECT
         SUM(requests)::float8 AS requests, SUM(errors)::float8 AS errors,
@@ -251,7 +254,7 @@ export async function overviewSummary(userId: string, range: OverviewRange, now 
     nodes: nodes.map((node) => ({
       id: node.id,
       slug: node.slug,
-      online: node.connection === "ONLINE",
+      online: nodeIsLive(node, now),
       trust: effectiveTrust(node),
     })),
     nodesTotal: nodeCount,
