@@ -58,6 +58,10 @@ const commonCapabilityShape = {
       vision: booleanSupportSchema,
       video: booleanSupportSchema,
       audio: booleanSupportSchema,
+      /** Tool calls; absent is unknown, and only false keeps tool requests off the model. */
+      tools: booleanSupportSchema,
+      /** Reasoning (thinking) controls; absent is unknown, and only false refuses them. */
+      reasoning: booleanSupportSchema,
     })
     .strict()
     .optional(),
@@ -79,6 +83,8 @@ const commonCapabilityShape = {
       listInputItems: booleanSupportSchema,
       countTokens: booleanSupportSchema,
       compact: booleanSupportSchema,
+      tools: booleanSupportSchema,
+      reasoning: booleanSupportSchema,
     })
     .strict()
     .optional(),

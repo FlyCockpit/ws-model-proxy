@@ -103,3 +103,75 @@ describe("servedModelCapabilities", () => {
     expect(capabilities.audio).toBeUndefined();
   });
 });
+
+describe("declared tool and reasoning support", () => {
+  const toolRequest = profileSurfaceRequest({
+    tools: [{ type: "function", function: { name: "lookup", parameters: {} } }],
+    parallel_tool_calls: false,
+  });
+  const path = (
+    capabilities: ReturnType<typeof servedModelCapabilities>,
+    requestedSurface: "OPENAI_CHAT_COMPLETIONS" | "OPENAI_RESPONSES",
+    request = toolRequest,
+  ) => resolveExecutionPath({ capabilities, requestedSurface, request }).mode;
+
+  it("puts the declarations on Chat Completions and Responses", () => {
+    const capabilities = servedModelCapabilities({
+      capabilities: ["TEXT_GENERATION", "RESPONSES_API"],
+      tools: true,
+      reasoning: false,
+    });
+    expect(capabilities).toMatchObject({
+      chatCompletions: { supported: true, tools: true, reasoning: false },
+      responses: { supported: true, tools: true, reasoning: false },
+    });
+  });
+
+  it("leaves undeclared (null) support unknown", () => {
+    const capabilities = servedModelCapabilities({
+      capabilities: ["TEXT_GENERATION"],
+      tools: null,
+      reasoning: null,
+    });
+    expect(capabilities.version === 1 && capabilities.chatCompletions).toEqual({
+      supported: true,
+      streaming: true,
+      vision: false,
+      video: false,
+      audio: false,
+    });
+    expect(path(capabilities, "OPENAI_CHAT_COMPLETIONS")).toBe("native");
+  });
+
+  it("keeps tool requests off a model declared without tools", () => {
+    const declined = servedModelCapabilities({ capabilities: ["TEXT_GENERATION"], tools: false });
+    expect(path(declined, "OPENAI_CHAT_COMPLETIONS")).toBe("unavailable");
+    // A request without tools still reaches it.
+    expect(path(declined, "OPENAI_CHAT_COMPLETIONS", {})).toBe("native");
+    const declared = servedModelCapabilities({ capabilities: ["TEXT_GENERATION"], tools: true });
+    expect(path(declared, "OPENAI_CHAT_COMPLETIONS")).toBe("native");
+  });
+
+  it("keeps reasoning requests off a model declared without reasoning", () => {
+    const request = profileSurfaceRequest({ reasoning: { effort: "high" } });
+    expect(request).toMatchObject({ reasoning: true });
+    const declined = servedModelCapabilities({
+      capabilities: ["TEXT_GENERATION", "RESPONSES_API"],
+      reasoning: false,
+    });
+    expect(path(declined, "OPENAI_RESPONSES", request)).toBe("unavailable");
+    const unknown = servedModelCapabilities({ capabilities: ["TEXT_GENERATION", "RESPONSES_API"] });
+    expect(path(unknown, "OPENAI_RESPONSES", request)).toBe("native");
+  });
+
+  it("keeps the declarations on a transcription model's version 2 capabilities", () => {
+    const capabilities = servedModelCapabilities({
+      capabilities: ["TEXT_GENERATION"],
+      type: "TRANSCRIPTION",
+      transcriptionProfile: { streaming: true },
+      tools: false,
+    });
+    expect(capabilities.version).toBe(2);
+    expect(capabilities.version === 2 && capabilities.chatCompletions?.tools).toBe(false);
+  });
+});

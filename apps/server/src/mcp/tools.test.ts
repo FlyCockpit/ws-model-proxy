@@ -133,6 +133,21 @@ describe("routing to procedures", () => {
     ]);
   });
 
+  it("runtime_update passes tool and reasoning declarations to setCapabilities", () => {
+    expect(
+      routeToolCall("runtime_update", {
+        runtimeId: "r",
+        modelCapabilities: [{ runtimeModelId: "m", tools: true, reasoning: null }],
+      }),
+    ).toEqual([
+      { path: "runtimes.update", input: { runtimeId: "r" } },
+      {
+        path: "runtimes.models.setCapabilities",
+        input: { runtimeModelId: "m", tools: true, reasoning: null },
+      },
+    ]);
+  });
+
   it("pool_update contributes and withdraws, and updates only when something else changes", () => {
     expect(
       routeToolCall("pool_update", { poolId: "p", contribute: { add: ["m1"], withdraw: ["x"] } }),

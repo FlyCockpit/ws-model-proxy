@@ -450,6 +450,10 @@ export type RouteServedModel = {
   upstreamModelId: string;
   /** Effective capabilities (override when set, else detected). */
   capabilities: string[];
+  /** The owner's tool-call declaration; null or absent is unknown. */
+  tools?: boolean | null;
+  /** The owner's reasoning declaration; null or absent is unknown. */
+  reasoning?: boolean | null;
   /** LLM, EMBEDDINGS or TRANSCRIPTION (the runtime's modelType). */
   type: string;
   transcriptionProfile: Prisma.JsonValue | null;
@@ -632,6 +636,8 @@ const TARGET_SELECT = {
       detectedCapabilities: true,
       capabilities: true,
       capabilitiesOverridden: true,
+      declaredTools: true,
+      declaredReasoning: true,
       type: true,
       transcriptionProfile: true,
       embeddingContract: true,
@@ -716,6 +722,8 @@ function routeParts(row: TargetSelected, now: Date): TestRoute | null {
       userId: model.userId,
       upstreamModelId: model.upstreamModelId,
       capabilities: effectiveModelCapabilities(model),
+      tools: model.declaredTools,
+      reasoning: model.declaredReasoning,
       type: model.type,
       transcriptionProfile: model.transcriptionProfile,
       embeddingContract: model.embeddingContract,

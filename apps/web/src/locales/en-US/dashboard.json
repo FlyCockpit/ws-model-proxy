@@ -2135,6 +2135,23 @@
       "detectedList": "Detected: {{list}}",
       "useDetected": "Use detected",
       "saved": "Capabilities saved.",
+      "declaration": {
+        "unknown": "Unknown",
+        "yes": "Yes",
+        "no": "No"
+      },
+      "tools": {
+        "label": "Tool calls",
+        "hint": "Unknown still routes tool requests here; No keeps them on other pool members.",
+        "yes": "Tools",
+        "no": "No tools"
+      },
+      "reasoning": {
+        "label": "Reasoning",
+        "hint": "Unknown still routes reasoning requests here; No keeps them on other pool members.",
+        "yes": "Reasoning",
+        "no": "No reasoning"
+      },
       "values": {
         "text_generation": "Text",
         "vision_input": "Images in",

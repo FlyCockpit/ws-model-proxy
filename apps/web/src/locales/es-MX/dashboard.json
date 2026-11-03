@@ -2135,6 +2135,23 @@
       "detectedList": "Detectadas: {{list}}",
       "useDetected": "Usar las detectadas",
       "saved": "Capacidades guardadas.",
+      "declaration": {
+        "unknown": "Desconocido",
+        "yes": "Sí",
+        "no": "No"
+      },
+      "tools": {
+        "label": "Llamadas a herramientas",
+        "hint": "Con Desconocido, las solicitudes con herramientas siguen llegando aquí; con No, van a otros miembros del pool.",
+        "yes": "Herramientas",
+        "no": "Sin herramientas"
+      },
+      "reasoning": {
+        "label": "Razonamiento",
+        "hint": "Con Desconocido, las solicitudes con razonamiento siguen llegando aquí; con No, van a otros miembros del pool.",
+        "yes": "Razonamiento",
+        "no": "Sin razonamiento"
+      },
       "values": {
         "text_generation": "Texto",
         "vision_input": "Imágenes de entrada",

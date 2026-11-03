@@ -13,6 +13,8 @@ import { transcriptionProfileSchema } from "@ws-model-proxy/api/lib/transcriptio
  * profile means the model serves `/v1/audio/transcriptions` even without `audio_input`, and its
  * `realtime` block is what `/v1/models` advertises as live (sessions route through
  * `realtime/routing.ts`, which reads the same profile).
+ * The owner's `tools` / `reasoning` declarations apply to the Chat Completions and Responses
+ * surfaces; null (undeclared) stays unknown, which routing lets through.
  * Surface-level (v3/v4) metadata such as Anthropic Messages is not modelled on RuntimeModel yet.
  */
 export function servedModelCapabilities(model: {
@@ -21,6 +23,10 @@ export function servedModelCapabilities(model: {
   type?: string;
   embeddingContract?: unknown;
   transcriptionProfile?: unknown;
+  /** RuntimeModel.declaredTools: null or absent is unknown. */
+  tools?: boolean | null;
+  /** RuntimeModel.declaredReasoning: null or absent is unknown. */
+  reasoning?: boolean | null;
 }): OpenAiCompatibleCapabilities {
   let capabilities = openAiCapabilitiesFromCoarse(model.capabilities);
   const contract = parseEmbeddingContract(model.embeddingContract);
@@ -47,5 +53,26 @@ export function servedModelCapabilities(model: {
       },
     };
   }
-  return capabilities;
+  return withDeclaredFeatures(capabilities, model.tools ?? undefined, model.reasoning ?? undefined);
+}
+
+function withDeclaredFeatures(
+  capabilities: OpenAiCompatibleCapabilities,
+  tools: boolean | undefined,
+  reasoning: boolean | undefined,
+): OpenAiCompatibleCapabilities {
+  if (tools === undefined && reasoning === undefined) return capabilities;
+  // Coarse capabilities always build version 1 or 2.
+  if (capabilities.version !== 1 && capabilities.version !== 2) return capabilities;
+  const declared = {
+    ...(tools === undefined ? {} : { tools }),
+    ...(reasoning === undefined ? {} : { reasoning }),
+  };
+  return {
+    ...capabilities,
+    ...(capabilities.chatCompletions
+      ? { chatCompletions: { ...capabilities.chatCompletions, ...declared } }
+      : {}),
+    ...(capabilities.responses ? { responses: { ...capabilities.responses, ...declared } } : {}),
+  };
 }

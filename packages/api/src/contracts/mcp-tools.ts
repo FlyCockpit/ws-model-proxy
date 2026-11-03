@@ -213,13 +213,18 @@ const runtimeUpdateInput = z
     compat: z.record(z.string(), z.unknown()).nullable().optional(),
     relearn: z.boolean().optional(),
     restartRunning: z.boolean().optional(),
-    /** Per served model; null: what the node detected. */
+    /**
+     * Per served model. capabilities null: what the node detected. tools / reasoning: whether
+     * the model takes tool calls / reasoning controls; null: unknown. Absent fields stay as they are.
+     */
     modelCapabilities: z
       .array(
         z
           .object({
             runtimeModelId: idSchema,
-            capabilities: z.array(z.enum(MODEL_CAPABILITY)).nullable(),
+            capabilities: z.array(z.enum(MODEL_CAPABILITY)).nullable().optional(),
+            tools: z.boolean().nullable().optional(),
+            reasoning: z.boolean().nullable().optional(),
           })
           .strict(),
       )
@@ -419,7 +424,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "runtime_create",
     description:
-      "Define a runtime (a server on a node, or commands that start one), or copy one shared with you (forkFrom). Put model downloads and other setup in an idempotent prepare step so applying a profile on a fresh node fetches weights by itself.",
+      "Define a runtime (a server on a node, or commands that start one), or copy one shared with you (forkFrom). Put model downloads and other setup in an idempotent prepare step so applying a profile on a fresh node fetches weights by itself. Once it serves, declare tool and reasoning support with runtime_update.",
     input: runtimeCreateInput,
     output: runtimesContract.create.output,
     procedures: ["runtimes.create", "runtimes.presets.list", "runtimes.fork"],
@@ -428,7 +433,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "runtime_update",
     description:
-      "Save a new version (say why in note); limit edits apply live, a changed definition needs restartRunning. Setup such as model downloads belongs in the idempotent prepare step.",
+      "Save a new version (say why in note); limit edits apply live, a changed definition needs restartRunning. Setup such as model downloads belongs in the idempotent prepare step. modelCapabilities declares per served model whether it takes tools and reasoning (known from its launch, e.g. a tool-call parser); routing keeps such requests off a model declared false.",
     input: runtimeUpdateInput,
     output: runtimesContract.update.output.extend({
       models: z.array(runtimeModelViewSchema).optional(),

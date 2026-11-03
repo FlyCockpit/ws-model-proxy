@@ -2559,3 +2559,56 @@ describe("runtimes.shares.create: a direct share only to a proved mailbox", () =
     expect(db.user.findFirst).not.toHaveBeenCalled();
   });
 });
+
+describe("models.setCapabilities declarations", () => {
+  const modelRow = (overrides: Record<string, unknown> = {}) => ({
+    id: "rm-1",
+    userId: OWNER,
+    upstreamModelId: "qwen",
+    type: "LLM" as const,
+    detectedCapabilities: ["TEXT_GENERATION"],
+    capabilities: [],
+    capabilitiesOverridden: false,
+    declaredTools: null,
+    declaredReasoning: null,
+    retired: false,
+    Members: [],
+    ...overrides,
+  });
+
+  it("declares tools and reasoning without touching the capability override", async () => {
+    db.runtimeModel.updateMany.mockResolvedValue({ count: 1 });
+    db.runtimeModel.findFirst.mockResolvedValue(
+      modelRow({ declaredTools: false, declaredReasoning: true }) as never,
+    );
+    const view = await client().models.setCapabilities({
+      runtimeModelId: "rm-1",
+      tools: false,
+      reasoning: true,
+    });
+    expect(db.runtimeModel.updateMany.mock.calls[0]?.[0]).toEqual({
+      where: { id: "rm-1", userId: OWNER },
+      data: { declaredTools: false, declaredReasoning: true },
+    });
+    expect(view).toMatchObject({
+      tools: false,
+      reasoning: true,
+      capabilities: ["TEXT_GENERATION"],
+      capabilitiesOverridden: false,
+    });
+  });
+
+  it("clears a declaration back to unknown with null", async () => {
+    db.runtimeModel.updateMany.mockResolvedValue({ count: 1 });
+    db.runtimeModel.findFirst.mockResolvedValue(modelRow() as never);
+    await client().models.setCapabilities({ runtimeModelId: "rm-1", tools: null });
+    expect(db.runtimeModel.updateMany.mock.calls[0]?.[0].data).toEqual({ declaredTools: null });
+  });
+
+  it("refuses a call that sets nothing", async () => {
+    expect(await reasonOf(client().models.setCapabilities({ runtimeModelId: "rm-1" }))).toBe(
+      "BAD_REQUEST",
+    );
+    expect(db.runtimeModel.updateMany).not.toHaveBeenCalled();
+  });
+});

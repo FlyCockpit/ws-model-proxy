@@ -177,6 +177,11 @@ model RuntimeModel {
   /// Owner override; used instead of detection when `capabilitiesOverridden`.
   capabilities           ModelCapability[] @default([])
   capabilitiesOverridden Boolean           @default(false)
+  /// Owner's declaration: the model takes tool calls. Null: unknown, and requests with tools
+  /// still route to it; false keeps them off it.
+  declaredTools          Boolean?
+  /// Owner's declaration: the model takes reasoning (thinking) controls. Null: unknown.
+  declaredReasoning      Boolean?
   embeddingContract      Json?
   transcriptionProfile   Json?
   lastSeenAt             DateTime?
