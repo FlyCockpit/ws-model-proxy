@@ -13,7 +13,7 @@ vi.mock("react-i18next", () => ({
     i18n: { language: "en-US" },
   }),
 }));
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
 vi.mock("@/utils/orpc", () => ({

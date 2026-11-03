@@ -1,6 +1,7 @@
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import * as React from "react";
 import type { TooltipValueType } from "recharts";
+// react-doctor-disable-next-line react-doctor/prefer-dynamic-import -- this is the Recharts wrapper itself; Recharts recognises ChartTooltip/ChartLegend as direct chart children, so they cannot be lazy. Pages lazy-load the chart that uses it (see apps/web metrics-results.tsx).
 import * as RechartsPrimitive from "recharts";
 
 // Format: { THEME_NAME: CSS_SELECTOR }
@@ -53,9 +54,10 @@ function ChartContainer({
 }) {
   const uniqueId = React.useId();
   const chartId = `chart-${id ?? uniqueId.replace(/:/g, "")}`;
+  const contextValue = React.useMemo(() => ({ config }), [config]);
 
   return (
-    <ChartContext.Provider value={{ config }}>
+    <ChartContext.Provider value={contextValue}>
       <div
         data-slot="chart"
         data-chart={chartId}
@@ -105,6 +107,18 @@ ${colorConfig
 
 const ChartTooltip = RechartsPrimitive.Tooltip;
 
+type ChartTooltipContentProps = React.ComponentProps<typeof RechartsPrimitive.Tooltip> &
+  React.ComponentProps<"div"> & {
+    hideLabel?: boolean;
+    hideIndicator?: boolean;
+    indicator?: "line" | "dot" | "dashed";
+    nameKey?: string;
+    labelKey?: string;
+  } & Omit<
+    RechartsPrimitive.DefaultTooltipContentProps<TooltipValueType, TooltipNameType>,
+    "accessibilityLayer"
+  >;
+
 function ChartTooltipContent({
   active,
   payload,
@@ -119,47 +133,16 @@ function ChartTooltipContent({
   color,
   nameKey,
   labelKey,
-}: React.ComponentProps<typeof RechartsPrimitive.Tooltip> &
-  React.ComponentProps<"div"> & {
-    hideLabel?: boolean;
-    hideIndicator?: boolean;
-    indicator?: "line" | "dot" | "dashed";
-    nameKey?: string;
-    labelKey?: string;
-  } & Omit<
-    RechartsPrimitive.DefaultTooltipContentProps<TooltipValueType, TooltipNameType>,
-    "accessibilityLayer"
-  >) {
+}: ChartTooltipContentProps) {
   const { config } = useChart();
-
-  const tooltipLabel = React.useMemo(() => {
-    if (hideLabel || !payload?.length) {
-      return null;
-    }
-
-    const [item] = payload;
-    const key = `${labelKey ?? item?.dataKey ?? item?.name ?? "value"}`;
-    const itemConfig = getPayloadConfigFromPayload(config, item, key);
-    const value =
-      !labelKey && typeof label === "string" ? (config[label]?.label ?? label) : itemConfig?.label;
-
-    if (labelFormatter) {
-      return (
-        <div className={cn("font-medium", labelClassName)}>{labelFormatter(value, payload)}</div>
-      );
-    }
-
-    if (!value) {
-      return null;
-    }
-
-    return <div className={cn("font-medium", labelClassName)}>{value}</div>;
-  }, [label, labelFormatter, payload, hideLabel, labelClassName, config, labelKey]);
 
   if (!active || !payload?.length) {
     return null;
   }
 
+  const tooltipLabel = hideLabel
+    ? null
+    : renderTooltipLabel({ config, payload, label, labelKey, labelFormatter, labelClassName });
   const nestLabel = payload.length === 1 && indicator !== "dot";
 
   return (
@@ -180,7 +163,7 @@ function ChartTooltipContent({
 
             return (
               <div
-                key={index}
+                key={seriesKey(item.dataKey, item.name)}
                 className={cn(
                   "flex w-full flex-wrap items-stretch gap-2 [&>svg]:h-2.5 [&>svg]:w-2.5 [&>svg]:text-muted-foreground",
                   indicator === "dot" && "items-center",
@@ -244,6 +227,37 @@ function ChartTooltipContent({
   );
 }
 
+/** The tooltip's heading: the label (or the first item's configured label), formatted. */
+function renderTooltipLabel({
+  config,
+  payload,
+  label,
+  labelKey,
+  labelFormatter,
+  labelClassName,
+}: Pick<ChartTooltipContentProps, "label" | "labelKey" | "labelFormatter" | "labelClassName"> & {
+  config: ChartConfig;
+  payload: NonNullable<ChartTooltipContentProps["payload"]>;
+}) {
+  const [item] = payload;
+  const key = `${labelKey ?? item?.dataKey ?? item?.name ?? "value"}`;
+  const itemConfig = getPayloadConfigFromPayload(config, item, key);
+  const value =
+    !labelKey && typeof label === "string" ? (config[label]?.label ?? label) : itemConfig?.label;
+
+  if (labelFormatter) {
+    return (
+      <div className={cn("font-medium", labelClassName)}>{labelFormatter(value, payload)}</div>
+    );
+  }
+
+  if (!value) {
+    return null;
+  }
+
+  return <div className={cn("font-medium", labelClassName)}>{value}</div>;
+}
+
 const ChartLegend = RechartsPrimitive.Legend;
 
 function ChartLegendContent({
@@ -272,13 +286,13 @@ function ChartLegendContent({
     >
       {payload
         .filter((item) => item.type !== "none")
-        .map((item, index) => {
+        .map((item) => {
           const key = `${nameKey ?? item.dataKey ?? "value"}`;
           const itemConfig = getPayloadConfigFromPayload(config, item, key);
 
           return (
             <div
-              key={index}
+              key={seriesKey(item.dataKey, item.value)}
               className={cn(
                 "flex items-center gap-1.5 [&>svg]:h-3 [&>svg]:w-3 [&>svg]:text-muted-foreground",
               )}
@@ -299,6 +313,14 @@ function ChartLegendContent({
         })}
     </div>
   );
+}
+
+/**
+ * A React key for a tooltip or legend entry: its series (`dataKey`) plus its name, which tells
+ * apart the entries of one series (a pie's sectors). Entries are unique by these in a chart.
+ */
+function seriesKey(dataKey: unknown, name: unknown): string {
+  return `${typeof dataKey === "function" ? "" : String(dataKey ?? "")}\u0000${String(name ?? "")}`;
 }
 
 function getPayloadConfigFromPayload(config: ChartConfig, payload: unknown, key: string) {

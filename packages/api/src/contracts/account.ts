@@ -142,8 +142,45 @@ export const userSettingsSchema = z
   })
   .strict();
 
+/** How many ids each Terminals-page order keeps. */
+export const TERMINAL_ORDER_MAX = 200;
+/** Terminal ids (tabs) or node ids, first first. */
+const terminalOrderSchema = z.array(idSchema).max(TERMINAL_ORDER_MAX);
+
+/**
+ * Your order on the Terminals page, kept across sign-ins and devices. Ids not listed follow in
+ * their usual order; ids of terminals or nodes that are gone are ignored.
+ */
+export const terminalLayoutSchema = z
+  .object({ tabs: terminalOrderSchema, nodes: terminalOrderSchema })
+  .strict();
+
 export const settingsContract = {
   get: query("session", noInputSchema, userSettingsSchema, "Your profile and alerts."),
+  terminalLayout: {
+    get: query(
+      "session",
+      noInputSchema,
+      terminalLayoutSchema,
+      "Your order of terminal tabs and nodes on the Terminals page.",
+    ),
+    update: mutation(
+      "human",
+      z
+        .object({
+          /** Replaces the tab order (terminal ids). Absent: unchanged. */
+          tabs: terminalOrderSchema.optional(),
+          /** Replaces the node order (node ids). Absent: unchanged. */
+          nodes: terminalOrderSchema.optional(),
+        })
+        .strict()
+        .refine((input) => input.tabs !== undefined || input.nodes !== undefined, {
+          message: "Set tabs or nodes.",
+        }),
+      terminalLayoutSchema,
+      "Save your order of terminal tabs or nodes on the Terminals page.",
+    ),
+  },
   update: mutation(
     "human",
     z

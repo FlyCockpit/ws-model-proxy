@@ -17,36 +17,32 @@ import { InlineRetry } from "@/components/inline-retry";
 import { StatusPill } from "@/components/status-pill";
 import { TimeAgo } from "@/components/time-ago";
 import { WideContent } from "@/components/wide-content";
-import { collapseUnchanged, diffLines, stableJsonLines } from "@/lib/line-diff";
+import { collapseUnchanged, type DiffHunkLine, diffLines, stableJsonLines } from "@/lib/line-diff";
 import { orpc } from "@/utils/orpc";
 
-type VersionDetail = Awaited<ReturnType<AppRouterClient["runtimes"]["versions"]["get"]>>;
+import { versionDocument } from "./version-history-utils";
+
 type VersionSummary = Awaited<
   ReturnType<AppRouterClient["runtimes"]["versions"]["list"]>
 >["items"][number];
 
 const PAGE = 20;
 
-/** Settings changed from automatic: the effective value of every override. */
-function overrides(view: Record<string, { effective: unknown; source: string } | undefined>) {
-  return Object.fromEntries(
-    Object.entries(view).flatMap(([key, value]) =>
-      value?.source === "override" ? [[key, value.effective]] : [],
-    ),
-  );
-}
-
-/** What a version defines, as the diff shows it (limits and advanced: overrides only). */
-export function versionDocument(version: VersionDetail | null): unknown {
-  if (!version) return {};
-  return {
-    spec: version.spec,
-    limits: overrides(version.limits as Record<string, { effective: unknown; source: string }>),
-    advanced: overrides(
-      version.advanced as unknown as Record<string, { effective: unknown; source: string }>,
-    ),
-    compat: version.compat,
-  };
+/**
+ * Each shown diff line with a key from where it sits: its line number in the old and the new
+ * document (a skip covers unchanged lines of both). Every line moves past at least one of
+ * them, so no two lines share a key.
+ */
+function keyedHunkLines(lines: readonly DiffHunkLine[]) {
+  let before = 0;
+  let after = 0;
+  return lines.map((line) => {
+    const key = `${line.kind}-${before}-${after}`;
+    const step = line.kind === "skip" ? line.count : 1;
+    if (line.kind !== "add") before += step;
+    if (line.kind !== "remove") after += step;
+    return { key, line };
+  });
 }
 
 /**
@@ -225,14 +221,14 @@ export function VersionDiff({
           className="w-max min-w-full py-2 font-mono text-xs leading-5"
           aria-label={t("dashboard:runtime.history.diffLabel")}
         >
-          {collapseUnchanged(lines).map((line, index) =>
+          {keyedHunkLines(collapseUnchanged(lines)).map(({ key, line }) =>
             line.kind === "skip" ? (
-              <div key={index} className="px-3 text-muted-foreground">
+              <div key={key} className="px-3 text-muted-foreground">
                 {t("dashboard:runtime.history.unchanged", { count: line.count })}
               </div>
             ) : (
               <div
-                key={index}
+                key={key}
                 data-diff={line.kind}
                 className={cn(
                   "px-3 whitespace-pre",

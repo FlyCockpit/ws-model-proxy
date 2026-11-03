@@ -14,7 +14,7 @@ import {
   EXPIRY_CHOICES,
   type ExpiryChoice,
   expiryFromChoice,
-} from "@/components/access/credential-meta";
+} from "@/components/access/credential-meta-utils";
 import { SecretReveal } from "@/components/access/secret-reveal";
 import { SegmentedControl } from "@/components/segmented-control";
 import { orpc } from "@/utils/orpc";

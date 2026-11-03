@@ -205,5 +205,12 @@
     "done": "Listo",
     "label": "Texto de la terminal",
     "wideLabel": "Líneas largas del texto de la terminal"
+  },
+  "order": {
+    "moved": "{{name}} se movió a la posición {{position}} de {{count}}.",
+    "moveNode": "Mover {{node}}",
+    "moveNodeHint": "Arrastra para reordenar, o enfoca y usa las flechas arriba y abajo. Tu orden se guarda en tu cuenta.",
+    "moveTabHint": "Arrastra para reordenar, o presiona Alt+Shift con las flechas izquierda y derecha. Tu orden se guarda en tu cuenta.",
+    "saveFailed": "No se pudo guardar tu orden. Inténtalo de nuevo."
   }
 }

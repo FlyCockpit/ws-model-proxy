@@ -723,6 +723,8 @@ const EXEMPT: Readonly<Record<string, Exemption>> = {
   "auth.passwordCapabilities": OWN_ACCOUNT,
   "settings.get": OWN_ACCOUNT,
   "settings.update": OWN_ACCOUNT,
+  "settings.terminalLayout.get": OWN_ACCOUNT,
+  "settings.terminalLayout.update": OWN_ACCOUNT,
   "settings.onboarding.complete": OWN_ACCOUNT,
   "users.list": ADMIN_USERS,
   "users.invite": ADMIN_USERS,

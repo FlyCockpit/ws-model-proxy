@@ -338,3 +338,27 @@ over while a wheel scroll is on its way, it is dropped instead of taking typing 
 One case is not covered yet and behaves as before this release: a wheel scroll that had already
 left your browser when they took over can still reach the computer after their takeover, and then
 takes typing back for you.
+
+## Rearrange terminal tabs and nodes
+
+On the Terminals page, drag a terminal tab or a node (by the grip at the start of its row) to
+reorder it. With the keyboard, Alt+Shift with the left and right arrows moves the focused tab,
+and the up and down arrows move a node whose grip is focused. On a phone, press and hold a
+tab, then drag. The order is saved to your account (two new `user` columns, so the deploy
+needs `APPLY_SCHEMA=safe`): it follows you across sign-ins and devices. New tabs and nodes go
+after the ones you placed.
+
+## Runtime and dependency updates
+
+- The app image and CI run on **Node.js 26** (was 24) and **pnpm 12** (was 11). Node 26 no
+  longer ships corepack, so the Dockerfiles install pnpm with npm. Local development needs
+  Node 26 and pnpm 12.16.0 (`packageManager` in `package.json`).
+- All npm, Cargo and GitHub Actions dependencies are on their newest stable releases that pass
+  the 7-day release-age gate, including the majors `vite-plugin-pwa` 2 and
+  `@anthropic-ai/sdk` 1. Prisma stays on 7.10.1: its `latest` tag points at an 8.0 release
+  candidate.
+- Better Auth 1.7.14: MCP access tokens must carry `azp` (the OAuth provider issues it), and
+  the MCP verifier now keeps the issuer's signing keys in memory per process.
+- Locale translation (`pnpm i18n:translate` with Anthropic) no longer sets `temperature`,
+  which the Anthropic API version used by SDK 1.x rejects.
+- No `wsmp` upgrade is needed.

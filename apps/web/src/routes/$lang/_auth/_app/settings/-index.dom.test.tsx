@@ -48,7 +48,7 @@ vi.mock("@/hooks/use-auth-session", () => ({
 
 vi.mock("@/i18n/use-namespace-t", () => ({ useNamespaceT: () => (key: string) => key }));
 
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
 
@@ -83,7 +83,7 @@ vi.mock("@/utils/orpc", () => ({
   },
 }));
 
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { Route } from "./index";
 
 async function mount() {

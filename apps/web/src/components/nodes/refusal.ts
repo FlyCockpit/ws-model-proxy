@@ -1,4 +1,4 @@
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import type { TFunction } from "i18next";
 
 import { refusalReservationOf, withReservation } from "@/lib/refusal-text";

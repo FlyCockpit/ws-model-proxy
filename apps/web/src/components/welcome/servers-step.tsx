@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { buttonVariants } from "@ws-model-proxy/ui/components/button";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { Plus } from "lucide-react";
 import { useTranslation } from "react-i18next";
 

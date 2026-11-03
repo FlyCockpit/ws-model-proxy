@@ -30,6 +30,8 @@ const INVENTORY = [
   "auth.passwordCapabilities",
   "settings.get",
   "settings.update",
+  "settings.terminalLayout.get",
+  "settings.terminalLayout.update",
   "settings.onboarding.complete",
   "users.list",
   "users.invite",

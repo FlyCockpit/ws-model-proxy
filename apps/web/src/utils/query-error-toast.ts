@@ -1,5 +1,5 @@
 import { type Query, QueryCache, type QueryClient } from "@tanstack/react-query";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 
 import { friendly } from "./friendly-error";
 

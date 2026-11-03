@@ -11,9 +11,9 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { ArrowRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import z from "zod";

@@ -1,8 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -14,21 +14,24 @@ import { TimeAgo } from "@/components/time-ago";
 import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
+import { stopUnprovenReason } from "./release-unproven-utils";
+
 type Instance = Awaited<ReturnType<AppRouterClient["runtimes"]["get"]>>["instanceList"][number];
-type Rank = Instance["ranks"][number];
 type ReleaseRequest = Awaited<
   ReturnType<AppRouterClient["runtimes"]["releaseRequests"]["list"]>
 >["items"][number];
 
 /**
- * Why the node cannot prove the stop right now, as the server records it on release: the node is
- * gone or offline, else the last automatic check's code (`status_running`, `port_in_use`, ...).
+ * The agent's evidence entries with keys from their content: the command, numbered when the
+ * same command appears again (entries have no identity of their own).
  */
-export function stopUnprovenReason(rank: Rank): string {
-  if (rank.nodeConnection === null) return "node_removed";
-  if (rank.nodeConnection.state === "OFFLINE") return "node_offline";
-  if (rank.lastStopCheck === null) return "no_check";
-  return rank.lastStopCheck.errorCode ?? "not_stopped";
+function keyedEvidence(evidence: ReleaseRequest["evidence"]) {
+  const seen = new Map<string, number>();
+  return evidence.map((entry) => {
+    const count = seen.get(entry.command) ?? 0;
+    seen.set(entry.command, count + 1);
+    return { key: `${count}:${entry.command}`, entry };
+  });
 }
 
 function useInvalidateAfterRelease() {
@@ -268,9 +271,8 @@ function FindingsBody({ request }: { request: ReleaseRequest }) {
       <pre className="max-h-48 min-w-0 overflow-x-auto overflow-y-auto overscroll-contain whitespace-pre-wrap break-words rounded bg-muted p-2 text-xs">
         {request.findings}
       </pre>
-      {request.evidence.map((entry, index) => (
-        // The agent's list never changes while shown; entries have no identity of their own.
-        <div key={index} className="flex min-w-0 flex-col gap-1">
+      {keyedEvidence(request.evidence).map(({ key, entry }) => (
+        <div key={key} className="flex min-w-0 flex-col gap-1">
           <p className="text-xs text-muted-foreground">
             {t("dashboard:runtime.releaseUnproven.request.command")}
           </p>

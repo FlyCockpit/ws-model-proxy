@@ -25,7 +25,7 @@ vi.mock("react-i18next", () => ({
   }),
 }));
 
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({ toast: state.toast }));
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({ toast: state.toast }));
 
 // The alert dialog itself is not under test (portals and focus traps): it shows its parts.
 vi.mock("@/components/access/confirm-action", () => ({

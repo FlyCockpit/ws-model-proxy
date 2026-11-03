@@ -3,8 +3,8 @@ import { createFileRoute } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Card, CardContent } from "@ws-model-proxy/ui/components/card";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -399,19 +399,6 @@ const STATUS_TONE: Record<RequestRow["status"], string> = {
 
 function RequestCard({ row }: { row: RequestRow }) {
   const { t } = useTranslation(["activity"]);
-  const facts = [
-    row.route ? t(`activity:requests.routeValue.${row.route}`) : null,
-    row.queueWaitMs ? t("activity:requests.queueWait", { ms: row.queueWaitMs }) : null,
-    row.ttftMs !== null ? t("activity:requests.ttft", { ms: row.ttftMs }) : null,
-    row.durationMs !== null ? t("activity:requests.duration", { ms: row.durationMs }) : null,
-    row.promptTokens !== null || row.completionTokens !== null
-      ? t("activity:requests.tokens", {
-          prompt: row.promptTokens ?? 0,
-          completion: row.completionTokens ?? 0,
-        })
-      : null,
-    row.attempts > 1 ? t("activity:requests.attempts", { count: row.attempts }) : null,
-  ].filter((fact): fact is string => fact !== null);
   return (
     <Card size="sm">
       <CardContent className="flex min-w-0 flex-col gap-1">
@@ -434,22 +421,8 @@ function RequestCard({ row }: { row: RequestRow }) {
             {row.operation ? ` · ${row.operation}` : ""}
           </span>
         </p>
-        {facts.length > 0 ? (
-          <p className="text-xs text-muted-foreground">{facts.join(" · ")}</p>
-        ) : null}
-        {row.rejection ? (
-          <p className="break-all text-xs text-destructive">
-            {t("activity:requests.rejection", {
-              reason: KNOWN_REASONS.has(row.rejection)
-                ? t(`activity:requests.reason.${row.rejection}`)
-                : t("activity:requests.reason.other", { code: row.rejection }),
-            })}
-          </p>
-        ) : row.errorClass ? (
-          <p className="break-all text-xs text-destructive">
-            {t("activity:requests.error", { reason: row.errorClass })}
-          </p>
-        ) : null}
+        <RequestFacts row={row} />
+        <RequestProblem row={row} />
         {row.upstreamError ? (
           <p className="break-words text-xs text-muted-foreground">
             {t("activity:requests.upstreamError", { message: row.upstreamError })}
@@ -458,4 +431,46 @@ function RequestCard({ row }: { row: RequestRow }) {
       </CardContent>
     </Card>
   );
+}
+
+/** Route, queue wait, timings, tokens and attempts, whichever the request has. */
+function RequestFacts({ row }: { row: RequestRow }) {
+  const { t } = useTranslation(["activity"]);
+  const facts = [
+    row.route ? t(`activity:requests.routeValue.${row.route}`) : null,
+    row.queueWaitMs ? t("activity:requests.queueWait", { ms: row.queueWaitMs }) : null,
+    row.ttftMs !== null ? t("activity:requests.ttft", { ms: row.ttftMs }) : null,
+    row.durationMs !== null ? t("activity:requests.duration", { ms: row.durationMs }) : null,
+    row.promptTokens !== null || row.completionTokens !== null
+      ? t("activity:requests.tokens", {
+          prompt: row.promptTokens ?? 0,
+          completion: row.completionTokens ?? 0,
+        })
+      : null,
+    row.attempts > 1 ? t("activity:requests.attempts", { count: row.attempts }) : null,
+  ].filter((fact): fact is string => fact !== null);
+  return facts.length > 0 ? (
+    <p className="text-xs text-muted-foreground">{facts.join(" · ")}</p>
+  ) : null;
+}
+
+/** Why the proxy turned the request away, or the error it failed with. */
+function RequestProblem({ row }: { row: RequestRow }) {
+  const { t } = useTranslation(["activity"]);
+  if (row.rejection) {
+    return (
+      <p className="break-all text-xs text-destructive">
+        {t("activity:requests.rejection", {
+          reason: KNOWN_REASONS.has(row.rejection)
+            ? t(`activity:requests.reason.${row.rejection}`)
+            : t("activity:requests.reason.other", { code: row.rejection }),
+        })}
+      </p>
+    );
+  }
+  return row.errorClass ? (
+    <p className="break-all text-xs text-destructive">
+      {t("activity:requests.error", { reason: row.errorClass })}
+    </p>
+  ) : null;
 }

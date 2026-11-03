@@ -35,7 +35,7 @@ vi.mock("react-i18next", () => ({
   }),
 }));
 
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
 
@@ -70,7 +70,7 @@ vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => navigateMock,
 }));
 
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import i18n from "i18next";
 import enErrors from "@/locales/en-US/errors.json";
 import { SignInCard } from "./sign-in-card";

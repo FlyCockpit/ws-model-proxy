@@ -17,7 +17,7 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { Plus, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -25,6 +25,7 @@ import z from "zod";
 
 import { FieldErrors } from "@/components/field-errors";
 import { NativeSelect } from "@/components/native-select";
+import { useRowKeys } from "@/components/runtimes/use-row-keys";
 import { rejectedDefinesWarning } from "@/lib/define-rejections";
 import {
   draftToReader,
@@ -49,17 +50,19 @@ type ReaderValues = ReaderDraft & { check: string };
 /** Reader issues at the input that owns them (`map[2].series`), or `check`. */
 function readerIssues(values: ReaderValues, base: MetricsReader | undefined) {
   const issues: Array<{ path: Array<string | number>; message: string }> = [];
+  // The first row of each signal (a later row with the same signal is a duplicate).
+  const firstRow = new Map<string, number>();
   values.map.forEach((row, index) => {
-    if (values.map.findIndex((other) => other.signal === row.signal) !== index)
-      issues.push({ path: ["map", index, "signal"], message: "duplicate" });
+    if (!firstRow.has(row.signal)) firstRow.set(row.signal, index);
+    else issues.push({ path: ["map", index, "signal"], message: "duplicate" });
   });
   const parsed = metricsReaderSchema.optional().safeParse(draftToReader(values, base));
   if (!parsed.success)
     for (const issue of parsed.error.issues) {
       const [head, signal, field] = issue.path;
       const message = specIssueText(issue);
-      const row = values.map.findIndex((item) => item.signal === signal);
-      if (head === "map" && row >= 0 && typeof field === "string")
+      const row = typeof signal === "string" ? firstRow.get(signal) : undefined;
+      if (head === "map" && row !== undefined && typeof field === "string")
         issues.push({ path: ["map", row, field], message });
       else if (typeof head === "string" && head !== "map" && head !== "kind")
         issues.push({ path: [head], message });
@@ -72,23 +75,23 @@ function readerIssues(values: ReaderValues, base: MetricsReader | undefined) {
   return issues;
 }
 
-/**
- * The runtime's metrics reader (`spec.metricsReader`): the engine's own, or a route or command
- * whose output maps to load signals. A preset fills the form; saving writes a new version of
- * the definition (a new launch: running instances use it after a restart).
- */
-export function MetricsReaderCard({
+type ReaderForm = ReturnType<typeof useReaderForm>;
+type RowKeys = ReturnType<typeof useRowKeys>;
+type Translate = ReturnType<typeof useTranslation<["dashboard", "common"]>>["t"];
+type TextFieldName = "route" | "countRoute" | "command" | "intervalSecs";
+
+/** The reader form: validated against the reader schema, saved as a new definition version. */
+function useReaderForm({
   runtimeId,
   spec,
-  readOnly,
+  t,
+  queryClient,
 }: {
   runtimeId: string;
   spec: RuntimeSpec;
-  readOnly: boolean;
+  t: Translate;
+  queryClient: ReturnType<typeof useQueryClient>;
 }) {
-  const { t } = useTranslation(["dashboard", "common"]);
-  const queryClient = useQueryClient();
-  const [preset, setPreset] = useState<"" | ReaderPresetId>("");
   const update = useMutation({
     ...orpc.runtimes.update.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
@@ -103,7 +106,7 @@ export function MetricsReaderCard({
           issue.message === "duplicate" ? t("dashboard:runtime.reader.duplicate") : issue.message,
       });
   });
-  const form = useForm({
+  return useForm({
     defaultValues: { ...readerToDraft(base), check: "" } as ReaderValues,
     validators: { onSubmit: schema },
     onSubmit: async ({ value }) => {
@@ -130,214 +133,27 @@ export function MetricsReaderCard({
       }
     },
   });
-  const textField = (
-    name: "route" | "countRoute" | "command" | "intervalSecs",
-    id: string,
-    label: string,
-    hint?: string,
-    options: { mono?: boolean; inputMode?: "numeric" } = {},
-  ) => {
-    const { mono, inputMode } = options;
-    return (
-      <form.Field name={name}>
-        {(field) => (
-          <div className="min-w-0 space-y-1.5">
-            <Label htmlFor={id}>{label}</Label>
-            <Input
-              id={id}
-              className={mono ? "h-11 font-mono text-xs" : "h-11"}
-              autoCapitalize="none"
-              spellCheck={false}
-              inputMode={inputMode}
-              value={field.state.value}
-              onBlur={field.handleBlur}
-              onChange={(event) => field.handleChange(event.target.value)}
-            />
-            {hint ? <p className="text-xs text-muted-foreground">{hint}</p> : null}
-            <FieldErrors field={field} />
-          </div>
-        )}
-      </form.Field>
-    );
-  };
-  const readerSource = (kind: "route" | "command") => {
-    return (
-      <>
-        <div className="grid min-w-0 gap-3 sm:grid-cols-2">
-          {kind === "route" ? (
-            <>
-              {textField(
-                "route",
-                "reader-route",
-                t("dashboard:runtime.reader.route"),
-                t("dashboard:runtime.reader.routeHint"),
-                { mono: true },
-              )}
-              {textField(
-                "countRoute",
-                "reader-count-route",
-                t("dashboard:runtime.reader.countRoute"),
-                t("dashboard:runtime.reader.countRouteHint"),
-                { mono: true },
-              )}
-            </>
-          ) : (
-            textField(
-              "command",
-              "reader-command",
-              t("dashboard:runtime.reader.command"),
-              t("dashboard:runtime.reader.commandHint"),
-              { mono: true },
-            )
-          )}
-          <form.Field name="format">
-            {(field) => (
-              <div className="min-w-0 space-y-1.5">
-                <Label htmlFor="reader-format">{t("dashboard:runtime.reader.format")}</Label>
-                <NativeSelect
-                  id="reader-format"
-                  value={field.state.value}
-                  onChange={(event) =>
-                    field.handleChange(event.target.value as "json" | "prometheus")
-                  }
-                >
-                  <option value="prometheus">
-                    {t("dashboard:runtime.reader.formats.prometheus")}
-                  </option>
-                  <option value="json">{t("dashboard:runtime.reader.formats.json")}</option>
-                </NativeSelect>
-              </div>
-            )}
-          </form.Field>
-          {textField(
-            "intervalSecs",
-            "reader-interval",
-            t("dashboard:runtime.reader.interval"),
-            t("dashboard:runtime.reader.intervalHint"),
-            { inputMode: "numeric" },
-          )}
-        </div>
-        <form.Field name="map" mode="array">
-          {(map) => (
-            <div className="flex min-w-0 flex-col gap-3">
-              <p className="text-sm font-medium">{t("dashboard:runtime.reader.map")}</p>
-              <p className="text-xs text-muted-foreground">
-                {t("dashboard:runtime.reader.mapHint")}
-              </p>
-              {map.state.value.map((_, index) => (
-                <div
-                  key={index}
-                  className="grid min-w-0 gap-3 rounded-lg border p-3 sm:grid-cols-2"
-                >
-                  <form.Field name={`map[${index}].signal`}>
-                    {(field) => (
-                      <div className="min-w-0 space-y-1.5">
-                        <Label htmlFor={`reader-map-${index}-signal`}>
-                          {t("dashboard:runtime.reader.signal")}
-                        </Label>
-                        <NativeSelect
-                          id={`reader-map-${index}-signal`}
-                          value={field.state.value}
-                          onChange={(event) =>
-                            field.handleChange(event.target.value as ReaderSignal)
-                          }
-                        >
-                          {READER_SIGNALS.map((signal) => (
-                            <option key={signal} value={signal}>
-                              {signal}
-                            </option>
-                          ))}
-                        </NativeSelect>
-                        <FieldErrors field={field} />
-                      </div>
-                    )}
-                  </form.Field>
-                  {(["series", "divideBy", "scale"] as const).map((name) => (
-                    <form.Field key={name} name={`map[${index}].${name}`}>
-                      {(field) => (
-                        <div className="min-w-0 space-y-1.5">
-                          <Label htmlFor={`reader-map-${index}-${name}`}>
-                            {t(`dashboard:runtime.reader.fields.${name}`)}
-                          </Label>
-                          <Input
-                            id={`reader-map-${index}-${name}`}
-                            className="h-11 font-mono text-xs"
-                            autoCapitalize="none"
-                            spellCheck={false}
-                            inputMode={name === "scale" ? "decimal" : undefined}
-                            value={field.state.value}
-                            onBlur={field.handleBlur}
-                            onChange={(event) => field.handleChange(event.target.value)}
-                          />
-                          <FieldErrors field={field} />
-                        </div>
-                      )}
-                    </form.Field>
-                  ))}
-                  <form.Field name={`map[${index}].aggregate`}>
-                    {(field) => (
-                      <div className="min-w-0 space-y-1.5">
-                        <Label htmlFor={`reader-map-${index}-aggregate`}>
-                          {t("dashboard:runtime.reader.fields.aggregate")}
-                        </Label>
-                        <NativeSelect
-                          id={`reader-map-${index}-aggregate`}
-                          value={field.state.value}
-                          onChange={(event) =>
-                            field.handleChange(event.target.value as ReaderAggregate)
-                          }
-                        >
-                          {AGGREGATES.map((aggregate) => (
-                            <option key={aggregate} value={aggregate}>
-                              {t(`dashboard:runtime.reader.aggregates.${aggregate || "default"}`)}
-                            </option>
-                          ))}
-                        </NativeSelect>
-                      </div>
-                    )}
-                  </form.Field>
-                  <div className="flex items-end">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="touch"
-                      onClick={() => map.removeValue(index)}
-                    >
-                      <Trash2 aria-hidden="true" />
-                      {t("dashboard:runtime.reader.removeSignal")}
-                    </Button>
-                  </div>
-                </div>
-              ))}
-              {nextFreeSignal(map.state.value) ? (
-                <div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="touch"
-                    onClick={() => {
-                      const signal = nextFreeSignal(map.state.value);
-                      if (signal)
-                        map.pushValue({
-                          signal,
-                          series: "",
-                          aggregate: "",
-                          scale: "",
-                          divideBy: "",
-                        });
-                    }}
-                  >
-                    <Plus aria-hidden="true" />
-                    {t("dashboard:runtime.reader.addSignal")}
-                  </Button>
-                </div>
-              ) : null}
-            </div>
-          )}
-        </form.Field>
-      </>
-    );
-  };
+}
+
+/**
+ * The runtime's metrics reader (`spec.metricsReader`): the engine's own, or a route or command
+ * whose output maps to load signals. A preset fills the form; saving writes a new version of
+ * the definition (a new launch: running instances use it after a restart).
+ */
+export function MetricsReaderCard({
+  runtimeId,
+  spec,
+  readOnly,
+}: {
+  runtimeId: string;
+  spec: RuntimeSpec;
+  readOnly: boolean;
+}) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  const queryClient = useQueryClient();
+  const [preset, setPreset] = useState<"" | ReaderPresetId>("");
+  const rowKeys = useRowKeys("reader-map-");
+  const form = useReaderForm({ runtimeId, spec, t, queryClient });
   const applyPreset = (id: "" | ReaderPresetId) => {
     setPreset(id);
     if (id === "") return;
@@ -364,41 +180,14 @@ export function MetricsReaderCard({
           }}
         >
           <fieldset disabled={readOnly} className="flex min-w-0 flex-col gap-4">
-            <div className="min-w-0 space-y-1.5">
-              <Label htmlFor="reader-preset">{t("dashboard:runtime.reader.preset")}</Label>
-              <NativeSelect
-                id="reader-preset"
-                value={preset}
-                onChange={(event) => applyPreset(event.target.value as "" | ReaderPresetId)}
-              >
-                <option value="">{t("dashboard:runtime.reader.pickPreset")}</option>
-                {READER_PRESETS.map((id) => (
-                  <option key={id} value={id}>
-                    {t(`dashboard:runtime.reader.presets.${id}`)}
-                  </option>
-                ))}
-              </NativeSelect>
-            </div>
-            <form.Field name="kind">
-              {(field) => (
-                <div className="min-w-0 space-y-1.5">
-                  <Label htmlFor="reader-kind">{t("dashboard:runtime.reader.kind")}</Label>
-                  <NativeSelect
-                    id="reader-kind"
-                    value={field.state.value}
-                    onChange={(event) => field.handleChange(event.target.value as ReaderKind)}
-                  >
-                    {KINDS.map((kind) => (
-                      <option key={kind} value={kind}>
-                        {t(`dashboard:runtime.reader.kinds.${kind}`)}
-                      </option>
-                    ))}
-                  </NativeSelect>
-                </div>
-              )}
-            </form.Field>
+            <ReaderPresetField preset={preset} onPreset={applyPreset} />
+            <ReaderKindField form={form} />
             <form.Subscribe selector={(state) => state.values.kind}>
-              {(kind) => (kind === "route" || kind === "command" ? readerSource(kind) : null)}
+              {(kind) =>
+                kind === "route" || kind === "command" ? (
+                  <ReaderSource form={form} kind={kind} rowKeys={rowKeys} />
+                ) : null
+              }
             </form.Subscribe>
             <form.Field name="check">{(field) => <FieldErrors field={field} />}</form.Field>
             <form.Subscribe selector={(state) => state.isSubmitting}>
@@ -414,5 +203,310 @@ export function MetricsReaderCard({
         </form>
       </CardContent>
     </Card>
+  );
+}
+
+/** A preset fills the form (picking it is not saved; the form's values are). */
+function ReaderPresetField({
+  preset,
+  onPreset,
+}: {
+  preset: "" | ReaderPresetId;
+  onPreset: (id: "" | ReaderPresetId) => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <div className="min-w-0 space-y-1.5">
+      <Label htmlFor="reader-preset">{t("dashboard:runtime.reader.preset")}</Label>
+      <NativeSelect
+        id="reader-preset"
+        value={preset}
+        onChange={(event) => onPreset(event.target.value as "" | ReaderPresetId)}
+      >
+        <option value="">{t("dashboard:runtime.reader.pickPreset")}</option>
+        {READER_PRESETS.map((id) => (
+          <option key={id} value={id}>
+            {t(`dashboard:runtime.reader.presets.${id}`)}
+          </option>
+        ))}
+      </NativeSelect>
+    </div>
+  );
+}
+
+function ReaderKindField({ form }: { form: ReaderForm }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <form.Field name="kind">
+      {(field) => (
+        <div className="min-w-0 space-y-1.5">
+          <Label htmlFor="reader-kind">{t("dashboard:runtime.reader.kind")}</Label>
+          <NativeSelect
+            id="reader-kind"
+            value={field.state.value}
+            onChange={(event) => field.handleChange(event.target.value as ReaderKind)}
+          >
+            {KINDS.map((kind) => (
+              <option key={kind} value={kind}>
+                {t(`dashboard:runtime.reader.kinds.${kind}`)}
+              </option>
+            ))}
+          </NativeSelect>
+        </div>
+      )}
+    </form.Field>
+  );
+}
+
+function ReaderTextField({
+  form,
+  name,
+  id,
+  label,
+  hint,
+  mono,
+  inputMode,
+}: {
+  form: ReaderForm;
+  name: TextFieldName;
+  id: string;
+  label: string;
+  hint?: string;
+  mono?: boolean;
+  inputMode?: "numeric";
+}) {
+  return (
+    <form.Field name={name}>
+      {(field) => (
+        <div className="min-w-0 space-y-1.5">
+          <Label htmlFor={id}>{label}</Label>
+          <Input
+            id={id}
+            className={mono ? "h-11 font-mono text-xs" : "h-11"}
+            autoCapitalize="none"
+            spellCheck={false}
+            inputMode={inputMode}
+            value={field.state.value}
+            onBlur={field.handleBlur}
+            onChange={(event) => field.handleChange(event.target.value)}
+          />
+          {hint ? <p className="text-xs text-muted-foreground">{hint}</p> : null}
+          <FieldErrors field={field} />
+        </div>
+      )}
+    </form.Field>
+  );
+}
+
+function ReaderFormatField({ form }: { form: ReaderForm }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <form.Field name="format">
+      {(field) => (
+        <div className="min-w-0 space-y-1.5">
+          <Label htmlFor="reader-format">{t("dashboard:runtime.reader.format")}</Label>
+          <NativeSelect
+            id="reader-format"
+            value={field.state.value}
+            onChange={(event) => field.handleChange(event.target.value as "json" | "prometheus")}
+          >
+            <option value="prometheus">{t("dashboard:runtime.reader.formats.prometheus")}</option>
+            <option value="json">{t("dashboard:runtime.reader.formats.json")}</option>
+          </NativeSelect>
+        </div>
+      )}
+    </form.Field>
+  );
+}
+
+/** Where a route or command reader reads, how often, and how its output maps to signals. */
+function ReaderSource({
+  form,
+  kind,
+  rowKeys,
+}: {
+  form: ReaderForm;
+  kind: "route" | "command";
+  rowKeys: RowKeys;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <>
+      <div className="grid min-w-0 gap-3 sm:grid-cols-2">
+        {kind === "route" ? (
+          <>
+            <ReaderTextField
+              form={form}
+              name="route"
+              id="reader-route"
+              label={t("dashboard:runtime.reader.route")}
+              hint={t("dashboard:runtime.reader.routeHint")}
+              mono
+            />
+            <ReaderTextField
+              form={form}
+              name="countRoute"
+              id="reader-count-route"
+              label={t("dashboard:runtime.reader.countRoute")}
+              hint={t("dashboard:runtime.reader.countRouteHint")}
+              mono
+            />
+          </>
+        ) : (
+          <ReaderTextField
+            form={form}
+            name="command"
+            id="reader-command"
+            label={t("dashboard:runtime.reader.command")}
+            hint={t("dashboard:runtime.reader.commandHint")}
+            mono
+          />
+        )}
+        <ReaderFormatField form={form} />
+        <ReaderTextField
+          form={form}
+          name="intervalSecs"
+          id="reader-interval"
+          label={t("dashboard:runtime.reader.interval")}
+          hint={t("dashboard:runtime.reader.intervalHint")}
+          inputMode="numeric"
+        />
+      </div>
+      <ReaderSignalMap form={form} rowKeys={rowKeys} />
+    </>
+  );
+}
+
+/** The signal map's rows (one per load signal) and "Add signal" while a signal is free. */
+function ReaderSignalMap({ form, rowKeys }: { form: ReaderForm; rowKeys: RowKeys }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <form.Field name="map" mode="array">
+      {(map) => (
+        <div className="flex min-w-0 flex-col gap-3">
+          <p className="text-sm font-medium">{t("dashboard:runtime.reader.map")}</p>
+          <p className="text-xs text-muted-foreground">{t("dashboard:runtime.reader.mapHint")}</p>
+          {map.state.value.map((_, index) => (
+            <ReaderSignalRow
+              key={rowKeys.key(index)}
+              form={form}
+              index={index}
+              onRemove={() => {
+                rowKeys.remove(map.state.value.length, index);
+                map.removeValue(index);
+              }}
+            />
+          ))}
+          {nextFreeSignal(map.state.value) ? (
+            <div>
+              <Button
+                type="button"
+                variant="outline"
+                size="touch"
+                onClick={() => {
+                  const signal = nextFreeSignal(map.state.value);
+                  if (signal)
+                    map.pushValue({
+                      signal,
+                      series: "",
+                      aggregate: "",
+                      scale: "",
+                      divideBy: "",
+                    });
+                }}
+              >
+                <Plus aria-hidden="true" />
+                {t("dashboard:runtime.reader.addSignal")}
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      )}
+    </form.Field>
+  );
+}
+
+function ReaderSignalRow({
+  form,
+  index,
+  onRemove,
+}: {
+  form: ReaderForm;
+  index: number;
+  onRemove: () => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <div className="grid min-w-0 gap-3 rounded-lg border p-3 sm:grid-cols-2">
+      <form.Field name={`map[${index}].signal`}>
+        {(field) => (
+          <div className="min-w-0 space-y-1.5">
+            <Label htmlFor={`reader-map-${index}-signal`}>
+              {t("dashboard:runtime.reader.signal")}
+            </Label>
+            <NativeSelect
+              id={`reader-map-${index}-signal`}
+              value={field.state.value}
+              onChange={(event) => field.handleChange(event.target.value as ReaderSignal)}
+            >
+              {READER_SIGNALS.map((signal) => (
+                <option key={signal} value={signal}>
+                  {signal}
+                </option>
+              ))}
+            </NativeSelect>
+            <FieldErrors field={field} />
+          </div>
+        )}
+      </form.Field>
+      {(["series", "divideBy", "scale"] as const).map((name) => (
+        <form.Field key={name} name={`map[${index}].${name}`}>
+          {(field) => (
+            <div className="min-w-0 space-y-1.5">
+              <Label htmlFor={`reader-map-${index}-${name}`}>
+                {t(`dashboard:runtime.reader.fields.${name}`)}
+              </Label>
+              <Input
+                id={`reader-map-${index}-${name}`}
+                className="h-11 font-mono text-xs"
+                autoCapitalize="none"
+                spellCheck={false}
+                inputMode={name === "scale" ? "decimal" : undefined}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
+      ))}
+      <form.Field name={`map[${index}].aggregate`}>
+        {(field) => (
+          <div className="min-w-0 space-y-1.5">
+            <Label htmlFor={`reader-map-${index}-aggregate`}>
+              {t("dashboard:runtime.reader.fields.aggregate")}
+            </Label>
+            <NativeSelect
+              id={`reader-map-${index}-aggregate`}
+              value={field.state.value}
+              onChange={(event) => field.handleChange(event.target.value as ReaderAggregate)}
+            >
+              {AGGREGATES.map((aggregate) => (
+                <option key={aggregate} value={aggregate}>
+                  {t(`dashboard:runtime.reader.aggregates.${aggregate || "default"}`)}
+                </option>
+              ))}
+            </NativeSelect>
+          </div>
+        )}
+      </form.Field>
+      <div className="flex items-end">
+        <Button type="button" variant="ghost" size="touch" onClick={onRemove}>
+          <Trash2 aria-hidden="true" />
+          {t("dashboard:runtime.reader.removeSignal")}
+        </Button>
+      </div>
+    </div>
   );
 }

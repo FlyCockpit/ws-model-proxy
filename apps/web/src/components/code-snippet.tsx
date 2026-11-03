@@ -1,5 +1,5 @@
 import { Button } from "@ws-model-proxy/ui/components/button";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Copy } from "lucide-react";
 import { useTranslation } from "react-i18next";

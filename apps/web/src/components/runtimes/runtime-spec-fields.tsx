@@ -19,6 +19,7 @@ import { useTranslation } from "react-i18next";
 
 import { FieldErrors } from "@/components/field-errors";
 import { NativeSelect } from "@/components/native-select";
+import { useRowKeys } from "@/components/runtimes/use-row-keys";
 import { SegmentedControl } from "@/components/segmented-control";
 import { type FieldGroupOf, withFieldGroup } from "@/hooks/use-app-form";
 import {
@@ -191,6 +192,7 @@ function CheckRow({
  * key of a form made with `useAppForm`. Switching tabs converts between them; parts the form has
  * no inputs for are kept (see `runtime-spec-draft.ts`).
  */
+// react-doctor-disable-next-line react-doctor/only-export-components -- withFieldGroup returns the component itself (React Doctor does not take a customHOCs setting)
 export const RuntimeSpecFields = withFieldGroup({
   defaultValues: editorValues({}) as SpecEditorValues,
   props: {} as { kind: RuntimeKind; idPrefix: string },
@@ -354,6 +356,7 @@ function ModelsSection({
   id: (name: string) => string;
 }) {
   const { t } = useTranslation(["dashboard"]);
+  const rowKeys = useRowKeys("model-");
   return (
     <Section title={t("dashboard:runtime.specForm.serving")}>
       <div className="grid min-w-0 gap-3 sm:grid-cols-3">
@@ -430,7 +433,10 @@ function ModelsSection({
               </p>
             ) : null}
             {models.state.value.map((_, index) => (
-              <div key={index} className="flex min-w-0 flex-col gap-2 rounded-lg border p-3">
+              <div
+                key={rowKeys.key(index)}
+                className="flex min-w-0 flex-col gap-2 rounded-lg border p-3"
+              >
                 <div className="flex min-w-0 items-end gap-2">
                   <div className="min-w-0 flex-1">
                     <group.Field name={`draft.models[${index}].id`}>
@@ -449,7 +455,10 @@ function ModelsSection({
                     variant="ghost"
                     size="icon-touch"
                     aria-label={t("dashboard:runtime.specForm.removeModel")}
-                    onClick={() => models.removeValue(index)}
+                    onClick={() => {
+                      rowKeys.remove(models.state.value.length, index);
+                      models.removeValue(index);
+                    }}
                   >
                     <Trash2 aria-hidden="true" />
                   </Button>
@@ -755,8 +764,110 @@ function groupSizeOf(value: string): number {
   return Number.isInteger(size) && size >= 1 && size <= 64 ? size : 1;
 }
 
+/** The path of one resource draft: a rank's entry, or a reservation's resource. */
+type ResourcePath = `draft.resources[${number}]` | `draft.reservations[${number}].resource`;
+
+/**
+ * One resource's inputs (its kind and what that kind holds), for rank resources and
+ * reservations. `idPrefix` names the inputs (`resource-0`, `reservation-1`).
+ */
+function ResourceFields({
+  group,
+  id,
+  path,
+  idPrefix,
+  kind,
+}: {
+  group: Group;
+  id: (name: string) => string;
+  path: ResourcePath;
+  idPrefix: string;
+  kind: ResourceKind;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <>
+      <group.Field name={`${path}.kind`}>
+        {(field) => (
+          <div className="min-w-0 space-y-1.5">
+            <Label htmlFor={id(`${idPrefix}-kind`)}>
+              {t("dashboard:runtime.specForm.resourceKind")}
+            </Label>
+            <NativeSelect
+              id={id(`${idPrefix}-kind`)}
+              value={field.state.value}
+              onChange={(event) => field.handleChange(event.target.value as ResourceKind)}
+            >
+              {RESOURCE_KINDS.map((option) => (
+                <option key={option} value={option}>
+                  {t(`dashboard:runtime.specForm.resourceKinds.${option}`)}
+                </option>
+              ))}
+            </NativeSelect>
+            <FieldErrors field={field} />
+          </div>
+        )}
+      </group.Field>
+      {kind === "unified" ? (
+        <group.Field name={`${path}.memoryGb`}>
+          {(field) => (
+            <TextInput
+              id={id(`${idPrefix}-memory`)}
+              label={t("dashboard:runtime.specForm.memoryGb")}
+              field={field}
+              inputMode="decimal"
+            />
+          )}
+        </group.Field>
+      ) : null}
+      {kind === "discrete" ? (
+        <>
+          <group.Field name={`${path}.gpuCount`}>
+            {(field) => (
+              <TextInput
+                id={id(`${idPrefix}-gpus`)}
+                label={t("dashboard:runtime.specForm.gpuCount")}
+                field={field}
+                inputMode="numeric"
+              />
+            )}
+          </group.Field>
+          <group.Field name={`${path}.vramGb`}>
+            {(field) => (
+              <TextInput
+                id={id(`${idPrefix}-vram`)}
+                label={t("dashboard:runtime.specForm.vramGb")}
+                field={field}
+                inputMode="decimal"
+              />
+            )}
+          </group.Field>
+          <group.Field name={`${path}.vendor`}>
+            {(field) => <GpuVendorField id={id(`${idPrefix}-vendor`)} field={field} />}
+          </group.Field>
+        </>
+      ) : null}
+      {kind === "cpu" || kind === "discrete" ? (
+        <group.Field name={`${path}.ramGb`}>
+          {(field) => (
+            <TextInput
+              id={id(`${idPrefix}-ram`)}
+              label={t("dashboard:runtime.specForm.ramGb")}
+              hint={kind === "discrete" ? t("dashboard:runtime.specForm.optional") : undefined}
+              field={field}
+              inputMode="decimal"
+            />
+          )}
+        </group.Field>
+      ) : null}
+    </>
+  );
+}
+
 function ResourcesSection({ group, id }: { group: Group; id: (name: string) => string }) {
   const { t } = useTranslation(["dashboard"]);
+  // Rows are ranks (row i is rank i), never removed one by one: the keys stay positional.
+  const rowKeys = useRowKeys("resource-");
   return (
     <Section
       title={t("dashboard:runtime.specForm.resources")}
@@ -766,90 +877,19 @@ function ResourcesSection({ group, id }: { group: Group; id: (name: string) => s
         {(resources) => (
           <>
             {resources.state.value.map((resource, index) => (
-              <div key={index} className="flex min-w-0 flex-col gap-3 rounded-lg border p-3">
+              <div
+                key={rowKeys.key(index)}
+                className="flex min-w-0 flex-col gap-3 rounded-lg border p-3"
+              >
                 <RankTitle index={index} total={resources.state.value.length} />
                 <div className="grid min-w-0 gap-3 sm:grid-cols-2">
-                  <group.Field name={`draft.resources[${index}].kind`}>
-                    {(field) => (
-                      <div className="min-w-0 space-y-1.5">
-                        <Label htmlFor={id(`resource-${index}-kind`)}>
-                          {t("dashboard:runtime.specForm.resourceKind")}
-                        </Label>
-                        <NativeSelect
-                          id={id(`resource-${index}-kind`)}
-                          value={field.state.value}
-                          onChange={(event) =>
-                            field.handleChange(event.target.value as ResourceKind)
-                          }
-                        >
-                          {RESOURCE_KINDS.map((kind) => (
-                            <option key={kind} value={kind}>
-                              {t(`dashboard:runtime.specForm.resourceKinds.${kind}`)}
-                            </option>
-                          ))}
-                        </NativeSelect>
-                        <FieldErrors field={field} />
-                      </div>
-                    )}
-                  </group.Field>
-                  {resource.kind === "unified" ? (
-                    <group.Field name={`draft.resources[${index}].memoryGb`}>
-                      {(field) => (
-                        <TextInput
-                          id={id(`resource-${index}-memory`)}
-                          label={t("dashboard:runtime.specForm.memoryGb")}
-                          field={field}
-                          inputMode="decimal"
-                        />
-                      )}
-                    </group.Field>
-                  ) : null}
-                  {resource.kind === "discrete" ? (
-                    <>
-                      <group.Field name={`draft.resources[${index}].gpuCount`}>
-                        {(field) => (
-                          <TextInput
-                            id={id(`resource-${index}-gpus`)}
-                            label={t("dashboard:runtime.specForm.gpuCount")}
-                            field={field}
-                            inputMode="numeric"
-                          />
-                        )}
-                      </group.Field>
-                      <group.Field name={`draft.resources[${index}].vramGb`}>
-                        {(field) => (
-                          <TextInput
-                            id={id(`resource-${index}-vram`)}
-                            label={t("dashboard:runtime.specForm.vramGb")}
-                            field={field}
-                            inputMode="decimal"
-                          />
-                        )}
-                      </group.Field>
-                      <group.Field name={`draft.resources[${index}].vendor`}>
-                        {(field) => (
-                          <GpuVendorField id={id(`resource-${index}-vendor`)} field={field} />
-                        )}
-                      </group.Field>
-                    </>
-                  ) : null}
-                  {resource.kind === "cpu" || resource.kind === "discrete" ? (
-                    <group.Field name={`draft.resources[${index}].ramGb`}>
-                      {(field) => (
-                        <TextInput
-                          id={id(`resource-${index}-ram`)}
-                          label={t("dashboard:runtime.specForm.ramGb")}
-                          hint={
-                            resource.kind === "discrete"
-                              ? t("dashboard:runtime.specForm.optional")
-                              : undefined
-                          }
-                          field={field}
-                          inputMode="decimal"
-                        />
-                      )}
-                    </group.Field>
-                  ) : null}
+                  <ResourceFields
+                    group={group}
+                    id={id}
+                    path={`draft.resources[${index}]`}
+                    idPrefix={`resource-${index}`}
+                    kind={resource.kind}
+                  />
                 </div>
               </div>
             ))}
@@ -880,6 +920,7 @@ function ResourcesSection({ group, id }: { group: Group; id: (name: string) => s
  */
 function ReservationsSection({ group, id }: { group: Group; id: (name: string) => string }) {
   const { t } = useTranslation(["dashboard"]);
+  const rowKeys = useRowKeys("reservation-");
   return (
     <Section
       title={t("dashboard:runtime.specForm.reservations")}
@@ -889,7 +930,10 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
         {(reservations) => (
           <>
             {reservations.state.value.map((reservation, index) => (
-              <div key={index} className="flex min-w-0 flex-col gap-3 rounded-lg border p-3">
+              <div
+                key={rowKeys.key(index)}
+                className="flex min-w-0 flex-col gap-3 rounded-lg border p-3"
+              >
                 <div className="flex min-w-0 items-center justify-between gap-2">
                   <p className="text-sm font-medium">
                     {t("dashboard:runtime.specForm.reservation", { number: index + 1 })}
@@ -901,7 +945,10 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
                     aria-label={t("dashboard:runtime.specForm.removeReservation", {
                       number: index + 1,
                     })}
-                    onClick={() => reservations.removeValue(index)}
+                    onClick={() => {
+                      rowKeys.remove(reservations.state.value.length, index);
+                      reservations.removeValue(index);
+                    }}
                   >
                     <Trash2 aria-hidden="true" className="size-4" />
                   </Button>
@@ -918,88 +965,13 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
                       />
                     )}
                   </group.Field>
-                  <group.Field name={`draft.reservations[${index}].resource.kind`}>
-                    {(field) => (
-                      <div className="min-w-0 space-y-1.5">
-                        <Label htmlFor={id(`reservation-${index}-kind`)}>
-                          {t("dashboard:runtime.specForm.resourceKind")}
-                        </Label>
-                        <NativeSelect
-                          id={id(`reservation-${index}-kind`)}
-                          value={field.state.value}
-                          onChange={(event) =>
-                            field.handleChange(event.target.value as ResourceKind)
-                          }
-                        >
-                          {RESOURCE_KINDS.map((kind) => (
-                            <option key={kind} value={kind}>
-                              {t(`dashboard:runtime.specForm.resourceKinds.${kind}`)}
-                            </option>
-                          ))}
-                        </NativeSelect>
-                        <FieldErrors field={field} />
-                      </div>
-                    )}
-                  </group.Field>
-                  {reservation.resource.kind === "unified" ? (
-                    <group.Field name={`draft.reservations[${index}].resource.memoryGb`}>
-                      {(field) => (
-                        <TextInput
-                          id={id(`reservation-${index}-memory`)}
-                          label={t("dashboard:runtime.specForm.memoryGb")}
-                          field={field}
-                          inputMode="decimal"
-                        />
-                      )}
-                    </group.Field>
-                  ) : null}
-                  {reservation.resource.kind === "discrete" ? (
-                    <>
-                      <group.Field name={`draft.reservations[${index}].resource.gpuCount`}>
-                        {(field) => (
-                          <TextInput
-                            id={id(`reservation-${index}-gpus`)}
-                            label={t("dashboard:runtime.specForm.gpuCount")}
-                            field={field}
-                            inputMode="numeric"
-                          />
-                        )}
-                      </group.Field>
-                      <group.Field name={`draft.reservations[${index}].resource.vramGb`}>
-                        {(field) => (
-                          <TextInput
-                            id={id(`reservation-${index}-vram`)}
-                            label={t("dashboard:runtime.specForm.vramGb")}
-                            field={field}
-                            inputMode="decimal"
-                          />
-                        )}
-                      </group.Field>
-                      <group.Field name={`draft.reservations[${index}].resource.vendor`}>
-                        {(field) => (
-                          <GpuVendorField id={id(`reservation-${index}-vendor`)} field={field} />
-                        )}
-                      </group.Field>
-                    </>
-                  ) : null}
-                  {reservation.resource.kind === "cpu" ||
-                  reservation.resource.kind === "discrete" ? (
-                    <group.Field name={`draft.reservations[${index}].resource.ramGb`}>
-                      {(field) => (
-                        <TextInput
-                          id={id(`reservation-${index}-ram`)}
-                          label={t("dashboard:runtime.specForm.ramGb")}
-                          hint={
-                            reservation.resource.kind === "discrete"
-                              ? t("dashboard:runtime.specForm.optional")
-                              : undefined
-                          }
-                          field={field}
-                          inputMode="decimal"
-                        />
-                      )}
-                    </group.Field>
-                  ) : null}
+                  <ResourceFields
+                    group={group}
+                    id={id}
+                    path={`draft.reservations[${index}].resource`}
+                    idPrefix={`reservation-${index}`}
+                    kind={reservation.resource.kind}
+                  />
                 </div>
               </div>
             ))}
@@ -1024,6 +996,8 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
 
 function CommandsSection({ group, id }: { group: Group; id: (name: string) => string }) {
   const { t } = useTranslation(["dashboard"]);
+  // Rows are ranks (row i is rank i), never removed one by one: the keys stay positional.
+  const rowKeys = useRowKeys("command-");
   return (
     <Section
       title={t("dashboard:runtime.specForm.commands")}
@@ -1033,7 +1007,10 @@ function CommandsSection({ group, id }: { group: Group; id: (name: string) => st
         {(commands) => (
           <>
             {commands.state.value.map((_, index) => (
-              <div key={index} className="flex min-w-0 flex-col gap-3 rounded-lg border p-3">
+              <div
+                key={rowKeys.key(index)}
+                className="flex min-w-0 flex-col gap-3 rounded-lg border p-3"
+              >
                 <RankTitle index={index} total={commands.state.value.length} />
                 {COMMAND_FIELDS.map((name) => (
                   <group.Field key={name} name={`draft.commands[${index}].${name}`}>

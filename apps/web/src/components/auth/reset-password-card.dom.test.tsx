@@ -23,7 +23,7 @@ const resetPasswordMock = vi.hoisted(() => vi.fn());
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en-US" } }),
 }));
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
 vi.mock("@/lib/auth-client", () => ({

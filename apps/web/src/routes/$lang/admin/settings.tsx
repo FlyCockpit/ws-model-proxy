@@ -16,9 +16,9 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Switch } from "@ws-model-proxy/ui/components/switch";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { HardDrive, Shield, Trash2 } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -291,32 +291,105 @@ function MediaPolicyCard({ data }: { data: MediaAdminStats }) {
   const ttlFieldId = useId();
   const attachmentLimitFieldId = useId();
 
-  const ttlForm = useForm({
-    defaultValues: { hours: String(ttl.hours) },
-    validators: {
-      onChange: z.object({
-        hours: z
-          .string()
-          .refine((v) => /^\d+$/.test(v.trim()), t("admin:settings.media.ttlInvalid"))
-          .refine(
-            (v) => {
-              const n = Number(v);
-              return n >= ttl.min && n <= ttl.max;
-            },
-            t("admin:settings.media.ttlRange", { min: ttl.min, max: ttl.max }),
-          ),
-      }),
-    },
-    onSubmit: ({ value }) => {
-      updateTtl.mutate(
-        { mediaAssetTtlHours: Number(value.hours) },
-        {
-          onSuccess: () => toast.success(t("admin:settings.media.ttlSavedToast")),
-        },
-      );
-    },
-  });
+  const actionsDisabled = !data.uploadEnabled;
 
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <HardDrive className="size-5" />
+          {t("admin:settings.media.title")}
+        </CardTitle>
+        <CardDescription>{t("admin:settings.media.description")}</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {/* Upload capability (read-only, from deploy env) */}
+        <UploadStatusRow uploadEnabled={data.uploadEnabled} />
+
+        <AttachmentLimitSection
+          attachmentLimit={attachmentLimit}
+          fieldId={attachmentLimitFieldId}
+          saving={updateTtl.isPending}
+          onSave={(bytes, onSuccess) =>
+            updateTtl.mutate({ mediaAttachmentMaxBytes: bytes }, { onSuccess })
+          }
+        />
+
+        {/* Editable TTL */}
+        <TtlSection
+          ttl={ttl}
+          fieldId={ttlFieldId}
+          saving={updateTtl.isPending}
+          onSave={(hours, onSuccess) =>
+            updateTtl.mutate({ mediaAssetTtlHours: hours }, { onSuccess })
+          }
+        />
+
+        {/* Aggregate stats (counts only) */}
+        <MediaStatsGrid stats={stats} />
+
+        {/* Purge expired */}
+        <PurgeExpiredRow
+          disabled={actionsDisabled || purgeExpired.isPending}
+          purging={purgeExpired.isPending}
+          onPurge={() => purgeExpired.mutate()}
+        />
+
+        {/* Danger zone: delete all */}
+        <DeleteAllRow
+          disabled={actionsDisabled || stats.assetCount === 0}
+          onDeleteAll={() => setDeleteAllOpen(true)}
+        />
+      </CardContent>
+
+      <ConfirmDeleteDialog
+        open={deleteAllOpen}
+        onOpenChange={setDeleteAllOpen}
+        title={t("admin:settings.media.deleteAllConfirmTitle")}
+        description={t("admin:settings.media.deleteAllConfirmDescription", {
+          count: stats.assetCount,
+        })}
+        confirmToken={t("admin:settings.media.deleteAllConfirmToken")}
+        typePrompt={t("admin:settings.media.deleteAllConfirmPrompt")}
+        copyAriaLabel={t("admin:settings.media.deleteAllCopyLabel")}
+        confirmLabel={t("admin:settings.media.deleteAllAction")}
+        pendingLabel={t("admin:settings.media.deleting")}
+        isPending={deleteAll.isPending}
+        disabled={stats.assetCount === 0}
+        onConfirm={() => deleteAll.mutate()}
+      />
+    </Card>
+  );
+}
+
+function UploadStatusRow({ uploadEnabled }: { uploadEnabled: boolean }) {
+  const { t } = useTranslation(["admin", "common"]);
+  return (
+    <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
+      <div className="space-y-1">
+        <p className="font-medium">{t("admin:settings.media.uploadStatusTitle")}</p>
+        <p className="text-sm text-muted-foreground">
+          {uploadEnabled
+            ? t("admin:settings.media.uploadStatusEnabled")
+            : t("admin:settings.media.uploadStatusDisabled")}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function AttachmentLimitSection({
+  attachmentLimit,
+  fieldId,
+  saving,
+  onSave,
+}: {
+  attachmentLimit: MediaAdminStats["attachmentLimit"];
+  fieldId: string;
+  saving: boolean;
+  onSave: (bytes: number, onSuccess: () => void) => void;
+}) {
+  const { t } = useTranslation(["admin", "common"]);
   const attachmentLimitForm = useForm({
     defaultValues: { bytes: String(attachmentLimit.configuredBytes) },
     validators: {
@@ -339,216 +412,224 @@ function MediaPolicyCard({ data }: { data: MediaAdminStats }) {
       }),
     },
     onSubmit: ({ value }) => {
-      updateTtl.mutate(
-        { mediaAttachmentMaxBytes: Number(value.bytes) },
-        {
-          onSuccess: () => toast.success(t("admin:settings.media.attachmentLimitSavedToast")),
-        },
+      onSave(Number(value.bytes), () =>
+        toast.success(t("admin:settings.media.attachmentLimitSavedToast")),
       );
     },
   });
 
-  const actionsDisabled = !data.uploadEnabled;
+  return (
+    <div className="space-y-3 rounded-lg border p-4">
+      <div className="space-y-1">
+        <p className="font-medium">{t("admin:settings.media.attachmentLimitTitle")}</p>
+        <p className="text-sm text-muted-foreground">
+          {t("admin:settings.media.attachmentLimitDescription")}
+        </p>
+        <p className="text-sm text-muted-foreground">
+          {attachmentLimit.deploymentMaxBytes === null
+            ? t("admin:settings.media.attachmentLimitNoDeploymentCap")
+            : t("admin:settings.media.attachmentLimitDeploymentCap", {
+                max: formatBytes(attachmentLimit.deploymentMaxBytes),
+              })}
+        </p>
+        <p className="text-sm text-muted-foreground">
+          {t("admin:settings.media.attachmentLimitEffective", {
+            max: formatBytes(attachmentLimit.effectiveBytes),
+          })}
+        </p>
+      </div>
+      <form
+        className="flex flex-wrap items-start gap-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          void attachmentLimitForm.handleSubmit();
+        }}
+      >
+        <attachmentLimitForm.Field name="bytes">
+          {(field) => (
+            <div className="space-y-1">
+              <Label htmlFor={fieldId} className="sr-only">
+                {t("admin:settings.media.attachmentLimitTitle")}
+              </Label>
+              <Input
+                id={fieldId}
+                className="min-h-[44px] w-40"
+                type="number"
+                inputMode="numeric"
+                min={MEDIA_ATTACHMENT_MAX_BYTES_MIN}
+                max={MEDIA_ATTACHMENT_MAX_BYTES_MAX}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(e) => field.handleChange(e.target.value)}
+              />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </attachmentLimitForm.Field>
+        <SaveButton saving={saving} />
+      </form>
+    </div>
+  );
+}
+
+function TtlSection({
+  ttl,
+  fieldId,
+  saving,
+  onSave,
+}: {
+  ttl: MediaAdminStats["ttl"];
+  fieldId: string;
+  saving: boolean;
+  onSave: (hours: number, onSuccess: () => void) => void;
+}) {
+  const { t } = useTranslation(["admin", "common"]);
+  const ttlForm = useForm({
+    defaultValues: { hours: String(ttl.hours) },
+    validators: {
+      onChange: z.object({
+        hours: z
+          .string()
+          .refine((v) => /^\d+$/.test(v.trim()), t("admin:settings.media.ttlInvalid"))
+          .refine(
+            (v) => {
+              const n = Number(v);
+              return n >= ttl.min && n <= ttl.max;
+            },
+            t("admin:settings.media.ttlRange", { min: ttl.min, max: ttl.max }),
+          ),
+      }),
+    },
+    onSubmit: ({ value }) => {
+      onSave(Number(value.hours), () => toast.success(t("admin:settings.media.ttlSavedToast")));
+    },
+  });
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <HardDrive className="size-5" />
-          {t("admin:settings.media.title")}
-        </CardTitle>
-        <CardDescription>{t("admin:settings.media.description")}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        {/* Upload capability (read-only, from deploy env) */}
-        <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
-          <div className="space-y-1">
-            <p className="font-medium">{t("admin:settings.media.uploadStatusTitle")}</p>
-            <p className="text-sm text-muted-foreground">
-              {data.uploadEnabled
-                ? t("admin:settings.media.uploadStatusEnabled")
-                : t("admin:settings.media.uploadStatusDisabled")}
-            </p>
-          </div>
-        </div>
+    <div className="space-y-3 rounded-lg border p-4">
+      <div className="space-y-1">
+        <p className="font-medium">{t("admin:settings.media.ttlTitle")}</p>
+        <p className="text-sm text-muted-foreground">{t("admin:settings.media.ttlDescription")}</p>
+        <p className="text-sm text-muted-foreground">
+          {t("admin:settings.media.ttlHint", { min: ttl.min, max: ttl.max })}
+        </p>
+      </div>
+      <form
+        className="flex flex-wrap items-start gap-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          void ttlForm.handleSubmit();
+        }}
+      >
+        <ttlForm.Field name="hours">
+          {(field) => (
+            <div className="space-y-1">
+              <Label htmlFor={fieldId} className="sr-only">
+                {t("admin:settings.media.ttlTitle")}
+              </Label>
+              <Input
+                id={fieldId}
+                className="min-h-[44px] w-28"
+                type="number"
+                inputMode="numeric"
+                min={ttl.min}
+                max={ttl.max}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(e) => field.handleChange(e.target.value)}
+              />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </ttlForm.Field>
+        <SaveButton saving={saving} />
+      </form>
+    </div>
+  );
+}
 
-        <div className="space-y-3 rounded-lg border p-4">
-          <div className="space-y-1">
-            <p className="font-medium">{t("admin:settings.media.attachmentLimitTitle")}</p>
-            <p className="text-sm text-muted-foreground">
-              {t("admin:settings.media.attachmentLimitDescription")}
-            </p>
-            <p className="text-sm text-muted-foreground">
-              {attachmentLimit.deploymentMaxBytes === null
-                ? t("admin:settings.media.attachmentLimitNoDeploymentCap")
-                : t("admin:settings.media.attachmentLimitDeploymentCap", {
-                    max: formatBytes(attachmentLimit.deploymentMaxBytes),
-                  })}
-            </p>
-            <p className="text-sm text-muted-foreground">
-              {t("admin:settings.media.attachmentLimitEffective", {
-                max: formatBytes(attachmentLimit.effectiveBytes),
-              })}
-            </p>
-          </div>
-          <form
-            className="flex flex-wrap items-start gap-3"
-            onSubmit={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              void attachmentLimitForm.handleSubmit();
-            }}
-          >
-            <attachmentLimitForm.Field name="bytes">
-              {(field) => (
-                <div className="space-y-1">
-                  <Label htmlFor={attachmentLimitFieldId} className="sr-only">
-                    {t("admin:settings.media.attachmentLimitTitle")}
-                  </Label>
-                  <Input
-                    id={attachmentLimitFieldId}
-                    className="min-h-[44px] w-40"
-                    type="number"
-                    inputMode="numeric"
-                    min={MEDIA_ATTACHMENT_MAX_BYTES_MIN}
-                    max={MEDIA_ATTACHMENT_MAX_BYTES_MAX}
-                    value={field.state.value}
-                    onBlur={field.handleBlur}
-                    onChange={(e) => field.handleChange(e.target.value)}
-                  />
-                  <FieldErrors field={field} />
-                </div>
-              )}
-            </attachmentLimitForm.Field>
-            <Button type="submit" className="min-h-[44px]" disabled={updateTtl.isPending}>
-              {updateTtl.isPending ? t("admin:settings.updating") : t("common:actions.save")}
-            </Button>
-          </form>
-        </div>
+function SaveButton({ saving }: { saving: boolean }) {
+  const { t } = useTranslation(["admin", "common"]);
+  return (
+    <Button type="submit" className="min-h-[44px]" disabled={saving}>
+      {saving ? t("admin:settings.updating") : t("common:actions.save")}
+    </Button>
+  );
+}
 
-        {/* Editable TTL */}
-        <div className="space-y-3 rounded-lg border p-4">
-          <div className="space-y-1">
-            <p className="font-medium">{t("admin:settings.media.ttlTitle")}</p>
-            <p className="text-sm text-muted-foreground">
-              {t("admin:settings.media.ttlDescription")}
-            </p>
-            <p className="text-sm text-muted-foreground">
-              {t("admin:settings.media.ttlHint", { min: ttl.min, max: ttl.max })}
-            </p>
-          </div>
-          <form
-            className="flex flex-wrap items-start gap-3"
-            onSubmit={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              void ttlForm.handleSubmit();
-            }}
-          >
-            <ttlForm.Field name="hours">
-              {(field) => (
-                <div className="space-y-1">
-                  <Label htmlFor={ttlFieldId} className="sr-only">
-                    {t("admin:settings.media.ttlTitle")}
-                  </Label>
-                  <Input
-                    id={ttlFieldId}
-                    className="min-h-[44px] w-28"
-                    type="number"
-                    inputMode="numeric"
-                    min={ttl.min}
-                    max={ttl.max}
-                    value={field.state.value}
-                    onBlur={field.handleBlur}
-                    onChange={(e) => field.handleChange(e.target.value)}
-                  />
-                  <FieldErrors field={field} />
-                </div>
-              )}
-            </ttlForm.Field>
-            <Button type="submit" className="min-h-[44px]" disabled={updateTtl.isPending}>
-              {updateTtl.isPending ? t("admin:settings.updating") : t("common:actions.save")}
-            </Button>
-          </form>
-        </div>
-
-        {/* Aggregate stats (counts only) */}
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <MediaStat
-            label={t("admin:settings.media.statAssetCount")}
-            value={String(stats.assetCount)}
-          />
-          <MediaStat
-            label={t("admin:settings.media.statTotalBytes")}
-            value={formatBytes(stats.totalBytes)}
-          />
-          <MediaStat
-            label={t("admin:settings.media.statExpired")}
-            value={String(stats.expiredCount)}
-          />
-        </div>
-
-        {/* Purge expired */}
-        <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
-          <div className="space-y-1">
-            <p className="font-medium">{t("admin:settings.media.purgeTitle")}</p>
-            <p className="text-sm text-muted-foreground">
-              {t("admin:settings.media.purgeDescription")}
-            </p>
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            className="min-h-[44px]"
-            disabled={actionsDisabled || purgeExpired.isPending}
-            onClick={() => purgeExpired.mutate()}
-          >
-            {purgeExpired.isPending
-              ? t("admin:settings.media.purging")
-              : t("admin:settings.media.purgeAction")}
-          </Button>
-        </div>
-
-        {/* Danger zone: delete all */}
-        <div className="flex items-start justify-between gap-4 rounded-lg border border-destructive/40 p-4">
-          <div className="space-y-1">
-            <p className="flex items-center gap-2 font-medium text-destructive">
-              <Trash2 className="size-4" />
-              {t("admin:settings.media.deleteAllTitle")}
-            </p>
-            <p className="text-sm text-muted-foreground">
-              {t("admin:settings.media.deleteAllDescription")}
-            </p>
-          </div>
-          <Button
-            variant="destructive"
-            size="sm"
-            className="min-h-[44px]"
-            disabled={actionsDisabled || stats.assetCount === 0}
-            onClick={() => setDeleteAllOpen(true)}
-          >
-            {t("admin:settings.media.deleteAllAction")}
-          </Button>
-        </div>
-      </CardContent>
-
-      <ConfirmDeleteDialog
-        open={deleteAllOpen}
-        onOpenChange={setDeleteAllOpen}
-        title={t("admin:settings.media.deleteAllConfirmTitle")}
-        description={t("admin:settings.media.deleteAllConfirmDescription", {
-          count: stats.assetCount,
-        })}
-        confirmToken={t("admin:settings.media.deleteAllConfirmToken")}
-        typePrompt={t("admin:settings.media.deleteAllConfirmPrompt")}
-        copyAriaLabel={t("admin:settings.media.deleteAllCopyLabel")}
-        confirmLabel={t("admin:settings.media.deleteAllAction")}
-        pendingLabel={t("admin:settings.media.deleting")}
-        isPending={deleteAll.isPending}
-        disabled={stats.assetCount === 0}
-        onConfirm={() => deleteAll.mutate()}
+function MediaStatsGrid({ stats }: { stats: MediaAdminStats["stats"] }) {
+  const { t } = useTranslation(["admin", "common"]);
+  return (
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <MediaStat
+        label={t("admin:settings.media.statAssetCount")}
+        value={String(stats.assetCount)}
       />
-    </Card>
+      <MediaStat
+        label={t("admin:settings.media.statTotalBytes")}
+        value={formatBytes(stats.totalBytes)}
+      />
+      <MediaStat label={t("admin:settings.media.statExpired")} value={String(stats.expiredCount)} />
+    </div>
+  );
+}
+
+function PurgeExpiredRow({
+  disabled,
+  purging,
+  onPurge,
+}: {
+  disabled: boolean;
+  purging: boolean;
+  onPurge: () => void;
+}) {
+  const { t } = useTranslation(["admin", "common"]);
+  return (
+    <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
+      <div className="space-y-1">
+        <p className="font-medium">{t("admin:settings.media.purgeTitle")}</p>
+        <p className="text-sm text-muted-foreground">
+          {t("admin:settings.media.purgeDescription")}
+        </p>
+      </div>
+      <Button
+        variant="outline"
+        size="sm"
+        className="min-h-[44px]"
+        disabled={disabled}
+        onClick={onPurge}
+      >
+        {purging ? t("admin:settings.media.purging") : t("admin:settings.media.purgeAction")}
+      </Button>
+    </div>
+  );
+}
+
+function DeleteAllRow({ disabled, onDeleteAll }: { disabled: boolean; onDeleteAll: () => void }) {
+  const { t } = useTranslation(["admin", "common"]);
+  return (
+    <div className="flex items-start justify-between gap-4 rounded-lg border border-destructive/40 p-4">
+      <div className="space-y-1">
+        <p className="flex items-center gap-2 font-medium text-destructive">
+          <Trash2 className="size-4" />
+          {t("admin:settings.media.deleteAllTitle")}
+        </p>
+        <p className="text-sm text-muted-foreground">
+          {t("admin:settings.media.deleteAllDescription")}
+        </p>
+      </div>
+      <Button
+        variant="destructive"
+        size="sm"
+        className="min-h-[44px]"
+        disabled={disabled}
+        onClick={onDeleteAll}
+      >
+        {t("admin:settings.media.deleteAllAction")}
+      </Button>
+    </div>
   );
 }
 

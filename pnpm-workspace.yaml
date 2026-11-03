@@ -4,31 +4,10 @@ packages:
 minimumReleaseAge: 10080
 minimumReleaseAgeStrict: true
 minimumReleaseAgeIgnoreMissingTime: false
-# Excludes for packages that fail the 7-day minimum-age check on re-resolution.
-minimumReleaseAgeExclude:
-  # Security releases are allowed through immediately; exact pins keep the
-  # exception from weakening the age gate for future versions.
-  - "@fastify/busboy@3.2.2" # multipart CR/LF injection security release; exact pin
-  # GHSA-68fv-2mgg-jv7q / CVE-2026-93749 (high). 1.2.2 was published
-  # 2026-09-30T14:08Z; drop this entry once it clears the gate (2026-10-07T14:08Z).
-  - source-map-js@1.2.2
-  # GHSA-qx66-fv34-fjm8: patched Start and its matching dependency releases.
-  - "@tanstack/react-start@1.168.60"
-  - "@tanstack/react-router@1.170.41"
-  - "@tanstack/react-store@0.11.2"
-  - "@tanstack/router-core@1.171.34"
-  - "@tanstack/router-generator@1.167.40"
-  - "@tanstack/router-plugin@1.168.42"
-  - "@tanstack/react-start-client@1.168.39"
-  - "@tanstack/react-start-rsc@0.1.59"
-  - "@tanstack/react-start-server@1.167.46"
-  - "@tanstack/start-client-core@1.170.34"
-  - "@tanstack/start-plugin-core@1.171.49"
-  - "@tanstack/start-server-core@1.169.39"
-  - "@tanstack/start-storage-context@1.167.36"
 # Each selector lifts a transitive out of its vulnerable range. Selectors are
-# scoped tightly so unrelated majors are untouched; explicitly listed security
-# releases above are the only exceptions to the 7-day minimum-age gate.
+# scoped tightly so unrelated majors are untouched. Every target must clear the
+# 7-day minimum-age gate; a security release that cannot wait goes in a
+# minimumReleaseAgeExclude list as an exact pin.
 overrides:
   hono@<4.12.25: ">=4.12.25" # CVE-2026-54290 (CORS credential origin reflection)
   picomatch@>=4 <4.0.4: ">=4.0.4" # CVE-2026-33671 (ReDoS via extglob)
@@ -44,7 +23,7 @@ overrides:
   # CVE-2026-69192 (<10.3.1) plus four moderate advisories through 10.7.0.
   # 10.7.2 is the newest release that clears the 7-day gate.
   "ip-address@>=10 <10.7.2": 10.7.2
-  "source-map-js@<1.2.2": 1.2.2 # GHSA-68fv-2mgg-jv7q / CVE-2026-93749 (high); see minimumReleaseAgeExclude
+  "source-map-js@<1.2.2": 1.2.2 # GHSA-68fv-2mgg-jv7q / CVE-2026-93749 (high)
   # GHSA-p6vx-979v-rg4c (critical, <=1.6.0) / GHSA-jp82-f5mq-hwhp (high,
   # <=1.6.2) / GHSA-97r2-qh9m-474h and CVE-2026-116580 (high, <=1.6.7).
   # @tanstack/query-devtools 5.103+ depends on solid-js at runtime, and
@@ -60,19 +39,17 @@ overrides:
   # sharp-ico depends on sharp "*", so the ranged override above does not
   # select it and the lock stays on 0.35.0 without this parent pin.
   "sharp-ico@0.1.5>sharp": 0.35.5
-  # Prisma 7.10.0 depends on mysql2 3.15.3 exactly (GHSA-3f6p-5ww8-9rcr,
-  # patched in 3.22.0). 3.24.4 is the newest 3.x that clears the age gate.
-  # better-auth only peers mysql2 ^3 and dedupes onto Prisma's copy.
+  # GHSA-3f6p-5ww8-9rcr (patched in 3.22.0). Prisma 7.10.1 depends on mysql2
+  # 3.24.4 itself and better-auth only peers ^3, so this is a floor only.
   "mysql2@<3.22.0": 3.24.4
-  "prisma@7.10.0>mysql2": 3.24.4
-  "better-auth@1.7.7>mysql2": 3.24.4
   # CVE-2026-13697; GHSA-rfgv-xxqx-mfg5 (DoS) / GHSA-w293-vg96-wgc3 (TLS validation
   # bypass) below 7.29.1, and GHSA-xjj6-f33q-929c (high) below 7.30.1 / 8.12.2.
   "undici@>=7 <7.30.1": 7.30.1
   "undici@>=8 <8.12.2": 8.12.2
-  # GHSA-mrhx-c7xc-m3w5 (high, DoS via unbounded array validation). The catalog
-  # already asks for ^4.6.6; @better-auth/core resolved its own 4.6.5 copy.
-  "zod@>=4 <4.6.6": 4.6.6
+  # GHSA-mrhx-c7xc-m3w5 (high, DoS via unbounded array validation, patched in
+  # 4.6.6). @better-auth/core resolved its own older copy; lifting every 4.x below
+  # the catalog's 4.6.7 to it keeps a single installed zod.
+  "zod@>=4 <4.6.7": 4.6.7
   # CVE-2026-44635 (JSON-path injection) is patched in 0.28.17. Pinned EXACT
   # (not just `>=0.28.17`) to dedupe to a single installed copy: better-auth
   # 1.7.3 declares kysely as a DEPENDENCY (`^0.28.17 || ^0.29.0`, no kysely
@@ -83,11 +60,12 @@ overrides:
   # exactly one 0.28.17. kysely is only used transitively via better-auth here.
   kysely: 0.28.17
   path-to-regexp@>=8 <8.4.0: ">=8.4.0" # CVE-2026-4926 (ReDoS)
-  # Peer-range alignment after 2026-06 dependency refresh. These are scoped to
-  # the packages that declare the peers and all target releases are older than
-  # the 7-day minimumReleaseAge gate.
-  "vite-plugin-pwa@1.3.0>workbox-build": 7.4.1
-  # workbox-build transitives — vite-plugin-pwa 1.3.0 → workbox-build 7.4.1 is
+  # workbox-build 7.4.1 (the newest) still asks for glob ^11, and every glob 11
+  # release is deprecated upstream (old versions with published advisories).
+  # Its glob() / hasMagic() calls are unchanged in 13; the build check compares
+  # the generated precache list. Drop once workbox-build takes glob >=13.
+  "workbox-build@7.4.1>glob": 13.0.6
+  # workbox-build transitives — vite-plugin-pwa 2.0.0 → workbox-build 7.4.1 is
   # the latest upstream release and still pulls in vulnerable versions. Drop
   # these overrides if workbox-build patches the chain.
   serialize-javascript@<7.1.2: ">=7.1.2" # GHSA-5c6j-r48x-rmvq (RCE via RegExp.flags) / GHSA-gfhx-hw2g-v5hg
@@ -99,12 +77,6 @@ savePrefix: ""
 peerDependencyRules:
   allowedVersions:
     vite: "*"
-    # vite-plugin-pwa@1.3.0 peers @vite-pwa/assets-generator@^1, but we only use
-    # the standalone `pwa-assets-generator` CLI (pwa-assets.config.ts), not the
-    # plugin's `assets` integration, so v2 never loads through the plugin. The
-    # config API (defineConfig, minimal2023Preset) is unchanged in v2. Drop this
-    # once vite-plugin-pwa peers assets-generator@^2.
-    "@vite-pwa/assets-generator": "*"
 # Prisma 7.9.1 pins deepmerge-ts 7.1.5 exactly. The advisory requires two
 # attacker-controlled circular JavaScript object graphs; Prisma only uses it to
 # merge trusted local configuration, and plain JSON cannot trigger the issue.
@@ -123,9 +95,9 @@ allowBuilds:
 # Catalog: single-version deps shared across workspace packages.
 # Bump shared dependency versions here, not in individual package.json files.
 catalog:
-  "@fastify/busboy": 3.2.3
-  dotenv: ^18.0.7
-  zod: ^4.6.6
+  "@fastify/busboy": 3.2.4
+  dotenv: ^18.0.9
+  zod: ^4.6.7
   "@types/node": ^26.6.5
   "@types/ws": ^8.18.2
   # Types for pg (packages/db); keep on the pg 8.x line of packages/db.
@@ -135,65 +107,65 @@ catalog:
   # query_timeout normalization). Bump deliberately, re-check those lines,
   # and run the PostgreSQL suites that pg-internals.ts names.
   pg: 8.23.1
-  hono: ^4.13.13
-  "@orpc/server": ^1.15.5
-  "@orpc/openapi": ^1.15.5
-  "@orpc/zod": ^1.15.5
+  hono: ^4.13.14
+  "@orpc/server": ^1.16.1
+  "@orpc/openapi": ^1.16.1
+  "@orpc/zod": ^1.16.1
   # Exact pins: the 1.7.x family must stay aligned so @better-auth/core and
-  # plugin types resolve to a single copy. 1.7.7 is the newest release that
+  # plugin types resolve to a single copy. 1.7.14 is the newest release that
   # passes the 7-day minimumReleaseAge gate; bump the whole family together.
-  better-auth: 1.7.7
-  "@better-auth/oauth-provider": 1.7.7
-  "@better-auth/mcp": 1.7.7
-  "@better-auth/cimd": 1.7.7
+  better-auth: 1.7.14
+  "@better-auth/oauth-provider": 1.7.14
+  "@better-auth/mcp": 1.7.14
+  "@better-auth/cimd": 1.7.14
   # MCP SDK v2 (server transport). Exact pin: the handler/auth-adapter API
   # surface is versioned with the protocol; bump deliberately.
-  "@modelcontextprotocol/server": 2.3.1
-  lucide-react: ^1.55.0
+  "@modelcontextprotocol/server": 2.4.0
+  lucide-react: ^1.62.0
   next-themes: ^0.4.6
-  react: ^19.3.0
-  react-dom: ^19.3.0
+  react: ^19.3.1
+  react-dom: ^19.3.1
   # Required recharts peer; keep aligned with react.
-  react-is: ^19.3.0
+  react-is: ^19.3.1
   # shadcn chart component (packages/ui/src/components/chart.tsx).
   recharts: ^3.10.1
   # Test page chat answers (apps/web/src/components/test/chat-markdown.tsx).
   # Exact pins, as master had them; raw HTML stays off (no rehype-raw).
   react-markdown: 10.1.0
   remark-gfm: 4.0.1
-  sileo: ^0.1.5
-  "@prisma/client": ^7.10.0
-  "@orpc/client": ^1.15.5
+  sileo: ^0.1.6
+  "@prisma/client": ^7.10.1
+  "@orpc/client": ^1.16.1
   "@types/react": ^19.3.0
   "@types/react-dom": ^19.3.0
   "@testing-library/react": 16.3.3
-  "@testing-library/user-event": 14.6.7
+  "@testing-library/user-event": 14.6.8
   tailwindcss: ^4.3.3
   typescript: ^7.0.2
-  vite: ^8.3.4
+  vite: ^8.3.5
   "@vitejs/plugin-react": ^6.1.2
-  postcss: ^8.5.29
+  postcss: ^8.5.32
   "@tanstack/react-form": ^1.33.5
-  "@tanstack/react-query": ^5.104.2
-  "@tanstack/react-query-devtools": ^5.104.2
-  "@tanstack/react-router": ^1.170.42
+  "@tanstack/react-query": ^5.105.0
+  "@tanstack/react-query-devtools": ^5.105.0
+  "@tanstack/react-router": ^1.170.46
   "@tanstack/react-router-devtools": ^1.167.2
   "@tanstack/react-router-ssr-query": ^1.167.3
-  "@tanstack/react-start": ^1.168.61
+  "@tanstack/react-start": ^1.169.4
   tsx: ^4.23.15
-  vitest: ^5.0.3
+  vitest: ^5.0.5
   vitest-mock-extended: ^5.1.1
-  rate-limiter-flexible: ^11.2.1
+  rate-limiter-flexible: ^11.2.3
   ws: ^8.22.0
-  nodemailer: ^10.1.0
+  nodemailer: ^10.2.1
   "@types/nodemailer": ^8.0.2
-  tsdown: ^0.23.1
-  i18next: ^26.4.3
-  jsdom: 30.1.2
-  react-i18next: ^17.0.16
-  i18next-browser-languagedetector: ^8.2.1
-  openai: ^7.32.0
-  "@anthropic-ai/sdk": ^0.129.0
+  tsdown: ^0.23.2
+  i18next: ^26.5.11
+  jsdom: 30.1.3
+  react-i18next: ^17.1.9
+  i18next-browser-languagedetector: ^8.2.3
+  openai: ^7.45.0
+  "@anthropic-ai/sdk": ^1.3.0
   "qrcode.react": ^4.2.0
   "@fontsource-variable/inter": ^5.3.0
   # xterm.js 6 plus the fit and web-links addons published for that line.

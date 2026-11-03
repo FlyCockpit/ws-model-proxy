@@ -1,4 +1,4 @@
-FROM node:24-slim AS base
+FROM node:26-slim AS base
 
 ARG APT_CACHE_DATE=static
 
@@ -6,8 +6,8 @@ ARG APT_CACHE_DATE=static
 #   - openssl: required by Prisma query engine
 #   - postgresql-client: provides psql, used by docker-entrypoint.sh to hold a
 #     Postgres advisory lock around `prisma db push` (multi-replica safety).
-# `apt-get upgrade` pulls the latest Debian 12 security patches for packages
-# already in node:24-slim (glibc, libcap2, systemd libs, etc.) — the base image
+# `apt-get upgrade` pulls the latest Debian 13 security patches for packages
+# already in node:26-slim (glibc, libcap2, systemd libs, etc.) — the base image
 # lags the Debian point release, so Trivy fails on fixable HIGH CVEs without it.
 RUN echo "APT cache date: ${APT_CACHE_DATE}" && apt-get update -y && apt-get upgrade -y && apt-get install -y \
   openssl \
@@ -26,7 +26,9 @@ RUN apt-get update -y && apt-get install -y \
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 ENV NODE_OPTIONS="--max-old-space-size=4096"
-RUN corepack enable && corepack prepare pnpm@11.28.5 --activate
+# Node 25+ no longer bundles corepack, so pnpm comes from npm (build stages only).
+# Keep the version equal to package.json's packageManager.
+RUN npm install -g pnpm@12.16.0
 
 # --- Builder stage ---
 # pnpm install runs here with source files present so workspace symlinks resolve correctly
@@ -93,23 +95,18 @@ ARG BUILD_VERSION=""
 ENV BUILD_VERSION=$BUILD_VERSION
 
 # --- Turborepo Remote Cache ---
-# Shipped present-but-inert: with both empty (the default on a fresh clone),
-# turbo reports NotLinked and the build runs normally with local cache only —
-# no error, no behavior change ("just skips"). Set TURBO_TOKEN + TURBO_TEAM
-# (BOTH required; a token alone is ignored) to make `turbo build` replay cached
-# app outputs from Vercel's free remote cache. Pass them explicitly as build
-# args when your platform does not forward build-time env vars, e.g.
-# `docker build --build-arg TURBO_TOKEN=… --build-arg TURBO_TEAM=…`. Self-host
-# instead? add a matching `ARG TURBO_API=""` here and point it at your cache
-# (see the pattern doc). Builder stage ONLY — the final runner stage is
-# FROM base and never inherits these ENVs, so the token never ships in the
-# image.
-ARG TURBO_TOKEN=""
+# Optional and off by default: with no token, turbo reports NotLinked and the build runs
+# normally with its local cache only. To replay cached app outputs from a remote cache, set
+# BOTH a team and a token (a token alone is ignored). The token is a BuildKit secret, never a
+# build arg (build args are recorded in the image history):
+#   docker build --secret id=turbo_token,env=TURBO_TOKEN --build-arg TURBO_TEAM=… .
+# The secret exists only for the build command below; no layer, ENV or later stage keeps it.
+# Self-host the cache? add a matching `ARG TURBO_API=""` and pass it on the same command.
 ARG TURBO_TEAM=""
-ENV TURBO_TOKEN=$TURBO_TOKEN \
-    TURBO_TEAM=$TURBO_TEAM
-
-RUN pnpm turbo build --filter=server --filter=web
+RUN --mount=type=secret,id=turbo_token,required=false \
+    TURBO_TOKEN="$(cat /run/secrets/turbo_token 2>/dev/null || true)" \
+    TURBO_TEAM="$TURBO_TEAM" \
+    pnpm turbo build --filter=server --filter=web
 
 # Verify build outputs exist
 RUN test -f apps/server/dist/index.mjs && test -d apps/web/dist/client && test -d apps/web/dist/server
@@ -227,7 +224,7 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh ./scripts/backup.sh
 # Build stages keep npm; this only affects the final runner image.
 RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
-# Drop privileges. The `node` user (uid 1000) ships in node:24-slim. The
+# Drop privileges. The `node` user (uid 1000) ships in node:26-slim. The
 # server only reads /app at runtime; the entrypoint's writes go to /tmp
 # (mktemp) and to Postgres over the network, so no chown of /app is needed.
 USER node

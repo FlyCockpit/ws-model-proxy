@@ -1,5 +1,6 @@
 import { Link, Outlet } from "@tanstack/react-router";
-import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
+import { Button } from "@ws-model-proxy/ui/components/button";
+import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { PanelLeft } from "lucide-react";
 import { useTranslation } from "react-i18next";

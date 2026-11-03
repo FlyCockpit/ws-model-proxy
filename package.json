@@ -64,21 +64,21 @@
     "postinstall": "lefthook install"
   },
   "devDependencies": {
-    "@babel/parser": "^8.0.7",
-    "@biomejs/biome": "^2.5.15",
-    "@inquirer/prompts": "^8.7.3",
+    "@babel/parser": "^8.0.8",
+    "@biomejs/biome": "^2.6.3",
+    "@inquirer/prompts": "^8.7.5",
     "@types/node": "catalog:",
     "@ws-model-proxy/config": "workspace:*",
     "@ws-model-proxy/env": "workspace:*",
     "@ws-model-proxy/i18n-translate": "workspace:*",
     "dotenv": "catalog:",
-    "knip": "^6.41.0",
-    "lefthook": "^2.2.1",
-    "react-doctor": "^0.9.17",
+    "knip": "^6.43.0",
+    "lefthook": "^2.2.2",
+    "react-doctor": "^0.9.18",
     "tsx": "catalog:",
-    "turbo": "^2.11.7",
+    "turbo": "^2.11.10",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
-  "packageManager": "pnpm@11.28.5+sha512.484563d30b4c2ad27cb48aa94ff2b302dbcebc8ff6bf28816c2589886e146ce7f76f354f3bc1a438e6f5e9768c302aa0a6f7add8232903cd4cf81426cbc14d9e"
+  "packageManager": "pnpm@12.16.0+sha512.e9ccc91a0b8d52da297c16841f9ee05f3ddd631bd757ef26a211687d4a38de653c614453649294438c58be74c2ba62d53e633a4e153708c012296d0f3ee27b36"
 }

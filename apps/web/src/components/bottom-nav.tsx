@@ -1,6 +1,6 @@
 import { Link, useParams } from "@tanstack/react-router";
-import { buttonVariants } from "@ws-model-proxy/ui/components/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@ws-model-proxy/ui/components/sheet";
+import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";

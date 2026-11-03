@@ -119,8 +119,7 @@ async function checkPermission(tx: Prisma.TransactionClient, input: LocalSendBin
       },
     });
     if (
-      !member ||
-      member.kind !== "LOCAL" ||
+      member?.kind !== "LOCAL" ||
       member.state !== "ACTIVE" ||
       member.runtimeModelId !== input.runtimeModelId ||
       (member.shareId ?? null) !== (pool.contributedShareId ?? null)
@@ -129,8 +128,7 @@ async function checkPermission(tx: Prisma.TransactionClient, input: LocalSendBin
     if (member!.shareId) {
       const share = member!.Share;
       if (
-        !share ||
-        !share.canContribute ||
+        !share?.canContribute ||
         share.poolId !== pool.id ||
         share.granteeUserId !== input.engineOwnerUserId
       )

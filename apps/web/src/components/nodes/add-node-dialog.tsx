@@ -1,6 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
+import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Dialog,
   DialogContent,
@@ -19,12 +19,14 @@ import {
   SelectValue,
 } from "@ws-model-proxy/ui/components/select";
 import { Switch } from "@ws-model-proxy/ui/components/switch";
+import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { SegmentedControl } from "@/components/segmented-control";
 import { orpc } from "@/utils/orpc";
+import { parseLabels } from "./add-node-dialog-utils";
 import { EnrollmentPanel } from "./enrollment-panel";
 import { FieldError } from "./field-error";
 import type { EnrollmentResult } from "./node-types";
@@ -33,17 +35,6 @@ import { refusalToastOptions } from "./refusal";
 const LABEL_PATTERN = /^[a-z][a-z0-9-]{0,62}$/;
 const HOUR_MS = 3_600_000;
 const TTL_OPTIONS = ["1", "24", "168"] as const;
-
-export function parseLabels(text: string): string[] {
-  return [
-    ...new Set(
-      text
-        .split(/[\s,]+/)
-        .map((label) => label.trim())
-        .filter(Boolean),
-    ),
-  ];
-}
 
 function buildSchema(t: (key: string) => string) {
   return z

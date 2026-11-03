@@ -8,7 +8,8 @@ import { TimeAgo } from "@/components/time-ago";
 
 import { isTerminalPhase } from "@/lib/agent-update";
 
-import { ConnectionBadge, formatGb, NodeFlags, StatusPill, TrustBadge } from "./node-badges";
+import { ConnectionBadge, NodeFlags, StatusPill, TrustBadge } from "./node-badges";
+import { formatGb } from "./node-badges-utils";
 import type { NodeAgentUpdateView, NodeSummary } from "./node-types";
 
 export function NodeCard({

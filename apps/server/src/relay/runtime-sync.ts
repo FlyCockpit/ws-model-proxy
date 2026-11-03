@@ -405,7 +405,7 @@ export function createRuntimeSync(
       });
     }
     const session = relay.nodeSession(nodeId);
-    if (!session || session.trust !== "full") {
+    if (session?.trust !== "full") {
       drainQueued(nodeId);
       return null;
     }

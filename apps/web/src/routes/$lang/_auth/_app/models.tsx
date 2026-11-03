@@ -1,6 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { buttonVariants } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
   CardContent,
@@ -9,6 +8,7 @@ import {
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { FlaskConical } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";

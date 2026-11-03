@@ -1,5 +1,5 @@
 import { type Mutation, MutationCache } from "@tanstack/react-query";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 
 import { deletionConflictMessageKey, friendly } from "./friendly-error";
 

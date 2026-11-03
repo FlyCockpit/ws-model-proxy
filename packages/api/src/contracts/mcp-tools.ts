@@ -622,6 +622,7 @@ export const MCP_EXCLUDED_SESSION_PROCEDURES: Readonly<Record<string, string>> =
   "activity.needsYou.count": "The web nav badge; agents read needs in runtimes_get and nodes_get.",
   "activity.commands.list": "Agents follow their own commands with node_command_get.",
   "settings.get": "Account settings are for people.",
+  "settings.terminalLayout.get": "The Terminals page order is a person's browser layout.",
   "app.flags": "Web app switches.",
   "auth.updateLocale": "Web app plumbing.",
   "auth.passwordCapabilities": "Web app plumbing.",

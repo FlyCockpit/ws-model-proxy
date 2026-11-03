@@ -220,7 +220,8 @@ describe("Activity metrics explorer", () => {
     // Ungrouped, the chart reuses the totals answer: one request.
     expect(state.inputs).toHaveLength(1);
     expect(screen.getByText("activity:metrics.testsLeftOut:3")).toBeTruthy();
-    expect(screen.getByRole("img", { name: "activity:metrics.chartLabel:1" })).toBeTruthy();
+    // The chart loads lazily (Recharts is its own chunk).
+    expect(await screen.findByRole("img", { name: "activity:metrics.chartLabel:1" })).toBeTruthy();
     expect(
       screen.getAllByText("activity:metrics.requestLog")[0]?.closest("a")?.getAttribute("href"),
     ).toBe("/$lang/activity/requests");

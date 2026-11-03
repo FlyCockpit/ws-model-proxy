@@ -1,7 +1,7 @@
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { useTranslation } from "react-i18next";
 
-import { formatGb } from "@/components/nodes/node-badges";
+import { formatGb } from "@/components/nodes/node-badges-utils";
 
 type Instance = Awaited<ReturnType<AppRouterClient["runtimes"]["get"]>>["instanceList"][number];
 

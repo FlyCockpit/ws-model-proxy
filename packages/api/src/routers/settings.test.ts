@@ -94,6 +94,53 @@ describe("settings (per person)", () => {
     expect(db.user.update).not.toHaveBeenCalled();
   });
 
+  it("reads the caller's Terminals-page order", async () => {
+    db.user.findUnique.mockResolvedValue({
+      terminalTabOrder: ["t-2", "t-1"],
+      terminalNodeOrder: ["node-b"],
+    });
+    const client = createRouterClient(settingsRouter, { context: context() });
+    await expect(client.terminalLayout.get()).resolves.toEqual({
+      tabs: ["t-2", "t-1"],
+      nodes: ["node-b"],
+    });
+    expect(db.user.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "user-1" } }),
+    );
+  });
+
+  it("saves only the order given, for the caller only, keeping each id's first place", async () => {
+    db.user.update.mockResolvedValue({ terminalTabOrder: [], terminalNodeOrder: ["b", "a"] });
+    const client = createRouterClient(settingsRouter, { context: context() });
+    await expect(client.terminalLayout.update({ nodes: ["b", "a", "b"] })).resolves.toEqual({
+      tabs: [],
+      nodes: ["b", "a"],
+    });
+    expect(db.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "user-1" }, data: { terminalNodeOrder: ["b", "a"] } }),
+    );
+  });
+
+  it("refuses an empty, oversized or malformed order", async () => {
+    const client = createRouterClient(settingsRouter, { context: context() });
+    await expect(client.terminalLayout.update({})).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      client.terminalLayout.update({ tabs: Array.from({ length: 201 }, (_, i) => `t${i}`) }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(client.terminalLayout.update({ tabs: ["a b"] })).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
+    expect(db.user.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses saving an order without the CSRF header (not a person)", async () => {
+    const client = createRouterClient(settingsRouter, { context: context({}, false) });
+    await expect(client.terminalLayout.update({ tabs: ["t-1"] })).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+    expect(db.user.update).not.toHaveBeenCalled();
+  });
+
   it("completes onboarding once (the first time is kept)", async () => {
     db.user.findUnique.mockResolvedValue({ ...row, onboardingDoneAt: new Date("2026-10-01") });
     const client = createRouterClient(settingsRouter, { context: context() });

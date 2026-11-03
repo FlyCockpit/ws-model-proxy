@@ -448,6 +448,7 @@ export function stableJson(value: unknown): string {
 }
 
 function maxUnits(values: readonly bigint[]): bigint {
+  // biome-ignore lint/complexity/useMathMinMax: bigints; Math.max does not take them.
   return values.reduce((highest, value) => (value > highest ? value : highest));
 }
 

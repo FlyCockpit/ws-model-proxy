@@ -30,7 +30,7 @@ describe("AnthropicDirectProvider", () => {
     messagesCreate.mockReset();
   });
 
-  it("translates plaintext into es-MX with deterministic temperature and the default model", async () => {
+  it("translates plaintext into es-MX with the default model and no sampling parameters", async () => {
     messagesCreate.mockResolvedValue({
       content: [{ type: "text", text: "Hola" }],
       model: "claude-haiku-4-5",
@@ -49,13 +49,13 @@ describe("AnthropicDirectProvider", () => {
 
     const call = messagesCreate.mock.calls[0]?.[0] as {
       model: string;
-      temperature: number;
       max_tokens: number;
       system: string;
       messages: { role: string; content: string }[];
     };
     expect(call.model).toBe("claude-haiku-4-5");
-    expect(call.temperature).toBe(0);
+    // API version 2026-10-21 rejects temperature / top_p / top_k.
+    expect(call).not.toHaveProperty("temperature");
     expect(call.max_tokens).toBeGreaterThan(0);
     expect(call.system).toMatch(/Mexican Spanish/);
     expect(call.messages[0]?.role).toBe("user");

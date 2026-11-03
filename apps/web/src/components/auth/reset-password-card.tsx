@@ -1,21 +1,16 @@
 import { useForm } from "@tanstack/react-form";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@ws-model-proxy/ui/components/card";
+import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
+import { AuthCard } from "@/components/auth/auth-card";
 import { authClient } from "@/lib/auth-client";
 import { stripResetTokenFromAddressBar } from "@/lib/reset-password-search";
 import { friendly, isRateLimit } from "@/utils/friendly-error";
@@ -47,7 +42,8 @@ export function ResetPasswordCard({
   error: string | undefined;
 }) {
   const { t } = useTranslation(["auth"]);
-  const [token] = useState(searchToken);
+  // A snapshot on purpose: the route's token disappears once the address bar is cleaned.
+  const [initialToken] = useState(searchToken);
   const [tokenRejected, setTokenRejected] = useState(false);
 
   const backToLogin = (
@@ -63,7 +59,7 @@ export function ResetPasswordCard({
     </div>
   );
 
-  if (error || !token || tokenRejected) {
+  if (error || !initialToken || tokenRejected) {
     return (
       <div ref={stripTokenRef} className="contents">
         <AuthCard
@@ -91,7 +87,7 @@ export function ResetPasswordCard({
       >
         <ResetPasswordForm
           lang={lang}
-          token={token}
+          token={initialToken}
           onTokenRejected={() => setTokenRejected(true)}
         />
         {backToLogin}
@@ -212,27 +208,5 @@ function ResetPasswordForm({
         )}
       </form.Subscribe>
     </form>
-  );
-}
-
-function AuthCard({
-  title,
-  description,
-  children,
-}: {
-  title: string;
-  description: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex min-h-[80vh] items-center justify-center px-4">
-      <Card className="w-full max-w-md">
-        <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{title}</CardTitle>
-          <CardDescription>{description}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">{children}</CardContent>
-      </Card>
-    </div>
   );
 }

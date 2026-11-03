@@ -4,11 +4,11 @@ import { QueryCache, QueryClient, QueryClientProvider, useQuery } from "@tanstac
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
 }));
 
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { createAppQueryCache, retryQueryWith } from "./query-error-toast";
 
 function Failure({ meta }: { meta?: { skipGlobalErrorToast?: boolean } }) {

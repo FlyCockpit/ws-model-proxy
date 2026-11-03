@@ -1,8 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";

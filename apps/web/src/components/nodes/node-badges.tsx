@@ -1,5 +1,5 @@
 import { Button } from "@ws-model-proxy/ui/components/button";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Check, Copy } from "lucide-react";
 import { useState } from "react";
@@ -108,10 +108,4 @@ export function CommandBlock({ command, label }: { command: string; label?: stri
       </Button>
     </div>
   );
-}
-
-/** "12.5 GB" with at most one decimal. */
-export function formatGb(value: number | null, lang: string): string | null {
-  if (value === null) return null;
-  return `${new Intl.NumberFormat(lang, { maximumFractionDigits: 1 }).format(value)} GB`;
 }

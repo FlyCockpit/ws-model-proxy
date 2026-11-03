@@ -3,9 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
@@ -247,6 +247,45 @@ function StopEvidence({
   );
 }
 
+type Connection = Rank["nodeConnection"];
+type StopCheck = Rank["lastStopCheck"];
+
+/** The words for a rank's node connection (removed, online or offline, with or without a time). */
+function connectionKey(connection: Connection) {
+  if (connection === null) return "dashboard:runtime.markStopped.evidence.removed" as const;
+  const online = connection.state === "ONLINE";
+  if (connection.since === null)
+    return online
+      ? ("dashboard:runtime.markStopped.evidence.onlineNoTime" as const)
+      : ("dashboard:runtime.markStopped.evidence.offlineNoTime" as const);
+  return online
+    ? ("dashboard:runtime.markStopped.evidence.online" as const)
+    : ("dashboard:runtime.markStopped.evidence.offline" as const);
+}
+
+/** The last automatic stop check: none yet, or whether it proved the stop, when, and why not. */
+function LastCheck({ check, reason }: { check: StopCheck; reason: (code: string) => string }) {
+  const { t } = useTranslation(["dashboard"]);
+  if (check === null) return t("dashboard:runtime.markStopped.evidence.checkNone");
+  return (
+    <>
+      <span>
+        {t(
+          check.proven
+            ? "dashboard:runtime.markStopped.evidence.checkProven"
+            : "dashboard:runtime.markStopped.evidence.checkNotProven",
+        )}
+      </span>
+      <span className="text-muted-foreground">
+        <TimeAgo value={check.at} />
+      </span>
+      {check.errorCode ? (
+        <span className="break-words text-xs text-muted-foreground">{reason(check.errorCode)}</span>
+      ) : null}
+    </>
+  );
+}
+
 function RankEvidence({ rank }: { rank: Rank }) {
   const { t } = useTranslation(["dashboard"]);
   const reason = useCheckReason();
@@ -260,21 +299,7 @@ function RankEvidence({ rank }: { rank: Rank }) {
         })}
       </p>
       <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1">
-        <dt className="text-muted-foreground">
-          {connection === null
-            ? t("dashboard:runtime.markStopped.evidence.removed")
-            : connection.since === null
-              ? t(
-                  connection.state === "ONLINE"
-                    ? "dashboard:runtime.markStopped.evidence.onlineNoTime"
-                    : "dashboard:runtime.markStopped.evidence.offlineNoTime",
-                )
-              : t(
-                  connection.state === "ONLINE"
-                    ? "dashboard:runtime.markStopped.evidence.online"
-                    : "dashboard:runtime.markStopped.evidence.offline",
-                )}
-        </dt>
+        <dt className="text-muted-foreground">{t(connectionKey(connection))}</dt>
         <dd>{connection?.since ? <TimeAgo value={connection.since} /> : null}</dd>
         <dt className="text-muted-foreground">
           {t("dashboard:runtime.markStopped.evidence.holds")}
@@ -287,27 +312,7 @@ function RankEvidence({ rank }: { rank: Rank }) {
           {t("dashboard:runtime.markStopped.evidence.lastCheck")}
         </dt>
         <dd className="flex min-w-0 flex-wrap items-baseline gap-x-2 break-words">
-          {check === null ? (
-            t("dashboard:runtime.markStopped.evidence.checkNone")
-          ) : (
-            <>
-              <span>
-                {t(
-                  check.proven
-                    ? "dashboard:runtime.markStopped.evidence.checkProven"
-                    : "dashboard:runtime.markStopped.evidence.checkNotProven",
-                )}
-              </span>
-              <span className="text-muted-foreground">
-                <TimeAgo value={check.at} />
-              </span>
-              {check.errorCode ? (
-                <span className="break-words text-xs text-muted-foreground">
-                  {reason(check.errorCode)}
-                </span>
-              ) : null}
-            </>
-          )}
+          <LastCheck check={check} reason={reason} />
         </dd>
       </dl>
     </div>

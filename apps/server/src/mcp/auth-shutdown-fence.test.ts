@@ -1,4 +1,7 @@
 import { createHash, generateKeyPairSync, type KeyObject, sign } from "node:crypto";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { Hono } from "hono";
@@ -8,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * Part F pass 5 — F8 reopened: REAL requireMcpAuth continuation probes.
  *
  * The upstream verifier is NOT mocked here (unlike auth.test.ts): real
- * `requireMcpAuth` from @better-auth/mcp@1.7.3, real JOSE ES256 token/proof
+ * `requireMcpAuth` from @better-auth/mcp, real JOSE ES256 token/proof
  * verification, real DPoP binding, and the REAL Better Auth
  * `reserveVerificationValue` implementation — backed by a FENCED prisma
  * adapter around a mocked client (the exact production seam: the shared
@@ -104,6 +107,7 @@ function signedCredentials(tag: string) {
       aud: RESOURCE,
       exp: now + 300,
       sub: "u",
+      azp: "c",
       client_id: "c",
       scope: "mcp:read",
       mcp_grant_id: "g",
@@ -166,7 +170,25 @@ function mountHandler(
 
 let errorSpy: ReturnType<typeof vi.spyOn>;
 
-beforeEach(() => {
+/**
+ * The upstream verifier keeps each JWKS URL's keys for the process (@better-auth/core's
+ * `jwksCache`, not exported by any package entry). Every test signs with a fresh key and some
+ * need the JWKS fetch itself, so the cache is emptied first: it is reached through better-auth's
+ * own copy of @better-auth/core, the module the verifier uses.
+ */
+async function clearUpstreamJwksCache() {
+  const require = createRequire(import.meta.url);
+  const fromBetterAuth = createRequire(require.resolve("better-auth"));
+  const oauth2 = fromBetterAuth.resolve("@better-auth/core/oauth2");
+  const verify = (await import(pathToFileURL(join(dirname(oauth2), "verify.mjs")).href)) as {
+    jwksCache?: Map<unknown, unknown>;
+  };
+  if (!(verify.jwksCache instanceof Map)) throw new Error("upstream JWKS cache not found");
+  verify.jwksCache.clear();
+}
+
+beforeEach(async () => {
+  await clearUpstreamJwksCache();
   disarmDbShutdownFence();
   errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
   // Grant lookup misses (post-verification admission denial → 403) — the

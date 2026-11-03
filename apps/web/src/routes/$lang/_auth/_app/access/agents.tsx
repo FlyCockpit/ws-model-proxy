@@ -8,8 +8,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { Bot, Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -17,11 +17,8 @@ import { useTranslation } from "react-i18next";
 import type { AgentLevel } from "@/components/access/agent-level-choice";
 import { ConfirmAction } from "@/components/access/confirm-action";
 import { CreateAgentTokenDialog } from "@/components/access/create-agent-token-dialog";
-import {
-  CredentialDatesList,
-  CredentialStatusBadge,
-  credentialStatus,
-} from "@/components/access/credential-meta";
+import { CredentialDatesList, CredentialStatusBadge } from "@/components/access/credential-meta";
+import { credentialStatus } from "@/components/access/credential-meta-utils";
 import { CodeSnippet } from "@/components/code-snippet";
 import { InlineRetry } from "@/components/inline-retry";
 import { PageHeading } from "@/components/page-stub";

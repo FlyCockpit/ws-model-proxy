@@ -35,6 +35,9 @@ import { useNodeLive } from "@/stores/node-live";
 export function useNodeLiveUpdates(sessionKey: string | null): void {
   const queryClient = useQueryClient();
 
+  // The effect owns a long-lived stream's lifecycle (open, reconnect, abort on cleanup), not a
+  // one-shot data load: the data stays in the TanStack queries this only invalidates.
+  // react-doctor-disable-next-line react-doctor/no-fetch-in-effect -- a streaming subscription, not a fetch for data; see above
   useEffect(() => {
     if (!sessionKey || typeof window === "undefined" || typeof fetch !== "function") {
       useNodeLive.getState().set({ status: "off" });

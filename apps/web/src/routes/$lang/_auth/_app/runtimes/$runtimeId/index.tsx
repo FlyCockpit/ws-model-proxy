@@ -12,8 +12,8 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
-import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -21,7 +21,7 @@ import { AddToSharedPool } from "@/components/access/contribute";
 import { CopyableCode } from "@/components/copy-button";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
-import { formatGb } from "@/components/nodes/node-badges";
+import { formatGb } from "@/components/nodes/node-badges-utils";
 import { InstanceLoad } from "@/components/runtimes/instance-load";
 import {
   HeldUntilConfirmed,
@@ -480,17 +480,8 @@ function StartDialog({
     meta: { skipGlobalErrorToast: true },
   });
   const chosen = nodeIds.filter((nodeId) => nodeId !== "");
-  const pickProblem =
-    chosen.length > 0 && chosen.length < groupSize
-      ? "pickEveryRank"
-      : new Set(chosen).size < chosen.length
-        ? "pickDistinct"
-        : null;
-  const target = instanceId
-    ? { instanceId }
-    : chosen.length === groupSize
-      ? { nodeIds: chosen }
-      : {};
+  const pickProblem = pickProblemOf(chosen, groupSize);
+  const target = startTarget(instanceId, chosen, groupSize);
 
   const requestPreview = async () => {
     try {
@@ -562,71 +553,100 @@ function StartDialog({
           <p className="text-destructive">{t(`dashboard:runtime.nodePicker.${pickProblem}`)}</p>
         ) : null}
         {preview ? (
-          <>
-            {preview.starts.flatMap((startEntry) =>
-              startEntry.placements.map((placement) => (
-                <p key={`${placement.nodeId}-${placement.nodeNumber}`}>
-                  {t("dashboard:runtime.placement", {
-                    node: placement.nodeSlug,
-                    port: placement.port,
-                    number: placement.nodeNumber,
-                  })}
-                </p>
-              )),
-            )}
-            {preview.starts.flatMap((startEntry) =>
-              startEntry.reservations.map((reservation) => (
-                <p key={`reservation-${reservation.nodeId}-${reservation.index}`}>
-                  {t("dashboard:runtime.reservationPlacement", {
-                    node: reservation.nodeSlug,
-                    memory: formatGb(reservation.memoryGb, lang),
-                    number: reservation.index + 1,
-                  })}
-                </p>
-              )),
-            )}
-            {preview.stops.length > 0 ? (
-              <div className="font-medium text-amber-700 dark:text-amber-300">
-                <p>{t("dashboard:runtime.stops")}</p>
-                <ul className="list-disc pl-5">
-                  {preview.stops.map((stopEntry) => (
-                    <li key={stopEntry.instanceId}>
-                      {t(`dashboard:runtime.stopReason.${stopEntry.reason}`, {
-                        handle:
-                          runtime.instanceList.find((item) => item.id === stopEntry.instanceId)
-                            ?.handle ?? stopEntry.instanceId,
-                      })}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-            {preview.warnings.map((warning) => (
-              <p
-                key={`${warning.code}-${warning.nodeId ?? ""}`}
-                className="text-amber-700 dark:text-amber-300"
-              >
-                {t(`dashboard:runtime.warnings.${warning.code}`)}
-              </p>
-            ))}
-            {preview.refusals.map((refusal) => (
-              <p key={`${refusal.reason}-${refusal.subjectId ?? ""}`} className="text-destructive">
-                {withReservation(
-                  t,
-                  refusalReservationOf(refusal),
-                  t(`dashboard:runtime.refusals.${refusal.reason}`, {
-                    defaultValue: t("dashboard:runtime.refusals.other"),
-                  }),
-                )}
-              </p>
-            ))}
-          </>
+          <StartPreviewDetails preview={preview} runtime={runtime} lang={lang} />
         ) : (
           <p className="text-muted-foreground">{t("dashboard:runtime.previewFirst")}</p>
         )}
       </div>
     </ResponsiveDialog>
   );
+}
+
+/** The preview's placements, reservations, stops, warnings and refusals. */
+function StartPreviewDetails({
+  preview,
+  runtime,
+  lang,
+}: {
+  preview: StartPreview;
+  runtime: RuntimeDetail;
+  lang: string;
+}) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  return (
+    <>
+      {preview.starts.flatMap((startEntry) =>
+        startEntry.placements.map((placement) => (
+          <p key={`${placement.nodeId}-${placement.nodeNumber}`}>
+            {t("dashboard:runtime.placement", {
+              node: placement.nodeSlug,
+              port: placement.port,
+              number: placement.nodeNumber,
+            })}
+          </p>
+        )),
+      )}
+      {preview.starts.flatMap((startEntry) =>
+        startEntry.reservations.map((reservation) => (
+          <p key={`reservation-${reservation.nodeId}-${reservation.index}`}>
+            {t("dashboard:runtime.reservationPlacement", {
+              node: reservation.nodeSlug,
+              memory: formatGb(reservation.memoryGb, lang),
+              number: reservation.index + 1,
+            })}
+          </p>
+        )),
+      )}
+      {preview.stops.length > 0 ? (
+        <div className="font-medium text-amber-700 dark:text-amber-300">
+          <p>{t("dashboard:runtime.stops")}</p>
+          <ul className="list-disc pl-5">
+            {preview.stops.map((stopEntry) => (
+              <li key={stopEntry.instanceId}>
+                {t(`dashboard:runtime.stopReason.${stopEntry.reason}`, {
+                  handle:
+                    runtime.instanceList.find((item) => item.id === stopEntry.instanceId)?.handle ??
+                    stopEntry.instanceId,
+                })}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {preview.warnings.map((warning) => (
+        <p
+          key={`${warning.code}-${warning.nodeId ?? ""}`}
+          className="text-amber-700 dark:text-amber-300"
+        >
+          {t(`dashboard:runtime.warnings.${warning.code}`)}
+        </p>
+      ))}
+      {preview.refusals.map((refusal) => (
+        <p key={`${refusal.reason}-${refusal.subjectId ?? ""}`} className="text-destructive">
+          {withReservation(
+            t,
+            refusalReservationOf(refusal),
+            t(`dashboard:runtime.refusals.${refusal.reason}`, {
+              defaultValue: t("dashboard:runtime.refusals.other"),
+            }),
+          )}
+        </p>
+      ))}
+    </>
+  );
+}
+
+/** Ranks are picked all or none, each on its own node. */
+function pickProblemOf(chosen: string[], groupSize: number) {
+  return chosen.length > 0 && chosen.length < groupSize
+    ? "pickEveryRank"
+    : new Set(chosen).size < chosen.length
+      ? "pickDistinct"
+      : null;
+}
+
+function startTarget(instanceId: string | undefined, chosen: string[], groupSize: number) {
+  return instanceId ? { instanceId } : chosen.length === groupSize ? { nodeIds: chosen } : {};
 }
 
 const LIVE_PHASES = new Set<Instance["phase"]>(["STARTING", "READY", "UNHEALTHY", "UNAVAILABLE"]);
@@ -693,6 +713,8 @@ function NodePicker({
   onChange: (next: string[]) => void;
 }) {
   const { t } = useTranslation(["dashboard"]);
+  /** One slot per rank: the rank (its position) is the slot's identity, not the node in it. */
+  const slots = value.map((nodeId, rank) => ({ nodeId, rank, id: `start-node-${rank}` }));
   return (
     <div className="flex min-w-0 flex-col gap-3">
       {groupSize > 1 ? (
@@ -700,20 +722,19 @@ function NodePicker({
           {t("dashboard:runtime.nodePicker.multiHint", { count: groupSize })}
         </p>
       ) : null}
-      {value.map((nodeId, index) => {
-        const id = `start-node-${index}`;
+      {slots.map(({ nodeId, rank, id }) => {
         return (
-          <div key={index} className="space-y-1.5">
+          <div key={id} className="space-y-1.5">
             <Label htmlFor={id}>
               {groupSize > 1
-                ? t("dashboard:runtime.nodePicker.rank", { number: index + 1 })
+                ? t("dashboard:runtime.nodePicker.rank", { number: rank + 1 })
                 : t("dashboard:runtime.startOn")}
             </Label>
             <NativeSelect
               id={id}
               value={nodeId}
               onChange={(event) =>
-                onChange(value.map((item, at) => (at === index ? event.target.value : item)))
+                onChange(value.map((item, at) => (at === rank ? event.target.value : item)))
               }
             >
               <option value="">{t("dashboard:runtime.anyNode")}</option>

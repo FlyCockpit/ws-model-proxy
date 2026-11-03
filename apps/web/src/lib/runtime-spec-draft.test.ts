@@ -17,6 +17,15 @@ import {
 const HEALTH = { intervalMs: 15_000, failureThreshold: 3, successThreshold: 1 };
 const MESSAGES = { notJson: "not json", wrongKind: "wrong kind" };
 
+/**
+ * The spec as JSON text parsed back, as the JSON tab holds it. Not a clone: the round trip is
+ * the point (an `undefined` key is gone, as it would be from real JSON).
+ */
+function throughJson(value: unknown): unknown {
+  const text = JSON.stringify(value);
+  return JSON.parse(text);
+}
+
 const SPECS = {
   vllm: {
     api: "openai",
@@ -435,10 +444,10 @@ describe("lossless form conversion (F10 class)", () => {
     ["a part the form fills in", { ...SPECS.vllm, launch: { ...launch, labels: undefined } }],
     ["the other kind", SPECS.alwaysOn],
   ])("keeps the JSON tab for %s (nothing dropped or changed)", (_name, spec) => {
-    expect(losslessDraft(JSON.parse(JSON.stringify(spec)), "STARTABLE")).toBeNull();
-    const values = editorValues(JSON.parse(JSON.stringify(spec)), "STARTABLE");
+    expect(losslessDraft(throughJson(spec), "STARTABLE")).toBeNull();
+    const values = editorValues(throughJson(spec), "STARTABLE");
     expect(values.tab).toBe("json");
-    expect(JSON.parse(values.json)).toEqual(JSON.parse(JSON.stringify(spec)));
+    expect(JSON.parse(values.json)).toEqual(throughJson(spec));
   });
 });
 
@@ -464,7 +473,7 @@ describe("JSON the conversion cannot handle at all (R6-B-1)", () => {
     ["a numeric fabric", { ...SPECS.multiNode, launch: { ...multi, fabric: 7 } }],
     ["an object fabric", { ...SPECS.multiNode, launch: { ...multi, fabric: { name: "ib" } } }],
   ])("keeps the JSON tab without throwing for %s", (_name, spec) => {
-    const raw = JSON.parse(JSON.stringify(spec));
+    const raw = throughJson(spec);
     expect(() => losslessDraft(raw, "STARTABLE")).not.toThrow();
     expect(losslessDraft(raw, "STARTABLE")).toBeNull();
     const values = editorValues(raw, "STARTABLE");
@@ -477,6 +486,6 @@ describe("JSON the conversion cannot handle at all (R6-B-1)", () => {
       { ...SPECS.vllm, launch: { ...vllm, commands: [{ start: "run", stop: "7" }] } },
       { ...SPECS.multiNode, launch: { ...multi, fabric: "ib1" } },
     ])
-      expect(losslessDraft(JSON.parse(JSON.stringify(spec)), "STARTABLE")).not.toBeNull();
+      expect(losslessDraft(throughJson(spec), "STARTABLE")).not.toBeNull();
   });
 });

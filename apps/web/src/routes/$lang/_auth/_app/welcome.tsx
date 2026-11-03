@@ -107,68 +107,128 @@ function WelcomePage() {
       )}
 
       {pinned ? (
-        <Card className="min-w-0">
-          <CardHeader>
-            <p className="text-xs font-medium text-muted-foreground">
-              {t("dashboard:welcome.stepOf", { step: index + 1, total: WELCOME_STEPS.length })}
-            </p>
-            <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-lg">
-              <h2>{t(`dashboard:welcome.${current}.title`)}</h2>
-              {progress?.[current] ? (
-                <span className="inline-flex items-center gap-1 rounded-full bg-state-success-bg px-2 py-0.5 text-xs font-medium text-state-success">
-                  <Check aria-hidden="true" className="size-3.5" />
-                  {t("dashboard:welcome.done")}
-                </span>
-              ) : null}
-            </CardTitle>
-            <CardDescription>{t(`dashboard:welcome.${current}.description`)}</CardDescription>
-          </CardHeader>
-          <CardContent className="min-w-0">
-            <StepBody
-              step={current}
-              lang={lang}
-              enrollment={enrollment}
-              onEnrollment={setEnrollment}
-            />
-          </CardContent>
-          <CardFooter className="flex min-w-0 flex-wrap justify-between gap-2">
-            {back ? (
-              <Button type="button" variant="ghost" size="touch" onClick={() => void goTo(back)}>
-                <ArrowLeft aria-hidden="true" />
-                {t("dashboard:welcome.back")}
-              </Button>
-            ) : (
-              <span />
-            )}
-            {next ? (
-              <Button
-                type="button"
-                variant={progress?.[current] ? "default" : "outline"}
-                size="touch"
-                onClick={() => void goTo(next)}
-              >
-                {progress?.[current]
-                  ? t("dashboard:welcome.continue")
-                  : t("dashboard:welcome.skip")}
-                <ArrowRight aria-hidden="true" />
-              </Button>
-            ) : (
-              <Button
-                type="button"
-                size="touch"
-                disabled={complete.isPending}
-                onClick={() => void finish()}
-              >
-                {t("dashboard:welcome.finish")}
-                <ArrowRight aria-hidden="true" />
-              </Button>
-            )}
-          </CardFooter>
-        </Card>
+        <StepCard
+          lang={lang}
+          current={current}
+          index={index}
+          done={progress?.[current]}
+          back={back}
+          next={next}
+          finishing={complete.isPending}
+          enrollment={enrollment}
+          onEnrollment={setEnrollment}
+          onGoTo={(step) => void goTo(step)}
+          onFinish={() => void finish()}
+        />
       ) : (
         <Skeleton aria-hidden="true" className="h-72 w-full rounded-xl" />
       )}
     </div>
+  );
+}
+
+/** The current step: its title and done badge, its body, and back / next / finish. */
+function StepCard({
+  lang,
+  current,
+  index,
+  done,
+  back,
+  next,
+  finishing,
+  enrollment,
+  onEnrollment,
+  onGoTo,
+  onFinish,
+}: {
+  lang: string;
+  current: WelcomeStep;
+  index: number;
+  done: boolean | undefined;
+  back: WelcomeStep | null;
+  next: WelcomeStep | null;
+  finishing: boolean;
+  enrollment: EnrollmentResult | null;
+  onEnrollment: (result: EnrollmentResult) => void;
+  onGoTo: (step: WelcomeStep) => void;
+  onFinish: () => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <Card className="min-w-0">
+      <CardHeader>
+        <p className="text-xs font-medium text-muted-foreground">
+          {t("dashboard:welcome.stepOf", { step: index + 1, total: WELCOME_STEPS.length })}
+        </p>
+        <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-lg">
+          <h2>{t(`dashboard:welcome.${current}.title`)}</h2>
+          {done ? (
+            <span className="inline-flex items-center gap-1 rounded-full bg-state-success-bg px-2 py-0.5 text-xs font-medium text-state-success">
+              <Check aria-hidden="true" className="size-3.5" />
+              {t("dashboard:welcome.done")}
+            </span>
+          ) : null}
+        </CardTitle>
+        <CardDescription>{t(`dashboard:welcome.${current}.description`)}</CardDescription>
+      </CardHeader>
+      <CardContent className="min-w-0">
+        <StepBody step={current} lang={lang} enrollment={enrollment} onEnrollment={onEnrollment} />
+      </CardContent>
+      <StepFooter
+        done={done}
+        back={back}
+        next={next}
+        finishing={finishing}
+        onGoTo={onGoTo}
+        onFinish={onFinish}
+      />
+    </Card>
+  );
+}
+
+function StepFooter({
+  done,
+  back,
+  next,
+  finishing,
+  onGoTo,
+  onFinish,
+}: {
+  done: boolean | undefined;
+  back: WelcomeStep | null;
+  next: WelcomeStep | null;
+  finishing: boolean;
+  onGoTo: (step: WelcomeStep) => void;
+  onFinish: () => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <CardFooter className="flex min-w-0 flex-wrap justify-between gap-2">
+      {back ? (
+        <Button type="button" variant="ghost" size="touch" onClick={() => onGoTo(back)}>
+          <ArrowLeft aria-hidden="true" />
+          {t("dashboard:welcome.back")}
+        </Button>
+      ) : (
+        <span />
+      )}
+      {next ? (
+        <Button
+          type="button"
+          variant={done ? "default" : "outline"}
+          size="touch"
+          onClick={() => onGoTo(next)}
+        >
+          {done ? t("dashboard:welcome.continue") : t("dashboard:welcome.skip")}
+          <ArrowRight aria-hidden="true" />
+        </Button>
+      ) : (
+        <Button type="button" size="touch" disabled={finishing} onClick={onFinish}>
+          {t("dashboard:welcome.finish")}
+          <ArrowRight aria-hidden="true" />
+        </Button>
+      )}
+    </CardFooter>
   );
 }
 
