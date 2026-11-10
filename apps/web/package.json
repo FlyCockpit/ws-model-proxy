@@ -51,7 +51,7 @@
   },
   "devDependencies": {
     "@orpc/server": "catalog:",
-    "@tailwindcss/vite": "^4.3.3",
+    "@tailwindcss/vite": "^4.3.4",
     "@tanstack/react-query-devtools": "catalog:",
     "@tanstack/react-router-devtools": "catalog:",
     "@testing-library/react": "catalog:",
