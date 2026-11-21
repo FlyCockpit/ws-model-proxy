@@ -43,6 +43,10 @@ integration("node file ops (PostgreSQL)", () => {
 
   beforeAll(async () => {
     process.env.DATABASE_URL = databaseUrl;
+    // The modules under test read the validated server env, which needs the auth settings.
+    process.env.NODE_ENV = "test";
+    process.env.BETTER_AUTH_SECRET ??= "integration-test-secret-integration-test-secret";
+    process.env.BETTER_AUTH_URL ??= "http://localhost:3000";
     const { createFixturePrismaClient } = await import("@ws-model-proxy/db/test-fixture-client");
     m = {
       ops: await import("./node-file-ops.js"),
