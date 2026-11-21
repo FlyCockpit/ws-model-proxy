@@ -6019,7 +6019,7 @@ mod tests {
     }
 
     #[test]
-    fn hello_challenge_keeps_internal_errors_and_unparseable_replies_retryable() {
+    fn hello_challenge_keeps_internal_errors_and_unparsable_replies_retryable() {
         let mut socket = challenge_socket(Message::Text(
             r#"{"type":"protocol.error","failure":"protocol_error","message":"database unavailable","code":"internal","supportedVersions":["4.0"]}"#
                 .into(),
@@ -6039,7 +6039,7 @@ mod tests {
                 assert!(!message.contains("upgrade"));
                 assert_eq!(retry_floor(&error), None);
             }
-            _ => panic!("unparseable reply must reconnect"),
+            _ => panic!("unparsable reply must reconnect"),
         }
     }
 
