@@ -25,7 +25,11 @@
     // Type-level contract assertion: McpContext must satisfy the production
     // oRPC Context. No value-space consumer by design; the constraint is
     // checked at declaration time.
-    "apps/server/src/mcp/context.ts": ["types"]
+    "apps/server/src/mcp/context.ts": ["types"],
+    // ALL_AGENT_SCOPES is AGENT_SCOPES widened to readonly AgentScope[] for
+    // the test suites that pass every scope; the same value under two names is
+    // deliberate.
+    "packages/auth/src/agent-scopes.ts": ["duplicates"]
   },
   "workspaces": {
     ".": {
@@ -64,6 +68,15 @@
         "postcss",
         // Toast primitive re-exported from @ws-model-proxy/ui.
         "sileo"
+      ]
+    },
+    "apps/server": {
+      "ignoreDependencies": [
+        // Imported by packages/auth, not by the server itself: declaring them keeps them external
+        // in the tsdown bundle, so @better-auth/mcp and packages/auth share one instance
+        // (enforced by src/better-auth-single-instance.test.ts).
+        "@better-auth/cimd",
+        "@better-auth/oauth-provider"
       ]
     },
     "packages/ui": {
