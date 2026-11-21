@@ -15,17 +15,7 @@ minimumReleaseAgeIgnoreMissingTime: false
 # newer, unvetted release stays gated, and keep the list in block style (the
 # checker does not parse flow style).
 minimumReleaseAgeExclude:
-  # GHSA-39q9-qp46-w8xg: security fix dependency, released 2026-11-11.
-  # drop-after: 2026-11-18
-  - "hono@4.13.18"
-  # GHSA-p4f5-76q4-ffq7: security fix dependency, released 2026-11-11.
-  # drop-after: 2026-11-18
-  - "vite@8.3.8"
-  # ws 8.23.0 (released 2026-11-12) fixes a remote memory-exhaustion DoS: a peer
-  # floods Ping frames while not reading, so automatic Pongs pile up in memory.
-  # It is <7 days old; owner-approved security carve-out (2026-11-16).
-  # drop-after: 2026-11-20
-  - "ws@8.23.0"
+  # (no carve-outs at the moment)
 overrides:
   picomatch@>=4 <4.0.4: ">=4.0.4" # CVE-2026-33671 (ReDoS via extglob)
   defu@<6.1.5: ">=6.1.5" # CVE-2026-35209 (prototype pollution)
@@ -84,6 +74,10 @@ overrides:
   # these overrides if workbox-build patches the chain.
   serialize-javascript@<7.1.3: ">=7.1.3" # GHSA-5c6j-r48x-rmvq (RCE via RegExp.flags) / GHSA-gfhx-hw2g-v5hg / GHSA-m5mm-p8h7-m29v
   lodash@<4.18.0: ">=4.18.0" # GHSA-r5fr-rjxr-66jc (code injection via _.template)
+  # GHSA-7589-6fvf-x4pw (high, ReDoS in Schema.TemplateLiteral, patched in 3.22.1).
+  # @prisma/config pins effect 3.20.0 exactly; 3.22.4 is the newest 3.x release
+  # that clears the 7-day gate. Drop once Prisma requires effect >=3.22.1.
+  "effect@<3.22.1": 3.22.4
 blockExoticSubdeps: true
 dangerouslyAllowAllBuilds: false
 savePrefix: ""
