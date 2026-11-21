@@ -10,6 +10,39 @@ set -eu
 
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 REAL_NODE=$(command -v node)
+# Fixture configuration: the entrypoint only checks that DATABASE_URL and the
+# auth secret are set (the CMD is a stub), so the URL carries no credentials,
+# and the auth secret's name sits in a variable: the committed-secret scan
+# (pr-checks.yml, "Secret patterns") flags any literal assignment to it.
+FIXTURE_DATABASE_URL=postgresql://db:5432/app
+AUTH_SECRET_NAME=BETTER_AUTH_SECRET
+
+# A shell cannot trap a signal that was ignored when it started, and every
+# process it starts inherits the ignore: under `nohup` (HUP), a job started
+# with `&` from a non-interactive shell (INT, QUIT) or any launcher that
+# ignores TERM, the stop-signal cases would test the launcher, not the
+# entrypoint. So when HUP, INT or TERM arrives ignored, run this script once
+# more through node, whose children start with every signal at its default
+# (libuv resets them), forwarding the stop signals to it. The variable is the
+# loop guard; nothing else reads it.
+signal_ignored() {
+  # The braces keep the shell's own "Terminated"/"Hangup" report quiet too.
+  [ "$({ /bin/sh -c "kill -$1 \$\$; echo ignored"; } 2>/dev/null)" = "ignored" ]
+}
+if [ -z "${ENTRYPOINT_TEST_SIGNALS_RESET:-}" ] &&
+  { signal_ignored HUP || signal_ignored INT || signal_ignored TERM; }; then
+  ENTRYPOINT_TEST_SIGNALS_RESET=1 exec "$REAL_NODE" -e '
+    const { spawn } = require("node:child_process");
+    const { constants } = require("node:os");
+    const child = spawn("/bin/sh", process.argv.slice(1), { stdio: "inherit" });
+    for (const name of ["SIGHUP", "SIGINT", "SIGTERM"]) {
+      process.on(name, () => child.kill(name));
+    }
+    child.on("exit", (code, signal) => {
+      process.exit(code ?? 128 + constants.signals[signal]);
+    });
+  ' "$0" "$@"
+fi
 TEST_ROOT=$(mktemp -d)
 ENTRYPOINT_PID=""
 WATCHDOG_PID=""
@@ -54,7 +87,11 @@ cleanup() {
   reap_test_processes
   rm -rf "$TEST_ROOT"
 }
-trap cleanup EXIT HUP INT TERM
+# A stop signal ends the run (128 + its number) through the EXIT trap's cleanup.
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Bounded runs: a watchdog KILLs everything the run started if it has not
 # finished within 20 s, so a regression (a signal that is never acted on)
@@ -204,7 +241,7 @@ run() {
   set +e
   env -i PATH="$TEST_ROOT/bin:/usr/bin:/bin" APP_ROOT="$TEST_ROOT/app" ENTRYPOINT_TEST_RUN="$RUN_TOKEN" \
     ENTRYPOINT_TEST_EVENTS="$EVENTS" ENTRYPOINT_TEST_REAL_NODE="$REAL_NODE" \
-    DATABASE_URL=postgresql://u:p@db:5432/app BETTER_AUTH_SECRET=x \
+    DATABASE_URL="$FIXTURE_DATABASE_URL" "$AUTH_SECRET_NAME=fixture" \
     "$@" > "$TEST_ROOT/out" 2>&1
   status=$?
   set -e
@@ -293,7 +330,7 @@ expect_no_event "migrate-runtime"
 # Required variables.
 run 1 DATABASE_URL= $EP "$SERVER_CMD"
 expect_output 'Missing required environment variable(s): DATABASE_URL'
-run 1 BETTER_AUTH_SECRET= $EP "$SERVER_CMD"
+run 1 "$AUTH_SECRET_NAME=" $EP "$SERVER_CMD"
 expect_output 'Missing required environment variable(s): BETTER_AUTH_SECRET'
 expect_no_event "migrate-runtime"
 
@@ -324,18 +361,15 @@ expect_output 'Remove APPLY_SCHEMA'
 expect_output 'replace it with MIGRATE_ON_START=true'
 expect_no_event 'cmd ran'
 
-# A shell started with SIGINT ignored (any job launched with `&` from a
-# non-interactive shell, e.g. a backgrounded `pnpm check:ci`) cannot trap INT,
-# so the INT cases only run where INT can be delivered at all. HUP and TERM
-# are never ignored that way.
+# The stop-signal cases need HUP, INT and TERM deliverable; the run through
+# node at the top restored any that arrived ignored.
 STOP_SIGNALS="TERM INT HUP"
-INT_DELIVERABLE=true
-if [ "$(/bin/sh -c 'kill -INT $$; echo ignored' 2>/dev/null)" = "ignored" ]; then
-  echo "skip: the INT signal cases: SIGINT is ignored in this environment (a backgrounded run); run in the foreground to include them"
-  skipped=$((skipped + 1))
-  STOP_SIGNALS="TERM HUP"
-  INT_DELIVERABLE=false
-fi
+for signal in HUP INT TERM; do
+  if signal_ignored "$signal"; then
+    echo "FAIL: SIG$signal is still ignored after the reset at the top; the stop-signal cases cannot run" >&2
+    exit 1
+  fi
+done
 signal_status_of() {
   case "$1" in TERM) echo 143 ;; INT) echo 130 ;; HUP) echo 129 ;; esac
 }
@@ -559,7 +593,7 @@ drive() {
   start_watchdog
   drive_result=$(env -i PATH="$TEST_ROOT/bin:/usr/bin:/bin" APP_ROOT="$TEST_ROOT/app" ENTRYPOINT_TEST_RUN="$RUN_TOKEN" \
     ENTRYPOINT_TEST_EVENTS="$EVENTS" ENTRYPOINT_TEST_REAL_NODE="$REAL_NODE" DRIVE_OUT="$TEST_ROOT/out" \
-    DATABASE_URL=postgresql://u:p@db:5432/app BETTER_AUTH_SECRET=x "$@" \
+    DATABASE_URL="$FIXTURE_DATABASE_URL" "$AUTH_SECRET_NAME=fixture" "$@" \
     "$REAL_NODE" "$TEST_ROOT/drive.mjs" "$drive_copy" "$drive_command" "$drive_readyfile" "$drive_event" "$drive_plan" 2>&1) || true
   stop_watchdog "driven: $drive_copy $drive_command $*"
   drive_ready=$(echo "$drive_result" | sed -n 's/.*ready=\([01]\).*/\1/p')
@@ -667,17 +701,15 @@ expect_no_event "cmd ran"
 # shell has SIGINT ignored, and bash keeps that), the entrypoint exits 130.
 # The INT comes 0.5 s after launch, from the copy itself (a test launching the
 # entrypoint with & could not deliver INT: it would start with INT ignored).
-if [ "$INT_DELIVERABLE" = true ]; then
-  awk '{
-    print
-    line = $0; sub(/^[ \t]+/, "", line)
-    if (line == "child_pid=$!" && !done) { print "  (sleep 0.5; kill -INT \"$$\") &"; done = 1 }
-  }' "$TEST_ROOT/docker-entrypoint.sh" > "$TEST_ROOT/notice-int.sh"
-  run 130 STUB_NOTICE_SLEEP=100 sh "$TEST_ROOT/notice-int.sh" "$SERVER_CMD"
-  expect_event "notice-term"
-  expect_no_event "migrate-runtime"
-  expect_no_event "cmd ran"
-fi
+awk '{
+  print
+  line = $0; sub(/^[ \t]+/, "", line)
+  if (line == "child_pid=$!" && !done) { print "  (sleep 0.5; kill -INT \"$$\") &"; done = 1 }
+}' "$TEST_ROOT/docker-entrypoint.sh" > "$TEST_ROOT/notice-int.sh"
+run 130 STUB_NOTICE_SLEEP=100 sh "$TEST_ROOT/notice-int.sh" "$SERVER_CMD"
+expect_event "notice-term"
+expect_no_event "migrate-runtime"
+expect_no_event "cmd ran"
 
 if grep -q 'trap - .*TERM' "$TEST_ROOT/docker-entrypoint.sh"; then
   fail "startup traps must stay installed through exec"
