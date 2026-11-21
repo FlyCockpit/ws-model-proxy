@@ -104,19 +104,31 @@ struct StopRequest {
 }
 
 /// The `wsmp` executable a runtime host runs as: this one. The library's own tests run as a test
-/// binary, so they use the `wsmp` Cargo built beside it.
+/// binary, so they use the `wsmp` Cargo built for the same profile.
 pub fn host_exe() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("finding the wsmp executable")?;
     #[cfg(test)]
-    if let Some(built) = exe
-        .parent()
-        .and_then(Path::parent)
-        .map(|dir| dir.join("wsmp.exe"))
-        .filter(|built| built.is_file())
-    {
+    if let Some(built) = built_beside_test(&exe) {
         return Ok(built);
     }
     Ok(exe)
+}
+
+/// The `wsmp.exe` in the profile directory of a test binary: Cargo before 1.100 runs tests from
+/// `target/<profile>/deps/`, Cargo 1.100 from `target/<profile>/build/<package>/<hash>/out/`.
+#[cfg(test)]
+fn built_beside_test(test_exe: &Path) -> Option<PathBuf> {
+    let profile = test_exe
+        .ancestors()
+        .skip(1)
+        .find(|dir| {
+            matches!(
+                dir.file_name().and_then(|n| n.to_str()),
+                Some("deps" | "build")
+            )
+        })?
+        .parent()?;
+    Some(profile.join("wsmp.exe")).filter(|built| built.is_file())
 }
 
 /// Where the unit records live.
@@ -821,6 +833,23 @@ fn stop_grace(dir: &Path, unit: &str, invocation: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tests_find_the_wsmp_built_for_their_profile_in_either_cargo_layout() {
+        let target = tempfile::tempdir().expect("target");
+        let profile = target.path().join("debug");
+        let old = profile.join("deps").join("wsmp-0123.exe");
+        let new = profile.join("build/wsmp/0123/out/wsmp-0123.exe");
+        for test_exe in [&old, &new] {
+            std::fs::create_dir_all(test_exe.parent().expect("dir")).expect("dir");
+            std::fs::write(test_exe, b"").expect("test binary");
+        }
+        assert_eq!(built_beside_test(&old), None);
+        std::fs::write(profile.join("wsmp.exe"), b"").expect("wsmp");
+        for test_exe in [&old, &new] {
+            assert_eq!(built_beside_test(test_exe), Some(profile.join("wsmp.exe")));
+        }
+    }
 
     #[test]
     fn unit_names_are_plain_file_names() {
