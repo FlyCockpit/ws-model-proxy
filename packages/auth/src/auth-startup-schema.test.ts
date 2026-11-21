@@ -139,6 +139,8 @@ describe("auth instance plugin wiring (real production instance)", () => {
     expect(ids.slice(ALWAYS_ON.length)).toEqual([
       "jwt",
       "oauth-provider",
+      // After the provider's signature check, so it can read the verified oauth_query.
+      "wsmp-mcp-scope-policy",
       "wsmp-mcp-consent-level",
       "cimd",
     ]);

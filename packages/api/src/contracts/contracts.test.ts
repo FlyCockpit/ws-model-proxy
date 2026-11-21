@@ -18,7 +18,7 @@ import {
 import { advertisedToolList } from "./mcp-tools";
 import { metricsQueryInputSchema } from "./metrics";
 
-/** Spec §8.1a, with the decisions recorded in docs/contracts/0.4.0.md. */
+/** Every published procedure keeps its declared access level and schemas. */
 const INVENTORY = [
   "app.config",
   "app.flags",
@@ -137,9 +137,10 @@ const INVENTORY = [
   "access.agentTokens.list",
   "access.agentTokens.create",
   "access.agentTokens.revoke",
+  "access.agentTokens.setAccess",
   "access.oauthGrants.list",
   "access.oauthGrants.revoke",
-  "access.oauthGrants.setLevel",
+  "access.oauthGrants.setAccess",
   "access.shares.list",
   "access.shares.create",
   "access.shares.update",
@@ -274,8 +275,24 @@ describe("caller auth (positive human check)", () => {
   const callers: Record<string, CallerAuth> = {
     cookie: { kind: "cookie_session", userId: "u", sessionId: "s", csrfVerified: true },
     cookieNoCsrf: { kind: "cookie_session", userId: "u", sessionId: "s", csrfVerified: false },
-    fullAgent: { kind: "agent_token", userId: "u", agentTokenId: "t", level: "FULL" },
-    oauth: { kind: "oauth_access_token", userId: "u", grantId: "g", level: "FULL" },
+    fullAgent: {
+      kind: "agent_token",
+      userId: "u",
+      agentTokenId: "t",
+      access: {
+        scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+        nodeIds: null,
+      },
+    },
+    oauth: {
+      kind: "oauth_access_token",
+      userId: "u",
+      grantId: "g",
+      access: {
+        scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+        nodeIds: null,
+      },
+    },
     apiKey: { kind: "api_key", userId: "u", apiKeyId: "k" },
   };
 
@@ -383,7 +400,7 @@ describe("id formats", () => {
 describe("0.4.0 MCP tool manifest", () => {
   it("has the 28 tools in order, 7 of them read-only", () => {
     expect(MCP_TOOLS.map((tool) => tool.name)).toEqual([...MCP_TOOL_NAMES]);
-    expect(MCP_TOOLS.filter((tool) => tool.level === "READ").map((tool) => tool.name)).toEqual([
+    expect(MCP_TOOLS.filter((tool) => tool.scope === "read").map((tool) => tool.name)).toEqual([
       ...MCP_READ_TOOLS,
     ]);
     expect(MCP_TOOLS).toHaveLength(28);
@@ -395,7 +412,7 @@ describe("0.4.0 MCP tool manifest", () => {
         const procedure = procedures.get(path);
         expect(procedure?.access, `${tool.name} → ${path}`).toBe("agent");
         expect(procedure?.tools, `${tool.name} → ${path}`).toContain(tool.name);
-        if (tool.level === "READ") expect(procedure?.kind, `${tool.name} → ${path}`).toBe("query");
+        if (tool.scope === "read") expect(procedure?.kind, `${tool.name} → ${path}`).toBe("query");
       }
     for (const [path, procedure] of procedures)
       for (const name of procedure.tools ?? [])

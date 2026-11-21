@@ -10,9 +10,8 @@
  * generation number). Ownership and freshness are separate checks: a stop proof needs both.
  *
  * Callers hold the instance's owner fence and its capacity fence (`runGeneration` is a policy
- * column of the graph-write fence). Rows written before runs existed have `runGeneration` 0:
- * `resolveRun` bootstraps them from their steps on first touch, and the SQL trigger
- * `instance_run_order` keeps every new step at the instance's (positive) run.
+ * column of the graph-write fence). The SQL trigger `instance_run_order` keeps every new
+ * step at the instance's positive run.
  */
 import type { Prisma } from "@ws-model-proxy/db";
 
@@ -66,71 +65,18 @@ export function owned(step: { generation: number }, run: number): boolean {
   return step.generation === run;
 }
 
-type RunRow = { runGeneration: number; phase: string; operationId: string | null };
-
-/**
- * Phases a committed restart can be in before its start steps exist: STARTING (prepareStarts
- * has not reached it) and UNAVAILABLE (a node of it went offline first; recovery returns it to
- * STARTING). A row that reached either from a prepared run has a start step naming its
- * operation, so the operation test below keeps it at its latest generation.
- */
-const UNPREPARED_PHASES: ReadonlySet<string> = new Set(["STARTING", "UNAVAILABLE"]);
-
-/**
- * The run a legacy row (`runGeneration` 0) is on: its latest step generation, plus one when a
- * restart was committed and not prepared yet (STARTING or UNAVAILABLE under an operation no
- * start step names, the test `prepareStarts` uses), and at least 1.
- */
-async function legacyRun(db: Db, instanceId: string, row: RunRow): Promise<number> {
-  const latest =
-    (
-      await db.instanceStep.aggregate({
-        where: { instanceId, phase: { not: "HEALTH" } },
-        _max: { generation: true },
-      })
-    )._max.generation ?? 0;
-  const unprepared =
-    UNPREPARED_PHASES.has(row.phase) &&
-    row.operationId !== null &&
-    (await db.instanceStep.count({
-      where: {
-        instanceId,
-        phase: { in: [...RUN_START_PHASES] },
-        intent: { path: ["operationId"], equals: row.operationId },
-      },
-    })) === 0;
-  return Math.max(1, latest + (unprepared ? 1 : 0));
-}
-
-async function runRow(db: Db, instanceId: string): Promise<RunRow | null> {
-  return db.runtimeInstance.findUnique({
-    where: { id: instanceId },
-    select: { runGeneration: true, phase: true, operationId: true },
-  });
-}
-
-/**
- * The instance's current run (≥ 1). A legacy row is bootstrapped and the value persisted, so
- * every later decision reads the same run whether or not its start was prepared. Callers hold
- * the owner and instance capacity fences. 0 when the instance does not exist.
- */
+/** The stored current run, or 0 when the instance does not exist. */
 export async function resolveRun(db: Db, instanceId: string): Promise<number> {
-  const row = await runRow(db, instanceId);
-  if (!row) return 0;
-  if (row.runGeneration > 0) return row.runGeneration;
-  const run = await legacyRun(db, instanceId, row);
-  await db.runtimeInstance.updateMany({
-    where: { id: instanceId, runGeneration: 0 },
-    data: { runGeneration: run },
+  const row = await db.runtimeInstance.findUnique({
+    where: { id: instanceId },
+    select: { runGeneration: true },
   });
-  return run;
-}
-
-/** `resolveRun` without the write, for unfenced read-only callers. */
-export async function peekRun(db: Db, instanceId: string): Promise<number> {
-  const row = await runRow(db, instanceId);
-  if (!row) return 0;
-  return row.runGeneration > 0 ? row.runGeneration : legacyRun(db, instanceId, row);
+  if (row && row.runGeneration < 1) {
+    throw new Error(
+      "Runtime instance schema backfill not applied: the 1.0 upgrade migration has not run (see UPGRADING.md).",
+    );
+  }
+  return row?.runGeneration ?? 0;
 }
 
 /**

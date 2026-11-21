@@ -31,13 +31,16 @@ export const FULL_AGENT: CallerAuth = {
   kind: "agent_token",
   userId: OWNER,
   agentTokenId: "tok-1",
-  level: "FULL",
+  access: {
+    scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+    nodeIds: null,
+  },
 };
 export const READ_AGENT: CallerAuth = {
   kind: "agent_token",
   userId: OWNER,
   agentTokenId: "tok-2",
-  level: "READ",
+  access: { scopes: ["read"], nodeIds: null },
 };
 
 /** Every caller that is NOT a verified person. */
@@ -45,7 +48,15 @@ export const NOT_A_PERSON: ReadonlyArray<[string, CallerAuth | AnonymousAuth]> =
   ["Full agent token", FULL_AGENT],
   [
     "OAuth access token",
-    { kind: "oauth_access_token", userId: OWNER, grantId: "g", level: "FULL" },
+    {
+      kind: "oauth_access_token",
+      userId: OWNER,
+      grantId: "g",
+      access: {
+        scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+        nodeIds: null,
+      },
+    },
   ],
   ["API key", { kind: "api_key", userId: OWNER, apiKeyId: "k" }],
   [

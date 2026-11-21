@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { runtimeLaunchHash } from "@ws-model-proxy/api/lib/runtime-launch-hash";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { TEST_NODE_FEATURES } from "../../../../packages/api/src/lib/node-features-test-fixture";
 
 // The runtime lifecycle engine on real PostgreSQL: the graph-write fences, the step/claim/
 // instance CHECKs and triggers. The relay is a fake that records every job and answers as the
@@ -88,7 +89,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
         connectionGeneration: 1,
         trust: "FULL",
         // A current CLI: it proves what it runs (`rankIdle`).
-        features: { rankIdle: true },
+        features: TEST_NODE_FEATURES,
       },
     });
     const spec = {

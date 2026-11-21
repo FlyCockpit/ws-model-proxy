@@ -277,7 +277,41 @@ pub(crate) fn search(
                 Flow::Continue
             })
         };
-        walk(&ops.policy, &root, &root_path, 64, &mut visit)?;
+        let mut check = || {
+            cancel.check()?;
+            if started.elapsed() > deadline {
+                return Err(FileError::new(
+                    super::error::ErrorCode::Timeout,
+                    "search time budget reached; narrow root or glob",
+                ));
+            }
+            Ok(())
+        };
+        match walk(&ops.policy, &root, &root_path, 64, &mut check, &mut visit) {
+            Err(error) if error.code == super::error::ErrorCode::Timeout => {
+                state.note = Some(error.message)
+            }
+            Ok(stats) => {
+                if stats.truncated_dirs > 0 {
+                    let note = format!(
+                        "{} {} exceeded 100,000 entries; search results are incomplete; narrow root",
+                        stats.truncated_dirs,
+                        if stats.truncated_dirs == 1 {
+                            "directory"
+                        } else {
+                            "directories"
+                        }
+                    );
+                    if let Some(previous) = &mut state.note {
+                        previous.push_str("; ");
+                        previous.push_str(&note);
+                    } else {
+                        state.note = Some(note);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
     if state.out.ends_with('\n') {
         state.out.pop();
@@ -297,4 +331,52 @@ struct State {
     files: usize,
     scanned: usize,
     note: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_ops::walk::test_support::{truncated_tree, with_directory_limit};
+
+    #[test]
+    fn search_reports_nested_directory_truncation_even_without_matches() {
+        let (_dir, ops, root) = truncated_tree();
+        let args = SearchArgs {
+            root: crate::file_ops::display_path(&root).expect("display path"),
+            pattern: "absent".into(),
+            glob: Some("*.txt".into()),
+            ..SearchArgs::default()
+        };
+        let result =
+            with_directory_limit(2, || ops.search(&args, &Cancel::new())).expect("partial search");
+        assert_eq!(result.count, 0);
+        assert_eq!(result.scanned_files, 1);
+        let note = result.more.expect("incomplete search").note;
+        assert!(note.contains("1 directory exceeded 100,000 entries"));
+        assert!(note.contains("narrow root"));
+        assert!(
+            ops.search(&args, &Cancel::new())
+                .expect("complete search")
+                .more
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn search_truncation_preserves_existing_limit_notes_and_sibling_matches() {
+        let (_dir, ops, root) = truncated_tree();
+        let args = SearchArgs {
+            root: crate::file_ops::display_path(&root).expect("display path"),
+            pattern: "needle".into(),
+            max_matches: Some(1),
+            ..SearchArgs::default()
+        };
+        let result =
+            with_directory_limit(2, || ops.search(&args, &Cancel::new())).expect("partial search");
+        assert_eq!(result.count, 1);
+        assert!(result.matches.contains("z-sibling.txt:1|needle"));
+        let note = result.more.expect("incomplete search").note;
+        assert!(note.contains("more matches exist beyond 1"));
+        assert!(note.contains("exceeded 100,000 entries"));
+    }
 }

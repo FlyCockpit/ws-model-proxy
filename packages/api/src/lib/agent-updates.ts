@@ -1,5 +1,5 @@
 /**
- * `wsmp` self-update, server side (plan `self-update-plan.md`, D4/D7/D8): who may update which
+ * `wsmp` self-update, server side: who may update which
  * node, starting an update (`agent.update`), the node's progress reports, the server deadline
  * (`timed_out`) and the "Update all" batch driver. Everything is driven from the database
  * (`node_agent_update`, `node_agent_update_batch`), so a server restart loses nothing: the
@@ -31,7 +31,6 @@ import {
   type AgentUpdateStrategy,
   type NodeSelfUpdate,
   nodeFeaturesSchema,
-  nodeSelfUpdateSchema,
 } from "./runtime-spec";
 
 // ── The relay port ──
@@ -239,13 +238,9 @@ export function parseWsl(value: unknown): boolean {
 }
 
 function storedSelfUpdate(features: unknown): NodeSelfUpdate | null {
-  const parsed = nodeFeaturesSchema.safeParse(features);
-  if (parsed.success) return parsed.data.selfUpdate ?? null;
-  // Older rows or a partial shape: read just the self-update part.
-  const raw =
-    features && typeof features === "object" ? Reflect.get(features, "selfUpdate") : undefined;
-  const own = nodeSelfUpdateSchema.safeParse(raw);
-  return own.success ? own.data : null;
+  // Retired top-level fields in a stored report do not invalidate its update evidence.
+  const parsed = nodeFeaturesSchema.strip().safeParse(features);
+  return parsed.success ? parsed.data.selfUpdate : null;
 }
 
 /**
@@ -288,10 +283,8 @@ export function agentUpdateOffered(
   );
 }
 
-function isWindows(row: AgentUpdateNodeRow, build: NodeBuild | null): boolean {
-  if (build) return build.target.includes("windows");
-  const parsed = nodeFeaturesSchema.safeParse(row.features);
-  return parsed.success && parsed.data.launch?.platform === "windows";
+function isWindows(build: NodeBuild | null): boolean {
+  return build?.target.includes("windows") === true;
 }
 
 /**
@@ -404,12 +397,10 @@ function sameWsmp(
 /**
  * The version an owner may install anyway, or null.
  *
- * The capability is proved by the node's own answer, never by its hello (a hello field would be
- * refused by a 0.4.3 server): only a wsmp that checks its tap's version before installing sends
+ * The capability is proved by the node's own answer: a node that checks its tap's version sends
  * `availableVersion`, so the node's latest update must have been refused `version_mismatch`
  * carrying it, by the wsmp it still runs ({@link sameWsmp}: when a build commit is unknown, on
- * this same connection; an older wsmp, which would
- * `brew upgrade` blindly, never sent one). Also: the tap's version is newer than the node's
+ * this same connection). Also: the tap's version is newer than the node's
  * (`brew upgrade` never goes back), the node updates with Homebrew, and it is still outdated and
  * otherwise free to update ({@link agentUpdateEligibility}'s gates).
  */
@@ -534,7 +525,7 @@ export function agentUpdateEligibility(input: {
       ? manualCommandFor({
           origin: input.origin,
           build,
-          windows: isWindows(row, build),
+          windows: isWindows(build),
           server,
         })
       : null,

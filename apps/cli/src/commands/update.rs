@@ -230,6 +230,8 @@ fn update(args: &Args) -> Result<()> {
             "{running} runtime instance(s) run here and stop when wsmp restarts on this platform; pass `--force` to update anyway"
         );
     }
+    // Windows: a build older than 1.0 knows only the 0.4 task names.
+    crate::commands::service::refuse_pre_sid_downgrade(&manifest.version)?;
     let state_dir = crate::paths::state_dir()?;
     let update_dir = state_dir.join("update");
     // Released before the restart: the new build takes it to confirm.
@@ -259,10 +261,14 @@ fn update(args: &Args) -> Result<()> {
     } else {
         None
     };
+    // Preserve this node's libc/resolver behavior, just like remote updates.
+    let release_target = crate::update::build::release_target(&identity.target, |target| {
+        manifest.artifacts.contains_key(target)
+    });
     let machine = Machine {
         state_dir,
         live,
-        target: identity.target.clone(),
+        target: release_target.clone(),
         scheduler: scheduler.as_deref(),
         tar: crate::update::install::system_tar(),
         current_version: current.clone(),
@@ -303,12 +309,7 @@ fn update(args: &Args) -> Result<()> {
         );
     }
 
-    let artifact = manifest.artifacts.get(&identity.target).with_context(|| {
-        format!(
-            "the server offers no wsmp {} build for `{}`",
-            manifest.version, identity.target
-        )
-    })?;
+    let artifact = release_artifact(&manifest, &release_target)?;
     anyhow::ensure!(
         crate::protocol::frames::is_update_artifact_url(&artifact.url),
         "the server's artifact URL `{}` is not https",
@@ -343,7 +344,7 @@ fn update(args: &Args) -> Result<()> {
                 method: identity.method,
                 version: manifest.version.clone(),
                 commit: manifest.commit.clone(),
-                target: Some(identity.target.clone()),
+                target: Some(release_target),
                 binary: Some(machine.live.clone()),
                 installed_at: Some(crate::file_ops::fmt::rfc3339_secs(crate::update::unix_now())),
             },
@@ -381,6 +382,15 @@ fn finish(
     restart: crate::commands::service::Restart,
 ) -> Result<()> {
     if service {
+        // Windows: a node installed by 0.4.x moves onto the SID-named relay
+        // task now (a no-op elsewhere, and once moved). A failure leaves the
+        // task the relay runs from, so the update goes on.
+        if let Err(error) = crate::commands::service::migrate_relay_task_for(to) {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "moving the relay service to its new scheduled-task name failed; run `wsmp service install` to retry"
+            );
+        }
         crate::commands::service::restart_quietly(restart)
             .context("restarting the relay service")?;
         let text = match rollback {
@@ -664,11 +674,44 @@ fn log_tail() -> Option<String> {
         let file = dirs::home_dir()?.join("Library/Logs/ws-model-proxy/relay.err.log");
         #[cfg(not(target_os = "macos"))]
         let file = crate::paths::log_dir().ok()?.join("relay.log");
-        let text = std::fs::read(file).ok()?;
-        let text = String::from_utf8_lossy(&text);
-        let lines: Vec<&str> = text.lines().collect();
-        Some(lines[lines.len().saturating_sub(40)..].join("\n"))
+        bounded_log_tail(&mut std::fs::File::open(file).ok()?).ok()
     }
+}
+
+/// Read at most 64 KiB, even for a growing log, retaining the last forty lines.
+#[cfg(any(not(target_os = "linux"), test))]
+fn bounded_log_tail(reader: &mut (impl std::io::Read + std::io::Seek)) -> std::io::Result<String> {
+    use std::io::{Read, SeekFrom};
+
+    const CAP: u64 = 64 * 1024;
+    let len = reader.seek(SeekFrom::End(0))?;
+    let start = len.saturating_sub(CAP);
+    reader.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    reader.take(CAP).read_to_end(&mut bytes)?;
+    // The first line may start before our byte window; do not report a fragment.
+    let bytes = if start > 0 {
+        bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(&[][..], |end| &bytes[end + 1..])
+    } else {
+        &bytes
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines: Vec<_> = text.lines().rev().take(40).collect();
+    lines.reverse();
+    Ok(lines.join("\n"))
+}
+
+/// A missing compiled target is an error, even if another libc build exists.
+fn release_artifact<'a>(manifest: &'a Manifest, target: &str) -> Result<&'a Artifact> {
+    manifest.artifacts.get(target).with_context(|| {
+        format!(
+            "the server offers no wsmp {} build for `{target}`",
+            manifest.version
+        )
+    })
 }
 
 #[cfg(test)]
@@ -678,6 +721,93 @@ mod tests {
     use super::*;
     use crate::update::deadman::Scheduler;
     use crate::update::deadman::fake::FakeScheduler;
+
+    #[test]
+    fn manual_update_artifact_preserves_the_compiled_libc_target() {
+        for arch in ["x86_64", "aarch64"] {
+            let gnu = format!("{arch}-unknown-linux-gnu");
+            let musl = format!("{arch}-unknown-linux-musl");
+            let mut manifest = Manifest {
+                version: "1.0.0".into(),
+                commit: None,
+                release_url: None,
+                source_build: false,
+                artifacts: BTreeMap::new(),
+            };
+            for target in [&gnu, &musl] {
+                manifest.artifacts.insert(
+                    target.clone(),
+                    Artifact {
+                        url: format!("https://example.invalid/wsmp-{target}.tar.xz"),
+                        sha256: "0".repeat(64),
+                    },
+                );
+            }
+            for target in [&gnu, &musl] {
+                assert!(
+                    release_artifact(&manifest, target)
+                        .expect("compiled target")
+                        .url
+                        .contains(target)
+                );
+            }
+            manifest.artifacts.remove(&gnu);
+            let error = release_artifact(&manifest, &gnu).expect_err("must not switch to musl");
+            assert!(error.to_string().contains(&gnu));
+            assert!(release_artifact(&manifest, &musl).is_ok());
+        }
+    }
+
+    #[test]
+    fn log_tail_reads_only_a_bounded_window_of_a_large_file() {
+        use std::io::{Seek, Write};
+        let mut file = tempfile::tempfile().expect("tempfile");
+        file.write_all(&vec![b'x'; 2 * 1024 * 1024])
+            .expect("large prefix");
+        file.write_all(b"\n").expect("newline");
+        for n in 0..100 {
+            writeln!(file, "line {n}").expect("line");
+        }
+        struct Counted<R> {
+            inner: R,
+            bytes_read: usize,
+        }
+        impl<R: std::io::Read> std::io::Read for Counted<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.inner.read(buffer)?;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+        impl<R: std::io::Seek> std::io::Seek for Counted<R> {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+        let mut file = Counted {
+            inner: file,
+            bytes_read: 0,
+        };
+        let tail = bounded_log_tail(&mut file).expect("tail");
+        assert_eq!(file.bytes_read, 64 * 1024);
+        assert_eq!(
+            tail,
+            (60..100)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(
+            file.stream_position().expect("position"),
+            file.inner.metadata().expect("metadata").len()
+        );
+
+        // One line longer than the window is discarded, with bounded I/O.
+        let mut long = std::io::Cursor::new(vec![b'x'; 2 * 1024 * 1024]);
+        assert_eq!(bounded_log_tail(&mut long).expect("long line"), "");
+        let mut short = std::io::Cursor::new(b"one\ntwo\n");
+        assert_eq!(bounded_log_tail(&mut short).expect("short"), "one\ntwo");
+    }
 
     /// A self-replace update that swapped and never confirmed, past its deadline, with its
     /// rollback copy, and its dead-man registered.

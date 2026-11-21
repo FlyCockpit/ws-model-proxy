@@ -1,0 +1,51 @@
+# Opt in: docker compose -f compose.yaml -f compose.backups.yaml up -d --build
+# Adds shared storage, automatic migration backups, and a daily-backup service.
+services:
+  app:
+    environment:
+      BACKUP_ENABLED: "true"
+      # Optional S3 copy: passed through when set in the env file, empty (= unset)
+      # otherwise. BACKUP_S3_PREFIX falls back to its default "database" instead,
+      # because an empty prefix is refused.
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
+      BACKUP_S3_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY_ID:-}
+      BACKUP_S3_SECRET_ACCESS_KEY: ${BACKUP_S3_SECRET_ACCESS_KEY:-}
+      BACKUP_S3_REGION: ${BACKUP_S3_REGION:-}
+      BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-}
+      BACKUP_S3_FORCE_PATH_STYLE: ${BACKUP_S3_FORCE_PATH_STYLE:-}
+      BACKUP_S3_SSE: ${BACKUP_S3_SSE:-}
+      BACKUP_S3_PREFIX: ${BACKUP_S3_PREFIX:-database}
+    volumes:
+      - backups:/backups
+
+  backup:
+    build:
+      context: .
+    command: ["backup-schedule"]
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?set a random database password}@postgres:5432/ws-model-proxy
+      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-daily}
+      BACKUP_HOUR_UTC: ${BACKUP_HOUR_UTC:-3}
+      BACKUP_KEEP: ${BACKUP_KEEP:-14}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
+      BACKUP_S3_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY_ID:-}
+      BACKUP_S3_SECRET_ACCESS_KEY: ${BACKUP_S3_SECRET_ACCESS_KEY:-}
+      BACKUP_S3_REGION: ${BACKUP_S3_REGION:-}
+      BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-}
+      BACKUP_S3_FORCE_PATH_STYLE: ${BACKUP_S3_FORCE_PATH_STYLE:-}
+      BACKUP_S3_SSE: ${BACKUP_S3_SSE:-}
+      BACKUP_S3_PREFIX: ${BACKUP_S3_PREFIX:-database}
+    volumes:
+      - backups:/backups
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "scripts/backup/schedule.mjs", "health"]
+      interval: 60s
+      timeout: 5s
+      start_period: 10m
+    restart: unless-stopped
+
+volumes:
+  backups:

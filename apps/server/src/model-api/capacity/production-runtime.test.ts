@@ -50,9 +50,57 @@ beforeEach(() => {
     },
   }));
 });
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 describe("production capacity shutdown lifecycle", () => {
+  it("catches maintenance failures, logs only their class and retries on the next tick", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    store.sweepAbandoned.mockRejectedValueOnce(new TypeError("SQL with private parameters"));
+    const lifecycle = createProductionCapacityRuntime();
+    try {
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(log).toHaveBeenCalledExactlyOnceWith(
+        "[capacity] maintenance sweep failed:",
+        "TypeError",
+      );
+      expect(unhandled).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(store.sweepAbandoned).toHaveBeenCalledTimes(2);
+      expect(log).toHaveBeenCalledTimes(1);
+    } finally {
+      process.off("unhandledRejection", unhandled);
+      await lifecycle.close();
+    }
+  });
+
+  it("skips overlapping sweeps and waits for the active sweep before stopping", async () => {
+    let finish!: () => void;
+    store.sweepAbandoned.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const lifecycle = createProductionCapacityRuntime();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(store.sweepAbandoned).toHaveBeenCalledTimes(1);
+    const stopped = vi.fn();
+    const stopping = lifecycle.stopMaintenance().then(stopped);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(stopped).not.toHaveBeenCalled();
+    finish();
+    await stopping;
+    expect(stopped).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(store.sweepAbandoned).toHaveBeenCalledTimes(1);
+    await lifecycle.close();
+  });
+
   it("stops maintenance with no owners and closes idempotently", async () => {
     const lifecycle = createProductionCapacityRuntime();
     await lifecycle.stopMaintenance();

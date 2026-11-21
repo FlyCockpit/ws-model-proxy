@@ -8,22 +8,22 @@
 <p align="center">
   <a href="https://github.com/FlyCockpit/ws-model-proxy/stargazers"><img alt="GitHub stars" src="https://shieldcn.dev/github/stars/FlyCockpit/ws-model-proxy.svg?variant=secondary&mode=light&size=sm"></a>
   <a href="https://github.com/FlyCockpit/ws-model-proxy/forks"><img alt="GitHub forks" src="https://shieldcn.dev/github/forks/FlyCockpit/ws-model-proxy.svg?variant=secondary&mode=light&size=sm"></a>
-  <a href="Cargo.toml"><img alt="Rust 1.88+" src="https://shieldcn.dev/badge/rust-1.88+-ef7d00.svg?variant=secondary&mode=light&size=sm&logo=rust"></a>
+  <a href="Cargo.toml"><img alt="Rust 1.89+" src="https://shieldcn.dev/badge/rust-1.89+-ef7d00.svg?variant=secondary&mode=light&size=sm&logo=rust"></a>
   <a href="#license"><img alt="License" src="https://shieldcn.dev/github/license/FlyCockpit/ws-model-proxy.svg?variant=secondary&mode=light&size=sm"></a>
 </p>
 
-> The node client for WS Model Proxy 0.4.3.
+> The node client for WS Model Proxy 1.0.0.
 
 `wsmp` turns a computer into a **node** of your WS Model Proxy server. It keeps one outbound
 websocket to the server (no port forwarding), relays model requests to the runtimes on this
 node, and, when you allow it, runs the runtimes, commands, file operations and terminals the
 server asks for.
 
-0.4.3 speaks relay protocol 3.0. It does not work with older servers or CLIs: upgrade the server
-first, then reinstall each node once. From 0.4.3 on, released nodes keep working with newer
-servers and update from the browser.
-Image paste requires both the web app and the node's CLI to be upgraded to 0.4.1.
-A 0.3 CLI cannot connect to a 0.4.x server, and this CLI cannot connect to a 0.3 server.
+1.0.0 speaks relay protocol 4.0 and needs a 1.0 server. Coming from 0.4.x,
+upgrade the server, then run `wsmp update` on every node (or `brew upgrade wsmp`, or
+the server's installer): a 0.4.x wsmp is refused with an upgrade message, so the browser
+cannot push this one update. A 1.0 wsmp against a 0.4.x server asks you to upgrade the server.
+See [Upgrading from 0.4.x](../../UPGRADING.md). After that, nodes can update from the browser.
 
 ## Install
 
@@ -33,11 +33,25 @@ From your server:
 curl -fsSL https://wsmp.example.com/install.sh | sh
 ```
 
-The script installs the release binary of the server's version on Linux x86_64 and ARM64 (glibc
-2.34 or newer, such as Ubuntu 22.04+ and DGX OS) and on macOS. It verifies the archive's SHA-256
-against the release's `sha256.sum` and refuses to install on any mismatch or missing checksum.
+The script installs the release binary of the server's version on Linux x86_64 and ARM64 and
+on macOS. It verifies the archive's
+SHA-256 against the release's `sha256.sum` and refuses to install on any mismatch or missing checksum.
 On other systems, or when the server pins a commit (`WMP_CLI_SOURCE_REV`), it builds from source
-with `cargo install`, which needs Rust 1.88 or newer (<https://rustup.rs>) and a C compiler.
+with `cargo install`, which needs Rust 1.89 or newer (<https://rustup.rs>) and a C compiler.
+
+On Linux the script picks the build by C library:
+
+- **glibc 2.34 or newer** (Debian 12+, Ubuntu 22.04+, Fedora, Arch, …): the glibc build
+  (`*-unknown-linux-gnu`), as in 0.4.x. It resolves host names through the system's NSS, so a
+  `*.local` (mDNS) server URL or model endpoint works where the machine resolves it.
+- **musl (Alpine) or glibc older than 2.34**: the static musl build (`*-unknown-linux-musl`),
+  which runs anywhere but cannot resolve mDNS `*.local` names (use an `/etc/hosts` entry or an
+  IP address there).
+
+`wsmp update` and updates from the web app keep a node on the flavour it runs. wsmp is the
+FlyCockpit suite's deliberate exception to "Linux releases prefer static musl": a node often
+reaches its server or its model servers by a `*.local` name on the local network, which only
+the glibc build resolves.
 
 Either way the binary lands in `~/.cargo/bin` (`$CARGO_HOME/bin` when set); add it to your `PATH`
 if `wsmp` is not found.
@@ -46,13 +60,13 @@ if `wsmp` is not found.
 downloaded archive yourself:
 
 ```sh
-gh attestation verify wsmp-aarch64-unknown-linux-gnu.tar.xz --repo FlyCockpit/ws-model-proxy
+gh attestation verify wsmp-aarch64-unknown-linux-musl.tar.xz --repo FlyCockpit/ws-model-proxy
 ```
 
 Or build a release tag with cargo directly:
 
 ```sh
-cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.3 --locked wsmp
+cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v1.0.0 --locked wsmp
 ```
 
 **Windows.** In PowerShell (Windows PowerShell 5.1 or PowerShell 7), from your server:
@@ -108,8 +122,7 @@ says so.
 A plain code never takes over an existing node, even on the same computer: log in again with a
 new code and a new name, or use a Replace code.
 
-Logging in over an earlier enrollment for another server, or over leftovers of wsmp 0.3, is a
-fresh enrollment: `--trust` (or your answer) applies and the old node name is not reused (you are
+Logging in over an earlier enrollment for another server is a fresh enrollment: `--trust` (or your answer) applies and the old node name is not reused (you are
 asked for a name, or it comes from the hostname). A node you lowered to Relay only stays Relay
 only when you log in to the same server again; raise it with `wsmp trust full`. A Relay-only
 setting left by an earlier enrollment is kept too, unless this fresh enrollment explicitly chooses
@@ -125,7 +138,7 @@ wsmp service restart     # restart it (after `wsmp login`, or to apply a setting
 wsmp service logs        # its logs; -f to follow, -n <lines> (default 100)
 wsmp service uninstall   # stop, disable and remove it
 wsmp status              # whether the relay runs and is connected, plus its runtimes and instances
-wsmp hardware            # what this node detects (memory, GPUs, unified pool); --json
+wsmp hardware            # what this node detects (OS memory, accelerator memory, GPUs); --json
 wsmp run                 # run the relay in the foreground (what the service runs)
 wsmp logout              # forget this node's credential
 ```
@@ -136,16 +149,74 @@ Halo reports VRAM carve-out plus GTT as its pool), and Apple silicon (the GPU wi
 it before declaring overrides on the node's page in the web app (or through MCP); hardware is
 never declared on the node itself.
 
+Memory total is the OS physical total (`MemTotal` plus the BIOS VRAM carve-out on AMD APUs,
+`hw.memsize` on Apple). Accelerator memory is separately what the GPU can address: dedicated
+VRAM, AMD carve-out + GTT capped by TTM and physical RAM, Apple's wired GPU limit, or MemTotal
+on GB10. The dashboard and MCP use the OS total for `memoryGb`; declarations still win over
+node config and detection. `unifiedMemoryMiB` remains the GPU pool on the wire and is a RAM
+fallback only when no OS total was sent.
+
+On AMD APUs the default GTT/TTM allocation limit is about half of RAM, so a 128 GB machine may
+show roughly 62 GiB accelerator memory while still having over 120 GiB available RAM. To raise
+that limit, configure `ttm.pages_limit` and `ttm.page_pool_size` kernel parameters and reboot.
+They count pages (4 KiB on these AMD systems): 1 GiB = 262144 pages; for example a 120 GiB
+limit is `ttm.pages_limit=31457280 ttm.page_pool_size=31457280`. Pick a limit appropriate to
+your machine and OS needs, then check `wsmp hardware` again. `page_pool_size` controls TTM's
+page cache; `pages_limit` controls allocations. Recent kernels deprecate `amdgpu.gttsize` in
+favor of TTM ([kernel documentation](https://www.kernel.org/doc/html/v6.16/gpu/amdgpu/module-parameters.html)).
+Older kernels may also limit the reported GTT size; the CLI always uses the smaller reported
+GTT/TTM limit, so increasing TTM alone may not raise that older kernel's GPU pool.
+
+Placement subtracts 2 GiB OS headroom on unified nodes, reserved RAM, and unified GPUs'
+reserved VRAM from physical memory. GPU-side claims (VRAM on unified GPUs and `unified`-kind
+model entries) consume both this RAM budget and one shared accelerator budget. The accelerator
+budget is the effective accelerator total minus unified GPUs' reserved VRAM, with no second
+OS headroom deduction. CPU entries and a discrete entry's `ramGb` consume RAM only.
+
+RAM-only claims cannot use a detected AMD APU's BIOS VRAM carve-out. GPU allocations use the
+carve-out first, then system RAM through GTT: with physical memory P, carve-out C, headroom H,
+accelerator budget A, GPU-side usage G and RAM-only usage R, require G <= A, R + G <= P - H,
+and R <= P - C - H (with reservations deducted from their corresponding pools). A declared
+`memoryGb` remains an operator budget with no inferred carve-out deduction. Unknown
+accelerator memory adds no extra cap. Restarts overlap each pool independently; reservations,
+runtime starts, and profile previews/applies follow the same rules. Refusals use
+`not_enough_memory` and name only the additional limits that failed. Apple's RAM figure now
+shows physical memory while its wired limit caps GPU-side memory; GB10's detected pool equals
+its OS total. On a unified node GPU-side memory is capped by the effective
+`acceleratorMemoryGb`, not by a declared `memoryGb` (declare `acceleratorMemoryGb` to change it);
+one declared earlier is now a real cap; review overrides made to work around the old RAM figures.
+
 The service is a systemd user unit on Linux and a launchd agent on macOS. It needs no
 environment file: the node credential and node secrets (`wsmp secret`) are files the relay reads
 itself, and the unit pins only the config and state paths and the installing shell's `PATH`.
+The pinned `PATH` keeps every existing absolute directory except world-writable ones, so the
+service finds the same engines as your shell. Directories that end with your shell or login
+session are left off, because the service outlives them: anything under `/run/user/<uid>` (or a
+`$XDG_RUNTIME_DIR` under `/run`), temporary directories (`/tmp`, `/var/tmp`, and macOS's
+per-user `$TMPDIR` under `/var/folders`; a `$TMPDIR` elsewhere, such as a cluster's `/scratch`, is
+kept) and fnm's per-shell `fnm_multishells/<id>` directory. In place of the fnm one the service gets fnm's default version
+(`~/.local/share/fnm/aliases/default/bin`, or under `$FNM_DIR`); without a default, install says
+to run `fnm default <version>` and install again. `wsmp service install` warns about each directory
+that another account can write (group-writable for a group other than your private one, or owned
+by someone other than root or you), because a program planted there would run as the service;
+the warning says why and how to tighten it (`chmod g-w`, a `chown` by root, or re-running
+install with that directory removed from `PATH`).
 `wsmp service logs` reads journald on Linux (`journalctl --user -u wsmp.service`; on a host whose
 journal is not persistent, user units may log only to the system journal, which needs
 `journalctl --user-unit wsmp.service` with journal read access) and tails
 `~/Library/Logs/ws-model-proxy/relay.*.log` on macOS. Upgrading from 0.3: run `wsmp service
 install` again so the unit stops loading `service.env`, then delete that file.
 
-**Windows.** The service is a Task Scheduler task of yours, `wsmp-relay-<username>`. It starts
+**Windows.** The service is a Task Scheduler task of yours, `wsmp-relay-<your account SID>`
+(for example `wsmp-relay-S-1-5-21-…-1001`; 0.4.x used `wsmp-relay-<username>`, which two
+accounts with the same user name in different domains shared). `wsmp service install` and
+`wsmp service uninstall` replace or remove your own 0.4.x task, and so does a `wsmp update`
+run by 1.0 that installs a newer 1.x build. One with the old name that belongs to another
+account, or that wsmp cannot confirm is yours, is left alone, and the command says so. A node
+that the web app updated from 0.4.x keeps running from its old task until then; `wsmp service
+status`/`restart` find either name meanwhile, and `wsmp service install` keeps the old name
+while that update is still on trial. To go back to 0.4.x, run `wsmp service uninstall` with
+1.0 first (`wsmp update` refuses to install a pre-1.0 build while the service is installed). The task starts
 when you log on, runs as you with no extra privileges and no console window, and stops when you
 log off. It needs no password and no administrator rights. A relay that exits is started again
 within 5 minutes while you are logged on. A task cannot set environment variables, so the task
@@ -161,15 +232,56 @@ shells are found when the relay starts. Each terminal runs in a job of its own, 
 everything its shell started. A pasted image's path is quoted for the terminal's shell
 (PowerShell, Command Prompt, or `/mnt/c/...` in WSL).
 
-**Linux: enable lingering.** A user service stops when you log out, and runtimes are started as
-transient user units, which need a user manager that outlives your sessions. Enable it once:
+**Linux: lingering.** A user service runs only while your user manager does. Without systemd
+lingering that is only while you are logged in: the node goes offline at logout and does not
+start at boot. Runtimes are started as transient user units, which need the same. `wsmp service
+install` turns lingering on for you when it is off (`loginctl enable-linger <you>`, as you, with
+no password prompt; logind allows that on most systems). If logind refuses, install prints the
+command for an administrator:
 
 ```sh
-loginctl enable-linger $USER
+sudo loginctl enable-linger <your user name>
 ```
 
-Without linger the node refuses to start runtimes (the server shows why); relaying to always-on
-runtimes still works.
+`wsmp status` (text and `--json`, under `service`) and `wsmp service status` warn while an
+installed user service has lingering off. Without linger the node also refuses to start runtimes
+(the server shows why); relaying to always-on runtimes still works while you are logged in.
+
+If `systemctl --user` reaches no user manager at all (no login session and lingering off, or no
+systemd, as in a container), `wsmp service install` stops before writing the unit and prints the
+same `sudo loginctl enable-linger` command. A shell from `su - <user>` or `sudo -iu <user>` has no
+`XDG_RUNTIME_DIR`; wsmp then uses `/run/user/<uid>`, where logind runs the manager once lingering
+is on.
+
+**Linux: root or an ordinary account.** Install wsmp under an ordinary account, not as root.
+Everything the web app runs on a node (runtimes, node commands, browser terminals, file tools)
+runs as the account wsmp runs as, so a root relay would give the server root on the machine.
+The service is a systemd user unit, and runtimes and the update rollback timer run in that
+account's user manager. So `wsmp service install` as root refuses before writing anything, and
+`wsmp login` as root refuses before it enrolls whenever it would install or offer the service
+(`--service`, `--yes`, or a terminal to ask on; `--no-service` skips that). Both print these
+steps. On a fresh server where you are root (Hetzner, say), as root, once:
+
+```sh
+useradd --create-home --shell /bin/bash wsmp
+usermod -aG video,render wsmp    # GPU access for engines, where these groups exist
+loginctl enable-linger wsmp      # the service starts at boot, without a login
+su - wsmp
+```
+
+Then, as `wsmp`:
+
+```sh
+curl -fsSL https://wsmp.example.com/install.sh | sh
+~/.cargo/bin/wsmp login https://wsmp.example.com --code wsmp_enr_...
+```
+
+If you already enrolled the machine as root, run `wsmp logout` as root and delete that node in
+the web app. To run as root anyway without a service (a container, say), enroll with
+`wsmp login ... --no-service` and run `wsmp run` in the foreground. The file tools stay off
+there unless you turn them on with `wsmp config set-file-tools-as-root on`. A root user service
+installed by an earlier version keeps running and updating, but `wsmp service install` as root
+refuses to rewrite it.
 
 ## Trust
 
@@ -270,6 +382,13 @@ The server asks a node to do two different kinds of work:
   node's activity, and stop when trust is lowered. An agent can also queue a command for you
   (one that needs a password, for example); it runs only when you choose Run on the Terminals
   page.
+
+Agent host access (commands and files) lets the agent do whatever the wsmp daemon's OS user
+can do, including reading that account's node credential and identity key, editing wsmp's
+settings, and starting processes that survive cancellation. It is off until a person enables
+Full control at the node; Full control can only be raised locally, and a person can lower it
+from the dashboard at any time. File tools' forbidden paths and output masking are guard
+rails, not a sandbox. No isolation mode exists.
 
 Every runtime command gets, on top of a scrubbed environment, the secrets its definition names,
 the GPUs placement gave its rank (`CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES`, with
@@ -388,7 +507,7 @@ tools' recovery journal, and vLLM with CUDA on WSL.
 1. Enable systemd in the distribution (`/etc/wsl.conf`: `[boot]` then `systemd=true`), then run
    `wsl --shutdown`.
 2. Install `wsmp` with `install.sh` inside the distribution.
-3. Run `loginctl enable-linger $USER` and `wsmp service install` as on any Linux.
+3. Run `wsmp service install` as on any Linux (it turns on lingering, or says how).
 
 Agents then see Linux, not Windows, and files under `/mnt/c` are slow. WSL can stop a distribution
 that nothing is using: after you close your terminals, check that the node stays connected, and
@@ -477,7 +596,7 @@ shows the command to run on the node, and `wsmp update` there still works.
   relay.
 - wsmp updates itself only where it knows how it was installed: from `<state>/install.json`,
   which this release's `install.sh` and `install.ps1` write, or from a Homebrew `Cellar` or cargo
-  path. A binary without a receipt (installed by an older script, a package or a copy) is never
+  path. A binary without a receipt (installed by a package or a copy) is never
   overwritten: run the install script once to allow updates.
 - Where instances stop with the relay (macOS), the node checks again that it is idle after the
   download, and from that check to the restart it starts no runtime launch and no node command
@@ -519,7 +638,7 @@ Commands that print data take `--json` (`wsmp service` does not). Logs go to std
 | 2 | usage error |
 | 3 | not found |
 | 4 | the relay has no usable credential (none saved, rejected with HTTP 401, or refused at hello as revoked or enrolled with another identity); run `wsmp login`. Only under the systemd unit and in an interactive terminal; elsewhere the relay retries instead. The systemd unit does not restart on this code. |
-| 5 | the server refused this wsmp's relay protocol (HTTP 426 or an `upgrade_cli`/`upgrade_server` refusal at hello). Re-run the server's `install.sh` to install the matching wsmp (or upgrade the server), then restart wsmp. Only under a systemd unit written by this version's `wsmp service install` (it does not restart on this code) and in an interactive terminal; elsewhere, including an older unit, the relay logs it and retries every 5 minutes (re-run `wsmp service install` to update an older unit). |
+| 5 | the server refused this wsmp's relay protocol (HTTP 426 or an `upgrade_cli`/`upgrade_server` refusal at hello). Re-run the server's `install.sh` to install the matching wsmp (or upgrade the server), then restart wsmp. Only under a systemd unit written by this version's `wsmp service install` (it does not restart on this code) and in an interactive terminal; elsewhere the relay logs it and retries every 5 minutes. |
 | 75 | the relay installed an update and exits so its service starts the new binary (systemd restarts it, launchd's `KeepAlive` does, and on Windows the update's rollback task starts the relay task again) |
 | 128 + signal | the relay stopped on SIGHUP (129), SIGINT (130), or SIGTERM (143); on Unix it dies from that signal after cleanup |
 
@@ -543,14 +662,14 @@ cargo xtask sync-docs --check
 ```
 
 The relay protocol is shared with the server through the fixtures in
-`tests/fixtures/relay-3.0`; the contract is described in `docs/contracts/0.4.0.md` at the
-repository root. See [AGENTS.md](AGENTS.md) for conventions and [CONTRIBUTING.md](CONTRIBUTING.md)
+`tests/fixtures/relay-4.0`; see the public [relay protocol guide](docs/relay-protocol.md). See [AGENTS.md](AGENTS.md) for conventions and [CONTRIBUTING.md](CONTRIBUTING.md)
 for the PR checklist.
 
 ## Guides
 
 - [Error handling](docs/error-handling.md)
 - [File recovery](docs/file-recovery.md)
+- [Terminal images](docs/terminal-images.md)
 - [Releasing](docs/releasing.md)
 
 ## Agent Docs

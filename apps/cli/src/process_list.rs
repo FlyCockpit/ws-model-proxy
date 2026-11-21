@@ -221,7 +221,7 @@ impl PsSlot {
     fn take() -> std::io::Result<Self> {
         use std::sync::atomic::Ordering;
         // `fetch_update` is deprecated on current Rust; its replacement requires a newer
-        // compiler than our MSRV. Keep the bounded increment on Rust 1.88 with a CAS loop.
+        // compiler than our MSRV. Keep the bounded increment on Rust 1.89 with a CAS loop.
         let mut held = PS_OUTSTANDING.load(Ordering::Acquire);
         loop {
             if held >= PS_MAX_OUTSTANDING {

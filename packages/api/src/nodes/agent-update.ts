@@ -34,6 +34,7 @@ import {
   startAgentUpdate,
   untouchedNodeIds,
 } from "../lib/agent-updates";
+import { liveConnection } from "../lib/node-liveness";
 import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { stopInstancesOnNode } from "../routers/runtime-lifecycle";
 import { effectiveTrust } from "./trust";
@@ -179,7 +180,7 @@ function toBatchView(row: BatchRow): BatchView {
 async function loadOverview(userId: string, port: AgentUpdatePort, now: Date) {
   const nodes = await prisma.node.findMany({
     where: { userId },
-    select: AGENT_UPDATE_NODE_SELECT,
+    select: { ...AGENT_UPDATE_NODE_SELECT, lastHeartbeatAt: true },
     orderBy: { slug: "asc" },
   });
   const ids = nodes.map((node) => node.id);
@@ -245,7 +246,7 @@ async function loadOverview(userId: string, port: AgentUpdatePort, now: Date) {
     return {
       nodeId: node.id,
       slug: node.slug,
-      connection: node.connection,
+      connection: liveConnection(node, now),
       trust: effectiveTrust(node),
       version: node.cliVersion,
       build: eligibility.build,

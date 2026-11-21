@@ -585,12 +585,13 @@ pub fn deadman_spec(
 }
 
 /// Make sure `current`'s recovery copy is there and is the rollback copy's bytes, writing it
-/// (again) from the rollback copy otherwise, and record it. An update armed by an earlier build
-/// (whose job ran `wsmp.prev`) gets one here, before its job is armed again.
+/// (again) from the rollback copy otherwise. A missing recorded path is a stale job.
 fn ensure_recovery(current: &mut UpdateState, layout: &Layout) -> Result<()> {
-    if current.recovery_path.is_none()
-        || install::verify_recovery(&layout.prev, &layout.recovery).is_err()
-    {
+    anyhow::ensure!(
+        current.recovery_path.is_some(),
+        "the stale update job has no recoveryPath"
+    );
+    if install::verify_recovery(&layout.prev, &layout.recovery).is_err() {
         install::prepare_recovery(&layout.prev, &layout.recovery)?;
     }
     current.recovery_path = Some(layout.recovery.clone());
@@ -624,10 +625,8 @@ fn sweep_recovery(update_dir: &Path, live: &Path, scheduler: Option<&dyn Schedul
 /// The dead-man of `update_id` removed its own job (`remove()` succeeded) and has nothing left
 /// to do: remove its program (the recovery copy), under the update lock. Kept while the update
 /// still needs recovery ([`UpdateState::needs_recovery`]: a restart still owed, a rollback not
-/// recorded). A job armed by an earlier build ran `wsmp.prev`, which this build linked again
-/// after the restore ([`rollback_if_unconfirmed`]): that link goes instead. Best effort: what
-/// stays (Windows cannot delete the running program; the lock was busy) goes with a later
-/// sweep.
+/// recorded). Best effort: what stays (Windows cannot delete the running program;
+/// the lock was busy) goes with a later sweep.
 pub fn job_removed(update_dir: &Path, update_id: &str) {
     let Ok(Some(_lock)) = state::UpdateLock::wait(update_dir, LOCK_WAIT) else {
         return;
@@ -638,14 +637,8 @@ pub fn job_removed(update_dir: &Path, update_id: &str) {
     if current.update_id != update_id || current.needs_recovery() {
         return;
     }
-    match &current.recovery_path {
-        Some(recovery) => {
-            let _ = std::fs::remove_file(recovery);
-        }
-        None if current.phase() == state::Phase::RolledBack => {
-            let _ = std::fs::remove_file(&current.prev_path);
-        }
-        None => {}
+    if let Some(recovery) = &current.recovery_path {
+        let _ = std::fs::remove_file(recovery);
     }
 }
 
@@ -684,7 +677,7 @@ pub fn rollback_if_unconfirmed(
     if current.update_id != update_id {
         return Ok(Rollback::NotOurs);
     }
-    if !current.in_progress() {
+    if !current.in_progress() || current.recovery_path.is_none() {
         return Ok(Rollback::Settled);
     }
     // A rollback already decided (its intent is saved, and it may have begun) is finished now,
@@ -730,13 +723,6 @@ pub fn rollback_if_unconfirmed(
     // Failing here leaves `swapped` with the intent saved: the job runs again, and the replay
     // finds the restore done.
     state::save(update_dir, &current)?;
-    if current.recovery_path.is_none()
-        && let Err(error) = install::relink_program(&layout.live, &current.prev_path)
-    {
-        // A job armed by an earlier build runs `wsmp.prev`, which the restore consumed: its
-        // next run (a retried restart) needs it there again.
-        tracing::warn!(error = %format!("{error:#}"), "keeping the rollback job's program failed");
-    }
     Ok(Rollback::RolledBack)
 }
 
@@ -805,7 +791,7 @@ pub fn restart_pending(update_dir: &Path, update_id: &str) -> bool {
     matches!(
         state::load(update_dir),
         Ok(Some(current))
-            if current.update_id == update_id && current.lifecycle.restart_pending()
+            if current.update_id == update_id && current.recovery_path.is_some() && current.lifecycle.restart_pending()
     )
 }
 
@@ -867,7 +853,9 @@ pub fn settle_abandoned(
 pub fn no_longer_due(update_dir: &Path, update_id: &str) -> Option<Rollback> {
     match state::load(update_dir) {
         Ok(Some(current)) if current.update_id != update_id => Some(Rollback::NotOurs),
-        Ok(Some(current)) if !current.in_progress() => Some(Rollback::Settled),
+        Ok(Some(current)) if !current.in_progress() || current.recovery_path.is_none() => {
+            Some(Rollback::Settled)
+        }
         Ok(None) => Some(Rollback::NotOurs),
         _ => None,
     }
@@ -996,6 +984,29 @@ pub fn on_start(
     let Some(mut current) = state::load(update_dir)? else {
         return Ok(OnStart::Nothing);
     };
+    if current.strategy == UpdateStrategy::SelfReplace
+        && current.in_progress()
+        && current.recovery_path.is_none()
+    {
+        // `wsmp update` in 0.4.3 uses HTTP, so it can install this build despite the
+        // relay protocol change. Its job runs wsmp.prev and has no recoveryPath.
+        // Keep that safety net until normal health confirmation if the bytes match.
+        let installed = install::sha256_file(&current.live_path)
+            .context("reading the installed wsmp for an update without recoveryPath")?;
+        if current.to_sha256.as_deref() != Some(installed.as_str()) {
+            current.abandon_rollback();
+            current.fail(
+                UpdateReason::Internal,
+                "discarded stale update job: no recoveryPath was recorded and the installed binary does not match toSha256",
+            )?;
+            state::save(update_dir, &current)?;
+            if let Some(scheduler) = scheduler
+                && let Err(error) = super::deadman::disarm(scheduler)
+            {
+                tracing::warn!(error = %format!("{error:#}"), "discarding the stale update job failed");
+            }
+        }
+    }
     if !current.in_progress() {
         sweep_recovery(update_dir, &current.live_path, scheduler);
         return Ok(if current.needs_report() {
@@ -1829,41 +1840,123 @@ mod tests {
         assert!(!recovery.exists(), "swept");
     }
 
-    /// F-FA-1, the old layout: an update whose job an earlier build armed (it ran `wsmp.prev`;
-    /// the state names no recovery copy) and lost is armed again with a recovery copy of the
-    /// rollback copy, recorded in the state.
     #[cfg(unix)]
     #[test]
-    fn a_job_an_earlier_build_armed_is_armed_again_with_a_recovery_copy() {
+    fn a_job_without_recovery_or_matching_installed_bytes_is_discarded() {
         let (node, mut saved) = swapped_node();
-        let recovery = saved.recovery_path.take().expect("recorded");
-        std::fs::remove_file(&recovery).expect("rm");
+        saved.recovery_path = None;
         state::save(&node.update_dir(), &saved).expect("save");
-        node.scheduler.remove().expect("lost");
-        let late = saved.deadline + 300;
-        on_start(
-            &node.update_dir(),
-            Some(&node.scheduler),
-            new_build(&node.live_sha()),
-            3,
-            late,
-        )
-        .expect("start");
-        let spec = node
-            .scheduler
-            .registered
-            .borrow()
-            .clone()
-            .expect("armed again");
-        assert_eq!(spec.program(), recovery);
+        std::fs::write(&node.live, "another build").expect("replace live");
+        let live = node.live_text();
+        let prev = std::fs::read(&saved.prev_path).expect("prev");
         assert_eq!(
-            install::sha256_file(&recovery).expect("copy"),
-            install::sha256_file(&saved.prev_path).expect("prev")
+            no_longer_due(&node.update_dir(), &saved.update_id),
+            Some(Rollback::Settled)
         );
+        assert_eq!(
+            rollback_if_unconfirmed(
+                &node.update_dir(),
+                &saved.update_id,
+                saved.deadline + 300,
+                None,
+                || None
+            )
+            .expect("stale"),
+            Rollback::Settled
+        );
+        assert!(matches!(
+            on_start(
+                &node.update_dir(),
+                Some(&node.scheduler),
+                new_build(&node.live_sha()),
+                3,
+                saved.deadline + 300
+            )
+            .expect("start"),
+            OnStart::Report(_)
+        ));
+        assert!(
+            node.scheduler.registered.borrow().is_none(),
+            "stale job removed"
+        );
+        assert_eq!(node.live_text(), live);
+        assert_eq!(std::fs::read(&saved.prev_path).expect("prev"), prev);
         let stored = state::load(&node.update_dir())
             .expect("load")
             .expect("state");
-        assert_eq!(stored.recovery_path.as_deref(), Some(recovery.as_path()));
+        assert_eq!(stored.phase(), Phase::Failed);
+        assert!(stored.recovery_path.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_0_4_3_update_state_without_recovery_path_confirms_matching_bytes() {
+        let node = Node::new();
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/upgrade-0.4.3/state.json"
+        ))
+        .expect("fixture");
+        fixture["livePath"] = serde_json::json!(node.live);
+        fixture["prevPath"] = serde_json::json!(node.live.with_file_name("wsmp.prev"));
+        fixture["failedPath"] = serde_json::json!(node.live.with_file_name("wsmp.failed"));
+        std::fs::create_dir_all(node.update_dir()).expect("dir");
+        std::fs::write(state::path(&node.update_dir()), fixture.to_string()).expect("state");
+        std::fs::write(&node.live, b"wsmp 1.0 fixture\n").expect("live");
+        let saved = state::load(&node.update_dir())
+            .expect("load")
+            .expect("state");
+        assert!(saved.recovery_path.is_none());
+        std::fs::write(&saved.prev_path, "wsmp 0.4.3 fixture").expect("prev");
+        let spec = DeadmanSpec::new(
+            saved.update_id.clone(),
+            &saved.prev_path,
+            node.root.path(),
+            Duration::from_secs(90),
+        )
+        .expect("old dead-man");
+        node.scheduler.register(&spec).expect("register");
+        let started = on_start(
+            &node.update_dir(),
+            Some(&node.scheduler),
+            Running {
+                version: "1.0.0",
+                sha256: Some(&node.live_sha()),
+            },
+            3,
+            saved.deadline - 90,
+        )
+        .expect("start new build");
+        assert!(matches!(started, OnStart::AwaitConfirm(ref current)
+            if current.attempts == 1 && current.recovery_path.is_none()));
+        assert!(
+            node.scheduler.registered.borrow().is_some(),
+            "rollback stays armed until healthy"
+        );
+        assert!(matches!(
+            confirm(
+                &node.update_dir(),
+                Some(&node.scheduler),
+                &saved.update_id,
+                |_| None
+            )
+            .expect("confirm"),
+            Confirm::Confirmed(_)
+        ));
+        assert!(
+            node.scheduler.registered.borrow().is_none(),
+            "disarmed after confirmation"
+        );
+        assert_eq!(
+            state::load(&node.update_dir())
+                .expect("reload")
+                .expect("state")
+                .phase(),
+            state::Phase::Confirmed
+        );
+        assert_eq!(
+            std::fs::read(&node.live).expect("live"),
+            b"wsmp 1.0 fixture\n"
+        );
     }
 
     /// F-FA-1, the inverse: a recovery copy that cannot be written stops the update before
@@ -1947,6 +2040,11 @@ mod tests {
         let node = Node::new();
         let mut armed = state::sample(node.live.parent().expect("bin"), Phase::Armed);
         armed.live_path = node.live.clone();
+        armed.recovery_path = Some(
+            Layout::beside(&armed.live_path, &armed.update_id)
+                .expect("layout")
+                .recovery,
+        );
         armed.deadline = 1_793_188_890;
         state::save(&node.update_dir(), &armed).expect("save");
         let new = Layout::beside(&armed.live_path, &armed.update_id)
@@ -2005,6 +2103,11 @@ mod tests {
         let node = Node::new();
         let mut armed = state::sample(node.live.parent().expect("bin"), Phase::Armed);
         armed.live_path = node.live.clone();
+        armed.recovery_path = Some(
+            Layout::beside(&armed.live_path, &armed.update_id)
+                .expect("layout")
+                .recovery,
+        );
         state::save(&node.update_dir(), &armed).expect("save");
         let new = Layout::beside(&armed.live_path, &armed.update_id)
             .expect("layout")
@@ -2595,6 +2698,11 @@ mod tests {
         let update_dir = node.update_dir();
         let mut armed = state::sample(node.live.parent().expect("bin"), Phase::Armed);
         armed.live_path = node.live.clone();
+        armed.recovery_path = Some(
+            Layout::beside(&armed.live_path, &armed.update_id)
+                .expect("layout")
+                .recovery,
+        );
         state::save(&update_dir, &armed).expect("save");
         let new = node.live.with_file_name("wsmp.new");
         std::fs::write(&new, "new").expect("new");
@@ -2612,7 +2720,7 @@ mod tests {
         // A registered dead-man owns it.
         let spec = DeadmanSpec::new(
             armed.update_id.clone(),
-            &armed.prev_path,
+            armed.recovery_path.as_deref().expect("recovery"),
             &node.state_dir(),
             Duration::from_secs(90),
         )

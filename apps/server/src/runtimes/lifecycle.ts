@@ -38,7 +38,6 @@ import {
   isLeadingStop,
   mayHaveRunAfterRequeue,
   owned,
-  peekRun,
   physicalLaunch,
   recordStoppedThrough,
   resolveRun,
@@ -60,11 +59,7 @@ import {
 } from "@ws-model-proxy/api/lib/reservations";
 import { planRetake } from "@ws-model-proxy/api/lib/retake-plan";
 import { type RuntimeLaunch, runtimeLaunchSchema } from "@ws-model-proxy/api/lib/runtime-spec";
-import {
-  claimGpuIds,
-  type StepReservation,
-  stepJobReservations,
-} from "@ws-model-proxy/api/lib/step-intent";
+import { claimGpuIds, type StepReservation } from "@ws-model-proxy/api/lib/step-intent";
 import { effectiveTrust } from "@ws-model-proxy/api/nodes/trust";
 import { healthFailureDetail } from "@ws-model-proxy/config/health-reasons";
 import { RUNTIME_ADVANCED } from "@ws-model-proxy/config/runtime-defaults";
@@ -173,21 +168,10 @@ function activeOwner(now: Date): Prisma.UserWhereInput {
   };
 }
 
-/**
- * A runtime job for a node whose CLI cannot prove what it runs (from before `features.rankIdle`:
- * one runner across connections, and stop answers that say whether the rank is idle), or a start
- * whose run has reservations on one that cannot read them (before `features.jobReservations`):
- * refused before it is sent. A start FAILS its instance until the CLI is upgraded
- * (`TERMINAL_START_ERRORS`); a stop or probe cannot be proven there (`UNPROVABLE_STOP`).
- */
-export const CLI_UPGRADE_REQUIRED = "cli_upgrade_required";
-
 /** Codes that prove a stop cannot be proven by the node: a person decides (Mark as stopped). */
 const UNPROVABLE_STOP = new Set([
   // A person gave up on an interactive stop: they decide (Mark as stopped), nothing is retried.
   OPERATOR_CANCELLED,
-  // The node's CLI cannot prove a stop (no `rankIdle`): a person decides, or upgrades it.
-  CLI_UPGRADE_REQUIRED,
   "definition_missing",
   "definition_frozen",
   "instance_unknown",
@@ -204,10 +188,6 @@ export type LifecycleRelay = {
     trust: NodeTrustWire;
     /** The node can hold operator terminals (feature and terminal key). */
     operatorTerminals?: boolean;
-    /** The node's CLI reads a job's `reservations` (hello `features.jobReservations`). */
-    jobReservations?: boolean;
-    /** The node's CLI proves what it runs (hello `features.rankIdle`): runtime jobs need it. */
-    rankIdle?: boolean;
   } | null;
   /** Nodes with a live session here (dispatch looks at their steps only). */
   onlineNodeIds?(): string[];
@@ -322,8 +302,6 @@ const TERMINAL_START_ERRORS: ReadonlySet<string> = new Set([
   "operator_terminals_disabled",
   // A `process` start that hands its server off does so every time: it needs a `service` spec.
   "process_detached",
-  // The node's CLI cannot read the job's reservations until it is upgraded.
-  CLI_UPGRADE_REQUIRED,
 ]);
 
 export type LifecycleOptions = {
@@ -601,8 +579,8 @@ export class RuntimeLifecycle {
       }),
     );
     for (const row of byKey(page, (row) => row.phaseChangedAt.getTime())) {
-      // Plain read first (a legacy row's run computed without writing it).
-      if (await this.runPrepared(prisma, row.id, await peekRun(prisma, row.id))) continue;
+      // Plain read first, before acquiring the write fence.
+      if (await this.runPrepared(prisma, row.id, await resolveRun(prisma, row.id))) continue;
       await this.write(row.userId, row.id, async (tx) => {
         const instance = await tx.runtimeInstance.findUnique({
           where: { id: row.id },
@@ -1351,9 +1329,7 @@ export class RuntimeLifecycle {
 
   private async watchInstance(tx: Tx, instance: InstanceRow) {
     const now = this.now();
-    // The run is persisted before anything here changes the phase: a legacy row's committed,
-    // unprepared restart is read from its phase and operation (`resolveRun`), and nothing below
-    // may lose it.
+    // Read the current run before changing its phase.
     const run = await resolveRun(tx, instance.id);
     const nodeIds = instance.Ranks.flatMap((rank) => (rank.nodeId ? [rank.nodeId] : []));
     // A reservation's node (`launch.reservations`) is watched like a rank's: the instance's
@@ -1622,8 +1598,6 @@ export class RuntimeLifecycle {
       connectionGeneration: number;
       trust: NodeTrustWire;
       operatorTerminals?: boolean;
-      jobReservations?: boolean;
-      rankIdle?: boolean;
     },
   ) {
     const now = this.now();
@@ -1719,20 +1693,6 @@ export class RuntimeLifecycle {
     ) {
       await this.failStep(tx, step, "trust_relay");
       await this.afterStep(tx, step, false, "trust_relay");
-      return null;
-    }
-    // Runtime jobs go only to a CLI that proves what it runs (`features.rankIdle`): an older one
-    // cannot say whether a start it admitted may still launch, so none of its stops could be
-    // trusted. Refused here, saying to upgrade.
-    // A run with reservations tells its commands which nodes they got (the job's
-    // `reservations`). A CLI from before them refuses such a job outright, so the start fails
-    // here, saying to upgrade too.
-    if (
-      session.rankIdle !== true ||
-      (startPhase && stepJobReservations(intent.data) && session.jobReservations !== true)
-    ) {
-      await this.failStep(tx, step, CLI_UPGRADE_REQUIRED);
-      await this.afterStep(tx, step, false, CLI_UPGRADE_REQUIRED);
       return null;
     }
     if (startPhase) {
@@ -1885,7 +1845,6 @@ export class RuntimeLifecycle {
       ownerEpoch,
       headAddr,
       ...(operator ? { operator } : {}),
-      jobReservations: session.jobReservations === true,
     });
   }
 
@@ -2548,7 +2507,7 @@ export class RuntimeLifecycle {
       select: { id: true, phase: true, Ranks: { select: { id: true, rank: true, claim: true } } },
     });
     if (!instance) return false;
-    const run = await peekRun(db, instanceId);
+    const run = await resolveRun(db, instanceId);
     return (await this.unanswerableStopRanks(db, instance, run)).size > 0;
   }
 
@@ -3071,7 +3030,7 @@ export class RuntimeLifecycle {
    */
   async requeueStale(ref: NodeSessionRef): Promise<void> {
     const current = this.ownerEpoch(ref.connectionGeneration);
-    await this.requeueLost(ref, { NOT: { ownerEpoch: current } }, "re-queuing a stale step");
+    await this.requeueLost(ref, { NOT: { ownerEpoch: current } }, "re-queuing a stale step", true);
   }
 
   /** The session ended: its RUNNING steps go back to PENDING (the node re-observes them). */
@@ -3090,6 +3049,7 @@ export class RuntimeLifecycle {
     ref: NodeSessionRef,
     epoch: Prisma.InstanceStepWhereInput,
     what: string,
+    fenceGeneration = false,
   ): Promise<void> {
     const rows = await prisma.instanceStep.findMany({
       where: {
@@ -3102,10 +3062,22 @@ export class RuntimeLifecycle {
       },
       select: { id: true, instanceId: true },
     });
-    for (const row of rows)
+    for (const row of rows) {
+      if (
+        fenceGeneration &&
+        this.relay.nodeSession(ref.nodeId)?.connectionGeneration !== ref.connectionGeneration
+      )
+        break;
       await this.write(ref.userId, row.instanceId, async (tx) => {
         const step = await tx.instanceStep.findFirst({ where: { id: row.id, ...epoch } });
         if (!step) return;
+        if (fenceGeneration) {
+          const node = await tx.node.findUnique({
+            where: { id: ref.nodeId },
+            select: { connectionGeneration: true },
+          });
+          if (node?.connectionGeneration !== ref.connectionGeneration) return;
+        }
         if (interactiveIntent(step.intent)) {
           if (step.state === "RUNNING" || step.operatorTerminalId !== null)
             await this.reissueOperatorStep(tx, step);
@@ -3125,6 +3097,7 @@ export class RuntimeLifecycle {
           },
         });
       }).catch((error: unknown) => console.error(`[lifecycle] ${what} failed`, errorName(error)));
+    }
     this.wake();
   }
 
@@ -3138,7 +3111,7 @@ export class RuntimeLifecycle {
    * - otherwise its engine facts are recorded.
    * A record naming an earlier run's step, or one before this run's launch, or an unknown step,
    * changes nothing and is reported back as stale (the relay keeps what it served for that
-   * handle). A missing record, or one without a step id (nodes before 0.4.0), cannot be dated:
+   * handle). A missing record cannot be dated:
    * in a live run it makes a health probe due now, and the health thresholds decide.
    * Always-on instances follow their runtime's status.
    */
@@ -3171,7 +3144,7 @@ export class RuntimeLifecycle {
         });
         const claim = instance?.Ranks.find((row) => row.id === rank.id);
         if (!instance || !claim || claim.nodeId !== ref.nodeId) return;
-        const evidence = record?.stepId
+        const evidence = record
           ? await this.inventoryEvidence(tx, instance.id, claim.rank, ref.nodeId, record.stepId)
           : "undated";
         if (evidence === "stale") {
@@ -3275,7 +3248,7 @@ export class RuntimeLifecycle {
   > {
     return {
       "runtime.job.result": (ref, frame) => this.handleJobResult(ref, frame),
-      nodeDisconnected: (ref) => void this.nodeDisconnected(ref),
+      nodeDisconnected: (ref) => this.nodeDisconnected(ref),
       nodeReady: (ref) => this.requeueStale(ref),
       runtimeInventory: (ref, snapshot) => this.runtimeInventory(ref, snapshot),
     };

@@ -1,3 +1,4 @@
+import { ALL_AGENT_SCOPES } from "@ws-model-proxy/auth/agent-scopes";
 /**
  * Cross-owner isolation on the server side: what the procedures hand off to (MCP tool dispatch,
  * the interactive-step services, the lifecycle engine's dispatch, the definition sync) never lets
@@ -132,7 +133,13 @@ beforeEach(() => {
 // ── MCP: the credential, never the tool input, names the caller ──
 
 describe("MCP tools act as the credential's user only", () => {
-  const credential = { kind: "agent_token" as const, tokenId: "tok-b", level: "FULL" as const };
+  const credential = {
+    kind: "agent_token" as const,
+    tokenId: "tok-b",
+    grantId: "grant-b",
+    accessReadAt: performance.now(),
+    access: { scopes: ALL_AGENT_SCOPES, nodeIds: null },
+  };
   const dispatch = (): McpToolDispatch => ({
     orpcContext: createMcpContext({
       user: { ...TEST_USER, id: ATTACKER },
@@ -287,6 +294,60 @@ describe("MCP tools act as the credential's user only", () => {
       });
     }
   }
+});
+
+describe("shared pools never delegate agent node access", () => {
+  it.each([
+    ["node_command_run", { nodeId: "node-a", command: "id", timeoutMs: 10_000, confirm: "RUN" }],
+    [
+      "node_command_queue_for_user",
+      { nodeId: "node-a", command: "id", note: "check", expiresInHours: 1 },
+    ],
+    ["node_file_read", { nodeId: "node-a", path: "/tmp/a" }],
+    ["node_file_write", { nodeId: "node-a", path: "/tmp/a", content: "x" }],
+  ] as const)("%s refuses another owner's node despite a pool share", async (name, args) => {
+    resetMcpToolRateLimitsForTests();
+    // The node exists, but only an owner-scoped read may find it. A pool share exists too.
+    db.node.findFirst.mockResolvedValue(null);
+    db.share.findFirst.mockResolvedValue({
+      id: "shared",
+      ownerUserId: VICTIM,
+      granteeUserId: ATTACKER,
+      canUse: true,
+      canContribute: true,
+    } as never);
+    const tool = MCP_TOOLS.find((entry) => entry.name === name);
+    if (!tool) throw new Error(`missing ${name}`);
+    const credential = {
+      kind: "agent_token" as const,
+      tokenId: "shared-token",
+      grantId: "shared-grant",
+      accessReadAt: performance.now(),
+      expiresAt: null,
+      access: { scopes: ALL_AGENT_SCOPES, nodeIds: null },
+    };
+    const result = await runMcpTool(tool, {
+      args,
+      dispatch: {
+        credential,
+        requestId: "shared-pool-check",
+        orpcContext: createMcpContext({
+          user: { ...TEST_USER, id: ATTACKER },
+          credential,
+          expiresAt: new Date("2030-01-01"),
+          now: new Date(),
+          services: undefined,
+        }),
+      },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { code: "NOT_FOUND" } });
+    expect(db.node.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "node-a", userId: ATTACKER } }),
+    );
+    expect(db.nodeCommand.create).not.toHaveBeenCalled();
+    expect(db.queuedNodeCommand.create).not.toHaveBeenCalled();
+  });
 });
 
 // ── Interactive steps: attach, reopen, cancel ──

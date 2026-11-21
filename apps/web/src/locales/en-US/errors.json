@@ -1,5 +1,4 @@
 {
-  "appUpdateAvailable": "A new version is available. Reloading…",
   "couldNotCopy": "Couldn't copy — please select and copy manually.",
   "pageDescription": "{{appName}} is a web application",
   "rootError": "This page didn't load. Try again, or reload.",
@@ -22,5 +21,9 @@
     "retainedHistory": {
       "user": "This user has retained history and can't be deleted. Archive them instead."
     }
-  }
+  },
+  "notFound": "Page not found",
+  "notFoundDescription": "This page could not be found.",
+  "notFoundOverview": "Back to Overview",
+  "notFoundSignIn": "Sign in"
 }

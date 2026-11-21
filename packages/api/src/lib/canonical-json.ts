@@ -1,7 +1,7 @@
 /**
- * Canonical JSON for hashes the server and the node must agree on (relay 3.0 `launchHash`,
+ * Canonical JSON for hashes the server and the node must agree on (relay 4.0 `launchHash`,
  * node metric commands hash). Rust mirror: `apps/cli/src/protocol/canonical.rs`. Shared
- * vectors: `apps/cli/tests/fixtures/relay-3.0/canonical/vectors.json`.
+ * vectors: `apps/cli/tests/fixtures/relay-4.0/canonical/vectors.json`.
  *
  * Rules:
  * - object keys sorted by Unicode code point (= UTF-8 byte order; NOT UTF-16 order), no

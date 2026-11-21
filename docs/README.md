@@ -1,0 +1,16 @@
+# Public documentation
+
+- [Project setup and overview](../README.md)
+- [Upgrading from 0.4.x to 1.0.0](../UPGRADING.md)
+- [Changelog](../CHANGELOG.md) and [release notes](release-notes/)
+- [MCP server](mcp.md) and generated [tool coverage](mcp-tool-coverage.md)
+- [External fallback](external-fallback.md)
+- [Transcription interoperability](transcription-interoperability.md)
+- [Web routes](../sitemap.md)
+- [wsmp CLI](../apps/cli/README.md)
+- [Relay protocol 4.0](../apps/cli/docs/relay-protocol.md)
+- [File recovery](../apps/cli/docs/file-recovery.md)
+- [Terminal images](../apps/cli/docs/terminal-images.md)
+- [Error handling](../apps/cli/docs/error-handling.md)
+- [Releasing](../apps/cli/docs/releasing.md)
+- [Contributing](../CONTRIBUTING.md) and [security reporting](../SECURITY.md)

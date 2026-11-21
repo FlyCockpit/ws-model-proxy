@@ -2,7 +2,7 @@ name: CLI CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
   pull_request:
@@ -37,7 +37,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-09-12)
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-16)
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -52,7 +52,8 @@ jobs:
   # env-gated real-filesystem test. Nothing is installed: gcc, the distro's setuid
   # fusermount3 and libfuse3.so.3 come with the image, and the daemon compiles against the
   # vendored libfuse 3.14 headers (apps/cli/tests/support/exchangeless/vendor/libfuse3).
-  # Pinned to 24.04: ubuntu-latest moves to 26.04 in November 2026; re-evaluate then.
+  # Pinned to 24.04: Ubuntu 26.04 (ubuntu-latest from 2026-11-19) ships
+  # libfuse 3.18 only as libfuse3.so.4; this test links libfuse3.so.3.
   # The job FAILS (never skips) when it cannot mount.
   exchangeless-fs:
     runs-on: ubuntu-24.04
@@ -60,7 +61,7 @@ jobs:
     if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-09-12)
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-16)
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -71,12 +72,63 @@ jobs:
       - if: always()
         run: bash scripts/test-exchangeless-fs.sh cleanup
 
+  musl:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-16)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: apps/cli -> target
+          key: musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build and verify a static binary
+        run: |
+          set -euo pipefail
+          cargo build --release --target x86_64-unknown-linux-musl --locked
+          bin=target/x86_64-unknown-linux-musl/release/wsmp
+          file "$bin"
+          headers="$(readelf -lW "$bin")"
+          dynamic="$(readelf -dW "$bin")"
+          if grep -q 'INTERP' <<<"$headers"; then echo "::error::wsmp has an ELF interpreter"; exit 1; fi
+          if grep -q '(NEEDED)' <<<"$dynamic"; then echo "::error::wsmp has shared-library dependencies"; exit 1; fi
+      - run: cargo test --lib --target x86_64-unknown-linux-musl --locked
+
+  # The GNU release builds run on ubuntu-22.04 so they need at most glibc 2.34
+  # (CLI_RELEASE_MIN_GLIBC in apps/server/src/node-http.ts, which /install.sh
+  # checks before it picks the GNU archive). Catch a dependency that raises the
+  # floor here, not at release time. 22.04 runners retire 2027-04-17.
+  glibc-floor:
+    runs-on: ubuntu-22.04
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-16)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: apps/cli -> target
+          key: glibc-floor
+      - run: cargo build --release --locked
+      - run: bash scripts/check-glibc-floor.sh target/release/wsmp 2.34
+
   fmt:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-09-12)
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-16)
         with:
           toolchain: stable
           components: rustfmt
@@ -87,7 +139,7 @@ jobs:
     if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-09-12)
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-16)
         with:
           toolchain: stable
           components: clippy
@@ -103,9 +155,9 @@ jobs:
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-09-12)
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-16)
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: apps/cli -> target
@@ -140,7 +192,7 @@ jobs:
     if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-09-12)
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-16)
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -153,9 +205,9 @@ jobs:
     if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          tool: typos-cli
+          tool: typos-cli@1.52.0
       - run: typos
 
   policy:

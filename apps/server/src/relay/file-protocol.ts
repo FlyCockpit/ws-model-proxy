@@ -1,9 +1,9 @@
 import { z } from "zod";
 
 /**
- * Node file tools: the strict per-op argument and result schemas, shared by the relay 3.0
+ * Node file tools: the strict per-op argument and result schemas, shared by the relay 4.0
  * frames (`frames.ts`) and the cross-language fixtures under
- * `apps/cli/tests/fixtures/relay-3.0/`. The MCP tool inputs are
+ * `apps/cli/tests/fixtures/relay-4.0/`. The MCP tool inputs are
  * `packages/api/src/contracts/nodes.ts`, mapped to these args by
  * `packages/api/src/nodes/files.ts`. The Rust mirror is `apps/cli/src/file_ops`
  * (`FileOps::execute`) and `apps/cli/src/file_relay.rs`.

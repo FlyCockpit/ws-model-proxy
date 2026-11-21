@@ -47,13 +47,25 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 }));
 
 import { LATENCY_HISTOGRAM_BUCKETS } from "@ws-model-proxy/config/usage-metrics";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
+import type { CallerAuth } from "../contracts/auth-context";
+import { hiddenInstancesWhere } from "../lib/agent-hidden-nodes";
 import { callableIdsFor, poolAdvancedView } from "../lib/pool-views";
 import { CALLERS, contextFor, OWNER } from "./lane-c-test-helpers";
 import { modelsRouter } from "./models";
 import { poolsRouter } from "./pools";
 
 const db = prisma as unknown as DeepMockProxy<PrismaClient>;
+
+function scopedAgent(
+  kind: "agent_token" | "oauth_access_token",
+  nodeIds: string[] | null,
+): CallerAuth {
+  const auth = kind === "agent_token" ? CALLERS.fullAgent() : CALLERS.oauthAgent();
+  if (auth.kind !== "agent_token" && auth.kind !== "oauth_access_token")
+    throw new Error("agent expected");
+  return { ...auth, access: { ...auth.access, nodeIds } };
+}
 
 function poolRow(overrides: Record<string, unknown> = {}) {
   return {
@@ -114,6 +126,48 @@ function servingMember(phase = "READY") {
   };
 }
 
+function memberWithHiddenInstance(
+  placement: "bound" | "rank" | "reservation" | "stale target",
+  includeAllowed = false,
+) {
+  const base = servingMember();
+  const allowed = { ...base.RuntimeModel.Runtime.Instances[0]!, Reservations: [] };
+  const hidden = {
+    ...allowed,
+    id: "hidden-instance",
+    engineSlots: 16,
+    Ranks:
+      placement === "bound"
+        ? []
+        : [
+            ...allowed.Ranks,
+            ...(placement === "rank" || placement === "stale target"
+              ? [{ nodeId: "hidden", Node: { slug: "hidden", userId: OWNER } }]
+              : []),
+          ],
+    Reservations: placement === "reservation" ? [{ nodeId: "hidden" }] : [],
+  };
+  return {
+    ...base,
+    RuntimeModel: {
+      ...base.RuntimeModel,
+      Runtime: {
+        ...base.RuntimeModel.Runtime,
+        nodeId: placement === "bound" ? "hidden" : null,
+        Node: placement === "bound" ? { id: "hidden", slug: "hidden", userId: OWNER } : null,
+        Instances: [
+          ...(includeAllowed ? [allowed] : []),
+          ...(placement === "stale target" ? [] : [hidden]),
+        ],
+      },
+      Targets: [
+        ...(includeAllowed ? [{ health: "UNHEALTHY", Instance: allowed }] : []),
+        { health: "HEALTHY", Instance: hidden },
+      ],
+    },
+  };
+}
+
 function client(auth = CALLERS.person()) {
   return createRouterClient(poolsRouter, { context: contextFor(auth) });
 }
@@ -137,6 +191,8 @@ beforeEach(() => {
   db.$queryRaw.mockResolvedValue([] as never);
   db.executionTarget.findMany.mockResolvedValue([]);
   db.runtimeModel.findMany.mockResolvedValue([]);
+  db.runtimeInstance.findMany.mockResolvedValue([]);
+  db.runtime.findFirst.mockResolvedValue({ nodeId: null, Node: null, Instances: [] } as never);
   db.modelAlias.findMany.mockResolvedValue([]);
   // A pool being updated is still there under the owner fence.
   db.pool.count.mockResolvedValue(1);
@@ -226,6 +282,7 @@ describe("pools.create", () => {
   it("adds the caller's own served model and shows it serving", async () => {
     db.pool.create.mockResolvedValue({ id: "pool-1", userId: OWNER, modelType: "LLM" } as never);
     db.runtimeModel.findFirst.mockResolvedValue({
+      runtimeId: "rt-1",
       id: "rm-1",
       type: "LLM",
       retired: false,
@@ -261,6 +318,7 @@ describe("pools.create", () => {
       ),
     ).toBe("not_your_runtime");
     db.runtimeModel.findFirst.mockResolvedValue({
+      runtimeId: "rt-1",
       id: "rm-2",
       type: "EMBEDDINGS",
       retired: false,
@@ -552,6 +610,7 @@ describe("contributed members", () => {
   it("an agent contributes its own model through its share", async () => {
     db.share.findFirst.mockResolvedValue(share() as never);
     db.runtimeModel.findFirst.mockResolvedValue({
+      runtimeId: "rt-1",
       id: "rm-1",
       type: "LLM",
       retired: false,
@@ -577,6 +636,97 @@ describe("contributed members", () => {
     });
     expect(member.contributorEmail).toBe("owner-1@example.test");
   });
+
+  for (const kind of ["agent_token", "oauth_access_token"] as const) {
+    for (const [label, auth, filtered] of [
+      ["allowlisted", scopedAgent(kind, ["node-1"]), true],
+      ["all nodes", scopedAgent(kind, null), false],
+      ["person", CALLERS.person(), false],
+    ] as const) {
+      for (const placement of ["bound", "rank", "reservation", "stale target"] as const) {
+        it(`${kind}, ${label}, ${placement}: filters the contribution response after the write`, async () => {
+          db.share.findFirst.mockResolvedValue(share() as never);
+          db.runtimeModel.findFirst.mockResolvedValue({
+            runtimeId: "rt-1",
+            id: "rm-1",
+            type: "LLM",
+            retired: false,
+          } as never);
+          // Eligibility sees no placement; the response reread can see a person's later start
+          // or a stopped instance's target that eligibility intentionally does not load.
+          db.poolMember.create.mockResolvedValue({ id: "mem-1" } as never);
+          const row = {
+            ...memberWithHiddenInstance(placement),
+            shareId: "share-1",
+            Share: { Grantee: { email: "owner-1@example.test" } },
+          };
+          db.poolMember.findUniqueOrThrow.mockResolvedValue(row as never);
+          db.node.findMany.mockResolvedValue([{ id: "node-1" }, { id: "hidden" }] as never);
+          const liveLoad = vi.fn(() => new Map());
+          const member = await createRouterClient(poolsRouter, {
+            context: contextFor(auth, { liveLoad }),
+          }).members.addContributed({ poolId: "pool-1", runtimeModelId: "rm-1" });
+          const count = filtered || placement === "stale target" ? 0 : 1;
+          expect(member).toMatchObject({
+            status: count ? "serving" : "unavailable",
+            health: filtered ? "UNKNOWN" : "HEALTHY",
+            contributorEmail: "owner-1@example.test",
+            live: {
+              instances: count,
+              running: count,
+              waiting: null,
+              active: null,
+              slots: null,
+              p95LatencyMs: null,
+              share: null,
+            },
+          });
+          expect(liveLoad).not.toHaveBeenCalled();
+          expect(db.node.findMany).toHaveBeenCalledTimes(filtered ? 1 : 0);
+          if (filtered)
+            expect(db.node.findMany).toHaveBeenCalledWith({
+              where: { userId: OWNER },
+              select: { id: true },
+            });
+          // Filtering the response must not change the stored member or its source rows.
+          expect(row.RuntimeModel.Targets).toHaveLength(1);
+          expect(row.RuntimeModel.Runtime.Instances).toHaveLength(
+            placement === "stale target" ? 0 : 1,
+          );
+          expect(db.poolMember.create).toHaveBeenCalledTimes(1);
+        });
+      }
+    }
+
+    for (const placement of ["rank", "reservation"] as const) {
+      it(`${kind}, ${placement}: a hidden healthy target cannot override visible unhealthy health on contribution`, async () => {
+        db.share.findFirst.mockResolvedValue(share() as never);
+        db.runtimeModel.findFirst.mockResolvedValue({
+          runtimeId: "rt-1",
+          id: "rm-1",
+          type: "LLM",
+          retired: false,
+        } as never);
+        db.poolMember.create.mockResolvedValue({ id: "mem-1" } as never);
+        db.poolMember.findUniqueOrThrow.mockResolvedValue({
+          ...memberWithHiddenInstance(placement, true),
+          shareId: "share-1",
+          Share: { Grantee: { email: "owner-1@example.test" } },
+        } as never);
+        db.node.findMany.mockResolvedValue([{ id: "node-1" }, { id: "hidden" }] as never);
+        const member = await client(scopedAgent(kind, ["node-1"])).members.addContributed({
+          poolId: "pool-1",
+          runtimeModelId: "rm-1",
+        });
+        expect(member).toMatchObject({
+          status: "serving",
+          health: "UNHEALTHY",
+          live: { instances: 1, running: 1, waiting: null, active: null, slots: null },
+        });
+        expect(db.node.findMany).toHaveBeenCalledTimes(1);
+      });
+    }
+  }
 
   it("withdraw is limited to the contributor or the pool owner", async () => {
     db.poolMember.findFirst.mockResolvedValue(null);
@@ -715,6 +865,7 @@ describe("graph-write fences and review follow-ups", () => {
       Pool: { modelType: "LLM", Routing: { ownHardwareOnly: false } },
     } as never);
     db.runtimeModel.findFirst.mockResolvedValue({
+      runtimeId: "rt-1",
       id: "rm-1",
       type: "LLM",
       retired: false,
@@ -799,10 +950,15 @@ describe("graph-write fences and review follow-ups", () => {
     } as never);
     // Discovery retires the model between the first read and the fenced one.
     db.runtimeModel.findFirst
-      .mockResolvedValueOnce({ id: "rm-1", type: "LLM", retired: false } as never)
+      .mockResolvedValueOnce({
+        id: "rm-1",
+        runtimeId: "rt-1",
+        type: "LLM",
+        retired: false,
+      } as never)
       .mockImplementationOnce((async () => {
         expect(fenceLog.held).toEqual(expect.arrayContaining(["00:owner:bob"]));
-        return { id: "rm-1", type: "LLM", retired: true };
+        return { id: "rm-1", runtimeId: "rt-1", type: "LLM", retired: true };
       }) as never);
     expect(
       await reasonOf(
@@ -1041,4 +1197,551 @@ describe("pool Advanced defaults", () => {
     } as never);
     expect(off.protocolAdaptation.effective).toBe(false);
   });
+});
+
+for (const kind of ["agent_token", "oauth_access_token"] as const) {
+  describe(`${kind}: mutation response visibility`, () => {
+    for (const procedure of ["create", "update", "members.set"] as const) {
+      it(`${procedure}: uses the shared pool/member filter once for the whole response`, async () => {
+        const row = poolRow({
+          Members: [
+            memberWithHiddenInstance("rank", true),
+            { ...memberWithHiddenInstance("bound"), id: "mem-2", runtimeModelId: "rm-2" },
+          ],
+        });
+        db.pool.findFirst.mockResolvedValue(row as never);
+        db.pool.create.mockResolvedValue({
+          id: "pool-1",
+          userId: OWNER,
+          modelType: "LLM",
+        } as never);
+        db.poolMember.findMany.mockResolvedValue([{ RuntimeModel: { userId: OWNER } }] as never);
+        db.poolMember.findFirst.mockResolvedValue({
+          RuntimeModel: { userId: OWNER, runtimeId: "rt-1" },
+        } as never);
+        db.poolMember.updateMany.mockResolvedValue({ count: 1 });
+        db.node.findMany.mockResolvedValue([{ id: "node-1" }, { id: "hidden" }] as never);
+        const liveLoad = vi.fn(
+          (ids: readonly string[]) =>
+            new Map(
+              ids.map((id) => [id, { running: 2, waiting: 4, kvUsage: 0.5, at: new Date() }]),
+            ),
+        );
+        const api = createRouterClient(poolsRouter, {
+          context: contextFor(scopedAgent(kind, ["node-1"]), { liveLoad }),
+        });
+        // Placement checks see the runtime before the person starts its hidden instance;
+        // rendering the response must independently filter the post-write reread.
+        const view =
+          procedure === "create"
+            ? await api.create({ slug: "chat", name: "Chat", type: "LLM" })
+            : await api.update({
+                poolId: "pool-1",
+                ...(procedure === "members.set"
+                  ? { members: { set: [{ memberId: "mem-1", weight: 2 }] } }
+                  : { name: "New name" }),
+              });
+        expect(view.members[0]).toMatchObject({
+          status: "serving",
+          health: "UNHEALTHY",
+          live: { instances: 1, running: 1, waiting: 4, active: 2, slots: 8 },
+        });
+        expect(view.members[1]).toMatchObject({
+          status: "unavailable",
+          health: "UNKNOWN",
+          live: { instances: 0, running: 0, waiting: null, active: null, slots: null },
+        });
+        expect(view.runsOn).toEqual([{ nodeId: "node-1", slug: "box", mine: true, instances: 1 }]);
+        expect(liveLoad).toHaveBeenCalledExactlyOnceWith(["inst-1"]);
+        expect(db.node.findMany).toHaveBeenCalledExactlyOnceWith({
+          where: { userId: OWNER },
+          select: { id: true },
+        });
+        for (const [strings, ...values] of db.$queryRaw.mock.calls) {
+          const query = Prisma.sql(strings as TemplateStringsArray, ...values);
+          expect(query.values).toContainEqual(["hidden"]);
+        }
+      });
+    }
+  });
+
+  describe(`${kind}: allowlist aggregates`, () => {
+    for (const [label, auth, expected] of [
+      ["allowlisted", scopedAgent(kind, ["node-1"]), 1],
+      ["all nodes", scopedAgent(kind, null), 3],
+      ["person", CALLERS.person(), 3],
+    ] as const) {
+      it(`${label}: member live load and runsOn exclude whole hidden instances`, async () => {
+        const member = servingMember();
+        const allowed = { ...member.RuntimeModel.Runtime.Instances[0]!, Reservations: [] };
+        member.RuntimeModel.Runtime.Instances = [
+          allowed,
+          {
+            ...allowed,
+            id: "hidden-rank",
+            Ranks: [
+              ...allowed.Ranks,
+              { nodeId: "hidden", Node: { slug: "hidden", userId: OWNER } },
+            ],
+          },
+          { ...allowed, id: "hidden-reservation", Reservations: [{ nodeId: "hidden" }] },
+        ] as typeof member.RuntimeModel.Runtime.Instances;
+        db.node.findMany.mockResolvedValue([{ id: "node-1" }, { id: "hidden" }] as never);
+        db.pool.findFirst.mockResolvedValue(poolRow({ Members: [member] }) as never);
+        const liveLoad = vi.fn(
+          (ids: readonly string[]) =>
+            new Map(
+              ids.map((id) => [
+                id,
+                {
+                  running: 2,
+                  waiting: 4,
+                  kvUsage: 0.5,
+                  at: new Date(),
+                },
+              ]),
+            ),
+        );
+        const api = createRouterClient(poolsRouter, { context: contextFor(auth, { liveLoad }) });
+        const view = await api.get({ poolId: "pool-1" });
+        expect(view.members[0]?.live).toMatchObject({
+          instances: expected,
+          running: expected,
+          waiting: expected * 4,
+          active: expected * 2,
+          slots: expected * 8,
+        });
+        expect(view.runsOn.find((node) => node.nodeId === "node-1")?.instances).toBe(expected);
+        if (expected === 1) {
+          expect(view.runsOn.map((node) => node.nodeId)).toEqual(["node-1"]);
+          expect(liveLoad).toHaveBeenCalledWith(["inst-1"]);
+        }
+      });
+    }
+  });
+
+  describe(`${kind}: bound always-on instances and target health`, () => {
+    for (const [label, auth, filtered] of [
+      ["allowlisted", scopedAgent(kind, ["node-1"]), true],
+      ["all nodes", scopedAgent(kind, null), false],
+      ["person", CALLERS.person(), false],
+    ] as const) {
+      for (const placement of ["bound", "rank", "reservation"] as const) {
+        for (const visibleUnhealthy of [false, true]) {
+          it(`${label}: ${placement}, visible unhealthy=${visibleUnhealthy}: get/list health, status and live agree`, async () => {
+            const base = servingMember();
+            const hiddenInstance = {
+              id: "hidden-instance",
+              phase: "READY",
+              engineSlots: 16,
+              Ranks:
+                placement === "rank"
+                  ? [{ nodeId: "hidden", Node: { slug: "hidden", userId: OWNER } }]
+                  : [],
+              Reservations: placement === "reservation" ? [{ nodeId: "hidden" }] : [],
+            };
+            const visibleInstance = {
+              ...base.RuntimeModel.Runtime.Instances[0]!,
+              Reservations: [],
+            };
+            const hiddenMember = {
+              ...base,
+              RuntimeModel: {
+                ...base.RuntimeModel,
+                Runtime: {
+                  ...base.RuntimeModel.Runtime,
+                  nodeId: placement === "bound" ? "hidden" : null,
+                  Node:
+                    placement === "bound" ? { id: "hidden", slug: "hidden", userId: OWNER } : null,
+                  Instances: [hiddenInstance],
+                },
+                Targets: [{ health: "HEALTHY", Instance: hiddenInstance }],
+              },
+            };
+            // A bound runtime cannot also have a visible instance: use a second member.
+            const allowedMember = {
+              ...base,
+              id: "allowed-member",
+              runtimeModelId: "allowed-model",
+              RuntimeModel: {
+                ...base.RuntimeModel,
+                runtimeId: "allowed-runtime",
+                Targets: [{ health: "UNHEALTHY", Instance: visibleInstance }],
+              },
+            };
+            const mixedMember = {
+              ...hiddenMember,
+              RuntimeModel: {
+                ...hiddenMember.RuntimeModel,
+                Runtime: {
+                  ...hiddenMember.RuntimeModel.Runtime,
+                  Instances: [visibleInstance, hiddenInstance],
+                },
+                Targets: [
+                  { health: "UNHEALTHY", Instance: visibleInstance },
+                  { health: "HEALTHY", Instance: hiddenInstance },
+                ],
+              },
+            };
+            const members = visibleUnhealthy
+              ? placement === "bound"
+                ? [hiddenMember, allowedMember]
+                : [mixedMember]
+              : [hiddenMember];
+            const row = poolRow({ Members: members });
+            db.node.findMany.mockResolvedValue([{ id: "node-1" }, { id: "hidden" }] as never);
+            db.pool.findFirst.mockResolvedValue(row as never);
+            db.pool.findMany.mockResolvedValue([row] as never);
+            db.share.findMany.mockResolvedValue([]);
+            const liveLoad = vi.fn(
+              (ids: readonly string[]) =>
+                new Map(
+                  ids.map((id) => [
+                    id,
+                    {
+                      running: 2,
+                      waiting: 4,
+                      kvUsage: 0.5,
+                      at: new Date(),
+                    },
+                  ]),
+                ),
+            );
+            const api = createRouterClient(poolsRouter, {
+              context: contextFor(auth, { liveLoad }),
+            });
+            const views = [await api.get({ poolId: "pool-1" }), (await api.list()).pools[0]!];
+            for (const view of views) {
+              const main = view.members[0]!;
+              const visibleInMain = visibleUnhealthy && placement !== "bound";
+              const count = (filtered ? 0 : 1) + (visibleInMain ? 1 : 0);
+              expect(main.status).toBe(count ? "serving" : "unavailable");
+              expect(main.health).toBe(
+                filtered ? (visibleInMain ? "UNHEALTHY" : "UNKNOWN") : "HEALTHY",
+              );
+              expect(main.live).toMatchObject({
+                instances: count,
+                running: count,
+                waiting: count ? count * 4 : null,
+                active: count ? count * 2 : null,
+                slots: count ? (filtered ? 0 : 16) + (visibleInMain ? 8 : 0) : null,
+              });
+              if (filtered) {
+                expect(view.runsOn.map((node) => node.nodeId)).toEqual(
+                  visibleUnhealthy ? ["node-1"] : [],
+                );
+                expect(view.runsOn[0]?.instances).toBe(visibleUnhealthy ? 1 : undefined);
+                for (const [ids] of liveLoad.mock.calls)
+                  expect(ids).not.toContain("hidden-instance");
+              }
+              if (visibleUnhealthy && placement === "bound") {
+                expect(view.members[1]?.health).toBe("UNHEALTHY");
+                expect(view.members[1]?.live.instances).toBe(1);
+              }
+            }
+          });
+        }
+      }
+    }
+  });
+
+  describe(`${kind}: request aggregate allowlist`, () => {
+    for (const [label, auth, filtered] of [
+      ["allowlisted", scopedAgent(kind, ["node-1"]), true],
+      ["all nodes", scopedAgent(kind, null), false],
+      ["person", CALLERS.person(), false],
+    ] as const) {
+      it(`${label}: traffic, sparkline, latency and share exclude hidden-node requests`, async () => {
+        db.node.findMany.mockResolvedValue([{ id: "node-1" }, { id: "hidden" }] as never);
+        db.pool.findFirst.mockResolvedValue(poolRow({ Members: [servingMember()] }) as never);
+        const queries: Prisma.Sql[] = [];
+        db.$queryRaw.mockImplementation((async (
+          strings: TemplateStringsArray,
+          ...parts: unknown[]
+        ) => {
+          const query = Prisma.sql(strings, ...parts);
+          queries.push(query);
+          const excludesHidden =
+            query.sql.includes('NOT (COALESCE("nodeId"') &&
+            query.values.some((value) => Array.isArray(value) && value.includes("hidden"));
+          if (query.sql.includes("AS provider_model"))
+            return [
+              {
+                pool: "pool-1",
+                runtime: "rt-1",
+                provider_model: "",
+                requests: excludesHidden ? 4 : 104,
+                l1: 4,
+                l20: excludesHidden ? 0 : 100,
+              },
+              { pool: "pool-1", runtime: "", provider_model: "cloud", requests: 6, l1: 6 },
+            ];
+          return [
+            {
+              pool: "pool-1",
+              t: new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000),
+              requests: excludesHidden ? 10 : 110,
+              errors: excludesHidden ? 1 : 21,
+            },
+          ];
+        }) as never);
+        const view = await client(auth).get({ poolId: "pool-1" });
+        expect(view.traffic24h.requests).toBe(filtered ? 10 : 110);
+        expect(view.traffic24h.errors).toBe(filtered ? 1 : 21);
+        expect(view.traffic24h.sparkline.reduce((a, b) => a + b, 0)).toBe(filtered ? 10 : 110);
+        expect(view.members[0]?.live.share).toBeCloseTo(filtered ? 4 / 10 : 104 / 110);
+        const latency = view.members[0]?.live.p95LatencyMs;
+        expect(latency).not.toBeNull();
+        if (filtered) expect(latency).toBeLessThan(10);
+        else expect(latency).toBeGreaterThan(10_000);
+        expect(queries).toHaveLength(2);
+        for (const query of queries) {
+          expect(query.sql.includes('NOT (COALESCE("nodeId"')).toBe(filtered);
+          expect(query.sql).not.toContain("hidden");
+          if (filtered) expect(query.values).toContainEqual(["hidden"]);
+          expect(
+            query.values.some((value) => Array.isArray(value) && value.includes("hidden")),
+          ).toBe(filtered);
+        }
+        expect(db.node.findMany).toHaveBeenCalledTimes(filtered ? 1 : 0);
+      });
+
+      it(`${label}: requests a mixed instance served on an allowed node are left out too`, async () => {
+        db.node.findMany.mockResolvedValue([{ id: "node-1" }, { id: "hidden" }] as never);
+        // The head of inst-mixed is on node-1; another of its ranks is on the hidden node.
+        db.runtimeInstance.findMany.mockResolvedValue([{ id: "inst-mixed" }] as never);
+        db.pool.findFirst.mockResolvedValue(poolRow({ Members: [servingMember()] }) as never);
+        const queries: Prisma.Sql[] = [];
+        db.$queryRaw.mockImplementation((async (
+          strings: TemplateStringsArray,
+          ...parts: unknown[]
+        ) => {
+          const query = Prisma.sql(strings, ...parts);
+          queries.push(query);
+          const excludesMixed =
+            query.sql.includes('NOT (COALESCE("instanceId"') &&
+            query.values.some((value) => Array.isArray(value) && value.includes("inst-mixed"));
+          if (query.sql.includes("AS provider_model"))
+            return [
+              {
+                pool: "pool-1",
+                runtime: "rt-1",
+                provider_model: "",
+                requests: excludesMixed ? 4 : 54,
+                l1: 4,
+                l20: excludesMixed ? 0 : 50,
+              },
+              { pool: "pool-1", runtime: "", provider_model: "cloud", requests: 6, l1: 6 },
+            ];
+          return [
+            {
+              pool: "pool-1",
+              t: new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000),
+              requests: excludesMixed ? 10 : 60,
+              errors: excludesMixed ? 1 : 11,
+            },
+          ];
+        }) as never);
+        const view = await client(auth).get({ poolId: "pool-1" });
+        expect(view.traffic24h.requests).toBe(filtered ? 10 : 60);
+        expect(view.traffic24h.errors).toBe(filtered ? 1 : 11);
+        expect(view.traffic24h.sparkline.reduce((a, b) => a + b, 0)).toBe(filtered ? 10 : 60);
+        expect(view.members[0]?.live.share).toBeCloseTo(filtered ? 4 / 10 : 54 / 60);
+        const latency = view.members[0]?.live.p95LatencyMs;
+        if (filtered) expect(latency).toBeLessThan(10);
+        else expect(latency).toBeGreaterThan(10_000);
+        expect(queries).toHaveLength(2);
+        for (const query of queries) {
+          expect(query.sql.includes('NOT (COALESCE("instanceId"')).toBe(filtered);
+          expect(query.sql).not.toContain("inst-mixed");
+          if (filtered) expect(query.values).toContainEqual(["inst-mixed"]);
+        }
+        // One lookup per read, through the shared hidden-instance predicate, with no time
+        // bound: rollups bucket by completion, which can come long after the instance stopped.
+        if (filtered)
+          expect(db.runtimeInstance.findMany).toHaveBeenCalledExactlyOnceWith({
+            where: hiddenInstancesWhere(["hidden"]),
+            select: { id: true },
+          });
+        else expect(db.runtimeInstance.findMany).not.toHaveBeenCalled();
+      });
+    }
+  });
+
+  describe(`${kind}: member removal allowlist`, () => {
+    for (const path of [
+      "members.remove",
+      "pool_update",
+      "pool_delete",
+      "contribution withdrawal",
+    ] as const) {
+      for (const [label, auth, runtimeOwner, bound, denied] of [
+        ["hidden node", scopedAgent(kind, ["node-1"]), OWNER, "hidden", true],
+        ["hidden rank", scopedAgent(kind, ["node-1"]), OWNER, null, true],
+        ["hidden reservation", scopedAgent(kind, ["node-1"]), OWNER, null, true],
+        ["allowed node", scopedAgent(kind, ["node-1"]), OWNER, "node-1", false],
+        ["other person's runtime", scopedAgent(kind, ["node-1"]), "contributor", "hidden", false],
+        ["null allowlist", scopedAgent(kind, null), OWNER, "hidden", false],
+        ["person", CALLERS.person(), OWNER, "hidden", false],
+      ] as const) {
+        it(`${path}: ${label}`, async () => {
+          db.node.findMany.mockResolvedValue([{ id: "node-1" }, { id: "hidden" }] as never);
+          db.pool.findFirst.mockResolvedValue(poolRow() as never);
+          db.poolMember.findFirst.mockResolvedValue({
+            id: "mem-1",
+            poolId: "pool-1",
+            Pool: {
+              userId:
+                path === "contribution withdrawal" && runtimeOwner === OWNER ? "pool-owner" : OWNER,
+            },
+            RuntimeModel: { userId: runtimeOwner },
+          } as never);
+          db.poolMember.findMany.mockImplementation((async () => {
+            if (path === "contribution withdrawal") {
+              const poolOwner = runtimeOwner === OWNER ? "pool-owner" : OWNER;
+              expect(fenceLog.held).toContain(`00:owner:${poolOwner}`);
+              expect(fenceLog.held).toContain(`00:owner:${OWNER}`);
+            }
+            return [{ RuntimeModel: { userId: runtimeOwner, runtimeId: "rt-1" } }];
+          }) as never);
+          db.runtime.findFirst.mockResolvedValue({
+            nodeId: bound,
+            Node: bound ? { id: bound, userId: OWNER } : null,
+            Instances: bound
+              ? []
+              : [
+                  {
+                    id: "inst-1",
+                    Ranks: [
+                      {
+                        rank: 0,
+                        claim: "HELD",
+                        nodeId: label === "hidden rank" ? "hidden" : "node-1",
+                        Node: { id: label === "hidden rank" ? "hidden" : "node-1", userId: OWNER },
+                      },
+                    ],
+                    Reservations:
+                      label === "hidden reservation"
+                        ? [
+                            {
+                              index: 0,
+                              nodeId: "hidden",
+                              supersededGeneration: null,
+                              Node: { id: "hidden", userId: OWNER },
+                            },
+                          ]
+                        : [],
+                  },
+                ],
+          } as never);
+          db.poolMember.deleteMany.mockResolvedValue({ count: 1 });
+          db.pool.deleteMany.mockResolvedValue({ count: 1 });
+          const api = client(auth);
+          const result =
+            path === "pool_delete"
+              ? api.delete({ poolId: "pool-1" })
+              : path === "contribution withdrawal"
+                ? api.members.removeContributed({ memberId: "mem-1" })
+                : api.update({
+                    poolId: "pool-1",
+                    ...(path === "pool_update" ? { name: "Updated" } : {}),
+                    members: { remove: ["mem-1"] },
+                  });
+          if (path === "contribution withdrawal") {
+            // graphWrite takes every owner before the placement check and delete.
+            const expectedOwner = runtimeOwner === OWNER ? "pool-owner" : OWNER;
+            await result.catch(() => undefined);
+            expect(fenceLog.held).toContain(`00:owner:${expectedOwner}`);
+            expect(fenceLog.held).toContain(`00:owner:${OWNER}`);
+            expect(fenceLog.held).toContain(`00:owner:${runtimeOwner}`);
+          }
+          if (denied) {
+            await expect(result).rejects.toMatchObject({
+              code: "NOT_FOUND",
+              message: "That runtime does not exist.",
+            });
+            expect(db.poolMember.deleteMany).not.toHaveBeenCalled();
+            expect(db.pool.update).not.toHaveBeenCalled();
+            expect(db.pool.deleteMany).not.toHaveBeenCalled();
+            expect(db.auditEvent.create).not.toHaveBeenCalled();
+          } else {
+            await result;
+            expect(
+              path === "pool_delete" ? db.pool.deleteMany : db.poolMember.deleteMany,
+            ).toHaveBeenCalled();
+          }
+        });
+      }
+    }
+  });
+}
+
+describe("hidden nodes are only the caller's nodes", () => {
+  for (const kind of ["agent_token", "oauth_access_token"] as const) {
+    for (const bound of [false, true]) {
+      it(`${kind}: keeps another person's contributed health and runsOn, bound=${bound}`, async () => {
+        const member = servingMember();
+        const instance = {
+          ...member.RuntimeModel.Runtime.Instances[0]!,
+          Ranks: bound
+            ? []
+            : [{ nodeId: "contributor-node", Node: { slug: "theirs", userId: "contributor" } }],
+          Reservations: [],
+        };
+        const contributed = {
+          ...member,
+          shareId: "share-1",
+          RuntimeModel: {
+            ...member.RuntimeModel,
+            Runtime: {
+              ...member.RuntimeModel.Runtime,
+              nodeId: bound ? "contributor-node" : null,
+              Node: bound
+                ? { id: "contributor-node", slug: "theirs", userId: "contributor" }
+                : null,
+              Instances: [instance],
+            },
+            Targets: [{ health: "HEALTHY", Instance: instance }],
+          },
+        };
+        db.node.findMany.mockResolvedValue([{ id: "node-1" }, { id: "hidden" }] as never);
+        db.pool.findFirst.mockResolvedValue(poolRow({ Members: [contributed] }) as never);
+        const view = await client(scopedAgent(kind, ["node-1"])).get({ poolId: "pool-1" });
+        expect(view.members[0]?.live).toMatchObject({
+          instances: 1,
+          running: 1,
+          active: null,
+          slots: null,
+        });
+        expect(view.members[0]?.health).toBe("HEALTHY");
+        expect(view.members[0]?.status).toBe("serving");
+        expect(view.runsOn).toEqual([
+          { nodeId: "contributor-node", slug: "theirs", mine: false, instances: 1 },
+        ]);
+        expect(db.node.findMany).toHaveBeenCalledExactlyOnceWith({
+          where: { userId: OWNER },
+          select: { id: true },
+        });
+      });
+    }
+    it(`${kind}: preserves cloud-provider health with an explicit node allowlist`, async () => {
+      const cloud = {
+        ...servingMember(),
+        kind: "CLOUD",
+        RuntimeModel: null,
+        runtimeModelId: null,
+        providerModelId: "provider-model",
+        cloudOrder: 0,
+        ProviderModel: { upstreamModelId: "cloud-model", Target: { health: "HEALTHY" } },
+      };
+      db.node.findMany.mockResolvedValue([{ id: "node-1" }, { id: "hidden" }] as never);
+      db.pool.findFirst.mockResolvedValue(poolRow({ Members: [cloud] }) as never);
+      const view = await client(scopedAgent(kind, ["node-1"])).get({ poolId: "pool-1" });
+      expect(view.members[0]).toMatchObject({
+        health: "HEALTHY",
+        status: "cloud_standby",
+        live: { instances: 0, running: 0 },
+      });
+    });
+  }
 });

@@ -106,6 +106,7 @@ function ChangePasswordCard() {
         <div className="space-y-2">
           <Label htmlFor="current-password">{t("auth:fields.password")}</Label>
           <Input
+            className="h-11 text-base md:h-8 md:text-xs"
             id="current-password"
             type="password"
             autoComplete="current-password"
@@ -116,6 +117,7 @@ function ChangePasswordCard() {
         <div className="space-y-2">
           <Label htmlFor="new-password">{t("settings:security.newPassword")}</Label>
           <Input
+            className="h-11 text-base md:h-8 md:text-xs"
             id="new-password"
             type="password"
             autoComplete="new-password"
@@ -126,6 +128,7 @@ function ChangePasswordCard() {
         <div className="space-y-2">
           <Label htmlFor="confirm-new-password">{t("settings:security.confirmNewPassword")}</Label>
           <Input
+            className="h-11 text-base md:h-8 md:text-xs"
             id="confirm-new-password"
             type="password"
             autoComplete="new-password"
@@ -182,6 +185,7 @@ function Enable2FASection() {
         <div className="space-y-2">
           <Label htmlFor="confirm-password">{t("auth:fields.password")}</Label>
           <Input
+            className="h-11 text-base md:h-8 md:text-xs"
             id="confirm-password"
             type="password"
             autoComplete="current-password"
@@ -245,7 +249,7 @@ function Enable2FASection() {
           inputMode="numeric"
           autoComplete="one-time-code"
           maxLength={6}
-          className="text-center text-lg tracking-widest"
+          className="h-11 text-base md:h-8 md:text-xs text-center tracking-widest"
           onKeyDown={(e) => {
             if (e.key === "Enter") enrollment.verify();
           }}
@@ -313,6 +317,7 @@ function Disable2FASection() {
       <div className="space-y-2">
         <Label htmlFor="disable-password">{t("auth:fields.password")}</Label>
         <Input
+          className="h-11 text-base md:h-8 md:text-xs"
           id="disable-password"
           type="password"
           autoComplete="current-password"

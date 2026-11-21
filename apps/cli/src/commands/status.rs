@@ -53,10 +53,17 @@ pub fn run(args: &Args) -> Result<()> {
             object.insert("warnings".into(), serde_json::to_value(&view.warnings)?);
         }
     }
+    let service = service_check();
+    if let (Some(service), Some(object)) = (&service, response.as_object_mut()) {
+        object.insert("service".into(), serde_json::to_value(service)?);
+    }
     if args.json {
         return output::json(&response);
     }
     let mut lines = format_status(&response);
+    if let Some(service) = &service {
+        lines.extend(format_service(service));
+    }
     if let Some(view) = &view {
         lines.extend(format_local(view));
     }
@@ -64,6 +71,54 @@ pub fn run(args: &Args) -> Result<()> {
         output::line(line)?;
     }
     Ok(())
+}
+
+/// The installed relay service, as `wsmp status` reports it (Linux: a
+/// systemd user unit, which needs lingering to run without a login).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct ServiceCheck {
+    manager: &'static str,
+    /// `loginctl`'s `Linger`; null when it could not say.
+    linger: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn service_check() -> Option<ServiceCheck> {
+    use crate::commands::service;
+    if !service::installed() {
+        return None;
+    }
+    let linger = service::linger_on();
+    Some(ServiceCheck {
+        manager: "systemd-user",
+        linger,
+        warning: service::linger_status_warning(linger, &service::login_account()),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn service_check() -> Option<ServiceCheck> {
+    None
+}
+
+fn format_service(service: &ServiceCheck) -> Vec<String> {
+    let mut lines = vec![format!(
+        "service: {} (linger {})",
+        service.manager,
+        match service.linger {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "unknown",
+        }
+    )];
+    if let Some(warning) = &service.warning {
+        lines.push(format!("warning: {warning}"));
+    }
+    lines
 }
 
 fn field<'a>(response: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -160,5 +215,44 @@ mod tests {
                 "trust: full",
             ]
         );
+    }
+
+    #[test]
+    fn a_user_service_without_linger_is_flagged() {
+        let off = ServiceCheck {
+            manager: "systemd-user",
+            linger: Some(false),
+            warning: crate::commands::service::linger_status_warning(Some(false), "alice"),
+        };
+        let lines = format_service(&off);
+        assert_eq!(lines[0], "service: systemd-user (linger off)");
+        assert!(
+            lines[1].starts_with("warning: systemd lingering is off for `alice`")
+                && lines[1].contains("`loginctl enable-linger alice`"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(&off).expect("json")["linger"],
+            serde_json::json!(false)
+        );
+        let on = ServiceCheck {
+            manager: "systemd-user",
+            linger: Some(true),
+            warning: crate::commands::service::linger_status_warning(Some(true), "alice"),
+        };
+        assert_eq!(format_service(&on), ["service: systemd-user (linger on)"]);
+        assert!(
+            serde_json::to_value(&on)
+                .expect("json")
+                .get("warning")
+                .is_none()
+        );
+        let unknown = format_service(&ServiceCheck {
+            manager: "systemd-user",
+            linger: None,
+            warning: crate::commands::service::linger_status_warning(None, "alice"),
+        });
+        assert_eq!(unknown[0], "service: systemd-user (linger unknown)");
+        assert_eq!(unknown.len(), 2);
     }
 }

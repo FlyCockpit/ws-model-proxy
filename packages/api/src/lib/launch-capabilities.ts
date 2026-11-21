@@ -5,7 +5,6 @@
  * are for, so an `sh` command that only Linux can run (`systemctl`) may still be placed on macOS,
  * where it fails on the node. Pure: contracts are also bundled for the browser.
  */
-import { z } from "zod";
 import {
   COMMAND_FIELDS,
   type NodePlatform,
@@ -21,36 +20,15 @@ export type LaunchCapabilities = {
   shells: ReadonlySet<RuntimeShell>;
 };
 
-const legacyInfoSchema = z.object({ executionMechanism: z.string().optional() });
-
-/**
- * What the node reports (`features.launch`). An older CLI reports none: its
- * `node.info.executionMechanism` tells Linux with a systemd user manager (processes and
- * services) from macOS (services only), both running `sh`. Null when nothing says (an older
- * CLI on any other platform, or no user manager): the node is not checked here and refuses
- * what it cannot run itself.
- */
-export function launchCapabilities(
-  features: unknown,
-  nodeInfo: unknown,
-): LaunchCapabilities | null {
-  const parsed = nodeFeaturesSchema.safeParse(features);
+/** Stored launch evidence, ignoring retired top-level fields; null when unavailable. */
+export function launchCapabilities(features: unknown): LaunchCapabilities | null {
+  const parsed = nodeFeaturesSchema.strip().safeParse(features);
   const launch = parsed.success ? parsed.data.launch : undefined;
   if (launch)
     return {
       platform: launch.platform,
       management: new Set(launch.management),
       shells: new Set(launch.shells),
-    };
-  const info = legacyInfoSchema.safeParse(nodeInfo);
-  const mechanism = info.success ? info.data.executionMechanism : undefined;
-  if (mechanism === "macos")
-    return { platform: "macos", management: new Set(["service"]), shells: new Set(["sh"]) };
-  if (mechanism?.startsWith("systemd"))
-    return {
-      platform: "linux",
-      management: new Set(["process", "service"]),
-      shells: new Set(["sh"]),
     };
   return null;
 }

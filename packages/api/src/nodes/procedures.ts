@@ -8,8 +8,14 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { Context } from "../context";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { nodesContract as c } from "../contracts/nodes";
+import { hiddenNodeIds } from "../lib/agent-hidden-nodes";
 import { loadAgentNames } from "../lib/agent-names";
-import { assertMayWrite, callerActor } from "../lib/caller-actor";
+import {
+  agentNodeFilter,
+  assertAgentInstanceNodes,
+  nodeVisibleToAgent,
+} from "../lib/agent-node-access";
+import { assertAgentNode, assertAgentScope, callerActor } from "../lib/caller-actor";
 import { graphDelete, graphWrite } from "../lib/graph-write";
 import {
   agentBlockedNodeWithCleanup,
@@ -19,6 +25,7 @@ import {
 } from "../lib/instance-occupancy";
 import { launchCapabilities } from "../lib/launch-capabilities";
 import { publishNodeEvent } from "../lib/node-events";
+import { liveNodeWhere, nodeIsLive } from "../lib/node-liveness";
 import {
   isForeignKeyViolation,
   isUniqueViolation,
@@ -27,11 +34,7 @@ import {
   refuseAbout,
 } from "../lib/refuse";
 import { nodeMetricCommandsHash } from "../lib/runtime-launch-hash";
-import {
-  metricCommandNeedsLaunch,
-  nodeMetricCommandsSchema,
-  reportsLaunchFeatures,
-} from "../lib/runtime-spec";
+import { nodeMetricCommandsSchema } from "../lib/runtime-spec";
 import {
   fabricInUseRefusal,
   fabricMemberNodeIds,
@@ -39,7 +42,7 @@ import {
   refreshFabricsHashes,
   replaceNodeFabrics,
 } from "./fabrics";
-import { loadNodeDetail, loadNodeSummary } from "./load";
+import { loadNodeDetail, loadNodeSummary, visibleRankWhere, visibleReservationWhere } from "./load";
 import { isFullControl, nodeTrustView } from "./trust";
 import { nodeListSelect, parseHeldDefinitions, toNodeListRow } from "./views";
 
@@ -73,20 +76,48 @@ const PUSHED_FIELDS = ["portRange", "metricCommands", "fabrics", "commandMaxMs"]
 export const nodeProcedures = {
   list: contractProcedure(c.list).handler(async ({ context }) => {
     const now = new Date();
+    const hidden = await hiddenNodeIds(prisma, context.auth);
     const rows = await prisma.node.findMany({
-      where: { userId: context.session.user.id },
-      select: nodeListSelect,
+      where: { userId: context.session.user.id, ...agentNodeFilter(context.auth) },
+      select: {
+        ...nodeListSelect,
+        Ranks: {
+          ...nodeListSelect.Ranks,
+          where: visibleRankWhere(nodeListSelect.Ranks.where, hidden),
+        },
+        Reservations: {
+          ...nodeListSelect.Reservations,
+          where: visibleReservationWhere(nodeListSelect.Reservations.where, hidden),
+        },
+        FabricMembers: {
+          select: {
+            ip: true,
+            Fabric: {
+              select: {
+                name: true,
+                _count: { select: { Members: { where: { nodeId: { notIn: hidden } } } } },
+              },
+            },
+          },
+        },
+      },
       orderBy: { slug: "asc" },
     });
-    return { nodes: rows.map((row) => toNodeListRow(row, now)) };
+    return {
+      nodes: rows
+        .filter((row) => nodeVisibleToAgent(context.auth, row.id))
+        .map((row) => toNodeListRow(row, now)),
+    };
   }),
 
-  get: contractProcedure(c.get).handler(async ({ context, input }) =>
-    loadNodeDetail(context.session.user.id, input.nodeId),
-  ),
+  get: contractProcedure(c.get).handler(async ({ context, input }) => {
+    assertAgentNode(context.auth, input.nodeId);
+    return loadNodeDetail(context.session.user.id, input.nodeId, new Date(), context.auth);
+  }),
 
   update: contractProcedure(c.update).handler(async ({ context, input }) => {
-    assertMayWrite(context.auth);
+    assertAgentScope(context.auth, "nodes:manage");
+    assertAgentNode(context.auth, input.nodeId);
     const userId = context.session.user.id;
     const node = await prisma.node.findFirst({
       where: { id: input.nodeId, userId },
@@ -105,18 +136,9 @@ export const nodeProcedures = {
     if (!isFullControl(node)) throw relayOnly(node.id);
     if (input.metricCommands) {
       nodeMetricCommandsSchema.parse(input.metricCommands);
-      const needsLaunch = input.metricCommands.find(metricCommandNeedsLaunch);
-      if (needsLaunch && !reportsLaunchFeatures(node.features)) {
-        throw refuseAbout(
-          "upgrade_wsmp",
-          node.id,
-          `Node ${node.slug} runs a wsmp that reads metric commands only as text in sh. Upgrade wsmp on it to use an argv or a shell (metric command ${needsLaunch.name}).`,
-          "BAD_REQUEST",
-        );
-      }
       // The node refuses a shell it does not have too (the command reports `spawn`); this says
       // which it has.
-      const shells = launchCapabilities(node.features, node.nodeInfo)?.shells;
+      const shells = launchCapabilities(node.features)?.shells;
       const missing = input.metricCommands.find(
         (command) => command.shell && shells && !shells.has(command.shell),
       );
@@ -178,6 +200,7 @@ export const nodeProcedures = {
           const fabricNodes = await replaceNodeFabrics(tx, userId, node.id, input.fabrics);
           await refreshFabricsHashes(tx, userId, fabricNodes);
           affected = [...new Set([node.id, ...fabricNodes])];
+          for (const affectedNodeId of affected) assertAgentNode(context.auth, affectedNodeId);
         }
         if (changed.length > 0) {
           const now = new Date();
@@ -217,7 +240,7 @@ export const nodeProcedures = {
       const rescan = services?.rescan;
       await afterCommit(rescan && (() => rescan(node.id)));
     }
-    return loadNodeDetail(userId, node.id);
+    return loadNodeDetail(userId, node.id, new Date(), context.auth);
   }),
 
   setHold: contractProcedure(c.setHold).handler(async ({ context, input }) => {
@@ -229,7 +252,7 @@ export const nodeProcedures = {
         : { holdAt: null, holdNote: null, holdProfileId: null },
     });
     if (updated.count === 0) throw notFound("That node does not exist.");
-    return loadNodeSummary(userId, input.nodeId);
+    return loadNodeSummary(userId, input.nodeId, new Date(), context.auth);
   }),
 
   setTemporary: contractProcedure(c.setTemporary).handler(async ({ context, input }) => {
@@ -242,7 +265,7 @@ export const nodeProcedures = {
       },
     });
     if (updated.count === 0) throw notFound("That node does not exist.");
-    return loadNodeSummary(userId, input.nodeId);
+    return loadNodeSummary(userId, input.nodeId, new Date(), context.auth);
   }),
 
   rename: contractProcedure(c.rename).handler(async ({ context, input }) => {
@@ -252,7 +275,7 @@ export const nodeProcedures = {
       data: { name: input.name },
     });
     if (updated.count === 0) throw notFound("That node does not exist.");
-    return loadNodeSummary(userId, input.nodeId);
+    return loadNodeSummary(userId, input.nodeId, new Date(), context.auth);
   }),
 
   delete: contractProcedure(c.delete).handler(async ({ context, input }) =>
@@ -260,7 +283,8 @@ export const nodeProcedures = {
   ),
 
   deleteOffline: contractProcedure(c.deleteOffline).handler(async ({ context, input }) => {
-    assertMayWrite(context.auth);
+    assertAgentScope(context.auth, "nodes:manage");
+    assertAgentNode(context.auth, input.nodeId);
     return deleteNode(context, input.nodeId, { note: input.note ?? null });
   }),
 
@@ -537,12 +561,13 @@ async function deleteNode(
 ) {
   const userId = context.session.user.id;
   const stopped = await graphDelete({ userId, nodeIds: [nodeId] }, async (tx) => {
+    const now = new Date();
     const node = await tx.node.findFirst({
       where: { id: nodeId, userId },
-      select: { id: true, slug: true, connection: true },
+      select: { id: true, slug: true, connection: true, lastHeartbeatAt: true },
     });
     if (!node) throw notFound("That node does not exist.");
-    if (agent && node.connection === "ONLINE")
+    if (agent && nodeIsLive(node, now))
       throw refuseAbout(
         "node_online",
         node.id,
@@ -566,17 +591,24 @@ async function deleteNode(
     if (agent) {
       const affected = await tx.runtimeInstance.findMany({
         where: {
-          userId,
           desiredState: { not: null },
           OR: [
             occupiesNodesWhere([node.id]),
             { AND: [placedOnNodesWhere([node.id]), { phase: { notIn: [...NOT_RUNNING] } }] },
           ],
         },
-        select: { id: true, ...OCCUPANCY_SELECT },
+        select: { id: true, userId: true, ...OCCUPANCY_SELECT },
         orderBy: { id: "asc" },
       });
       for (const instance of affected) {
+        if (instance.userId !== userId) throw notFound("That node does not exist.");
+        await assertAgentInstanceNodes(
+          tx,
+          context.auth,
+          userId,
+          instance,
+          "That node does not exist.",
+        );
         const blocked = await agentBlockedNodeWithCleanup(tx, userId, instance);
         if (blocked)
           throw refuseAbout(
@@ -619,9 +651,9 @@ async function deleteNode(
     if (agent) {
       // The online check above is a plain read: a hello can commit after it. The delete re-checks
       // the row it locks (Postgres re-evaluates the WHERE), so an agent never deletes a node
-      // that came online in between.
+      // that came online or sent a heartbeat in between.
       const deleted = await tx.node.deleteMany({
-        where: { id: node.id, userId, connection: { not: "ONLINE" } },
+        where: { id: node.id, userId, NOT: liveNodeWhere(now) },
       });
       if (deleted.count === 0)
         throw refuseAbout(

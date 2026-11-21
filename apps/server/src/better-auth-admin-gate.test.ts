@@ -40,6 +40,7 @@ describe("betterAuthAdminGate", () => {
     app = new Hono();
     app.use("/api/auth/admin/*", betterAuthAdminGate);
     app.all("/api/auth/admin/set-role", downstream);
+    app.all("/api/auth/admin/stop-impersonating", downstream);
     app.all("/api/auth/admin/impersonate-user", downstream);
   });
 
@@ -115,5 +116,46 @@ describe("betterAuthAdminGate", () => {
     const res = await app.request("/api/auth/admin/impersonate-user", { method: "POST" });
     expect(res.status).toBe(200);
     expect(downstream).toHaveBeenCalledTimes(1);
+  });
+  it("lets an impersonating session stop via Better Auth with one cookie-only session read", async () => {
+    getSession.mockResolvedValue({
+      user: { id: "target", role: "user", emailVerified: false, twoFactorEnabled: false },
+      session: { impersonatedBy: "admin" },
+    });
+    db.appSetting.findUnique.mockResolvedValue({ value: "true" });
+    const res = await app.request("/api/auth/admin/stop-impersonating", {
+      method: "POST",
+      headers: { authorization: "Bearer ignored", cookie: "better-auth.session_token=target" },
+    });
+    expect(res.status).toBe(200);
+    expect(downstream).toHaveBeenCalledOnce();
+    expect(getSession).toHaveBeenCalledOnce();
+    const call = getSession.mock.calls[0]?.[0] as { headers: Headers };
+    expect(call.headers.get("authorization")).toBeNull();
+    expect(call.headers.get("cookie")).toBe("better-auth.session_token=target");
+  });
+
+  it("still rejects stop-impersonating for a normal non-admin session", async () => {
+    getSession.mockResolvedValue({
+      user: { id: "target", role: "user", emailVerified: true },
+      session: { impersonatedBy: null },
+    });
+    const res = await app.request("/api/auth/admin/stop-impersonating", { method: "POST" });
+    expect(res.status).toBe(403);
+    expect(downstream).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["GET", "/api/auth/admin/stop-impersonating"],
+    ["POST", "/api/auth/admin/set-role"],
+    ["POST", "/api/auth/admin/stop-impersonating/extra"],
+  ])("keeps the impersonated role gate for %s %s", async (method, path) => {
+    getSession.mockResolvedValue({
+      user: { id: "target", role: "user", emailVerified: true },
+      session: { impersonatedBy: "admin" },
+    });
+    const res = await app.request(path, { method });
+    expect(res.status).toBe(403);
+    expect(downstream).not.toHaveBeenCalled();
   });
 });

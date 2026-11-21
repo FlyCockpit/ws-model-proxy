@@ -20,7 +20,7 @@
 
 import {
   nodeEnrollRequestSchema,
-  RELAY_PROTOCOL,
+  RELAY_PROTOCOL_VERSION,
   wellKnownWsmpSchema,
 } from "@ws-model-proxy/api/contracts";
 import {
@@ -46,16 +46,25 @@ import { SERVER_VERSION } from "./version.js";
 export const CLI_REPOSITORY = "https://github.com/FlyCockpit/ws-model-proxy";
 
 /**
- * Release targets `/install.sh` downloads (`wsmp-<target>.tar.xz`, checksummed in `sha256.sum`;
- * apps/cli/dist-workspace.toml builds them). The Linux builds link glibc, built on Ubuntu 22.04
- * runners, so they need at least {@link CLI_RELEASE_MIN_GLIBC}.
+ * Unix release targets (`wsmp-<target>.tar.xz`, checksummed in `sha256.sum`;
+ * apps/cli/dist-workspace.toml builds them). On Linux, `/install.sh` installs the GNU build
+ * where glibc meets {@link CLI_RELEASE_MIN_GLIBC} (as 0.4.x did: a static musl build cannot
+ * resolve mDNS `*.local` server or model URLs), and the static musl build only on musl systems
+ * (Alpine), older glibc, or a libc it cannot identify. Updates keep each node on its flavour.
  */
 export const CLI_RELEASE_TARGETS = [
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
   "x86_64-apple-darwin",
   "aarch64-apple-darwin",
 ] as const;
+/**
+ * The oldest glibc the GNU builds run on. The release builds them on ubuntu-22.04 runners
+ * (glibc 2.35), and `apps/cli/scripts/check-glibc-floor.sh` fails the release and CLI CI when a
+ * binary needs a newer `GLIBC_x.y` symbol version than this. Keep the three in step.
+ */
 export const CLI_RELEASE_MIN_GLIBC = { major: 2, minor: 34 } as const;
 
 /** The GitHub Release of this server's version. */
@@ -73,7 +82,7 @@ export function defaultCliReleaseBaseUrl(): string {
 export const CLI_RELEASE_BINARIES_BY_DEFAULT = true;
 
 /** The branch an unconfigured server builds before {@link CLI_RELEASE_BINARIES_BY_DEFAULT}. */
-export const CLI_PREVIEW_BRANCH = "master";
+export const CLI_PREVIEW_BRANCH = "main";
 
 /**
  * What `/install.sh` installs. `release`: the checksummed binary for the node's platform from
@@ -190,6 +199,25 @@ cargo_home() {
 }
 bin_dir() { printf '%s/bin' "$(cargo_home)"; }
 
+# Whether this machine's C library is glibc at or above the GNU builds' floor
+# (${CLI_RELEASE_MIN_GLIBC.major}.${CLI_RELEASE_MIN_GLIBC.minor}). musl (Alpine), an older glibc, or a libc this cannot identify: no.
+glibc_ok() {
+  libc=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)
+  case "$libc" in
+    "glibc "*) ;;
+    *)
+      # No getconf: ldd --version names glibc on its first line ("ldd (… GLIBC …) 2.36").
+      libc=$(ldd --version 2>/dev/null | awk 'NR == 1 && /GLIBC|GNU libc/ { print "glibc " $NF }' || true)
+      ;;
+  esac
+  printf '%s\n' "$libc" | awk -v floor_major=${CLI_RELEASE_MIN_GLIBC.major} -v floor_minor=${CLI_RELEASE_MIN_GLIBC.minor} '
+    /^glibc [0-9]+[.][0-9]+([.][0-9]+)?$/ {
+      split($2, v, ".")
+      if (v[1] + 0 > floor_major || (v[1] + 0 == floor_major && v[2] + 0 >= floor_minor)) ok = 1
+    }
+    END { exit !ok }'
+}
+
 # The release target for this machine, or nothing when no release binary runs here.
 detect_target() {
   arch=$(uname -m)
@@ -200,23 +228,14 @@ detect_target() {
   esac
   case "$(uname -s)" in
     Linux)
-      # The Linux builds link glibc ${CLI_RELEASE_MIN_GLIBC.major}.${CLI_RELEASE_MIN_GLIBC.minor} or newer; musl and older glibc build from source.
-      glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)
-      case "$glibc" in
-        "glibc "*) ;;
-        *) return 0 ;;
-      esac
-      version=\${glibc#glibc }
-      major=\${version%%.*}
-      minor=\${version#*.}
-      minor=\${minor%%.*}
-      case "$major.$minor" in
-        *[!0-9.]* | .* | *.) return 0 ;;
-      esac
-      if [ "$major" -lt ${CLI_RELEASE_MIN_GLIBC.major} ] || { [ "$major" -eq ${CLI_RELEASE_MIN_GLIBC.major} ] && [ "$minor" -lt ${CLI_RELEASE_MIN_GLIBC.minor} ]; }; then
-        return 0
+      # The GNU build on glibc at the floor, as 0.4.x installed: it resolves mDNS
+      # \`*.local\` names through NSS, which a static musl build cannot. The static musl
+      # build on musl (Alpine) and older or unidentified libcs.
+      if glibc_ok; then
+        printf '%s-unknown-linux-gnu' "$arch"
+      else
+        printf '%s-unknown-linux-musl' "$arch"
       fi
-      printf '%s-unknown-linux-gnu' "$arch"
       ;;
     Darwin)
       # A Rosetta shell reports x86_64 on Apple silicon: install the native build.
@@ -308,13 +327,40 @@ install_release() {
   say "downloading wsmp $WSMP_VERSION for $target from $WSMP_RELEASE_URL..."
   fetch "$WSMP_RELEASE_URL/sha256.sum" "$tmp/sha256.sum" ||
     die "could not download $WSMP_RELEASE_URL/sha256.sum (is wsmp $WSMP_VERSION published there?)."
-  fetch "$WSMP_RELEASE_URL/$archive" "$tmp/$archive" ||
-    die "could not download $WSMP_RELEASE_URL/$archive."
   expected=$(awk -v f="$archive" '{ sub(/\\r$/, "") } $2 == f || $2 == "*" f { print tolower($1); exit }' "$tmp/sha256.sum")
+  # A release that does not list the chosen Linux flavour (a mirror of a pre-1.0 release has
+  # GNU archives only) falls back to the other one only where it runs; never past an archive
+  # named anywhere in sha256.sum, even on a malformed line (that fails closed below).
+  if [ -z "$expected" ] && ! grep -F -q "$archive" "$tmp/sha256.sum"; then
+    case "$target" in
+      *-unknown-linux-gnu) other="\${target%-gnu}-musl" ;;
+      *-unknown-linux-musl) other="\${target%-musl}-gnu" ;;
+      *) other="" ;;
+    esac
+    if [ -n "$other" ]; then
+      other_expected=$(awk -v f="wsmp-$other.tar.xz" '{ sub(/\\r$/, "") } $2 == f || $2 == "*" f { print tolower($1); exit }' "$tmp/sha256.sum")
+      case "$other" in
+        *-gnu) other_runs=0; glibc_ok && other_runs=1 ;;
+        *) other_runs=1 ;;
+      esac
+      if [ -n "$other_expected" ] && [ "$other_runs" = 1 ]; then
+        say "this release has no $archive; installing wsmp-$other.tar.xz instead."
+        target=$other
+        archive="wsmp-$target.tar.xz"
+        expected=$other_expected
+      elif [ -n "$other_expected" ]; then
+        say "this release has only GNU Linux binaries, which need glibc ${CLI_RELEASE_MIN_GLIBC.major}.${CLI_RELEASE_MIN_GLIBC.minor} or newer; building from source instead."
+        install_source ${sourceArgs}
+        return 0
+      fi
+    fi
+  fi
   case "$expected" in
     "" | *[!0-9a-f]*) die "sha256.sum has no checksum for $archive; not installing it." ;;
   esac
   [ \${#expected} -eq 64 ] || die "sha256.sum has no checksum for $archive; not installing it."
+  fetch "$WSMP_RELEASE_URL/$archive" "$tmp/$archive" ||
+    die "could not download $WSMP_RELEASE_URL/$archive."
   actual=$(sha256_of "$tmp/$archive" | awk '{ print tolower($1) }')
   [ -n "$actual" ] ||
     die "no SHA-256 tool (sha256sum, shasum or openssl) found; not installing an unverified binary."
@@ -385,7 +431,7 @@ main() {
     if [ -n "$target" ]; then
       install_release "$target"
     else
-      say "no wsmp release binary fits this machine ($(uname -s) $(uname -m); Linux needs glibc ${CLI_RELEASE_MIN_GLIBC.major}.${CLI_RELEASE_MIN_GLIBC.minor} or newer); building from source instead."
+      say "no wsmp release binary fits this machine ($(uname -s) $(uname -m)); building from source instead."
       install_source ${sourceArgs}
     fi
   fi
@@ -913,7 +959,7 @@ export function registerNodeHttpRoutes<E extends Env>(
     c.json(
       wellKnownWsmpSchema.parse({
         serverVersion: SERVER_VERSION,
-        protocolVersion: RELAY_PROTOCOL,
+        protocolVersion: RELAY_PROTOCOL_VERSION,
         origin: canonicalOrigin(),
         installScript: "/install.sh",
         enrollPath: NODE_ENROLL_PATH,

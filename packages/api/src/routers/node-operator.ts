@@ -10,10 +10,13 @@
  * outcome in the append-only `NodeAuditEvent` (subject `hmac-sha256:<hex> <program>`); the
  * output tail comes live from the node and is null while it is offline.
  */
+
 import { randomBytes } from "node:crypto";
 import { ORPCError } from "@orpc/server";
+import { liveAgentTokenWhere, mcpPatBlockedByPolicy } from "@ws-model-proxy/auth/mcp-pat-limits";
 import prisma from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
+import { env } from "@ws-model-proxy/env/server";
 import type { z } from "zod";
 import type { Context, NodeCommandLiveStatus, NodeOperatorServices } from "../context";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
@@ -24,7 +27,7 @@ import {
   type queuedCommandStatusSchema,
   type queuedCommandViewSchema,
 } from "../contracts/nodes";
-import { callerActor } from "../lib/caller-actor";
+import { assertAgentNode, assertAgentScope, callerActor } from "../lib/caller-actor";
 import { commandAuditSubject } from "../lib/command-audit";
 import { displayCommand } from "../lib/command-render";
 import { launchCapabilities } from "../lib/launch-capabilities";
@@ -61,7 +64,7 @@ function services(context: Context): NodeOperatorServices {
 }
 
 /**
- * Agents need a Full token for anything that runs or queues a command, and a browser call must
+ * Agents need commands scope for anything that runs or queues a command, and a browser call must
  * carry the verified CSRF header: a cookie without it is not a person (`agentRulesApply`) and
  * could be a cross-site form post. The RPC layer refuses those first
  * (`CSRF_REQUIRED_PROCEDURES`); this is the procedure's own check.
@@ -70,12 +73,7 @@ function assertAgentMayWrite(auth: CallerAuth | { kind: "anonymous" }): void {
   if (auth.kind === "cookie_session" && !auth.csrfVerified) {
     throw new ORPCError("FORBIDDEN", { message: "This request is missing its CSRF header." });
   }
-  if (
-    (auth.kind === "agent_token" || auth.kind === "oauth_access_token") &&
-    auth.level !== "FULL"
-  ) {
-    throw new ORPCError("FORBIDDEN", { message: "This needs a Full agent token." });
-  }
+  assertAgentScope(auth, "commands");
 }
 
 type OperatorNode = {
@@ -190,7 +188,11 @@ async function pollAndSettle(
  * before this read refuses here; one committed after it finds the row and cancels it
  * (`apps/server` relay/node-commands.ts), even before the node started it.
  */
-async function callerStillLive(auth: CallerAuth | { kind: "anonymous" }, userId: string) {
+async function callerStillLive(
+  auth: CallerAuth | { kind: "anonymous" },
+  userId: string,
+  nodeId: string,
+) {
   const now = new Date();
   const [owner, credential] = await Promise.all([
     prisma.user.findUnique({
@@ -202,20 +204,38 @@ async function callerStillLive(auth: CallerAuth | { kind: "anonymous" }, userId:
           where: {
             id: auth.agentTokenId,
             userId,
-            level: "FULL",
-            revokedAt: null,
-            OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+            grant: {
+              revokedAt: null,
+              scopes: { has: "COMMANDS" },
+              OR: [{ allNodes: true }, { Nodes: { some: { nodeId } } }],
+            },
+            // A no-expiry token is not live while the deployment disallows those.
+            ...liveAgentTokenWhere(now, env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY),
           },
-          select: { id: true },
+          select: { id: true, expiresAt: true },
         })
       : auth.kind === "oauth_access_token"
         ? prisma.mcpGrant.findFirst({
-            where: { id: auth.grantId, userId, level: "FULL", revokedAt: null },
+            where: {
+              id: auth.grantId,
+              userId,
+              revokedAt: null,
+              scopes: { has: "COMMANDS" },
+              OR: [{ allNodes: true }, { Nodes: { some: { nodeId } } }],
+            },
             select: { id: true },
           })
         : Promise.resolve({ id: userId }),
   ]);
-  return owner !== null && !userCredentialAccessBlocked(owner, now) && credential !== null;
+  // Final synchronous verdict: the policy is re-judged after the reads, not only in their SQL.
+  const blocked =
+    auth.kind === "agent_token" &&
+    credential !== null &&
+    "expiresAt" in credential &&
+    mcpPatBlockedByPolicy(credential.expiresAt, env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY);
+  return (
+    owner !== null && !userCredentialAccessBlocked(owner, now) && credential !== null && !blocked
+  );
 }
 
 /**
@@ -231,6 +251,7 @@ const commands = {
   run: contractProcedure(c.commands.run).handler(async ({ context, input }) => {
     assertAgentMayWrite(context.auth);
     const userId = userIdOf(context);
+    assertAgentNode(context.auth, input.nodeId, "That node or command does not exist.");
     const node = await fullControlNode(userId, input.nodeId);
     const operator = services(context);
     const argv = typeof input.command === "string" ? null : input.command;
@@ -244,7 +265,7 @@ const commands = {
       });
     }
     // The node refuses a shell it does not have too; this says which it has.
-    const shells = launchCapabilities(node.features, node.nodeInfo)?.shells;
+    const shells = launchCapabilities(node.features)?.shells;
     if (input.shell && shells && !shells.has(input.shell)) {
       throw refuseAbout(
         "shell_unavailable",
@@ -273,7 +294,7 @@ const commands = {
       },
       select: nodeCommandSelect,
     });
-    if (!(await callerStillLive(context.auth, userId))) {
+    if (!(await callerStillLive(context.auth, userId, node.id))) {
       await settleNodeCommand(row, "FAILED", null, undefined, {
         outcome: "failed",
         reason: "token_inactive",
@@ -300,6 +321,14 @@ const commands = {
       });
       if (error instanceof ORPCError) throw error;
       const nodeReason = nodeRefusal(error);
+      if (nodeReason === "bad_cwd") {
+        throw refuseAbout(
+          "bad_cwd",
+          node.id,
+          `Node ${node.slug} cannot use that working directory: use an absolute path or ~ for an existing, accessible directory on the node. Its home directory must also be available.`,
+          "BAD_REQUEST",
+        );
+      }
       if (nodeReason === "shell_unavailable") {
         throw refuseAbout(
           "shell_unavailable",
@@ -343,12 +372,13 @@ const commands = {
 
   get: contractProcedure(c.commands.get).handler(async ({ context, input }) => {
     const userId = userIdOf(context);
-    if (input.cancel) assertAgentMayWrite(context.auth);
+    assertAgentMayWrite(context.auth);
     const row = await prisma.nodeCommand.findFirst({
       where: { id: input.commandId, userId },
       select: nodeCommandSelect,
     });
     if (!row) return queuedCommandStatus(context, userId, input.commandId, input.cancel === true);
+    assertAgentNode(context.auth, row.nodeId, "That node or command does not exist.");
     if (input.cancel && row.state !== "RUNNING") {
       throw refuseAbout(
         "command_not_running",
@@ -383,6 +413,7 @@ async function queuedCommandStatus(
     select: queuedSelect,
   });
   if (!queuedRow) throw notFound("That node or command does not exist.");
+  assertAgentNode(context.auth, queuedRow.nodeId, "That node or command does not exist.");
   const view = queuedView(cancel ? await withdrawQueued(context, userId, queuedRow) : queuedRow);
   return {
     commandId: view.id,
@@ -509,6 +540,7 @@ async function appendTerminalAudit(args: {
 const terminals = {
   openTicket: contractProcedure(c.terminals.openTicket).handler(async ({ context, input }) => {
     const userId = userIdOf(context);
+    assertAgentNode(context.auth, input.nodeId, "That node or command does not exist.");
     const node = await fullControlNode(userId, input.nodeId);
     const ticket = await services(context).openTerminalTicket({
       userId,
@@ -652,6 +684,7 @@ const queued = {
         message: "Only an agent queues a command for a person. Open a terminal to run it.",
       });
     }
+    assertAgentNode(context.auth, input.nodeId, "That node or command does not exist.");
     const node = await fullControlNode(userId, input.nodeId, { allowOffline: true });
     for (const text of [input.command, input.note]) {
       const issue = runtimeTextIssue(text);
@@ -680,6 +713,40 @@ const queued = {
       },
       select: queuedSelect,
     });
+    // Register the row before the live read: narrowing before it is seen here, and narrowing
+    // afterwards sees the pending row in the server's withdrawal sweep.
+    if (!(await callerStillLive(context.auth, userId, node.id))) {
+      await prisma.$transaction(async (tx) => {
+        const withdrawn = await tx.queuedNodeCommand.updateMany({
+          where: { id: row.id, userId, state: "QUEUED", agentTokenId, mcpGrantId },
+          data: {
+            state: "WITHDRAWN",
+            decidedAt: new Date(),
+            decidedBy: agentTokenId ?? mcpGrantId,
+            outcome: null,
+          },
+        });
+        if (withdrawn.count === 1)
+          await tx.nodeAuditEvent.create({
+            data: {
+              userId,
+              nodeId: node.id,
+              actor: "AGENT",
+              agentTokenId,
+              mcpGrantId,
+              kind: "command_queued_for_user",
+              subject: commandAuditSubject(input.command),
+              outcome: "cancelled",
+              reason: "access_narrowed",
+              startedAt: now,
+              finishedAt: new Date(),
+            },
+          });
+      });
+      throw new ORPCError("FORBIDDEN", {
+        message: "This credential no longer allows this command.",
+      });
+    }
     // Needs you: e-mail the person (when SMTP and their alerts are on). Never awaited, never
     // throws: the agent's call does not wait on SMTP.
     void notifyQueuedCommand({ userId, nodeSlug: node.slug, now });

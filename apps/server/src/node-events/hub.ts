@@ -104,6 +104,16 @@ export class NodeEventHub {
   }
 
   /**
+   * Ends one stream whose client went away (the request's abort signal, ./route.ts): a pending
+   * admission is given back, an open stream is closed without `unauthorized`. Idempotent, and a
+   * no-op after the stream's own `cancel` or any other end.
+   */
+  drop(subscriber: NodeEventSubscriber): void {
+    if (subscriber.state === "closed") return;
+    this.end(subscriber, null);
+  }
+
+  /**
    * Opens a reserved stream. Null when it was closed while its session was read (sign-out,
    * deletion, shutdown): the route answers 401 or 503 instead.
    */

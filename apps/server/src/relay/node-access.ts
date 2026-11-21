@@ -4,12 +4,19 @@
  * one revoke sweep (`revokeOpenNodeAgentAccess`). Callers keep the "no await between the verdict
  * and the dispatch" ordering described on `Admission`.
  *
- * 0.4.0 rule (spec §6.3): an agent may act on a node only with a FULL agent token and only
- * while the node is at Full control, both as stored (a person's pending lowering counts as
- * Relay) and as the live session reports it. There are no per-node agent grants any more.
+ * An agent needs the matching live scope, an allowed node it owns, and Full node trust,
+ * both as stored (a pending trust lowering counts as Relay) and as the session reports it.
  */
+import {
+  type AgentAccess,
+  agentHasScope,
+  agentNodeAllowed,
+} from "@ws-model-proxy/auth/agent-scopes";
+import { readMcpGrantAccess } from "@ws-model-proxy/auth/mcp-grant-access";
+import { liveAgentTokenWhere, mcpPatBlockedByPolicy } from "@ws-model-proxy/auth/mcp-pat-limits";
 import prisma from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
+import { env } from "@ws-model-proxy/env/server";
 import { nodeOwnerMatches } from "./node-owner.js";
 import { relaySessionManager } from "./session-manager.js";
 
@@ -47,13 +54,31 @@ type OwnerState = {
  * runs the per-user sweep ({@link revokeOpenNodeAgentAccessForUser}).
  * In memory, single process: the relay sockets and the sweeps live here.
  */
-type Admission = { tokenId: string; userId: string; revoked: boolean };
+type Admission = {
+  tokenId: string;
+  userId: string;
+  nodeId: string;
+  capability: NodeAgentCapability;
+  revoked: boolean;
+};
 const openAdmissions = new Set<Admission>();
 
 /** Mark every admission still reading for `tokenId`: its request refuses. */
 export function revokeOpenNodeAgentAccess(tokenId: string): void {
   for (const admission of openAdmissions) {
     if (admission.tokenId === tokenId) admission.revoked = true;
+  }
+}
+
+/** Narrowing only fences admissions that would no longer be allowed. */
+export function narrowOpenNodeAgentAccess(tokenId: string, access: AgentAccess): void {
+  for (const admission of openAdmissions) {
+    if (
+      admission.tokenId === tokenId &&
+      (!agentHasScope(access, admission.capability === "command" ? "commands" : "files") ||
+        !agentNodeAllowed(access, admission.nodeId))
+    )
+      admission.revoked = true;
   }
 }
 
@@ -74,7 +99,7 @@ export function resetNodeAgentAccessForTests(): void {
   openAdmissions.clear();
 }
 
-export type LiveAgentToken = { name: string; expiresAt: Date | null };
+export type LiveAgentToken = { name: string; expiresAt: Date | null; access: AgentAccess };
 
 type AccessNode = {
   id: string;
@@ -105,7 +130,7 @@ export type NodeAgentAccessReads = {
 };
 
 /**
- * The caller's credential if it is still live and FULL: an agent token (not revoked, not
+ * The caller's live grant access: an agent token (not revoked, not
  * expired) or an OAuth grant (not revoked; its access tokens expire on their own and the MCP
  * layer checks them per request).
  */
@@ -115,21 +140,24 @@ async function readLiveCredential(
 ): Promise<LiveAgentToken | null> {
   if (input.credentialKind === "oauth_grant") {
     const grant = await prisma.mcpGrant.findFirst({
-      where: { id: input.tokenId, userId: input.userId, level: "FULL", revokedAt: null },
+      where: { id: input.tokenId, userId: input.userId, revokedAt: null },
       select: { clientId: true },
     });
-    return grant ? { name: grant.clientId, expiresAt: null } : null;
+    const access = grant ? await readMcpGrantAccess(prisma, input.tokenId) : null;
+    return grant && access ? { name: grant.clientId, expiresAt: null, access } : null;
   }
-  return prisma.agentToken.findFirst({
+  const token = await prisma.agentToken.findFirst({
     where: {
       id: input.tokenId,
       userId: input.userId,
-      level: "FULL",
-      revokedAt: null,
-      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+      grant: { revokedAt: null, userId: input.userId },
+      // A no-expiry token is not live while the deployment disallows those.
+      ...liveAgentTokenWhere(now, env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY),
     },
-    select: { name: true, expiresAt: true },
+    select: { name: true, expiresAt: true, grantId: true },
   });
+  const access = token ? await readMcpGrantAccess(prisma, token.grantId) : null;
+  return token && access ? { name: token.name, expiresAt: token.expiresAt, access } : null;
 }
 
 /**
@@ -140,8 +168,15 @@ async function readLiveCredential(
  */
 export async function readNodeAgentAccess(
   input: NodeAgentAccessInput,
+  capability: NodeAgentCapability = "command",
 ): Promise<NodeAgentAccessReads> {
-  const admission: Admission = { tokenId: input.tokenId, userId: input.userId, revoked: false };
+  const admission: Admission = {
+    tokenId: input.tokenId,
+    userId: input.userId,
+    nodeId: input.nodeId,
+    capability,
+    revoked: false,
+  };
   openAdmissions.add(admission);
   try {
     const now = new Date();
@@ -191,6 +226,13 @@ function tokenLive(reads: NodeAgentAccessReads): reads is NodeAgentAccessReads &
   if (admission.revoked || token === null) return false;
   const now = Date.now();
   if (token.expiresAt !== null && token.expiresAt.getTime() <= now) return false;
+  // Re-judged here, synchronously, so a policy read never precedes an await this verdict
+  // trusts (the SQL fragment above only saves the reads). OAuth grants are not agent tokens.
+  if (
+    input.credentialKind !== "oauth_grant" &&
+    mcpPatBlockedByPolicy(token.expiresAt, env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY)
+  )
+    return false;
   return input.expiresAt === null || input.expiresAt.getTime() > now;
 }
 
@@ -207,6 +249,10 @@ export function judgeNodeAgentAccess(
   // Closing and judging are one synchronous step: no revoke can slip between them.
   openAdmissions.delete(admission);
   if (!tokenLive(reads)) return { ok: false, error: "token_inactive" };
+  if (!agentHasScope(reads.token.access, capability === "command" ? "commands" : "files"))
+    return { ok: false, error: "token_inactive" };
+  if (!agentNodeAllowed(reads.token.access, input.nodeId))
+    return { ok: false, error: "unknown_node" };
   if (!node || node.userId !== input.userId) return { ok: false, error: "unknown_node" };
   if (owner === null || userCredentialAccessBlocked(owner, new Date())) {
     return { ok: false, error: "token_inactive" };

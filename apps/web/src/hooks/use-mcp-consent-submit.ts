@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { EditableAgentAccess } from "@/lib/agent-access";
 import { authClient } from "@/lib/auth-client";
 import { resolveOauthRedirectUrl } from "@/lib/mcp-oauth-search";
 
@@ -17,14 +18,12 @@ import { resolveOauthRedirectUrl } from "@/lib/mcp-oauth-search";
  * (resolveOauthRedirectUrl); denial carries the client's redirect_uri with
  * `error=access_denied` through the same contract.
  */
-export type ConsentPhase = "review" | "submitting" | "denied" | "invalid";
+export type ConsentPhase = "review" | "submitting" | "denied" | "invalid" | "error";
 
-/**
- * Better Auth's consent body plus `level`, which its endpoint schema does not declare: the
- * server's consent hooks read it from the request body (packages/auth/src/mcp-consent-level.ts).
- */
+/** Better Auth's consent body plus the access fields read by the server consent hooks. */
 type ConsentBody = NonNullable<Parameters<typeof authClient.oauth2.consent>[0]> & {
-  level?: "READ" | "FULL";
+  scopes?: EditableAgentAccess["scopes"];
+  nodeIds?: string[] | null;
 };
 
 export function useMcpConsentSubmit() {
@@ -47,22 +46,20 @@ export function useMcpConsentSubmit() {
     };
   }, []);
 
-  /**
-   * `level`: the access the person chose on the page (approval only). The server records it on
-   * the grant (packages/auth/src/mcp-consent-level.ts); a denial carries none.
-   */
-  const submit = useCallback(async (accept: boolean, level?: "READ" | "FULL") => {
+  // The OAuth client plugin attaches the signed oauth_query from the raw URL.
+  // Denial carries only the decision; access always comes from the person's form.
+  const submit = useCallback(async (accept: boolean, access?: EditableAgentAccess) => {
     setPhase("submitting");
     try {
       // The signed oauth_query is attached by oauthProviderClient() from
-      // window.location.search; this call sends ONLY the person's decision.
-      const body: ConsentBody = accept && level !== undefined ? { accept, level } : { accept };
+      // window.location.search; the body carries the person's decision and chosen access.
+      const body: ConsentBody = accept && access !== undefined ? { accept, ...access } : { accept };
       const result = await authClient.oauth2.consent(body);
       if (disposed.current) return;
       if (result.error) {
-        // invalid_signature / expired transaction / missing oauth query: the
-        // transaction cannot be completed from this page.
-        setPhase("invalid");
+        // The provider uses invalid_signature for failed signature OR expiry verification.
+        // Other failures (including a generic 400) must not claim the signature expired.
+        setPhase(isInvalidConsentTransaction(result.error) ? "invalid" : "error");
         return;
       }
       const url = resolveOauthRedirectUrl(result.data);
@@ -73,11 +70,19 @@ export function useMcpConsentSubmit() {
         window.location.assign(url);
         return;
       }
-      setPhase(accept ? "invalid" : "denied");
+      setPhase(accept ? "error" : "denied");
     } catch {
-      if (!disposed.current) setPhase("invalid");
+      if (!disposed.current) setPhase("error");
     }
   }, []);
 
   return { phase, submit };
+}
+
+function isInvalidConsentTransaction(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  return (
+    ("code" in error && error.code === "invalid_signature") ||
+    ("error" in error && error.error === "invalid_signature")
+  );
 }

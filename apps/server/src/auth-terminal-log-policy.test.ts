@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { MCP_FINE_SCOPES } from "@ws-model-proxy/auth/agent-scopes";
 import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { prismaAdapter } from "better-auth/adapters/prisma";
@@ -138,7 +139,7 @@ function buildMemoryApp(opts: { mountRequestLog?: boolean; injectRequestFailure?
         redirectUris: [CALLBACK],
         grantTypes: ["authorization_code", "refresh_token"],
         responseTypes: ["code"],
-        scopes: ["mcp:read", "mcp:write", "offline_access"],
+        scopes: ["mcp:read", ...MCP_FINE_SCOPES, "offline_access"],
         skipConsent: true,
         requirePKCE: true,
         disabled: false,
@@ -275,7 +276,7 @@ describe("bucket C — prisma adapter native join + B1 terminal guarantee", () =
       redirectUris: [CALLBACK],
       grantTypes: ["authorization_code", "refresh_token"],
       responseTypes: ["code"],
-      scopes: ["mcp:read", "mcp:write", "offline_access"],
+      scopes: ["mcp:read", ...MCP_FINE_SCOPES, "offline_access"],
       skipConsent: true,
       requirePKCE: true,
       disabled: false,

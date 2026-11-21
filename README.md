@@ -1,21 +1,22 @@
-<a href="https://github.com/FlyCockpit/ws-model-proxy">
-  <picture>
-    <source media="(prefers-color-scheme: light)" srcset="https://shieldcn.dev/header/graph.svg?title=WS+Model+Proxy&subtitle=Self-hosted+OpenAI-compatible+model+routing+through+outbound+websockets&logo=websocket&size=wide&theme=cyan&mode=light&align=left">
-    <img src="https://shieldcn.dev/header/graph.svg?title=WS+Model+Proxy&subtitle=Self-hosted+OpenAI-compatible+model+routing+through+outbound+websockets&logo=websocket&size=wide&theme=cyan&mode=dark&align=left" alt="WS Model Proxy">
-  </picture>
-</a>
-
 <p align="center">
-  <a href="https://github.com/FlyCockpit/ws-model-proxy/stargazers"><img alt="GitHub stars" src="https://shieldcn.dev/github/stars/FlyCockpit/ws-model-proxy.svg?variant=secondary&mode=light&size=sm"></a>
-  <a href="https://github.com/FlyCockpit/ws-model-proxy/blob/master/LICENSE"><img alt="License" src="https://shieldcn.dev/github/license/FlyCockpit/ws-model-proxy.svg?variant=secondary&mode=light&size=sm"></a>
-  <a href="https://github.com/FlyCockpit/ws-model-proxy/commits/master"><img alt="Last commit" src="https://shieldcn.dev/github/last-commit/FlyCockpit/ws-model-proxy.svg?variant=secondary&mode=light&size=sm"></a>
-  <a href="apps/cli/Cargo.toml"><img alt="Rust CLI" src="https://shieldcn.dev/badge/cli-wsmp-ef7d00.svg?variant=secondary&mode=light&size=sm&logo=rust"></a>
+  <img src=".github/assets/logo.png" alt="" width="160" height="160">
 </p>
 
-# WS Model Proxy
+<h1 align="center">WS Model Proxy</h1>
 
-Self-hosted web app plus a node client (`wsmp`) that serves the models running on your own
-computers through one OpenAI-compatible API on a VPS, without router port forwarding.
+<p align="center">Self-hosted OpenAI-compatible model routing through outbound websockets.</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://shieldcn.dev/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://github.com/FlyCockpit/ws-model-proxy/releases"><img src="https://shieldcn.dev/github/FlyCockpit/ws-model-proxy/release.svg" alt="GitHub release"></a>
+  <a href="https://nodejs.org"><img src="https://shieldcn.dev/badge/Node.js-26-339933.svg?logo=nodedotjs" alt="Node.js 26"></a>
+  <a href="https://www.rust-lang.org/tools/install"><img src="https://shieldcn.dev/badge/Rust-1.89%2B-orange.svg?logo=rust" alt="Rust 1.89+"></a>
+  <a href="https://github.com/FlyCockpit"><img src="https://shieldcn.dev/badge/part%20of-FlyCockpit-0ea5e9.svg" alt="Part of FlyCockpit"></a>
+</p>
+
+WS Model Proxy (WMP) is a self-hosted web app plus a node client (`wsmp`) that serves the models running on your own computers through one OpenAI-compatible API on a VPS, without router port forwarding. It is for people who run inference servers at home or in a lab and want to call them, share them, or fall back to cloud providers from one endpoint.
+
+## Features
 
 - **Nodes** are computers running `wsmp`. Each keeps one outbound websocket to the server and
   gives it one trust level: **Full control** (the server may define and start runtimes, run
@@ -30,129 +31,45 @@ computers through one OpenAI-compatible API on a VPS, without router port forwar
   people who contribute theirs), and `owner/pool:external` may also use cloud **providers** under
   a monthly cap when local runtimes are busy. Pools can be shared by e-mail; a person you share
   with can use the pool, contribute their own runtimes to it, or both, and either side can stop.
-- **Agents** connect over MCP (OAuth or an agent token, Read-only or Full). With Full they can
-  define, start and stop runtimes and manage pools; raising a node's trust, provider accounts
-  and Forget stay with people.
+- **Agents** connect over MCP (OAuth or an agent token) with `read` and optional scopes for
+  pools, runtimes, node management, commands, files and model tests. People choose allowed
+  owned nodes and can edit access later; shared pools never grant control of another user's
+  nodes. Raising node trust, provider accounts and Forget stay with people.
+- **OpenAI-compatible API.** `/v1/*` with bearer API keys, including audio transcription and translation, and realtime.
+- **Node tools.** Browser terminals, node file tools and node self-update from the **Nodes** page.
 
 WMP keeps content-free usage and routing metadata, never chat content. Native Responses defaults
 to `store: false`; backend storage requires explicit caller opt-in. External embeddings need an
 exact vector-space contract. See [external fallback](docs/external-fallback.md).
 
-## Current Direction
+## How it works
 
-- Deploy one Docker web app on a VPS.
-- In local development and tests, the first signed-up user becomes admin automatically.
-- On a fresh production database with public signup disabled, only `ADMIN_EMAIL` may bootstrap the first admin.
-- Later users are regular users unless promoted by an admin.
-- Admins can enable or disable open signup. Admin invites still work when open signup is closed.
-- Auth works with email/password even when SMTP is not configured. When SMTP
-  is configured, email verification is required and the full verification UX
-  (safe callback URLs, resend, localized mail) is enabled.
-- A node logs in once with `wsmp login` and a one-time enrollment code from the **Nodes** page,
-  then holds an outbound websocket connection to the server.
-- One node can hold many runtimes, and a multi-node runtime spans several nodes.
-- Request media passes through the proxy. With upload storage configured, chat attachments are
-  kept only for the retention window an admin sets (Admin → Settings).
-
-## Runtime Shape
-
-- `apps/web`: React/TanStack Router web dashboard.
-- `apps/server`: Hono API/server entrypoint.
-- `apps/cli`: Rust workspace for `wsmp`, the node client.
-- `packages/api`: oRPC routers and procedures.
-- `packages/auth`: Better Auth configuration.
-- `packages/db`: Prisma schema/client.
-- `packages/env`: environment validation.
-- `packages/ui`: shared UI components.
-
-The runtime is intentionally reduced to the product web service, CLI, Postgres, Better Auth, i18n, and the PWA shell.
+One Docker service (Hono server, React web app, oRPC API, MCP server and websocket relay) runs on a VPS with Postgres. Each node runs `wsmp`, which logs in once with `wsmp login` and a one-time enrollment code from the **Nodes** page, then holds one outbound websocket to the server. The server routes `/v1/*` requests for a pool to a runtime on a connected node, and the node proxies them to its local inference server. One node can hold many runtimes, and a multi-node runtime spans several nodes. Request media passes through the proxy.
 
 An MCP (Model Context Protocol) server exposes dashboard operations to OAuth-authenticated clients. It is on by default; set `WMP_MCP_ENABLED=false` to close it — see [docs/mcp.md](docs/mcp.md).
 
-## Local Development
+## Quick start
 
-```sh
-pnpm install
-pnpm dev:services
-pnpm db:validate
-pnpm db:push
-pnpm dev
-```
+These steps take a fresh deployment to a first API call. The **Get started** page in the web app walks through the same steps.
 
-Use the repository `pnpm db:push` wrapper for every schema application. It
-runs Prisma and then installs the database constraints/backfills in
-`packages/db/prisma/schema-hardening.sql`; invoking raw `prisma db push` alone
-is unsupported.
+1. Deploy the web service and Postgres.
+2. With public signup disabled, configure `ADMIN_EMAIL` before first use, then create the first admin from that address.
+3. **Add a node**: on the **Nodes** page, choose **Add a node** and run the command it shows on
+   the computer that runs (or will run) your models. It installs `wsmp` through the server's
+   `/install.sh` and runs `wsmp login` with a one-time enrollment code, which asks for the trust
+   level and offers to install the per-user service. See [apps/cli/README.md](apps/cli/README.md).
+4. **Add a runtime**: on **Runtimes**, choose **New runtime**: a detected or always-on server
+   (an address on the node), or a preset (vLLM, SGLang, llama.cpp, Docker Compose, ...) that the server starts
+   for you.
+5. **Create a pool** from one of the runtime's served models. Its callable ID (`you/pool`) is the
+   model name clients send.
+6. **Create an API key** under **Access → API keys**, and try the pool on the **Test** page.
 
-### Environment files
+Model API clients call `/v1/*` with `Authorization: Bearer ...`. Cookie/session auth and permissive browser CORS are intentionally not supported for those bearer routes in v1.
 
-Root `.env.example` and `apps/web/.env.example` are **generated** from
-`scripts/lib/env-manifest.ts`. Do not hand-edit them.
+## Installation
 
-```sh
-pnpm env:sync          # rewrite the .env.example files from the manifest
-pnpm env:check         # CI gate: schema keys, manifest, and examples stay in sync
-pnpm generate:secrets  # interactive production env block (WMP vars only)
-pnpm docker:check-copy # CI gate: Dockerfile COPY lists match workspace members
-```
-
-`pnpm generate:secrets` prompts for deploy target, generates
-`BETTER_AUTH_SECRET`, and collects only variables that apply to this repo
-(no Redis, S3, CMS, VAPID, or worker knobs). Use `--all` to include rate-limit
-tuning comments, or `--out <file>` to write a gitignored file.
-
-Email is optional: without SMTP, signup/login work and verification is off.
-With SMTP configured, email verification is required and verification mail,
-password-reset mail (when used), and email 2FA OTP are available.
-
-Useful checks:
-
-```sh
-pnpm db:validate
-pnpm check-types
-pnpm --filter web check-types
-pnpm test
-pnpm env:check
-pnpm docker:check-copy
-pnpm policy:auth-session
-```
-
-## Publishing and Runtime
-
-Releases are created manually from the `master` branch with the root `Release` GitHub Actions workflow. A release publishes:
-
-- The app container to GHCR.
-- Cross-platform `wsmp` CLI archives to the GitHub Release, with a `sha256.sum` checksum file and signed build-provenance attestations (`gh attestation verify <archive> --repo FlyCockpit/ws-model-proxy`). The workflow refuses to publish when a Linux, macOS or Windows archive or its checksum is missing.
-- The generated Homebrew formula to `FlyCockpit/homebrew-tap`.
-
-Before the first release, create a protected `release` environment and add `HOMEBREW_TAP_TOKEN` as an environment secret. It must have `contents:write` access to `FlyCockpit/homebrew-tap` so the release workflow can update `Formula/wsmp.rb`.
-
-> **This server needs wsmp 0.4.0 or newer** (relay protocol 3.0). Image paste requires the web app and the node's CLI to be upgraded to 0.4.1. When upgrading from 0.3.x, upgrade every node together with the server; 0.3.x CLIs are refused at connect. You can also build from this repository: `cargo install --path apps/cli --bin wsmp`.
-
-The usual way to install the CLI on a node is the server's own installer, which the **Add a node** dialog runs for you:
-
-```sh
-curl -fsSL https://wsmp.example.com/install.sh | sh
-```
-
-From the 0.4.0 release on, it installs the release binary of the server's version into `~/.cargo/bin` (`$CARGO_HOME/bin` when set) on Linux x86_64 and ARM64 (glibc 2.34 or newer) and macOS, after checking its SHA-256 against the release's `sha256.sum` (it refuses to install on a mismatch or a missing checksum). Other systems build the release tag from source with cargo (Rust 1.88 or newer). `WMP_CLI_RELEASE_BASE_URL` points it at a mirror of the release assets; `WMP_CLI_SOURCE_REV` makes it build that commit from source instead. Windows nodes install with the release's PowerShell installer instead (see the [CLI README](apps/cli/README.md#windows)).
-
-Alternatively, after the first release, install the CLI with Homebrew (remove it before using `/install.sh`, or it can shadow `~/.cargo/bin/wsmp` on your `PATH`):
-
-```sh
-brew install flycockpit/tap/wsmp
-```
-
-Alternative CLI installers are attached to each GitHub Release:
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/FlyCockpit/ws-model-proxy/releases/latest/download/wsmp-installer.sh | sh
-```
-
-```powershell
-irm https://github.com/FlyCockpit/ws-model-proxy/releases/latest/download/wsmp-installer.ps1 | iex
-```
+### Server
 
 The app image is published as:
 
@@ -175,6 +92,70 @@ run multiple web replicas until they are moved to a shared durable limiter.
 No Redis, S3/R2 object storage, VAPID push service, CMS/MCP service, video
 pipeline, docs app, or separate queue process is required in v1.
 
+For a local production smoke test or a VPS behind a reverse proxy, use
+[`compose.yaml`](compose.yaml). Supply just `POSTGRES_PASSWORD` (random hex),
+`BETTER_AUTH_SECRET` (32+ random characters), `BETTER_AUTH_URL`,
+`TRUST_PROXY_HOPS` (your actual proxy count), and `ADMIN_EMAIL` in a private
+platform env file, then run:
+
+```sh
+docker compose --env-file /path/to/private.env up -d --build
+```
+
+The image sets `NODE_ENV=production`, builds both apps, and applies migrations.
+The web port binds to loopback on port 3000 (`WEB_PORT` overrides it); put your
+HTTPS reverse proxy in front. The server does not compress responses, so enable
+compression at the proxy (on Dokploy, add a Traefik `compress` middleware to the
+app's domain). On Dokploy, which listens on host port 3000 itself, remove the
+`ports:` mapping and attach a domain to service `app`, port 3000. The optional
+SMTP settings (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`)
+and `WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS` go in the same env file;
+`compose.yaml` passes them to the app (an empty value counts as unset; email is on
+once `SMTP_HOST` is set). Postgres has persistent storage and no published
+port. Public signup remains closed; register with `ADMIN_EMAIL` to bootstrap.
+No SMTP, backup settings, backup volume, or backup sidecar are required.
+Automatic backups default off and startup logs how to enable them. To opt in
+to pre-migration and daily backups with local storage, add the override:
+
+```sh
+docker compose --env-file /path/to/private.env -f compose.yaml -f compose.backups.yaml up -d --build
+```
+
+The override also passes `BACKUP_S3_*` from the env file to the app and the
+backup service for an off-site copy (see
+[`docs/backup-and-restore.md`](docs/backup-and-restore.md)).
+
+### Node client (`wsmp`)
+
+> **Server 1.0 needs wsmp 1.0 or newer** (relay protocol 4.0). It refuses 0.4.x CLIs with an upgrade message. Upgrade the server and every node together; see [UPGRADING.md](UPGRADING.md). You can also build from this repository: `cargo install --path apps/cli --bin wsmp`.
+
+The usual way to install the CLI on a node is the server's own installer, which the **Add a node** dialog runs for you:
+
+```sh
+curl -fsSL https://wsmp.example.com/install.sh | sh
+```
+
+It installs the release binary of the server's version into `~/.cargo/bin` (`$CARGO_HOME/bin` when set) on Linux x86_64 and ARM64 and macOS (on Linux the glibc build where glibc is 2.34 or newer, as in 0.4.x, so `*.local` mDNS server and model URLs keep resolving; the static musl build on Alpine and older glibc), after checking its SHA-256 against the release's `sha256.sum` (it refuses to install on a mismatch or a missing checksum). Other systems build the release tag from source with cargo (Rust 1.89 or newer). `WMP_CLI_RELEASE_BASE_URL` points it at a mirror of the release assets; `WMP_CLI_SOURCE_REV` makes it build that commit from source instead. Windows nodes install with the release's PowerShell installer instead (see the [CLI README](apps/cli/README.md#windows)).
+
+Alternatively, install the CLI with Homebrew (remove it before using `/install.sh`, or it can shadow `~/.cargo/bin/wsmp` on your `PATH`):
+
+```sh
+brew install flycockpit/tap/wsmp
+```
+
+Alternative CLI installers are attached to each GitHub Release:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/FlyCockpit/ws-model-proxy/releases/latest/download/wsmp-installer.sh | sh
+```
+
+```powershell
+irm https://github.com/FlyCockpit/ws-model-proxy/releases/latest/download/wsmp-installer.ps1 | iex
+```
+
+## Configuration
+
 Required production values:
 
 - `DATABASE_URL`: Postgres connection string.
@@ -182,12 +163,29 @@ Required production values:
 - `BETTER_AUTH_URL`: public HTTPS app URL.
 - `NODE_ENV=production`.
 - `TRUST_PROXY_HOPS`: how many reverse proxies sit in front of the app. Use `1` behind one reverse proxy (Dokploy/Traefik, Caddy, nginx), `0` when clients connect directly, and more for chained proxies (`2` for Cloudflare in front of your proxy). The client IP used for rate limits is the `X-Forwarded-For` entry this many hops from the right. Too high lets clients forge their IP; too low puts every client in one rate-limit bucket. The server refuses to start in production without it.
+  An appended port (`1.2.3.4:5678`, `[2001:db8::1]:5678`, as Azure Application Gateway adds by default) is stripped, so port appending can stay on.
 
 Optional values include SMTP settings (enables verification, password reset, and email 2FA delivery; see below), one rate-limit multiplier (`WMP_RATE_LIMIT_SCALE`, 0.1-100, scaling every built-in budget; the per-recipient email and failed-password caps are always on), and display/build values such as `VITE_APP_NAME`, `VITE_SERVER_URL`, and `BUILD_VERSION`. If `SIGNUP_ENABLED=false` on a fresh production database, set `ADMIN_EMAIL` to the sole operator address allowed to bootstrap its first admin. Case and surrounding whitespace are canonicalized before account creation. Prefer `pnpm generate:secrets` over hand-editing production env.
 
+- `WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS`: maximum expiry for newly created agent tokens, in days (integer 1–3650, default 90). Existing tokens are unchanged.
+- `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY`: allows agent tokens without expiry (default `true`), independently of the maximum for expiring tokens. Turning it off also refuses existing no-expiry tokens (they are kept, shown as blocked by policy, and work again once it is back on).
+
+### Accounts and admins
+
+- In local development and tests, the first signed-up user becomes admin automatically.
+- On a fresh production database with public signup disabled, only `ADMIN_EMAIL` may bootstrap the first admin.
+- Later users are regular users unless promoted by an admin.
+- Admins can enable or disable open signup. Admin invites still work when open signup is closed.
+- Auth works with email/password even when SMTP is not configured. When SMTP is configured, email verification is required and the full verification UX (safe callback URLs, resend, localized mail) is enabled.
+- With upload storage configured, chat attachments are kept only for the retention window an admin sets (Admin → Settings).
+
 SMTP is optional. When it is configured, new accounts must verify their email, and users can reset a forgotten password from the sign-in page ("Forgot password?"). The reset link expires after one hour, works once, and signs the account out everywhere. Without SMTP there is no self-service password recovery: a user who forgets their password can't reset it.
 
-Schema sync is handled by the server container entrypoint with `APPLY_SCHEMA=off|safe|dangerous`; keep it `off` for normal deploys and use `safe` for additive schema deploys. Each release's notes say which setting it needs; see [`docs/release-notes/`](docs/release-notes/).
+### Database migrations
+
+The schema ships as committed Prisma migrations (`packages/db/prisma/migrations/`). The server container applies pending ones on start (`MIGRATE_ON_START`, default `true`); a database that is already up to date costs one query. On a platform that runs a one-shot job before rollout, run the image with the command `migrate` and set `MIGRATE_ON_START=false` on the app. Two containers that both migrate serialize on a Postgres advisory lock. A migration that would break the release still running, a failed migration, or a database whose schema the runner cannot identify stops the start with the reason; nothing is applied. Automatic backups are off by default (`BACKUP_ENABLED=false`); migrations and readiness proceed without backup storage. To opt in, set `BACKUP_ENABLED=true` and mount a volume at `/backups` (and/or set `BACKUP_S3_*` for an S3-compatible bucket); the runner then takes a verified `pg_dump` before it migrates. A manual backup or provider snapshot before an upgrade is also available. Details, the recovery runbook and the backup/restore commands: [`docs/schema-migrations.md`](docs/schema-migrations.md), [`docs/backup-and-restore.md`](docs/backup-and-restore.md).
+
+`APPLY_SCHEMA` (0.4.x) is deprecated and still accepted during 1.x with a startup warning: `off` means `MIGRATE_ON_START=false`, `safe` means `true`, and `dangerous` is refused. A 0.4.3 database (created by the old schema push, without migration history) is adopted automatically on the first 1.0 start; see [`UPGRADING.md`](UPGRADING.md).
 
 ### Server requirements
 
@@ -195,24 +193,9 @@ Schema sync is handled by the server container entrypoint with `APPLY_SCHEMA=off
 - **Database sessions run in UTC.** Every Prisma connection the server opens (all application queries, including the sweepers) is forced to `TimeZone=UTC` on connect (`packages/db/src/client-factory.ts`), whatever the URL options, `PGOPTIONS`, or role/database/server defaults say. Raw-SQL clocks (`now()`, `clock_timestamp()`) are compared with `timestamp without time zone` columns written from JavaScript in UTC, so do not change `TimeZone` from application SQL.
 - **No transaction-mode poolers.** PgBouncer `pool_mode=transaction` (and other transaction-mode poolers) is unsupported: session settings such as `TimeZone` and the sweeper's `statement_timeout` must persist for the life of the connection. Connect directly to Postgres or use session pooling.
 
-Schema sync never queues behind live traffic for long. `prisma db push` runs with a 5s `lock_timeout` and is retried as a whole on a lock timeout or deadlock (`packages/db/scripts/push-schema.mjs`). Schema hardening locks every table it touches up front with `NOWAIT` and retries until it gets them all at once, and it is skipped entirely when neither `schema-hardening.sql` nor the database catalog changed since its last apply (`SCHEMA_HARDENING_FORCE=1` re-applies anyway).
+Migrations never queue behind live traffic for long. Each one runs in a single transaction with a 5 s `lock_timeout` and a 60 s `statement_timeout`; a failed attempt rolls back whole and the runner retries it once. The database invariants Prisma cannot express (`packages/db/prisma/schema-hardening.sql`: checks, triggers, fences) ship inside migrations; their up-front `LOCK TABLE … NOWAIT` is retried in place so it never waits on a lock while holding one.
 
-Getting started (the **Get started** page walks through the same steps):
-
-1. Deploy the web service and Postgres.
-2. With public signup disabled, configure `ADMIN_EMAIL` before first use, then create the first admin from that address.
-3. **Add a node**: on the **Nodes** page, choose **Add a node** and run the command it shows on
-   the computer that runs (or will run) your models. It installs `wsmp` through the server's
-   `/install.sh` and runs `wsmp login` with a one-time enrollment code, which asks for the trust
-   level and offers to install the per-user service. See [apps/cli/README.md](apps/cli/README.md).
-4. **Add a runtime**: on **Runtimes**, choose **New runtime**: a detected or always-on server
-   (an address on the node), or a preset (vLLM, SGLang, llama.cpp, Docker Compose, ...) that the server starts
-   for you.
-5. **Create a pool** from one of the runtime's served models. Its callable ID (`you/pool`) is the
-   model name clients send.
-6. **Create an API key** under **Access → API keys**, and try the pool on the **Test** page.
-
-Model API clients call `/v1/*` with `Authorization: Bearer ...`. Cookie/session auth and permissive browser CORS are intentionally not supported for those bearer routes in v1.
+## Usage
 
 ### OpenAI-compatible client API
 
@@ -257,6 +240,100 @@ members may take the request.
 4. **Is it in a pool?** Clients and `/v1/models` see pools, never runtimes: add the served model
    to a pool, and check that your API key covers that pool (**Access → API keys**).
 
+## Development
+
+```sh
+pnpm install
+pnpm dev:services
+pnpm db:worktree
+pnpm db:migrate:apply
+pnpm dev
+```
+
+`pnpm db:worktree` creates this checkout's local database (`ws-model-proxy`, or
+`ws_model_proxy_wt_<hash>` in a git worktree) and its `_shadow` database, and points `.env`
+at it. A schema change is: edit `packages/db/prisma/schema/`, `pnpm db:migrate <name>`
+(writes the SQL, applies nothing), review the SQL, `pnpm db:migrate:apply`, and commit both.
+`pnpm db:reset:local` recreates this checkout's local database from the migrations; a local
+database created by the 0.4.x `db:push` has no migration history, so reset it once.
+`prisma db push`, `prisma migrate dev` and `prisma migrate reset` are not used in this repo.
+See [`docs/schema-migrations.md`](docs/schema-migrations.md).
+
+### Environment files
+
+Root `.env.example` and `apps/web/.env.example` are **generated** from
+`scripts/lib/env-manifest.ts`. Do not hand-edit them.
+
+```sh
+pnpm env:sync          # rewrite the .env.example files from the manifest
+pnpm env:check         # CI gate: schema keys, manifest, and examples stay in sync
+pnpm generate:secrets  # interactive production env block (WMP vars only)
+pnpm docker:check-copy # CI gate: Dockerfile COPY lists match workspace members
+```
+
+`pnpm generate:secrets` prompts for deploy target, generates
+`BETTER_AUTH_SECRET`, and collects only variables that apply to this repo
+(no Redis, S3, CMS, VAPID, or worker knobs). Use `--all` to include rate-limit
+tuning comments, or `--out <file>` to write a gitignored file.
+
+Email is optional: without SMTP, signup/login work and verification is off.
+With SMTP configured, email verification is required and verification mail,
+password-reset mail (when used), and email 2FA OTP are available.
+
+Useful checks:
+
+```sh
+pnpm db:validate
+pnpm check-types
+pnpm --filter web check-types
+pnpm test
+pnpm env:check
+pnpm docker:check-copy
+pnpm policy:auth-session
+```
+
+### Repository layout
+
+- `apps/web`: React/TanStack Router web dashboard.
+- `apps/server`: Hono API/server entrypoint.
+- `apps/cli`: Rust workspace for `wsmp`, the node client.
+- `packages/api`: oRPC routers and procedures.
+- `packages/auth`: Better Auth configuration.
+- `packages/db`: Prisma schema/client.
+- `packages/env`: environment validation.
+- `packages/ui`: shared UI components.
+
+The runtime is intentionally reduced to the product web service, CLI, Postgres, Better Auth, i18n, and the PWA shell.
+
+### Releasing
+
+Releases are created manually from the `main` branch with the root `Release` GitHub Actions workflow. A release publishes:
+
+- The app container to GHCR.
+- Cross-platform `wsmp` CLI archives to the GitHub Release, with a `sha256.sum` checksum file and signed build-provenance attestations (`gh attestation verify <archive> --repo FlyCockpit/ws-model-proxy`). The workflow refuses to publish when a Linux, macOS or Windows archive or its checksum is missing.
+- The generated Homebrew formula to `FlyCockpit/homebrew-tap`.
+
+To release from a fork or new repository, create a protected `release` environment and add `HOMEBREW_TAP_TOKEN` as an environment secret. It must have `contents:write` access to `FlyCockpit/homebrew-tap` so the release workflow can update `Formula/wsmp.rb`.
+
+See [apps/cli/docs/releasing.md](apps/cli/docs/releasing.md) for the CLI release process.
+
+## Documentation
+
+- [MCP server](docs/mcp.md) and the generated [MCP tool coverage](docs/mcp-tool-coverage.md)
+- [External fallback](docs/external-fallback.md) (`:external` pools)
+- [Transcription interoperability](docs/transcription-interoperability.md)
+- [Release notes](docs/release-notes/)
+- [`wsmp` CLI README](apps/cli/README.md), with guides on [error handling](apps/cli/docs/error-handling.md), [file recovery](apps/cli/docs/file-recovery.md) and [terminal images](apps/cli/docs/terminal-images.md)
+- [Web routes](sitemap.md)
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md), and [AGENTS.md](AGENTS.md) for the repository rules.
+
+## Security
+
+Please report vulnerabilities privately. See [SECURITY.md](SECURITY.md).
+
 ## License
 
-MIT. See [LICENSE](./LICENSE).
+Copyright (c) 2026 FlyCockpit LLC. Licensed under the [MIT License](LICENSE).

@@ -28,8 +28,10 @@ const { SERVER_VERSION } = await import("./version.js");
 
 const RELEASE = "https://releases.example.com/wsmp/v0.4.3";
 const LINUX = "a".repeat(64);
+const MUSL = "c".repeat(64);
+const ARM_MUSL = "d".repeat(64);
 const WINDOWS = "b".repeat(64);
-const SUMS = `${"0".repeat(64)}  source.tar.gz\n${LINUX}  wsmp-x86_64-unknown-linux-gnu.tar.xz\r\n${WINDOWS.toUpperCase()} *wsmp-x86_64-pc-windows-msvc.zip\n\n`;
+const SUMS = `${"0".repeat(64)}  source.tar.gz\n${LINUX}  wsmp-x86_64-unknown-linux-gnu.tar.xz\r\n${MUSL} *wsmp-x86_64-unknown-linux-musl.tar.xz\n${ARM_MUSL}  wsmp-aarch64-unknown-linux-musl.tar.xz\n${WINDOWS.toUpperCase()} *wsmp-x86_64-pc-windows-msvc.zip\n\n`;
 
 function fetchStub(routes: Record<string, () => Response>) {
   const calls: string[] = [];
@@ -42,15 +44,32 @@ function fetchStub(routes: Record<string, () => Response>) {
 }
 
 describe("sha256.sum", () => {
-  it("lists every wsmp archive by target, lower-case", () => {
+  it("lists distinct GNU and musl archives by target, lower-case", () => {
     expect(parseSha256Sum(SUMS, RELEASE)).toEqual({
       "x86_64-unknown-linux-gnu": {
         url: `${RELEASE}/wsmp-x86_64-unknown-linux-gnu.tar.xz`,
         sha256: LINUX,
       },
+      "x86_64-unknown-linux-musl": {
+        url: `${RELEASE}/wsmp-x86_64-unknown-linux-musl.tar.xz`,
+        sha256: MUSL,
+      },
+      "aarch64-unknown-linux-musl": {
+        url: `${RELEASE}/wsmp-aarch64-unknown-linux-musl.tar.xz`,
+        sha256: ARM_MUSL,
+      },
       "x86_64-pc-windows-msvc": {
         url: `${RELEASE}/wsmp-x86_64-pc-windows-msvc.zip`,
         sha256: WINDOWS,
+      },
+    });
+  });
+
+  it("keeps GNU-only releases usable by released updaters", () => {
+    expect(parseSha256Sum(`${LINUX}  wsmp-x86_64-unknown-linux-gnu.tar.xz\n`, RELEASE)).toEqual({
+      "x86_64-unknown-linux-gnu": {
+        url: `${RELEASE}/wsmp-x86_64-unknown-linux-gnu.tar.xz`,
+        sha256: LINUX,
       },
     });
   });
@@ -82,8 +101,10 @@ describe("the release manifest", () => {
       sourceBuild: false,
     });
     expect(Object.keys(manifest.artifacts).sort()).toEqual([
+      "aarch64-unknown-linux-musl",
       "x86_64-pc-windows-msvc",
       "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
     ]);
   });
 

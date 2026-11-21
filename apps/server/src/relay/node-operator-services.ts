@@ -1,5 +1,5 @@
 /**
- * The relay side of `Context.services.nodeOperator` (lane D): node commands over relay 3.0
+ * The relay side of `Context.services.nodeOperator` (lane D): node commands over relay 4.0
  * (`exec.start` / `exec.poll` / `exec.cancel`, answered by `exec.started` / `exec.status` /
  * `exec.rejected`) and the browser terminal tickets.
  *
@@ -22,6 +22,7 @@ import {
   nodeCommandStateFromWire,
   settleNodeCommand,
 } from "@ws-model-proxy/api/lib/node-command-settle";
+import { liveNodeWhere } from "@ws-model-proxy/api/lib/node-liveness";
 import {
   NODE_COMMAND_MAX_MS,
   NODE_COMMAND_TAIL_MAX_BYTES,
@@ -434,13 +435,13 @@ export function createNodeOperatorServices(
       if (ended && tracked?.nodeId === node.nodeId && tracked.userId === node.userId) {
         tracker.forget(frame.commandId, node.nodeId);
       }
-      let answered = false;
       for (const waiter of [...(pollWaiters.get(frame.commandId) ?? [])]) {
-        if (!sameSession(node, waiter)) continue;
-        answered = true;
-        waiter.onStatus(frame);
+        if (sameSession(node, waiter)) waiter.onStatus(frame);
       }
-      if (!ended || answered) return;
+      if (!ended) return;
+      // Recorded here too, in the relay's own context, even when a poll answered: that poll's
+      // request may already be aborted (a revoked or narrowed credential ends its calls) and
+      // its database fence would refuse the write. Settling is exactly-once either way.
       try {
         await recordUnpolledEnd(node, frame);
       } catch (error) {
@@ -467,6 +468,33 @@ export function createNodeOperatorServices(
       }
     },
   };
+
+  tracker.setCommandReconciler(async (row) => {
+    // Past the command deadline and recovery grace, a missing node means its outcome is lost.
+    // A reachable node may still know the final result, even after an unsolicited write failed.
+    const session = relay.nodeSession(row.nodeId);
+    if (!session || session.userId !== row.userId) {
+      // A different replica may own the session. Its live node remains retryable here.
+      const liveNode = await prisma.node.findFirst({
+        where: { id: row.nodeId, userId: row.userId, ...liveNodeWhere(new Date()) },
+        select: { id: true },
+      });
+      if (liveNode) return;
+      await settleNodeCommand(row, "UNKNOWN", undefined, undefined);
+      return;
+    }
+    const live = await pollCommand({
+      userId: row.userId,
+      nodeId: row.nodeId,
+      commandId: row.id,
+      endsBy: row.endsBy,
+      waitMs: 0,
+      cancel: false,
+    });
+    // No answer or still running: retry on a later sweep without inventing an outcome.
+    if (!live || live.state === "RUNNING") return;
+    await settleNodeCommand(row, live.state, live.exitCode, commandFinishedAt(row.startedAt, live));
+  });
 
   return { services: { openTerminalTicket, startCommand, pollCommand }, handlers };
 }

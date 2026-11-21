@@ -9,7 +9,7 @@ import prisma from "@ws-model-proxy/db";
 import type { Context } from "../context";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { nodesContract as c } from "../contracts/nodes";
-import { assertMayWrite, callerActor } from "../lib/caller-actor";
+import { assertAgentNode, assertAgentScope, callerActor } from "../lib/caller-actor";
 import { nodeIsLive } from "../lib/node-liveness";
 import type { NodeSecretWriteResult } from "../lib/node-relay-services";
 import { notFound, refuseAbout } from "../lib/refuse";
@@ -17,7 +17,8 @@ import { nodeFeaturesSchema } from "../lib/runtime-spec";
 import { isFullControl } from "./trust";
 
 async function secretTarget(context: SignedInContext, nodeId: string) {
-  assertMayWrite(context.auth);
+  assertAgentScope(context.auth, "nodes:manage");
+  assertAgentNode(context.auth, nodeId);
   const userId = context.session.user.id;
   const node = await prisma.node.findFirst({
     where: { id: nodeId, userId },
@@ -95,7 +96,8 @@ async function recordSecretName(
     where: { id: nodeId, userId },
     select: { features: true },
   });
-  const features = nodeFeaturesSchema.safeParse(row?.features);
+  // A stored pre-release report can have retired top-level fields; drop them on write.
+  const features = nodeFeaturesSchema.strip().safeParse(row?.features);
   if (!features.success) {
     // The node's next `node.state` still lists the name. Node id and reason only: never the
     // stored features or a value.

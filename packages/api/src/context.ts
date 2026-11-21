@@ -1,5 +1,6 @@
 import { auth, type Session } from "@ws-model-proxy/auth";
 import { cookieSessionHeaders } from "@ws-model-proxy/auth/cookie-session";
+import type { AgentAccessNarrowedEvent } from "@ws-model-proxy/auth/mcp-grant-access";
 import type { Context as HonoContext } from "hono";
 import type { z } from "zod";
 import type { AnonymousAuth, CallerAuth } from "./contracts/auth-context";
@@ -65,11 +66,10 @@ export type ContextServices = {
    */
   onAccessRevoked?: (event: AccessRevokedEvent) => Promise<void>;
   /**
-   * A grant was lowered from Full to Read-only and committed. Every later lookup already reads
-   * READ; the server ends the work its Full level started (in-flight write tool calls, node
-   * commands and file ops, queued commands).
+   * A credential's scopes or node allowlist narrowed and committed. End in-flight tool calls
+   * and any node work that the new live access no longer permits.
    */
-  onAccessLevelLowered?: (event: AccessLevelLoweredEvent) => Promise<void>;
+  onAgentAccessNarrowed?: (event: AgentAccessNarrowedEvent) => Promise<void>;
   /** Charges one public invite lookup to the caller's address; false: over its budget. */
   limitInviteLookup?: () => Promise<boolean>;
   /** Charges one signed-in invite acceptance (`auth.acceptInvite`) to the user; false: over. */
@@ -77,8 +77,8 @@ export type ContextServices = {
   /** Terminals and node commands: the relay surfaces these procedures need. */
   nodeOperator?: NodeOperatorServices;
   /**
-   * Node file tools (`nodes.files.*`) over relay 3.0. The procedure has checked the caller (a
-   * FULL agent credential), the node's owner and its stored trust; the server admits again
+   * Node file tools (`nodes.files.*`) over relay 4.0. The procedure has checked the caller (a
+   * agent credential with files scope), the node's owner and its stored trust; the server admits again
    * (live credential, owner, trust, live session and its owner, file roots) before sending.
    */
   nodeFiles?: NodeFileServices;
@@ -141,8 +141,8 @@ export type AccessRevokedEvent =
   | { kind: "oauth_grant"; userId: string; grantId: string; clientId: string }
   | { kind: "share"; ownerUserId: string; granteeUserId: string; poolId: string };
 
-/** A grant's level went from Full to Read-only and committed (`access.oauthGrants.setLevel`). */
-export type AccessLevelLoweredEvent = { kind: "oauth_grant"; userId: string; grantId: string };
+/** A committed scope or node restriction change (shared with the auth consent hook). */
+export type { AgentAccessNarrowedEvent } from "@ws-model-proxy/auth/mcp-grant-access";
 
 /** A node command's live status from the node (`exec.status`); null output when offline. */
 export type NodeCommandLiveStatus = {
@@ -218,7 +218,7 @@ export type NodeOperatorServices = {
   }): Promise<{ ticket: string; terminalId: string; expiresAt: Date }>;
   /**
    * `exec.start`: start a command; resolves once the node answered `exec.started`. When the node
-   * refused it, the error's `nodeReason` is the node's reason (`bad_command`, `shell_unavailable`).
+   * refused it, the error's `nodeReason` is the node's reason (`bad_command`, `bad_cwd`, `shell_unavailable`).
    */
   startCommand(args: {
     userId: string;
@@ -254,7 +254,7 @@ export type NodeOperatorServices = {
   }): Promise<NodeCommandLiveStatus | null>;
 };
 
-/** A relay 3.0 file op (`apps/server/src/relay/file-protocol.ts`). */
+/** A relay 4.0 file op (`apps/server/src/relay/file-protocol.ts`). */
 export type NodeFileOp =
   | "read"
   | "stat"

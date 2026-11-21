@@ -17,6 +17,7 @@ import {
 } from "./mcp-config";
 import { mcpConsentLevel } from "./mcp-consent-level";
 import { createMcpPostLoginOptions, issueMcpGrantClaims } from "./mcp-grant";
+import { mcpScopePolicy } from "./mcp-scope-policy";
 
 /**
  * `WMP_MCP_ENABLED` kill switch for the Better Auth 1.7 MCP plugin set.
@@ -154,7 +155,10 @@ export function resolveMcpPlugins({ enabled, baseUrl }: { enabled: boolean; base
         },
       ],
     }),
-    // The consent page's Read-only/Full choice, recorded on the grant the approval's code
+    // Verify signed OAuth queries in the provider first, then reject removed scopes
+    // before consent/continuation can persist approvals or issue authorization codes.
+    mcpScopePolicy(),
+    // The consent page's scopes and node restrictions, recorded on the grant the approval's code
     // exchanges into (mcp-consent-level.ts). After mcp(): the provider's before hook verifies
     // the signed oauth_query first.
     mcpConsentLevel({ secret: env.BETTER_AUTH_SECRET }),

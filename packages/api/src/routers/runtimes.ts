@@ -6,7 +6,14 @@ import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { agentRulesApply } from "../contracts/auth-context";
 import type { RefusalReason } from "../contracts/refusals";
 import { runtimesContract as c, runtimeSlugSchema } from "../contracts/runtimes";
-import { callerActor } from "../lib/caller-actor";
+import { hiddenNodeIds, visibleInstancesWhere } from "../lib/agent-hidden-nodes";
+import {
+  agentNodeFilter,
+  assertAgentInstanceNodes,
+  assertAgentRuntimeNodes,
+  nodeVisibleToAgent,
+} from "../lib/agent-node-access";
+import { assertAgentNode, assertAgentScope, callerActor } from "../lib/caller-actor";
 import { canonicalJson } from "../lib/canonical-json";
 import {
   graphDelete,
@@ -100,20 +107,41 @@ async function previousHashesOf(rows: RuntimeSummaryRow[]): Promise<Map<string, 
   return result;
 }
 
-async function summariesOf(rows: RuntimeSummaryRow[]) {
+async function summariesOf(rows: RuntimeSummaryRow[], auth?: SignedInContext["auth"]) {
   const previous = await previousHashesOf(rows);
   return rows
     .filter((row) => row.CurrentVersion !== null)
-    .map((row) => runtimeSummary(row, previous.get(row.id) ?? null));
+    .map((row) => {
+      const summary = runtimeSummary(row, previous.get(row.id) ?? null);
+      if (!auth) return summary;
+      return {
+        ...summary,
+        nodeId: summary.nodeId && !nodeVisibleToAgent(auth, summary.nodeId) ? null : summary.nodeId,
+        nodes: summary.nodes.filter((node) => nodeVisibleToAgent(auth, node.id)),
+      };
+    });
 }
 
-async function summaryOf(userId: string, runtimeId: string) {
+function summaryInclude(hidden: readonly string[]) {
+  return {
+    ...RUNTIME_SUMMARY_INCLUDE,
+    Instances: { ...RUNTIME_SUMMARY_INCLUDE.Instances, where: visibleInstancesWhere(hidden) },
+  };
+}
+
+async function summaryOf(
+  userId: string,
+  runtimeId: string,
+  auth?: SignedInContext["auth"],
+  hidden?: readonly string[],
+) {
+  const excluded = hidden ?? (auth ? await hiddenNodeIds(prisma, auth) : []);
   const row = await prisma.runtime.findFirst({
     where: { id: runtimeId, userId },
-    include: RUNTIME_SUMMARY_INCLUDE,
+    include: summaryInclude(excluded),
   });
   if (!row) throw notFound("That runtime does not exist.");
-  const [summary] = await summariesOf([row]);
+  const [summary] = await summariesOf([row], auth);
   if (!summary) throw notFound("That runtime does not exist.");
   return summary;
 }
@@ -130,6 +158,7 @@ function assertAgentMayUseNode(
   context: SignedInContext,
   node: { id: string; trust: "RELAY" | "FULL" | null; trustLowerRequestedAt: Date | null },
 ): void {
+  assertAgentNode(context.auth, node.id);
   if (agentRulesApply(context.auth) && effectiveTrust(node) !== "FULL")
     throw refuseAbout(
       "trust_relay",
@@ -157,6 +186,7 @@ type ForkSource = { ownerUserId: string; stillShared: (tx: Tx) => Promise<void> 
 /** Creates a runtime with version 1, its served models, and an always-on runtime's instance. */
 async function createRuntime(context: SignedInContext, input: CreateInput, source?: ForkSource) {
   const userId = userIdOf(context);
+  assertAgentScope(context.auth, "runtimes");
   const actor = callerActor(context.auth, userId);
   assertKindMatchesSpec(input.kind, input.spec);
   if ((input.kind === "ALWAYS_ON") !== (input.nodeId !== undefined))
@@ -169,7 +199,10 @@ async function createRuntime(context: SignedInContext, input: CreateInput, sourc
       await source?.stillShared(tx);
       // Under the owner fence: a trust change (a person's lowering, the node's report) waits
       // for it, so the node is not lowered between this check and the write.
-      if (input.nodeId) assertAgentMayUseNode(context, await ownedNode(userId, input.nodeId, tx));
+      if (input.nodeId) {
+        assertAgentNode(context.auth, input.nodeId);
+        assertAgentMayUseNode(context, await ownedNode(userId, input.nodeId, tx));
+      }
       const runtime = await tx.runtime.create({
         data: {
           userId,
@@ -362,17 +395,19 @@ async function markStoppedConflict(
 
 export const runtimesRouter = {
   list: contractProcedure(c.list).handler(async ({ context }) => {
+    const hidden = await hiddenNodeIds(prisma, context.auth);
     const rows = await prisma.runtime.findMany({
       where: { userId: userIdOf(context) },
-      include: RUNTIME_SUMMARY_INCLUDE,
+      include: summaryInclude(hidden),
       orderBy: { createdAt: "asc" },
     });
-    return { runtimes: await summariesOf(rows) };
+    return { runtimes: await summariesOf(rows, context.auth) };
   }),
 
   get: contractProcedure(c.get).handler(async ({ input, context }) => {
     const userId = userIdOf(context);
-    const summary = await summaryOf(userId, input.runtimeId);
+    const hidden = await hiddenNodeIds(prisma, context.auth);
+    const summary = await summaryOf(userId, input.runtimeId, context.auth, hidden);
     const [current, models, instances, shares, nodes, profile] = await Promise.all([
       prisma.runtimeVersion.findFirstOrThrow({
         where: { id: summary.currentVersion.id },
@@ -396,6 +431,14 @@ export const runtimesRouter = {
         where: {
           runtimeId: input.runtimeId,
           userId,
+          ...visibleInstancesWhere(hidden),
+          // Preserve the existing agent ownership check, including for a null allowlist.
+          ...(context.auth.kind === "agent_token" || context.auth.kind === "oauth_access_token"
+            ? {
+                Ranks: { every: { OR: [{ nodeId: null }, { Node: { userId } }] } },
+                Reservations: { every: { OR: [{ nodeId: null }, { Node: { userId } }] } },
+              }
+            : {}),
           // A stopped instance is listed while it still holds resources (a rank marked
           // stopped whose stop is not proven yet), so its reserved state and last stop check
           // stay visible.
@@ -412,7 +455,11 @@ export const runtimesRouter = {
         select: { id: true, Grantee: { select: { email: true } } },
       }),
       prisma.node.findMany({
-        where: { userId, OR: [{ trust: "RELAY" }, { trustLowerRequestedAt: { not: null } }] },
+        where: {
+          userId,
+          ...agentNodeFilter(context.auth),
+          OR: [{ trust: "RELAY" }, { trustLowerRequestedAt: { not: null } }],
+        },
         select: { id: true, heldDefinitions: true },
       }),
       prisma.runtimeRequestProfile.findFirst({
@@ -444,34 +491,38 @@ export const runtimesRouter = {
       where: { userId },
       select: { id: true, slug: true, refusedDefinitions: true },
     });
-    const refusedOn = refusing.flatMap((node) => {
-      const refused = Array.isArray(node.refusedDefinitions) ? node.refusedDefinitions : [];
-      return refused.flatMap((entry) => {
-        const record = jsonObject(entry);
-        return record.runtimeId === input.runtimeId && typeof record.versionId === "string"
-          ? [
-              {
-                nodeId: node.id,
-                nodeSlug: node.slug,
-                versionId: record.versionId,
-                reason: typeof record.reason === "string" ? record.reason : null,
-                detail: typeof record.detail === "string" ? record.detail : null,
-              },
-            ]
-          : [];
+    const refusedOn = refusing
+      .filter((node) => nodeVisibleToAgent(context.auth, node.id))
+      .flatMap((node) => {
+        const refused = Array.isArray(node.refusedDefinitions) ? node.refusedDefinitions : [];
+        return refused.flatMap((entry) => {
+          const record = jsonObject(entry);
+          return record.runtimeId === input.runtimeId && typeof record.versionId === "string"
+            ? [
+                {
+                  nodeId: node.id,
+                  nodeSlug: node.slug,
+                  versionId: record.versionId,
+                  reason: typeof record.reason === "string" ? record.reason : null,
+                  detail: typeof record.detail === "string" ? record.detail : null,
+                },
+              ]
+            : [];
+        });
       });
-    });
-    const frozenOn = nodes.flatMap((node) => {
-      const held = Array.isArray(node.heldDefinitions) ? node.heldDefinitions : [];
-      return held.flatMap((entry) => {
-        const record = jsonObject(entry);
-        return record.runtimeId === input.runtimeId &&
-          typeof record.versionId === "string" &&
-          record.versionId !== current.id
-          ? [{ nodeId: node.id, versionId: record.versionId }]
-          : [];
+    const frozenOn = nodes
+      .filter((node) => nodeVisibleToAgent(context.auth, node.id))
+      .flatMap((node) => {
+        const held = Array.isArray(node.heldDefinitions) ? node.heldDefinitions : [];
+        return held.flatMap((entry) => {
+          const record = jsonObject(entry);
+          return record.runtimeId === input.runtimeId &&
+            typeof record.versionId === "string" &&
+            record.versionId !== current.id
+            ? [{ nodeId: node.id, versionId: record.versionId }]
+            : [];
+        });
       });
-    });
     return {
       ...summary,
       current: versionDetail(current, previous, factsFrom),
@@ -569,6 +620,7 @@ export const runtimesRouter = {
 
   update: contractProcedure(c.update).handler(async ({ input, context }) => {
     const userId = userIdOf(context);
+    assertAgentScope(context.auth, "runtimes");
     const actor = callerActor(context.auth, userId);
     const runtime = await prisma.runtime.findFirst({
       where: { id: input.runtimeId, userId },
@@ -576,11 +628,33 @@ export const runtimesRouter = {
         id: true,
         kind: true,
         origin: true,
-        Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
+        Node: { select: { id: true, userId: true, trust: true, trustLowerRequestedAt: true } },
         CurrentVersion: { select: VERSION_SELECT },
+        Instances: {
+          where: {
+            OR: [{ desiredState: "RUNNING" }, { Ranks: { some: { claim: { not: "RELEASED" } } } }],
+          },
+          select: { id: true, ...OCCUPANCY_SELECT },
+        },
       },
     });
     if (!runtime?.CurrentVersion) throw notFound("That runtime does not exist.");
+    if (runtime.Node) {
+      assertAgentNode(context.auth, runtime.Node.id, "That runtime does not exist.");
+      if (
+        (context.auth.kind === "agent_token" || context.auth.kind === "oauth_access_token") &&
+        runtime.Node.userId !== userId
+      )
+        throw notFound("That runtime does not exist.");
+    }
+    for (const instance of runtime.Instances ?? [])
+      await assertAgentInstanceNodes(
+        prisma,
+        context.auth,
+        userId,
+        instance,
+        "That runtime does not exist.",
+      );
     const current = runtime.CurrentVersion;
     const spec = input.spec ?? storedSpec(current.spec);
     assertKindMatchesSpec(runtime.kind, spec);
@@ -612,6 +686,7 @@ export const runtimesRouter = {
     // Everything below is derived from `current`, read before the fence: under it, `current`
     // must still be the runtime's version (another update may have landed meanwhile).
     const assertStillCurrent = async (tx: Tx) => {
+      await assertAgentRuntimeNodes(tx, context.auth, userId, runtime.id);
       const still = await tx.runtime.count({
         where: { id: runtime.id, userId, currentVersionId: current.id },
       });
@@ -711,6 +786,14 @@ export const runtimesRouter = {
             Reservations: OCCUPANCY_SELECT.Reservations,
           },
         });
+        for (const instance of instances)
+          await assertAgentInstanceNodes(
+            tx,
+            context.auth,
+            userId,
+            instance,
+            "That runtime does not exist.",
+          );
         // Restarted as `runtime_start` with the instance id restarts it (without stopping
         // others): placed again on its nodes by the planner, its capacity, definition slots and
         // labels included, so it may take other resources, ports or reservations.
@@ -774,7 +857,16 @@ export const runtimesRouter = {
         const starts: PlannedStartWrite[] = [];
         const blockedBy: string[][] = [];
         if (candidates.length > 0 && spec.launch) {
-          const planner = new PlacementPlanner(await loadPlacementContext(tx, { userId, agent }));
+          const planner = new PlacementPlanner(
+            await loadPlacementContext(tx, {
+              userId,
+              agent,
+              nodeIds:
+                context.auth.kind === "agent_token" || context.auth.kind === "oauth_access_token"
+                  ? context.auth.access.nodeIds
+                  : null,
+            }),
+          );
           for (const instance of candidates) {
             const reservationNodeIds: Array<string | null> = [];
             for (const reservation of currentReservations(instance.Reservations))
@@ -864,17 +956,21 @@ export const runtimesRouter = {
 
   delete: contractProcedure(c.delete).handler(async ({ input, context }) => {
     const userId = userIdOf(context);
+    assertAgentScope(context.auth, "runtimes");
     callerActor(context.auth, userId);
     const runtime = await prisma.runtime.findFirst({
       where: { id: input.runtimeId, userId },
-      select: { id: true },
+      select: { id: true, nodeId: true },
     });
     if (!runtime) throw notFound("That runtime does not exist.");
+    if (runtime.nodeId)
+      assertAgentNode(context.auth, runtime.nodeId, "That runtime does not exist.");
     let members: Array<{ id: string }> = [];
     try {
       members = await graphDelete({ userId, runtimeIds: [runtime.id] }, async (tx) => {
         // Decided under the fences (the owner's, and every instance's capacity fence): a start
         // committed before them is seen here, and none commits until this delete does.
+        await assertAgentRuntimeNodes(tx, context.auth, userId, runtime.id);
         const busy = await tx.runtimeInstance.count({
           where: {
             runtimeId: runtime.id,
@@ -925,7 +1021,7 @@ export const runtimesRouter = {
   steps: runtimeSteps,
   instances: {
     /**
-     * A person (or a Full agent, on Full-control nodes: recovery like deleting an offline
+     * A person (or an agent with runtimes scope, on Full-control nodes: recovery like deleting an offline
      * node) marks stopped an instance whose stop cannot be proven (node gone or unable to prove it): the rank's claim
      * becomes HELD_UNKNOWN. Placement keeps counting its resources and port until a status
      * probe proves the stop; the instance settles STOPPED (spec §3.5). Audited as a MARK_STOPPED
@@ -933,6 +1029,7 @@ export const runtimesRouter = {
      */
     markStopped: contractProcedure(c.instances.markStopped).handler(async ({ input, context }) => {
       const userId = userIdOf(context);
+      assertAgentScope(context.auth, "runtimes");
       const actor = callerActor(context.auth, userId);
       const agent = agentRulesApply(context.auth);
       if (agent && input.confirm !== "MARK_STOPPED")
@@ -956,6 +1053,7 @@ export const runtimesRouter = {
             },
           });
           if (!instance) throw notFound("That instance does not exist.");
+          await assertAgentInstanceNodes(tx, context.auth, userId, instance);
           const ranks = instance.Ranks.filter(
             (rank) =>
               rank.claim === "HELD" &&
@@ -1056,7 +1154,16 @@ export const runtimesRouter = {
     setCapabilities: contractProcedure(c.models.setCapabilities).handler(
       async ({ input, context }) => {
         const userId = userIdOf(context);
+        assertAgentScope(context.auth, "runtimes");
         callerActor(context.auth, userId);
+        if (context.auth.kind === "agent_token" || context.auth.kind === "oauth_access_token") {
+          const model = await prisma.runtimeModel.findFirst({
+            where: { id: input.runtimeModelId, userId },
+            select: { runtimeId: true },
+          });
+          if (!model) throw notFound("That served model does not exist.");
+          await assertAgentRuntimeNodes(prisma, context.auth, userId, model.runtimeId);
+        }
         const updated = await prisma.runtimeModel.updateMany({
           where: { id: input.runtimeModelId, userId },
           data: {

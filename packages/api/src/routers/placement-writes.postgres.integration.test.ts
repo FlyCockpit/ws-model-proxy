@@ -1,6 +1,7 @@
 import { createRouterClient } from "@orpc/server";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { retryAnswers } from "../integration/retry-answers";
+import { TEST_NODE_FEATURES } from "../lib/node-features-test-fixture";
 import type { RuntimeSpec } from "../lib/runtime-spec";
 import { CALLERS, contextFor } from "./lane-c-test-helpers";
 
@@ -76,6 +77,7 @@ integration("placement writes on PostgreSQL", () => {
             connection: "ONLINE",
             trust: "FULL",
             declaredResources: { kind: "unified", memoryGb: 66 },
+            features: TEST_NODE_FEATURES,
             portStart: 30000,
             portEnd: 30010,
           },

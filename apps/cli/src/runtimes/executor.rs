@@ -1,5 +1,4 @@
-//! Durable runtime-instance execution (ported from the 0.3 deployment
-//! executor). No model output is captured or persisted.
+//! Durable runtime-instance execution. No model output is captured or persisted.
 //!
 //! One record per instance rank, in its own file under
 //! `<state>/runtime-instances/`, so several runtimes run side by side. The
@@ -60,8 +59,8 @@ pub struct Job {
     pub stop_command: String,
     pub status_command: Option<String>,
     pub health_command: Option<String>,
-    /// The shell every command above runs in (argv commands were rendered for it). Records
-    /// written before it existed ran `sh`.
+    /// The shell every command above runs in (argv commands were rendered for it).
+    /// Omitted when it is the default, `sh`.
     #[serde(default = "sh", skip_serializing_if = "is_sh")]
     pub shell: CommandShell,
     /// Each argv command's arguments, stored beside its script (`command_argv` is `command`'s):
@@ -353,16 +352,13 @@ struct Record {
     completed: BTreeMap<String, Completed>,
     observed_step: String,
     observed_hash: String,
-    #[serde(default)]
     consecutive_health_failures: u32,
-    #[serde(default)]
     consecutive_health_successes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stopped_at: Option<u64>,
     /// A step of this run ran outside the node's units (`external`: a person ran it in an
     /// operator terminal; `self-detached`: no units on this platform). Kept after the stop
     /// clears `invocations`, so a later check still asks its status command.
-    #[serde(default)]
     outside_units: bool,
 }
 

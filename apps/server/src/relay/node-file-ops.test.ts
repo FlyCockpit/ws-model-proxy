@@ -7,6 +7,9 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
+// node-access reads the no-expiry agent token flag (on, as the default deployment).
+vi.mock("@ws-model-proxy/env/server", () => ({ env: { WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: true } }));
+
 const relay = vi.hoisted(() => ({
   getLiveNodeState: vi.fn(),
   dispatchFileOp: vi.fn(),
@@ -25,7 +28,7 @@ const { resetNodeAgentAccessForTests } = await import("./node-access.js");
 const db = prisma as unknown as {
   node: { findUnique: MockInstance };
   agentToken: { findFirst: MockInstance };
-  mcpGrant: { findFirst: MockInstance };
+  mcpGrant: { findFirst: MockInstance; findUnique: MockInstance };
   user: { findUnique: MockInstance };
 };
 
@@ -73,6 +76,7 @@ function lastAudit(): Record<string, unknown> {
 describe("node file ops (server side)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.agentToken.findFirst.mockClear();
     ops.resetFileOpsForTests();
     resetNodeAgentAccessForTests();
     db.node.findUnique.mockResolvedValue({
@@ -83,8 +87,22 @@ describe("node file ops (server side)", () => {
       trustLowerRequestedAt: null,
       rejectedProtocolVersion: null,
     });
-    db.agentToken.findFirst.mockResolvedValue({ name: "agent", expiresAt: null });
-    db.mcpGrant.findFirst.mockResolvedValue({ clientId: "client" });
+    db.agentToken.findFirst.mockResolvedValue({
+      name: "agent",
+      expiresAt: null,
+      grantId: "grant-1",
+    });
+    db.mcpGrant.findFirst.mockResolvedValue({
+      scopes: ["READ", "COMMANDS", "FILES"],
+      allNodes: true,
+      Nodes: [],
+    });
+    db.mcpGrant.findFirst.mockResolvedValue({
+      clientId: "client",
+      scopes: ["READ", "COMMANDS", "FILES"],
+      allNodes: true,
+      Nodes: [],
+    });
     db.user.findUnique.mockResolvedValue({
       banned: false,
       banExpires: null,
@@ -243,6 +261,36 @@ describe("node file ops (server side)", () => {
     expect(relay.dispatchFileOp).not.toHaveBeenCalled();
   });
 
+  it("keeps file work when pools or commands is removed, then ends it when files is removed", async () => {
+    const pending = ops.runFileOp({ ...base, op: "read", args: { path: `${ROOT}/a` } });
+    await dispatched();
+    ops.cancelFileOpsForNarrowedCredential(base.tokenId, {
+      scopes: ["read", "files"],
+      nodeIds: null,
+    });
+    expect(relay.dispatchFileCancel).not.toHaveBeenCalled();
+    ops.cancelFileOpsForNarrowedCredential(base.tokenId, { scopes: ["read"], nodeIds: null });
+    await expect(pending).resolves.toMatchObject({ ok: false, code: "token_inactive" });
+    expect(relay.dispatchFileCancel).toHaveBeenCalledOnce();
+  });
+
+  it("ends only file work on a removed node", async () => {
+    const pending = ops.runFileOp({ ...base, op: "read", args: { path: `${ROOT}/a` } });
+    await dispatched();
+    ops.cancelFileOpsForNarrowedCredential(base.tokenId, {
+      scopes: ["read", "files"],
+      nodeIds: [base.nodeId],
+    });
+    expect(relay.dispatchFileCancel).not.toHaveBeenCalled();
+    ops.cancelFileOpsForNarrowedCredential("unrelated-token", { scopes: ["read"], nodeIds: [] });
+    expect(relay.dispatchFileCancel).not.toHaveBeenCalled();
+    ops.cancelFileOpsForNarrowedCredential(base.tokenId, {
+      scopes: ["read", "files"],
+      nodeIds: ["keep-node"],
+    });
+    await expect(pending).resolves.toMatchObject({ ok: false, code: "token_inactive" });
+  });
+
   it("admits an OAuth grant by its grant row and audits the grant", async () => {
     const pending = ops.runFileOp({
       ...base,
@@ -254,7 +302,7 @@ describe("node file ops (server side)", () => {
     const { op } = await dispatched();
     expect(db.mcpGrant.findFirst).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: "grant-1", userId: "user-1", level: "FULL", revokedAt: null },
+        where: { id: "grant-1", userId: "user-1", revokedAt: null },
       }),
     );
     expect(db.agentToken.findFirst).not.toHaveBeenCalled();

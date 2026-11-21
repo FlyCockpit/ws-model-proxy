@@ -5,12 +5,14 @@ const db = vi.hoisted(() => ({
   claimReleaseRequest: { updateMany: vi.fn(async () => ({ count: 1 })) },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
-const files = vi.hoisted(() => ({ cancelFileOpsForToken: vi.fn() }));
+const files = vi.hoisted(() => ({
+  cancelFileOpsForToken: vi.fn(),
+  cancelFileOpsForNarrowedCredential: vi.fn(),
+}));
 vi.mock("./relay/node-file-ops.js", () => files);
 
-const { endAgentWork, handleAccessLevelLowered, handleAccessRevoked } = await import(
-  "./access-revocation.js"
-);
+const { endAgentWork, endNarrowedAgentWork, handleAgentAccessNarrowed, handleAccessRevoked } =
+  await import("./access-revocation.js");
 
 function deps() {
   return {
@@ -94,30 +96,56 @@ describe("endAgentWork", () => {
   });
 });
 
-describe("handleAccessLevelLowered", () => {
-  it("ends only the grant's Full work: write tool calls, node work, queued commands", async () => {
-    const cancelMcpWriteToolCalls = vi.fn(() => 2);
-    const endWork = vi.fn(async () => undefined);
-    await handleAccessLevelLowered(
-      { kind: "oauth_grant", userId: "u", grantId: "g3" },
-      { cancelMcpWriteToolCalls, endAgentWork: endWork },
-    );
-    expect(cancelMcpWriteToolCalls).toHaveBeenCalledWith("g3");
-    expect(endWork).toHaveBeenCalledWith({
-      userId: "u",
-      credentialIds: ["g3"],
-      outcome: "credential_lowered",
-    });
+describe("access narrowing", () => {
+  const event = {
+    kind: "agent_token" as const,
+    userId: "u",
+    agentTokenId: "t3",
+    grantId: "g3",
+    before: { scopes: ["read", "pools", "commands", "files"] as const, nodeIds: null },
+    after: { scopes: ["read", "commands", "files"] as const, nodeIds: null },
+  };
+
+  it("aborts all MCP calls under both ids even when only pools was removed", async () => {
+    const d = deps();
+    await handleAgentAccessNarrowed(event, d);
+    expect(d.cancelMcpToolCalls.mock.calls).toEqual([["t3"], ["g3"]]);
+    expect(d.endAgentWork).toHaveBeenCalledWith(event);
   });
 
-  it("records why the queued commands expired", async () => {
+  it("does not expire queued commands when only pools is removed", async () => {
     db.queuedNodeCommand.updateMany.mockClear();
-    files.cancelFileOpsForToken.mockClear();
-    await endAgentWork({ userId: "u", credentialIds: ["g3"], outcome: "credential_lowered" });
-    expect(files.cancelFileOpsForToken.mock.calls).toEqual([["g3"]]);
-    expect(db.queuedNodeCommand.updateMany).toHaveBeenCalledWith(
+    files.cancelFileOpsForNarrowedCredential.mockClear();
+    await endNarrowedAgentWork(event);
+    expect(db.queuedNodeCommand.updateMany).not.toHaveBeenCalled();
+    expect(files.cancelFileOpsForNarrowedCredential.mock.calls).toEqual([
+      ["t3", event.after],
+      ["g3", event.after],
+    ]);
+  });
+
+  it("expires only queues on nodes outside the new list", async () => {
+    await endNarrowedAgentWork({ ...event, after: { ...event.after, nodeIds: ["keep"] } });
+    expect(db.queuedNodeCommand.updateMany).toHaveBeenLastCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ state: "EXPIRED", outcome: "credential_lowered" }),
+        where: expect.objectContaining({
+          nodeId: { notIn: ["keep"] },
+          userId: "u",
+        }),
+        data: expect.objectContaining({ outcome: "credential_lowered" }),
+      }),
+    );
+  });
+
+  it("expires all its queued commands when commands scope is removed", async () => {
+    await endNarrowedAgentWork({ ...event, after: { scopes: ["read", "files"], nodeIds: null } });
+    expect(db.queuedNodeCommand.updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        where: {
+          userId: "u",
+          state: "QUEUED",
+          OR: [{ agentTokenId: { in: ["t3", "g3"] } }, { mcpGrantId: { in: ["t3", "g3"] } }],
+        },
       }),
     );
   });

@@ -27,7 +27,7 @@ pub enum Origin {
     Cli,
 }
 
-/// The `phase` of the stored record (and of the progress frames): what a released wsmp reads.
+/// The `phase` of the stored record and progress frames.
 /// [`Lifecycle::phase`] gives it for a lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,7 +79,7 @@ pub enum Lifecycle {
     /// Swapped, and a rollback was decided and may have begun: saved before the restore takes
     /// the rollback copy, so a rollback interrupted after it (a crash, a failed save) is finished
     /// on replay, and no confirmation certifies the build it replaces. Stored as `swapped` with
-    /// `rollingBack`, which a released wsmp ignores.
+    /// `rollingBack`.
     RollingBack,
     Confirmed {
         /// The server stored how this server update ended (`agent.update.ack`).
@@ -246,8 +246,7 @@ pub struct UpdateState {
     /// (`.wsmp-recovery-<id>` beside the binary), so the job still has a program to run after
     /// the restore consumed `prev_path` (a retried relay restart, a replay). Kept while
     /// [`Self::needs_recovery`], removed once the job is gone. `None`: no dead-man of this
-    /// release was armed (Homebrew, no scheduler), or one of an earlier build was, which runs
-    /// `prev_path`. Optional: a released wsmp ignores it.
+    /// update was armed (Homebrew, no scheduler). A scheduled job without it is stale.
     pub recovery_path: Option<PathBuf>,
     /// Where a rollback moves the build that failed.
     pub failed_path: PathBuf,
@@ -270,10 +269,8 @@ pub struct UpdateState {
     pub updated_at: String,
 }
 
-/// `state.json` as every release writes it: the fields in this order, the lifecycle flat
-/// (`phase` and the marks). The rollback marks are optional fields, absent when false, so a
-/// file without them is the file a released wsmp wrote; a released wsmp that starts after a
-/// rollback reads this file and ignores the fields it does not know (as this build does).
+/// `state.json` stores a flat lifecycle (`phase` and optional marks).
+/// Optional fields remain tolerant when reading a state file left on disk.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Wire {
@@ -767,11 +764,9 @@ mod tests {
         assert!(!state.needs_recovery());
     }
 
-    /// The rollback marks are optional fields, not phases: absent when false (the file is what a
-    /// released wsmp wrote), read back when set, and a reader ignores fields it does not know (as
-    /// a released wsmp does with these, after a rollback restores it).
+    /// Optional marks preserve the lifecycle, while unknown fields remain tolerated.
     #[test]
-    fn the_rollback_marks_are_optional_fields_old_readers_skip() {
+    fn optional_rollback_marks_round_trip_and_unknown_fields_are_ignored() {
         let dir = tempfile::tempdir().expect("dir");
         let update = dir.path().join("update");
         let mut state = sample(dir.path(), Phase::Swapped);
@@ -901,36 +896,6 @@ mod tests {
         built.lifecycle = RollingBack;
         built.detail = None;
         assert_eq!(encode(&built), file("Server-rolling-back"));
-    }
-
-    /// A file wsmp 0.4.3 wrote (no `recoveryPath`, no rollback marks: it had none) loads, in
-    /// every phase, and is written back the same.
-    #[cfg(unix)]
-    #[test]
-    fn every_file_a_0_4_3_wsmp_wrote_loads_and_is_written_the_same() {
-        let mut phases = std::collections::BTreeSet::new();
-        for (name, json) in written_before() {
-            if json.contains("\"rollingBack\"") {
-                continue;
-            }
-            // The same file without the fields 0.4.3 did not have (each on a line of its own,
-            // never the last), in the order it wrote them.
-            let released: String = json
-                .lines()
-                .filter(|line| {
-                    !line.starts_with("  \"recoveryPath\"")
-                        && !line.starts_with("  \"restartPending\"")
-                })
-                .flat_map(|line| [line, "\n"])
-                .collect();
-            let value: serde_json::Value = serde_json::from_str(&released).expect(&name);
-            let state: UpdateState = serde_json::from_str(&released).expect(&name);
-            let phase: Phase = serde_json::from_value(value["phase"].clone()).expect("a phase");
-            assert_eq!(state.phase(), phase, "{name}");
-            phases.insert(format!("{phase:?}"));
-            assert_eq!(encode(&state), released, "{name}");
-        }
-        assert_eq!(phases.len(), 5, "every phase: {phases:?}");
     }
 
     /// Any combination of the flat record's marks (only some are ever written) loads to one

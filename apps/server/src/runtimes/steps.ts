@@ -390,15 +390,9 @@ export function jobFrame(input: {
   ownerEpoch: string;
   headAddr: string | null;
   operator?: RuntimeJobFrame["operator"];
-  /**
-   * The node's CLI reads `reservations` (hello `features.jobReservations`). A released CLI
-   * refuses a job with unknown fields: without it they are left out (a start that needs them
-   * is refused before it is sent, `cli_upgrade_required`).
-   */
-  jobReservations?: boolean;
 }): RuntimeJobFrame {
   const { intent } = input;
-  const reservations = input.jobReservations ? stepJobReservations(intent) : null;
+  const reservations = stepJobReservations(intent);
   // The same values the step views render the shown command from (`step-intent.ts`).
   const placeholders: JobPlaceholders = stepJobPlaceholders(intent, input.headAddr);
   const fabricId = stepJobFabricId(intent);

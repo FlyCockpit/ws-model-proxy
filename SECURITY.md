@@ -2,17 +2,19 @@
 
 ## Reporting a vulnerability
 
-Please report security vulnerabilities **privately**, not via public issues:
+Please report security vulnerabilities **privately** through
+[GitHub private vulnerability reporting](https://github.com/FlyCockpit/ws-model-proxy/security/advisories/new).
+Do not open public issues, discussions or pull requests for security problems.
+We aim to acknowledge reports within 72 hours and agree on a fix and disclosure timeline.
 
-- Preferred: open a private advisory on the repository's
-  [Security tab -> "Report a vulnerability"](../../security/advisories/new).
-- If private advisories are unavailable, contact the repository owner privately.
+## In scope
 
-We aim to acknowledge reports within 72 hours.
+The server (model API, relay/WebSocket, MCP endpoint and OAuth, authentication),
+the web dashboard, the `wsmp` CLI and self-update, and the container images.
 
 ## Supported versions
 
-Only the latest release is supported.
+Only the 1.0.x release line is supported. Versions 0.4.x and earlier are unsupported.
 
 ## Security controls
 
@@ -29,6 +31,16 @@ Only the latest release is supported.
   API and WebSocket surfaces.
 - Tiered rate limiting for signup and auth routes.
 - Production boot guards for weak or missing `BETTER_AUTH_SECRET`.
+- MCP OAuth scope policy on top of Better Auth's provider: an authorize request
+  must name its scopes (Better Auth would otherwise default to every scope the
+  client registered, better-auth#12194), and consent, refresh and the agent
+  grant can only narrow them. Known, accepted gap: dynamic client registration
+  is narrowed to the requested scopes in a second write after Better Auth has
+  stored the client with the whole ceiling. If that write fails, wsmp tries to
+  delete the client and answers 500. A crash in between, or a failed deletion,
+  leaves a client whose `client_id` and secret were never returned. It still needs a person's consent and PKCE,
+  and the cleanup sweep removes it after 24 hours. See
+  [docs/mcp.md](docs/mcp.md#client-registration-cimd--dynamic-registration).
 - Sharing a pool or runtime definition by e-mail shares directly only with an
   account whose mailbox the verify-email flow proved; any other address gets an
   invite that needs its link. Known, deliberate behavior: because the answer
@@ -46,16 +58,3 @@ The dashboard does not render user-authored or CMS Markdown/HTML. Its only
 authorized by a matching CSP hash. TanStack Start hydration scripts receive a
 per-request CSP nonce. If untrusted rich text is introduced later, it must be
 sanitized before rendering and the CSP must not be weakened to accommodate it.
-
-
-## Features that need a paid GitHub tier
-
-The defaults above work on any repository, public or private, with no GitHub
-Advanced Security subscription. These are intentionally not shipped because they
-require GHAS on private repos:
-
-- CodeQL for generic JS/TS SAST.
-- GitHub Dependency Review Action.
-
-If your repository is public, or you have GHAS, either can be added as a
-workflow with no product behavior change.

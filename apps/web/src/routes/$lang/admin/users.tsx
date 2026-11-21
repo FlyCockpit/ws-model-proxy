@@ -34,7 +34,6 @@ import {
   SelectValue,
 } from "@ws-model-proxy/ui/components/select";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { useDebounce } from "@ws-model-proxy/ui/hooks/use-async-search";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import type { TFunction } from "i18next";
@@ -42,12 +41,12 @@ import { Archive, ArchiveRestore, Copy, MoreVertical, Plus, Shield, Trash } from
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
-
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { SegmentedControl } from "@/components/segmented-control";
 import { useClientDateText } from "@/hooks/use-client-date-text";
 import { useCopyFeedback } from "@/hooks/use-copy-feedback";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { useHaptics } from "@/hooks/use-haptics";
 import { useNamespaceT } from "@/i18n/use-namespace-t";
 import { orpc } from "@/utils/orpc";
@@ -93,7 +92,7 @@ function AdminUsers() {
     emailSent: boolean;
   } | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
-  const debouncedSearch = useDebounce(search.trim(), 300);
+  const debouncedSearch = useDebouncedValue(search.trim(), 300);
 
   const list = useQuery(
     orpc.users.list.queryOptions({

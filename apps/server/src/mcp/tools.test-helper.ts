@@ -1,8 +1,9 @@
+import type { AgentScope } from "@ws-model-proxy/auth/agent-scopes";
 /**
- * Test fixtures for the MCP tool tests: a verified dispatch for a READ or FULL credential.
+ * Test fixtures for the MCP tool tests: a verified dispatch for a scoped credential.
  * (Tests must mock `@ws-model-proxy/db` and the env modules before importing tools.ts.)
  */
-import { createMcpContext, type McpLevel, type McpSessionUser } from "./context";
+import { createMcpContext, type McpSessionUser } from "./context";
 import type { McpToolDispatch } from "./tool-dispatch";
 
 export const TEST_USER: McpSessionUser = {
@@ -24,13 +25,20 @@ export const TEST_USER: McpSessionUser = {
 };
 
 export function testDispatch(
-  level: McpLevel,
-  options: { signal?: AbortSignal; tokenId?: string } = {},
+  scopes: readonly AgentScope[],
+  options: {
+    signal?: AbortSignal;
+    tokenId?: string;
+    accessReadAt?: number;
+    nodeIds?: readonly string[] | null;
+  } = {},
 ): McpToolDispatch {
   const credential = {
     kind: "agent_token" as const,
     tokenId: options.tokenId ?? "token-1",
-    level,
+    grantId: "token-grant-1",
+    accessReadAt: options.accessReadAt ?? performance.now(),
+    access: { scopes, nodeIds: options.nodeIds ?? null },
     expiresAt: null,
   };
   return {
@@ -47,16 +55,16 @@ export function testDispatch(
   };
 }
 
-/** A verified OAuth dispatch; `levelReadAt` defaults to now (`performance.now()`). */
+/** A verified OAuth dispatch; `accessReadAt` defaults to now (`performance.now()`). */
 export function testOAuthDispatch(
-  level: McpLevel,
-  options: { grantId?: string; levelReadAt?: number } = {},
+  scopes: readonly AgentScope[],
+  options: { grantId?: string; accessReadAt?: number; nodeIds?: readonly string[] | null } = {},
 ): McpToolDispatch {
   const credential = {
     kind: "oauth" as const,
     grantId: options.grantId ?? "grant-1",
-    level,
-    levelReadAt: options.levelReadAt ?? performance.now(),
+    access: { scopes, nodeIds: options.nodeIds ?? null },
+    accessReadAt: options.accessReadAt ?? performance.now(),
   };
   return {
     orpcContext: createMcpContext({

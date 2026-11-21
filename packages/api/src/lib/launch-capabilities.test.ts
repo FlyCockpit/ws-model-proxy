@@ -9,48 +9,52 @@ const FEATURES = {
   mediaExpand: true,
   liveStt: true,
   secrets: [],
+  jobReservations: true,
+  rankIdle: true,
+  selfUpdate: { strategies: ["self-replace"], instancesSurvive: true, remote: "allowed" },
 };
 
 describe("launchCapabilities", () => {
   it("reads what the node reports", () => {
-    const capabilities = launchCapabilities(
-      {
-        ...FEATURES,
-        launch: { platform: "windows", management: ["process", "service"], shells: ["pwsh"] },
-      },
-      { executionMechanism: "unsupported" },
-    );
+    const capabilities = launchCapabilities({
+      ...FEATURES,
+      launch: { platform: "windows", management: ["process", "service"], shells: ["pwsh"] },
+    });
     expect(capabilities?.platform).toBe("windows");
     expect([...(capabilities?.management ?? [])]).toEqual(["process", "service"]);
     expect([...(capabilities?.shells ?? [])]).toEqual(["pwsh"]);
   });
 
-  it("reads an older CLI's execution mechanism", () => {
-    expect(launchCapabilities(FEATURES, { executionMechanism: "macos" })).toEqual({
-      platform: "macos",
-      management: new Set(["service"]),
-      shells: new Set(["sh"]),
-    });
-    for (const mechanism of ["systemd+linger", "systemd-no-linger"])
-      expect(launchCapabilities(null, { executionMechanism: mechanism })?.platform).toBe("linux");
-  });
+  it.each(["standard", "isolated"])(
+    "keeps stored launch capabilities when legacy policy is %s",
+    (agentCommands) => {
+      const capabilities = launchCapabilities({
+        ...FEATURES,
+        agentCommands,
+        launch: { platform: "linux", management: ["process"], shells: ["sh"] },
+      });
+      expect(capabilities?.platform).toBe("linux");
+      expect([...(capabilities?.management ?? [])]).toEqual(["process"]);
+      expect([...(capabilities?.shells ?? [])]).toEqual(["sh"]);
+    },
+  );
 
   it("says nothing when nothing says", () => {
-    expect(launchCapabilities(null, null)).toBeNull();
-    expect(launchCapabilities(FEATURES, { executionMechanism: "unsupported" })).toBeNull();
-    // An unreadable report falls back to the mechanism.
-    expect(
-      launchCapabilities(
-        { ...FEATURES, launch: { platform: "plan9" } },
-        { executionMechanism: "macos" },
-      )?.platform,
-    ).toBe("macos");
+    expect(launchCapabilities(null)).toBeNull();
+    expect(launchCapabilities(FEATURES)).toBeNull();
+    expect(launchCapabilities({ ...FEATURES, launch: { platform: "plan9" } })).toBeNull();
   });
 });
 
 describe("launchRunsOn", () => {
-  const linux = launchCapabilities(null, { executionMechanism: "systemd+linger" });
-  const mac = launchCapabilities(null, { executionMechanism: "macos" });
+  const linux = launchCapabilities({
+    ...FEATURES,
+    launch: { platform: "linux", management: ["process", "service"], shells: ["sh"] },
+  });
+  const mac = launchCapabilities({
+    ...FEATURES,
+    launch: { platform: "macos", management: ["service"], shells: ["sh"] },
+  });
   if (!linux || !mac) throw new Error("capabilities");
 
   it("needs the management mode", () => {

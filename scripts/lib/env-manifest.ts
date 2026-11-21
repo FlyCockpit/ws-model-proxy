@@ -115,11 +115,11 @@ export const ENV_GROUPS: EnvGroup[] = [
   },
   {
     id: "runtime",
-    title: "Runtime + schema sync",
+    title: "Runtime + migrations",
     always: true,
     comment: [
-      "APPLY_SCHEMA gates whether `prisma db push` runs at container start.",
-      "Set it to `safe` on a schema-changing deploy, then flip it back to `off`.",
+      "The server applies pending migrations at container start (MIGRATE_ON_START,",
+      "default true); a database already up to date costs one query.",
     ],
   },
   {
@@ -231,16 +231,34 @@ export const ENV_VARS: EnvVar[] = [
     ],
   },
   {
-    key: "APPLY_SCHEMA",
+    key: "MIGRATE_ON_START",
     group: "runtime",
     source: "default",
-    default: "off",
-    choices: [{ value: "off" }, { value: "safe" }, { value: "dangerous" }],
+    default: "true",
     inSchema: false,
-    example: "off",
+    choices: [{ value: "true" }, { value: "false" }],
+    example: "true",
     comment: [
-      "off | safe | dangerous. Read by scripts/docker-entrypoint.sh, not by Zod.",
-      "Keep `off` for a normal deploy.",
+      "Read by scripts/docker-entrypoint.sh, not the Zod schemas. Default: true",
+      "for the server command, false for every other command (it then waits,",
+      "read-only, up to 300 s for migrations to be applied). Container platforms",
+      "that run the image's `migrate` command as a one-shot job before rollout set",
+      "false. Replaces APPLY_SCHEMA (0.4.x), still accepted during 1.x with a",
+      "warning: off → false, safe → true; dangerous is refused.",
+    ],
+  },
+  {
+    key: "BACKUP_ENABLED",
+    group: "runtime",
+    source: "default",
+    default: "false",
+    choices: [{ value: "false" }, { value: "true" }],
+    comment: [
+      "Automatic pre-migration and pre-drop backups are OFF by default; migrations proceed without them.",
+      "Set true and mount a writable /backups volume and/or configure BACKUP_S3_* to enable them.",
+      "With true and neither destination, migrations refuse to run instead of skipping the backup.",
+      "Daily backups separately require the optional backup-schedule service with BACKUP_SCHEDULE=daily.",
+      "Explicit backup and restore commands remain available regardless of this flag.",
     ],
   },
   {
@@ -370,11 +388,20 @@ export const ENV_VARS: EnvVar[] = [
     key: "WMP_CLI_RELEASE_BASE_URL",
     group: "runtime",
     source: "manual",
-    example: "https://github.com/FlyCockpit/ws-model-proxy/releases/download/v0.4.0",
+    example: "https://github.com/FlyCockpit/ws-model-proxy/releases/download/v1.0.0",
     comment: [
       "Optional. Where /install.sh downloads wsmp-<target>.tar.xz and sha256.sum (https only) and",
       "installs the checksum-verified binary. Unset: the GitHub Release of the server's version.",
       "Ignored when WMP_CLI_SOURCE_REV is set.",
+    ],
+  },
+  {
+    key: "WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS",
+    group: "runtime",
+    source: "default",
+    default: "90",
+    comment: [
+      "Maximum lifetime of newly minted agent tokens in days (1-3650). Existing tokens are unaffected.",
     ],
   },
   {
@@ -383,8 +410,9 @@ export const ENV_VARS: EnvVar[] = [
     source: "default",
     default: "true",
     comment: [
-      "Allow minting no-expiry (unlimited-lifetime) agent tokens. The product default is 90 days.",
-      "Turn off to refuse an explicit no-expiry token. Omitting expiry still mints a 90-day token; a chosen expiry must be within MCP_PAT_MAX_TTL_DAYS (365 days).",
+      "Allow no-expiry (unlimited-lifetime) agent tokens. The product default is 90 days.",
+      "Turn off to require an expiry within WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS on new tokens and to",
+      "refuse existing no-expiry tokens (kept, shown as blocked by policy) until turned back on.",
     ],
   },
   {
@@ -671,7 +699,6 @@ export const ENV_VARS: EnvVar[] = [
     comment: [
       "Multiplies every built-in rate-limit budget (0.1-100); windows stay fixed.",
       "Per-recipient email and failed-password caps are always on (at least 1).",
-      "Replaces the RATE_LIMIT_* settings, which are no longer read.",
     ],
   },
 

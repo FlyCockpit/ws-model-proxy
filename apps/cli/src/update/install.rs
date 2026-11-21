@@ -153,7 +153,8 @@ pub fn system_tar() -> PathBuf {
 
 /// Unpack `archive` into the empty directory `into` with `tar`, and find the
 /// `wsmp` binary: at the top or in `wsmp-<target>/` (as the release archives
-/// lay it out), a regular file (never a link).
+/// lay it out), a regular file (never a link). `target` is the chosen manifest
+/// key, which may differ from the current binary's compiled target.
 pub fn extract(tar: &Path, archive: &Path, into: &Path, target: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(into).with_context(|| format!("creating `{}`", into.display()))?;
     // The paths go to `tar` exactly as they are (never as text: a path that is not UTF-8 would
@@ -235,11 +236,19 @@ fn clear(path: &Path) -> Result<()> {
     match remove_if_present(path) {
         Ok(()) => Ok(()),
         Err(error) if cfg!(windows) => {
-            let aside = path.with_extension(format!("old-{}", super::new_update_id()));
+            let aside = retired_path(path);
             std::fs::rename(path, &aside).map_err(|_| error)
         }
         Err(error) => Err(error),
     }
+}
+
+/// A sibling recognized by `clear_retired`, including for prev/failed binaries.
+fn retired_path(path: &Path) -> PathBuf {
+    path.with_file_name(exe_name(&format!(
+        "{RETIRED_PREFIX}{}",
+        super::new_update_id()
+    )))
 }
 
 fn sync_dir(path: &Path) {
@@ -303,26 +312,6 @@ pub fn verify_recovery(prev: &Path, recovery: &Path) -> Result<()> {
         recovery.display(),
         prev.display()
     );
-    Ok(())
-}
-
-/// A rollback job armed by an earlier build runs `program` (the rollback copy, `wsmp.prev`),
-/// which the restore consumed: put the restored live binary there again (a hard link, or a
-/// copy), so the job's next run (a retried restart) still has its program. Nothing is changed
-/// when `program` is there.
-pub fn relink_program(live: &Path, program: &Path) -> Result<()> {
-    if std::fs::symlink_metadata(program).is_ok() {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        if std::fs::hard_link(live, program).is_err() {
-            copy_file(live, program)?;
-        }
-    }
-    #[cfg(not(unix))]
-    copy_file(live, program)?;
-    sync_dir(program);
     Ok(())
 }
 
@@ -467,6 +456,29 @@ pub fn clean(layout: &Layout) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fallback_names_are_swept_for_every_binary_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in [
+            "wsmp.prev.exe",
+            "wsmp.failed.exe",
+            ".wsmp-retired-existing.exe",
+        ] {
+            let aside = retired_path(&dir.path().join(name));
+            assert_eq!(aside.parent(), Some(dir.path()));
+            assert!(
+                aside
+                    .file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .starts_with(RETIRED_PREFIX)
+            );
+            std::fs::write(aside, b"retired").expect("write");
+        }
+        clear_retired(&dir.path().join("wsmp.exe"));
+        assert_eq!(std::fs::read_dir(dir.path()).expect("read dir").count(), 0);
+    }
+
     #[cfg(unix)]
     fn write_exe(path: &Path, body: &str) {
         std::fs::write(path, body).expect("write");
@@ -586,6 +598,57 @@ mod tests {
         assert_eq!(found, odd.join("out").join("wsmp"));
         assert_eq!(probe_version(&found).expect("probe"), "9.8.7");
         assert!(!sibling.exists(), "the text-form sibling was used");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracts_the_selected_linux_release_target_or_a_root_binary() {
+        for arch in ["x86_64", "aarch64"] {
+            let gnu = format!("{arch}-unknown-linux-gnu");
+            let musl = format!("{arch}-unknown-linux-musl");
+            for (selected, other) in [(&gnu, &musl), (&musl, &gnu)] {
+                for at_root in [false, true] {
+                    let dir = tempfile::tempdir().expect("dir");
+                    let src = dir.path().join("src");
+                    let inner = if at_root {
+                        src.clone()
+                    } else {
+                        src.join(format!("wsmp-{selected}"))
+                    };
+                    std::fs::create_dir_all(&inner).expect("mkdir");
+                    write_exe(&inner.join("wsmp"), "#!/bin/sh\necho 'wsmp 9.8.7'\n");
+                    let archive = dir.path().join("a.tar.gz");
+                    assert!(
+                        std::process::Command::new("tar")
+                            .arg("-czf")
+                            .arg(&archive)
+                            .arg("-C")
+                            .arg(&src)
+                            .arg(".")
+                            .status()
+                            .expect("tar")
+                            .success()
+                    );
+                    let out = dir.path().join("out");
+                    let found = extract(&system_tar(), &archive, &out, selected).expect("extract");
+                    let expected = if at_root {
+                        out.join("wsmp")
+                    } else {
+                        out.join(format!("wsmp-{selected}/wsmp"))
+                    };
+                    assert_eq!(found, expected);
+                    assert_eq!(probe_version(&found).expect("probe"), "9.8.7");
+                    if !at_root {
+                        // The archive's folder names its target: extracting it as another
+                        // target's archive is refused.
+                        assert!(
+                            extract(&system_tar(), &archive, &dir.path().join("wrong"), other)
+                                .is_err()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(unix)]

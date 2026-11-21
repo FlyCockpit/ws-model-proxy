@@ -177,7 +177,6 @@ export const MEMBER_KIND = ["LOCAL", "CLOUD"] as const;
 export const MEMBER_STATE = ["ACTIVE", "DISABLED"] as const;
 export const SIDECAR_INPUT = ["IMAGE", "AUDIO", "VIDEO"] as const;
 export const API_KEY_SCOPE = ["ALL_POOLS", "SELECTED_POOLS"] as const;
-export const AGENT_LEVEL = ["READ", "FULL"] as const;
 export const PROVIDER_AUTH_TYPE = ["API_KEY", "BEARER"] as const;
 export const PROVIDER_CREDENTIAL_STATUS = ["ACTIVE", "REPLACED", "REVOKED"] as const;
 export const PROVIDER_HEALTH = ["UNKNOWN", "HEALTHY", "DEGRADED", "UNAVAILABLE"] as const;
@@ -225,7 +224,7 @@ export const PRISMA_ENUM_MIRRORS = {
   MemberState: MEMBER_STATE,
   SidecarInput: SIDECAR_INPUT,
   ApiKeyScope: API_KEY_SCOPE,
-  AgentLevel: AGENT_LEVEL,
+  AgentScope: ["READ", "POOLS", "RUNTIMES", "NODES_MANAGE", "COMMANDS", "FILES", "MODELS_TEST"],
   ProviderAuthType: PROVIDER_AUTH_TYPE,
   ProviderCredentialStatus: PROVIDER_CREDENTIAL_STATUS,
   ProviderHealth: PROVIDER_HEALTH,

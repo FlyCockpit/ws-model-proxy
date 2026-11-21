@@ -31,7 +31,7 @@ afterEach(() => {
 function Root() {
   useHashTargetScroll();
   return (
-    <main data-scroll-restoration-id="app-main">
+    <main id="main-content" tabIndex={-1} data-scroll-restoration-id="app-main">
       <Outlet />
     </main>
   );
@@ -47,6 +47,15 @@ function setup() {
       component: () => (
         <>
           <a href="#second">jump</a>
+          <a
+            href="#main-content"
+            onClick={(event) => {
+              event.preventDefault();
+              document.getElementById("main-content")?.focus({ preventScroll: true });
+            }}
+          >
+            Skip to content
+          </a>
           <button type="button" id="target">
             Target
           </button>
@@ -109,5 +118,26 @@ describe("useHashTargetScroll", () => {
     });
     expect(scrolled).toEqual(["second", "second"]);
     expect(router.history.length).toBe(before + 1);
+  });
+  it("leaves a handled skip link out of router navigation and history", async () => {
+    const router = setup();
+    await act(() => router.navigate({ href: "/b" }));
+    const main = document.getElementById("main-content");
+    if (!main) throw new Error("main missing");
+    main.scrollTop = 250;
+    const before = router.history.length;
+    const navigate = vi.spyOn(router, "navigate");
+    const location = router.state.location;
+    const link = document.querySelector<HTMLAnchorElement>('a[href="#main-content"]');
+    if (!link) throw new Error("skip link missing");
+    await act(async () => {
+      link.click();
+    });
+    await waitFor(() => expect(document.activeElement).toBe(main));
+    expect(main.scrollTop).toBe(250);
+    expect(scrolled).toEqual([]);
+    expect(router.history.length).toBe(before);
+    expect(router.state.location).toBe(location);
+    expect(navigate).not.toHaveBeenCalled();
   });
 });

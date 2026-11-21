@@ -2,7 +2,9 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { User } from "lucide-react";
+import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
+import { User, UserPlus } from "lucide-react";
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -30,10 +32,20 @@ export default function UserMenu() {
   const { state } = useAuthSession();
   const config = useQuery(orpc.app.config.queryOptions());
   const { t } = useTranslation("nav");
-  const [mounted, setMounted] = useState(false);
+  const [mountedForUser, setMountedForUser] = useState<string | null>(null);
+  const [hadIdentity, setHadIdentity] = useState(false);
+  if (state.session && !hadIdentity) setHadIdentity(true);
 
   if (state.status === "pending") {
     return <Skeleton className="h-11 w-24" />;
+  }
+
+  if (state.status === "error" && (hadIdentity || state.session)) {
+    return (
+      <Button variant="outline" size="icon-touch" disabled aria-label={t("userMenu.open")}>
+        <User className="size-4" aria-hidden="true" />
+      </Button>
+    );
   }
 
   if (state.status !== "authenticated") {
@@ -45,14 +57,24 @@ export default function UserMenu() {
     return (
       <div className="flex items-center gap-2">
         {showSignUp && (
-          <Link to="/$lang/signup" params={{ lang }} search={{ redirectTo: undefined }}>
-            <Button size="touch">{t("userMenu.signUp")}</Button>
+          <Link
+            to="/$lang/signup"
+            params={{ lang }}
+            search={{ redirectTo: undefined }}
+            aria-label={t("userMenu.signUp")}
+            className={cn(buttonVariants({ size: "touch" }), "w-11 px-0 sm:w-auto sm:px-3.5")}
+          >
+            <UserPlus className="size-4 sm:hidden" aria-hidden="true" />
+            <span className="hidden sm:inline">{t("userMenu.signUp")}</span>
           </Link>
         )}
-        <Link to="/$lang/login" params={{ lang }} search={{ redirectTo: undefined }}>
-          <Button size="touch" variant="outline">
-            {t("userMenu.signIn")}
-          </Button>
+        <Link
+          to="/$lang/login"
+          params={{ lang }}
+          search={{ redirectTo: undefined }}
+          className={buttonVariants({ size: "touch", variant: "outline" })}
+        >
+          {t("userMenu.signIn")}
         </Link>
       </div>
     );
@@ -74,7 +96,7 @@ export default function UserMenu() {
       onFocus={prefetchMenu}
       onClick={() => {
         prefetchMenu();
-        setMounted(true);
+        setMountedForUser(state.session.user.id);
       }}
     >
       <User className="size-4 md:hidden" aria-hidden="true" />
@@ -82,11 +104,11 @@ export default function UserMenu() {
     </Button>
   );
 
-  if (!mounted) return shell(false);
+  if (mountedForUser !== state.session.user.id) return shell(false);
 
   return (
     <Suspense fallback={shell(true)}>
-      <UserMenuContent />
+      <UserMenuContent key={state.session.user.id} />
     </Suspense>
   );
 }

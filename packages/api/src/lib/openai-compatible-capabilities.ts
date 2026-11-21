@@ -361,27 +361,12 @@ const v3CapabilitiesSchema = z
   })
   .strict();
 
-function omitLegacyCompletions(value: unknown): unknown {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
-  const record = { ...(value as Record<string, unknown>) };
-  delete record.completions;
-  if (record.surfaces && typeof record.surfaces === "object" && !Array.isArray(record.surfaces)) {
-    const surfaces = { ...(record.surfaces as Record<string, unknown>) };
-    delete surfaces.openaiCompletions;
-    record.surfaces = surfaces;
-  }
-  return record;
-}
-
-export const openAiCompatibleCapabilitiesSchema = z.preprocess(
-  omitLegacyCompletions,
-  z.discriminatedUnion("version", [
-    v1CapabilitiesSchema,
-    v2CapabilitiesSchema,
-    v3CapabilitiesSchema,
-    v4CapabilitiesSchema,
-  ]),
-);
+export const openAiCompatibleCapabilitiesSchema = z.discriminatedUnion("version", [
+  v1CapabilitiesSchema,
+  v2CapabilitiesSchema,
+  v3CapabilitiesSchema,
+  v4CapabilitiesSchema,
+]);
 
 export type OpenAiCompatibleCapabilities = z.infer<typeof openAiCompatibleCapabilitiesSchema>;
 

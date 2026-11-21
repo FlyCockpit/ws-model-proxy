@@ -26,12 +26,10 @@ import {
   nodeMetricCommandsHash,
 } from "@ws-model-proxy/api/lib/runtime-launch-hash";
 import {
-  metricCommandNeedsLaunch,
   type NodeMetricCommand,
   nodeMetricCommandsSchema,
   nodeRuntimeSpec,
   RUNTIME_DEFINITIONS_MAX,
-  reportsLaunchFeatures,
   runtimeSpecSchema,
 } from "@ws-model-proxy/api/lib/runtime-spec";
 import { nodeFabricSets } from "@ws-model-proxy/api/nodes/fabrics";
@@ -249,13 +247,8 @@ export async function loadNodeDefinitionState(
   if (!fullControl) return state;
 
   const metric = nodeMetricCommandsSchema.safeParse(node.metricCommands);
-  const stored: NodeMetricCommand[] = metric.success ? metric.data : [];
+  const commands: NodeMetricCommand[] = metric.success ? metric.data : [];
   if (!metric.success) console.error("[runtime-sync] stored metric commands do not parse", nodeId);
-  // A node without `features.launch` cannot parse an argv or a `shell` (`nodes.update` refuses
-  // them for it; rows saved earlier, or a downgraded node, still reach here).
-  const commands = reportsLaunchFeatures(node.features)
-    ? stored
-    : stored.filter((command) => !metricCommandNeedsLaunch(command));
   const sets = nodeFabricSets(node.FabricMembers);
   state.node = {
     portRange: [node.portStart, node.portEnd],

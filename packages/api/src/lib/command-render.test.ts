@@ -44,7 +44,7 @@ type Vectors = {
 };
 const vectors = JSON.parse(
   readFileSync(
-    join(repoRoot, "apps/cli/tests/fixtures/relay-3.0/rules/command-render.json"),
+    join(repoRoot, "apps/cli/tests/fixtures/relay-4.0/rules/command-render.json"),
     "utf8",
   ),
 ) as Vectors;

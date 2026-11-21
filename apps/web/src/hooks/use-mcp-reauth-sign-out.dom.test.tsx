@@ -2,7 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * MCP tombstone-reauth sign-out hook (Phase 6, Part H pass 2):
@@ -19,6 +19,17 @@ const signOutMock = vi.hoisted(() =>
 vi.mock("@/lib/auth-client", () => ({
   authClient: { signOut: signOutMock },
 }));
+
+const reload = vi.fn();
+const undoSignOutMark = vi.hoisted(() => vi.fn());
+const markSignOut = vi.hoisted(() => vi.fn(() => undoSignOutMark));
+vi.mock("./use-reload-on-identity-change", () => ({ markExplicitSignOut: markSignOut }));
+beforeEach(() => {
+  Object.defineProperty(window, "location", {
+    configurable: true,
+    value: { href: "https://example.test/en-US/mcp-login?oauth_query=signed", reload },
+  });
+});
 
 import { MCP_REAUTH_STATUS_QUERY_KEY } from "@/lib/mcp-oauth-search";
 import { useMcpReauthSignOut } from "./use-mcp-reauth-sign-out";
@@ -42,7 +53,7 @@ describe("useMcpReauthSignOut", () => {
     vi.clearAllMocks();
   });
 
-  it("signs out with disableRedirect, never navigates, and invalidates the tombstone-probe cache", async () => {
+  it("signs out with disableRedirect, invalidates the probe cache, and reloads the exact signed URL", async () => {
     const { result, invalidateSpy } = renderHookWithClient();
     expect(result.current.isSigningOut).toBe(false);
     expect(result.current.signOutFailed).toBe(false);
@@ -57,6 +68,9 @@ describe("useMcpReauthSignOut", () => {
     expect(signOutMock).toHaveBeenCalledWith({ disableRedirect: true });
     expect(result.current.isSigningOut).toBe(false);
     expect(result.current.signOutFailed).toBe(false);
+    expect(markSignOut).toHaveBeenCalledOnce();
+    expect(reload).toHaveBeenCalledOnce();
+    expect(window.location.href).toBe("https://example.test/en-US/mcp-login?oauth_query=signed");
     // The probe cache is invalidated by its prefix key so the NEXT session
     // can never reuse this session's cached reauth/continue decision.
     expect(invalidateSpy).toHaveBeenCalledWith({
@@ -72,6 +86,8 @@ describe("useMcpReauthSignOut", () => {
     });
     expect(result.current.signOutFailed).toBe(true);
     expect(result.current.isSigningOut).toBe(false);
+    expect(undoSignOutMark).toHaveBeenCalledOnce();
+    expect(reload).not.toHaveBeenCalled();
     // A failed sign-out keeps the session: no cache invalidation.
     expect(invalidateSpy).not.toHaveBeenCalled();
   });
@@ -84,6 +100,8 @@ describe("useMcpReauthSignOut", () => {
     });
     expect(result.current.isSigningOut).toBe(false);
     expect(result.current.signOutFailed).toBe(true);
+    expect(undoSignOutMark).toHaveBeenCalledOnce();
+    expect(reload).not.toHaveBeenCalled();
   });
 
   it("clears the failure state on a subsequent successful retry", async () => {

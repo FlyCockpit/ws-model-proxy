@@ -6,7 +6,7 @@ the state-directory registry is unavailable. Startup reports registry entries
 without walking potentially blocked remote file roots.
 
 Recovery keeps private hardlink pins in INTENT v3. Serialized inode numbers
-alone never authorize restoring or deleting an object. Legacy journals, missing
+alone never authorize restoring or deleting an object. Unsupported journal versions, missing
 pins, directory objects and unsupported aliases require manual resolution.
 Never remove retained pins or INTENT before identifying all affected objects.
 

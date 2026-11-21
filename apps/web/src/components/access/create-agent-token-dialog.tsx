@@ -4,30 +4,26 @@ import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
-import { useState } from "react";
+import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { type ReactNode, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
-import {
-  type AgentLevel,
-  AgentLevelChoice,
-  DEFAULT_AGENT_LEVEL,
-} from "@/components/access/agent-level-choice";
-import {
-  EXPIRY_CHOICES,
-  type ExpiryChoice,
-  expiryFromChoice,
-} from "@/components/access/credential-meta-utils";
+import { AgentAccessChoice } from "@/components/access/agent-access-choice";
 import { SecretReveal } from "@/components/access/secret-reveal";
 import { CodeSnippet } from "@/components/code-snippet";
-import { SegmentedControl } from "@/components/segmented-control";
+import { InlineRetry } from "@/components/inline-retry";
+import {
+  agentAccessSchema,
+  defaultAgentAccess,
+  type EditableAgentAccess,
+} from "@/lib/agent-access";
+import {
+  agentTokenExpiry,
+  agentTokenExpiryPresets,
+  localDateInputValue,
+} from "@/lib/agent-token-expiry";
 import { orpc } from "@/utils/orpc";
-
-const createSchema = z.object({
-  name: z.string().trim().min(1).max(120),
-  level: z.enum(["READ", "FULL"]),
-  expiry: z.enum(EXPIRY_CHOICES),
-});
 
 /** Access → Agents "Create agent token": the form, then the token once with an agent config. */
 export function CreateAgentTokenDialog({
@@ -39,7 +35,7 @@ export function CreateAgentTokenDialog({
   onOpenChange: (open: boolean) => void;
   mcpUrl: string | null;
 }) {
-  const { t } = useTranslation(["access"]);
+  const { t } = useTranslation(["access", "common"]);
   const [secret, setSecret] = useState<string | null>(null);
   // Owned here so the dialog cannot close while the token is being minted (a late result would
   // otherwise reveal the secret later); `gcTime: 0` keeps it out of the mutation cache.
@@ -66,14 +62,21 @@ export function CreateAgentTokenDialog({
           2,
         )
       : null;
-  return (
+  const renderDialog = (children: ReactNode, footer?: ReactNode) => (
     <ResponsiveDialog
       open={open}
       onOpenChange={(next) => (next ? onOpenChange(true) : close())}
       title={secret ? t("access:agents.created") : t("access:agents.createTitle")}
       description={secret ? undefined : t("access:agents.tokensDescription")}
+      className="md:max-h-[calc(100dvh-2rem)] md:grid-rows-[auto_minmax(0,1fr)_auto] [&>[data-slot=drawer-header]]:shrink-0 [&>[data-slot=drawer-footer]]:shrink-0"
+      footer={footer}
     >
-      {secret ? (
+      {children}
+    </ResponsiveDialog>
+  );
+  return secret ? (
+    renderDialog(
+      <div className="min-h-0 min-w-0 pb-4 md:overflow-x-hidden md:overflow-y-auto md:overscroll-contain">
         <SecretReveal value={secret} onDone={close}>
           {config ? (
             <div className="min-w-0 space-y-1.5">
@@ -82,61 +85,124 @@ export function CreateAgentTokenDialog({
             </div>
           ) : null}
         </SecretReveal>
-      ) : open ? (
-        <CreateAgentTokenForm
-          create={create.mutateAsync}
-          onCreated={(value) => {
-            setSecret(value);
-            create.reset();
-          }}
-        />
-      ) : null}
-    </ResponsiveDialog>
-  );
+      </div>,
+    )
+  ) : open ? (
+    <CreateAgentTokenForm
+      renderDialog={renderDialog}
+      onCancel={close}
+      create={create.mutateAsync}
+      onCreated={(value) => {
+        setSecret(value);
+        create.reset();
+      }}
+    />
+  ) : null;
 }
 
 type CreateAgentToken = (input: {
   name: string;
-  level: AgentLevel;
+  scopes: EditableAgentAccess["scopes"];
+  nodeIds: string[] | null;
   expiresAt: string | null;
 }) => Promise<{ secret: string }>;
 
-function CreateAgentTokenForm({
-  create,
-  onCreated,
-}: {
+function CreateAgentTokenForm(props: {
+  renderDialog: (children: ReactNode, footer?: ReactNode) => ReactNode;
+  onCancel: () => void;
   create: CreateAgentToken;
   onCreated: (secret: string) => void;
 }) {
-  const { t } = useTranslation(["access"]);
-  const queryClient = useQueryClient();
+  const { t } = useTranslation(["access", "common"]);
   const flags = useQuery(orpc.app.flags.queryOptions());
-  const noExpiryAllowed = flags.data?.agentTokenNoExpiryAllowed === true;
-  const choices = EXPIRY_CHOICES.filter((choice) => choice !== "never" || noExpiryAllowed);
+  if (flags.isPending) return props.renderDialog(<Skeleton className="h-96 w-full" />);
+  if (flags.isError)
+    return props.renderDialog(
+      <InlineRetry message={t("access:agents.policyFailed")} onRetry={() => flags.refetch()} />,
+    );
+  return (
+    <ReadyAgentTokenForm
+      {...props}
+      maxLifetimeDays={flags.data.agentTokenMaxLifetimeDays}
+      allowNoExpiry={flags.data.agentTokenNoExpiryAllowed}
+    />
+  );
+}
+
+function ReadyAgentTokenForm({
+  renderDialog,
+  onCancel,
+  create,
+  onCreated,
+  maxLifetimeDays,
+  allowNoExpiry,
+}: {
+  onCancel: () => void;
+  create: CreateAgentToken;
+  onCreated: (secret: string) => void;
+  renderDialog: (children: ReactNode, footer?: ReactNode) => ReactNode;
+  maxLifetimeDays: number;
+  allowNoExpiry: boolean;
+}) {
+  const { t } = useTranslation(["access", "common"]);
+  const queryClient = useQueryClient();
+  const formId = useId();
+  const choices = agentTokenExpiryPresets(maxLifetimeDays);
+  const createSchema = z
+    .object({
+      name: z.string().trim().min(1).max(120),
+      access: agentAccessSchema,
+      expiry: z.string(),
+      customDate: z.string(),
+    })
+    .refine(
+      (value) =>
+        agentTokenExpiry(
+          value.expiry,
+          value.customDate,
+          Date.now(),
+          maxLifetimeDays,
+          allowNoExpiry,
+        ) !== undefined,
+      {
+        path: ["expiry"],
+        message: t("access:agents.expiryInvalid", { days: maxLifetimeDays }),
+      },
+    );
   const form = useForm({
     defaultValues: {
       name: "",
-      level: DEFAULT_AGENT_LEVEL,
-      expiry: "d90" as ExpiryChoice,
+      access: defaultAgentAccess(),
+      expiry: String(Math.min(90, maxLifetimeDays)),
+      customDate: "",
     },
     validators: { onSubmit: createSchema },
     onSubmit: async ({ value }) => {
-      // A failure is toasted by the global mutation error handler.
+      const expiresAt = agentTokenExpiry(
+        value.expiry,
+        value.customDate,
+        Date.now(),
+        maxLifetimeDays,
+        allowNoExpiry,
+      );
+      if (expiresAt === undefined) return;
       const result = await create({
         name: value.name.trim(),
-        level: value.level,
-        expiresAt: expiryFromChoice(value.expiry, Date.now()),
+        ...value.access,
+        expiresAt,
       }).catch(() => null);
       if (!result) return;
-      // Reveal at once: the dialog may close while the list refreshes, and a late reveal would
-      // leave the secret behind for the next open.
       onCreated(result.secret);
       void queryClient.invalidateQueries({ queryKey: orpc.access.agentTokens.list.key() });
     },
   });
-  return (
+  const now = Date.now();
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  return renderDialog(
     <form
-      className="flex min-w-0 flex-col gap-4 pb-4"
+      id={formId}
+      className="flex min-w-0 flex-col gap-4 pb-4 md:overflow-x-hidden md:overflow-y-auto md:overscroll-contain"
       onSubmit={(event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -167,32 +233,94 @@ function CreateAgentTokenForm({
           </div>
         )}
       </form.Field>
-      <form.Field name="level">
-        {(field) => <AgentLevelChoice value={field.state.value} onChange={field.handleChange} />}
+      <form.Field name="access">
+        {(field) => <AgentAccessChoice value={field.state.value} onChange={field.handleChange} />}
       </form.Field>
       <form.Field name="expiry">
         {(field) => (
           <div className="min-w-0 space-y-2">
             <Label>{t("access:fields.expiry")}</Label>
-            <SegmentedControl
-              value={field.state.value}
-              onChange={field.handleChange}
-              ariaLabel={t("access:fields.expiry")}
-              items={choices.map((choice) => ({
-                value: choice,
-                label: t(`access:expiry.${choice}`),
-              }))}
-            />
+            <p className="text-xs text-muted-foreground">
+              {t("access:agents.maxLifetime", { days: maxLifetimeDays })}
+            </p>
+            <div
+              role="group"
+              aria-label={t("access:fields.expiry")}
+              className="grid min-w-0 grid-cols-2 gap-2"
+            >
+              {[
+                ...choices.map((days) => ({
+                  value: String(days),
+                  label: t("access:agents.expiryDays", { count: days }),
+                })),
+                { value: "custom", label: t("access:agents.customDate") },
+                ...(allowNoExpiry ? [{ value: "never", label: t("access:agents.noExpiry") }] : []),
+              ].map((choice) => (
+                <Button
+                  key={choice.value}
+                  type="button"
+                  size="touch"
+                  variant="outline"
+                  className="h-auto min-h-11 min-w-0 whitespace-normal py-2 aria-pressed:border-primary aria-pressed:bg-primary/10 aria-pressed:ring-1 aria-pressed:ring-primary dark:aria-pressed:border-primary dark:aria-pressed:bg-primary/15"
+                  aria-pressed={field.state.value === choice.value}
+                  onClick={() => field.handleChange(choice.value)}
+                >
+                  {choice.label}
+                </Button>
+              ))}
+            </div>
+            {field.state.value === "never" ? (
+              <p className="text-xs text-muted-foreground">{t("access:agents.noExpiryHint")}</p>
+            ) : null}
+            {field.state.value === "custom" ? (
+              <form.Field name="customDate">
+                {(dateField) => (
+                  <div className="space-y-2">
+                    <Label htmlFor="agent-token-date">{t("access:agents.customDate")}</Label>
+                    <Input
+                      id="agent-token-date"
+                      type="date"
+                      className="min-h-11"
+                      min={localDateInputValue(tomorrow)}
+                      max={localDateInputValue(new Date(now + maxLifetimeDays * 86_400_000))}
+                      value={dateField.state.value}
+                      onBlur={dateField.handleBlur}
+                      onChange={(event) => dateField.handleChange(event.target.value)}
+                      aria-invalid={field.state.meta.errors.length > 0}
+                      aria-describedby={
+                        field.state.meta.errors.length > 0 ? "agent-token-expiry-error" : undefined
+                      }
+                    />
+                  </div>
+                )}
+              </form.Field>
+            ) : null}
+            {field.state.meta.errors.length > 0 ? (
+              <p id="agent-token-expiry-error" className="text-sm text-destructive">
+                {t("access:agents.expiryInvalid", { days: maxLifetimeDays })}
+              </p>
+            ) : null}
           </div>
         )}
       </form.Field>
-      <form.Subscribe selector={(state) => state.isSubmitting}>
-        {(isSubmitting) => (
-          <Button type="submit" size="touch" disabled={isSubmitting}>
+    </form>,
+    <form.Subscribe selector={(state) => state.isSubmitting}>
+      {(isSubmitting) => (
+        <div className="flex min-w-0 flex-wrap justify-end gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="touch"
+            disabled={isSubmitting}
+            onClick={onCancel}
+          >
+            {t("common:actions.cancel")}
+          </Button>
+          <Button type="submit" form={formId} size="touch" disabled={isSubmitting}>
             {isSubmitting ? t("access:agents.creating") : t("access:agents.create")}
           </Button>
-        )}
-      </form.Subscribe>
-    </form>
+        </div>
+      )}
+    </form.Subscribe>,
   );
 }

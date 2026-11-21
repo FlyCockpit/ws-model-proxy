@@ -47,3 +47,31 @@ describe("MCP personal-token expiry bounds", () => {
     expect(endOfLocalDay(next).getTime()).toBeGreaterThan(mcpPatClientExpiryCapMs(now.getTime()));
   });
 });
+
+describe("no-expiry agent token policy", () => {
+  it("blocks only no-expiry tokens, and fails closed unless explicitly allowed", async () => {
+    const { mcpPatBlockedByPolicy, MCP_PAT_NO_EXPIRY_BLOCKED_REASON } = await import(
+      "./mcp-pat-limits"
+    );
+    expect(MCP_PAT_NO_EXPIRY_BLOCKED_REASON).toBe("mcp_pat_no_expiry_blocked");
+    expect(mcpPatBlockedByPolicy(null, false)).toBe(true);
+    expect(mcpPatBlockedByPolicy(null, undefined)).toBe(true);
+    expect(mcpPatBlockedByPolicy(null, true)).toBe(false);
+    expect(mcpPatBlockedByPolicy(new Date(), false)).toBe(false);
+    expect(mcpPatBlockedByPolicy("2026-12-01T00:00:00.000Z", false)).toBe(false);
+  });
+
+  it("builds the live-token where fragment from the policy", async () => {
+    const { liveAgentTokenWhere } = await import("./mcp-pat-limits");
+    const now = new Date("2026-11-14T00:00:00Z");
+    expect(liveAgentTokenWhere(now, true)).toEqual({
+      revokedAt: null,
+      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+    });
+    for (const off of [false, undefined])
+      expect(liveAgentTokenWhere(now, off)).toEqual({
+        revokedAt: null,
+        OR: [{ expiresAt: { gt: now } }],
+      });
+  });
+});

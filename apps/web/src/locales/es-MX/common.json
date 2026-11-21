@@ -21,8 +21,10 @@
     "tryAgain": "Intentar de nuevo",
     "viewAll": "Ver todo"
   },
-  "appName": "{{name}}",
   "loading": "Cargando…",
   "somethingWentWrong": "Algo salió mal",
-  "welcome": "Bienvenido"
+  "welcome": "Bienvenido",
+  "fileDrop": {
+    "ignored": "Suelta los archivos en un área de carga compatible."
+  }
 }

@@ -1,0 +1,18 @@
+{
+  "updateId": "AAAAAAAAAAAAAAAAAAAAAA",
+  "origin": "cli",
+  "strategy": "self-replace",
+  "fromVersion": "0.4.3",
+  "toVersion": "1.0.0",
+  "toSha256": "92f8b4dc64b6c5b9e266b6dda352d36bd50ed797616c7270fe6b8cefec3b3e9d",
+  "livePath": "/node/bin/wsmp",
+  "prevPath": "/node/bin/wsmp.prev",
+  "failedPath": "/node/bin/wsmp.failed",
+  "rollbackAfterSecs": 90,
+  "deadline": 1900000090,
+  "deadmanAt": 1900000090,
+  "attempts": 0,
+  "phase": "swapped",
+  "reported": false,
+  "updatedAt": "2030-03-17T17:46:40Z"
+}

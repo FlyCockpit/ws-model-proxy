@@ -19,12 +19,12 @@ import { createServerFn } from "@tanstack/react-start";
  * `allowNoExpiry` mirrors the mint-time WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY contract
  * (packages/api/src/routers/mcp-tokens.ts) for the settings token panel: the
  * create dialog lists "No expiry" only while the deployment allows it. The
- * selected default is 90 days either way. The procedure still re-validates
- * at mint time — the flag here is UX pre-loading, not authorization. An
- * omitted expiresAt is 90 days; only an explicit null is no expiry.
+ * selected default is the smaller of 90 days and maxLifetimeDays. The shared env
+ * validator parses WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS as an integer from 1 to 3650
+ * (default 90). The procedure revalidates the policy at mint time.
  */
 export const getMcpWebAvailability = createServerFn({ method: "GET" }).handler(
-  async (): Promise<{ enabled: boolean; allowNoExpiry: boolean }> => {
+  async (): Promise<{ enabled: boolean; allowNoExpiry: boolean; maxLifetimeDays: number }> => {
     // Initialization failures (including the dynamic import itself —
     // R83/R84 F7) resolve to enabled: false / allowNoExpiry: false — the
     // fail-closed direction. The serverFn never leaks error internals to the
@@ -34,9 +34,10 @@ export const getMcpWebAvailability = createServerFn({ method: "GET" }).handler(
       return {
         enabled: env.WMP_MCP_ENABLED === true,
         allowNoExpiry: env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY === true,
+        maxLifetimeDays: env.WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS,
       };
     } catch {
-      return { enabled: false, allowNoExpiry: false };
+      return { enabled: false, allowNoExpiry: false, maxLifetimeDays: 90 };
     }
   },
 );

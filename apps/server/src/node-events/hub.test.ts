@@ -160,6 +160,38 @@ describe("NodeEventHub", () => {
     expect(hub.size).toBe(0);
   });
 
+  it("drops a stream whose client went away, once, alongside its own cancel", async () => {
+    const hub = new NodeEventHub();
+    const gone = open(hub, "user-1", "sess-1");
+    const kept = open(hub, "user-1", "sess-2");
+    await drain(gone.reader);
+
+    hub.drop(gone.subscriber);
+    expect(gone.subscriber.state).toBe("closed");
+    expect(await drain(gone.reader)).toBe("<closed>");
+    expect(hub.size).toBe(1);
+    hub.drop(gone.subscriber);
+    await gone.reader.cancel();
+    expect(hub.size).toBe(1);
+
+    // Cancelled first, then dropped: still counted once.
+    await kept.reader.cancel();
+    hub.drop(kept.subscriber);
+    expect(hub.size).toBe(0);
+    expect(hub.reserve({ userId: "user-1", sessionId: "sess-3" }).ok).toBe(true);
+    expect(hub.size).toBe(1);
+  });
+
+  it("drops a pending reservation so it can never open", () => {
+    const hub = new NodeEventHub();
+    const reserved = hub.reserve({ userId: "a", sessionId: "s" });
+    if (!reserved.ok) throw new Error("refused");
+    hub.drop(reserved.subscriber);
+    hub.release(reserved.subscriber);
+    expect(hub.size).toBe(0);
+    expect(hub.activate(reserved.subscriber)).toBeNull();
+  });
+
   it("pings open streams", async () => {
     vi.useFakeTimers();
     const hub = new NodeEventHub(undefined, 1000);

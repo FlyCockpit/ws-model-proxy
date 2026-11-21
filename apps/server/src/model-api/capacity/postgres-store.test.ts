@@ -723,3 +723,165 @@ describe("admission priority", () => {
     await expect(store.acquire(attempt)).rejects.toBeInstanceOf(RangeError);
   });
 });
+
+describe("waiting poll notifications", () => {
+  function pollFixture(grantOther = false) {
+    const now = new Date("2026-10-01T00:00:00Z");
+    const waiter = (id: string, sequence: bigint) => ({
+      id: `waiter-${id}`,
+      userId: "owner",
+      admissionRequestId: id,
+      capacityId: "capacity",
+      executionTargetId: "target",
+      poolId: null,
+      poolMemberId: null,
+      candidateOrder: 0,
+      effectivePriority: 1,
+      effectiveConcurrencyLimit: null,
+      effectiveConcurrencyScope: "DIRECT_TARGET",
+      effectiveConcurrencyScopeId: "target",
+      effectivePoolConcurrencyLimit: null,
+      effectiveBorrowReserved: true,
+      state: "WAITING",
+      notBefore: null,
+      deadlineAt: new Date(now.getTime() + 60_000),
+      AdmissionRequest: {
+        requestId: id,
+        attemptId: id,
+        enqueueSequence: sequence,
+        deadlineAt: new Date(now.getTime() + 60_000),
+        metricFailOpen: true,
+      },
+    });
+    const own = waiter("request", 2n);
+    const other = { ...waiter("other", 1n), executionTargetId: "target-other" };
+    const existing = {
+      id: "request",
+      state: "WAITING",
+      Lease: null,
+      Waiters: [own],
+      deadlineAt: own.deadlineAt,
+      heartbeatAt: now,
+      enqueueSequence: 2n,
+    };
+    const tx = {
+      $executeRaw: vi.fn().mockResolvedValue(0),
+      $queryRaw: vi.fn().mockResolvedValue([{ now }]),
+      admissionRequest: {
+        findUnique: vi.fn().mockResolvedValue(existing),
+        findUniqueOrThrow: vi.fn().mockResolvedValue(existing),
+        update: vi.fn().mockResolvedValue(existing),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        findMany: vi.fn().mockResolvedValue([{ id: "other", state: "WAITING", Lease: null }]),
+      },
+      capacityWaiter: {
+        count: vi.fn().mockResolvedValue(1),
+        updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+        findMany: vi.fn(
+          async (args: { distinct?: unknown; include?: unknown; select?: { id?: unknown } }) => {
+            if (args.distinct) return [];
+            if (args.include) return [other, own];
+            if (args.select?.id) return [{ id: other.id }, { id: own.id }];
+            return [];
+          },
+        ),
+      },
+      runtimeInstance: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: "capacity",
+          userId: "owner",
+          engineSlots: null,
+          Version: { concurrencyLimit: 1, engine: "VLLM" },
+        }),
+      },
+      capacityLease: {
+        findMany: vi
+          .fn()
+          .mockResolvedValue(
+            grantOther ? [] : [{ executionTargetId: "target", poolMemberId: null }],
+          ),
+      },
+      capacityScheduler: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          schedulerCursor: 16,
+          schedulerDeficits: [],
+          schedulerVersion: 1,
+          nextFencingToken: 1n,
+        }),
+        update: vi.fn().mockResolvedValue({ nextFencingToken: 2n }),
+      },
+      executionTarget: {
+        findMany: vi.fn(async (args: { where: { id?: unknown } }) =>
+          args.where.id ? [{ id: "target" }, { id: "target-other" }] : [],
+        ),
+        findUnique: vi.fn().mockResolvedValue({ instanceId: "capacity", runtimeModelId: null }),
+      },
+      poolMember: { findMany: vi.fn().mockResolvedValue([]) },
+    };
+    const client = {
+      $transaction: async (work: (client: typeof tx) => Promise<unknown>) => work(tx),
+    };
+    const notify = vi.fn().mockResolvedValue(undefined);
+    const store = new PostgresCapacityAdmissionStore(
+      client as unknown as ConstructorParameters<typeof PostgresCapacityAdmissionStore>[0],
+      "poll-unit",
+      { notify },
+    );
+    const poll = () =>
+      store.acquire({
+        requestId: "request",
+        attemptId: "request",
+        ownerId: "owner",
+        sourceKind: "TEST",
+        basePriority: 1,
+        connectionOwner: "test",
+        deadlineAt: own.deadlineAt,
+        candidates: [],
+      });
+    return { poll, notify, tx };
+  }
+
+  it("does not notify on repeated unchanged WAITING polls", async () => {
+    const { poll, notify } = pollFixture();
+    await expect(poll()).resolves.toEqual({ state: "WAITING", requestId: "request" });
+    await expect(poll()).resolves.toEqual({ state: "WAITING", requestId: "request" });
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 1, 2])(
+    "notifies when waiter expiration changes admission state in sweep %i",
+    async (sweep) => {
+      const { poll, notify, tx } = pollFixture();
+      // Before the admission pass, within its capacity sweep, and after its
+      // last-chance check respectively. A sibling remains live in every case.
+      for (let i = 0; i < sweep; i++)
+        tx.capacityWaiter.updateMany.mockResolvedValueOnce({ count: 0 });
+      tx.capacityWaiter.updateMany.mockResolvedValueOnce({ count: 1 });
+      await expect(poll()).resolves.toEqual({ state: "WAITING", requestId: "request" });
+      expect(notify).toHaveBeenCalledExactlyOnceWith(["capacity"]);
+    },
+  );
+
+  it("notifies when the admission pass removes an orphaned waiter", async () => {
+    const { poll, notify, tx } = pollFixture();
+    tx.executionTarget.findMany.mockImplementation(async (args) =>
+      args.where.id ? [{ id: "target" }] : [],
+    );
+    await expect(poll()).resolves.toEqual({ state: "WAITING", requestId: "request" });
+    expect(tx.capacityWaiter.updateMany).toHaveBeenCalledWith({
+      where: { id: "waiter-other", state: "WAITING" },
+      data: expect.objectContaining({ state: "CANCELLED" }),
+    });
+    expect(notify).toHaveBeenCalledExactlyOnceWith(["capacity"]);
+  });
+
+  it("notifies when a poll grants another request while its caller remains WAITING", async () => {
+    const { poll, notify, tx } = pollFixture(true);
+    await expect(poll()).resolves.toEqual({ state: "WAITING", requestId: "request" });
+    expect(tx.admissionRequest.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["other"] } },
+      data: { state: "ADMITTED" },
+    });
+    expect(notify).toHaveBeenCalledExactlyOnceWith(["capacity"]);
+  });
+});

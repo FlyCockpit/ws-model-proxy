@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { z } from "zod";
+import { TEST_NODE_FEATURES } from "../../../../packages/api/src/lib/node-features-test-fixture";
 
 const db = vi.hoisted(() => ({
   node: { findUnique: vi.fn(), findMany: vi.fn(), updateMany: vi.fn(async () => ({ count: 1 })) },
@@ -784,26 +784,14 @@ describe("loadNodeDefinitionState", () => {
     errors.mockRestore();
   });
 
-  describe("metric commands a released node cannot parse", () => {
+  describe("metric command dispatch", () => {
     const metric = { intervalSecs: 30, timeoutSecs: 5, format: "lines" as const };
     const stored = [
       { ...metric, name: "text", command: "nvidia-smi --query" },
       { ...metric, name: "argv", command: ["nvidia-smi", "--query"] },
-      { ...metric, name: "shell", command: "Get-Counter", shell: "pwsh" },
-      { ...metric, name: "sh", command: "uptime", shell: "sh" },
+      { ...metric, name: "shell", command: "Get-Counter", shell: "pwsh" as const },
+      { ...metric, name: "sh", command: "uptime", shell: "sh" as const },
     ];
-    /** v0.4.2's `NodeMetricCommand`: text alone, unknown fields refused (a fatal frame fault). */
-    const released = z
-      .object({
-        name: z.string(),
-        command: z.string(),
-        intervalSecs: z.number(),
-        timeoutSecs: z.number(),
-        format: z.enum(["json", "prometheus", "lines"]),
-        map: z.record(z.string(), z.unknown()).optional(),
-      })
-      .strict();
-
     function mockNodeWith(features: unknown) {
       db.node.findUnique.mockResolvedValueOnce({
         userId: "user-1",
@@ -820,31 +808,16 @@ describe("loadNodeDefinitionState", () => {
       mockRestartedInstance([]);
     }
 
-    /** What v0.4.2 reports: no `launch`. */
-    const releasedFeatures = {
-      terminals: { supported: true, max: 4, approvalRequired: false },
-      operatorTerminals: false,
-      files: { roots: null, asRoot: false, source: "default" },
-      runtimeHosts: [],
+    /** A node feature report. */
+    const features = {
+      ...TEST_NODE_FEATURES,
       mediaExpand: true,
       liveStt: true,
       secrets: [],
     };
 
-    it("sends a node without features.launch only what v0.4.2 parses, hashed as sent", async () => {
-      mockNodeWith(releasedFeatures);
-      const state = await loadNodeDefinitionState("node-1");
-      const sent = state?.node?.metricCommands;
-      expect(sent?.commands.map((command) => command.name)).toEqual(["text"]);
-      for (const command of sent?.commands ?? []) released.parse(command);
-      expect(sent?.hash).toBe(nodeMetricCommandsHash(sent?.commands ?? []));
-    });
-
-    it("sends everything to a node that reports features.launch", async () => {
-      mockNodeWith({
-        ...releasedFeatures,
-        launch: { platform: "windows", management: ["process"], shells: ["pwsh", "cmd"] },
-      });
+    it("sends text, argv and explicit-shell metrics without negotiation", async () => {
+      mockNodeWith(features);
       const state = await loadNodeDefinitionState("node-1");
       expect(state?.node?.metricCommands.commands.map((command) => command.name)).toEqual([
         "text",
@@ -852,6 +825,7 @@ describe("loadNodeDefinitionState", () => {
         "shell",
         "sh",
       ]);
+      expect(state?.node?.metricCommands.hash).toBe(nodeMetricCommandsHash(stored));
     });
   });
 

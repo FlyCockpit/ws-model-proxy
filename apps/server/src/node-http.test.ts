@@ -79,7 +79,7 @@ describe("node bootstrap HTTP", () => {
     const res = await app().hono.request("/.well-known/wsmp");
     expect(await res.json()).toEqual({
       serverVersion: SERVER_VERSION,
-      protocolVersion: "3.0",
+      protocolVersion: "4.0",
       origin: "https://proxy.example.com",
       installScript: "/install.sh",
       enrollPath: "/api/node/enroll",

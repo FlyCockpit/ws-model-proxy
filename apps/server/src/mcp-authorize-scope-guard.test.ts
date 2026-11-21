@@ -236,7 +236,7 @@ describe("mcpAuthorizeScopeGuard (flag on)", () => {
 
   it("L16: form resource — canonical LAST → forwarded byte-identical", async () => {
     const { app, getCaptured } = buildApp();
-    const body = `scope=mcp:read mcp:write&resource=${FOREIGN_PARAM}&resource=${CANONICAL_PARAM}&code_challenge=x`;
+    const body = `scope=mcp:read mcp:pools&resource=${FOREIGN_PARAM}&resource=${CANONICAL_PARAM}&code_challenge=x`;
     const res = await app.request(AUTHORIZE, {
       method: "POST",
       headers: { "content-type": FORM },
@@ -300,7 +300,7 @@ describe("mcpAuthorizeScopeGuard (flag on)", () => {
 
   it("forwards a form-encoded POST with a present scope/resource without consuming its body", async () => {
     const { app, getCaptured } = buildApp();
-    const body = `scope=mcp:read mcp:write&resource=${CANONICAL_PARAM}&client_id=abc&code_challenge=x`;
+    const body = `scope=mcp:read mcp:pools&resource=${CANONICAL_PARAM}&client_id=abc&code_challenge=x`;
     const res = await app.request(AUTHORIZE, {
       method: "POST",
       headers: { "content-type": FORM },
@@ -497,42 +497,16 @@ describe("inspectAuthorizeRequest (unit — pinned downstream semantics)", () =>
     );
   });
 
-  it("POST JSON branch (hybrid content types): scope/resource per pinned object semantics", async () => {
-    const json = (body: unknown, contentType = HYBRID_JSON) =>
-      inspect(post(contentType, JSON.stringify(body)));
-    expect(await json({ scope: "mcp:read", resource: CANONICAL })).toBe("forward");
-    expect(await json({ resource: CANONICAL })).toBe("invalid-scope");
-    expect(await json({ scope: "  ", resource: CANONICAL })).toBe("invalid-scope");
-    expect(await json({ scope: "mcp:read" })).toBe("invalid-target");
-    expect(await json({ scope: "mcp:read", resource: FOREIGN })).toBe("invalid-target");
-    expect(await json({ scope: "mcp:read", resource: [FOREIGN, CANONICAL] })).toBe("forward");
-    expect(await json({ scope: "mcp:read", resource: [FOREIGN] })).toBe("invalid-target");
-    expect(await json({ scope: ["mcp:read"], resource: CANONICAL })).toBe("forward");
-    expect(await json({ scope: "mcp:read", resource: 42 })).toBe("forward");
-    expect(await json("not-an-object")).toBe("forward");
-    expect(await json(null)).toBe("forward");
-  });
-
-  it("POST: hybrid family admitted — `+json` suffix and charset params", async () => {
-    expect(
-      await inspect(
-        post(
-          "application/x-www-form-urlencoded+json",
-          JSON.stringify({ scope: "mcp:read", resource: CANONICAL }),
-        ),
-      ),
-    ).toBe("forward");
-    expect(
-      await inspect(
-        post(
-          "application/x-www-form-urlencoded; charset=utf-8",
-          `scope=mcp:read&resource=${CANONICAL_PARAM}`,
-        ),
-      ),
-    ).toBe("forward");
-    expect(
-      await inspect(post("application/vnd.x+json+application/x-www-form-urlencoded", "null")),
-    ).toBe("forward");
+  it("POST: exact form base accepts charset parameters and casing", async () => {
+    for (const contentType of [
+      FORM,
+      `${FORM}; charset=utf-8`,
+      "Application/X-WWW-Form-Urlencoded",
+    ]) {
+      expect(await inspect(post(contentType, `scope=mcp:read&resource=${CANONICAL_PARAM}`))).toBe(
+        "forward",
+      );
+    }
   });
 
   it("POST: non-admissible content types and other methods are not applicable", async () => {
@@ -541,17 +515,15 @@ describe("inspectAuthorizeRequest (unit — pinned downstream semantics)", () =>
       "application/json; charset=utf-8",
       "multipart/form-data",
       "text/plain",
+      HYBRID_JSON,
+      "application/x-www-form-urlencoded+json",
+      "application/vnd.x+json+application/x-www-form-urlencoded",
+      "text/application/x-www-form-urlencoded",
+      "application/x-www-form-urlencoded-json",
     ]) {
       expect(await inspect(post(contentType, "scope=")), contentType).toBe("not-applicable");
     }
     expect(await inspect(post(null, "scope="))).toBe("not-applicable");
-    // Admissibility is an INCLUDES match on the base, but undici refuses to
-    // form-parse exotic non-`+` suffixes — the guard judges that LOCALLY
-    // (invalid_request) instead of forwarding (downstream formData() would
-    // throw the same TypeError as a non-APIError → 500 + raw-TypeError log).
-    expect(await inspect(post("application/x-www-form-urlencoded-json", "scope="))).toBe(
-      "invalid-request",
-    );
     expect(
       await inspect(
         new Request(url(""), {
@@ -563,37 +535,20 @@ describe("inspectAuthorizeRequest (unit — pinned downstream semantics)", () =>
     ).toBe("not-applicable");
   });
 
-  it("POST: form-admissible but unform-parseable bodies are LOCAL invalid_request (text/ hybrid)", async () => {
-    // `text/application/x-www-form-urlencoded` passes the substring
-    // allowlist; undici refuses to form-parse it (probe-verified against
-    // the installed runtime). Local 400 invalid_request — never forwarded.
-    expect(
-      await inspect(
-        post(
-          "text/application/x-www-form-urlencoded",
-          `scope=mcp:read&resource=${CANONICAL_PARAM}`,
-        ),
-      ),
-    ).toBe("invalid-request");
-    expect(
-      await inspect(post("text/application/x-www-form-urlencoded", "not-a-form-body=\xff\xfe")),
-    ).toBe("invalid-request");
-  });
-
-  it("POST: JSON-branch malformed bodies STAY forwarded (downstream SyntaxError → APIError 400)", async () => {
-    expect(await inspect(post(HYBRID_JSON, "{not json"))).toBe("not-applicable");
-  });
-
   it("middleware: form-parse failure → local 400 invalid_request, non-redirecting, downstream untouched", async () => {
     // This describe defaults the flag OFF; enable it for this middleware
     // assertion (the outer beforeEach resets it for the neighbors).
     mockEnv.WMP_MCP_ENABLED = true;
     const { app, downstream } = buildApp();
+    const parse = vi
+      .spyOn(Request.prototype, "formData")
+      .mockRejectedValueOnce(new TypeError("invalid form"));
     const res = await app.request(AUTHORIZE, {
       method: "POST",
-      headers: { "content-type": "text/application/x-www-form-urlencoded" },
+      headers: { "content-type": FORM },
       body: `scope=mcp:read&resource=${CANONICAL_PARAM}`,
     });
+    parse.mockRestore();
     expect(res.status).toBe(400);
     expect(res.headers.get("location")).toBeNull();
     expect(res.headers.get("cache-control")).toBe("no-store");
@@ -627,5 +582,89 @@ describe("inspectAuthorizeRequest (unit — pinned downstream semantics)", () =>
       expect(res.headers.get("cache-control")).toBe("no-store");
       expect(res.headers.get("location")).toBeNull();
     }
+  });
+});
+
+describe("removed OAuth scope", () => {
+  beforeEach(() => {
+    mockEnv.WMP_MCP_ENABLED = true;
+  });
+
+  it.each(["GET", "POST"])(
+    "%s refuses mcp:write locally before resource/client validation",
+    async (method) => {
+      const { app, downstream } = buildApp();
+      const params = new URLSearchParams({
+        scope: "mcp:read mcp:write offline_access",
+        redirect_uri: "https://unvalidated.example/cb",
+      });
+      const response = await app.request(method === "GET" ? `${AUTHORIZE}?${params}` : AUTHORIZE, {
+        method,
+        ...(method === "POST" ? { headers: { "content-type": FORM }, body: params } : {}),
+      });
+      expect(response.status).toBe(400);
+      expect(response.headers.get("location")).toBeNull();
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(await response.json()).toEqual({
+        error: "invalid_scope",
+        error_description:
+          "mcp:write was removed in wsmp 1.0. Request mcp:read plus the scopes you need: mcp:pools, mcp:runtimes, mcp:nodes:manage, mcp:commands, mcp:files, mcp:models:test.",
+      });
+      expect(downstream).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["mcp:write", " mcp:write ", "mcp:read  mcp:write"])(
+    "matches exact ASCII-space-separated tokens: %s",
+    async (scope) => {
+      expect(
+        await inspect(
+          new Request(`${BASE}${AUTHORIZE}?${new URLSearchParams({ scope, resource: CANONICAL })}`),
+        ),
+      ).toBe("removed-scope");
+    },
+  );
+
+  it.each(["MCP:WRITE", "mcp:write:extra", "mcp:write\t", "mcp:read\tmcp:write"])(
+    "forwards other literal tokens unchanged: %s",
+    async (scope) => {
+      expect(
+        await inspect(
+          new Request(`${BASE}${AUTHORIZE}?${new URLSearchParams({ scope, resource: CANONICAL })}`),
+        ),
+      ).toBe("forward");
+    },
+  );
+
+  it("keeps POST last-value semantics in both directions", async () => {
+    for (const [first, last, decision] of [
+      ["mcp:write", "mcp:read", "forward"],
+      ["mcp:read", "mcp:write", "removed-scope"],
+    ]) {
+      expect(
+        await inspect(
+          new Request(`${BASE}${AUTHORIZE}`, {
+            method: "POST",
+            headers: { "content-type": FORM },
+            body: `scope=${first}&scope=${last}&resource=${CANONICAL_PARAM}`,
+          }),
+        ),
+      ).toBe(decision);
+    }
+  });
+
+  it("leaves duplicate GET scopes and unsupported media types to downstream validation", async () => {
+    expect(await inspect(new Request(`${BASE}${AUTHORIZE}?scope=mcp:write&scope=mcp:read`))).toBe(
+      "forward",
+    );
+    expect(
+      await inspect(
+        new Request(`${BASE}${AUTHORIZE}`, {
+          method: "POST",
+          headers: { "content-type": HYBRID_JSON },
+          body: "scope=mcp:write",
+        }),
+      ),
+    ).toBe("not-applicable");
   });
 });

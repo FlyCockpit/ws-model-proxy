@@ -629,8 +629,31 @@ describe("createApp readiness probe — GET /ready through the real route (#79 i
     expect(await res.json()).toEqual({
       ok: true,
       degraded: false,
+      commit: null,
       checks: { postgres: true, userDeletionSweep: "not_running" },
     });
+  });
+
+  it("reports the build's commit only when BUILD_VERSION is a full 40-hex SHA", async () => {
+    prismaMock.$queryRaw.mockResolvedValue([{ "?column?": 1 }]);
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    try {
+      for (const [buildVersion, commit] of [
+        [sha, sha],
+        ["wt-fa1c7aad-84e64fde104f", null],
+        ["v1.0.0", null],
+        [sha.toUpperCase(), null],
+        [`${sha}0`, null],
+      ] as const) {
+        Object.assign(envMock, { BUILD_VERSION: buildVersion });
+        const app = await buildApp(true);
+        const res = await app.request(`${BASE}/ready`);
+        expect(res.status).toBe(200);
+        expect(((await res.json()) as { commit: unknown }).commit).toBe(commit);
+      }
+    } finally {
+      Reflect.deleteProperty(envMock, "BUILD_VERSION");
+    }
   });
 
   it("Postgres up, sweep failing: still 200, but degraded with the coarse sweep state", async () => {
@@ -643,6 +666,7 @@ describe("createApp readiness probe — GET /ready through the real route (#79 i
       expect(await res.json()).toEqual({
         ok: true,
         degraded: true,
+        commit: null,
         checks: { postgres: true, userDeletionSweep: "failing" },
       });
     } finally {
@@ -669,6 +693,7 @@ describe("createApp readiness probe — GET /ready through the real route (#79 i
       expect(JSON.parse(text)).toEqual({
         ok: false,
         degraded: false,
+        commit: null,
         checks: { postgres: false, userDeletionSweep: "failing" },
       });
       // No error detail from the failed check reaches the unauthenticated body.

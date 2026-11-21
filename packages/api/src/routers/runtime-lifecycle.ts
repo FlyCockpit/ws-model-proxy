@@ -1,3 +1,4 @@
+import { assertAgentInstanceNodes, assertAgentOwnedNodes } from "../lib/agent-node-access";
 /**
  * `runtimes.start` / `runtimes.stop`: placement preview, the people-echo-the-fingerprint rule
  * (D13) and the agent trust rule (agents act only on Full-control nodes, `trust_relay`).
@@ -20,7 +21,7 @@ import {
   type previewWarningSchema,
   type startPreviewSchema,
 } from "../contracts/runtimes";
-import { callerActor } from "../lib/caller-actor";
+import { assertAgentNode, assertAgentScope, callerActor } from "../lib/caller-actor";
 import { canonicalJson } from "../lib/canonical-json";
 import { graphWrite, instanceCapacityFences } from "../lib/graph-write";
 import {
@@ -69,6 +70,9 @@ async function computeStart(
   input: StartInput,
 ): Promise<Computed> {
   const userId = context.session.user.id;
+  assertAgentScope(context.auth, "runtimes");
+  for (const nodeId of input.nodeIds ?? []) assertAgentNode(context.auth, nodeId);
+  await assertAgentOwnedNodes(db, context.auth, input.nodeIds ?? []);
   const agent = agentRulesApply(context.auth);
   const runtime = await db.runtime.findFirst({
     where: { id: input.runtimeId, userId },
@@ -100,7 +104,16 @@ async function computeStart(
       message: "This version has no launch (spec.launch) to start.",
     });
 
-  const planner = new PlacementPlanner(await loadPlacementContext(db, { userId, agent }));
+  const planner = new PlacementPlanner(
+    await loadPlacementContext(db, {
+      userId,
+      agent,
+      nodeIds:
+        context.auth.kind === "agent_token" || context.auth.kind === "oauth_access_token"
+          ? context.auth.access.nodeIds
+          : null,
+    }),
+  );
   const refusals: Refusal[] = [];
   const warnings: Warning[] = [];
   const starts: StartPreview["starts"] = [];
@@ -151,6 +164,7 @@ async function computeStart(
       },
     });
     if (!instance) throw notFound("That instance does not exist.");
+    await assertAgentInstanceNodes(db, context.auth, userId, instance);
     restart = { instanceId: instance.id };
     // An agent's restart reaches every node the instance holds now (the leading stop acts on the
     // old launch, its ranks and reservations, a replaced run's included, and the nodes a launch
@@ -286,6 +300,7 @@ export const runtimeStart = contractProcedure(c.start).handler(async ({ input, c
   const person = isHumanCaller(context.auth);
   if (person && !input.fingerprint)
     throw refuse("preview_required", "Preview the start first, then confirm it.");
+  assertAgentScope(context.auth, "runtimes");
   const actor = callerActor(context.auth, userId);
   // The plan is computed under the owner fence (so no other graph write of this user lands
   // between plan and write), then the capacity fences of every instance it changes are taken:
@@ -340,6 +355,8 @@ export const runtimeStart = contractProcedure(c.start).handler(async ({ input, c
 });
 
 export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, context }) => {
+  if ("nodeId" in input && input.nodeId)
+    assertAgentNode(context.auth, input.nodeId, "Nothing of this runtime is running there.");
   const userId = context.session.user.id;
   const where =
     "instanceId" in input
@@ -390,6 +407,7 @@ async function stopInstancesWhere(
   where: Prisma.RuntimeInstanceWhereInput,
   allowed?: (tx: Prisma.TransactionClient) => Promise<boolean>,
 ): Promise<string | null> {
+  assertAgentScope(context.auth, "runtimes");
   const actor = callerActor(context.auth, userId);
   // Read, check and write under the owner fence, so a trust lowering (an owner write) cannot
   // land in between and let an agent's stop through; then the capacity fences of the stops.
@@ -431,6 +449,7 @@ async function stopInstancesWhere(
       // launch that may still run names.
       if (agentRulesApply(context.auth))
         for (const instance of instances) {
+          await assertAgentInstanceNodes(tx, context.auth, userId, instance);
           const blocked = await agentBlockedNodeWithCleanup(tx, userId, instance);
           if (blocked)
             throw refuseAbout("trust_relay", blocked.nodeId ?? instance.id, TRUST_RELAY_MESSAGE);

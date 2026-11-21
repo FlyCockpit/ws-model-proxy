@@ -142,7 +142,7 @@ export const instanceRankViewSchema = z
      * STOPPED instance): `proven` false means the node could not confirm the process is gone,
      * and `errorCode` says why (`port_in_use`, `port_held_outside_runtime`, `process_alive`,
      * `process_unknown`, `status_running`, `status_unknown`, `unowned_service`; `not_stopped`
-     * from older nodes). Null when none ran.
+     * when no more specific stop detail is available). Null when none ran.
      */
     lastStopCheck: z
       .object({ at: isoDateSchema, proven: z.boolean(), errorCode: z.string().nullable() })
@@ -582,14 +582,14 @@ export const runtimesContract = {
     "agent",
     noInputSchema,
     z.object({ runtimes: z.array(runtimeSummarySchema) }).strict(),
-    "Your runtimes with current version and instance counts.",
+    "Your runtimes with current version and instance counts. Allowlisted agents exclude instances with a rank or reservation on a hidden node.",
     ["runtimes_get"],
   ),
   get: query(
     "agent",
     z.object({ runtimeId: idSchema }).strict(),
     runtimeDetailSchema,
-    "One runtime: current version (limits with sources), served models, instances, shares, contributions.",
+    "One runtime: current version (limits with sources), served models, instances, shares, contributions. Allowlisted agents see matching instance rows and counts excluding hidden nodes.",
     ["runtimes_get"],
   ),
   versions: {

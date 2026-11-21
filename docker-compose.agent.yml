@@ -16,7 +16,7 @@ services:
     profiles: [dev, prod]
 
   mailpit:
-    image: axllent/mailpit:v1.21
+    image: axllent/mailpit:v1.33.0
     environment:
       MP_SMTP_AUTH_ACCEPT_ANY: "true"
       MP_SMTP_AUTH_ALLOW_INSECURE: "true"
@@ -59,7 +59,10 @@ services:
         set -e
         pnpm install --frozen-lockfile --ignore-scripts
         pnpm -F @ws-model-proxy/db exec prisma generate
-        pnpm -F @ws-model-proxy/db db:push
+        # migration.sql only: scheduled deletions (contract.sql) and the
+        # runner-owned _wmp_* tables are production-runner concerns
+        # (docs/schema-migrations.md § Expand and contract).
+        pnpm -F @ws-model-proxy/db exec prisma migrate deploy
         exec pnpm dev:raw
     volumes:
       - ./:/app
@@ -103,7 +106,9 @@ services:
       SERVER_PORT: "3000"
       # The browser reaches the container through the published port, no proxy.
       TRUST_PROXY_HOPS: "0"
-      APPLY_SCHEMA: safe
+      # The image migrates on start (MIGRATE_ON_START defaults to true for the
+      # server) and this Postgres has no volume, so each `up` applies every
+      # migration to an empty database.
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${WEB_PORT:-3001}:3000"
     depends_on:

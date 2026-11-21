@@ -1,5 +1,6 @@
 import { Dialog as DialogPrimitive } from "@base-ui/react/dialog";
 import { Button } from "@ws-model-proxy/ui/components/button";
+import { useUiLabels } from "@ws-model-proxy/ui/components/ui-labels";
 
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { XIcon } from "lucide-react";
@@ -38,10 +39,14 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  closeLabel,
   ...props
 }: DialogPrimitive.Popup.Props & {
   showCloseButton?: boolean;
+  closeLabel?: string;
 }) {
+  const labels = useUiLabels();
+  const label = closeLabel ?? labels.close;
   return (
     <DialogPortal>
       <DialogOverlay />
@@ -57,10 +62,16 @@ function DialogContent({
         {showCloseButton && (
           <DialogPrimitive.Close
             data-slot="dialog-close"
-            render={<Button variant="ghost" className="absolute top-2 right-2" size="icon-sm" />}
+            render={
+              <Button
+                variant="ghost"
+                className="absolute top-2 right-2 after:absolute after:-inset-2 after:content-['']"
+                size="icon-sm"
+              />
+            }
           >
             <XIcon />
-            <span className="sr-only">Close</span>
+            <span className="sr-only">{label}</span>
           </DialogPrimitive.Close>
         )}
       </DialogPrimitive.Popup>

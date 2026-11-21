@@ -164,7 +164,15 @@ beforeEach(() => {
   marks = [];
   dispatched = [];
   hooks = {};
-  store.tables.node.push(nodeRow({ userId: OWNER, features: { selfUpdate: { ...SELF_UPDATE } } }));
+  store.tables.node.push(
+    nodeRow({
+      userId: OWNER,
+      features: {
+        ...(nodeRow().features as Record<string, unknown>),
+        selfUpdate: { ...SELF_UPDATE },
+      },
+    }),
+  );
 });
 
 const turnOff = async () => {
@@ -175,7 +183,10 @@ const optOutLive = () => {
 };
 const optOutStored = () => {
   Object.assign(store.tables.node[0] ?? {}, {
-    features: { selfUpdate: { ...SELF_UPDATE, remote: "off" } },
+    features: {
+      ...(nodeRow().features as Record<string, unknown>),
+      selfUpdate: { ...SELF_UPDATE, remote: "off" },
+    },
   });
 };
 const lowerTrust = () => {

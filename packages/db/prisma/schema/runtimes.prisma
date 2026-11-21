@@ -310,10 +310,9 @@ model RuntimeInstance {
   phaseReason                 String?
   /// The instance's current run (`packages/api/src/lib/instance-run.ts`): the step generation
   /// that owns its claims. Every restart begins a new run in the transaction that commits it, so
-  /// steps of an earlier run are never dispatched and their answers change nothing. 0: a row
-  /// written before runs existed; it is bootstrapped from its steps on first touch. Monotonic,
-  /// and every new step's generation equals it (`instance_run_order`).
-  runGeneration               Int                 @default(0)
+  /// steps of an earlier run are never dispatched and their answers change nothing. Positive
+  /// and monotonic; every new step's generation equals it (`instance_run_order`).
+  runGeneration               Int                 @default(1)
   /// When the stop reconciler last took this STOPPING instance (null: never). A pass takes the
   /// least recently taken first, so every stopping instance is reached however many there are.
   lastStopReconcileAt         DateTime?

@@ -6,6 +6,9 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
+const policy = vi.hoisted(() => ({ env: { WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: true as boolean } }));
+vi.mock("@ws-model-proxy/env/server", () => ({ env: policy.env }));
+
 const live = vi.hoisted(() => ({ getLiveNodeState: vi.fn() }));
 vi.mock("./session-manager.js", () => ({ relaySessionManager: live }));
 
@@ -16,12 +19,14 @@ const {
   readNodeAgentAccess,
   resetNodeAgentAccessForTests,
   revokeOpenNodeAgentAccess,
+  narrowOpenNodeAgentAccess,
   revokeOpenNodeAgentAccessForUser,
 } = await import("./node-access.js");
 
 const db = prisma as unknown as {
   node: { findUnique: MockInstance };
   agentToken: { findFirst: MockInstance };
+  mcpGrant: { findFirst: MockInstance; findUnique: MockInstance };
   user: { findUnique: MockInstance };
 };
 
@@ -49,7 +54,16 @@ describe("node agent access", () => {
       trustLowerRequestedAt: null,
       rejectedProtocolVersion: null,
     });
-    db.agentToken.findFirst.mockResolvedValue({ name: "agent", expiresAt: null });
+    db.agentToken.findFirst.mockResolvedValue({
+      name: "agent",
+      expiresAt: null,
+      grantId: "grant-1",
+    });
+    db.mcpGrant.findFirst.mockResolvedValue({
+      scopes: ["READ", "COMMANDS", "FILES"],
+      allNodes: true,
+      Nodes: [],
+    });
     db.user.findUnique.mockResolvedValue({
       banned: false,
       banExpires: null,
@@ -59,22 +73,65 @@ describe("node agent access", () => {
   });
 
   async function verdict(capability: "command" | "file_read" | "file_write" = "file_read") {
-    return judgeNodeAgentAccess(await readNodeAgentAccess(input), capability);
+    return judgeNodeAgentAccess(await readNodeAgentAccess(input, capability), capability);
   }
 
-  it("admits a FULL token on a Full-control node with file roots", async () => {
+  it("admits a scoped token on a Full-control node with file roots", async () => {
     await expect(verdict()).resolves.toMatchObject({ ok: true, fileRoots: ["/home/me"] });
     expect(db.agentToken.findFirst).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
           id: "tok-1",
           userId: "user-1",
-          level: "FULL",
+          grant: { revokedAt: null, userId: "user-1" },
           revokedAt: null,
         }),
       }),
     );
     expect(openNodeAgentAccessCountForTests()).toBe(0);
+  });
+
+  it("excludes no-expiry tokens from the live-token read only while no-expiry tokens are off", async () => {
+    await verdict();
+    expect(db.agentToken.findFirst.mock.calls.at(-1)?.[0]?.where?.OR).toEqual([
+      { expiresAt: null },
+      { expiresAt: { gt: expect.any(Date) } },
+    ]);
+    try {
+      policy.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = false;
+      await verdict();
+      expect(db.agentToken.findFirst.mock.calls.at(-1)?.[0]?.where?.OR).toEqual([
+        { expiresAt: { gt: expect.any(Date) } },
+      ]);
+    } finally {
+      policy.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = true;
+    }
+  });
+
+  it("re-judges the policy in the synchronous verdict: a flip during the owner read refuses", async () => {
+    try {
+      db.user.findUnique.mockImplementationOnce(async () => {
+        policy.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = false;
+        return { banned: false, banExpires: null, deletionRequestedAt: null };
+      });
+      await expect(verdict()).resolves.toEqual({ ok: false, error: "token_inactive" });
+      // A dated token is not affected by the flag.
+      db.agentToken.findFirst.mockResolvedValueOnce({
+        name: "agent",
+        expiresAt: new Date(Date.now() + 86_400_000),
+        grantId: "grant-1",
+      });
+      await expect(verdict()).resolves.toMatchObject({ ok: true });
+      // OAuth grants are never agent tokens.
+      expect(
+        judgeNodeAgentAccess(
+          await readNodeAgentAccess({ ...input, credentialKind: "oauth_grant" }, "file_read"),
+          "file_read",
+        ),
+      ).toMatchObject({ ok: true });
+    } finally {
+      policy.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = true;
+    }
   });
 
   it("refuses an inactive token, a foreign node and a blocked owner", async () => {
@@ -88,6 +145,55 @@ describe("node agent access", () => {
       deletionRequestedAt: null,
     });
     await expect(verdict()).resolves.toEqual({ ok: false, error: "token_inactive" });
+  });
+
+  it.each(["command", "file_read", "file_write"] as const)(
+    "refuses %s on another user's node even when reachable through a shared pool",
+    async (capability) => {
+      db.node.findUnique.mockResolvedValueOnce({ id: "node-1", userId: "pool-owner" });
+      await expect(verdict(capability)).resolves.toEqual({ ok: false, error: "unknown_node" });
+    },
+  );
+
+  it.each(["command", "file_read"] as const)(
+    "refuses %s on a node outside its live list",
+    async (capability) => {
+      db.mcpGrant.findFirst.mockResolvedValueOnce({
+        scopes: ["READ", "COMMANDS", "FILES"],
+        allNodes: false,
+        Nodes: [{ nodeId: "other-node" }],
+      });
+      await expect(verdict(capability)).resolves.toEqual({ ok: false, error: "unknown_node" });
+    },
+  );
+
+  it.each(["command", "file_read"] as const)(
+    "refuses %s after its required live scope was removed",
+    async (capability) => {
+      db.mcpGrant.findFirst.mockResolvedValueOnce({ scopes: ["READ"], allNodes: true, Nodes: [] });
+      await expect(verdict(capability)).resolves.toEqual({ ok: false, error: "token_inactive" });
+    },
+  );
+
+  it("narrowing fences only admissions outside the new scope or node set", async () => {
+    const reads = await readNodeAgentAccess(input, "file_read");
+    narrowOpenNodeAgentAccess(input.tokenId, {
+      scopes: ["read", "files"],
+      nodeIds: [input.nodeId],
+    });
+    expect(judgeNodeAgentAccess(reads, "file_read")).toMatchObject({ ok: true });
+    const removedNode = await readNodeAgentAccess(input, "file_read");
+    narrowOpenNodeAgentAccess(input.tokenId, { scopes: ["read", "files"], nodeIds: [] });
+    expect(judgeNodeAgentAccess(removedNode, "file_read")).toEqual({
+      ok: false,
+      error: "token_inactive",
+    });
+    const removedScope = await readNodeAgentAccess(input, "command");
+    narrowOpenNodeAgentAccess(input.tokenId, { scopes: ["read", "files"], nodeIds: null });
+    expect(judgeNodeAgentAccess(removedScope, "command")).toEqual({
+      ok: false,
+      error: "token_inactive",
+    });
   });
 
   it("refuses Relay only: stored, pending lowering, or live", async () => {

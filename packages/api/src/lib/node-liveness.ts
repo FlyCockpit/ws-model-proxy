@@ -46,6 +46,11 @@ export function nodeIsLive(node: NodeLivenessRow | null | undefined, now: Date):
   return !!node && nodeLiveness(node, now).state === "online";
 }
 
+/** The connection a reader shows: ONLINE only while live; a stale ONLINE row reads OFFLINE. */
+export function liveConnection(node: NodeLivenessRow, now: Date): "ONLINE" | "OFFLINE" {
+  return nodeIsLive(node, now) ? "ONLINE" : "OFFLINE";
+}
+
 /**
  * Since when the node has been unreachable, or null while it is live: an OFFLINE row since its
  * disconnect (the epoch when none was recorded: as long ago as can be), a stale one since its

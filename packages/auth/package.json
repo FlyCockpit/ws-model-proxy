@@ -1,5 +1,6 @@
 {
   "name": "@ws-model-proxy/auth",
+  "private": true,
   "type": "module",
   "exports": {
     ".": {
@@ -16,6 +17,9 @@
     },
     "./force-two-factor-policy": {
       "default": "./src/force-two-factor-policy.ts"
+    },
+    "./agent-scopes": {
+      "default": "./src/agent-scopes.ts"
     },
     "./mcp-config": {
       "default": "./src/mcp-config.ts"
@@ -35,8 +39,8 @@
     "./mcp-grant": {
       "default": "./src/mcp-grant.ts"
     },
-    "./mcp-grant-level": {
-      "default": "./src/mcp-grant-level.ts"
+    "./mcp-grant-access": {
+      "default": "./src/mcp-grant-access.ts"
     },
     "./user-deletion-listeners": {
       "default": "./src/user-deletion-listeners.ts"

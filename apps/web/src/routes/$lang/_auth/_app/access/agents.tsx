@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
+import type { AgentScope } from "@ws-model-proxy/api/contracts";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -13,16 +14,15 @@ import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { Bot, Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-
-import type { AgentLevel } from "@/components/access/agent-level-choice";
+import { AgentAccessSummary } from "@/components/access/agent-access-choice";
 import { ConfirmAction } from "@/components/access/confirm-action";
 import { CreateAgentTokenDialog } from "@/components/access/create-agent-token-dialog";
 import { CredentialDatesList, CredentialStatusBadge } from "@/components/access/credential-meta";
 import { credentialStatus } from "@/components/access/credential-meta-utils";
+import { EditAgentAccessDialog } from "@/components/access/edit-agent-access-dialog";
 import { CodeSnippet } from "@/components/code-snippet";
 import { InlineRetry } from "@/components/inline-retry";
 import { PageHeading } from "@/components/page-stub";
-import { SegmentedControl } from "@/components/segmented-control";
 import { TimeAgo } from "@/components/time-ago";
 import { orpc } from "@/utils/orpc";
 
@@ -33,7 +33,8 @@ export const Route = createFileRoute("/$lang/_auth/_app/access/agents")({
 type AgentTokenView = {
   id: string;
   name: string;
-  level: AgentLevel;
+  scopes: AgentScope[];
+  nodeIds: string[] | null;
   lookupPrefix: string;
   createdAt: string;
   lastUsedAt: string | null;
@@ -54,7 +55,7 @@ function AccessAgentsPage() {
         <Skeleton aria-hidden="true" className="h-20 w-full rounded-xl" />
       ) : tokens.isError ? null : (
         <Card>
-          <CardContent className="min-w-0 space-y-1.5">
+          <CardContent className="min-w-0 flex-1 space-y-1.5">
             <p className="text-sm font-medium">{t("access:agents.mcpUrl")}</p>
             <CodeSnippet code={tokens.data.mcpUrl} copyLabel={t("access:agents.copyMcpUrl")} />
             <p className="text-xs text-muted-foreground">{t("access:agents.mcpHint")}</p>
@@ -63,7 +64,7 @@ function AccessAgentsPage() {
       )}
       <Card>
         <CardHeader className="flex min-w-0 flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0 space-y-1.5">
+          <div className="min-w-0 flex-1 space-y-1.5">
             <CardTitle>{t("access:agents.tokensTitle")}</CardTitle>
             <CardDescription>{t("access:agents.tokensDescription")}</CardDescription>
           </div>
@@ -116,19 +117,11 @@ function TokenList({ tokens }: { tokens: AgentTokenView[] }) {
   );
 }
 
-function LevelBadge({ level }: { level: AgentLevel }) {
-  const { t } = useTranslation(["access"]);
-  return (
-    <span className="inline-flex shrink-0 items-center rounded-full bg-muted px-2 py-0.5 text-xs">
-      {level === "FULL" ? t("access:agents.levelFull") : t("access:agents.levelRead")}
-    </span>
-  );
-}
-
 function TokenRow({ token, now }: { token: AgentTokenView; now: number }) {
   const { t } = useTranslation(["access"]);
   const queryClient = useQueryClient();
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
   const revoke = useMutation(
     orpc.access.agentTokens.revoke.mutationOptions({
       onSuccess: async () => {
@@ -138,28 +131,51 @@ function TokenRow({ token, now }: { token: AgentTokenView; now: number }) {
       },
     }),
   );
+  const setAccess = useMutation(
+    orpc.access.agentTokens.setAccess.mutationOptions({
+      onSuccess: () => {
+        toast.success(t("access:agents.accessChanged"));
+      },
+      onSettled: () =>
+        queryClient.invalidateQueries({ queryKey: orpc.access.agentTokens.list.key() }),
+    }),
+  );
   const status = credentialStatus(token, now);
   return (
     <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-      <div className="min-w-0 space-y-1.5">
+      <div className="min-w-0 flex-1 space-y-1.5">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <span className="truncate font-medium">{token.name}</span>
-          <LevelBadge level={token.level} />
           <CredentialStatusBadge status={status} />
         </div>
+        <AgentAccessSummary scopes={token.scopes} nodeIds={token.nodeIds} />
         <p className="break-all font-mono text-xs text-muted-foreground">{token.lookupPrefix}…</p>
         <CredentialDatesList row={token} />
+        {status === "blocked" ? (
+          <p data-policy-notice="" className="text-xs text-destructive">
+            {t("access:agents.blockedByPolicy")}
+          </p>
+        ) : null}
       </div>
-      {status !== "revoked" ? (
-        <Button
-          type="button"
-          variant="outline"
-          size="touch"
-          className="self-start"
-          onClick={() => setConfirmOpen(true)}
-        >
-          {t("access:revoke.action")}
-        </Button>
+      <div className="flex min-w-0 flex-wrap gap-2 self-start">
+        {status === "active" ? (
+          <Button type="button" variant="outline" size="touch" onClick={() => setEditOpen(true)}>
+            {t("access:agents.edit")}
+          </Button>
+        ) : null}
+        {status !== "revoked" ? (
+          <Button type="button" variant="outline" size="touch" onClick={() => setConfirmOpen(true)}>
+            {t("access:revoke.action")}
+          </Button>
+        ) : null}
+      </div>
+      {editOpen ? (
+        <EditAgentAccessDialog
+          name={token.name}
+          access={{ scopes: token.scopes, nodeIds: token.nodeIds }}
+          onClose={() => setEditOpen(false)}
+          onSave={(access) => setAccess.mutateAsync({ agentTokenId: token.id, ...access })}
+        />
       ) : null}
       <ConfirmAction
         open={confirmOpen}
@@ -216,15 +232,16 @@ function OAuthRow({
     grantId: string;
     clientName: string | null;
     redirectHost: string | null;
-    level: AgentLevel;
-    fullAvailable: boolean;
+    scopes: AgentScope[];
+    nodeIds: string[] | null;
+    availableScopes: AgentScope[];
     createdAt: string;
   };
 }) {
   const { t } = useTranslation(["access"]);
   const queryClient = useQueryClient();
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [confirmFullOpen, setConfirmFullOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
   const name = connection.clientName ?? t("access:agents.unnamedClient");
   const revoke = useMutation(
     orpc.access.oauthGrants.revoke.mutationOptions({
@@ -235,66 +252,44 @@ function OAuthRow({
       },
     }),
   );
-  // A failure is toasted by the global mutation error handler; the list stays the truth.
-  const setLevel = useMutation(
-    orpc.access.oauthGrants.setLevel.mutationOptions({
-      onSuccess: async () => {
-        setConfirmFullOpen(false);
-        toast.success(t("access:agents.levelChanged"));
+  const setAccess = useMutation(
+    orpc.access.oauthGrants.setAccess.mutationOptions({
+      onSuccess: () => {
+        toast.success(t("access:agents.accessChanged"));
       },
       onSettled: () =>
         queryClient.invalidateQueries({ queryKey: orpc.access.oauthGrants.list.key() }),
     }),
   );
-  const chooseLevel = (next: AgentLevel) => {
-    if (next === connection.level || setLevel.isPending) return;
-    // Raising gives the agent write access: say what Full allows first. Lowering is immediate.
-    if (next === "FULL") setConfirmFullOpen(true);
-    else setLevel.mutate({ grantId: connection.grantId, level: next });
-  };
-  // Without mcp:write in its approval the agent can never act at Full: nothing to raise to
-  // (a Full grant from before stays lowerable).
-  const levelLocked = !connection.fullAvailable && connection.level === "READ";
   return (
     <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-      <div className="min-w-0 space-y-1">
+      <div className="min-w-0 flex-1 space-y-1">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <span className="truncate font-medium">{name}</span>
-          <LevelBadge level={connection.level} />
         </div>
         <p className="text-xs text-muted-foreground">
           {connection.redirectHost ? `${connection.redirectHost} · ` : null}
           <TimeAgo value={connection.createdAt} />
         </p>
-        {levelLocked ? (
-          <p className="text-xs text-muted-foreground">{t("access:agents.fullUnavailable")}</p>
-        ) : null}
+        <AgentAccessSummary scopes={connection.scopes} nodeIds={connection.nodeIds} />
       </div>
       <div className="flex min-w-0 flex-wrap items-center gap-2 self-start sm:self-center">
-        {levelLocked ? null : (
-          <SegmentedControl
-            value={connection.level}
-            onChange={chooseLevel}
-            ariaLabel={t("access:agents.levelFor", { name })}
-            items={[
-              { value: "READ", label: t("access:agents.levelRead") },
-              { value: "FULL", label: t("access:agents.levelFull") },
-            ]}
-          />
-        )}
+        <Button type="button" variant="outline" size="touch" onClick={() => setEditOpen(true)}>
+          {t("access:agents.edit")}
+        </Button>
         <Button type="button" variant="outline" size="touch" onClick={() => setConfirmOpen(true)}>
           {t("access:agents.disconnect")}
         </Button>
       </div>
-      <ConfirmAction
-        open={confirmFullOpen}
-        onOpenChange={setConfirmFullOpen}
-        title={t("access:agents.raiseTitle", { name })}
-        description={t("access:agents.levelFullHint")}
-        confirmLabel={t("access:agents.raiseConfirm")}
-        isPending={setLevel.isPending}
-        onConfirm={() => setLevel.mutate({ grantId: connection.grantId, level: "FULL" })}
-      />
+      {editOpen ? (
+        <EditAgentAccessDialog
+          name={name}
+          access={{ scopes: connection.scopes, nodeIds: connection.nodeIds }}
+          availableScopes={connection.availableScopes}
+          onClose={() => setEditOpen(false)}
+          onSave={(access) => setAccess.mutateAsync({ grantId: connection.grantId, ...access })}
+        />
+      ) : null}
       <ConfirmAction
         open={confirmOpen}
         onOpenChange={setConfirmOpen}

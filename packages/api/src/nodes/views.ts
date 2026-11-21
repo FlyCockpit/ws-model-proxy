@@ -13,6 +13,7 @@ import type {
   nodeSummarySchema,
   queuedCommandViewSchema,
 } from "../contracts/nodes";
+import { liveConnection } from "../lib/node-liveness";
 import {
   CURRENT_RESERVATION_WHERE,
   HOLDING_RESERVATION_WHERE,
@@ -133,7 +134,7 @@ export function toNodeSummary(row: NodeSummaryRow, now: Date): NodeSummary {
     id: row.id,
     slug: row.slug,
     name: row.name,
-    connection: row.connection,
+    connection: liveConnection(row, now),
     lastHeartbeatAt: row.lastHeartbeatAt?.toISOString() ?? null,
     version: row.cliVersion,
     rejectedProtocolVersion: row.rejectedProtocolVersion,
@@ -176,7 +177,8 @@ export function toNodeListRow(row: NodeListSelected, now: Date): NodeListRow {
     heldClaims: heldClaimsOf(row),
     now,
   });
-  const features = nodeFeaturesSchema.safeParse(row.features);
+  // Stored reports may retain retired top-level fields; live relay reports stay strict.
+  const features = nodeFeaturesSchema.strip().safeParse(row.features);
   return {
     ...toNodeSummary(row, now),
     hostname: row.hostname,
@@ -408,7 +410,8 @@ export function toNodeDetail(
     })),
   };
   const summary = toNodeSummary({ ...row, ...held }, now);
-  const features = nodeFeaturesSchema.safeParse(row.features);
+  // Project current fields from stored reports without rejecting retired top-level fields.
+  const features = nodeFeaturesSchema.strip().safeParse(row.features);
   const declared = declaredHardwareSchema.safeParse(row.declaredResources);
   const metricCommands = nodeMetricCommandsSchema.safeParse(row.metricCommands);
 

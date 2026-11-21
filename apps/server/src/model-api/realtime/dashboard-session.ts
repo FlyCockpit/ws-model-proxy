@@ -7,7 +7,7 @@ import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-ac
  * Better Auth session row exists, belongs to the user and has not expired
  * (sign-out and session revocation delete it), the user has no active ban or
  * pending deletion, and, while the force-2FA policy is on, the user is
- * enrolled (the dashboard's `protectedProcedure` rule). The same rules as the
+ * enrolled (the dashboard's `session` contract access rule). The same rules as the
  * browser terminal socket's admission and recheck. A read that throws
  * propagates: the caller refuses the upgrade or skips one recheck sweep.
  */

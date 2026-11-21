@@ -2,6 +2,7 @@ import { createRouterClient, ORPCError } from "@orpc/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDeep, mockReset } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
+import { TEST_NODE_FEATURES } from "../lib/node-features-test-fixture";
 
 vi.mock("@ws-model-proxy/db", () => ({
   default: mockDeep<PrismaClient>(),
@@ -121,6 +122,7 @@ function runtimeRow(overrides: Record<string, unknown> = {}) {
 function nodeRow(overrides: Record<string, unknown> = {}) {
   return {
     id: "node-1",
+    userId: OWNER,
     slug: "box",
     trust: "FULL" as const,
     trustLowerRequestedAt: null,
@@ -132,6 +134,7 @@ function nodeRow(overrides: Record<string, unknown> = {}) {
     trustChangedAt: null,
     heldDefinitions: [],
     declaredResources: { kind: "unified", memoryGb: 66 },
+    features: TEST_NODE_FEATURES,
     nodeInfo: null,
     nodeMetrics: null,
     nodeMetricsAt: null,
@@ -502,7 +505,7 @@ describe("runtimes.update", () => {
       updateRow({
         kind: "ALWAYS_ON",
         origin: "NODE",
-        Node: { id: "node-1", trust: "FULL", trustLowerRequestedAt: null },
+        Node: { userId: OWNER, id: "node-1", trust: "FULL", trustLowerRequestedAt: null },
         CurrentVersion: versionRow({ spec, launchHash: runtimeLaunchHash(spec) }),
       }) as never,
     );
@@ -540,7 +543,7 @@ describe("runtimes.update", () => {
       updateRow({
         kind: "ALWAYS_ON",
         // Read Full before the write; lowered by the time the owner fence is held.
-        Node: { id: "node-1", trust: "FULL", trustLowerRequestedAt: null },
+        Node: { userId: OWNER, id: "node-1", trust: "FULL", trustLowerRequestedAt: null },
         CurrentVersion: versionRow({ spec, launchHash: runtimeLaunchHash(spec) }),
       }) as never,
     );
@@ -564,7 +567,7 @@ describe("runtimes.update", () => {
       updateRow({
         kind: "ALWAYS_ON",
         origin: "NODE",
-        Node: { id: "node-1", trust: "FULL", trustLowerRequestedAt: null },
+        Node: { userId: OWNER, id: "node-1", trust: "FULL", trustLowerRequestedAt: null },
         CurrentVersion: versionRow({ spec, launchHash: runtimeLaunchHash(spec) }),
       }) as never,
     );
@@ -636,7 +639,14 @@ describe("runtimes.update", () => {
         claim: "HELD",
         port,
         distPort: null,
-        Node: { id: "node-1", slug: "box", trust: "FULL", trustLowerRequestedAt: null, ...node },
+        Node: {
+          userId: OWNER,
+          id: "node-1",
+          slug: "box",
+          trust: "FULL",
+          trustLowerRequestedAt: null,
+          ...node,
+        },
       },
     ],
     Reservations: reservations,
@@ -780,6 +790,7 @@ describe("runtimes.update", () => {
       reservations: [{ labels: ["worker"], resources: { kind: "unified", memoryGb: 32 } }],
     });
     const worker = (id: string, trust: "FULL" | "RELAY", pending: boolean) => ({
+      userId: OWNER,
       id,
       slug: id,
       trust,
@@ -830,7 +841,13 @@ describe("runtimes.update", () => {
         {
           ...updateInstance(SPEC).Ranks[0],
           nodeId,
-          Node: { id: nodeId, slug: nodeId, trust: "FULL", trustLowerRequestedAt: null },
+          Node: {
+            userId: OWNER,
+            id: nodeId,
+            slug: nodeId,
+            trust: "FULL",
+            trustLowerRequestedAt: null,
+          },
         },
       ],
     });
@@ -1176,7 +1193,13 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
             claim: "HELD",
             port: 30004,
             distPort: null,
-            Node: { id: "node-1", slug: "n1", trust: "FULL", trustLowerRequestedAt: null },
+            Node: {
+              userId: OWNER,
+              id: "node-1",
+              slug: "n1",
+              trust: "FULL",
+              trustLowerRequestedAt: null,
+            },
           },
         ],
         Reservations: [
@@ -1184,7 +1207,13 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
             index: 0,
             nodeId: "worker",
             supersededGeneration: superseded,
-            Node: { id: "worker", slug: "worker", trust, trustLowerRequestedAt: lowering },
+            Node: {
+              userId: OWNER,
+              id: "worker",
+              slug: "worker",
+              trust,
+              trustLowerRequestedAt: lowering,
+            },
           },
         ],
       } as never);
@@ -1217,7 +1246,13 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
           claim: "HELD",
           port: 30004,
           distPort: null,
-          Node: { id: "node-1", slug: "n1", trust: "FULL", trustLowerRequestedAt: null },
+          Node: {
+            userId: OWNER,
+            id: "node-1",
+            slug: "n1",
+            trust: "FULL",
+            trustLowerRequestedAt: null,
+          },
         },
       ],
       Reservations: [{ index: 0, nodeId: null, supersededGeneration: null, Node: null }],
@@ -1242,7 +1277,13 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
           claim: "RELEASED",
           port: 30004,
           distPort: null,
-          Node: { id: "node-1", slug: "n1", trust: "FULL", trustLowerRequestedAt: null },
+          Node: {
+            userId: OWNER,
+            id: "node-1",
+            slug: "n1",
+            trust: "FULL",
+            trustLowerRequestedAt: null,
+          },
         },
       ],
       Reservations: [],
@@ -1275,7 +1316,15 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
     db.node.findMany.mockImplementation(((args: { where?: { id?: { in?: string[] } } }) =>
       Promise.resolve(
         args.where?.id?.in?.includes("w-old")
-          ? [{ id: "w-old", slug: "w-old", trust: "RELAY", trustLowerRequestedAt: null }]
+          ? [
+              {
+                id: "w-old",
+                userId: OWNER,
+                slug: "w-old",
+                trust: "RELAY",
+                trustLowerRequestedAt: null,
+              },
+            ]
           : [nodeRow()],
       )) as never);
     expect(
@@ -1296,7 +1345,13 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
           claim: "HELD",
           port: 30004,
           distPort: null,
-          Node: { id: "node-1", slug: "n1", trust: "FULL", trustLowerRequestedAt: null },
+          Node: {
+            userId: OWNER,
+            id: "node-1",
+            slug: "n1",
+            trust: "FULL",
+            trustLowerRequestedAt: null,
+          },
         },
       ],
       Reservations: [
@@ -1304,7 +1359,13 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
           index: 0,
           nodeId: "worker",
           supersededGeneration: 3,
-          Node: { id: "worker", slug: "worker", trust: "RELAY", trustLowerRequestedAt: null },
+          Node: {
+            userId: OWNER,
+            id: "worker",
+            slug: "worker",
+            trust: "RELAY",
+            trustLowerRequestedAt: null,
+          },
         },
       ],
     } as never);
@@ -1328,7 +1389,13 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
           claim: "HELD",
           port: 30004,
           distPort: null,
-          Node: { id: "node-1", slug: "n1", trust: "FULL", trustLowerRequestedAt: null },
+          Node: {
+            userId: OWNER,
+            id: "node-1",
+            slug: "n1",
+            trust: "FULL",
+            trustLowerRequestedAt: null,
+          },
         },
       ],
       Reservations: [],
@@ -1366,7 +1433,13 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
           claim: "HELD",
           port: 30004,
           distPort: null,
-          Node: { id: "node-1", slug: "n1", trust: "FULL", trustLowerRequestedAt: null },
+          Node: {
+            userId: OWNER,
+            id: "node-1",
+            slug: "n1",
+            trust: "FULL",
+            trustLowerRequestedAt: null,
+          },
         },
       ],
       Reservations: [],
@@ -1503,7 +1576,13 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
             rank: 0,
             nodeId: "node-1",
             claim: reservation?.claim ?? "HELD",
-            Node: { id: "node-1", slug: "node-1", trust, trustLowerRequestedAt: null },
+            Node: {
+              userId: OWNER,
+              id: "node-1",
+              slug: "node-1",
+              trust,
+              trustLowerRequestedAt: null,
+            },
           },
         ],
         Reservations: reservation
@@ -1513,6 +1592,7 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
                 nodeId: "worker",
                 supersededGeneration: null,
                 Node: {
+                  userId: OWNER,
                   id: "worker",
                   slug: "worker",
                   trust: reservation.trust,
@@ -1613,7 +1693,10 @@ describe("review follow-ups", () => {
         desiredState: "RUNNING",
         LaunchVersion: { launchHash: runtimeLaunchHash(instanceLaunch) },
         Ranks: [
-          { claim: "HELD", Node: { id: "node-1", trust: "FULL", trustLowerRequestedAt: null } },
+          {
+            claim: "HELD",
+            Node: { userId: OWNER, id: "node-1", trust: "FULL", trustLowerRequestedAt: null },
+          },
         ],
       },
     ] as never);
@@ -1659,7 +1742,9 @@ describe("review follow-ups", () => {
     db.runtimeInstance.findMany.mockResolvedValue([
       {
         id: "inst-1",
-        Ranks: [{ Node: { id: "node-1", trust: "FULL", trustLowerRequestedAt: null } }],
+        Ranks: [
+          { Node: { userId: OWNER, id: "node-1", trust: "FULL", trustLowerRequestedAt: null } },
+        ],
       },
     ] as never);
     db.runtimeOperation.create.mockResolvedValue({ id: "op-2" } as never);
@@ -1748,7 +1833,7 @@ describe("second authz review follow-ups", () => {
       kind: "agent_token" as const,
       userId: OWNER,
       agentTokenId: "tok-r",
-      level: "READ" as const,
+      access: { scopes: ["read"], nodeIds: null },
     };
     expect(
       await reasonOf(
@@ -2021,13 +2106,20 @@ describe("runtimes.instances.markStopped", () => {
       rank,
       nodeId: `node-${rank}`,
       claim,
-      Node: { id: `node-${rank}`, slug: `node-${rank}`, trust, trustLowerRequestedAt: null },
+      Node: {
+        userId: OWNER,
+        id: `node-${rank}`,
+        slug: `node-${rank}`,
+        trust,
+        trustLowerRequestedAt: null,
+      },
     })),
     Reservations: reservations.map((reservation, index) => ({
       index,
       nodeId: reservation.nodeId,
       supersededGeneration: reservation.supersededGeneration ?? null,
       Node: {
+        userId: OWNER,
         id: reservation.nodeId,
         slug: reservation.nodeId,
         trust: reservation.trust,
@@ -2613,4 +2705,211 @@ describe("models.setCapabilities declarations", () => {
     );
     expect(db.runtimeModel.updateMany).not.toHaveBeenCalled();
   });
+});
+
+describe("runtime instance summary allowlist", () => {
+  for (const kind of ["agent_token", "oauth_access_token"] as const) {
+    for (const [label, nodeIds, filtered] of [
+      ["allowlisted", ["node-1"], true],
+      ["all nodes", null, false],
+      ["person", null, false],
+    ] as const) {
+      it(`${kind} ${label}: every summary count uses the instance-row predicate`, async () => {
+        const base = kind === "agent_token" ? CALLERS.fullAgent() : CALLERS.oauthAgent();
+        if (base.kind !== "agent_token" && base.kind !== "oauth_access_token")
+          throw new Error("agent expected");
+        const auth =
+          label === "person" ? CALLERS.person() : { ...base, access: { ...base.access, nodeIds } };
+        const hiddenWhere = {
+          NOT: {
+            OR: [
+              { Runtime: { nodeId: { in: ["hidden"] } } },
+              { Ranks: { some: { nodeId: { in: ["hidden"] } } } },
+              { Reservations: { some: { nodeId: { in: ["hidden"] } } } },
+            ],
+          },
+        };
+        db.node.findMany.mockResolvedValue([{ id: "node-1" }, { id: "hidden" }] as never);
+        const instances = ["READY", "STARTING", "FAILED"].flatMap((phase) => [
+          {
+            phase,
+            needsOperator: "STEP",
+            desiredState: "RUNNING",
+            Ranks: [{ nodeId: "node-1", Node: { slug: "box", userId: OWNER } }],
+            Reservations: [],
+          },
+          {
+            phase,
+            needsOperator: "STEP",
+            desiredState: "RUNNING",
+            Ranks: [{ nodeId: "hidden", Node: { slug: "hidden", userId: OWNER } }],
+            Reservations: [],
+          },
+          {
+            phase,
+            needsOperator: "STEP",
+            desiredState: "RUNNING",
+            Ranks: [{ nodeId: "node-1", Node: { slug: "box", userId: OWNER } }],
+            Reservations: [{ nodeId: "hidden" }],
+          },
+        ]);
+        // This fake applies the relation filter requested by the procedure; the PG suite
+        // separately exercises that predicate against actual rank rows.
+        db.runtime.findMany.mockImplementation((async (args: {
+          include: { Instances: { where: unknown } };
+        }) => {
+          expect(args.include.Instances.where).toEqual(filtered ? hiddenWhere : {});
+          const excluded = JSON.stringify(args.include.Instances.where).includes('"hidden"');
+          return [
+            runtimeRow({
+              Instances: instances.filter(
+                (instance) =>
+                  !excluded ||
+                  [...instance.Ranks, ...instance.Reservations].every(
+                    (part) => part.nodeId !== "hidden",
+                  ),
+              ),
+            }),
+          ];
+        }) as never);
+        const result = await client(auth).list();
+        expect(result.runtimes[0]?.instances).toEqual({
+          running: filtered ? 1 : 3,
+          starting: filtered ? 1 : 3,
+          failed: filtered ? 1 : 3,
+          needsYou: filtered ? 3 : 9,
+        });
+        expect(db.node.findMany).toHaveBeenCalledTimes(filtered ? 1 : 0);
+        // Detail uses precisely the same filter, alongside its stopped-instance visibility.
+        db.runtime.findFirst.mockResolvedValue(runtimeRow() as never);
+        db.runtimeInstance.findMany.mockResolvedValue([]);
+        await client(auth)
+          .get({ runtimeId: "rt-1" })
+          .catch(() => undefined);
+        expect(db.runtime.findFirst.mock.calls.at(-1)?.[0]?.include).toMatchObject({
+          Instances: { where: filtered ? hiddenWhere : {} },
+        });
+        expect(db.runtimeInstance.findMany.mock.calls.at(-1)?.[0]?.where).toMatchObject(
+          filtered ? hiddenWhere : { runtimeId: "rt-1" },
+        );
+      });
+    }
+  }
+});
+
+describe("always-on runtime bound-node visibility", () => {
+  for (const kind of ["agent_token", "oauth_access_token"] as const) {
+    for (const [label, nodeIds, filtered] of [
+      ["allowlisted", ["node-1"], true],
+      ["all nodes", null, false],
+      ["person", null, false],
+    ] as const) {
+      for (const boundNode of ["node-1", "hidden"]) {
+        it(`${kind} ${label}: list/get counts and rankless rows bound to ${boundNode} agree`, async () => {
+          const base = kind === "agent_token" ? CALLERS.fullAgent() : CALLERS.oauthAgent();
+          if (base.kind !== "agent_token" && base.kind !== "oauth_access_token")
+            throw new Error("agent expected");
+          const auth =
+            label === "person"
+              ? CALLERS.person()
+              : { ...base, access: { ...base.access, nodeIds } };
+          const alwaysOnSpec = {
+            api: "openai",
+            engine: "vllm",
+            modelType: "llm",
+            models: [{ id: "qwen" }],
+            address: { baseUrl: "http://127.0.0.1:8000" },
+          };
+          const version = versionRow({ spec: alwaysOnSpec });
+          const instances = ["READY", "STARTING", "FAILED"].map((phase) => ({
+            id: `bound-${phase}`,
+            runtimeId: "rt-1",
+            handle: `i-${phase.toLowerCase()}`,
+            versionId: "ver-1",
+            launchVersionId: "ver-1",
+            desiredState: null,
+            phase,
+            phaseReason: null,
+            phaseChangedAt: new Date(),
+            needsOperator: "STEP",
+            startedBy: "USER",
+            restartsInWindow: 0,
+            nextRestartAt: null,
+            engineSlots: 8,
+            factsAt: null,
+            Ranks: [],
+            Reservations: [],
+            Steps: [],
+            Version: { version: 1, advanced: {} },
+            LaunchVersion: { spec: alwaysOnSpec, editor: "USER", launchHash: version.launchHash },
+            Fabric: null,
+          }));
+          const hiddenWhere = {
+            NOT: {
+              OR: [
+                { Runtime: { nodeId: { in: ["hidden"] } } },
+                { Ranks: { some: { nodeId: { in: ["hidden"] } } } },
+                { Reservations: { some: { nodeId: { in: ["hidden"] } } } },
+              ],
+            },
+          };
+          const visible = !(filtered && boundNode === "hidden");
+          const summary = (where: unknown) => {
+            expect(where).toEqual(filtered ? hiddenWhere : {});
+            return runtimeRow({
+              kind: "ALWAYS_ON",
+              nodeId: boundNode,
+              Node: { id: boundNode, slug: boundNode, userId: OWNER },
+              CurrentVersion: version,
+              Instances: visible ? instances : [],
+            });
+          };
+          db.node.findMany.mockResolvedValue([
+            { id: "node-1", heldDefinitions: [], refusedDefinitions: [] },
+            { id: "hidden", heldDefinitions: [], refusedDefinitions: [] },
+          ] as never);
+          db.runtime.findMany.mockImplementation((async (args: {
+            include: { Instances: { where: unknown } };
+          }) => [summary(args.include.Instances.where)]) as never);
+          db.runtime.findFirst.mockImplementation((async (args: {
+            include: { Instances: { where: unknown } };
+          }) => summary(args.include.Instances.where)) as never);
+          db.runtimeVersion.findFirstOrThrow.mockResolvedValue(version as never);
+          db.runtimeModel.findMany.mockResolvedValue([]);
+          db.runtimeShare.findMany.mockResolvedValue([]);
+          db.runtimeRequestProfile.findFirst.mockResolvedValue(null);
+          db.runtimeInstance.findMany.mockImplementation((async (args: { where: unknown }) => {
+            expect(args.where).toMatchObject(filtered ? hiddenWhere : { runtimeId: "rt-1" });
+            return visible ? instances : [];
+          }) as never);
+          const liveLoad = vi.fn(
+            (ids: readonly string[]) =>
+              new Map(
+                ids.map((id) => [id, { running: 2, waiting: 4, kvUsage: 0.5, at: new Date() }]),
+              ),
+          );
+          const api = createRouterClient(runtimesRouter, {
+            context: contextFor(auth, { liveLoad }),
+          });
+          const list = await api.list();
+          const detail = await api.get({ runtimeId: "rt-1" });
+          for (const runtime of [list.runtimes[0]!, detail])
+            expect(runtime.instances).toEqual({
+              running: visible ? 1 : 0,
+              starting: visible ? 1 : 0,
+              failed: visible ? 1 : 0,
+              needsYou: visible ? 3 : 0,
+            });
+          expect(detail.instanceList).toHaveLength(visible ? 3 : 0);
+          if (visible)
+            expect(detail.instanceList[0]?.live).toMatchObject({
+              running: 2,
+              waiting: 4,
+              slots: 8,
+            });
+          else expect(liveLoad).not.toHaveBeenCalled();
+        });
+      }
+    }
+  }
 });

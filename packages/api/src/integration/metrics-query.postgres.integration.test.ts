@@ -14,6 +14,7 @@ import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-clien
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 import type { CallerAuth } from "../contracts/auth-context";
+import { TEST_NODE_FEATURES } from "../lib/node-features-test-fixture";
 import type { RuntimeSpec } from "../lib/runtime-spec";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -60,7 +61,7 @@ const agent = (userId: string): CallerAuth => ({
   kind: "agent_token",
   userId,
   agentTokenId: `${userId}-tok`,
-  level: "READ",
+  access: { scopes: ["read"], nodeIds: null },
 });
 const person = (userId: string): CallerAuth => ({
   kind: "cookie_session",
@@ -109,6 +110,7 @@ integration("metrics_query on PostgreSQL", () => {
         slug: `${RUN}-box`,
         connection: "ONLINE",
         trust: "FULL",
+        features: TEST_NODE_FEATURES,
         declaredResources: { kind: "unified", memoryGb: 66 },
         portStart: 30000,
         portEnd: 30010,
@@ -316,6 +318,7 @@ integration("metrics_query on PostgreSQL", () => {
       await db.runtimeLoadMinute.deleteMany({ where: { ownerUserId: users } });
       await db.nodeMetricsMinute.deleteMany({ where: { ownerUserId: users } });
       await db.pool.deleteMany({ where: { userId: users } });
+      await db.profile.deleteMany({ where: { userId: users } });
       await db.runtimeInstance.deleteMany({ where: { userId: users } });
       await db.runtimeOperation.deleteMany({ where: { userId: users } });
       await db.runtime.updateMany({ where: { userId: users }, data: { currentVersionId: null } });
@@ -710,5 +713,424 @@ integration("metrics_query on PostgreSQL", () => {
       groupBy: "member",
     });
     expect(member.series[0]?.group).toEqual({ key: "contrib-model" });
+  });
+
+  it("filters hidden-node aggregates and refuses removing their runtime members on PostgreSQL", async () => {
+    // A rank is on the allowed node, but its live reservation reaches the hidden node.
+    // This checks the whole-instance relation predicates, beyond a simple node-id filter.
+    const hidden = await fixtures.node.create({
+      data: {
+        userId: OWNER,
+        slug: "aggregate-hidden",
+        connection: "ONLINE",
+        trust: "FULL",
+        features: TEST_NODE_FEATURES,
+      },
+    });
+    await fixtures.instanceReservation.create({
+      data: {
+        instanceId: ids.instance,
+        nodeId: hidden.id,
+        index: 0,
+        labels: [],
+        resources: { kind: "unified", memoryGb: 1 },
+      },
+    });
+    const pool = await fixtures.pool.create({
+      data: { userId: OWNER, slug: "aggregate-filter", name: "Aggregate filter", modelType: "LLM" },
+    });
+    const member = await fixtures.poolMember.create({
+      data: { poolId: pool.id, kind: "LOCAL", runtimeModelId: ids.runtimeModel },
+    });
+    const bucketStart = new Date(Math.floor(Date.now() / 60_000) * 60_000 - 60_000);
+    const key = {
+      bucketStart,
+      ownerUserId: OWNER,
+      requesterUserId: OWNER,
+      poolId: pool.id,
+      source: "API_KEY" as const,
+    };
+    await fixtures.usageRollupMinute.createMany({
+      data: [
+        {
+          ...key,
+          runtimeId: ids.runtime,
+          versionId: ids.version,
+          nodeId: ids.node,
+          requests: 4,
+          errors: 1,
+          latencyHistogram: histogramWith(10, 10, 10, 10),
+        },
+        {
+          ...key,
+          runtimeId: ids.runtime,
+          versionId: ids.version,
+          nodeId: hidden.id,
+          requests: 96,
+          errors: 20,
+          latencyHistogram: histogramWith(...new Array<number>(96).fill(20_000)),
+        },
+        { ...key, providerModelId: "aggregate-cloud", requests: 6, cloudRequests: 6 },
+        {
+          // Served on the ALLOWED node by the mixed instance: hidden from the allowlist too.
+          ...key,
+          runtimeId: ids.runtime,
+          versionId: ids.version,
+          nodeId: ids.node,
+          instanceId: ids.instance,
+          requests: 50,
+          errors: 5,
+          latencyHistogram: histogramWith(...new Array<number>(50).fill(20_000)),
+        },
+      ],
+    });
+    const mixedRequest = await fixtures.relayRequest.create({
+      data: {
+        userId: OWNER,
+        resourceOwnerUserId: OWNER,
+        source: "API_KEY",
+        poolId: pool.id,
+        status: "SUCCEEDED",
+        selectedNodeId: ids.node,
+        selectedInstanceId: ids.instance,
+        completedAt: new Date(),
+      },
+      select: { id: true },
+    });
+    const plainRequest = await fixtures.relayRequest.create({
+      data: {
+        userId: OWNER,
+        resourceOwnerUserId: OWNER,
+        source: "API_KEY",
+        poolId: pool.id,
+        status: "SUCCEEDED",
+        selectedNodeId: ids.node,
+        completedAt: new Date(),
+      },
+      select: { id: true },
+    });
+    await fixtures.runtimeLoadMinute.create({
+      data: {
+        bucketStart,
+        ownerUserId: OWNER,
+        runtimeId: ids.runtime,
+        versionId: ids.version,
+        instanceId: ids.instance,
+        nodeId: ids.node,
+        samples: 1,
+        maxRunning: 7,
+      },
+    });
+    // A long-stopped instance with a reservation on the hidden node. A lookup bounded by
+    // request creation (`requests_list`) leaves it out; rollup reads are unbounded, because a
+    // request it served can complete (or be finalized by recovery) long after it stopped.
+    const stoppedAt = new Date(Date.now() - 30 * 24 * 3_600_000);
+    const stale = await fixtures.runtimeInstance.create({
+      data: {
+        userId: OWNER,
+        runtimeId: ids.runtime,
+        versionId: ids.version,
+        launchVersionId: ids.version,
+        handle: `i-${RUN.replace(/[^a-z0-9]/g, "")
+          .padEnd(12, "0")
+          .slice(-12)}`,
+        startedBy: "USER",
+        desiredState: "STOPPED",
+        phase: "STOPPED",
+        phaseChangedAt: stoppedAt,
+      },
+      select: { id: true },
+    });
+    await fixtures.instanceReservation.create({
+      data: {
+        instanceId: stale.id,
+        nodeId: hidden.id,
+        index: 0,
+        labels: [],
+        resources: { kind: "unified", memoryGb: 1 },
+      },
+    });
+    // Its last request, finalized in this window on the ALLOWED node long after it stopped.
+    await fixtures.usageRollupMinute.create({
+      data: {
+        ...key,
+        runtimeId: ids.runtime,
+        versionId: ids.version,
+        nodeId: ids.node,
+        instanceId: stale.id,
+        requests: 3,
+        errors: 1,
+        latencyHistogram: histogramWith(20_000, 20_000, 20_000),
+      },
+    });
+    const { hiddenServing } = await import("../lib/agent-hidden-serving");
+    const recent = await hiddenServing(fixtures, [hidden.id], new Date(Date.now() - 86_400_000));
+    expect(recent.instanceIds).toContain(ids.instance);
+    expect(recent.instanceIds).not.toContain(stale.id);
+    const longAgo = await hiddenServing(fixtures, [hidden.id], new Date(stoppedAt.getTime() - 1));
+    expect(longAgo.instanceIds).toEqual(expect.arrayContaining([ids.instance, stale.id]));
+    const unbounded = await hiddenServing(fixtures, [hidden.id]);
+    expect(unbounded.instanceIds).toEqual(expect.arrayContaining([ids.instance, stale.id]));
+    const access = { scopes: ["read", "pools", "runtimes"] as const, nodeIds: [ids.node] };
+    const range = {
+      from: new Date(bucketStart.getTime() - 60_000).toISOString(),
+      to: new Date(bucketStart.getTime() + 120_000).toISOString(),
+    };
+    for (const kind of ["agent_token", "oauth_access_token"] as const) {
+      const scoped = client(
+        kind === "agent_token"
+          ? { kind, userId: OWNER, agentTokenId: "aggregate-token", access }
+          : { kind, userId: OWNER, grantId: "aggregate-grant", access },
+      );
+      const runtime = await scoped.runtimes.get({ runtimeId: ids.runtime });
+      expect(runtime.instances.starting).toBe(0);
+      expect(runtime.instanceList).toHaveLength(0);
+      const view = await scoped.pools.get({ poolId: pool.id });
+      expect(view.members[0]?.live.instances).toBe(0);
+      expect(view.traffic24h.requests).toBe(10);
+      expect(view.traffic24h.errors).toBe(1);
+      expect(view.traffic24h.sparkline.reduce((a, b) => a + b, 0)).toBe(10);
+      expect(view.members[0]?.live.share).toBeCloseTo(0.4);
+      expect(view.members[0]?.live.p95LatencyMs).toBeLessThan(100);
+      const node = await scoped.nodes.get({ nodeId: ids.node });
+      expect(node.runningInstances).toBe(0);
+      expect(node.reservedNowMemoryGb).toBe(0);
+      const load = await scoped.activity.metrics.query({
+        scope: { runtime: ids.runtime },
+        metrics: ["running_max"],
+        range,
+        step: "1m",
+      });
+      expect(load.totals.running_max).toBeUndefined();
+      const requestMetrics = await scoped.activity.metrics.query({
+        scope: { pool: pool.id },
+        metrics: ["requests", "errors"],
+        range,
+        step: "1m",
+      });
+      expect(requestMetrics.totals).toEqual({ requests: 10, errors: 1 });
+      const listed = await scoped.activity.requests.list({ poolId: pool.id, limit: 50 });
+      expect(listed.items.map((row) => row.id)).toContain(plainRequest.id);
+      expect(listed.items.map((row) => row.id)).not.toContain(mixedRequest.id);
+      await expect(
+        scoped.pools.update({ poolId: pool.id, members: { remove: [member.id] } }),
+      ).rejects.toMatchObject({ code: "NOT_FOUND" });
+      await expect(scoped.pools.delete({ poolId: pool.id })).rejects.toMatchObject({
+        code: "NOT_FOUND",
+      });
+      await expect(scoped.runtimes.delete({ runtimeId: ids.runtime })).rejects.toMatchObject({
+        code: "NOT_FOUND",
+      });
+      expect(await fixtures.poolMember.count({ where: { id: member.id } })).toBe(1);
+    }
+    for (const auth of [person(OWNER), agent(OWNER)]) {
+      const unscoped = client(auth);
+      const runtime = await unscoped.runtimes.get({ runtimeId: ids.runtime });
+      expect(runtime.instances.starting).toBe(1);
+      expect(runtime.instanceList).toHaveLength(1);
+      const view = await unscoped.pools.get({ poolId: pool.id });
+      expect(view.members[0]?.live.instances).toBe(1);
+      expect(view.traffic24h.requests).toBe(159);
+      expect(view.traffic24h.errors).toBe(27);
+      expect(view.members[0]?.live.share).toBeCloseTo(153 / 159);
+      const listed = await unscoped.activity.requests.list({ poolId: pool.id, limit: 50 });
+      expect(listed.items.map((row) => row.id)).toEqual(
+        expect.arrayContaining([plainRequest.id, mixedRequest.id]),
+      );
+      expect(view.members[0]?.live.p95LatencyMs).toBeGreaterThan(10_000);
+      const load = await unscoped.activity.metrics.query({
+        scope: { runtime: ids.runtime },
+        metrics: ["running_max"],
+        range,
+        step: "1m",
+      });
+      expect(load.totals.running_max).toBe(7);
+    }
+    await client(person(OWNER)).pools.update({ poolId: pool.id, members: { remove: [member.id] } });
+    expect(await fixtures.poolMember.count({ where: { id: member.id } })).toBe(0);
+  });
+
+  it("hides rankless always-on bindings consistently across read surfaces on PostgreSQL", async () => {
+    const hidden = await fixtures.node.create({
+      data: {
+        userId: OWNER,
+        slug: "always-on-hidden",
+        connection: "ONLINE",
+        trust: "FULL",
+        features: TEST_NODE_FEATURES,
+      },
+    });
+    const access = { scopes: ["read"] as const, nodeIds: [ids.node] };
+    const callers: Array<{ auth: CallerAuth; filtered: boolean }> = [
+      {
+        auth: { kind: "agent_token", userId: OWNER, agentTokenId: "bound-token", access },
+        filtered: true,
+      },
+      {
+        auth: { kind: "oauth_access_token", userId: OWNER, grantId: "bound-grant", access },
+        filtered: true,
+      },
+      { auth: agent(OWNER), filtered: false },
+      {
+        auth: {
+          kind: "oauth_access_token",
+          userId: OWNER,
+          grantId: "all-grant",
+          access: { ...access, nodeIds: null },
+        },
+        filtered: false,
+      },
+      { auth: person(OWNER), filtered: false },
+    ];
+    const profile = await fixtures.profile.create({
+      data: {
+        userId: OWNER,
+        slug: "bound-controls",
+        name: "Bound controls",
+        editor: "USER",
+        editorUserId: OWNER,
+        Nodes: { create: [{ nodeId: ids.node }, { nodeId: hidden.id }] },
+        Items: {
+          create: [{ position: 0, runtimeId: ids.runtime, versionId: ids.version, count: 1 }],
+        },
+      },
+    });
+    const before = await Promise.all(
+      callers.map(async ({ auth }) => ({
+        node: await client(auth).nodes.get({ nodeId: ids.node }),
+        profile: await client(auth).profiles.get({ profileId: profile.id }),
+      })),
+    );
+    const created = await client(person(OWNER)).runtimes.create({
+      slug: "bound-hidden",
+      name: "Bound hidden",
+      kind: "ALWAYS_ON",
+      nodeId: hidden.id,
+      spec: {
+        api: "openai",
+        engine: "vllm",
+        modelType: "llm",
+        models: [{ id: "m" }],
+        address: { baseUrl: "http://127.0.0.1:8000" },
+      },
+    });
+    const runtimeId = created.runtime.id;
+    const runtime = await fixtures.runtime.findUniqueOrThrow({
+      where: { id: runtimeId },
+      include: { Models: true, Instances: true },
+    });
+    const instance = runtime.Instances[0]!;
+    const model = runtime.Models[0]!;
+    await fixtures.runtimeInstance.update({
+      where: { id: instance.id },
+      data: { phase: "READY", phaseReason: null, engineSlots: 8 },
+    });
+    expect(await fixtures.instanceRank.count({ where: { instanceId: instance.id } })).toBe(0);
+    expect(await fixtures.instanceReservation.count({ where: { instanceId: instance.id } })).toBe(
+      0,
+    );
+    await fixtures.executionTarget.create({
+      data: {
+        userId: OWNER,
+        kind: "INSTANCE_MODEL",
+        instanceId: instance.id,
+        runtimeModelId: model.id,
+        health: "HEALTHY",
+      },
+    });
+    const pool = await fixtures.pool.create({
+      data: { userId: OWNER, slug: "bound-pool", name: "Bound pool", modelType: "LLM" },
+    });
+    await fixtures.poolMember.create({
+      data: { poolId: pool.id, kind: "LOCAL", runtimeModelId: model.id },
+    });
+    const bucketStart = new Date(Math.floor(Date.now() / 60_000) * 60_000 - 60_000);
+    const range = {
+      from: new Date(bucketStart.getTime() - 60_000).toISOString(),
+      to: new Date(bucketStart.getTime() + 120_000).toISOString(),
+    };
+    // Deliberately record load under the allowed node: the runtime binding must also exclude it.
+    await fixtures.runtimeLoadMinute.create({
+      data: {
+        bucketStart,
+        ownerUserId: OWNER,
+        runtimeId,
+        versionId: instance.versionId,
+        instanceId: instance.id,
+        nodeId: ids.node,
+        samples: 2,
+        kvSamples: 2,
+        sumKvUsage: 1,
+        maxKvUsage: 0.75,
+        maxRunning: 7,
+        maxWaiting: 3,
+        fullSamples: 1,
+      },
+    });
+    for (const [index, { auth, filtered }] of callers.entries()) {
+      const api = client(auth);
+      const detail = await api.runtimes.get({ runtimeId });
+      const list = await api.runtimes.list();
+      for (const view of [detail, list.runtimes.find((row) => row.id === runtimeId)!]) {
+        expect(view.instances).toEqual({
+          running: filtered ? 0 : 1,
+          starting: 0,
+          failed: 0,
+          needsYou: 0,
+        });
+      }
+      expect(detail.instanceList).toHaveLength(filtered ? 0 : 1);
+      const poolDetail = await api.pools.get({ poolId: pool.id });
+      const poolList = await api.pools.list();
+      for (const view of [poolDetail, poolList.pools.find((row) => row.id === pool.id)!]) {
+        expect(view.members[0]).toMatchObject({
+          status: filtered ? "unavailable" : "serving",
+          health: filtered ? "UNKNOWN" : "HEALTHY",
+          live: {
+            instances: filtered ? 0 : 1,
+            running: filtered ? 0 : 1,
+            active: null,
+            waiting: null,
+            slots: filtered ? null : 8,
+          },
+        });
+        expect(view.runsOn).toHaveLength(filtered ? 0 : 1);
+        if (!filtered) expect(view.runsOn[0]).toMatchObject({ nodeId: hidden.id, instances: 1 });
+      }
+      const load = await api.activity.metrics.query({
+        scope: { pool: pool.id },
+        metrics: ["kv_usage_avg", "kv_usage_max", "running_max", "waiting_max", "full_ratio"],
+        range,
+        step: "1m",
+      });
+      if (filtered) {
+        expect(load.totals).toEqual({});
+        expect(load.series).toEqual([]);
+      } else {
+        expect(load.totals).toEqual({
+          kv_usage_avg: 0.5,
+          kv_usage_max: 0.75,
+          running_max: 7,
+          waiting_max: 3,
+          full_ratio: 0.5,
+        });
+        expect(load.series[0]?.values.running_max).toEqual([7]);
+      }
+      const node = await api.nodes.get({ nodeId: ids.node });
+      for (const key of [
+        "runningInstances",
+        "needsYou",
+        "reservedNowMemoryGb",
+        "alwaysOnRuntimes",
+      ] as const)
+        expect(node[key]).toEqual(before[index]!.node[key]);
+      const profileView = await api.profiles.get({ profileId: profile.id });
+      expect(profileView.items[0]?.runningNow).toEqual(before[index]!.profile.items[0]?.runningNow);
+      expect(profileView.satisfied).toEqual(before[index]!.profile.satisfied);
+      if (filtered)
+        await expect(api.nodes.get({ nodeId: hidden.id })).rejects.toMatchObject({
+          code: "NOT_FOUND",
+        });
+    }
   });
 });

@@ -31,7 +31,10 @@ function node(files: Files | null) {
           runtimeHosts: [],
           mediaExpand: false,
           liveStt: false,
+          jobReservations: true,
+          rankIdle: true,
           secrets: [],
+          selfUpdate: { strategies: ["self-replace"], instancesSurvive: true, remote: "allowed" },
         }
       : null,
   };

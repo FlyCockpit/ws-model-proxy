@@ -1,5 +1,5 @@
-//! What this node's hardware is: memory, accelerators and the memory a model
-//! can occupy. Feeds `node.info` (placement reads it as the last fallback
+//! What this node's hardware is: OS physical memory and the separate memory
+//! accelerators can address. Feeds `node.info` (placement reads it as the last fallback
 //! after the browser and node declarations) and `wsmp hardware`.
 //!
 //! Sources, each optional:
@@ -44,10 +44,12 @@ pub struct Hardware {
     /// `MemTotal` excludes), or `hw.memsize`.
     #[serde(rename = "memoryTotalMiB", skip_serializing_if = "Option::is_none")]
     pub memory_total_mib: Option<u64>,
-    /// Unified nodes: the pool a model can occupy.
+    /// Unified nodes: the GPU-addressable pool (not the OS physical total).
+    /// Retained on the wire alongside `acceleratorMemoryMiB`.
     #[serde(rename = "unifiedMemoryMiB", skip_serializing_if = "Option::is_none")]
     pub unified_memory_mib: Option<u64>,
-    /// Memory the accelerators can hold: discrete VRAM, or the unified pool.
+    /// Memory accelerators can address: discrete VRAM, or a unified GPU pool
+    /// limited by AMD GTT/TTM or Apple's wired limit independently of RAM.
     #[serde(
         rename = "acceleratorMemoryMiB",
         skip_serializing_if = "Option::is_none"
@@ -699,20 +701,31 @@ pub fn assemble(sources: Sources) -> Hardware {
         // `MemTotal` excludes the BIOS carve-out.
         let physical = meminfo.map(|total| total.saturating_add(vram));
         let addressable = vram.saturating_add(gtt);
-        // Unknown GPU limits leave the pool unreported: placement then falls
-        // back to physical memory, as it would without this report.
+        // Without any reported GPU pool, leave it unknown: RAM still comes
+        // from the OS total and placement adds no extra accelerator cap.
         let pool = (addressable > 0).then(|| physical.map_or(addressable, |p| addressable.min(p)));
         let unknown = || "unknown".to_string();
         notes.push(format!(
-            "unified (AMD APU): pool = min(VRAM carve-out {vram} MiB + GTT {gtt} MiB, \
+            "unified (AMD APU): OS physical memory = MemTotal + VRAM carve-out; \
+             GPU-addressable pool = min(VRAM carve-out {vram} MiB + GTT {gtt} MiB (TTM capped), \
              physical {} MiB)",
             physical.map_or_else(unknown, |value| value.to_string())
         ));
         if gtt < raw_gtt {
             notes.push(format!(
-                "GTT is {raw_gtt} MiB but ttm.pages_limit caps allocations at {gtt} MiB; \
-                 raise ttm.pages_limit (and ttm.page_pool_size) to use more"
+                "GTT is {raw_gtt} MiB but ttm.pages_limit caps allocations at {gtt} MiB"
             ));
+        }
+        if pool
+            .zip(physical)
+            .is_some_and(|(pool, physical)| pool < physical)
+        {
+            notes.push(
+                "GPU can address less than physical memory (default GTT/TTM is about half of RAM); \
+                 raise ttm.pages_limit / ttm.page_pool_size kernel parameters (4 KiB pages); \
+                 amdgpu.gttsize is deprecated on recent kernels"
+                    .into(),
+            );
         }
         return unified(pool, physical, notes, gpus);
     }
@@ -753,6 +766,8 @@ pub(crate) mod fixtures {
         "dgx-spark-gb10",
         "strix-halo",
         "strix-halo-uma96",
+        "strix-halo-default",
+        "phoenix-default",
         "rtx-3090",
         "apple-m3-max",
     ];
@@ -850,6 +865,29 @@ mod tests {
             hardware.gpus[0].name.as_deref(),
             Some("AMD Radeon 8050S/8060S (Strix Halo)")
         );
+    }
+
+    #[test]
+    fn default_amd_apus_keep_physical_ram_separate_from_the_gpu_limit() {
+        for (fixture, physical, pool, vram, gtt, target) in [
+            ("strix-halo-default", 126136, 63324, 512, 62812, "gfx1151"),
+            ("phoenix-default", 15974, 9011, 2048, 6963, "gfx1103"),
+        ] {
+            let hardware = assemble(sources(fixture));
+            assert_eq!(hardware.node_kind, NodeKind::Unified, "{fixture}");
+            assert_eq!(hardware.memory_total_mib, Some(physical), "{fixture}");
+            assert_eq!(hardware.unified_memory_mib, Some(pool), "{fixture}");
+            assert_eq!(hardware.accelerator_memory_mib, Some(pool), "{fixture}");
+            assert_eq!(hardware.gpus[0].vram_total_mib, Some(vram));
+            assert_eq!(hardware.gpus[0].gtt_total_mib, Some(gtt));
+            assert_eq!(hardware.gpus[0].gfx_target.as_deref(), Some(target));
+            let note = hardware.notes.join(" ");
+            assert!(note.contains("physical memory"));
+            assert!(note.contains("GPU-addressable"));
+            assert!(note.contains("raise ttm.pages_limit / ttm.page_pool_size"));
+            assert!(note.contains("4 KiB pages"));
+            assert!(note.contains("amdgpu.gttsize is deprecated"));
+        }
     }
 
     #[test]

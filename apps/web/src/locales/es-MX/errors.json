@@ -1,5 +1,4 @@
 {
-  "appUpdateAvailable": "Una nueva versión está disponible. Recargando…",
   "couldNotCopy": "No se pudo copiar — por favor selecciona y copia manualmente.",
   "pageDescription": "{{appName}} es una aplicación web",
   "rootError": "Esta página no cargó. Intenta de nuevo o recarga.",
@@ -22,5 +21,9 @@
     "retainedHistory": {
       "user": "Este usuario tiene historial retenido y no se puede eliminar. Archívalo en su lugar."
     }
-  }
+  },
+  "notFound": "Página no encontrada",
+  "notFoundDescription": "No se pudo encontrar esta página.",
+  "notFoundOverview": "Volver al resumen",
+  "notFoundSignIn": "Iniciar sesión"
 }

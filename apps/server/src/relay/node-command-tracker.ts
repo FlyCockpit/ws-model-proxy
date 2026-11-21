@@ -10,8 +10,16 @@
  *
  * Holds ids only: never a command's text or output.
  */
+import {
+  type NodeCommandRow,
+  nodeCommandSelect,
+} from "@ws-model-proxy/api/lib/node-command-settle";
+import { type AgentAccess, agentHasScope } from "@ws-model-proxy/auth/agent-scopes";
+import { liveAgentTokenWhere, mcpPatBlockedByPolicy } from "@ws-model-proxy/auth/mcp-pat-limits";
+import type { Prisma } from "@ws-model-proxy/db";
 import prisma from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
+import { env } from "@ws-model-proxy/env/server";
 import type { ServerToNodeControlFrame } from "./frames.js";
 import type { SendGuard } from "./session-manager.js";
 
@@ -19,6 +27,8 @@ import type { SendGuard } from "./session-manager.js";
 export const NODE_COMMAND_TRACK_GRACE_MS = 10 * 60_000;
 /** RUNNING rows read per query by the sweep and the ban / revocation passes. */
 export const NODE_COMMAND_SWEEP_PAGE = 500;
+/** Bound recovery polls and database writes per maintenance pass. */
+export const NODE_COMMAND_RECOVERY_PAGE = 50;
 
 export type TrackedNodeCommand = {
   commandId: string;
@@ -45,6 +55,13 @@ function errorName(error: unknown): string {
 
 export class NodeCommandTracker {
   private byId = new Map<string, TrackedNodeCommand>();
+  private reconcileCommand: ((row: NodeCommandRow) => Promise<void>) | null = null;
+  private recoveryCursor: string | undefined;
+
+  /** Installed by the operator services so recovery uses the same session-bound poll path. */
+  setCommandReconciler(reconcile: (row: NodeCommandRow) => Promise<void>): void {
+    this.reconcileCommand = reconcile;
+  }
 
   constructor(
     private readonly relay: NodeCommandSendPort,
@@ -147,10 +164,28 @@ export class NodeCommandTracker {
     });
   }
 
+  /** Only commands no longer covered by the narrowed access end. */
+  async cancelForNarrowedCredential(input: {
+    userId: string;
+    credentialIds: readonly string[];
+    access: AgentAccess;
+  }): Promise<number> {
+    const ids = [...new Set(input.credentialIds)];
+    if (ids.length === 0) return 0;
+    const commandsAllowed = agentHasScope(input.access, "commands");
+    if (commandsAllowed && input.access.nodeIds === null) return 0;
+    return this.cancelRows({
+      userId: input.userId,
+      state: "RUNNING",
+      OR: [{ agentTokenId: { in: ids } }, { mcpGrantId: { in: ids } }],
+      ...(commandsAllowed ? { nodeId: { notIn: [...(input.access.nodeIds ?? [])] } } : {}),
+    });
+  }
+
   /**
    * The 60 s pass: ends running commands whose agent credential is no longer live (revoked,
-   * expired or below Full) or whose owner is banned or marked for deletion, and drops tracked
-   * entries well past their end time that the node never reported.
+   * expired, without commands scope, or outside its node allowlist) or whose owner is banned or marked for deletion, drops expired
+   * tracked entries and reconciles a bounded page of overdue RUNNING rows.
    */
   async sweep(now = this.now()): Promise<number> {
     for (const [commandId, entry] of this.byId) {
@@ -168,9 +203,39 @@ export class NodeCommandTracker {
         ...(cursor !== undefined ? { cursor: { id: cursor }, skip: 1 } : {}),
       });
       cancelled += await this.sweepPage(rows, now);
-      if (rows.length < NODE_COMMAND_SWEEP_PAGE) return cancelled;
+      if (rows.length < NODE_COMMAND_SWEEP_PAGE) break;
       cursor = rows[rows.length - 1]?.id;
     }
+    await this.reconcileOverdue(now);
+    return cancelled;
+  }
+
+  /** Recover final reports lost to a failed write, also across server restarts. */
+  private async reconcileOverdue(now: number): Promise<void> {
+    const reconcile = this.reconcileCommand;
+    if (!reconcile) return;
+    const rows = await prisma.nodeCommand.findMany({
+      where: {
+        state: "RUNNING",
+        endsBy: { lte: new Date(now - NODE_COMMAND_TRACK_GRACE_MS) },
+        ...(this.recoveryCursor === undefined ? {} : { id: { gt: this.recoveryCursor } }),
+      },
+      select: nodeCommandSelect,
+      orderBy: { id: "asc" },
+      take: NODE_COMMAND_RECOVERY_PAGE,
+    });
+    // Move past unresponsive commands too; they must not starve the rest of the backlog.
+    this.recoveryCursor =
+      rows.length === NODE_COMMAND_RECOVERY_PAGE ? rows[rows.length - 1]?.id : undefined;
+    await Promise.all(
+      rows.map(async (row) => {
+        try {
+          await reconcile(row);
+        } catch (error) {
+          console.error("[relay] overdue node command reconciliation failed", errorName(error));
+        }
+      }),
+    );
   }
 
   /** One page of RUNNING rows: those whose credential or owner is no longer live end. */
@@ -189,25 +254,45 @@ export class NodeCommandTracker {
         : prisma.agentToken.findMany({
             where: {
               id: { in: tokenIds },
-              level: "FULL",
-              revokedAt: null,
-              OR: [{ expiresAt: null }, { expiresAt: { gt: at } }],
+              grant: { revokedAt: null, scopes: { has: "COMMANDS" } },
+              // A no-expiry token is not live while the deployment disallows those.
+              ...liveAgentTokenWhere(at, env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY),
             },
-            select: { id: true },
+            select: {
+              id: true,
+              userId: true,
+              expiresAt: true,
+              grant: { select: { allNodes: true, Nodes: { select: { nodeId: true } } } },
+            },
           }),
       grantIds.length === 0
         ? []
         : prisma.mcpGrant.findMany({
-            where: { id: { in: grantIds }, level: "FULL", revokedAt: null },
-            select: { id: true },
+            where: { id: { in: grantIds }, scopes: { has: "COMMANDS" }, revokedAt: null },
+            select: { id: true, userId: true, allNodes: true, Nodes: { select: { nodeId: true } } },
           }),
       prisma.user.findMany({
         where: { id: { in: userIds } },
         select: { id: true, banned: true, banExpires: true, deletionRequestedAt: true },
       }),
     ]);
-    const tokenLive = new Set(liveTokens.map((token) => token.id));
-    const grantLive = new Set(liveGrants.map((grant) => grant.id));
+    // Re-judged after the reads (the SQL fragment only saves rows): a no-expiry token is not
+    // live while the deployment disallows those.
+    const tokenLive = new Map(
+      liveTokens
+        .filter(
+          (token) =>
+            !mcpPatBlockedByPolicy(token.expiresAt ?? null, env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY),
+        )
+        .map((token) => [token.id, token]),
+    );
+    const grantLive = new Map(liveGrants.map((grant) => [grant.id, grant]));
+    const allowsNode = (
+      access: { allNodes: boolean; Nodes: { nodeId: string }[] } | undefined,
+      nodeId: string,
+    ) =>
+      access !== undefined &&
+      (access.allNodes || access.Nodes.some((node) => node.nodeId === nodeId));
     const blocked = new Set(
       users.filter((user) => userCredentialAccessBlocked(user, at)).map((user) => user.id),
     );
@@ -217,8 +302,12 @@ export class NodeCommandTracker {
       const ended =
         blocked.has(row.userId) ||
         !known.has(row.userId) ||
-        (row.agentTokenId !== null && !tokenLive.has(row.agentTokenId)) ||
-        (row.mcpGrantId !== null && !grantLive.has(row.mcpGrantId));
+        (row.agentTokenId !== null &&
+          (tokenLive.get(row.agentTokenId)?.userId !== row.userId ||
+            !allowsNode(tokenLive.get(row.agentTokenId)?.grant, row.nodeId))) ||
+        (row.mcpGrantId !== null &&
+          (grantLive.get(row.mcpGrantId)?.userId !== row.userId ||
+            !allowsNode(grantLive.get(row.mcpGrantId), row.nodeId)));
       if (!ended) continue;
       // Sent again on every pass while the row runs: a repeat is a no-op on the node.
       this.cancel(this.entryOf(row));
@@ -230,6 +319,7 @@ export class NodeCommandTracker {
   /** Test isolation. */
   clear(): void {
     this.byId.clear();
+    this.recoveryCursor = undefined;
   }
 
   private entryOf(row: RunningRow) {
@@ -241,11 +331,7 @@ export class NodeCommandTracker {
     };
   }
 
-  private async cancelRows(where: {
-    userId: string;
-    state: "RUNNING";
-    OR?: Array<{ agentTokenId: { in: string[] } } | { mcpGrantId: { in: string[] } }>;
-  }): Promise<number> {
+  private async cancelRows(where: Prisma.NodeCommandWhereInput): Promise<number> {
     let cancelled = 0;
     let cursor: string | undefined;
     for (;;) {

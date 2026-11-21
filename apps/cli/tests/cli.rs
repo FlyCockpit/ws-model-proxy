@@ -275,9 +275,8 @@ fn run_persists_generated_slug_before_auth_failure() {
     write_config(
         &config,
         json!({
-            "version": 1,
-            "serverUrl": "http://127.0.0.1:9",
-            "endpoints": []
+            "version": 3,
+            "serverUrl": "http://127.0.0.1:9"
         }),
     );
 
@@ -303,7 +302,7 @@ fn run_without_the_stop_marker_keeps_retrying_a_missing_credential() {
     let state = tmp.path().join("state");
     write_config(
         &config,
-        json!({ "version": 1, "serverUrl": "http://127.0.0.1:9", "endpoints": [] }),
+        json!({ "version": 3, "serverUrl": "http://127.0.0.1:9" }),
     );
     // A macOS LaunchAgent or detached daemon: exiting would only relaunch.
     // The generous timeout leaves room for slow CI startup before the warning.
@@ -330,7 +329,7 @@ const IDENTITY_PREFIX: &str = "B";
 
 fn well_known(origin: &str) -> Value {
     json!({
-        "serverVersion": "0.4.0", "protocolVersion": "3.0", "origin": origin,
+        "serverVersion": "1.0.0", "protocolVersion": "4.0", "origin": origin,
         "installScript": "/install.sh", "enrollPath": "/api/node/enroll"
     })
 }
@@ -338,7 +337,7 @@ fn well_known(origin: &str) -> Value {
 fn enrolled(slug: &str) -> Value {
     json!({
         "ok": true, "nodeId": "node-1", "slug": slug, "credential": "c".repeat(48),
-        "replaced": null, "trustLowerPending": false
+        "replaced": null, "trustLowerPending": false, "removeAfterOfflineMs": null
     })
 }
 
@@ -479,59 +478,6 @@ fn a_fresh_login_takes_the_chosen_trust_and_a_lowered_node_stays_lowered() {
         .stderr(predicate::str::contains("cannot run from a command"));
 }
 
-/// Leftover 0.3 state (a config without `trust`, an old credential) is not
-/// a lowering and not this node: the login takes `--trust` and a new name.
-#[test]
-fn a_login_over_leftover_0_3_state_is_a_fresh_enrollment() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "serverUrl": "https://old.example.com",
-            "cliSlug": "old-box",
-            "endpoints": []
-        }),
-    );
-    fs::create_dir_all(&state).unwrap();
-    fs::write(
-        state.join("node-credential.json"),
-        json!({ "token": "old-0.3-credential", "server": "https://old.example.com" }).to_string(),
-    )
-    .unwrap();
-    let server = TestServer::start(vec![
-        (
-            "/.well-known/wsmp",
-            200,
-            well_known("https://wsmp.example.com"),
-        ),
-        ("/api/node/enroll", 200, enrolled("fresh-box")),
-    ]);
-    let mut cmd = cli(&config, &state);
-    cmd.args([
-        "login",
-        &server.base_url,
-        "--code",
-        CODE,
-        "--trust",
-        "full",
-        "--no-service",
-        "--json",
-    ]);
-    assert_eq!(json_stdout(cmd)["trust"], "full");
-    server.requests.recv().unwrap();
-    let enroll_request = server.requests.recv().unwrap();
-    let body: Value =
-        serde_json::from_str(enroll_request.split("\r\n\r\n").nth(1).expect("body")).unwrap();
-    assert_ne!(body["slug"], "old-box", "the old node's name was reused");
-    server.join();
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["trust"], "full");
-    assert_eq!(cfg["cliSlug"], "fresh-box");
-}
-
 /// A Relay-only setting an earlier enrollment (another server) left: a fresh
 /// enrollment keeps it without an explicit choice and clears it with
 /// `--trust full`.
@@ -546,11 +492,10 @@ fn a_fresh_enrollment_clears_a_leftover_lowering_only_when_full_is_chosen() {
     write_config(
         &config,
         json!({
-            "version": 1,
+            "version": 3,
             "serverUrl": "https://old.example.com",
             "cliSlug": "old-box",
-            "trust": "full",
-            "endpoints": []
+            "trust": "full"
         }),
     );
     cli(&config, &state)
@@ -800,7 +745,7 @@ fn login_refuses_a_server_on_another_protocol() {
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
     let mut old = well_known("https://wsmp.example.com");
-    old["protocolVersion"] = json!("2.4");
+    old["protocolVersion"] = json!("3.0");
     let server = TestServer::start(vec![("/.well-known/wsmp", 200, old)]);
     cli(&config, &state)
         .args([
@@ -927,11 +872,10 @@ fn commands_wsmp_started_cannot_change_wsmp_itself() {
     write_config(
         &config,
         json!({
-            "version": 1,
+            "version": 3,
             "serverUrl": "https://wsmp.example.com",
             "cliSlug": "spark-1",
-            "trust": "full",
-            "endpoints": []
+            "trust": "full"
         }),
     );
     fs::create_dir_all(&state).unwrap();
@@ -1055,25 +999,17 @@ fn config_terminal_flags_persist_and_ask_for_a_restart() {
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["allowHumanTerminal"], true);
     assert!(cfg.get("requireTerminalApproval").is_none());
-    // The 0.3 command switches are gone: trust is the one switch.
+    // Trust is configured through `wsmp trust`.
     cli(&config, &state)
         .args(["config", "set-mcp-commands", "unsupervised"])
         .assert()
         .failure();
-    // A config from an older wsmp loses its old switches on the next write.
-    fs::write(
-        &config,
-        r#"{"version":1,"allowMcpCommands":true,"mcpCommandMode":"unsupervised"}"#,
-    )
-    .unwrap();
     cli(&config, &state)
         .args(["config", "set-terminal-approval", "on"])
         .assert()
         .success();
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(cfg.get("mcpCommandMode").is_none());
-    assert!(cfg.get("allowMcpCommands").is_none());
-    assert!(cfg.get("trust").is_none());
+    assert_eq!(cfg["requireTerminalApproval"], true);
     cli(&config, &state)
         .args(["config", "set-terminal-approval", "off"])
         .assert()
@@ -1289,7 +1225,7 @@ fn runtime_list_and_status_show_the_held_runtimes() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
-    write_config(&config, json!({ "version": 1, "trust": "full" }));
+    write_config(&config, json!({ "version": 3, "trust": "full" }));
     write_held_always_on(&state, "http://127.0.0.1:9");
     let mut list = cli(&config, &state);
     list.args(["runtime", "list", "--json"]);
@@ -1323,7 +1259,7 @@ fn runtime_test_asks_the_model_list_and_reports_status_and_latency() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
-    write_config(&config, json!({ "version": 1, "trust": "relay" }));
+    write_config(&config, json!({ "version": 3, "trust": "relay" }));
     let server = TestServer::start(vec![(
         "/v1/models",
         200,
@@ -1589,7 +1525,7 @@ mod signal_shutdown {
                     format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
                 ));
                 let response = format!(
-                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: ws-model-proxy.relay.v3\r\n\r\n"
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: ws-model-proxy.relay.v4\r\n\r\n"
                 );
                 stream
                     .write_all(response.as_bytes())
@@ -1759,11 +1695,10 @@ mod signal_shutdown {
         prepare(&state);
         let relay = FakeRelay::start();
         let mut value = json!({
-            "version": 1,
+            "version": 3,
             "serverUrl": relay.server_url,
             "cliSlug": "cli-signal-test",
-            "trust": "full",
-            "endpoints": []
+            "trust": "full"
         });
         if let (Some(base), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
             base.extend(extra.clone());
@@ -2080,7 +2015,7 @@ mod signal_shutdown {
     fn hello_ok(socket: &mut TcpStream) {
         write_text(
             socket,
-            r#"{"type":"hello.ok","id":"h-1","protocolVersion":"3.0","nodeId":"node-1","definitionSync":"expect"}"#,
+            r#"{"type":"hello.ok","id":"h-1","protocolVersion":"4.0","nodeId":"node-1","definitionSync":"expect"}"#,
         );
     }
 
@@ -2485,7 +2420,7 @@ fn trust_full_from_a_terminal_but_not_from_a_user_service() {
     let state = tmp.path().join("state");
     write_config(
         &config,
-        json!({ "version": 1, "serverUrl": "https://wsmp.example.com", "trust": "full", "endpoints": [] }),
+        json!({ "version": 3, "serverUrl": "https://wsmp.example.com", "trust": "full" }),
     );
     cli(&config, &state)
         .args(["trust", "relay"])
@@ -2757,6 +2692,7 @@ fn a_dead_man_whose_relay_restart_fails_keeps_its_job_and_fails() {
             "toVersion": "0.4.3",
             "livePath": live,
             "prevPath": prev,
+            "recoveryPath": bin.join(".wsmp-recovery-AAAAAAAAAAAAAAAAAAAAAA"),
             "failedPath": bin.join("wsmp.failed"),
             "rollbackAfterSecs": 90,
             "deadline": 1,
@@ -2830,9 +2766,8 @@ struct DeadmanFixture {
 
 #[cfg(target_os = "linux")]
 impl DeadmanFixture {
-    /// `recovery`: the job armed as this release arms it (its own recovery copy); otherwise
-    /// as an earlier build armed it (it runs `wsmp.prev`, and the state names no copy).
-    fn new(recovery: bool) -> Self {
+    /// A current update with its own recovery copy for the rollback job.
+    fn new() -> Self {
         use std::os::unix::fs::PermissionsExt;
         use wsmp::update::{install, state};
         let tmp = tempfile::tempdir().expect("fixture");
@@ -2866,9 +2801,7 @@ impl DeadmanFixture {
         if fs::hard_link(env!("CARGO_BIN_EXE_wsmp"), &layout.prev).is_err() {
             fs::copy(env!("CARGO_BIN_EXE_wsmp"), &layout.prev).expect("fixture");
         }
-        if recovery {
-            install::prepare_recovery(&layout.prev, &layout.recovery).expect("fixture");
-        }
+        install::prepare_recovery(&layout.prev, &layout.recovery).expect("fixture");
         let current = state::UpdateState {
             update_id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
             origin: state::Origin::Server,
@@ -2878,7 +2811,7 @@ impl DeadmanFixture {
             to_sha256: Some(install::sha256_file(&layout.live).expect("fixture")),
             live_path: layout.live.clone(),
             prev_path: layout.prev.clone(),
-            recovery_path: recovery.then(|| layout.recovery.clone()),
+            recovery_path: Some(layout.recovery.clone()),
             failed_path: layout.failed.clone(),
             rollback_after_secs: 90,
             deadline: 1,
@@ -2899,25 +2832,15 @@ impl DeadmanFixture {
     }
 
     /// The units this release writes for the job (as `SystemdTimer::register` does), and the
-    /// `ExecStart` argv of the service: exactly what systemd runs. An earlier build's job ran
-    /// `wsmp.prev` with the same arguments.
+    /// `ExecStart` argv of the service: exactly what systemd runs.
     fn arm(&self) -> Vec<String> {
         use wsmp::update::{deadman, flow};
-        let spec = match self.current.recovery_path {
-            Some(_) => flow::deadman_spec(
-                &self.current,
-                &self.state,
-                std::time::Duration::from_secs(90),
-            )
-            .expect("fixture"),
-            None => deadman::DeadmanSpec::new(
-                self.current.update_id.clone(),
-                &self.current.prev_path,
-                &self.state,
-                std::time::Duration::from_secs(90),
-            )
-            .expect("fixture"),
-        };
+        let spec = flow::deadman_spec(
+            &self.current,
+            &self.state,
+            std::time::Duration::from_secs(90),
+        )
+        .expect("fixture");
         let (service, timer) = deadman::systemd_units(&spec, 1).expect("fixture");
         fs::write(self.units.join("wsmp-update-deadman.service"), &service).expect("fixture");
         fs::write(self.units.join("wsmp-update-deadman.timer"), timer).expect("fixture");
@@ -2979,7 +2902,7 @@ impl DeadmanFixture {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_dead_mans_scheduled_program_runs_again_after_a_failed_restart() {
-    let node = DeadmanFixture::new(true);
+    let node = DeadmanFixture::new();
     let job = node.arm();
     assert_eq!(
         Path::new(&job[0]),
@@ -3037,7 +2960,7 @@ fn the_dead_mans_scheduled_program_runs_again_after_a_failed_restart() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_dead_mans_scheduled_program_finishes_a_rollback_cut_short_after_the_restore() {
-    let mut node = DeadmanFixture::new(true);
+    let mut node = DeadmanFixture::new();
     let job = node.arm();
     // What the interrupted run did: intent saved, then the restore, then it died.
     node.current.begin_rollback().unwrap();
@@ -3070,36 +2993,4 @@ fn the_dead_mans_scheduled_program_finishes_a_rollback_cut_short_after_the_resto
             .contains("bad-new-build"),
         "the failed build is kept"
     );
-}
-
-/// F-FA-1, the old layout: a job armed by an earlier build runs `wsmp.prev` (the state names
-/// no recovery copy). This build's rollback puts the restored binary at that path again once
-/// `rolled_back` is saved, so the job's next run after a failed restart still starts; once it
-/// restarted the relay and removed the job, that path goes again (as after any rollback).
-#[cfg(target_os = "linux")]
-#[test]
-fn a_dead_man_armed_by_an_earlier_build_runs_again_after_a_failed_restart() {
-    let node = DeadmanFixture::new(false);
-    let job = node.arm();
-    assert_eq!(Path::new(&job[0]), node.current.prev_path);
-
-    let first = node.run_job(&job);
-    assert!(!first.status.success());
-    assert_eq!(node.stored()["restartPending"], true);
-    assert!(
-        Path::new(&job[0]).exists(),
-        "the job's program is there again"
-    );
-
-    node.restart_works();
-    let second = node.run_job(&job);
-    assert!(
-        second.status.success(),
-        "{}",
-        String::from_utf8_lossy(&second.stderr)
-    );
-    assert!(node.stored().get("restartPending").is_none());
-    assert!(node.job_removed());
-    assert!(!node.current.prev_path.exists());
-    assert!(node.current.live_path.exists());
 }

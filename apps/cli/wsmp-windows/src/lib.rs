@@ -21,6 +21,8 @@
 #[cfg(windows)]
 mod conpty;
 #[cfg(windows)]
+pub mod console;
+#[cfg(windows)]
 mod file_info;
 #[cfg(windows)]
 mod host_job;

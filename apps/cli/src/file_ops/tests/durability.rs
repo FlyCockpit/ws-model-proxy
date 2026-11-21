@@ -214,6 +214,10 @@ fn hook(directory: &Path) -> PathBuf {
 }
 
 #[test]
+#[cfg_attr(
+    target_env = "musl",
+    ignore = "injects faults with LD_PRELOAD, which a static musl test binary never loads"
+)]
 fn actual_fsync_failures_preserve_truthful_recovery_state() {
     let directory = tempfile::tempdir().unwrap();
     let library = hook(directory.path());
@@ -481,6 +485,10 @@ fn actual_io_child() {
 }
 
 #[test]
+#[cfg_attr(
+    target_env = "musl",
+    ignore = "injects faults with LD_PRELOAD, which a static musl test binary never loads"
+)]
 fn real_io_stall_keeps_pool_ownership_until_settlement() {
     let directory = tempfile::tempdir().unwrap();
     let library = hook(directory.path());
@@ -695,6 +703,10 @@ fn run_scenario(library: &Path, directory: &Path, scenario: &str, envs: &[(&str,
 /// residue), FR-4 (unjournaled ops refuse on unsupported directory sync) and
 /// FR-5 (reported residue exists).
 #[test]
+#[cfg_attr(
+    target_env = "musl",
+    ignore = "injects faults with LD_PRELOAD, which a static musl test binary never loads"
+)]
 fn refused_effects_and_committed_cleanup_are_truthful() {
     let directory = tempfile::tempdir().unwrap();
     let library = hook(directory.path());
@@ -931,6 +943,10 @@ fn scenario_child() {
 
 /// FR-2: a process killed right after the named phase became durable.
 #[test]
+#[cfg_attr(
+    target_env = "musl",
+    ignore = "injects faults with LD_PRELOAD, which a static musl test binary never loads"
+)]
 fn interrupted_capture_and_delete_publication_roll_back_automatically() {
     let directory = tempfile::tempdir().unwrap();
     let library = hook(directory.path());
@@ -1024,6 +1040,10 @@ fn killed_child() {
 /// `recover --apply` must restore the right object and never publish the
 /// CLI's own rejected temp.
 #[test]
+#[cfg_attr(
+    target_env = "musl",
+    ignore = "injects faults with LD_PRELOAD, which a static musl test binary never loads"
+)]
 fn interrupted_replace_rolls_back_without_publishing_its_temp() {
     let directory = tempfile::tempdir().unwrap();
     let library = hook(directory.path());
@@ -1196,6 +1216,10 @@ fn capture_enoent_after_effect_keeps_the_object_journaled() {
 /// F6: a CLI state directory without directory fsync is an unsafe
 /// filesystem for journaling, named in the error, with nothing changed.
 #[test]
+#[cfg_attr(
+    target_env = "musl",
+    ignore = "injects faults with LD_PRELOAD, which a static musl test binary never loads"
+)]
 fn unsupported_state_directory_sync_is_unsafe_filesystem() {
     let directory = tempfile::tempdir().unwrap();
     let library = hook(directory.path());

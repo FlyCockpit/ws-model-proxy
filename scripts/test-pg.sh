@@ -5,7 +5,7 @@
 # Spins up a THROWAWAY postgres:17 container (same image as
 # docker-compose.dev.yml) under a UNIQUE name with a RANDOM loopback host
 # port, waits for TCP readiness, runs scripts/test-postgres-integration.sh
-# (the same gate CI runs: db:push plus hardening, then the API and server
+# (the same gate CI runs: `prisma migrate deploy` of the committed migrations, then the API and server
 # `test:postgres` suites) against the disposable URL, and tears the container
 # down — including its ANONYMOUS VOLUMES — on exit, on failure, and on
 # interruption.
@@ -51,13 +51,19 @@
 # OPT-OUT (bring your own database): if SCHEMA_VALIDATION_DATABASE_URL is
 # already exported when this script starts, provisioning is SKIPPED and the
 # suite runs against that URL directly — no container is created or removed.
-# The database is changed in place (schema push plus suite fixtures), so it
+# The database is changed in place (migrations plus suite fixtures), so it
 # must be disposable. REQUIRE_POSTGRES_INTEGRATION=1 is always set so a
 # missing/unreachable URL fails loudly instead of silently skipping tests.
 #
 # Usage:
 #   pnpm test:pg
+#   pnpm test:pg --container-prefix <name>
+#   TEST_CONTAINER_PREFIX=<name> pnpm test:pg
 #   SCHEMA_VALIDATION_DATABASE_URL=postgresql://... pnpm test:pg
+#
+# CONTAINER NAME: <prefix>-test-pg-<run-id>. The prefix is `wsmp` unless
+# `--container-prefix <name>` or TEST_CONTAINER_PREFIX sets it (the flag wins;
+# an invalid value is an error, exit 2): scripts/lib/test-container-prefix.sh.
 #
 # No sudo. Requires docker (or podman via CONTAINER_RUNTIME) to be available
 # unless the opt-out URL is provided.
@@ -71,6 +77,15 @@ echo "[$SCRIPT_NAME] disposable-PostgreSQL integration runner"
 # Locate the repo root from this script's location (works from any cwd).
 # ---------------------------------------------------------------------------
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The container's name prefix (flag > TEST_CONTAINER_PREFIX > `wsmp`),
+# validated before anything is created.
+# shellcheck source=lib/test-container-prefix.sh
+. "$REPO_ROOT/scripts/lib/test-container-prefix.sh"
+CONTAINER_PREFIX="$(test_container_prefix wsmp "$@")" || {
+  echo "[$SCRIPT_NAME] error: invalid container prefix; nothing was created." >&2
+  exit 2
+}
 
 # The suites to run live in one place: the shared CI gate script.
 INTEGRATION_SCRIPT="$REPO_ROOT/scripts/test-postgres-integration.sh"
@@ -115,7 +130,7 @@ runtime() {
 CLEANED_UP=0
 RUN_ID="t$(date +%s)r$$x$RANDOM$RANDOM"
 RUN_LABEL="wsmp.test-pg.run=${RUN_ID}"
-CONTAINER_NAME="wsmp-test-pg-${RUN_ID}"
+CONTAINER_NAME="${CONTAINER_PREFIX}-test-pg-${RUN_ID}"
 # EXCLUSIVELY allocated below via `mkdir` (atomic): a stale cidfile can
 # never exist inside a directory only this run could create.
 RUN_DIR="${TMPDIR:-/tmp}/wsmp-test-pg.${RUN_ID}"
@@ -425,10 +440,10 @@ fi
 echo "[$SCRIPT_NAME] postgres is ready (TCP)."
 
 # ---------------------------------------------------------------------------
-# Schema sync and suites — the shared gate script pushes the schema through
-# the repo's OWN db:push pipeline (prisma db push plus hardening; safe,
-# non-destructive) and runs every suite. The URL is scoped to this invocation
-# only (env-prefix form — never exported into the environment).
+# Migrations and suites — the shared gate script applies the committed
+# migrations (`prisma migrate deploy`, which carry the hardening) and runs
+# every suite. The URL is scoped to this invocation only (env-prefix form —
+# never exported into the environment).
 # ---------------------------------------------------------------------------
 cd "$REPO_ROOT"
 echo "[$SCRIPT_NAME] running the PostgreSQL integration suites..."

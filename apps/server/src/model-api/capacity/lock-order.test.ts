@@ -47,7 +47,7 @@ function sourceFiles(directory: string): string[] {
     if (entry.isDirectory())
       return ["node_modules", "generated", "e2e"].includes(entry.name) ? [] : sourceFiles(path);
     return /\.(tsx?|mjs|sql|sh)$/.test(entry.name) &&
-      !/\.test\.tsx?$/.test(entry.name) &&
+      !/\.test\.(?:tsx?|mjs)$/.test(entry.name) &&
       !/(?:\.test-helper|-test-helpers)\.ts$/.test(entry.name)
       ? [path]
       : [];
@@ -73,9 +73,20 @@ const ADVISORY_SITES: Record<string, string> = {
     "The fence module: acquireFences calls wsmp_acquire_fences (its docs name pg_advisory*).",
   "packages/db/prisma/schema-hardening.sql":
     "Defines wsmp_acquire_fences and the residency trigger's nonblocking target try-lock (never a waited fence).",
-  "scripts/docker-entrypoint.sh":
-    "Writer class D: the deploy's session-level lock serializing schema applies on a dedicated connection that holds nothing else.",
-  "scripts/test-docker-entrypoint-schema.sh": "Test double for the entrypoint's deploy lock.",
+  "packages/db/prisma/migrations/0_init/migration.sql":
+    "The released 0.4.3 hardening (0_init): defines wsmp_acquire_fences and the residency trigger's nonblocking target try-lock.",
+  "packages/db/prisma/migrations/20261112000000_upgrade_to_1_0_0/migration.sql":
+    "The 1.0 hardening (generated from schema-hardening.sql): re-defines wsmp_acquire_fences and the residency try-lock.",
+  "scripts/db/migrate-runtime.mjs":
+    "Writer class D: the migration runner's session-level lock (MIGRATION_RUNNER_LOCK_KEY) serializing deploys, on a dedicated connection that holds nothing else.",
+  "scripts/backup/restore.mjs":
+    "Writer class D: restore takes the migration runner lock on a dedicated connection before replacing the database.",
+  "scripts/db/lib/migration-state.mjs":
+    "Writer class D: tryHoldRunnerLock, the non-waiting migration runner lock `pnpm db:migrate:apply` holds on a dedicated local connection before it resolves a failed migration.",
+  "scripts/db/test-migrations.mjs":
+    "Test driver: holds the runner lock against a disposable Postgres.",
+  "scripts/backup/test-backup-restore.mjs":
+    "Test driver: holds the runner lock against a disposable Postgres.",
 };
 
 /** Files allowed to name the fence protocol (function or setting), and why. */
@@ -88,6 +99,12 @@ const FENCE_PROTOCOL_SITES: Record<string, string> = {
     "Test fixtures only: a client whose connections carry the bypass marker.",
   "packages/db/scripts/verify-schema-hardening.mjs":
     "Deploy verification: asserts the hardening SQL still defines the protocol.",
+  "packages/db/prisma/migrations/0_init/migration.sql":
+    "The released 0.4.3 hardening (0_init): the protocol, the fence triggers, the bypass marker.",
+  "packages/db/prisma/migrations/20261112000000_upgrade_to_1_0_0/migration.sql":
+    "The 1.0 hardening: the protocol, the fence triggers and the deploy's bypass marker.",
+  "packages/db/prisma/fixtures/0_init.sql":
+    "Migration test fixture (CI check 4): its transaction carries the bypass marker.",
 };
 
 function findAdvisoryReferences(file: string, source: string): string[] {
@@ -171,8 +188,10 @@ const HOT_PATH_WRITERS: Record<string, string> = {
   "packages/db/prisma/schema-hardening.sql": "D: deploy backfills under exclusive table locks",
   "packages/db/scripts/verify-schema-hardening.mjs":
     "D: schema verification on a disposable database",
-  "packages/db/scripts/pre-push-null-cleanup.mjs":
-    "D: legacy NULL row cleanup and in-place renames before the schema push",
+  "packages/db/prisma/migrations/0_init/migration.sql":
+    "D: the 0.4.3 hardening's backfills (no-ops on the new database it runs on)",
+  "packages/db/prisma/migrations/20261112000000_upgrade_to_1_0_0/migration.sql":
+    "D: the 1.0 upgrade's backfills under exclusive table locks",
 };
 
 // ---------------------------------------------------------------------------
@@ -202,7 +221,7 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/lib/claim-release.ts":
     "M: a claim's release (proven stop or a person's release without proof) and its release requests, inside the caller's graphWrite (owner fence, then the instance's capacity fence); the request sweep writes only claim_release_request, which no fence covers",
   "packages/api/src/lib/instance-run.ts":
-    "M: an instance's run (runGeneration: a legacy row's bootstrap, and beginRun at a restart), inside the caller's graphWrite (owner fence, then the instance's capacity fence; runGeneration is a policy column of the fence)",
+    "M: an instance's run (runGeneration: beginRun at a restart), inside the caller's graphWrite (owner fence, then the instance's capacity fence; runGeneration is a policy column of the fence)",
   "packages/api/src/lib/operator-need.ts":
     "M: a step's terminal write (endSteps: state, error, hold) and the instance's needsOperator, inside the caller's graphWrite (owner fence, then the instance's capacity fence)",
   "packages/api/src/lib/reservations.ts":
@@ -253,6 +272,12 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/db/src/parent-deletion.ts": "user deletion marker writes (unfenced columns)",
   "packages/db/prisma/schema-hardening.sql": "D: deploy backfills (bypass marker)",
   "packages/db/scripts/verify-schema-hardening.mjs": "D: schema verification",
+  "packages/db/prisma/migrations/0_init/migration.sql":
+    "D: the 0.4.3 hardening's backfills (bypass marker)",
+  "packages/db/prisma/migrations/20261112000000_upgrade_to_1_0_0/migration.sql":
+    "D: the 1.0 upgrade's backfills (bypass marker)",
+  "packages/db/prisma/fixtures/0_init.sql": "D: migration test fixture rows (bypass marker)",
+  "scripts/backup/test-backup-restore.mjs": "Test driver: synthetic rows in a disposable database",
 };
 
 // ---------------------------------------------------------------------------
@@ -300,6 +325,10 @@ const REVIEWED_SHARE_LOCKS: Record<string, string> = {
   "apps/server/src/model-api/local-send.ts:user.FOR SHARE":
     "Sorted user SHARE locks after graph owner/target-policy fences and graph rows catch unfenced Better Auth one-user bans. Ban writer updates one user and takes no inference row afterwards. Deletion writers share owner fences, and pool-before-user order matches deletion. No later fence/graph row acquisition.",
   "packages/db/prisma/schema-hardening.sql:user.FOR SHARE":
+    "session_refuse_deleting_user (DEL-STATE commit point): a BEFORE INSERT ON session trigger. The session inserter holds no fence and takes none afterwards (a single-statement insert, or sign-up's transaction on a brand-new user row), so its wait on a mark, the user delete's row lock or a user writer closes no cycle.",
+  "packages/db/prisma/migrations/0_init/migration.sql:user.FOR SHARE":
+    "session_refuse_deleting_user (DEL-STATE commit point): a BEFORE INSERT ON session trigger. The session inserter holds no fence and takes none afterwards (a single-statement insert, or sign-up's transaction on a brand-new user row), so its wait on a mark, the user delete's row lock or a user writer closes no cycle.",
+  "packages/db/prisma/migrations/20261112000000_upgrade_to_1_0_0/migration.sql:user.FOR SHARE":
     "session_refuse_deleting_user (DEL-STATE commit point): a BEFORE INSERT ON session trigger. The session inserter holds no fence and takes none afterwards (a single-statement insert, or sign-up's transaction on a brand-new user row), so its wait on a mark, the user delete's row lock or a user writer closes no cycle.",
   "packages/db/src/parent-deletion.ts:user.FOR SHARE":
     "lockUserDeletionOwner (F2-03): the first lock of a user-deletion drain batch, on its deletion generation. The batch takes no fence; afterwards it takes only history rows with SKIP LOCKED and their H-internal cascades, every lock wait bounded by a transaction-local lock_timeout and every statement by a transaction-local statement_timeout. It never waits on a fence or a graph row, so the user delete (fences, then this row FOR UPDATE) waiting for it closes no cycle; abandon, restore and a new mark wait for the batch and then withdraw the generation.",

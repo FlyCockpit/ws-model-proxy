@@ -7,8 +7,13 @@ import {
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const wiring = vi.hoisted(() => ({ reconciler: undefined as unknown }));
 vi.mock("./relay/node-commands.js", () => ({
-  nodeCommandTracker: {},
+  nodeCommandTracker: {
+    setCommandReconciler: vi.fn((reconciler: unknown) => {
+      wiring.reconciler = reconciler;
+    }),
+  },
   cancelNodeCommandsForCredentials: vi.fn(async () => 0),
   cancelNodeCommandsForUser: vi.fn(),
   sweepExpiredNodeCommands: vi.fn(async () => 0),
@@ -115,6 +120,10 @@ function deferred<T>() {
 
 describe("app deletion listeners reach browser terminal sockets", () => {
   let closeRelay: MockInstance;
+
+  it("registers overdue command reconciliation while wiring the app", () => {
+    expect(wiring.reconciler).toBeTypeOf("function");
+  });
 
   beforeEach(() => {
     db.session.findUnique.mockReset();

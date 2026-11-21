@@ -1,13 +1,22 @@
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, verify, type webcrypto } from "node:crypto";
+import {
+  ALL_AGENT_SCOPES,
+  agentScopeToDb,
+  MCP_FINE_SCOPES,
+  MCP_MISSING_SCOPE_DESCRIPTION,
+} from "@ws-model-proxy/auth/agent-scopes";
 import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
+import { makeSignature } from "better-auth/crypto";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const FULL_OAUTH_SCOPE = `mcp:read ${MCP_FINE_SCOPES.join(" ")}`;
 
 /**
  * Committed real-handler parity tests (Part D pass 3, L21): the authorize
  * boundary in mcp-authorize-scope-guard.ts must judge exactly the request
- * the INSTALLED downstream stack (better-auth@1.7.3 → better-call@1.4.0
+ * the INSTALLED downstream stack (better-auth@1.7.18 → better-call@1.4.5
  * getBody + oauth-provider query parsing) would judge. Every fixture here
  * mounts the guard in front of a real `betterAuth` instance (memory
  * adapter, real resolveMcpPlugins with the flag on, mocked Prisma mcpGrant
@@ -15,11 +24,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  *
  * Coverage split (pass 4): the skipConsent: true fixtures below cover
  * PARSER parity (guard vs installed better-call/oauth-provider parsing);
- * the consent-enabled fixture at the bottom covers the FULL consent flow
+ * the consent-enabled fixture at the bottom covers the full consent flow
  * (authorize → consent page → consent accept → code exchange → grant
  * minting) and the L17 referenceId continuity (consent row referenceId ===
  * the grant's referenceId), and the consent page's Read-only/Full choice
- * (mcp-consent-level.ts): only the person's `level` sets the grant level.
+ * (mcp-consent-access.ts): only the person's approval sets grant access.
  *
  * The mocked mcpGrant table is a small in-memory store keyed like the real
  * unique (userId, clientId, referenceId), so consent-time and exchange-time
@@ -31,13 +40,16 @@ type GrantRow = {
   userId: string;
   clientId: string;
   referenceId: string;
-  level: "READ" | "FULL";
+  scopes: ReturnType<typeof agentScopeToDb>[];
+  allNodes: boolean;
+  Nodes: { nodeId: string }[];
   revokedAt: Date | null;
 };
 type GrantKey = { userId: string; clientId: string; referenceId: string };
 const store = vi.hoisted(() => ({ rows: [] as GrantRow[], audits: [] as unknown[] }));
 const grants = vi.hoisted(() => ({
   findUnique: vi.fn(),
+  findFirst: vi.fn(),
   create: vi.fn(),
   createMany: vi.fn(),
   updateMany: vi.fn(),
@@ -52,7 +64,14 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   },
 }));
 vi.mock("@ws-model-proxy/db", () => {
-  const tx = { mcpGrant: grants, auditEvent: audits };
+  const tx = {
+    mcpGrant: grants,
+    auditEvent: audits,
+    mcpGrantNode: {
+      deleteMany: vi.fn(async () => ({ count: 0 })),
+      createMany: vi.fn(async () => ({ count: 0 })),
+    },
+  };
   return {
     default: {
       ...tx,
@@ -62,9 +81,9 @@ vi.mock("@ws-model-proxy/db", () => {
 });
 
 import {
-  type McpGrantLevelLoweredEvent,
-  onMcpGrantLevelLowered,
-} from "../../../packages/auth/src/mcp-grant-level";
+  type AgentAccessNarrowedEvent,
+  onMcpGrantAccessNarrowed,
+} from "../../../packages/auth/src/mcp-grant-access";
 import { resolveMcpPlugins } from "../../../packages/auth/src/mcp-plugins";
 import { mcpAuthorizeScopeGuard } from "./mcp-authorize-scope-guard";
 
@@ -77,13 +96,17 @@ function findRow(key: GrantKey): GrantRow | undefined {
   );
 }
 
-function createRow(data: GrantKey & { level?: "READ" | "FULL" }): GrantRow {
+function createRow(
+  data: GrantKey & { scopes?: ReturnType<typeof agentScopeToDb>[]; allNodes?: boolean },
+): GrantRow {
   const row: GrantRow = {
     id: `parity-grant-${store.rows.length + 1}`,
     userId: data.userId,
     clientId: data.clientId,
     referenceId: data.referenceId,
-    level: data.level ?? "READ",
+    scopes: data.scopes ?? ["READ"],
+    allNodes: data.allNodes ?? true,
+    Nodes: [],
     revokedAt: null,
   };
   store.rows.push(row);
@@ -123,34 +146,54 @@ beforeEach(() => {
   // ON CONFLICT DO NOTHING, like `skipDuplicates`.
   grants.createMany
     .mockReset()
-    .mockImplementation(async (args: { data: Array<GrantKey & { level: "READ" | "FULL" }> }) => {
-      let count = 0;
-      for (const data of args.data) {
-        if (findRow(data)) continue;
-        createRow(data);
-        count += 1;
-      }
-      return { count };
-    });
-  grants.updateMany
-    .mockReset()
     .mockImplementation(
       async (args: {
-        where: { id: string; userId: string; revokedAt: null; level: "READ" | "FULL" };
-        data: { level: "READ" | "FULL" };
+        data: Array<GrantKey & { scopes: ReturnType<typeof agentScopeToDb>[]; allNodes: boolean }>;
       }) => {
-        const row = store.rows.find(
-          (candidate) =>
-            candidate.id === args.where.id &&
-            candidate.userId === args.where.userId &&
-            candidate.revokedAt === null &&
-            candidate.level === args.where.level,
-        );
-        if (!row) return { count: 0 };
-        row.level = args.data.level;
-        return { count: 1 };
+        let count = 0;
+        for (const data of args.data) {
+          if (findRow(data)) continue;
+          createRow(data);
+          count += 1;
+        }
+        return { count };
       },
     );
+  grants.findFirst
+    .mockReset()
+    .mockImplementation(async (args: { where: { id: string; userId?: string } }) => {
+      const row = store.rows.find(
+        (candidate) =>
+          candidate.id === args.where.id &&
+          (args.where.userId === undefined || candidate.userId === args.where.userId) &&
+          candidate.revokedAt === null,
+      );
+      return row ? { ...row } : null;
+    });
+  grants.updateMany.mockReset().mockImplementation(
+    async (args: {
+      where: {
+        id: string;
+        userId: string;
+        scopes: { equals: ReturnType<typeof agentScopeToDb>[] };
+        allNodes: boolean;
+      };
+      data: { scopes: ReturnType<typeof agentScopeToDb>[]; allNodes: boolean };
+    }) => {
+      const row = store.rows.find(
+        (candidate) =>
+          candidate.id === args.where.id &&
+          candidate.userId === args.where.userId &&
+          candidate.revokedAt === null &&
+          JSON.stringify(candidate.scopes) === JSON.stringify(args.where.scopes.equals) &&
+          candidate.allNodes === args.where.allNodes,
+      );
+      if (!row) return { count: 0 };
+      row.scopes = args.data.scopes;
+      row.allNodes = args.data.allNodes;
+      return { count: 1 };
+    },
+  );
   audits.create.mockReset().mockImplementation(async (args: { data: unknown }) => {
     store.audits.push(args.data);
     return args.data;
@@ -197,7 +240,7 @@ function buildApp({
         redirectUris: [CALLBACK],
         grantTypes: ["authorization_code", "refresh_token"],
         responseTypes: ["code"],
-        scopes: ["mcp:read", "mcp:write", "offline_access"],
+        scopes: ["mcp:read", ...MCP_FINE_SCOPES, "offline_access"],
         skipConsent,
         requirePKCE: true,
         disabled: false,
@@ -267,44 +310,42 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     expect(grants.create).not.toHaveBeenCalled();
   });
 
-  describe("hybrid JSON content type (application/json+application/x-www-form-urlencoded)", () => {
-    const post = (app: Hono, payload: unknown) =>
-      app.request(`${BASE}${AUTHORIZE}`, {
+  it.each([
+    { ...oauthParams, resource: CANONICAL },
+    { ...oauthParams, scope: "   ", resource: CANONICAL },
+    { ...oauthParams, scope: "mcp:read" },
+    { ...oauthParams, scope: "mcp:read", resource: CANONICAL },
+  ])(
+    "hybrid JSON/form content type → downstream 415 before OAuth validation (%j)",
+    async (payload) => {
+      const { app } = buildApp();
+      const res = await app.request(`${BASE}${AUTHORIZE}`, {
         method: "POST",
         headers: { "content-type": HYBRID_JSON, origin: BASE },
         body: JSON.stringify(payload),
       });
-
-    it("missing scope → LOCAL invalid_scope, non-redirecting", async () => {
-      const { app } = buildApp();
-      const res = await post(app, { ...oauthParams, resource: CANONICAL });
-      expect(res.status).toBe(400);
+      expect(res.status).toBe(415);
       expect(res.headers.get("location")).toBeNull();
-      expect(await res.json()).toMatchObject({ error: "invalid_scope" });
-    });
+      expect(await res.json()).toMatchObject({ code: "UNSUPPORTED_MEDIA_TYPE" });
+      expect(grants.findUnique).not.toHaveBeenCalled();
+      expect(grants.create).not.toHaveBeenCalled();
+    },
+  );
 
-    it("blank scope → LOCAL invalid_scope, non-redirecting", async () => {
-      const { app } = buildApp();
-      const res = await post(app, { ...oauthParams, scope: "   ", resource: CANONICAL });
-      expect(res.status).toBe(400);
-      expect(res.headers.get("location")).toBeNull();
-      expect(await res.json()).toMatchObject({ error: "invalid_scope" });
+  it.each([
+    "application/x-www-form-urlencoded+json",
+    "application/vnd.x+json+application/x-www-form-urlencoded",
+    "text/application/x-www-form-urlencoded",
+    "application/x-www-form-urlencoded-json",
+  ])("non-exact form media type %s → downstream 415", async (contentType) => {
+    const { app } = buildApp();
+    const res = await app.request(`${BASE}${AUTHORIZE}`, {
+      method: "POST",
+      headers: { "content-type": contentType, origin: BASE },
+      body: formBody({ scope: "mcp:read", resource: CANONICAL }),
     });
-
-    it("missing resource → LOCAL invalid_target, non-redirecting", async () => {
-      const { app } = buildApp();
-      const res = await post(app, { ...oauthParams, scope: "mcp:read" });
-      expect(res.status).toBe(400);
-      expect(res.headers.get("location")).toBeNull();
-      expect(await res.json()).toMatchObject({ error: "invalid_target" });
-    });
-
-    it("valid scope + canonical resource → forwarded (login redirect)", async () => {
-      const { app } = buildApp();
-      const res = await post(app, { ...oauthParams, scope: "mcp:read", resource: CANONICAL });
-      expect(res.status).toBe(302);
-      expect(res.headers.get("location")).toContain("/mcp-login");
-    });
+    expect(res.status).toBe(415);
+    expect(res.headers.get("location")).toBeNull();
   });
 
   it("repeated form resource keys: foreign LAST → LOCAL invalid_target", async () => {
@@ -353,7 +394,7 @@ describe("MCP authorize boundary parity with the installed handler", () => {
       scope: "mcp:read",
       resource: CANONICAL,
     });
-    query.append("scope", "mcp:write");
+    query.append("scope", "mcp:pools");
     const res = await app.request(`${BASE}${AUTHORIZE}?${query.toString()}`);
     expect(res.status).toBe(302);
     const location = new URL(res.headers.get("location")!, BASE);
@@ -472,7 +513,7 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     ) as Record<string, unknown>;
     expect(claims.mcp_grant_id).toBe(store.rows[0]?.id);
     // A skip-consent client never saw the page: its grant is Read-only.
-    expect(store.rows[0]?.level).toBe("READ");
+    expect(store.rows[0]?.scopes).toEqual(["READ"]);
   });
 
   it("FULL FLOW hazard closed: BOM-prefixed resource authorize is locally rejected — no guard-passing shape reaches token issuance without the hook", async () => {
@@ -534,25 +575,6 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     expect(grants.create).not.toHaveBeenCalled();
   });
 
-  it("form-admissible but unform-parseable content type → LOCAL 400 invalid_request (was: downstream 500 + raw TypeError)", async () => {
-    const { app } = buildApp();
-    const res = await app.request(`${BASE}${AUTHORIZE}`, {
-      method: "POST",
-      headers: { "content-type": "text/application/x-www-form-urlencoded", origin: BASE },
-      body: formBody({ scope: "mcp:read", resource: CANONICAL }),
-    });
-    expect(res.status).toBe(400);
-    expect(res.headers.get("location")).toBeNull();
-    expect(await res.json()).toMatchObject({ error: "invalid_request" });
-  });
-
-  // ------------------------------------------------------------------
-  // L21 (pass 4) — consent-enabled FULL flow (fixture client with
-  // skipConsent: false), steps pinned against the installed provider.
-  // The skipConsent fixtures above cover parser parity; THIS one covers
-  // the consent round-trip and the L17 referenceId continuity.
-  // ------------------------------------------------------------------
-
   it("CONSENT FULL FLOW: authorize → consent page → consent accept → code exchange; oauthConsent row and grant share the referenceId", async () => {
     const { app, auth, memory } = buildApp({ skipConsent: false });
 
@@ -602,14 +624,16 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     const consentRow = (memory.oauthConsent ?? [])[0] as { referenceId?: unknown } | undefined;
     expect(consentRow?.referenceId).toMatch(/^[a-f0-9]{64}$/);
 
-    // 5. The approval created the grant (at the default Read-only level)
+    // 5. The approval created the grant (with the default read scope)
     //    under the CONSENT row's referenceId (L17 continuity), before the
     //    code reached the browser.
     expect(store.rows).toHaveLength(1);
     expect(store.rows[0]).toMatchObject({
       referenceId: consentRow?.referenceId,
       clientId: CLIENT,
-      level: "READ",
+      scopes: ["READ"],
+      allNodes: true,
+      Nodes: [],
       revokedAt: null,
     });
 
@@ -724,10 +748,10 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     await authorizeExpectConsent(app, cookie, "mcp:read");
     expect(memory.oauthConsent ?? []).toHaveLength(1);
 
-    // Step-up request adds mcp:write: the remembered row does NOT cover the
+    // Step-up request adds all fine scopes: the remembered row does NOT cover the
     // requested scope set (`!requestedScopes.every((s) => consent.scopes
     // .includes(s))` in the installed authorize), so the consent page
-    // re-prompts — for the FULL requested scope set (mcp:read mcp:write),
+    // re-prompts — for the FULL requested scope set (mcp:read all fine scopes),
     // NOT just the delta: the installed provider signs and persists the
     // whole authorization query (authorize-9whjxVLJ.mjs:5660-5684 signs the
     // full query; :55-117 persists the accepted full scope set).
@@ -742,7 +766,7 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     const stepUp = await app.request(`${BASE}${AUTHORIZE}`, {
       method: "POST",
       headers: { "content-type": FORM, cookie, origin: BASE },
-      body: formBody({ scope: "mcp:read mcp:write", resource: CANONICAL }),
+      body: formBody({ scope: FULL_OAUTH_SCOPE, resource: CANONICAL }),
     });
     expect(stepUp.status).toBe(302);
     const location = new URL(stepUp.headers.get("location")!, BASE);
@@ -761,14 +785,14 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     expect(codeUrl.searchParams.get("code")).toBeTruthy();
     const rows = memory.oauthConsent ?? [];
     const scopeSets = rows.map((row) => (row.scopes as string[]) ?? []);
-    expect(scopeSets.some((scopes) => scopes.includes("mcp:write"))).toBe(true);
+    expect(scopeSets.some((scopes) => scopes.includes("mcp:pools"))).toBe(true);
 
     // A subsequent FULL-SET authorize now skips the prompt (the remembered
     // set covers it).
     const after = await app.request(`${BASE}${AUTHORIZE}`, {
       method: "POST",
       headers: { "content-type": FORM, cookie, origin: BASE },
-      body: formBody({ scope: "mcp:read mcp:write", resource: CANONICAL }),
+      body: formBody({ scope: FULL_OAUTH_SCOPE, resource: CANONICAL }),
     });
     expect(after.status).toBe(302);
     const afterLocation = new URL(after.headers.get("location")!, BASE);
@@ -812,12 +836,12 @@ describe("MCP authorize boundary parity with the installed handler", () => {
   });
 
   // ------------------------------------------------------------------
-  // The consent page's Read-only/Full choice (mcp-consent-level.ts): the
-  // level comes from the PERSON's consent body only, defaults to Read-only,
+  // The consent page's scope choice: access
+  // comes from the PERSON's consent body only, defaults to read,
   // and is recorded on the exact grant the code exchanges into.
   // ------------------------------------------------------------------
 
-  describe("consent level", () => {
+  describe("consent access", () => {
     /** authorize → expect the consent page; returns its signed query. */
     async function consentPage(
       app: Hono,
@@ -879,70 +903,77 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     it("a person choosing Full records a Full grant (audited as the person) the code exchanges into", async () => {
       const { app, auth } = buildApp({ skipConsent: false });
       const cookie = await consentFixtureUser(app, auth, "full@example.test");
-      const query = await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+      const query = await consentPage(app, cookie, { scope: FULL_OAUTH_SCOPE });
       const code = await codeFrom(
-        await postConsent(app, cookie, { accept: true, level: "FULL", oauth_query: query }),
+        await postConsent(app, cookie, {
+          accept: true,
+          scopes: ALL_AGENT_SCOPES,
+          nodeIds: null,
+          oauth_query: query,
+        }),
       );
       expect(store.rows).toHaveLength(1);
-      expect(store.rows[0]?.level).toBe("FULL");
+      expect(store.rows[0]?.scopes).toEqual(ALL_AGENT_SCOPES.map(agentScopeToDb));
       expect(store.audits).toEqual([
         expect.objectContaining({
           actor: "USER",
           action: "mcp_grant.consent",
           resourceType: "mcp_grant",
           resourceId: store.rows[0]?.id,
-          after: { level: "FULL" },
+          after: { scopes: ALL_AGENT_SCOPES, nodeIds: null },
         }),
       ]);
       const claims = await exchange(app, code);
       expect(claims.mcp_grant_id).toBe(store.rows[0]?.id);
-      expect(claims.scope).toBe("mcp:read mcp:write");
+      expect(claims.scope).toBe(FULL_OAUTH_SCOPE);
     });
 
-    it("no level in the approval means Read-only, even when the client asked for mcp:write", async () => {
+    it("no scopes in the approval means Read-only, even when the client asked for all fine scopes", async () => {
       const { app, auth } = buildApp({ skipConsent: false });
       const cookie = await consentFixtureUser(app, auth, "default@example.test");
-      const query = await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+      const query = await consentPage(app, cookie, { scope: FULL_OAUTH_SCOPE });
       await codeFrom(await postConsent(app, cookie, { accept: true, oauth_query: query }));
-      expect(store.rows[0]?.level).toBe("READ");
+      expect(store.rows[0]?.scopes).toEqual(["READ"]);
     });
 
-    it("a client cannot pick the level: a `level` it puts in the authorize request is never read", async () => {
+    it("a client cannot pick grant scopes: `scopes` it puts in the authorize request is never read", async () => {
       const { app, auth } = buildApp({ skipConsent: false });
       const cookie = await consentFixtureUser(app, auth, "client-level@example.test");
       const query = await consentPage(app, cookie, {
-        scope: "mcp:read mcp:write",
-        level: "FULL",
+        scope: FULL_OAUTH_SCOPE,
+        scopes: JSON.stringify(ALL_AGENT_SCOPES),
       });
       // The client's parameter rides inside the signed query; the approval carries none.
-      expect(new URLSearchParams(query).get("level")).toBe("FULL");
+      expect(new URLSearchParams(query).get("scopes")).toBe(JSON.stringify(ALL_AGENT_SCOPES));
       await codeFrom(await postConsent(app, cookie, { accept: true, oauth_query: query }));
-      expect(store.rows[0]?.level).toBe("READ");
+      expect(store.rows[0]?.scopes).toEqual(["READ"]);
     });
 
-    it("refuses Full when the approved scopes lack mcp:write, and an unknown level, before any code or grant", async () => {
+    it("refuses Full when the approved scopes lack all fine scopes, and an unknown scope, before any code or grant", async () => {
       const { app, auth, memory } = buildApp({ skipConsent: false });
       const cookie = await consentFixtureUser(app, auth, "refused@example.test");
       const readOnly = await consentPage(app, cookie, { scope: "mcp:read" });
       const full = await postConsent(app, cookie, {
         accept: true,
-        level: "FULL",
+        scopes: ALL_AGENT_SCOPES,
+        nodeIds: null,
         oauth_query: readOnly,
       });
       expect(full.status).toBe(400);
       expect(await full.json()).toMatchObject({ error: "invalid_request" });
       // Narrowing the approval to mcp:read takes write away too.
-      const both = await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+      const both = await consentPage(app, cookie, { scope: FULL_OAUTH_SCOPE });
       const narrowed = await postConsent(app, cookie, {
         accept: true,
-        level: "FULL",
+        scopes: ALL_AGENT_SCOPES,
+        nodeIds: null,
         scope: "mcp:read",
         oauth_query: both,
       });
       expect(narrowed.status).toBe(400);
       const unknown = await postConsent(app, cookie, {
         accept: true,
-        level: "ADMIN",
+        scopes: ["read", "admin"],
         oauth_query: both,
       });
       expect(unknown.status).toBe(400);
@@ -950,28 +981,33 @@ describe("MCP authorize boundary parity with the installed handler", () => {
       expect(memory.oauthConsent ?? []).toHaveLength(0);
     });
 
-    it("a cross-site approval (another origin) is refused before any level is written", async () => {
+    it("a cross-site approval (another origin) is refused before any access is written", async () => {
       const { app, auth } = buildApp({ skipConsent: false, originCheck: true });
       const cookie = await consentFixtureUser(app, auth, "csrf@example.test");
-      const query = await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+      const query = await consentPage(app, cookie, { scope: FULL_OAUTH_SCOPE });
       const forged = await postConsent(
         app,
         cookie,
-        { accept: true, level: "FULL", oauth_query: query },
+        { accept: true, scopes: ALL_AGENT_SCOPES, nodeIds: null, oauth_query: query },
         "https://evil.example",
       );
       expect(forged.status).toBe(403);
       expect(store.rows).toHaveLength(0);
       // The same approval from the app's own origin goes through.
       await codeFrom(
-        await postConsent(app, cookie, { accept: true, level: "FULL", oauth_query: query }),
+        await postConsent(app, cookie, {
+          accept: true,
+          scopes: ALL_AGENT_SCOPES,
+          nodeIds: null,
+          oauth_query: query,
+        }),
       );
-      expect(store.rows[0]?.level).toBe("FULL");
+      expect(store.rows[0]?.scopes).toEqual(ALL_AGENT_SCOPES.map(agentScopeToDb));
     });
 
-    it("step-up: the person's choice on the re-prompt replaces the level; remembered consent never changes it", async () => {
-      const lowered: McpGrantLevelLoweredEvent[] = [];
-      const unsubscribe = onMcpGrantLevelLowered((event) => {
+    it("step-up: the person's choice on the re-prompt replaces access; remembered consent never changes it", async () => {
+      const lowered: AgentAccessNarrowedEvent[] = [];
+      const unsubscribe = onMcpGrantAccessNarrowed((event) => {
         lowered.push(event);
       });
       try {
@@ -984,80 +1020,93 @@ describe("MCP authorize boundary parity with the installed handler", () => {
             oauth_query: await consentPage(app, cookie, { scope: "mcp:read" }),
           }),
         );
-        expect(store.rows[0]?.level).toBe("READ");
+        expect(store.rows[0]?.scopes).toEqual(["READ"]);
 
-        // Step-up to mcp:write re-prompts; the person chooses Full.
+        // Step-up to all fine scopes re-prompts; the person chooses Full.
         await codeFrom(
           await postConsent(app, cookie, {
             accept: true,
-            level: "FULL",
-            oauth_query: await consentPage(app, cookie, { scope: "mcp:read mcp:write" }),
+            scopes: ALL_AGENT_SCOPES,
+            nodeIds: null,
+            oauth_query: await consentPage(app, cookie, { scope: FULL_OAUTH_SCOPE }),
           }),
         );
         expect(store.rows).toHaveLength(1);
-        expect(store.rows[0]?.level).toBe("FULL");
+        expect(store.rows[0]?.scopes).toEqual(ALL_AGENT_SCOPES.map(agentScopeToDb));
 
         // The person lowers it elsewhere (Access → Agents); a remembered
         // re-authorization (no page) issues a code but never raises it back.
         const row = store.rows[0];
-        if (row) row.level = "READ";
+        if (row) row.scopes = ["READ"];
         const remembered = await app.request(`${BASE}${AUTHORIZE}`, {
           method: "POST",
           headers: { "content-type": FORM, cookie, origin: BASE },
-          body: formBody({ scope: "mcp:read mcp:write", resource: CANONICAL }),
+          body: formBody({ scope: FULL_OAUTH_SCOPE, resource: CANONICAL }),
         });
         expect(remembered.status).toBe(302);
         const code = new URL(remembered.headers.get("location")!).searchParams.get("code");
         expect(code).toBeTruthy();
         await exchange(app, code ?? "");
-        expect(store.rows[0]?.level).toBe("READ");
+        expect(store.rows[0]?.scopes).toEqual(["READ"]);
 
         // prompt=consent shows the page again: the person raises, then lowers.
         await codeFrom(
           await postConsent(app, cookie, {
             accept: true,
-            level: "FULL",
+            scopes: ALL_AGENT_SCOPES,
+            nodeIds: null,
             oauth_query: await consentPage(app, cookie, {
-              scope: "mcp:read mcp:write",
+              scope: FULL_OAUTH_SCOPE,
               prompt: "consent",
             }),
           }),
         );
-        expect(store.rows[0]?.level).toBe("FULL");
+        expect(store.rows[0]?.scopes).toEqual(ALL_AGENT_SCOPES.map(agentScopeToDb));
         expect(lowered).toEqual([]);
         await codeFrom(
           await postConsent(app, cookie, {
             accept: true,
-            level: "READ",
+            scopes: ["read"],
+            nodeIds: null,
             oauth_query: await consentPage(app, cookie, {
-              scope: "mcp:read mcp:write",
+              scope: FULL_OAUTH_SCOPE,
               prompt: "consent",
             }),
           }),
         );
-        expect(store.rows[0]?.level).toBe("READ");
-        expect(lowered).toEqual([{ userId: store.rows[0]?.userId, grantId: store.rows[0]?.id }]);
+        expect(store.rows[0]?.scopes).toEqual(["READ"]);
+        expect(lowered).toEqual([
+          {
+            kind: "oauth_grant",
+            agentTokenId: null,
+            userId: store.rows[0]?.userId,
+            grantId: store.rows[0]?.id,
+            before: { scopes: ALL_AGENT_SCOPES, nodeIds: null },
+            after: { scopes: ["read"], nodeIds: null },
+          },
+        ]);
         expect(store.audits.map((entry) => (entry as { after: unknown }).after)).toEqual([
-          { level: "READ" },
-          { level: "FULL" },
-          { level: "FULL" },
-          { level: "READ" },
+          { scopes: ["read"], nodeIds: null },
+          { scopes: ALL_AGENT_SCOPES, nodeIds: null },
+          { scopes: ALL_AGENT_SCOPES, nodeIds: null },
+          { scopes: ["read"], nodeIds: null },
         ]);
       } finally {
         unsubscribe();
       }
     });
 
-    it("withholds the code when the level cannot be recorded", async () => {
+    it("withholds the code when access cannot be recorded", async () => {
       const { app, auth, memory } = buildApp({ skipConsent: false });
       const cookie = await consentFixtureUser(app, auth, "storage@example.test");
-      const query = await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+      const query = await consentPage(app, cookie, { scope: FULL_OAUTH_SCOPE });
       grants.createMany.mockRejectedValueOnce(new Error("db down"));
       const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
       try {
         const response = await postConsent(app, cookie, {
           accept: true,
-          level: "FULL",
+          scopes: ALL_AGENT_SCOPES,
+          nodeIds: null,
           oauth_query: query,
         });
         expect(response.status).toBe(500);
@@ -1066,10 +1115,320 @@ describe("MCP authorize boundary parity with the installed handler", () => {
         // The approval is forgotten: the next authorize asks the person again instead of
         // issuing a code from a remembered consent.
         expect(memory.oauthConsent ?? []).toHaveLength(0);
-        await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+        await consentPage(app, cookie, { scope: FULL_OAUTH_SCOPE });
       } finally {
         errors.mockRestore();
       }
     });
   });
+});
+
+// ------------------------------------------------------------------
+// better-auth#12194 (open upstream; fix PR #12231 unmerged): oauth-provider 1.7.18 answers an
+// authorize request without `scope` with every scope stored on the client. The parity client,
+// like a DCR client registered without `scope`, stores the whole ceiling (mcp:read, the six
+// fine scopes, offline_access). These cases show what wsmp issues for a scopeless or partial
+// request: tokens are verified against the provider's own JWKS, not just decoded.
+// ------------------------------------------------------------------
+describe("better-auth#12194: scopeless and partial authorize requests never widen", () => {
+  async function signedIn(auth: ReturnType<typeof buildApp>["auth"], email: string) {
+    const signup = await auth.api.signUpEmail({
+      body: { name: "Scope Check", email, password: "parity-test-password-123" },
+      asResponse: true,
+    });
+    expect(signup.status).toBe(200);
+    return signup.headers
+      .getSetCookie()
+      .map((v) => v.split(";")[0])
+      .join("; ");
+  }
+
+  /** The JWT's claims after checking its signature against the provider's published JWKS. */
+  async function verifiedClaims(
+    auth: ReturnType<typeof buildApp>["auth"],
+    jwt: string,
+  ): Promise<Record<string, unknown>> {
+    const [header = "", payload = "", signature = ""] = jwt.split(".");
+    const head = JSON.parse(Buffer.from(header, "base64url").toString("utf8")) as {
+      alg: string;
+      kid: string;
+    };
+    const jwksResponse = await auth.handler(new Request(`${BASE}/api/auth/jwks`));
+    expect(jwksResponse.status).toBe(200);
+    const { keys } = (await jwksResponse.json()) as {
+      keys: (webcrypto.JsonWebKey & { kid: string })[];
+    };
+    const jwk = keys.find((key) => key.kid === head.kid);
+    expect(jwk).toBeDefined();
+    const key = createPublicKey({ key: jwk as webcrypto.JsonWebKey, format: "jwk" });
+    const check = (body: string) =>
+      head.alg === "EdDSA"
+        ? verify(null, Buffer.from(body), key, Buffer.from(signature, "base64url"))
+        : verify(
+            "sha256",
+            Buffer.from(body),
+            { key, dsaEncoding: "ieee-p1363" },
+            Buffer.from(signature, "base64url"),
+          );
+    expect(check(`${header}.${payload}`)).toBe(true);
+    // Control: the same check refuses a payload with a widened scope.
+    const forged = Buffer.from(
+      JSON.stringify({
+        ...JSON.parse(Buffer.from(payload, "base64url").toString("utf8")),
+        scope: FULL_OAUTH_SCOPE,
+      }),
+    ).toString("base64url");
+    expect(check(`${header}.${forged}`)).toBe(false);
+    return JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<
+      string,
+      unknown
+    >;
+  }
+
+  function expectMissingScope(response: Response) {
+    expect(response.status).toBe(400);
+    expect(response.headers.get("location")).toBeNull();
+    expect(response.headers.get("cache-control")).toBe("no-store");
+  }
+
+  it.each([
+    ["GET", undefined],
+    ["GET", ""],
+    ["GET", " \t "],
+    ["POST", undefined],
+    ["POST", ""],
+  ])(
+    "through the server: %s with scope %j → local invalid_scope, nothing stored",
+    async (method, scope) => {
+      const { app, auth, memory } = buildApp({ skipConsent: false });
+      const cookie = await signedIn(auth, "guard@example.test");
+      const params = {
+        ...oauthParams,
+        resource: CANONICAL,
+        ...(scope === undefined ? {} : { scope }),
+      };
+      const response =
+        method === "GET"
+          ? await app.request(`${BASE}${AUTHORIZE}?${new URLSearchParams(params)}`, {
+              headers: { cookie },
+            })
+          : await app.request(`${BASE}${AUTHORIZE}`, {
+              method: "POST",
+              headers: { "content-type": FORM, cookie, origin: BASE },
+              body: new URLSearchParams(params).toString(),
+            });
+      expectMissingScope(response);
+      expect(await response.json()).toEqual({
+        error: "invalid_scope",
+        error_description: MCP_MISSING_SCOPE_DESCRIPTION,
+      });
+      expect(memory.verification).toHaveLength(0);
+      expect(memory.oauthConsent).toHaveLength(0);
+      expect(store.rows).toHaveLength(0);
+    },
+  );
+
+  it.each(["GET", "POST"])(
+    "at the provider, without the server's guard: %s without scope → invalid_scope, not the stored ceiling",
+    async (method) => {
+      const { auth, memory } = buildApp({ skipConsent: false });
+      const cookie = await signedIn(auth, "direct@example.test");
+      const params = new URLSearchParams({ ...oauthParams, resource: CANONICAL });
+      const response = await auth.handler(
+        method === "GET"
+          ? new Request(`${BASE}${AUTHORIZE}?${params}`, { headers: { cookie } })
+          : new Request(`${BASE}${AUTHORIZE}`, {
+              method: "POST",
+              headers: { "content-type": FORM, cookie, origin: BASE },
+              body: params.toString(),
+            }),
+      );
+      expectMissingScope(response);
+      expect(await response.json()).toMatchObject({
+        error: "invalid_scope",
+        error_description: MCP_MISSING_SCOPE_DESCRIPTION,
+      });
+      expect(memory.verification).toHaveLength(0);
+      expect(memory.oauthConsent).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["consent", { accept: true }],
+    ["continue", { selected: true }],
+    ["continue", { postLogin: true }],
+  ])("a signed query without scope cannot resume through %s %j", async (path, body) => {
+    const { app, auth, memory } = buildApp({ skipConsent: false });
+    const cookie = await signedIn(auth, "resume@example.test");
+    const query = new URLSearchParams({
+      ...oauthParams,
+      resource: CANONICAL,
+      exp: String(Math.floor(Date.now() / 1000) + 600),
+    });
+    query.sort();
+    query.set(
+      "sig",
+      await makeSignature(query.toString(), "parity-test-secret-at-least-thirty-two-characters"),
+    );
+    const response = await app.request(`${BASE}/api/auth/oauth2/${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: BASE },
+      body: JSON.stringify({ ...body, oauth_query: query.toString() }),
+    });
+    expectMissingScope(response);
+    expect(await response.json()).toMatchObject({
+      error: "invalid_scope",
+      error_description: MCP_MISSING_SCOPE_DESCRIPTION,
+    });
+    expect(memory.oauthConsent).toHaveLength(0);
+    expect(memory.verification).toHaveLength(0);
+    expect(store.rows).toHaveLength(0);
+  });
+
+  it.each([
+    [null, 400],
+    ["mcp:read", 200],
+  ] as const)("sign-in resuming a signed query with scope %j answers %i", async (scope, status) => {
+    const { app, auth, memory } = buildApp({ skipConsent: false });
+    await signedIn(auth, "signin@example.test");
+    const sessions = memory.session?.length ?? 0;
+    const query = new URLSearchParams({
+      ...oauthParams,
+      resource: CANONICAL,
+      ...(scope === null ? {} : { scope }),
+      exp: String(Math.floor(Date.now() / 1000) + 600),
+    });
+    query.sort();
+    query.set(
+      "sig",
+      await makeSignature(query.toString(), "parity-test-secret-at-least-thirty-two-characters"),
+    );
+    const response = await app.request(`${BASE}/api/auth/sign-in/email`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: BASE },
+      body: JSON.stringify({
+        email: "signin@example.test",
+        password: "parity-test-password-123",
+        oauth_query: query.toString(),
+      }),
+    });
+    expect(response.status).toBe(status);
+    if (scope === null) {
+      expect(await response.json()).toMatchObject({
+        error: "invalid_scope",
+        error_description: MCP_MISSING_SCOPE_DESCRIPTION,
+      });
+      expect(memory.session).toHaveLength(sessions);
+      return;
+    }
+    // The resumed authorize goes on to consent with exactly the signed scope.
+    const body = (await response.json()) as { url?: string };
+    const next = new URL(body.url ?? "", BASE);
+    expect(next.pathname).toContain("/mcp-consent");
+    expect(next.searchParams.get("scope")).toBe(scope);
+  });
+
+  it.each([
+    ["mcp:read", ["read"]],
+    ["mcp:read offline_access", ["read"]],
+    ["mcp:read mcp:files offline_access", ["read", "files"]],
+  ] as const)(
+    "a client holding every scope that asks for %j gets a token for exactly that",
+    async (scope, agentScopes) => {
+      const { app, auth, memory } = buildApp({ skipConsent: false });
+      const cookie = await signedIn(auth, "partial@example.test");
+      expect(memory.oauthClient?.[0]?.scopes).toEqual([
+        "mcp:read",
+        ...MCP_FINE_SCOPES,
+        "offline_access",
+      ]);
+      const authorize = await app.request(`${BASE}${AUTHORIZE}`, {
+        method: "POST",
+        headers: { "content-type": FORM, cookie, origin: BASE },
+        body: formBody({ scope, resource: CANONICAL }),
+      });
+      expect(authorize.status).toBe(302);
+      const page = new URL(authorize.headers.get("location")!, BASE);
+      expect(page.pathname).toContain("/mcp-consent");
+      // The consent page is asked about exactly the requested scopes.
+      expect(page.searchParams.get("scope")).toBe(scope);
+      const oauthQuery = page.search.slice(1);
+      const consent = (extra: Record<string, unknown>) =>
+        app.request(`${BASE}/api/auth/oauth2/consent`, {
+          method: "POST",
+          headers: { "content-type": "application/json", cookie, origin: BASE },
+          body: JSON.stringify({ accept: true, oauth_query: oauthQuery, ...extra }),
+        });
+
+      // Approval cannot widen: neither the OAuth scope nor the agent permissions.
+      const widerScope = await consent({ scope: `${scope} mcp:pools` });
+      expect(widerScope.status).toBe(400);
+      const widerAccess = await consent({ scopes: [...agentScopes, "pools"] });
+      expect(widerAccess.status).toBe(400);
+      expect(await widerAccess.json()).toMatchObject({
+        error_description: "Agent scopes exceed the approved OAuth scopes.",
+      });
+      expect(memory.oauthConsent).toHaveLength(0);
+      expect(store.rows).toHaveLength(0);
+
+      const approved = await consent({ scopes: [...agentScopes] });
+      expect(approved.status).toBe(200);
+      const { url } = (await approved.json()) as { url: string };
+      const code = new URL(url, BASE).searchParams.get("code");
+      expect(code).toBeTruthy();
+      expect(store.rows).toHaveLength(1);
+      expect(store.rows[0]?.scopes).toEqual(agentScopes.map(agentScopeToDb));
+
+      const token = await app.request(`${BASE}/api/auth/oauth2/token`, {
+        method: "POST",
+        headers: { "content-type": FORM },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: CLIENT,
+          code: code!,
+          code_verifier: VERIFIER,
+          redirect_uri: CALLBACK,
+          // Ignored on a code exchange: the code carries the consented scopes.
+          scope: FULL_OAUTH_SCOPE,
+        }),
+      });
+      expect(token.status).toBe(200);
+      const tokens = (await token.json()) as {
+        access_token: string;
+        refresh_token?: string;
+        scope: string;
+      };
+      expect(tokens.scope).toBe(scope);
+      const claims = await verifiedClaims(auth, tokens.access_token);
+      expect(claims.scope).toBe(scope);
+      expect(claims.aud).toBe(CANONICAL);
+      expect(claims.mcp_grant_id).toBe(store.rows[0]?.id);
+
+      if (!scope.includes("offline_access")) {
+        expect(tokens.refresh_token).toBeUndefined();
+        return;
+      }
+      const refresh = (extra: Record<string, string>) =>
+        app.request(`${BASE}/api/auth/oauth2/token`, {
+          method: "POST",
+          headers: { "content-type": FORM },
+          body: new URLSearchParams({
+            grant_type: "refresh_token",
+            client_id: CLIENT,
+            refresh_token: tokens.refresh_token ?? "",
+            ...extra,
+          }),
+        });
+      // A refresh cannot add a scope the person did not approve.
+      const widened = await refresh({ scope: `${scope} mcp:pools` });
+      expect(widened.status).toBe(400);
+      expect(await widened.json()).toMatchObject({ error: "invalid_scope" });
+      // A refresh without scope keeps exactly the approved scopes.
+      const kept = await refresh({});
+      expect(kept.status).toBe(200);
+      const keptJson = (await kept.json()) as { access_token: string; scope: string };
+      expect(keptJson.scope).toBe(scope);
+      expect((await verifiedClaims(auth, keptJson.access_token)).scope).toBe(scope);
+    },
+  );
 });

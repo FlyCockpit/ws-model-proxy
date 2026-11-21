@@ -12,6 +12,7 @@ const envMock = {
   WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: undefined as string | undefined,
   WMP_MCP_ENABLED: true,
   WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: true,
+  WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS: 90,
   WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: false,
   BETTER_AUTH_URL: "https://proxy.example.com",
 };
@@ -149,6 +150,7 @@ describe("app", () => {
       privateNetworksAllowed: true,
       mcpEnabled: true,
       agentTokenNoExpiryAllowed: true,
+      agentTokenMaxLifetimeDays: 90,
     });
     expect(JSON.stringify(await client.app.flags())).not.toContain(sentinel);
     expect(JSON.stringify(await client.app.flags())).not.toContain("keyring");
@@ -161,6 +163,7 @@ describe("app", () => {
       privateNetworksAllowed: false,
       mcpEnabled: true,
       agentTokenNoExpiryAllowed: true,
+      agentTokenMaxLifetimeDays: 90,
     });
   });
 

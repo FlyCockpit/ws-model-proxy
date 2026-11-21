@@ -25,7 +25,7 @@ function fakePrisma() {
   return {
     mediaAsset: {
       findFirst: vi.fn(),
-      update: vi.fn(),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       create: vi.fn(),
       delete: vi.fn(),
       aggregate: vi.fn().mockResolvedValue({ _sum: { sizeBytes: 0 } }),
@@ -173,8 +173,8 @@ describe("uploadMedia", () => {
     expect(result.createdAt).toEqual(originalCreatedAt);
     // Only one create total; the dedup path refreshes expiresAt instead.
     expect(prisma.mediaAsset.create).toHaveBeenCalledOnce();
-    expect(prisma.mediaAsset.update).toHaveBeenCalledWith({
-      where: { id: "asset-1" },
+    expect(prisma.mediaAsset.updateMany).toHaveBeenCalledWith({
+      where: { id: "asset-1", expiresAt: { gt: now } },
       data: { expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000) },
     });
   });
@@ -255,5 +255,97 @@ describe("uploadMedia", () => {
     // The quota aggregate was never consulted on the dedup path.
     expect(prisma.mediaAsset.aggregate).not.toHaveBeenCalled();
     expect(prisma.mediaAsset.create).not.toHaveBeenCalled();
+  });
+  it.each(["findFirst", "aggregate", "updateMany"] as const)(
+    "discards staged bytes when %s fails",
+    async (operation) => {
+      const store = new LocalMediaStore(root);
+      const prisma = fakePrisma();
+      prisma.mediaAsset.findFirst.mockResolvedValue(
+        operation === "updateMany"
+          ? { id: "old", mime: "image/png", sizeBytes: PNG.length, createdAt: new Date(0) }
+          : null,
+      );
+      prisma.mediaAsset[operation].mockRejectedValue(new Error("database unavailable"));
+      await expect(
+        uploadMedia({
+          source: source(PNG),
+          userId: "user-1",
+          store,
+          ttlHours: 24,
+          maxBytesPerUser: 1000,
+          prisma: prisma as never,
+        }),
+      ).rejects.toThrow("database unavailable");
+      expect(await readdir(join(root, "tmp"))).toEqual([]);
+      expect(prisma.mediaAsset.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("creates fresh bytes when the dedup refresh loses to expiry deletion", async () => {
+    const store = new LocalMediaStore(root);
+    const prisma = fakePrisma();
+    prisma.mediaAsset.findFirst.mockResolvedValue({
+      id: "expired",
+      mime: "image/png",
+      sizeBytes: PNG.length,
+      createdAt: new Date(0),
+    });
+    prisma.mediaAsset.updateMany.mockResolvedValue({ count: 0 });
+    prisma.mediaAsset.create.mockImplementation(async ({ data }: { data: { id: string } }) => ({
+      id: data.id,
+      createdAt: new Date(2000),
+    }));
+    const result = await uploadMedia({
+      source: source(PNG),
+      userId: "user-1",
+      store,
+      ttlHours: 24,
+      prisma: prisma as never,
+      now: new Date(2000),
+    });
+    expect(result.deduped).toBe(false);
+    expect(result.id).not.toBe("expired");
+    const object = await store.getStream(result.id);
+    expect(object?.sizeBytes).toBe(PNG.length);
+    object?.stream.destroy();
+    expect(await readdir(join(root, "tmp"))).toEqual([]);
+  });
+
+  it("reads the dedup and quota clock after staging completes", async () => {
+    const store = new LocalMediaStore(root);
+    const prisma = fakePrisma();
+    prisma.mediaAsset.findFirst.mockResolvedValue(null);
+    prisma.mediaAsset.create.mockImplementation(async ({ data }: { data: { id: string } }) => ({
+      id: data.id,
+      createdAt: new Date(2000),
+    }));
+    let time = new Date(1000);
+    const originalStage = store.stage.bind(store);
+    vi.spyOn(store, "stage").mockImplementation(async (...args) => {
+      const staged = await originalStage(...args);
+      time = new Date(2000);
+      return staged;
+    });
+    const result = await uploadMedia({
+      source: source(PNG),
+      userId: "user-1",
+      store,
+      ttlHours: 1,
+      maxBytesPerUser: 1000,
+      prisma: prisma as never,
+      now: () => time,
+    });
+    expect(prisma.mediaAsset.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ expiresAt: { gt: new Date(2000) } }),
+      }),
+    );
+    expect(prisma.mediaAsset.aggregate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ expiresAt: { gt: new Date(2000) } }),
+      }),
+    );
+    expect(result.expiresAt).toEqual(new Date(2000 + 60 * 60 * 1000));
   });
 });

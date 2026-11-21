@@ -14,6 +14,20 @@ import {
 } from "@ws-model-proxy/config/usage-metrics";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { metricsQueryInputSchema, metricsQueryOutputSchema } from "../contracts/metrics";
+import { hiddenInstancesWhere } from "./agent-hidden-nodes";
+
+/**
+ * The shared hidden-instance lookup, with no time bound: rollups bucket by completion, which can
+ * come long after the instance stopped (abandoned-request recovery included).
+ */
+function isHiddenLookup(args: unknown): boolean {
+  const query = args as { where?: unknown; select?: unknown };
+  if (JSON.stringify(query.where) !== JSON.stringify(hiddenInstancesWhere(["hidden"])))
+    return false;
+  expect(query.select).toEqual({ id: true });
+  return true;
+}
+
 import { compactNumber, runMetricsQuery } from "./metrics-query";
 
 const db = prisma as unknown as ReturnType<typeof mockDeep<PrismaClient>>;
@@ -522,4 +536,167 @@ describe("compactNumber", () => {
     expect(compactNumber(0.123456)).toBe(0.123);
     expect(compactNumber(12.3456)).toBe(12.3);
   });
+});
+
+describe("load aggregates with a hidden binding, reservation or rank", () => {
+  for (const [label, access, filtered] of [
+    ["allowlisted", { scopes: ["read"] as const, nodeIds: ["allowed"] }, true],
+    ["null allowlist", { scopes: ["read"] as const, nodeIds: null }, false],
+    ["person", undefined, false],
+  ] as const) {
+    it(`${label}: every load aggregate excludes the entire hidden instance`, async () => {
+      db.node.findMany.mockResolvedValue([{ id: "allowed" }, { id: "hidden" }] as never);
+      // The shared hidden-instance predicate resolves the mixed instance once per read.
+      db.runtimeInstance.findMany.mockImplementation((async (args: unknown) =>
+        isHiddenLookup(args) ? [{ id: "inst-mixed" }] : []) as never);
+      const queries: Prisma.Sql[] = [];
+      db.$queryRaw.mockImplementation((async (
+        strings: TemplateStringsArray,
+        ...parts: unknown[]
+      ) => {
+        const query = Prisma.sql(strings, ...parts);
+        queries.push(query);
+        const excludesMixed =
+          query.sql.includes('NOT (COALESCE(l."instanceId"') &&
+          query.values.some((value) => Array.isArray(value) && value.includes("inst-mixed"));
+        const row = excludesMixed
+          ? {
+              g: "",
+              samples: 2,
+              kvSamples: 2,
+              sumKvUsage: 0.4,
+              maxKvUsage: 0.3,
+              maxRunning: 1,
+              maxWaiting: 2,
+              fullSamples: 0,
+            }
+          : {
+              g: "",
+              samples: 4,
+              kvSamples: 4,
+              sumKvUsage: 2,
+              maxKvUsage: 0.9,
+              maxRunning: 8,
+              maxWaiting: 9,
+              fullSamples: 2,
+            };
+        return [{ ...row, ...(query.sql.includes("date_bin") ? { t: minute(1) } : {}) }];
+      }) as never);
+      const result = await runMetricsQuery(
+        "owner",
+        parse({
+          scope: { pool: "pool1" },
+          metrics: ["kv_usage_avg", "kv_usage_max", "running_max", "waiting_max", "full_ratio"],
+          range: "1h",
+          step: "1m",
+        }),
+        NOW,
+        access,
+      );
+      const expected = filtered
+        ? { kv_usage_avg: 0.2, kv_usage_max: 0.3, running_max: 1, waiting_max: 2, full_ratio: 0 }
+        : { kv_usage_avg: 0.5, kv_usage_max: 0.9, running_max: 8, waiting_max: 9, full_ratio: 0.5 };
+      expect(result.totals).toEqual(expected);
+      for (const [metric, value] of Object.entries(expected))
+        expect(result.series[0]?.values[metric]).toEqual([value]);
+      expect(queries).toHaveLength(2);
+      for (const query of queries) {
+        expect(query.sql.includes('NOT (COALESCE(l."nodeId"')).toBe(filtered);
+        expect(query.sql.includes('NOT (COALESCE(l."instanceId"')).toBe(filtered);
+        expect(query.sql).not.toContain("hidden");
+        expect(query.sql).not.toContain("inst-mixed");
+        if (filtered) {
+          expect(query.values).toContainEqual(["hidden"]);
+          expect(query.values).toContainEqual(["inst-mixed"]);
+        }
+      }
+    });
+  }
+});
+
+describe("request metrics with a hidden binding, reservation or rank", () => {
+  for (const [label, access, filtered] of [
+    ["allowlisted", { scopes: ["read"] as const, nodeIds: ["allowed"] }, true],
+    ["null allowlist", { scopes: ["read"] as const, nodeIds: null }, false],
+    ["person", undefined, false],
+  ] as const) {
+    it(`${label}: requests served by a mixed instance are left out like its load`, async () => {
+      db.node.findMany.mockResolvedValue([{ id: "allowed" }, { id: "hidden" }] as never);
+      db.runtimeInstance.findMany.mockImplementation((async (args: unknown) =>
+        isHiddenLookup(args) ? [{ id: "inst-mixed" }] : []) as never);
+      const queries: Prisma.Sql[] = [];
+      db.$queryRaw.mockImplementation((async (
+        strings: TemplateStringsArray,
+        ...parts: unknown[]
+      ) => {
+        queries.push(Prisma.sql(strings, ...parts));
+        return [];
+      }) as never);
+      await runMetricsQuery(
+        "owner",
+        parse({ scope: { pool: "pool1" }, metrics: ["requests"], range: "1h", step: "1m" }),
+        NOW,
+        access,
+      );
+      const rollups = queries.filter((query) => query.sql.includes("usage_rollup"));
+      expect(rollups.length).toBeGreaterThan(0);
+      for (const query of rollups) {
+        expect(query.sql.includes('NOT (COALESCE("nodeId"')).toBe(filtered);
+        expect(query.sql.includes('NOT (COALESCE("instanceId"')).toBe(filtered);
+        expect(query.sql).not.toContain("inst-mixed");
+        if (filtered) expect(query.values).toContainEqual(["inst-mixed"]);
+      }
+    });
+  }
+});
+
+describe("node gauges of a runtime with a hidden instance", () => {
+  for (const [label, access, filtered] of [
+    ["allowlisted", { scopes: ["read"] as const, nodeIds: ["allowed", "only-mixed"] }, true],
+    ["person", undefined, false],
+  ] as const) {
+    it(`${label}: a node only a hidden instance ran on is not among the runtime's nodes`, async () => {
+      db.node.findMany.mockResolvedValue([
+        { id: "allowed" },
+        { id: "only-mixed" },
+        { id: "hidden" },
+      ] as never);
+      // inst-mixed has a rank on only-mixed (allowed) and a reservation on the hidden node.
+      db.runtime.findFirst.mockResolvedValue({
+        id: "rt1",
+        nodeId: null,
+        Instances: [
+          { id: "inst-ok", Ranks: [{ nodeId: "allowed" }] },
+          { id: "inst-mixed", Ranks: [{ nodeId: "only-mixed" }] },
+        ],
+      } as never);
+      db.runtimeInstance.findMany.mockImplementation((async (args: unknown) =>
+        isHiddenLookup(args) ? [{ id: "inst-mixed" }] : []) as never);
+      const queries: Prisma.Sql[] = [];
+      db.$queryRaw.mockImplementation((async (
+        strings: TemplateStringsArray,
+        ...parts: unknown[]
+      ) => {
+        queries.push(Prisma.sql(strings, ...parts));
+        return [];
+      }) as never);
+      await runMetricsQuery(
+        "owner",
+        parse({ scope: { runtime: "rt1" }, metrics: ["cpu_pct"], range: "1h", step: "1m" }),
+        NOW,
+        access,
+      );
+      expect(queries.length).toBeGreaterThan(0);
+      for (const query of queries) {
+        const nodeLists = query.values.filter(
+          (value): value is string[] =>
+            Array.isArray(value) && value.some((item) => item === "allowed"),
+        );
+        expect(nodeLists[0]).toEqual(filtered ? ["allowed"] : ["allowed", "only-mixed"]);
+        // Nodes found through engine load skip the hidden instance's load too.
+        expect(query.sql.includes('NOT (COALESCE("instanceId"')).toBe(filtered);
+        if (filtered) expect(query.values).toContainEqual(["inst-mixed"]);
+      }
+    });
+  }
 });

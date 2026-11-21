@@ -8,6 +8,12 @@ import { histogramQuantile, LATENCY_HISTOGRAM_BUCKETS } from "@ws-model-proxy/co
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { effectiveTrust } from "../nodes/trust";
 import { callableIdOf } from "./access-views";
+import {
+  andServedVisibly,
+  type HiddenServing,
+  NOTHING_HIDDEN,
+  ROLLUP_SERVED,
+} from "./agent-hidden-serving";
 import { compactNumber } from "./metrics-query";
 import { liveNodeWhere, nodeIsLive } from "./node-liveness";
 import { memberLatencyKey } from "./pool-views";
@@ -61,13 +67,15 @@ export type PoolTraffic = { requests: number; errors: number; sparkline: number[
 /**
  * Requests and errors to the owner's pools over a range, with a request sparkline (agent tests
  * excluded). Recent traffic lives in the minute rollup (hourly rows only hold what compaction
- * moved out after 30 days).
+ * moved out after 30 days). For an allowlisted agent, requests served on a hidden node or by a
+ * hidden instance (`agent-hidden-nodes.ts`) are left out before aggregation.
  */
 export async function poolTraffic(
   ownerId: string,
   poolIds: readonly string[],
   range: OverviewRange,
   now = new Date(),
+  hidden: HiddenServing = NOTHING_HIDDEN,
 ): Promise<Map<string, PoolTraffic>> {
   const { from, bucketMs, buckets } = windowOf(range, now);
   const byPool = new Map(
@@ -82,7 +90,7 @@ export async function poolTraffic(
       SUM(requests)::float8 AS requests, SUM(errors)::float8 AS errors
     FROM usage_rollup_minute
     WHERE "ownerUserId" = ${ownerId} AND "poolId" = ANY(${[...poolIds]}::text[])
-      AND "bucketStart" >= ${from} AND ${realTraffic()}
+      AND "bucketStart" >= ${from} AND ${realTraffic()}${andServedVisibly(hidden, ROLLUP_SERVED)}
     GROUP BY 1, 2`;
   for (const row of rows) {
     const entry = byPool.get(String(row.pool));
@@ -119,12 +127,14 @@ export type MemberRecentTraffic = {
 /**
  * Each member of the owner's pools: its p95 latency over the last 15 minutes and its requests
  * over the last 24 hours, of real traffic (minute rollups, one bounded query; agent tests
- * excluded).
+ * excluded). Requests served on a hidden node or by a hidden instance are left out of latency,
+ * requests and the share totals alike, so the visible members' shares still add up to 1.
  */
 export async function memberRecentTraffic(
   ownerId: string,
   poolIds: readonly string[],
   now = new Date(),
+  hidden: HiddenServing = NOTHING_HIDDEN,
 ): Promise<MemberRecentTraffic> {
   const traffic: MemberRecentTraffic = {
     p95: new Map(),
@@ -151,7 +161,7 @@ export async function memberRecentTraffic(
       )}
     FROM usage_rollup_minute
     WHERE "ownerUserId" = ${ownerId} AND "poolId" = ANY(${[...poolIds]}::text[])
-      AND "bucketStart" >= ${shareFrom} AND "bucketStart" <= ${now} AND ${realTraffic()}
+      AND "bucketStart" >= ${shareFrom} AND "bucketStart" <= ${now} AND ${realTraffic()}${andServedVisibly(hidden, ROLLUP_SERVED)}
     GROUP BY 1, 2, 3`;
   for (const row of rows) {
     const pool = String(row.pool);

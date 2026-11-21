@@ -1,17 +1,9 @@
-//! Relay protocol 3.0 frames, both directions (S0 contract).
+//! Relay protocol 4.0 frames in both directions.
 //!
 //! Serde mirror of `apps/server/src/relay/frames.ts`. Every fixture under
-//! `tests/fixtures/relay-3.0/` must deserialize here and serialize back to the
-//! same JSON (tests below). Fields this build does not know in what the server
-//! sends are ignored, so a later server may add some, except in runtime
-//! definitions (`DefinitionEnvelope`, `NodeDefinition` and the `runtime_spec`
-//! types), which stay strict (`deny_unknown_fields`) and are refused part by
-//! part (`runtime_store::repair`). Node frames are strict too. Unknown frame
-//! types are refused; the server accepts exactly protocol `3.0`.
-//!
-//! These types fix the wire shape. Value rules the node enforces on top of
-//! them (placeholder typing §4.6, define validation §4.3, path allowlist §4.8)
-//! land in chunks C1–C4.
+//! `tests/fixtures/relay-4.0/` must deserialize and serialize back to the same
+//! JSON. Unknown server fields are ignored except in strict runtime definitions;
+//! unknown frame types and invalid cross-field values are refused.
 
 use std::collections::BTreeMap;
 
@@ -27,8 +19,8 @@ use super::runtime_spec::{
 };
 use crate::stt_wire::SttEvent;
 
-pub const RELAY_PROTOCOL_VERSION: &str = "3.0";
-pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v3";
+pub const RELAY_PROTOCOL_VERSION: &str = "4.0";
+pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v4";
 pub const RUNTIME_INVENTORY_CHUNK_MAX: usize = 512;
 /// Byte budget of one chunked frame (define, its answer, inventory, node.metrics).
 pub const CHUNK_BUDGET_BYTES: usize = 60 * 1024;
@@ -780,7 +772,7 @@ pub fn is_secret_name(name: &str) -> bool {
 
 /// A node's address on a fabric, exactly as the server and the database
 /// accept it (`packages/api/src/lib/ip-literal.ts`, shared vectors in
-/// `tests/fixtures/relay-3.0/rules/fabric-ip.json`): the canonical text of one
+/// `tests/fixtures/relay-4.0/rules/fabric-ip.json`): the canonical text of one
 /// address (dotted quad without leading zeros, RFC 5952 IPv6 without an
 /// embedded IPv4 part), never 0.0.0.0/8, loopback, `::/96` or IPv4-mapped.
 pub fn is_fabric_ip(value: &str) -> bool {
@@ -1103,7 +1095,7 @@ pub struct HelloNode {
     pub terminal_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_identity: Option<NodeTerminalIdentity>,
-    /// Which build this is (two `0.4.2` builds can differ). Absent on older CLIs.
+    /// Which build this is (two builds of the same version can differ).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<NodeBuild>,
     /// Sent only when there is something to say (`wsl: true`).
@@ -1215,19 +1207,6 @@ pub struct DetectedServer {
     pub models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-}
-
-/// `hello.ok`'s `features`: optional node frame fields this server accepts.
-/// Fields a later server adds here are ignored.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServerFeatures {
-    /// `exec.started` may carry `ranWith`.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub exec_ran_with: bool,
-    /// A `version_mismatch` refusal in `agent.update.progress` may carry `availableVersion`.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub agent_update_available_version: bool,
 }
 
 /// How a node command ran (`exec.started`'s `ranWith`).
@@ -1551,10 +1530,8 @@ pub enum NodeFrame {
         started_at: String,
         /// started_at + min(timeout_ms, the node's command_max_ms).
         ends_by: String,
-        /// How the node ran it. Sent only to a server whose `hello.ok` had
-        /// `features.execRanWith`: an older server's strict schema refuses it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ran_with: Option<RanWith>,
+        /// How the node ran it.
+        ran_with: RanWith,
     },
     #[serde(rename = "exec.rejected")]
     ExecRejected { command_id: String, reason: String },
@@ -1591,10 +1568,8 @@ pub enum NodeFrame {
         reason: Option<UpdateReason>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
-        /// The version the node could install instead (Homebrew: its tap's), sent only with
-        /// `refused` / `version_mismatch`, and only to a server whose `hello.ok` said it accepts
-        /// it (`features.agentUpdateAvailableVersion`; an older server's strict schema refuses
-        /// it). The owner may then install it anyway (`agent.update` naming it).
+        /// The version the node could install instead, sent with a
+        /// `refused` / `version_mismatch` reply so the owner may install it anyway.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         available_version: Option<String>,
     },
@@ -1628,10 +1603,6 @@ pub enum ServerFrame {
         protocol_version: String,
         node_id: String,
         definition_sync: DefinitionSync,
-        /// What this server accepts beyond protocol 3.0 as first released.
-        /// Absent from an older server: it accepts none of it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        features: Option<ServerFeatures>,
     },
     #[serde(rename = "protocol.error")]
     ProtocolError {
@@ -1903,7 +1874,7 @@ mod double_option {
 }
 
 /// A cross-field rule a frame broke (the zod schemas refuse the same frames;
-/// shared vectors: `relay-3.0/invalid/*/semantic-*.json`).
+/// shared vectors: `relay-4.0/invalid/*/semantic-*.json`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameRuleError(pub &'static str);
 
@@ -2476,7 +2447,7 @@ mod tests {
     }
 
     fn fixtures() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/relay-3.0")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/relay-4.0")
     }
 
     fn load(dir: &str) -> Vec<(String, Value)> {
@@ -2680,74 +2651,21 @@ mod tests {
     ];
 
     #[test]
-    fn hello_ok_features_are_optional_and_lenient() {
-        let features = |json: Value| match serde_json::from_value::<ServerFrame>(json) {
-            Ok(ServerFrame::HelloOk { features, .. }) => features,
-            other => panic!("expected hello.ok, got {other:?}"),
-        };
-        let hello = |extra: Value| {
-            let mut json = serde_json::json!({
-                "type": "hello.ok",
-                "id": "h-1",
-                "protocolVersion": "3.0",
-                "nodeId": "nd5q6w7e8r9t0y1u2i3o4p5a6",
-                "definitionSync": "none",
-            });
-            if let (Some(object), Value::Object(extra)) = (json.as_object_mut(), extra) {
-                object.extend(extra);
-            }
-            json
-        };
-        // An older server: none of it.
-        assert_eq!(features(hello(serde_json::json!({}))), None);
-        assert!(
-            !features(hello(serde_json::json!({ "features": {} })))
-                .unwrap_or_default()
-                .exec_ran_with
-        );
-        // A later server's features this build does not know are ignored.
-        assert_eq!(
-            features(hello(serde_json::json!({
-                "features": { "execRanWith": true, "laterThing": { "x": 1 } }
-            }))),
-            Some(ServerFeatures {
-                exec_ran_with: true,
-                agent_update_available_version: false,
-            })
-        );
-        assert!(
-            features(hello(serde_json::json!({
-                "features": { "agentUpdateAvailableVersion": true }
-            })))
-            .unwrap_or_default()
-            .agent_update_available_version
-        );
-    }
-
-    #[test]
     fn ran_with_has_its_wire_shape() {
         let frame = NodeFrame::ExecStarted {
             command_id: "UnecweYLMFV6n8TpDjNYfQ".into(),
             started_at: "2026-10-06T12:00:00.000Z".into(),
             ends_by: "2026-10-06T13:00:00.000Z".into(),
-            ran_with: Some(RanWith {
+            ran_with: RanWith {
                 shell: None,
                 mode: RanMode::Direct,
-            }),
+            },
         };
         let json = serde_json::to_value(&frame).expect("serializes");
         assert_eq!(
             json["ranWith"],
             serde_json::json!({ "shell": null, "mode": "direct" })
         );
-        let without = NodeFrame::ExecStarted {
-            command_id: "UnecweYLMFV6n8TpDjNYfQ".into(),
-            started_at: "2026-10-06T12:00:00.000Z".into(),
-            ends_by: "2026-10-06T13:00:00.000Z".into(),
-            ran_with: None,
-        };
-        let json = serde_json::to_value(&without).expect("serializes");
-        assert!(json.get("ranWith").is_none(), "{json}");
     }
 
     #[test]

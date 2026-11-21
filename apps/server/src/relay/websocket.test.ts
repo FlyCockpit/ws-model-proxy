@@ -25,6 +25,17 @@ vi.mock("../client-ip.js", () => ({
     c.req.header("x-test-ip") ?? "203.0.113.1",
 }));
 
+vi.mock("./registration.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./registration.js")>();
+  return { ...original, recordRejectedNodeHello: vi.fn(original.recordRejectedNodeHello) };
+});
+
+const prisma = (await import("@ws-model-proxy/db")).default;
+const { mockDeep } = await import("vitest-mock-extended");
+const db = prisma as unknown as ReturnType<typeof mockDeep<typeof prisma>>;
+const { recordRejectedNodeHello } = await import("./registration.js");
+const { registerNodeHttpRoutes } = await import("../node-http.js");
+const { SERVER_VERSION } = await import("../version.js");
 const { authenticateNodeCredential } = await import("./node-credential-auth.js");
 const { createRelayWebsocketMiddleware, relaySocketEvents } = await import("./websocket.js");
 const { relaySessionManager } = await import("./session-manager.js");
@@ -82,23 +93,132 @@ describe("createRelayWebsocketMiddleware", () => {
     });
   });
 
-  it("rejects unsupported relay protocol versions before upgrade", async () => {
+  it("records an authenticated v3 refusal without charging the IP", async () => {
+    const token = "ws-model-proxy.relay.v3";
+    const protocolVersion = "3.0";
+    authenticateMock.mockResolvedValue(identityFor("node-id"));
     const response = await app().request("/api/cli/ws", {
-      method: "GET",
       headers: websocketHeaders({
         Authorization: "Bearer wsmp_node_secret",
-        "Sec-WebSocket-Protocol": "ws-model-proxy.relay.v2",
+        "Sec-WebSocket-Protocol": token,
       }),
     });
-
     expect(response.status).toBe(426);
-    await expect(response.json()).resolves.toMatchObject({
+    await expect(response.json()).resolves.toEqual({
       type: "protocol.error",
       failure: "protocol_error",
       code: "upgrade_cli",
+      message:
+        "This server runs WS Model Proxy 1.0 and needs wsmp 1.0 or later. Upgrade wsmp (re-run the server's install.sh, or brew upgrade wsmp), then restart it.",
       supportedVersions: RELAY_PROTOCOL_VERSIONS,
-      supportedSubprotocol: "ws-model-proxy.relay.v3",
+      supportedSubprotocol: RELAY_SUBPROTOCOL,
+      serverVersion: SERVER_VERSION,
+      minimumCliVersion: "1.0.0",
     });
+    expect(recordRejectedNodeHello).toHaveBeenCalledWith(
+      identityFor("node-id"),
+      { protocolVersion, cliVersion: null },
+      expect.any(Date),
+    );
+    expect(await relayUpgradeIpLimiter.get("ip:203.0.113.1")).toBeNull();
+    expect((await relayUpgradeNodeLimiter.get("node:node-id"))?.consumedPoints).toBe(1);
+    const write = db.node.updateMany.mock.calls[0]?.[0];
+    const rejectedAt = write?.data.rejectedAt;
+    expect(rejectedAt).toBeInstanceOf(Date);
+    if (!(rejectedAt instanceof Date)) throw new Error("missing refusal timestamp");
+    expect(write?.where).toEqual({
+      id: "node-id",
+      userId: "user-id",
+      OR: [{ rejectedAt: null }, { rejectedAt: { lt: new Date(rejectedAt.getTime() - 60_000) } }],
+    });
+  });
+
+  it("uses the same per-node budget for v3 refusals and current upgrades", async () => {
+    authenticateMock.mockResolvedValue(identityFor("node-id"));
+    for (let attempt = 0; attempt < DEFAULTS.relayUpgradeNode.points; attempt += 1) {
+      const response = await app().request("/api/cli/ws", {
+        headers: websocketHeaders({
+          Authorization: "Bearer wsmp_node_secret",
+          "Sec-WebSocket-Protocol": "ws-model-proxy.relay.v3",
+        }),
+      });
+      expect(response.status).toBe(426);
+    }
+    vi.mocked(recordRejectedNodeHello).mockClear();
+    db.node.updateMany.mockClear();
+    for (const token of ["ws-model-proxy.relay.v3", RELAY_SUBPROTOCOL]) {
+      const response = await app().request("/api/cli/ws", {
+        headers: websocketHeaders({
+          Authorization: "Bearer wsmp_node_secret",
+          "Sec-WebSocket-Protocol": token,
+        }),
+      });
+      expect(response.status).toBe(429);
+      expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(0);
+    }
+    expect(recordRejectedNodeHello).not.toHaveBeenCalled();
+    expect(db.node.updateMany).not.toHaveBeenCalled();
+    expect(await relayUpgradeIpLimiter.get("ip:203.0.113.1")).toBeNull();
+  });
+
+  it.each([undefined, "Bearer invalid"])(
+    "charges an old-token refusal with missing or invalid credentials (%s)",
+    async (authorization) => {
+      authenticateMock.mockResolvedValue(null);
+      const response = await app().request("/api/cli/ws", {
+        headers: websocketHeaders({
+          "Sec-WebSocket-Protocol": "ws-model-proxy.relay.v3",
+          ...(authorization ? { Authorization: authorization } : {}),
+        }),
+      });
+      expect(response.status).toBe(426);
+      expect(recordRejectedNodeHello).not.toHaveBeenCalled();
+      expect((await relayUpgradeIpLimiter.get("ip:203.0.113.1"))?.consumedPoints).toBe(1);
+    },
+  );
+
+  it.each(["ws-model-proxy.relay.v1", "ws-model-proxy.relay.v2", "ws-model-proxy.relay.v99"])(
+    "charges %s to the IP without inspecting credentials",
+    async (token) => {
+      authenticateMock.mockResolvedValue(identityFor("node-id"));
+      const response = await app().request("/api/cli/ws", {
+        headers: websocketHeaders({
+          Authorization: "Bearer wsmp_node_secret",
+          "Sec-WebSocket-Protocol": token,
+        }),
+      });
+      expect(response.status).toBe(426);
+      expect(authenticateMock).not.toHaveBeenCalled();
+      expect(recordRejectedNodeHello).not.toHaveBeenCalled();
+      expect((await relayUpgradeIpLimiter.get("ip:203.0.113.1"))?.consumedPoints).toBe(1);
+    },
+  );
+
+  // Permanent bootstrap contract: released clients must understand a protocol refusal.
+  it("keeps the released-client refusal predicate and five-field discovery contract", async () => {
+    const response = await app().request("/api/cli/ws", {
+      headers: websocketHeaders({ "Sec-WebSocket-Protocol": "ws-model-proxy.relay.v3" }),
+    });
+    expect(response.status).toBe(426);
+    const text = await response.text();
+    expect(new TextEncoder().encode(text).length).toBeLessThan(1024);
+    const body = JSON.parse(text) as Record<string, unknown>;
+    expect(body.code === "upgrade_cli" || "supportedSubprotocol" in body).toBe(true);
+    const hono = new Hono();
+    registerNodeHttpRoutes(hono);
+    const discovery = (await (await hono.request("/.well-known/wsmp")).json()) as Record<
+      string,
+      unknown
+    >;
+    expect(discovery).toEqual({
+      serverVersion: SERVER_VERSION,
+      protocolVersion: "4.0",
+      origin: "https://proxy.example.test",
+      installScript: "/install.sh",
+      enrollPath: "/api/node/enroll",
+    });
+    expect(String(discovery.protocolVersion) > "3.0").toBe(true);
+    expect(Number(discovery.protocolVersion)).toBeGreaterThan(Number("3.0"));
   });
 
   it("blocks an address that keeps failing, with Retry-After, without checking credentials", async () => {

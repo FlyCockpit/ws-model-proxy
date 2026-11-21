@@ -8,7 +8,10 @@ import { type AnonymousAuth, agentRulesApply, type CallerAuth } from "../contrac
 import type { MODEL_CAPABILITY, MODEL_TYPE } from "../contracts/common";
 import { modelsContract as c, type TEST_SURFACES } from "../contracts/models";
 import { callableIdOf } from "../lib/access-views";
+import { assertAgentInstanceNodes } from "../lib/agent-node-access";
+import { assertAgentNode, assertAgentScope } from "../lib/caller-actor";
 import { cloudEgressEnabled } from "../lib/cloud-egress";
+import { OCCUPANCY_SELECT } from "../lib/instance-occupancy";
 import { type SessionNames, sessionNames } from "../lib/model-names";
 import { callableIdsFor, MEMBER_INCLUDE, poolStatus } from "../lib/pool-views";
 import { notFound, refuse } from "../lib/refuse";
@@ -299,6 +302,7 @@ export const modelsRouter = {
       "pool" in input.target
         ? await resolvePoolTarget(userId, input.target.pool)
         : await resolveRuntimeTarget(userId, input.target);
+    await assertAgentTestNodes(auth, userId, resolved.target);
     if (input.bench && !resolved.ownedByCaller) {
       throw refuse(
         "own_hardware_only",
@@ -404,7 +408,7 @@ type ResolvedTarget = {
 /**
  * A test sends real requests to someone's hardware (or spends cloud credit), so it is a write:
  * a browser call must carry the verified CSRF header (a cookie without it is not a person,
- * `agentRulesApply`) and agents need a Full token (MCP lists `model_test` as a Full tool).
+ * `agentRulesApply`) and agents need models:test scope.
  */
 function assertMayTest(auth: CallerAuth | AnonymousAuth): asserts auth is CallerAuth {
   if (auth.kind === "anonymous" || auth.kind === "api_key") {
@@ -413,11 +417,49 @@ function assertMayTest(auth: CallerAuth | AnonymousAuth): asserts auth is Caller
   if (agentRulesApply(auth) && auth.kind === "cookie_session") {
     throw new ORPCError("FORBIDDEN", { message: "This request is missing its CSRF header." });
   }
-  if (
-    (auth.kind === "agent_token" || auth.kind === "oauth_access_token") &&
-    auth.level !== "FULL"
-  ) {
-    throw new ORPCError("FORBIDDEN", { message: "This needs a Full agent token." });
+  assertAgentScope(auth, "models:test");
+}
+
+/** Admission may pick any member instance; every possible node must belong to this agent. */
+async function assertAgentTestNodes(
+  auth: CallerAuth,
+  userId: string,
+  target: import("../context").ModelTestServiceTarget,
+): Promise<void> {
+  if (auth.kind !== "agent_token" && auth.kind !== "oauth_access_token") return;
+  const runtimes = await prisma.runtime.findMany({
+    where:
+      target.kind === "runtime"
+        ? { id: target.runtimeId }
+        : { Models: { some: { Members: { some: { poolId: target.poolId } } } } },
+    select: {
+      Node: { select: { id: true, userId: true } },
+      Instances: {
+        where: {
+          ...(target.kind === "runtime" && target.instanceId ? { id: target.instanceId } : {}),
+          OR: [
+            { desiredState: "RUNNING" },
+            { desiredState: null },
+            { Ranks: { some: { claim: { not: "RELEASED" } } } },
+          ],
+        },
+        select: { id: true, ...OCCUPANCY_SELECT },
+      },
+    },
+  });
+  for (const runtime of runtimes) {
+    if (runtime.Node) {
+      assertAgentNode(auth, runtime.Node.id, "That model test target does not exist.");
+      if (runtime.Node.userId !== userId) throw notFound("That model test target does not exist.");
+    }
+    for (const instance of runtime.Instances)
+      await assertAgentInstanceNodes(
+        prisma,
+        auth,
+        userId,
+        instance,
+        "That model test target does not exist.",
+      );
   }
 }
 

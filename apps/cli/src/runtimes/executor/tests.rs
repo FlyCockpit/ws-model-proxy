@@ -941,11 +941,8 @@ fn a_stop_is_never_proven_while_its_unit_runs_or_its_port_is_taken() {
     );
 }
 
-/// The state spark-1958 was left in (launched by an older CLI, so a legacy record and no rank
-/// slice): the stop of a `process` run whose commands are all `true` failed
-/// at its deadline (status kept saying alive), the instance was marked stopped and settled
-/// STOPPED, and the rank stays HELD_UNKNOWN. Its unit is gone and its port is free: the next
-/// automatic check proves the stop, so the server releases the claim.
+/// A stopped rank with stub status commands is proven stopped once its unit
+/// is gone and its port is free, allowing the server to release the claim.
 #[test]
 fn a_rank_marked_stopped_whose_status_is_a_stub_is_proven_once_its_process_is_gone() {
     let root = tempfile::tempdir().expect("root");
@@ -961,20 +958,6 @@ fn a_rank_marked_stopped_whose_status_is_a_stub_is_proven_once_its_process_is_go
         record.phase = InstancePhase::Stopping;
     }
     executor.persist().expect("persist");
-    // Written by the older CLI that launched it: no `outside_units`, no dist port, and its
-    // commands never ran in a rank slice (the slice does not exist: nothing in it).
-    let mut stored: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
-    for record in stored["records"]
-        .as_object_mut()
-        .expect("records")
-        .values_mut()
-    {
-        let record = record.as_object_mut().expect("record");
-        assert!(record.remove("outside_units").is_some());
-        assert!(record["job"].get("distPort").is_none());
-    }
-    std::fs::write(&path, serde_json::to_vec(&stored).expect("json")).expect("write");
     // The unit is gone (`systemctl stop` ran), nothing listens on the port.
     runtime.units.borrow_mut().clear();
     let mut executor = Executor::load(path).expect("reload");
@@ -1609,17 +1592,13 @@ while ($true) {
     );
 }
 
-/// Self-update (D3): the relay after an update adopts the instances the
-/// version before it started. `tests/fixtures/instance-state/0.4.2-ready.json`
-/// is a record exactly as 0.4.2 wrote it (a started, ready rank); a change to
-/// the record format must keep reading it.
+/// A restarted relay adopts a ready instance from the current persisted format.
 #[test]
-fn the_next_version_adopts_instances_the_previous_one_started() {
+fn a_restarted_relay_adopts_instances_from_the_current_format() {
     let root = tempfile::tempdir().expect("root");
     let path = root.path().join("in1-r0.json");
     let fixture = std::fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/instance-state/0.4.2-ready.json"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/instance-state/ready.json"),
     )
     .expect("fixture");
     std::fs::write(&path, fixture).expect("write");
@@ -1634,7 +1613,19 @@ fn the_next_version_adopts_instances_the_previous_one_started() {
         .units
         .borrow_mut()
         .insert("wsmp-i-abcdefabcdef-r0".into(), "invocation".into());
-    let mut executor = Executor::load(path.clone()).expect("the record of 0.4.2 loads");
+    let mut executor = Executor::load(path.clone()).expect("the current record loads");
+    executor.persist().expect("persist current format");
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+    let fixture: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/instance-state/ready.json"),
+        )
+        .expect("fixture"),
+    )
+    .expect("json");
+    assert_eq!(written, fixture, "fixture must match the current writer");
     let ranks = executor.ranks();
     assert_eq!(ranks.len(), 1);
     assert_eq!(ranks[0].phase, InstancePhase::Ready);

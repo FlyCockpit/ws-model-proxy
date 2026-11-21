@@ -71,44 +71,59 @@ model ModelAlias {
 
 /// MCP OAuth/PAT grant tombstone (unchanged; not a Better Auth model).
 model McpGrant {
-  id          String     @id @default(cuid(2))
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @default(now()) @updatedAt
+  id          String       @id @default(cuid(2))
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @default(now()) @updatedAt
   userId      String
   clientId    String
   referenceId String
-  /// READ or FULL, the person's choice (consent page, Access → Agents). An OAuth request is
-  /// FULL only while this is FULL and its token carries `mcp:write`.
-  level       AgentLevel @default(READ)
+  scopes      AgentScope[] @default([READ])
+  allNodes    Boolean      @default(true)
   revokedAt   DateTime?
 
-  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   AgentToken AgentToken?
+  Nodes      McpGrantNode[]
 
+  @@unique([id, userId])
   @@unique([userId, clientId, referenceId])
   @@index([userId, clientId])
   @@map("mcp_grant")
 }
 
-enum AgentLevel {
-  /// Every *_get tool, metrics_query, requests_list.
+enum AgentScope {
   READ
-  /// Everything an agent may do (configure, start/stop/preempt, node commands and files on
-  /// FULL-trust nodes). Never grants anything (§6.3).
-  FULL
+  POOLS
+  RUNTIMES
+  NODES_MANAGE
+  COMMANDS
+  FILES
+  MODELS_TEST
 }
 
-/// Human-minted agent (MCP) token. Replaces McpPersonalToken (scopes + allowCliCommands +
-/// allowCliFileRead collapse into `level`).
+/// Same-owner node restrictions for a grant; ignored while allNodes is true.
+model McpGrantNode {
+  grantId String
+  nodeId  String
+  userId  String
+
+  Grant McpGrant @relation(fields: [grantId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Node  Node     @relation(fields: [nodeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@id([grantId, nodeId])
+  @@index([nodeId])
+  @@map("mcp_grant_node")
+}
+
+/// Human-minted agent credential; access is held exclusively by its grant.
 model AgentToken {
-  id           String     @id
-  createdAt    DateTime   @default(now())
+  id           String    @id
+  createdAt    DateTime  @default(now())
   userId       String
   name         String
-  level        AgentLevel
-  lookupPrefix String     @unique
-  secretDigest String     @unique
-  grantId      String     @unique
+  lookupPrefix String    @unique
+  secretDigest String    @unique
+  grantId      String    @unique
   lastUsedAt   DateTime?
   revokedAt    DateTime?
   expiresAt    DateTime?

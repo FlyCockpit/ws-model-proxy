@@ -17,6 +17,7 @@ import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-clien
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Context, ContextServices } from "../context";
 import type { CallerAuth } from "../contracts/auth-context";
+import { TEST_NODE_FEATURES } from "../lib/node-features-test-fixture";
 import type { RuntimeSpec } from "../lib/runtime-spec";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -70,11 +71,27 @@ function credentialsOf(userId: string): ReadonlyArray<[string, CallerAuth]> {
   return [
     [
       "Full agent token",
-      { kind: "agent_token", userId, agentTokenId: `${userId}-tok`, level: "FULL" },
+      {
+        kind: "agent_token",
+        userId,
+        agentTokenId: `${userId}-tok`,
+        access: {
+          scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+          nodeIds: null,
+        },
+      },
     ],
     [
       "Full OAuth grant",
-      { kind: "oauth_access_token", userId, grantId: `${userId}-grant`, level: "FULL" },
+      {
+        kind: "oauth_access_token",
+        userId,
+        grantId: `${userId}-grant`,
+        access: {
+          scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+          nodeIds: null,
+        },
+      },
     ],
     ["cookie with CSRF", person(userId)],
   ];
@@ -193,6 +210,7 @@ integration("cross-owner isolation on PostgreSQL", () => {
         connection: "ONLINE",
         trust: "FULL",
         declaredResources: { kind: "unified", memoryGb: 66 },
+        features: TEST_NODE_FEATURES,
         portStart: 30000,
         portEnd: 30010,
       },

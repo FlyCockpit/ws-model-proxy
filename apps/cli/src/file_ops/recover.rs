@@ -324,7 +324,6 @@ fn derived_phase(dir: &Path, intent: &Intent) -> IntentPhase {
         && let Some(published) = &intent.published
         && let Some(destination) = published.origin.to_path()
         && let Ok(metadata) = fs::symlink_metadata(destination)
-        && intent.version >= 3
         && let Ok(recovery) = open_dir(dir)
         && anchored_identity(&recovery, published)
             .is_ok_and(|pin| pin.matches_for_restore(&Stat::from_metadata(&metadata)))
@@ -355,16 +354,6 @@ fn skip_live_pid(
 }
 
 fn apply_intent(path: &Path, intent: &Intent, apply: bool, slots: Vec<String>) -> RecoverReport {
-    if intent.version < 3 {
-        return RecoverReport {
-            path: path.display().to_string(),
-            action: RecoverAction::Listed,
-            message: "legacy INTENT has no durable identity anchors; manual resolution required"
-                .to_string(),
-            phase: Some(intent_phase_name(intent.phase).to_string()),
-            slots,
-        };
-    }
     let phase_enum = derived_phase(path, intent);
     let phase = super::intent::intent_phase_name(phase_enum).to_string();
     if manual_only(intent.op, phase_enum) {
@@ -429,11 +418,6 @@ fn roll_back(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
     let parent = open_dir(dir.parent().ok_or("recovery path has no parent")?)?;
     let name = dir.file_name().ok_or("recovery path has no file name")?;
     let recovery = open_dir(dir)?;
-    if intent.version < 3 && !present_slots(dir).is_empty() {
-        return Err(
-            "legacy INTENT has no durable identity anchors; manual resolution required".to_string(),
-        );
-    }
     // Undoing a replace never publishes its own temp T (CLI-generated, never
     // acknowledged): T is identified ONLY by the live `published` pin, moved off
     // the public name if a compensation had not captured it yet, and disposed
@@ -537,14 +521,6 @@ fn roll_forward(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
         {
             sync_directory(&open_dir(parent)?)?;
         }
-    }
-    if intent.version < 3
-        && (!present_slots(dir).is_empty()
-            || intent.order == Some(super::intent::IntentOrder::ExchangeFirst))
-    {
-        return Err(
-            "legacy INTENT has no durable identity anchors; manual resolution required".to_string(),
-        );
     }
     if intent.op == IntentOp::Rename
         && intent.order == Some(super::intent::IntentOrder::ExchangeFirst)
@@ -1030,90 +1006,6 @@ mod tests {
             .expect("directory")
             .sync_all()
             .expect("sync anchor");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn legacy_matching_snapshots_never_authorize_disposal() {
-        for slot_mode in [false, true] {
-            let fx = Fx::new();
-            let dir = fx.root.join(".wsmp-recover-ABCDEFGHIJ");
-            fs::create_dir(&dir).unwrap();
-            let slot = dir.join("slot-1");
-            fs::write(&slot, b"ONLY ORIGINAL").unwrap();
-            let temp = if slot_mode {
-                slot.clone()
-            } else {
-                dir.join("tmp")
-            };
-            if !slot_mode {
-                fs::write(&temp, b"unpublished temporary").unwrap();
-            }
-            let old = Stat::from_metadata(&fs::symlink_metadata(&temp).unwrap());
-            let original = Stat::from_metadata(&fs::symlink_metadata(&slot).unwrap());
-            let target = fx.root.join("target");
-            let mut intent = if slot_mode {
-                Intent::delete(&target)
-            } else {
-                Intent::replace(&target)
-            };
-            intent.version = 2;
-            intent.pid = 0;
-            intent.phase = if slot_mode {
-                IntentPhase::Committed
-            } else {
-                IntentPhase::Captured
-            };
-            intent.published = Some(IntentSlot::planned(&target).with_stat(&old));
-            intent.slots.insert(
-                "slot-1".to_string(),
-                IntentSlot::planned(&target).with_stat(&original),
-            );
-            fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
-            fs::remove_file(&temp).unwrap();
-            let successor = if slot_mode { &slot } else { &target };
-            let mut reused = false;
-            for _ in 0..10_000 {
-                fs::write(successor, b"STRANGER").unwrap();
-                let now = Stat::from_metadata(&fs::symlink_metadata(successor).unwrap());
-                if old.same_object(&now) {
-                    reused = true;
-                    break;
-                }
-                fs::remove_file(successor).unwrap();
-            }
-            if !reused {
-                // Allocation policies differ between filesystems and runs. The
-                // deterministic contract is that even matching legacy metadata
-                // confers no destructive authority. Force that predicate, not a
-                // fake claim that the kernel recycled this particular inode.
-                fs::write(successor, b"STRANGER").unwrap();
-                let now = Stat::from_metadata(&fs::symlink_metadata(successor).unwrap());
-                if slot_mode {
-                    intent.slots.insert(
-                        "slot-1".to_string(),
-                        IntentSlot::planned(&target).with_stat(&now),
-                    );
-                } else {
-                    intent.published = Some(IntentSlot::planned(&target).with_stat(&now));
-                }
-                fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
-            }
-            crate::output::diagnostic(format!(
-                "legacy snapshot boundary slot={slot_mode}: actual kernel inode reuse={reused}"
-            ))
-            .expect("fixture diagnostic");
-            let report = recover_dir(&dir, true, None);
-            assert_eq!(report.action, RecoverAction::Listed, "{report:?}");
-            assert_eq!(fs::read(successor).unwrap(), b"STRANGER");
-            if !slot_mode {
-                assert_eq!(fs::read(&slot).unwrap(), b"ONLY ORIGINAL");
-            }
-            assert!(dir.join("INTENT").is_file());
-            if slot_mode {
-                assert!(!target.exists(), "committed delete must not resurrect");
-            }
-        }
     }
 
     #[test]

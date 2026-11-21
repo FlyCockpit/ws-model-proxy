@@ -363,8 +363,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
               waiter.deadlineAt <= observedAt,
           ).map((waiter) => waiter.id)
         : [];
+      let expiredWaiters = 0;
       if (existing) {
-        await tx.capacityWaiter.updateMany({
+        const expired = await tx.capacityWaiter.updateMany({
           where: {
             admissionRequestId: existing.id,
             state: "WAITING",
@@ -377,6 +378,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             terminalReason: "candidate_deadline",
           },
         });
+        expiredWaiters += expired.count;
         const liveWaiters = await tx.capacityWaiter.count({
           where: {
             admissionRequestId: existing.id,
@@ -495,12 +497,18 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       // ("admit only if free now"), so the creating pass admits them before
       // the deadline sweep; afterwards they expire below. Orphaned waiters of
       // other requests that #admitCapacity cancels on the way leave projections.
+      // Track actual state changes separately: projections may be empty for
+      // requests without a relay row, and unchanged polls must not wake waiters.
+      let admissionChanged = false;
       const admitted: RelayAdmissionProjection[] = [];
       for (const capacityId of orderedCapacityIds)
         await this.#admitCapacity(tx, capacityId, now, admitted, {
           requestId: request.id,
           creatingRequestId: existing ? undefined : request.id,
           lastChanceWaiterIds,
+          onChanged: () => {
+            admissionChanged = true;
+          },
         });
       const refreshed = await tx.admissionRequest.findUniqueOrThrow({
         where: { id: request.id },
@@ -514,7 +522,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         };
       // Zero budgets of a new attempt, and last-chance deferred waiters of a
       // poll, had their one admission check in this pass: expire them now.
-      await tx.capacityWaiter.updateMany({
+      const expired = await tx.capacityWaiter.updateMany({
         where: { admissionRequestId: request.id, state: "WAITING", deadlineAt: { lte: now } },
         data: { state: "EXPIRED", stateChangedAt: now, terminalReason: "candidate_deadline" },
       });
@@ -545,7 +553,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       }
       return {
         result: { state: "WAITING", requestId: refreshed.id } as const,
-        notify: capacityIds,
+        notify: admissionChanged || expiredWaiters + expired.count > 0 ? capacityIds : [],
         relay: admitted,
       };
     });
@@ -799,12 +807,13 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     /** Deferred waiters owed a last-chance check in this pass (planner exception). */
     lastChanceWaiterIds: readonly string[],
     projections: RelayAdmissionProjection[],
+    onChanged?: () => void,
   ): Promise<{
     snapshot: AdmissionSnapshot;
     rows: Map<string, AdmissionWaiterRow>;
     userId: string;
   } | null> {
-    await tx.capacityWaiter.updateMany({
+    const expired = await tx.capacityWaiter.updateMany({
       where: {
         capacityId,
         state: "WAITING",
@@ -821,6 +830,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         terminalReason: "candidate_deadline",
       },
     });
+    if (expired.count > 0) onChanged?.();
     // Grant-time routability re-check (DB state only). The policy snapshot on
     // a waiter is frozen at enqueue, but its member may have been drained,
     // disabled, or (local members) zero-weighted or put into an UNHEALTHY
@@ -878,8 +888,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           select: { id: true },
         })
       : [];
-    if (unroutableMembers.length || unhealthyTargets.length)
-      await tx.capacityWaiter.updateMany({
+    if (unroutableMembers.length || unhealthyTargets.length) {
+      const cancelled = await tx.capacityWaiter.updateMany({
         where: {
           capacityId,
           state: "WAITING",
@@ -894,6 +904,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           terminalReason: MEMBER_UNROUTABLE_REASON,
         },
       });
+      if (cancelled.count > 0) onChanged?.();
+    }
     // A graph row, read without a lock: the capacity fence the caller holds
     // excludes every writer of its policy. A deleted capacity admits nothing;
     // its waiters are orphans the capacity sweeper terminalizes.
@@ -962,6 +974,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       now,
       projections,
     );
+    if (livingWaiters.length < queuedWaiters.length) onChanged?.();
     // Metric routing (S-B part 2): a waiter whose member is metric-FULL is not
     // planned, unless its whole request fails open (see #metricFullWaiterIds).
     const metricFull = await this.#metricFullWaiterIds(tx, livingWaiters, now, {
@@ -1372,6 +1385,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       requestId?: string;
       creatingRequestId?: string;
       lastChanceWaiterIds?: readonly string[];
+      onChanged?: () => void;
     } = {},
   ): Promise<boolean> {
     // G2n: fill mode (release/reclaim) is NEW admission work; with the fence
@@ -1389,6 +1403,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         options.creatingRequestId,
         options.lastChanceWaiterIds ?? [],
         projections,
+        options.onChanged,
       );
       // A deleted capacity admits nothing; its waiters are orphans the
       // capacity sweeper terminalizes.
@@ -1403,6 +1418,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         plan,
         userId,
       );
+      if (persisted.length > 0) options.onChanged?.();
       const granted =
         options.requestId !== undefined &&
         persisted.some((grant) => grant.admissionRequestId === options.requestId);

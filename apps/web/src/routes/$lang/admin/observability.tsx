@@ -6,16 +6,15 @@ import { Card, CardContent } from "@ws-model-proxy/ui/components/card";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { useDebounce } from "@ws-model-proxy/ui/hooks/use-async-search";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import type { ReactNode } from "react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-
 import { InlineRetry } from "@/components/inline-retry";
 import { SegmentedControl } from "@/components/segmented-control";
 import { StatusPill } from "@/components/status-pill";
 import { TimeAgo } from "@/components/time-ago";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/admin/observability")({
@@ -36,7 +35,7 @@ function AdminObservability() {
   const [tab, setTab] = useState<Tab>("nodes");
   const [owner, setOwner] = useState("");
   const [page, setPage] = useState(1);
-  const ownerQuery = useDebounce(owner.trim(), 300);
+  const ownerQuery = useDebouncedValue(owner.trim(), 300);
   const input: PageInput = {
     page,
     pageSize: PAGE_SIZE,

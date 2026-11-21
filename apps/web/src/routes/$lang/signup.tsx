@@ -565,6 +565,7 @@ function SignUpForm({
           <div className="space-y-2">
             <Label htmlFor={field.name}>{t("auth:fields.name")}</Label>
             <Input
+              className="h-11 text-base md:h-8 md:text-xs"
               id={field.name}
               name={field.name}
               autoComplete="name"
@@ -586,6 +587,7 @@ function SignUpForm({
           <div className="space-y-2">
             <Label htmlFor={field.name}>{t("auth:fields.slug")}</Label>
             <Input
+              className="h-11 text-base md:h-8 md:text-xs"
               id={field.name}
               name={field.name}
               inputMode="text"
@@ -608,6 +610,7 @@ function SignUpForm({
           <div className="space-y-2">
             <Label htmlFor={field.name}>{t("auth:fields.email")}</Label>
             <Input
+              className="h-11 text-base md:h-8 md:text-xs"
               id={field.name}
               name={field.name}
               type="email"
@@ -631,6 +634,7 @@ function SignUpForm({
           <div className="space-y-2">
             <Label htmlFor={field.name}>{t("auth:fields.password")}</Label>
             <Input
+              className="h-11 text-base md:h-8 md:text-xs"
               id={field.name}
               name={field.name}
               type="password"

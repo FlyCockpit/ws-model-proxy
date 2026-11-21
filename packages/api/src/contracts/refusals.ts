@@ -189,6 +189,8 @@ export const REFUSAL_REASONS = [
    * command, runtime, agent token, MCP grant or setting), only reads.
    */
   "impersonating",
+  /** The node could not resolve an existing working directory for the command. */
+  "bad_cwd",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

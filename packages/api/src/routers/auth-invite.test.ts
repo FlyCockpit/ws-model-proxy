@@ -98,7 +98,15 @@ describe("auth.acceptInvite (signed in)", () => {
     ["cookie without CSRF", { ...PERSON, csrfVerified: false }],
     [
       "Full agent token",
-      { kind: "agent_token", userId: "friend", agentTokenId: "t", level: "FULL" },
+      {
+        kind: "agent_token",
+        userId: "friend",
+        agentTokenId: "t",
+        access: {
+          scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+          nodeIds: null,
+        },
+      },
     ],
     ["API key", { kind: "api_key", userId: "friend", apiKeyId: "k" }],
   ])("is for a person only: refuses a %s", async (_label, auth) => {

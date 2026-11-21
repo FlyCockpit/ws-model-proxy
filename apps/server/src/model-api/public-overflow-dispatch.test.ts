@@ -314,6 +314,23 @@ beforeEach(() => {
 });
 
 describe("owner/pool:external dispatch", () => {
+  it("settles NOT_SENT when cancellation arrives during beforeProviderSend", async () => {
+    const controller = new AbortController();
+    const beforeProviderSend = vi.fn(async () => {
+      await Promise.resolve();
+      controller.abort(new Error("client disconnected"));
+    });
+    const result = await dispatchPublicOverflow({
+      ...request(),
+      signal: controller.signal,
+      beforeProviderSend,
+    });
+    expect(beforeProviderSend).toHaveBeenCalledOnce();
+    expect(result.dispatched).toBe(false);
+    expect(world.sent).toEqual([]);
+    expect(world.reconciled).toEqual([expect.objectContaining({ dispatchOutcome: "NOT_SENT" })]);
+  });
+
   it("reserves, claims, sends to the cloud member, then settles the attempt", async () => {
     const result = await dispatchPublicOverflow(request());
     expect(result.dispatched).toBe(true);

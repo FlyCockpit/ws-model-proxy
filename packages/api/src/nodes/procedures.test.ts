@@ -1,5 +1,5 @@
 import { createRouterClient } from "@orpc/server";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDeep, mockReset } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
 
@@ -40,7 +40,10 @@ vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
 }));
 
 import prisma from "@ws-model-proxy/db";
+import type { CallerAuth } from "../contracts/auth-context";
 import { type NodeEvent, onNodeEvent } from "../lib/node-events";
+import { TEST_NODE_FEATURES } from "../lib/node-features-test-fixture";
+import { liveNodeWhere, NODE_HEARTBEAT_STALE_MS } from "../lib/node-liveness";
 import { nodesRouter } from "../routers/nodes";
 import {
   contextFor,
@@ -53,6 +56,7 @@ import {
 import { nodeTrustView } from "./trust";
 
 const db = vi.mocked(prisma, true);
+const NOW = new Date("2026-11-03T12:00:00.000Z");
 
 function nodeRow(overrides: Record<string, unknown> = {}) {
   return {
@@ -101,10 +105,16 @@ function client(auth = PERSON, services?: Parameters<typeof contextFor>[1]) {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(NOW);
   mockReset(db);
   db.$transaction.mockImplementation(((fn: (tx: typeof db) => unknown) => fn(db)) as never);
   db.runtime.findMany.mockResolvedValue([]);
   db.node.findMany.mockResolvedValue([]);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("nodeTrustView", () => {
@@ -155,17 +165,54 @@ describe("human-only node procedures", () => {
 });
 
 describe("nodes.list / get", () => {
+  it.each(["standard", "isolated"])(
+    "projects known features from stored pre-release features with legacy policy %s",
+    async (agentCommands) => {
+      const features = {
+        ...TEST_NODE_FEATURES,
+        terminals: { ...TEST_NODE_FEATURES.terminals, shells: ["pwsh"] },
+        secrets: [{ name: "WSMP_SECRET_HF", updatedAt: "2026-10-01T00:00:00.000Z" }],
+      };
+      const row = nodeRow({ features: { ...features, agentCommands } });
+      db.node.findMany.mockResolvedValueOnce([row] as never);
+      const list = await client().list({});
+      expect(list.nodes[0]).toMatchObject({
+        terminalShells: ["pwsh"],
+        secretNames: ["WSMP_SECRET_HF"],
+      });
+      db.node.findFirst.mockResolvedValueOnce(row as never);
+      const detail = await client().get({ nodeId: "node-1" });
+      expect(detail.features).toEqual(features);
+      expect(detail.secrets).toEqual(features.secrets);
+    },
+  );
+
   it("lists summaries for the caller's nodes only (agents too)", async () => {
     db.node.findMany.mockResolvedValueOnce([nodeRow()] as never);
     const out = await client(FULL_AGENT).list({});
     expect(db.node.findMany.mock.calls[0]?.[0]?.where).toEqual({ userId: "owner-1" });
     expect(out.nodes[0]).toMatchObject({
       slug: "box",
+      connection: "OFFLINE",
       hardwareKind: "discrete",
       alwaysOnRuntimes: 1,
       needsYou: 2,
       trust: { effective: "FULL" },
     });
+  });
+
+  it.each([new Date(NOW.getTime() - 10_000), null])(
+    "lists a live node with heartbeat %s as ONLINE",
+    async (lastHeartbeatAt) => {
+      db.node.findMany.mockResolvedValueOnce([nodeRow({ lastHeartbeatAt })] as never);
+      const out = await client(FULL_AGENT).list({});
+      expect(out.nodes[0]?.connection).toBe("ONLINE");
+    },
+  );
+
+  it("answers ONLINE in the detail for a fresh heartbeat", async () => {
+    db.node.findFirst.mockResolvedValueOnce(nodeRow({ lastHeartbeatAt: new Date() }) as never);
+    expect((await client().get({ nodeId: "node-1" })).connection).toBe("ONLINE");
   });
 
   it("answers NOT_FOUND for another user's node", async () => {
@@ -199,6 +246,7 @@ describe("nodes.list / get", () => {
     );
     db.runtime.findMany.mockResolvedValueOnce([{ id: "rt-1", currentVersionId: "v-2" }] as never);
     const detail = await client().get({ nodeId: "node-1" });
+    expect(detail.connection).toBe("OFFLINE");
     expect(detail.hardware.memoryGb).toEqual({ value: 64, source: "detected" });
     expect(detail.hardware.reservedMemoryGb).toEqual({ value: 8, source: "browser" });
     expect(detail.hardware.usableMemoryGb).toBe(56);
@@ -216,11 +264,18 @@ describe("nodes.list / get", () => {
 });
 
 describe("nodes.deleteOffline (MCP node_delete)", () => {
-  const fullNode = (id: string) => ({ id, slug: id, trust: "FULL", trustLowerRequestedAt: null });
+  const fullNode = (id: string) => ({
+    id,
+    userId: "owner-1",
+    slug: id,
+    trust: "FULL",
+    trustLowerRequestedAt: null,
+  });
   /** The instance the deletion stops: its head here, its worker reservation elsewhere. */
   function occupant(worker: Record<string, unknown> | null, supersededGeneration: number | null) {
     return {
       id: "inst-1",
+      userId: "owner-1",
       Ranks: [{ rank: 0, nodeId: "node-1", claim: "HELD", Node: fullNode("node-1") }],
       Reservations: [
         {
@@ -237,9 +292,15 @@ describe("nodes.deleteOffline (MCP node_delete)", () => {
     connection: "ONLINE" | "OFFLINE",
     deleted = 1,
     affected: unknown[] = [occupant(fullNode("worker"), null)],
+    lastHeartbeatAt: Date | null = new Date(),
   ) {
     db.node.deleteMany.mockResolvedValueOnce({ count: deleted });
-    db.node.findFirst.mockResolvedValueOnce({ id: "node-1", slug: "box", connection } as never);
+    db.node.findFirst.mockResolvedValueOnce({
+      id: "node-1",
+      slug: "box",
+      connection,
+      lastHeartbeatAt,
+    } as never);
     db.profileItem.findFirst.mockResolvedValueOnce(null);
     db.runtimeInstance.findMany.mockResolvedValueOnce(affected as never);
     db.instanceRank.findMany.mockResolvedValueOnce([{ instanceId: "inst-1" }] as never);
@@ -247,12 +308,36 @@ describe("nodes.deleteOffline (MCP node_delete)", () => {
     db.fabricMember.findMany.mockResolvedValue([] as never);
   }
 
-  it("refuses an online node (node_online) and deletes nothing", async () => {
-    setupDelete("ONLINE");
+  it.each([NOW, null])(
+    "refuses an online node with heartbeat %s (node_online) and deletes nothing",
+    async (lastHeartbeatAt) => {
+      setupDelete("ONLINE", 1, undefined, lastHeartbeatAt);
+      await expect(
+        client(FULL_AGENT).deleteOffline({ nodeId: "node-1", confirm: "DELETE" }),
+      ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "node_online" } });
+      expect(db.node.delete).not.toHaveBeenCalled();
+      expect(db.node.deleteMany).not.toHaveBeenCalled();
+    },
+  );
+
+  it("deletes a stale ONLINE node (no heartbeat for 3 min)", async () => {
+    setupDelete("ONLINE", 1, undefined, new Date(NOW.getTime() - 4 * 60_000));
+    const out = await client(FULL_AGENT).deleteOffline({ nodeId: "node-1", confirm: "DELETE" });
+    expect(out).toEqual({ deleted: true, stoppedInstances: ["inst-1"] });
+    expect(db.node.deleteMany).toHaveBeenCalledWith({
+      where: { id: "node-1", userId: "owner-1", NOT: liveNodeWhere(NOW) },
+    });
+  });
+
+  it("refuses deletion when a stale ONLINE node sent a heartbeat after the check", async () => {
+    setupDelete("ONLINE", 0, undefined, new Date(NOW.getTime() - NODE_HEARTBEAT_STALE_MS - 1));
     await expect(
       client(FULL_AGENT).deleteOffline({ nodeId: "node-1", confirm: "DELETE" }),
     ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "node_online" } });
-    expect(db.node.delete).not.toHaveBeenCalled();
+    expect(db.node.deleteMany).toHaveBeenCalledWith({
+      where: { id: "node-1", userId: "owner-1", NOT: liveNodeWhere(NOW) },
+    });
+    expect(db.auditEvent.create).not.toHaveBeenCalled();
   });
 
   it("refuses a node that came online after the check, inside the same transaction", async () => {
@@ -276,7 +361,7 @@ describe("nodes.deleteOffline (MCP node_delete)", () => {
       userId: "owner-1",
     });
     expect(db.node.deleteMany).toHaveBeenCalledWith({
-      where: { id: "node-1", userId: "owner-1", connection: { not: "ONLINE" } },
+      where: { id: "node-1", userId: "owner-1", NOT: liveNodeWhere(NOW) },
     });
     expect(db.node.delete).not.toHaveBeenCalled();
     const audit = db.auditEvent.create.mock.calls[0]?.[0]?.data;
@@ -315,7 +400,7 @@ describe("nodes.deleteOffline (MCP node_delete)", () => {
       expect(db.node.deleteMany).not.toHaveBeenCalled();
       // Every instance the trigger stops or releases here, through the shared occupancy read.
       expect(db.runtimeInstance.findMany.mock.calls[0]?.[0]).toMatchObject({
-        where: { userId: "owner-1", desiredState: { not: null } },
+        where: { desiredState: { not: null } },
       });
     },
   );
@@ -324,6 +409,7 @@ describe("nodes.deleteOffline (MCP node_delete)", () => {
     setupDelete("OFFLINE", 1, [
       {
         id: "inst-1",
+        userId: "owner-1",
         Ranks: [
           {
             rank: 0,
@@ -391,6 +477,9 @@ describe("nodes.update", () => {
         mediaExpand: true,
         liveStt: true,
         secrets: [],
+        jobReservations: true,
+        rankIdle: true,
+        selfUpdate: { strategies: ["self-replace"], instancesSurvive: true, remote: "allowed" },
         launch: { platform: "linux", management: ["process", "service"], shells: ["sh"] },
       },
     };
@@ -411,38 +500,6 @@ describe("nodes.update", () => {
         metricCommands: [{ ...metric, command: ["nvidia-smi"], shell: "cmd" }],
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
-    expect(db.$transaction).not.toHaveBeenCalled();
-  });
-
-  it("tells a node without features.launch to upgrade before saving an argv or a shell", async () => {
-    // v0.4.2: no `launch`, and a metric command it cannot parse would end its session.
-    const released = {
-      ...trustRow,
-      slug: "box",
-      nodeInfo: { executionMechanism: "systemd+linger" },
-      features: {
-        terminals: { supported: true, max: 4, approvalRequired: false },
-        operatorTerminals: false,
-        files: { roots: null, asRoot: false, source: "default" },
-        runtimeHosts: [],
-        mediaExpand: true,
-        liveStt: true,
-        secrets: [],
-      },
-    };
-    const metric = {
-      name: "gpu_power",
-      command: "nvidia-smi",
-      intervalSecs: 5,
-      timeoutSecs: 5,
-      format: "lines" as const,
-    };
-    for (const changed of [{ command: ["nvidia-smi"] }, { shell: "sh" as const }]) {
-      db.node.findFirst.mockResolvedValueOnce(released as never);
-      await expect(
-        client().update({ nodeId: "node-1", metricCommands: [{ ...metric, ...changed }] }),
-      ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { reason: "upgrade_wsmp" } });
-    }
     expect(db.$transaction).not.toHaveBeenCalled();
   });
 
@@ -568,7 +625,7 @@ describe("nodes.update", () => {
         kind: "oauth_access_token",
         userId: "owner-1",
         grantId: "g",
-        level: "READ",
+        access: { scopes: ["read"], nodeIds: null },
       } as never).update({ nodeId: "node-1", labels: ["a"] }),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
@@ -788,4 +845,158 @@ describe("activity", () => {
     expect(out.items.map((item) => item.id)).toEqual(["a", "b"]);
     expect(out.nextCursor).toBe("b");
   });
+});
+
+describe("node detail allowlist projection", () => {
+  it("omits disallowed fabric peers from an allowed node's detail", async () => {
+    db.node.findFirst.mockResolvedValueOnce(
+      nodeRow({
+        FabricMembers: [
+          {
+            ip: "10.0.0.1",
+            Fabric: {
+              id: "f-1",
+              name: "qsfp",
+              Members: [
+                { nodeId: "node-1", ip: "10.0.0.1", Node: { slug: "box" } },
+                { nodeId: "node-2", ip: "10.0.0.2", Node: { slug: "box2" } },
+              ],
+            },
+          },
+        ],
+      }) as never,
+    );
+    const detail = await client({
+      ...FULL_AGENT,
+      access: { scopes: ["read"], nodeIds: ["node-1"] },
+    }).get({ nodeId: "node-1" });
+    expect(detail.fabrics[0]?.peers).toEqual([]);
+  });
+});
+
+describe("allowed node counts exclude hidden instances and peers", () => {
+  for (const kind of ["agent_token", "oauth_access_token"] as const) {
+    for (const [label, nodeIds, filtered] of [
+      ["allowlisted", ["node-1"], true],
+      ["all nodes", null, false],
+      ["person", null, false],
+    ] as const) {
+      it(`${kind} ${label}: running, needs-you, reserved memory, peer counts and detail agree`, async () => {
+        const access = { scopes: ["read"] as const, nodeIds };
+        const auth: CallerAuth =
+          label === "person"
+            ? PERSON
+            : kind === "agent_token"
+              ? { kind, userId: PERSON.userId, agentTokenId: "t", access }
+              : { kind, userId: PERSON.userId, grantId: "g", access };
+        const hiddenWhere = {
+          NOT: {
+            OR: [
+              { Runtime: { nodeId: { in: ["hidden"] } } },
+              { Ranks: { some: { nodeId: { in: ["hidden"] } } } },
+              { Reservations: { some: { nodeId: { in: ["hidden"] } } } },
+            ],
+          },
+        };
+        const nodeData = (excluded: boolean, detail = false) =>
+          nodeRow({
+            userId: PERSON.userId,
+            Ranks: ["visible", ...(excluded ? [] : ["mixed"])].map((id) => ({
+              rank: 0,
+              claim: "HELD",
+              resources: { kind: "unified", memoryGb: 2 },
+              prevResources: null,
+              prevPort: null,
+              Instance: {
+                id,
+                phase: "READY",
+                needsOperator: "STEP",
+                runtimeId: "rt",
+                Runtime: { slug: "rt" },
+                _count: { Ranks: 1 },
+              },
+            })),
+            Reservations: excluded
+              ? []
+              : [
+                  {
+                    instanceId: "mixed-reserved",
+                    index: 0,
+                    resources: { kind: "unified", memoryGb: 3 },
+                    supersededGeneration: null,
+                    Instance: {
+                      id: "mixed-reserved",
+                      runtimeId: "rt",
+                      phase: "READY",
+                      needsOperator: null,
+                      Runtime: { slug: "rt" },
+                      Ranks: [{ claim: "HELD" }],
+                      _count: { Reservations: 1 },
+                    },
+                  },
+                ],
+            FabricMembers: [
+              {
+                ip: "10.0.0.1",
+                Fabric: detail
+                  ? {
+                      id: "fabric",
+                      name: "lan",
+                      Members: [
+                        { nodeId: "node-1", ip: "10.0.0.1", Node: { slug: "box" } },
+                        { nodeId: "hidden", ip: "10.0.0.2", Node: { slug: "hidden" } },
+                      ],
+                    }
+                  : { name: "lan", _count: { Members: excluded ? 1 : 2 } },
+              },
+            ],
+          });
+        // Mirror Prisma's relation WHERE in this fake, and check its exact shape separately.
+        const check = (select: unknown) => {
+          const typed = select as {
+            Ranks: { where: { AND?: unknown[] } };
+            Reservations: { where: { AND?: unknown[] } };
+          };
+          if (filtered) {
+            expect(typed.Ranks.where.AND).toContainEqual({ Instance: hiddenWhere });
+            expect(typed.Reservations.where.AND).toContainEqual({ Instance: hiddenWhere });
+          } else {
+            expect(typed.Ranks.where.AND).toBeUndefined();
+            expect(typed.Reservations.where.AND).toBeUndefined();
+          }
+          return JSON.stringify(select).includes('"hidden"');
+        };
+        db.node.findMany.mockImplementation((async (args: { select: unknown }) => {
+          if (JSON.stringify(args.select) === '{"id":true}')
+            return [{ id: "node-1" }, { id: "hidden" }];
+          if (JSON.stringify(args.select) === '{"id":true,"nodeInfo":true}') return [];
+          const typed = args.select as {
+            FabricMembers: {
+              select: { Fabric: { select: { _count: { select: { Members: unknown } } } } };
+            };
+          };
+          expect(typed.FabricMembers.select.Fabric.select._count.select.Members).toEqual({
+            where: { nodeId: { notIn: filtered ? ["hidden"] : [] } },
+          });
+          return [nodeData(check(args.select))];
+        }) as never);
+        const result = await client(auth).list();
+        expect(result.nodes[0]).toMatchObject({
+          runningInstances: filtered ? 1 : 2,
+          needsYou: filtered ? 3 : 4,
+          reservedNowMemoryGb: filtered ? 2 : 7,
+          alwaysOnRuntimes: 1,
+          fabrics: [{ peerCount: filtered ? 0 : 1 }],
+        });
+        db.node.findFirst.mockImplementation((async (args: { select: unknown }) =>
+          nodeData(check(args.select), true)) as never);
+        const detail = await client(auth).get({ nodeId: "node-1" });
+        expect(detail.runningInstances).toBe(filtered ? 1 : 2);
+        expect(detail.reservedNowMemoryGb).toBe(filtered ? 2 : 7);
+        expect(detail.hardware.reservedNowMemoryGb).toBe(filtered ? 2 : 7);
+        expect(detail.instances).toHaveLength(filtered ? 1 : 3);
+        expect(detail.fabrics[0]?.peers).toHaveLength(filtered ? 0 : 1);
+      });
+    }
+  }
 });

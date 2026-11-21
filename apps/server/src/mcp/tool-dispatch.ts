@@ -43,7 +43,7 @@ export interface McpToolDispatch {
    * dispatches (and older bindings) keep working; production always sets it.
    */
   signal?: AbortSignal;
-  /** Admission credential (agent token or OAuth) with its READ/FULL level. */
+  /** Admission credential (agent token or OAuth) with its scope and node access snapshot. */
   credential: McpRequestCredential;
 }
 

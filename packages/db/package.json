@@ -1,5 +1,6 @@
 {
   "name": "@ws-model-proxy/db",
+  "private": true,
   "type": "module",
   "exports": {
     ".": {
@@ -47,13 +48,11 @@
   },
   "scripts": {
     "check-types": "tsc --noEmit",
-    "db:push": "node scripts/push-schema.mjs && node scripts/apply-schema-hardening.mjs",
-    "db:push:dangerous": "bash ../../scripts/db-push-dangerous-local.sh",
     "db:generate": "prisma generate",
     "db:validate": "prisma validate && prisma format --check && node scripts/test-entrypoint-schema.mjs && node scripts/verify-schema-hardening.mjs",
     "db:format": "prisma format",
     "postinstall": "prisma generate",
-    "db:studio": "prisma studio",
+    "db:studio": "bash ../../scripts/assert-local-database.sh db:studio && prisma studio",
     "db:start": "bash ../../scripts/compose.sh up -d",
     "db:watch": "bash ../../scripts/compose.sh up",
     "db:stop": "bash ../../scripts/compose.sh stop",

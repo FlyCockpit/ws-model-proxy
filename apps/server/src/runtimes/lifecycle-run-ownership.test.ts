@@ -1,5 +1,6 @@
 import type { RuntimeLaunch } from "@ws-model-proxy/api/lib/runtime-spec";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TEST_NODE_FEATURES } from "../../../../packages/api/src/lib/node-features-test-fixture";
 
 // Run ownership (design v2, packages/api/src/lib/instance-run.ts): every restart begins a new run
 // in the transaction that commits it; a step of an earlier run is never dispatched and its
@@ -47,6 +48,7 @@ type NodeRow = {
   memoryGb: number;
   /** Stored hello features; absent: a current CLI (`rankIdle`). */
   features?: Row;
+  connectionGeneration?: number;
 };
 
 const store = vi.hoisted(() => ({
@@ -56,6 +58,7 @@ const store = vi.hoisted(() => ({
   versions: [] as Row[],
   /** prepareStarts' candidate scan finds nothing (its bounded batch skipped the row). */
   skipPrepare: false,
+  failStepScan: false,
   /** Fenced writes of these owners fail (a transient database error, C4C / sweep tests). */
   failOwners: new Set<string>(),
   /** Fabric member addresses by node id (`fabricMember.findFirst`). */
@@ -185,10 +188,12 @@ const db = vi.hoisted(() => {
     lastHeartbeatAt: node.online ? new Date(8e12) : null,
     trust: "FULL",
     trustLowerRequestedAt: null,
-    connectionGeneration: 1,
-    features: node.features ?? { rankIdle: true },
+    connectionGeneration: node.connectionGeneration ?? 1,
+    features: node.features ?? TEST_NODE_FEATURES,
   });
   const answer = (model: string, method: string, args: Row = {}): unknown => {
+    if (model === "instanceStep" && method === "findMany" && store.failStepScan)
+      throw new Error("step scan unavailable");
     const where = (args.where ?? {}) as Row;
     if (model === "node") {
       const rows = store.nodes
@@ -768,6 +773,7 @@ beforeEach(() => {
   store.instances = [];
   store.steps = [];
   store.skipPrepare = false;
+  store.failStepScan = false;
   store.failOwners = new Set();
   store.fabricIps = new Map();
   store.nextId = 1;
@@ -816,6 +822,53 @@ afterEach(() => {
     store.instances.flatMap((row) => row.Ranks.map((rank) => rank.nodeId)),
   );
   expect(sent.filter((entry) => !executionNodes.has(entry.nodeId))).toEqual([]);
+});
+
+describe("session recovery generation fences", () => {
+  it.each(["RUNNING", "AWAITING_OPERATOR"])(
+    "an obsolete reconnect leaves a newer session's %s step unchanged inside the transaction",
+    async (state) => {
+      store.instances.push(instance("inst"));
+      const step = addGeneration("inst", 1, { START: { state } }).START;
+      if (!step) throw new Error("no start step");
+      step.ownerEpoch = "new-server:2";
+      if (state === "AWAITING_OPERATOR")
+        step.intent = { ...(step.intent as Row), interactive: true };
+      step.operatorTerminalId = state === "AWAITING_OPERATOR" ? "existing-terminal" : null;
+      const node = store.nodes.find((row) => row.id === "head");
+      if (!node) throw new Error("no node");
+      // The relay still reports the hook's generation, but the committed node is already newer.
+      node.connectionGeneration = 2;
+      const before = structuredClone(store.steps);
+      const lc = engine();
+      await lc.stop();
+      await lc.requeueStale(REF);
+      expect(store.steps).toEqual(before);
+      expect(closed).toEqual([]);
+    },
+  );
+
+  it("the current reconnect requeues earlier-session work", async () => {
+    store.instances.push(instance("inst"));
+    const step = addGeneration("inst", 1, { START: { state: "RUNNING" } }).START;
+    if (!step) throw new Error("no start step");
+    step.ownerEpoch = "old-server:1";
+    const lc = engine();
+    await lc.stop();
+    await lc.requeueStale(REF);
+    expect(step).toMatchObject({ state: "PENDING", ownerEpoch: null });
+  });
+
+  it("the composed disconnect hook catches and logs a rejected lifecycle scan", async () => {
+    const { composeNodeFrameHandlers } = await import("../relay/node-frame-handlers.js");
+    const lc = engine();
+    await lc.stop();
+    store.failStepScan = true;
+    const handlers = composeNodeFrameHandlers(lc.handlers());
+    await expect(Promise.resolve(handlers.nodeDisconnected?.(REF))).resolves.toBeUndefined();
+    expect(errors).toEqual([["[relay] node frame handler failed", "nodeDisconnected", "Error"]]);
+    errors = [];
+  });
 });
 
 describe("instance-run helpers", () => {
@@ -900,21 +953,6 @@ describe("instance-run helpers", () => {
     }
     expect(owned({ generation: 3 }, 3)).toBe(true);
     expect(owned({ generation: 2 }, 3)).toBe(false);
-  });
-
-  it("bootstraps a legacy row once, counting a committed but unprepared restart (T8 unit)", async () => {
-    store.instances = [instance("inst", { runGeneration: 0, phase: "READY" })];
-    addGeneration("inst", 1, { START: { state: "SUCCEEDED" }, READINESS: { state: "SUCCEEDED" } });
-    expect(await resolveRun(db as never, "inst")).toBe(1);
-    expect(main().runGeneration).toBe(1);
-    store.instances = [
-      instance("legacy", { runGeneration: 0, phase: "STARTING", operationId: "op-B" }),
-    ];
-    addGeneration("legacy", 1, { START: { state: "PENDING" } }, "v1", "op-A");
-    // Operation B committed, its steps never prepared: B is run 2.
-    expect(await resolveRun(db as never, "legacy")).toBe(2);
-    expect(main("legacy").runGeneration).toBe(2);
-    expect(await beginRun(db as never, "legacy")).toBe(3);
   });
 });
 
@@ -1241,57 +1279,6 @@ describe("stop proofs are of the current run, after its launches (F5, R3-B-1, C3
     expect(answer).toEqual({ ok: true, stale: [] });
   });
 
-  it("T7: legacy rows (run 0): generation 1's inventory and requeued STATUS release nothing; generation 2's STATUS does", async () => {
-    store.instances = [
-      instance("inst", { runGeneration: 0, phase: "STOPPED", desiredState: "STOPPED" }),
-    ];
-    Object.assign(rank(), { claim: "HELD_UNKNOWN", markedStoppedAt: now, lastStopCheckAt: now });
-    addGeneration("inst", 1, { START: { state: "SUCCEEDED" } });
-    const g1stop = addStop("inst", 1, 0, "SUCCEEDED");
-    addGeneration("inst", 2, {
-      STOP: { state: "SUCCEEDED" },
-      START: { state: "SUCCEEDED" },
-      READINESS: { state: "SUCCEEDED" },
-    });
-    // Generation 1's stop record arrives late.
-    await inventory([inventoryRecord("inst", "stopped", g1stop.id as string)]);
-    expect(rank().claim).toBe("HELD_UNKNOWN");
-    expect(main().runGeneration).toBe(2);
-    // A generation-1 status probe re-queued by a reconnect (attempts 1) is not re-sent.
-    const g1status = addStop("inst", 1, 0, "PENDING", "STATUS");
-    g1status.attempts = 1;
-    const lc = engine();
-    await lc.runOnce();
-    expect(framesTo("status").filter((entry) => entry.frame.generation === 1)).toEqual([]);
-    expect(stepById(g1status.id)).toMatchObject({ state: "FAILED", errorCode: "superseded" });
-    expect(rank().claim).toBe("HELD_UNKNOWN");
-    // Control (I8): generation 2's own status probe proves it.
-    rank().lastStopCheckAt = null;
-    // The probe is written at the end of a pass and sent on the next one.
-    await lc.runOnce();
-    await lc.runOnce();
-    const probe = lastFrame("status");
-    expect(probe.generation).toBe(2);
-    await lc.handleJobResult(REF, ok(probe));
-    await lc.stop();
-    expect(rank().claim).toBe("RELEASED");
-  });
-
-  it("T8: a legacy committed restart not reached by prepareStarts: the old START never goes out", async () => {
-    store.instances = [
-      instance("inst", { runGeneration: 0, phase: "STARTING", operationId: "op-B" }),
-    ];
-    // Operation A's generation 1 was prepared (not sent) before B was committed.
-    const g1 = addGeneration("inst", 1, { START: { state: "PENDING" } }, "v1", "op-A");
-    store.skipPrepare = true;
-    const lc = engine();
-    await lc.runOnce();
-    await lc.stop();
-    expect(framesTo("start")).toEqual([]);
-    expect(stepById(g1.START?.id).state).toBe("CANCELLED");
-    expect(main().runGeneration).toBe(2);
-  });
-
   it("T9: at generation 20,000 a fresh status probe and the current gang stop release; the leading stop after START does not", async () => {
     const G = 20_000;
     store.instances = [
@@ -1386,7 +1373,7 @@ describe("stop proofs are of the current run, after its launches (F5, R3-B-1, C3
       errorCode: "launch_pending",
     });
   });
-  it("a stop proves only when the node answers its rank idle; an older CLI gets no runtime job", async () => {
+  it("a stop proves only when the node answers its rank idle", async () => {
     store.instances = [instance("inst", { phase: "STOPPING", runGeneration: 1 })];
     store.steps = [];
     addGeneration("inst", 1, { START: { state: "RUNNING" } });
@@ -1402,28 +1389,6 @@ describe("stop proofs are of the current run, after its launches (F5, R3-B-1, C3
     ).toBe(true);
   });
 
-  it("refuses every runtime job to a CLI that cannot prove what it runs (cli_upgrade_required)", async () => {
-    store.instances = [instance("inst", { phase: "STARTING" })];
-    addGeneration("inst", 1, {});
-    const lc = new RuntimeLifecycle(
-      {
-        onlineNodeIds: () => ["head"],
-        nodeSession: () => ({ userId: "u1", connectionGeneration: 1, trust: "full" }),
-        sendToNode: (nodeId: string, frame: unknown) => {
-          sent.push({ nodeId, frame: frame as Row });
-          return true;
-        },
-      } as unknown as ConstructorParameters<typeof RuntimeLifecycle>[0],
-      { now: () => now },
-    );
-    sent.length = 0;
-    await lc.runOnce();
-    await lc.stop();
-    expect(sent).toEqual([]);
-    expect(
-      store.steps.find((step) => step.instanceId === "inst" && step.state === "FAILED"),
-    ).toMatchObject({ errorCode: "cli_upgrade_required" });
-  });
   it("T16: releaseClaim refuses a step of another rank, an unfinished result, a leading stop over HELD; never-ran is evaluated here", async () => {
     store.instances = [
       instance("inst", { phase: "STOPPING", runGeneration: 2 }),
@@ -1515,13 +1480,6 @@ describe("inventory without ordered evidence (DC8, T14, T15)", () => {
     await lc.stop();
     expect(main().phase).toBe("UNHEALTHY");
     expect(rank().claim).toBe("HELD");
-  });
-
-  it("T14: a record without a step id (before 0.4.0) does not crash the run either", async () => {
-    store.instances = [instance("inst", { phase: "READY" })];
-    addGeneration("inst", 1, { START: { state: "SUCCEEDED" }, READINESS: { state: "SUCCEEDED" } });
-    await inventory([inventoryRecord("inst", "stopped")]);
-    expect(main().phase).toBe("READY");
   });
 
   it("T15: a current-run record naming its HEALTH step, stopped, is a crash (I6)", async () => {
@@ -2193,72 +2151,6 @@ describe("batched sweeps reach every row (SWEEP, ./sweep.ts)", () => {
     },
     120_000,
   );
-});
-
-// ── Legacy bootstrap through offline and recovery (DP-2 / DC1-legacy, C4C) ──
-
-describe("a legacy committed restart survives offline and recovery (DP-2, C4C)", () => {
-  it.each([false, true])(
-    "offline before the run was first resolved (pre-resolved control=%s): back as STARTING in run 2",
-    async (preResolved) => {
-      store.instances = [instance("inst", { runGeneration: 0, operationId: "op-B" })];
-      addGeneration(
-        "inst",
-        1,
-        { START: { state: "SUCCEEDED" }, READINESS: { state: "SUCCEEDED" } },
-        "v1",
-        "op-A",
-      );
-      store.skipPrepare = true;
-      if (preResolved) expect(await resolveRun(db as never, "inst")).toBe(2);
-      const lc = engine();
-      const head = store.nodes.find((node) => node.id === "head");
-      if (!head) throw new Error("no head");
-      head.online = false;
-      await lc.runOnce();
-      expect(main().phase).toBe("UNAVAILABLE");
-      // Persisted before the phase changed.
-      expect(main().runGeneration).toBe(2);
-      head.online = true;
-      await lc.runOnce();
-      await lc.stop();
-      expect(main()).toMatchObject({ phase: "STARTING", runGeneration: 2 });
-    },
-  );
-
-  it("an upgrade with an already UNAVAILABLE unprepared restart keeps that restart", async () => {
-    store.instances = [
-      instance("inst", { phase: "UNAVAILABLE", runGeneration: 0, operationId: "op-B" }),
-    ];
-    addGeneration(
-      "inst",
-      1,
-      { START: { state: "SUCCEEDED" }, READINESS: { state: "SUCCEEDED" } },
-      "v1",
-      "op-A",
-    );
-    const lc = engine();
-    await lc.runOnce();
-    await lc.stop();
-    expect(main()).toMatchObject({ phase: "STARTING", runGeneration: 2 });
-  });
-
-  it("inverse: a legacy UNAVAILABLE row of a prepared run recovers READY at its run", async () => {
-    store.instances = [
-      instance("inst", { phase: "UNAVAILABLE", runGeneration: 0, operationId: "op-A" }),
-    ];
-    addGeneration(
-      "inst",
-      1,
-      { START: { state: "SUCCEEDED" }, READINESS: { state: "SUCCEEDED" } },
-      "v1",
-      "op-A",
-    );
-    const lc = engine();
-    await lc.runOnce();
-    await lc.stop();
-    expect(main()).toMatchObject({ phase: "READY", runGeneration: 1 });
-  });
 });
 
 // ── Inventory classification fails closed (R4-B-3 / DC4 error path, C4C) ──

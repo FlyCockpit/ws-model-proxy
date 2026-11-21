@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::state::load_node_credential;
+use crate::state::{NodeCredential, load_node_credential};
 
 /// The relay protocol `/.well-known/wsmp` must announce.
 pub const WELL_KNOWN_PATH: &str = "/.well-known/wsmp";
@@ -41,8 +41,44 @@ pub fn is_missing_credential(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<MissingCredential>().is_some())
 }
 
-/// The relay bearer credential from `node-credential.json`.
-pub fn resolve_credential() -> Result<String> {
+/// Preserve the startup enrollment/config pair, including released `set-server`
+/// configurations whose credential still names an older address.
+#[derive(Default)]
+pub struct CredentialPairing {
+    startup_server: Option<String>,
+}
+
+impl CredentialPairing {
+    /// Read once per connection attempt. If startup storage is temporarily
+    /// unavailable, the first successful read establishes the startup pair.
+    pub fn resolve_credential(
+        &mut self,
+        server_url: Option<&str>,
+        public_origin: Option<&str>,
+    ) -> Result<String> {
+        self.credential_for_server(resolve_node_credential()?, server_url, public_origin)
+    }
+
+    fn credential_for_server(
+        &mut self,
+        credential: NodeCredential,
+        server_url: Option<&str>,
+        public_origin: Option<&str>,
+    ) -> Result<String> {
+        let startup_server = self
+            .startup_server
+            .get_or_insert_with(|| credential.server.clone());
+        anyhow::ensure!(
+            credential.server == *startup_server
+                || credential_matches_server(&credential, server_url, public_origin),
+            "the enrollment changed while wsmp was running; restart wsmp with `wsmp service restart` or restart `wsmp run`"
+        );
+        Ok(credential.credential)
+    }
+}
+
+/// Retain the enrollment server so callers can detect a change while running.
+pub fn resolve_node_credential() -> Result<NodeCredential> {
     let Some(credential) = load_node_credential()? else {
         let state_dir = crate::paths::state_dir()?;
         if !state_dir.is_dir() {
@@ -57,7 +93,23 @@ pub fn resolve_credential() -> Result<String> {
         )
         .into());
     };
-    Ok(credential.credential)
+    Ok(credential)
+}
+
+/// Match either the connect address or the explicitly pinned public origin.
+pub(crate) fn credential_matches_server(
+    credential: &NodeCredential,
+    server_url: Option<&str>,
+    public_origin: Option<&str>,
+) -> bool {
+    let origin = |value: &str| {
+        Url::parse(value)
+            .ok()
+            .and_then(|url| matches!(url.scheme(), "http" | "https").then(|| url.origin()))
+    };
+    let stored = origin(&credential.server);
+    stored.is_some()
+        && (stored == server_url.and_then(origin) || stored == public_origin.and_then(origin))
 }
 
 /// `GET /.well-known/wsmp`. A field a later server adds is ignored.
@@ -72,32 +124,19 @@ pub struct WellKnown {
 }
 
 pub fn fetch_well_known(server_url: &str) -> Result<WellKnown> {
-    let url = join(server_url, WELL_KNOWN_PATH)?;
-    let mut response = ureq::get(url.as_str())
-        .header("Accept", "application/json")
-        .config()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .build()
-        .call()
-        .with_context(|| format!("reaching `{}`", url.as_str()))?;
-    let status = response.status().as_u16();
-    anyhow::ensure!(
-        response.status().is_success(),
-        "`{}` answered HTTP status {status}; is this a WS Model Proxy 0.4 server?",
-        url.as_str()
-    );
-    let known: WellKnown = response
-        .body_mut()
-        .read_json()
-        .with_context(|| format!("reading `{}`", url.as_str()))?;
+    let known = fetch_well_known_document(server_url)?;
     anyhow::ensure!(
         known.protocol_version == crate::protocol::RELAY_PROTOCOL_VERSION,
         "the server speaks relay protocol `{}`, this wsmp speaks `{}`; {}",
         crate::display_escape::escape_single_line(&known.protocol_version),
         crate::protocol::RELAY_PROTOCOL_VERSION,
-        if known.protocol_version.as_str() < crate::protocol::RELAY_PROTOCOL_VERSION {
-            "upgrade the server"
+        if crate::protocol::relay_protocol_major(&known.protocol_version)
+            .zip(crate::protocol::relay_protocol_major(
+                crate::protocol::RELAY_PROTOCOL_VERSION
+            ))
+            .is_some_and(|(server, cli)| server < cli)
+        {
+            "upgrade the server to WS Model Proxy 1.0 or later (or install the wsmp that server serves)"
         } else {
             "upgrade wsmp"
         }
@@ -107,6 +146,30 @@ pub fn fetch_well_known(server_url: &str) -> Result<WellKnown> {
         "the server announces an unexpected enrollment path"
     );
     Ok(known)
+}
+
+/// Discovery without enrollment validation, also used to diagnose an unreadable HTTP 426.
+pub(crate) fn fetch_well_known_document(server_url: &str) -> Result<WellKnown> {
+    let url = join(server_url, WELL_KNOWN_PATH)?;
+    let mut response = ureq::get(url.as_str())
+        .header("Accept", "application/json")
+        .config()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build()
+        .call()
+        .with_context(|| format!("reaching `{}`", url.as_str()))?;
+    let status = response.status().as_u16();
+    anyhow::ensure!(
+        response.status().is_success(),
+        "`{}` answered HTTP status {status}; is this a WS Model Proxy 1.0 or later server?",
+        url.as_str()
+    );
+    response
+        .body_mut()
+        .read_json()
+        .with_context(|| format!("reading `{}`", url.as_str()))
 }
 
 /// `POST /api/node/enroll`.
@@ -137,8 +200,8 @@ pub struct Enrolled {
     pub replaced: Option<ReplacedNode>,
     pub trust_lower_pending: bool,
     /// Set when the node is temporary: the server deletes it after this long
-    /// offline. Absent from older servers.
-    #[serde(default)]
+    /// offline; null for a permanent node.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub remove_after_offline_ms: Option<u64>,
 }
 
@@ -269,6 +332,222 @@ pub fn join(server_url: &str, path: &str) -> Result<Url> {
 mod tests {
     use super::*;
 
+    fn enrollment(server: &str, token: &str) -> NodeCredential {
+        NodeCredential {
+            node_id: "node-1".into(),
+            slug: "spark-1".into(),
+            server: server.into(),
+            credential: token.into(),
+        }
+    }
+
+    #[test]
+    fn credential_pairing_accepts_legacy_mismatched_startup_without_a_public_origin() {
+        for server in ["https://old.invalid", "invalid"] {
+            let mut pairing = CredentialPairing::default();
+            let credential = enrollment(server, "test-only-token");
+            assert_eq!(
+                pairing
+                    .credential_for_server(
+                        credential.clone(),
+                        Some("http://192.168.1.10:3000"),
+                        None
+                    )
+                    .expect("legacy startup pair"),
+                credential.credential
+            );
+            assert_eq!(pairing.startup_server.as_deref(), Some(server));
+        }
+    }
+
+    #[test]
+    fn credential_pairing_refuses_a_different_server_mid_run_with_restart_advice() {
+        let mut pairing = CredentialPairing::default();
+        let configured = Some("https://configured.invalid");
+        pairing
+            .credential_for_server(
+                enrollment("https://legacy.invalid", "initial"),
+                configured,
+                None,
+            )
+            .expect("startup");
+        for _ in 0..2 {
+            let error = pairing
+                .credential_for_server(
+                    enrollment("https://other.invalid", "replacement"),
+                    configured,
+                    None,
+                )
+                .expect_err("cross-server replacement");
+            let message = error.to_string();
+            assert!(message.contains("enrollment changed while wsmp was running"));
+            assert!(message.contains("wsmp service restart"));
+            assert!(message.contains("restart `wsmp run`"));
+            assert!(!message.contains("login"));
+            assert!(!message.contains("replacement"));
+        }
+        assert_eq!(
+            pairing.startup_server.as_deref(),
+            Some("https://legacy.invalid")
+        );
+    }
+
+    #[test]
+    fn credential_pairing_accepts_same_server_refresh_mid_run() {
+        let mut pairing = CredentialPairing::default();
+        for token in ["initial", "refreshed"] {
+            assert_eq!(
+                pairing
+                    .credential_for_server(
+                        enrollment("https://legacy.invalid", token),
+                        Some("https://configured.invalid"),
+                        None
+                    )
+                    .expect("same legacy enrollment server"),
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn credential_pairing_accepts_changed_server_matching_config_or_public_origin() {
+        let mut pairing = CredentialPairing::default();
+        let configured = Some("http://192.168.1.10:3000");
+        let public = Some("https://public.invalid");
+        for server in [
+            "https://legacy.invalid",
+            "http://192.168.1.10:3000/path",
+            "https://public.invalid:443/path",
+        ] {
+            assert!(
+                pairing
+                    .credential_for_server(
+                        enrollment(server, "test-only-token"),
+                        configured,
+                        public
+                    )
+                    .is_ok()
+            );
+        }
+        assert_eq!(
+            pairing.startup_server.as_deref(),
+            Some("https://legacy.invalid")
+        );
+    }
+
+    #[test]
+    fn credential_pairing_requires_the_same_valid_server_origin() {
+        let credential = NodeCredential {
+            node_id: "node-1".into(),
+            slug: "spark-1".into(),
+            server: "https://example.invalid/enrolled".into(),
+            credential: "test-only-token".into(),
+        };
+        for configured in [
+            "https://example.invalid/other",
+            "https://example.invalid:443",
+        ] {
+            assert!(credential_matches_server(
+                &credential,
+                Some(configured),
+                None
+            ));
+        }
+        for configured in [
+            None,
+            Some("https://other.invalid"),
+            Some("http://example.invalid"),
+            Some("https://example.invalid:444"),
+            Some("invalid"),
+        ] {
+            assert!(!credential_matches_server(&credential, configured, None));
+        }
+        let invalid = NodeCredential {
+            server: "invalid".into(),
+            ..credential
+        };
+        assert!(!credential_matches_server(
+            &invalid,
+            Some("invalid"),
+            Some("invalid")
+        ));
+    }
+
+    #[test]
+    fn credential_pairing_accepts_the_pinned_public_origin() {
+        let credential = NodeCredential {
+            node_id: "node-1".into(),
+            slug: "spark-1".into(),
+            server: "https://example.invalid/enrolled".into(),
+            credential: "test-only-token".into(),
+        };
+        for public in ["https://example.invalid", "https://example.invalid:443"] {
+            assert!(credential_matches_server(
+                &credential,
+                Some("http://192.168.1.10:3000"),
+                Some(public)
+            ));
+        }
+        for public in [
+            "https://other.invalid",
+            "http://example.invalid",
+            "https://example.invalid:444",
+            "invalid",
+        ] {
+            assert!(!credential_matches_server(
+                &credential,
+                Some("http://192.168.1.10:3000"),
+                Some(public),
+            ));
+        }
+        // An invalid optional pin does not invalidate a matching connect address.
+        assert!(credential_matches_server(
+            &credential,
+            Some("https://example.invalid"),
+            Some("invalid")
+        ));
+    }
+
+    #[test]
+    fn well_known_names_the_side_that_must_upgrade() {
+        use std::io::{Read, Write};
+        for (version, action) in [
+            ("3.0", "upgrade the server"),
+            ("5.0", "upgrade wsmp"),
+            ("10.0", "upgrade wsmp"),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let origin = format!("http://{}", listener.local_addr().expect("address"));
+            let body = serde_json::json!({
+                "serverVersion": "test", "protocolVersion": version, "origin": origin,
+                "installScript": "/install.sh", "enrollPath": ENROLL_PATH
+            })
+            .to_string();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("timeout");
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).expect("request") > 0);
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("reply");
+            });
+            let error = fetch_well_known(&origin).expect_err("different protocol");
+            server.join().expect("server");
+            assert!(error.to_string().contains(action), "{version}: {error}");
+        }
+    }
+
+    #[test]
+    fn enrollment_requires_the_offline_removal_field() {
+        let body = serde_json::json!({
+            "ok": true, "nodeId": "node-1", "slug": "spark-1",
+            "credential": "c".repeat(40), "replaced": null, "trustLowerPending": false
+        })
+        .to_string();
+        assert!(parse_enroll_answer(200, &body).is_err());
+    }
+
     #[test]
     fn enrollment_codes_have_the_minted_shape() {
         assert!(is_enrollment_code("wsmp_enr_ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
@@ -290,7 +569,8 @@ mod tests {
             200,
             &serde_json::json!({
                 "ok": true, "nodeId": "node-1", "slug": "spark-1",
-                "credential": "c".repeat(40), "replaced": null, "trustLowerPending": false
+                "credential": "c".repeat(40), "replaced": null, "trustLowerPending": false,
+                "removeAfterOfflineMs": null
             })
             .to_string(),
         )

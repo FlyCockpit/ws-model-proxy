@@ -64,13 +64,13 @@ function renderCoverage(): string {
     "",
     `## Tools (${MCP_TOOLS.length})`,
     "",
-    "READ credentials see the READ tools; FULL credentials see all.",
+    "Every credential includes read. Tools are visible only when their required scope is granted; node access is further restricted to owned nodes in the credential allowlist.",
     "",
-    "| Tool | Token | Procedures | Confirm | Rate limit | Notes | Description |",
+    "| Tool | Scope | Procedures | Confirm | Rate limit | Notes | Description |",
     "| --- | --- | --- | --- | --- | --- | --- |",
     ...MCP_TOOLS.map(
       (tool) =>
-        `| ${code(tool.name)} | ${tool.level} | ${tool.procedures.map(code).join(", ")} | ${confirmLiteral(tool)} | ${rateLimit(tool)} | ${notes(tool)} | ${cell(tool.description)} |`,
+        `| ${code(tool.name)} | ${tool.scope} | ${tool.procedures.map(code).join(", ")} | ${confirmLiteral(tool)} | ${rateLimit(tool)} | ${notes(tool)} | ${cell(tool.description)} |`,
     ),
     "",
     "## Session procedures kept off MCP",

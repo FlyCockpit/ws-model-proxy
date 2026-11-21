@@ -210,11 +210,11 @@ type CliFeatures = {
 };
 
 /**
- * "current" speaks relay 3.0; "identified" adds the terminal identity proof; "below-minimum"
+ * "current" speaks relay 4.0; "identified" adds the terminal identity proof; "below-minimum"
  * is a 2.x CLI the relay refuses.
  */
 type CliKind = "current" | "identified" | "below-minimum";
-const BELOW_MINIMUM_PROTOCOL = "2.9";
+const BELOW_MINIMUM_PROTOCOL = "3.0";
 
 function challengeNonce(socket: FakeSocket): string {
   for (const send of socket.sends) {
@@ -233,8 +233,7 @@ function hello(socket: FakeSocket, slug: string, kind: CliKind, features?: CliFe
       type: "hello",
       id: `hello-${slug}`,
       protocolVersion: BELOW_MINIMUM_PROTOCOL,
-      cli: { slug, hostname: `${slug}.local`, version: "0.3.9" },
-      endpoints: [],
+      node: { slug, version: "0.4.3" },
     });
   }
   const full = features?.fullControl ?? true;
@@ -253,6 +252,7 @@ function hello(socket: FakeSocket, slug: string, kind: CliKind, features?: CliFe
         "https://proxy.example.com",
       ),
       terminalPublicKey: uncompressedKey(),
+      build: { commit: null, target: "x86_64-unknown-linux-gnu", installMethod: "script" },
       ...(kind === "identified"
         ? {
             terminalIdentity: {
@@ -275,6 +275,8 @@ function hello(socket: FakeSocket, slug: string, kind: CliKind, features?: CliFe
       mediaExpand: false,
       liveStt: false,
       secrets: [],
+      jobReservations: true,
+      rankIdle: true,
       selfUpdate: { strategies: ["self-replace"], instancesSurvive: true, remote: "allowed" },
     },
     definitions: [],
@@ -495,6 +497,7 @@ describe("terminal websocket admission", () => {
 describe("terminal browser hub", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.node.findMany.mockClear();
     // `clearAllMocks` keeps queued `...Once` values; a test that stops early
     // must not leak its admission reads into the next one.
     db.user.findUnique.mockReset();
@@ -1094,6 +1097,50 @@ describe("terminal browser hub", () => {
     expect(browser.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
   });
 
+  it("refuses an open or attach once two-factor becomes mandatory for an unenrolled owner", async () => {
+    const cli = await connectCli("one");
+    // Policy off: the unenrolled owner opens as before.
+    await open(attachBrowser(), "one");
+    expect(cli.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(1);
+
+    twoFactorPolicy.required.mockResolvedValue(true);
+    const opening = attachBrowser();
+    await open(opening, "one");
+    expect(opening.closes).toEqual([{ code: 4401, reason: "two_factor_required" }]);
+    expect(cli.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(1);
+
+    const attaching = attachBrowser();
+    await terminalBrowserHub.handleText(
+      attaching,
+      JSON.stringify({
+        type: "attach",
+        terminalId: Buffer.alloc(16, 1).toString("base64url"),
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      }),
+    );
+    expect(attaching.closes).toEqual([{ code: 4401, reason: "two_factor_required" }]);
+
+    // A failed policy read fails closed, like a failed session read.
+    const failed = attachBrowser();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    twoFactorPolicy.required.mockRejectedValueOnce(new Error("db down"));
+    await open(failed, "one");
+    expect(failed.closes).toEqual([{ code: 1011, reason: "admission_failed" }]);
+    errors.mockRestore();
+
+    // An enrolled owner still opens under the policy.
+    db.session.findUnique.mockResolvedValueOnce({
+      userId: "user-id",
+      expiresAt: new Date("2099-01-01T00:00:00.000Z"),
+      user: { twoFactorEnabled: true, deletionRequestedAt: null, banned: null, banExpires: null },
+    });
+    const enrolled = attachBrowser();
+    await open(enrolled, "one");
+    expect(enrolled.closes).toEqual([]);
+    expect(cli.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(2);
+  });
+
   /** The admission read's row: a live session of `user-id`, owner flags as given. */
   function admissionRow(user: Record<string, unknown> = {}) {
     return {
@@ -1258,7 +1305,7 @@ describe("terminal browser hub", () => {
     });
     const listed = terminalBrowserHub.handleText(browser, JSON.stringify({ type: "list" }));
     read.reject(new Error("db down"));
-    await expect(admission).rejects.toThrow("db down");
+    await expect(admission).rejects.toMatchObject({ message: "db down" });
     await listed;
     expect(browser.closes).toEqual([{ code: 1011, reason: "admission_failed" }]);
     expect(registered(browser)).toBe(false);

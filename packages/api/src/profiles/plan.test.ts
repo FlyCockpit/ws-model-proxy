@@ -16,8 +16,14 @@ function node(id: string, overrides: Partial<PlanNode> = {}): PlanNode {
     requiredVersionIds: new Set(),
     memoryGb: 64,
     gpus: [],
+    unifiedAcceleratorGb: null,
+    ramOnlyGb: null,
     liveFreeMemoryGb: null,
-    launch: null,
+    launch: {
+      platform: "linux",
+      management: new Set(["process", "service"]),
+      shells: new Set(["sh"]),
+    },
     ...overrides,
   };
 }
@@ -96,6 +102,32 @@ describe("profilePlan", () => {
     expect(plan.preview.starts).toHaveLength(1);
     expect(plan.preview.starts[0]?.placements[0]).toMatchObject({ port: 30000, nodeNumber: 1 });
     expect(plan.preview.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it.each(["discrete", "unified"] as const)("caps %s model memory in profile planning", (kind) => {
+    const i = input({
+      nodes: new Map([
+        [
+          "a",
+          node("a", {
+            memoryGb: 121.18,
+            unifiedAcceleratorGb: 61.84,
+            gpus: [{ key: "amd:0", vendor: "amd", vramGb: 0, unified: true }],
+          }),
+        ],
+      ]),
+      owned: [{ nodeId: "a", hold: false, holdNote: null }],
+    });
+    const version = i.versions.get("v-1")!;
+    const spec = launchSpec({
+      resources: [kind === "unified" ? { kind, memoryGb: 70 } : { kind, gpuCount: 1, vramGb: 70 }],
+    });
+    const plan = profilePlan({ ...i, versions: new Map([["v-1", { ...version, spec }]]) });
+    expect(plan.preview.starts).toEqual([]);
+    expect(plan.preview.refusals[0]).toMatchObject({
+      reason: "not_enough_memory",
+      message: expect.stringContaining("Unified accelerator limit"),
+    });
   });
 
   it("places an interactive item and warns that a person runs a step", () => {

@@ -21,6 +21,7 @@ import { stepIntentSchema } from "./step-intent";
 /** What the trust and naming checks read of an occupied node. */
 export const OCCUPANCY_NODE_SELECT = {
   id: true,
+  userId: true,
   slug: true,
   trust: true,
   trustLowerRequestedAt: true,
@@ -45,6 +46,7 @@ export const OCCUPANCY_SELECT = {
 
 export type OccupancyNode = Pick<NodeTrustColumns, "trust" | "trustLowerRequestedAt"> & {
   id: string;
+  userId?: string;
 };
 
 export type OccupancyRank<N extends OccupancyNode = OccupancyNode> = {

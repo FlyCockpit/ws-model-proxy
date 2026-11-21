@@ -1,2 +1,2 @@
 /** The server and CLI version this build ships; `/install.sh` installs the matching wsmp. */
-export const SERVER_VERSION = "0.4.3";
+export const SERVER_VERSION = "1.0.0";

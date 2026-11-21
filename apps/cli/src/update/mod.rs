@@ -1,5 +1,4 @@
-//! Self-update: `wsmp update` and the server's `agent.update` (see
-//! `self-update-plan.md` at the repository root).
+//! Self-update: `wsmp update` and the server's `agent.update`.
 //!
 //! The self-replace sequence: download the release archive beside the live
 //! binary (same filesystem, never `/tmp`), verify its SHA-256 (and, later, a

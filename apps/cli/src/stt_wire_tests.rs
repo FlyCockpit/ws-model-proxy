@@ -8,7 +8,7 @@ const SESSION: &str = "AAECAwQFBgcICQoLDA0ODw";
 
 fn fixture(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/relay-3.0/stt")
+        .join("tests/fixtures/relay-4.0/stt")
         .join(name)
 }
 

@@ -117,13 +117,13 @@ function RuntimeOverview({ runtime }: { runtime: RuntimeDetail }) {
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <div className="min-w-0 space-y-1">
-        <h1 className="flex min-w-0 flex-wrap items-center gap-2 text-2xl font-semibold">
+        <h2 className="flex min-w-0 flex-wrap items-center gap-2 text-2xl font-semibold">
           <span className="break-all">{runtime.name}</span>
           <StatusPill tone="info">{t(`dashboard:runtime.kind.${runtime.kind}`)}</StatusPill>
           {runtime.service ? (
             <StatusPill tone="muted">{t("dashboard:runtime.service")}</StatusPill>
           ) : null}
-        </h1>
+        </h2>
         <p className="break-all font-mono text-sm text-muted-foreground">
           {runtime.slug} · v{runtime.currentVersion.version}
         </p>
@@ -324,14 +324,15 @@ function InstanceReasonNote({ instance }: { instance: Instance }) {
           {t("dashboard:runtime.healthReason.label", { reason })}
         </p>
       ) : null}
-      {instance.phaseReason === "process_detached" ? (
-        <p className="break-words text-sm text-destructive">
-          {t("dashboard:runtime.processDetached")}
-        </p>
-      ) : null}
+      {/* Only instances failed by 0.4.x carry this historical reason. */}
       {instance.phaseReason === "cli_upgrade_required" ? (
         <p className="break-words text-sm text-destructive">
           {t("dashboard:runtime.cliUpgradeRequired")}
+        </p>
+      ) : null}
+      {instance.phaseReason === "process_detached" ? (
+        <p className="break-words text-sm text-destructive">
+          {t("dashboard:runtime.processDetached")}
         </p>
       ) : null}
       {waiting ? <p className="break-words text-xs text-muted-foreground">{waiting}</p> : null}

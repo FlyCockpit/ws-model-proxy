@@ -1,4 +1,4 @@
-/** The 28 MCP tools of 0.4.0 (spec §6.2 + owner round 3 + review), in manifest order. READ tokens get the first 7. */
+/** The 28 MCP tools of 0.4.0 (spec §6.2 + owner round 3 + review), in manifest order. The first seven require read; each remaining tool declares its domain scope. */
 export const MCP_READ_TOOLS = [
   "nodes_get",
   "runtimes_get",

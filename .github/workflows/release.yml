@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release tag to publish, for example v0.1.0. Must match apps/cli/Cargo.toml.
+        description: Release tag to publish, for example v1.0.0. Must match apps/cli/Cargo.toml.
         required: true
         type: string
       publish_latest:
@@ -32,8 +32,6 @@ jobs:
       container-tags: ${{ steps.release.outputs.container-tags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
 
       - id: release
         name: Validate version, branch, and image tags
@@ -41,14 +39,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "$GITHUB_REF" != "refs/heads/master" ]; then
-            echo "::error::Run releases from the master branch. Current ref is $GITHUB_REF."
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Run releases from the main branch. Current ref is $GITHUB_REF."
             exit 1
           fi
 
           tag="${{ inputs.version }}"
           if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Release version must be a SemVer tag like v0.1.0 without build metadata."
+            echo "::error::Release version must be a SemVer tag like v1.0.0 without build metadata."
             exit 1
           fi
 
@@ -108,9 +106,10 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-latest
           - platform: linux/arm64
             arch: arm64
+            # GitHub has no ubuntu-latest arm64 label; this is the matching image as of 2026-11.
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -135,6 +134,11 @@ jobs:
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ needs.validate.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           labels: |
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.vendor=FlyCockpit LLC
+            org.opencontainers.image.title=WS Model Proxy
+            org.opencontainers.image.description=Self-hosted OpenAI-compatible model routing through outbound websockets.
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
@@ -146,8 +150,9 @@ jobs:
           provenance: false
 
       - name: Scan ${{ matrix.arch }} image with Trivy
-        uses: aquasecurity/trivy-action@8f28faec26515256b6d22074d1d2a8986f4cbd87 # untagged master (2026-10-21), after v0.36.0: bundles trivy v0.76.1
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
+          version: v0.76.2
           image-ref: ${{ needs.validate.outputs.image }}@${{ steps.build.outputs.digest }}
           severity: HIGH,CRITICAL
           exit-code: '1'
@@ -217,7 +222,14 @@ jobs:
             [ -n "$tag" ] && tag_args+=(--tag "$tag")
           done <<< "$CONTAINER_TAGS"
 
-          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          docker buildx imagetools create "${tag_args[@]}" \
+            --annotation "index:org.opencontainers.image.licenses=MIT" \
+            --annotation "index:org.opencontainers.image.vendor=FlyCockpit LLC" \
+            --annotation "index:org.opencontainers.image.title=WS Model Proxy" \
+            --annotation "index:org.opencontainers.image.description=Self-hosted OpenAI-compatible model routing through outbound websockets." \
+            --annotation "index:org.opencontainers.image.url=https://github.com/${GITHUB_REPOSITORY}" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            "${sources[@]}"
           docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG"
 
   plan-cli-release:
@@ -225,7 +237,7 @@ jobs:
     needs:
       - validate
       - release-preflight
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ needs.validate.outputs.tag }}
@@ -246,7 +258,7 @@ jobs:
       - name: Install dist
         shell: bash
         working-directory: apps/cli
-        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.34.0/cargo-dist-installer.sh | sh
 
       - name: Cache dist
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -321,11 +333,96 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
 
+      - name: Configure native musl compilers
+        if: ${{ contains(join(matrix.targets, ','), '-linux-musl') }}
+        shell: bash
+        env:
+          RELEASE_TARGETS: ${{ join(matrix.targets, ' ') }}
+        run: |
+          set -euo pipefail
+          for target in $RELEASE_TARGETS; do
+            case "$target" in *-unknown-linux-musl) ;; *) continue ;; esac
+            compiler_target=${target//-/_}
+            echo "CC_${compiler_target}=musl-gcc" >> "$GITHUB_ENV"
+            echo "CARGO_TARGET_${compiler_target^^}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+          done
+
       - name: Build artifacts
         working-directory: apps/cli
         run: |
           dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+
+      # dist 0.34's v0 config has no per-target include. Add musl's MIT
+      # notice after packaging, then refresh both checksum files and manifest
+      # hashes before global artifacts (installers/sha256.sum) are generated.
+      - name: Verify static musl binaries and include their licence notice
+        if: ${{ contains(join(matrix.targets, ','), '-linux-musl') }}
+        shell: bash
+        working-directory: apps/cli
+        env:
+          RELEASE_TARGETS: ${{ join(matrix.targets, ' ') }}
+        run: |
+          set -euo pipefail
+          for target in $RELEASE_TARGETS; do
+            case "$target" in *-unknown-linux-musl) ;; *) continue ;; esac
+            archive="target/distrib/wsmp-$target.tar.xz"
+            dir="$(mktemp -d)"
+            tar -xJf "$archive" -C "$dir"
+            bin="$dir/wsmp-$target/wsmp"
+            file "$bin"
+            # Capture first: a failed readelf must fail the job too.
+            headers="$(readelf -lW "$bin")"
+            dynamic="$(readelf -dW "$bin")"
+            if grep -q 'INTERP' <<<"$headers"; then echo "::error::$archive has an ELF interpreter"; exit 1; fi
+            if grep -q '(NEEDED)' <<<"$dynamic"; then echo "::error::$archive has shared-library dependencies"; exit 1; fi
+            cp /usr/share/doc/musl-dev/copyright "$dir/wsmp-$target/musl-COPYRIGHT.txt"
+            tar -cJf "$archive" -C "$dir" "wsmp-$target"
+            rm -rf "$dir"
+            python3 - "$archive" <<'PYTHON'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          archive = Path(sys.argv[1])
+          manifest_path = Path('dist-manifest.json')
+          manifest = json.loads(manifest_path.read_text())
+          artifact = manifest['artifacts'][archive.name]
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          artifact.setdefault('checksums', {})['sha256'] = digest
+          artifact.setdefault('assets', []).append({
+              'name': 'musl-COPYRIGHT.txt', 'path': 'musl-COPYRIGHT.txt', 'kind': 'license',
+          })
+          checksum_id = artifact['checksum']
+          checksum = archive.parent / checksum_id
+          checksum.write_text(f'{digest} *{archive.name}\n')
+          manifest['artifacts'][checksum_id].setdefault('checksums', {})['sha256'] = hashlib.sha256(checksum.read_bytes()).hexdigest()
+          manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+          PYTHON
+          done
+
+      # The GNU builds are what /install.sh installs on glibc Linux (static musl
+      # cannot resolve mDNS `*.local` names). It promises them to any glibc at or
+      # above CLI_RELEASE_MIN_GLIBC (apps/server/src/node-http.ts): 2.34. The
+      # ubuntu-22.04 runners (glibc 2.35, dist-workspace.toml) keep the newest
+      # symbol version a build needs at 2.34; this gate fails the release if one
+      # needs more. Keep the floor below equal to that constant.
+      - name: Verify the GNU binaries' glibc floor
+        if: ${{ contains(join(matrix.targets, ','), '-linux-gnu') }}
+        shell: bash
+        working-directory: apps/cli
+        env:
+          RELEASE_TARGETS: ${{ join(matrix.targets, ' ') }}
+        run: |
+          set -euo pipefail
+          for target in $RELEASE_TARGETS; do
+            case "$target" in *-unknown-linux-gnu) ;; *) continue ;; esac
+            dir="$(mktemp -d)"
+            tar -xJf "target/distrib/wsmp-$target.tar.xz" -C "$dir"
+            bash scripts/check-glibc-floor.sh "$dir/wsmp-$target/wsmp" 2.34
+            rm -rf "$dir"
+          done
 
       - id: cargo-dist
         name: Post-build
@@ -351,7 +448,7 @@ jobs:
     needs:
       - plan-cli-release
       - build-cli-local-artifacts
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
@@ -418,7 +515,7 @@ jobs:
       attestations: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
@@ -483,7 +580,7 @@ jobs:
           # cargo-dist ends sha256.sum with a blank line, which `sha256sum --strict` refuses as
           # improperly formatted. Drop blank lines so the published file passes a strict check.
           sed -i '/^[[:space:]]*$/d' sha256.sum
-          for archive in wsmp-x86_64-unknown-linux-gnu.tar.xz wsmp-aarch64-unknown-linux-gnu.tar.xz wsmp-aarch64-apple-darwin.tar.xz wsmp-x86_64-apple-darwin.tar.xz wsmp-x86_64-pc-windows-msvc.zip; do
+          for archive in wsmp-x86_64-unknown-linux-gnu.tar.xz wsmp-aarch64-unknown-linux-gnu.tar.xz wsmp-x86_64-unknown-linux-musl.tar.xz wsmp-aarch64-unknown-linux-musl.tar.xz wsmp-aarch64-apple-darwin.tar.xz wsmp-x86_64-apple-darwin.tar.xz wsmp-x86_64-pc-windows-msvc.zip; do
             if [ ! -f "$archive" ]; then
               echo "::error::$archive is missing from the release artifacts."
               exit 1
@@ -548,7 +645,7 @@ jobs:
     needs:
       - validate
       - publish-cli-release
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     environment: release
     steps:
       - name: Validate tap token

@@ -1,36 +1,283 @@
 #!/bin/sh
-# Docker entrypoint — runs before the container CMD.
+# Docker entrypoint — PID 1 of the image; runs before the container CMD.
 #
-# Responsibilities:
-#   1. Validate required environment variables.
-#   2. Gate schema sync on APPLY_SCHEMA. When sync is requested, run
-#      `prisma db push` plus repository schema hardening under a Postgres
-#      advisory lock so concurrent replicas (and any accidental cross-image
-#      pushes) serialize.
-#   3. exec the container CMD.
+# Backup writer keys stay out of the server: this script holds BACKUP_S3_*
+# only while the migration runner and its backups run as children, then unsets
+# every BACKUP_S3_* variable and execs tini with the CMD. tini becomes PID 1
+# with the cleaned environment: neither /proc/1/environ nor the server's
+# environment carries the writer keys. One-shot backup/restore commands keep
+# them because writing backups is their job.
 #
-# APPLY_SCHEMA values:
-#   off       — skip schema sync. Normal app boot. Default when unset.
-#   safe      — run `prisma db push`. Prisma refuses destructive operations
-#               (drop column, narrow type, etc.) and exits non-zero.
-#   dangerous — run `prisma db push --accept-data-loss`. Destructive operations
-#               are applied.
+# Image commands:
+#   migrate              run the migration runner once and exit with its status
+#                        (container platforms: a one-shot job before rollout).
+#   restore <args...>    exec scripts/backup/restore.sh (one-shot restore job).
+#   backup [--keep <n>]  take a verified pg_dump now (label `manual`).
+#   backup-schedule      the optional daily-backup service (scripts/backup/schedule.mjs).
+#   restore-drill <src>  restore into a throwaway empty database and verify it.
+#   hold-deletions [days|--clear]
+#                        pause scheduled deletions for `days` (default 7,
+#                        1..90) with the owner hold, or remove it (one-shot;
+#                        after a restore the runner cannot detect).
+#   anything else        the normal CMD (the server), after:
+#     1. required env validation;
+#     2. migrations — MIGRATE_ON_START=true (default for the server command):
+#        `node scripts/db/migrate-runtime.mjs apply` (classify the database,
+#        adopt a released 0.4.3 database that has no migration history, refuse
+#        failed / foreign schemas / in-place breaking changes on a served
+#        database, the pre-migration backup when BACKUP_ENABLED=true (a
+#        missing destination refuses the start: pre-migrate.sh
+#        --startup-notice), `prisma migrate deploy`, then
+#        the scheduled deletions phase). Concurrent leaders serialize on the
+#        runner's advisory lock; the second normally finds nothing to do.
+#        MIGRATE_ON_START=false (default for every other command):
+#        `migrate-runtime.mjs wait` — read-only wait (fixed 300 s) for the
+#        database to be up to date (a `migrate` job or another container
+#        migrates it).
+#        Both register this process in the instance registry under a fresh
+#        WMP_INSTANCE_ID (exported here). The one-shot commands (`migrate`,
+#        `restore`, `hold-deletions`, `backup*`, `restore-drill`) get no id (an
+#        inherited WMP_INSTANCE_ID is unset first) and register nothing;
+#     3. drop BACKUP_S3_* and exec tini with the CMD.
+#
+# APPLY_SCHEMA (0.4.x) is a deprecated alias, accepted during 1.x with a
+# warning: off → MIGRATE_ON_START=false, safe → MIGRATE_ON_START=true.
+# APPLY_SCHEMA=dangerous is refused: migrations never accept data loss.
+#
+# See docs/schema-migrations.md.
 
+# Install handlers before validation or any child launch (the startup check,
+# the `node -p` that mints the instance id, the runner), so there is no gap
+# between steps where a `docker stop` is dropped (a shell running as PID 1
+# ignores TERM unless it traps it) and the runner or the CMD starts anyway.
+# They stay through `exec` (exec resets caught signals itself). (Before the
+# first trap and between `exec` and tini installing its own handlers, a TERM
+# to PID 1 is dropped; sh cannot close those windows.)
+#
+# A supervised child gets TERM for every stop signal: this non-interactive
+# shell starts background children with SIGINT ignored, and bash keeps that,
+# so a forwarded INT could not stop it. The entrypoint still exits with the
+# signal's own status (143 TERM, 130 INT, 129 HUP).
+child_pid=""
+child_start=""
+launching_child=false
+stop_signal=""
+stopping=false
+have_proc=false
+if [ -r /proc/self/stat ]; then have_proc=true; fi
+# With a supervised child, the handler itself repeats the TERM until the child
+# is gone (stop_child): a signal that lands just before supervise's `wait` runs
+# the handler and then lets `wait` block, so nothing after it could repeat a
+# TERM the child missed. During the launch the child is not identified yet:
+# the handler only records the signal, and supervise forwards it. A signal
+# that lands while a stop is already under way only records itself: a nested
+# handler that drove the child to gone (letting dash reap it and free its PID)
+# would make the interrupted check-then-kill outside it signal a stale PID.
+# Without /proc nothing repeats the TERM, so there every signal sends one, as
+# before.
+stop_startup() {
+  stop_signal="$1"
+  [ "$stopping" = false ] || [ "$have_proc" = false ] || return 0
+  if [ -n "$child_pid" ]; then
+    stopping=true
+    stop_child
+  elif [ "$launching_child" = false ]; then
+    exit "$2"
+  fi
+}
+trap 'stop_startup TERM 143' TERM
+trap 'stop_startup INT 130' INT
+trap 'stop_startup HUP 129' HUP
 set -e
 
-# The production entrypoint is installed in /usr/local/bin while the workspace
-# lives under /app, so its own directory cannot be used to locate packages.
-# APP_ROOT/DB_PACKAGE_DIR remain overridable for derivative images and the
-# executable entrypoint tests.
+# The pause between repeated TERMs: 0.2 s where sleep takes fractions, else
+# 1 s. Decided once, here: in dash a trap that runs during another trap leaves
+# $? at the outer trap's status, so the loop cannot branch on sleep's status.
+stop_pause=1
+if sleep 0.01 2>/dev/null; then stop_pause=0.2; fi
+
+# proc_start <pid>: sets proc_start_value to the start time of a live (not
+# zombie) process, field 22 of /proc/<pid>/stat, or to "" for a process that is
+# gone or a zombie. It tells the supervised child apart from a later process
+# that reuses its PID once it has been reaped (dash reaps a background child
+# while it waits for any foreground command, such as `sleep`). Builtins only,
+# no fork: the trap handler runs it, and a container at its pids limit cannot
+# fork, so the first TERM always gets out. (stop_child's pause does fork
+# `sleep`: at a full pids limit dash exits 2 there, after that TERM, and the
+# container's teardown ends the child.) The stop guard keeps two calls from
+# interleaving.
+proc_start() {
+  proc_start_value=""
+  stat_line=""
+  read -r stat_line 2>/dev/null <"/proc/$1/stat" || [ -n "$stat_line" ] || return 0
+  # Field 2 (comm) is in parentheses and may contain spaces: drop through ") ".
+  # shellcheck disable=SC2086
+  set -- ${stat_line##*) }
+  [ $# -ge 20 ] || return 0
+  [ "$1" != Z ] || return 0
+  shift 19
+  proc_start_value=$1
+}
+
+# child_alive: the supervised child still runs (same start time as at launch;
+# without /proc, `kill -0`).
+child_alive() {
+  if [ "$have_proc" = true ]; then
+    [ -n "$child_start" ] || return 1
+    proc_start "$child_pid"
+    [ "$proc_start_value" = "$child_start" ]
+  else
+    kill -0 "$child_pid" 2>/dev/null
+  fi
+}
+
+# term_child: TERM the supervised child, checked right before the kill, so a
+# reaped child's reused PID is not signalled (a gap of microseconds remains
+# between the check and the kill builtin; it matters only if the PID space
+# wraps around within it).
+term_child() {
+  [ -n "$child_pid" ] || return 0
+  if [ "$have_proc" = false ] || child_alive; then
+    kill -TERM "$child_pid" 2>/dev/null || :
+  fi
+}
+
+# stop_child: TERM the child every 0.2 s until it is gone (where /proc
+# identifies it; elsewhere, once). One TERM is not enough: one that lands in
+# the instant after the fork, before the forked shell has reset the traps it
+# inherited from this one, is swallowed there, and the command would run to
+# its end. Both supervised children (the bash startup check and the migration
+# runner) have no TERM handler, so repeating it is harmless.
+stop_child() {
+  term_child
+  # Without /proc a reaped child's PID could be reused: one TERM only, which
+  # the fork window can swallow. The image always has /proc; only a local run
+  # of this script elsewhere (not Linux) takes this path.
+  [ "$have_proc" = true ] || return 0
+  # (The pause forks `sleep`; the TERM itself never needs a fork.)
+  while child_alive; do
+    sleep "$stop_pause" 2>/dev/null || :
+    term_child
+  done
+}
+
+# supervise <command...>: run one startup child (the backup startup check, the
+# migration runner) in the background so a stop signal reaches it — this
+# shell is PID 1, and a trapped signal only runs between commands — then wait
+# for the child's own exit (status in child_status). After a stop signal the
+# CMD never starts: the child gets TERM until it is gone, then the entrypoint
+# exits with the signal's status.
+supervise() {
+  launching_child=true
+  "$@" &
+  child_pid=$!
+  # Its identity for every later TERM, read with builtins only, so dash cannot
+  # reap the child (and free its PID) before the read. A child that already
+  # exited reads as gone and is never signalled. Until
+  # launching_child is false, a signal is only recorded (term_child skips a
+  # child it cannot identify yet) and handled just below.
+  if [ "$have_proc" = true ]; then
+    proc_start "$child_pid"
+    child_start=$proc_start_value
+  fi
+  launching_child=false
+  set +e
+  if [ -z "$stop_signal" ]; then
+    wait "$child_pid"
+    child_status=$?
+  fi
+  # A stop signal recorded during the launch (the handler has already stopped
+  # the child for any later one): TERM the child until it is gone, then
+  # collect it.
+  if [ -n "$stop_signal" ]; then
+    stopping=true
+    stop_child
+    wait "$child_pid" 2>/dev/null
+    # Without /proc: a further signal interrupts that wait; wait again while
+    # the child still runs.
+    while [ "$have_proc" = false ] && kill -0 "$child_pid" 2>/dev/null; do
+      wait "$child_pid" 2>/dev/null
+    done
+  fi
+  set -e
+  child_pid=""
+  child_start=""
+  case "$stop_signal" in
+    TERM) exit 143 ;;
+    INT) exit 130 ;;
+    HUP) exit 129 ;;
+  esac
+}
+
+# The production entrypoint is installed in /usr/local/bin while the app lives
+# under /app. APP_ROOT stays overridable for scripts/test-docker-entrypoint-schema.sh.
 APP_ROOT="${APP_ROOT:-/app}"
-DB_PACKAGE_DIR="${DB_PACKAGE_DIR:-$APP_ROOT/packages/db}"
+RUNNER="$APP_ROOT/scripts/db/migrate-runtime.mjs"
+BACKUP_HOOK="$APP_ROOT/scripts/backup/pre-migrate.sh"
+
+# --- Strict switches ---
+case "${BACKUP_ENABLED:-}" in
+  "" | true | false) ;;
+  *)
+    echo "FATAL: BACKUP_ENABLED must be true or false (got \"$BACKUP_ENABLED\")." >&2
+    exit 1
+    ;;
+esac
+
+# One-shot jobs never inherit a running application instance registration:
+# only the runner and the CMD below get a fresh WMP_INSTANCE_ID.
+unset WMP_INSTANCE_ID
+
+# --- One-shot image commands ---
+case "${1:-}" in
+  migrate)
+    if [ -z "$DATABASE_URL" ]; then
+      echo "FATAL: Missing required environment variable(s): DATABASE_URL" >&2
+      exit 1
+    fi
+    # Once per migrating start, even with nothing pending: BACKUP_ENABLED=true
+    # without a usable destination fails here, not at the first real migration.
+    supervise bash "$BACKUP_HOOK" --startup-notice
+    [ "$child_status" -eq 0 ] || exit "$child_status"
+    supervise node "$RUNNER" apply
+    exit "$child_status"
+    ;;
+  restore)
+    shift
+    exec tini -- bash "$APP_ROOT/scripts/backup/restore.sh" "$@"
+    ;;
+  hold-deletions)
+    shift
+    if [ -z "$DATABASE_URL" ]; then
+      echo "FATAL: Missing required environment variable(s): DATABASE_URL" >&2
+      exit 1
+    fi
+    exec tini -- node "$RUNNER" hold "$@"
+    ;;
+  backup)
+    # Back up now: the same pg_dump archive as the pre-migration backup.
+    shift
+    exec tini -- bash "$APP_ROOT/scripts/backup/pre-migrate.sh" --label manual --required "$@"
+    ;;
+  backup-schedule)
+    # The optional daily-backup service (BACKUP_SCHEDULE=daily; idles when off).
+    exec tini -- node "$APP_ROOT/scripts/backup/schedule.mjs" run
+    ;;
+  restore-drill)
+    # Restore into a THROWAWAY empty database and check it.
+    shift
+    exec tini -- node "$APP_ROOT/scripts/backup/drill.mjs" "$@"
+    ;;
+esac
 
 # --- 1. Required env vars ---
 missing=""
 required_vars="DATABASE_URL"
+is_server=false
 case " $* " in
-  *" apps/server/dist/index.mjs"*|*" apps/server/"*)
+  *" apps/server/dist/index.mjs"*|*" apps/server/"*|*"/apps/server/dist/index.mjs"*)
     required_vars="$required_vars BETTER_AUTH_SECRET"
+    is_server=true
     ;;
 esac
 
@@ -47,262 +294,90 @@ if [ -n "$missing" ]; then
   exit 1
 fi
 
-# --- 2. Schema sync ---
-APPLY_SCHEMA="${APPLY_SCHEMA:-off}"
-case "$APPLY_SCHEMA" in
-  off)
-    echo "APPLY_SCHEMA=off — skipping schema sync."
-    ;;
-  safe)
-    echo "APPLY_SCHEMA=safe — applying non-destructive schema changes."
-    # Prisma 7's `db push` does not run `generate` and rejects `--skip-generate`
-    # ("unknown or unexpected option"). The client is already generated at
-    # image-build time, so no flag is needed here.
-    push_flags=""
-    ;;
-  dangerous)
-    echo "APPLY_SCHEMA=dangerous — applying schema changes with --accept-data-loss."
-    push_flags="--accept-data-loss"
-    ;;
+# --- 2. Migrations ---
+# Deprecated 0.4.x alias. Never silently: the operator sees what it maps to.
+if [ -n "${APPLY_SCHEMA:-}" ]; then
+  case "$APPLY_SCHEMA" in
+    off) alias_value=false ;;
+    safe) alias_value=true ;;
+    dangerous)
+      echo "FATAL: APPLY_SCHEMA=dangerous is no longer supported. Schema changes now ship as reviewed" >&2
+      echo "       migrations and never drop data implicitly. Remove APPLY_SCHEMA; the server migrates" >&2
+      echo "       on start (MIGRATE_ON_START, default true). See docs/schema-migrations.md." >&2
+      exit 1
+      ;;
+    *)
+      echo "FATAL: APPLY_SCHEMA=$APPLY_SCHEMA is invalid (deprecated; use MIGRATE_ON_START=true|false)." >&2
+      exit 1
+      ;;
+  esac
+  if [ -n "${MIGRATE_ON_START:-}" ] && [ "$MIGRATE_ON_START" != "$alias_value" ]; then
+    echo "FATAL: APPLY_SCHEMA=$APPLY_SCHEMA (deprecated, means MIGRATE_ON_START=$alias_value) conflicts with" >&2
+    echo "       MIGRATE_ON_START=$MIGRATE_ON_START. Remove APPLY_SCHEMA." >&2
+    exit 1
+  fi
+  echo "WARNING: APPLY_SCHEMA is deprecated and will be removed; it now means MIGRATE_ON_START=$alias_value." >&2
+  if [ "$alias_value" = false ]; then
+    echo "         This container will NOT apply migrations: it waits for another runner (the \`migrate\`" >&2
+    echo "         command) to bring the database up to date. Remove APPLY_SCHEMA to migrate on start." >&2
+  else
+    echo "         Replace it with MIGRATE_ON_START=true, or remove both (true is the server default)." >&2
+  fi
+  MIGRATE_ON_START="$alias_value"
+fi
+
+if [ "$is_server" = true ]; then
+  MIGRATE_ON_START="${MIGRATE_ON_START:-true}"
+  role=server
+else
+  MIGRATE_ON_START="${MIGRATE_ON_START:-false}"
+  role=worker
+fi
+case "$MIGRATE_ON_START" in
+  true) runner_mode=apply ;;
+  false) runner_mode=wait ;;
   *)
-    echo "FATAL: APPLY_SCHEMA=$APPLY_SCHEMA is invalid. Use off, safe, or dangerous." >&2
+    echo "FATAL: MIGRATE_ON_START must be true or false (got \"$MIGRATE_ON_START\")." >&2
     exit 1
     ;;
 esac
 
-if [ "$APPLY_SCHEMA" != "off" ]; then
-  # Stable app-specific advisory lock ID for schema sync. `prisma db push` does NOT take an advisory lock on its own (unlike
-  # `prisma migrate deploy`), so we wrap it ourselves to serialize replicas.
-  LOCK_ID=1145389648
-  STATUS_FILE=$(mktemp)
-  echo 1 > "$STATUS_FILE"
-  HARDEN_STATUS_FILE=$(mktemp)
-  echo 0 > "$HARDEN_STATUS_FILE"
-  SCHEMA_LAUNCH_DIR=$(mktemp -d)
-  SCHEMA_LAUNCH_GATE="$SCHEMA_LAUNCH_DIR/start"
-  : > "$SCHEMA_LAUNCH_GATE"
-
-  schema_child_pid=""
-  schema_signal_status=""
-  schema_launch_phase="preparing"
-  schema_pending_signal=""
-  cleanup_schema_files() {
-    rm -f "$STATUS_FILE" "$HARDEN_STATUS_FILE"
-    rm -rf "$SCHEMA_LAUNCH_DIR"
-  }
-  handle_schema_signal() {
-    signal_name=$1
-    signal_status=$2
-    schema_signal_status=$signal_status
-    # Always retain the actual signal. In particular, a trap can run while the
-    # FIFO writer is blocked even though the launch phase is already `running`.
-    # The gate recovery path must not silently turn HUP or INT into TERM.
-    schema_pending_signal=$signal_name
-    case "$schema_launch_phase" in
-      launching)
-        # The background command has been requested but POSIX sh has not yet
-        # executed the following `$!` assignment. Remember the signal so the
-        # newly created process group is terminated as soon as its ID is known.
-        ;;
-      running)
-        # psql is a session/process-group leader. Signal the whole group so a
-        # live `\!` shell, Prisma, and schema-hardening process cannot outlive
-        # the advisory-lock session and keep mutating the database.
-        kill "-$signal_name" "-$schema_child_pid" 2>/dev/null || true
-        ;;
-      *)
-        # Before launch there is no schema process to clean up. Do not swallow
-        # the signal and continue into schema sync or application startup.
-        exit "$signal_status"
-        ;;
-    esac
-  }
-  trap cleanup_schema_files EXIT
-  trap 'handle_schema_signal HUP 129' HUP
-  trap 'handle_schema_signal INT 130' INT
-  trap 'handle_schema_signal TERM 143' TERM
-
-  echo "Acquiring schema advisory lock ($LOCK_ID)..."
-  # psql holds a session-level advisory lock across the `\!` shell call that
-  # invokes `prisma db push`. When the heredoc closes, the session exits and
-  # the lock is released.
-  #
-  # scripts/push-schema.mjs calls the prisma CLI by its copied path
-  # (node_modules/.bin/prisma) rather than `npx prisma`: the binary is COPY'd
-  # into the image explicitly, and the global npm/npx is stripped from the
-  # runtime image (it is never used at runtime and its vendored deps drag in
-  # CVEs).
-  #
-  # Lock order against the live application (DL-1): schema hardening locks
-  # every table it touches up front with NOWAIT and retries, so it never waits
-  # while holding a lock (apply-schema-hardening.mjs; it also skips entirely
-  # when the SQL and catalog are unchanged since its last apply). Prisma's
-  # push cannot lock up front, so it is the one deploy-only exception:
-  # push-schema.mjs gives every push statement a short lock_timeout and
-  # re-runs the whole (declarative) push on a lock timeout or deadlock.
-  #
-  # Connect psql via discrete libpq PG* env vars rather than passing
-  # DATABASE_URL as a CLI argument. A CLI argument is visible in
-  # /proc/<pid>/cmdline, so the password would leak to anything that can read
-  # process listings inside the container during the push; PGPASSWORD does not.
-  # We parse with node (already in the image — the HEALTHCHECK uses it too)
-  # because POSIX sh has no URL parser. Forwarding only the libpq-understood
-  # fields also avoids psql choking on Prisma-only query params (e.g. ?schema=).
-  # prisma db push is unaffected: it reads the full DATABASE_URL from the
-  # environment itself.
-  pg_env="$(node -e '
-    const u = new URL(process.env.DATABASE_URL);
-    const SQ = String.fromCharCode(39);
-    const q = (v) => SQ + String(v).split(SQ).join(SQ + "\\" + SQ + SQ) + SQ;
-    const dec = (v) => { try { return decodeURIComponent(v); } catch { return v; } };
-    const out = [];
-    out.push("export PGHOST=" + q(dec(u.hostname)));
-    if (u.port) out.push("export PGPORT=" + q(u.port));
-    if (u.username) out.push("export PGUSER=" + q(dec(u.username)));
-    if (u.password) out.push("export PGPASSWORD=" + q(dec(u.password)));
-    const db = dec(u.pathname.replace(/^\//, ""));
-    if (db) out.push("export PGDATABASE=" + q(db));
-    const sslmode = u.searchParams.get("sslmode");
-    if (sslmode) out.push("export PGSSLMODE=" + q(sslmode));
-    process.stdout.write(out.join("\n") + "\n");
-  ')" || { echo "FATAL: could not parse DATABASE_URL for psql." >&2; exit 1; }
-  eval "$pg_env"
-
-  schema_launch_phase="launching"
-  # `setsid` gives the complete schema-sync subtree a private process group.
-  # The FIFO is a launch barrier: no database operation can start until this
-  # parent has recorded `$!` as the group ID and handled any pending signal.
-  setsid sh -c '
-    launch_gate=$1
-    shift
-    if [ "${ENTRYPOINT_TEST_SCHEMA_EXIT_BEFORE_GATE:-0}" = 1 ]; then
-      exit 125
-    fi
-    # Polling a regular file keeps the parent write non-blocking even if this
-    # child dies before reaching the gate. Bound the handshake as a second
-    # line of defence against a supervisor failure before gate release.
-    gate_attempt=0
-    launch_token=
-    while [ "$gate_attempt" -lt 100 ]; do
-      IFS= read -r launch_token < "$launch_gate" || true
-      [ "$launch_token" = start ] && break
-      gate_attempt=$((gate_attempt + 1))
-      sleep 0.05
-    done
-    [ "$launch_token" = start ] || exit 125
-    exec "$@"
-  ' schema-launch "$SCHEMA_LAUNCH_GATE" psql -v ON_ERROR_STOP=1 <<EOF &
-SET lock_timeout = '300s';
-SELECT pg_advisory_lock($LOCK_ID);
-\! cd "$DB_PACKAGE_DIR" && node scripts/push-schema.mjs $push_flags; push_status=\$?; echo \$push_status > "$STATUS_FILE"; if [ "\$push_status" -eq 0 ]; then node scripts/apply-schema-hardening.mjs; echo \$? > "$HARDEN_STATUS_FILE"; fi
-SELECT pg_advisory_unlock($LOCK_ID);
-EOF
-  # Executable tests use this narrow hook to deliver a signal in the otherwise
-  # instruction-sized gap before `$!` is copied. It is intentionally limited
-  # to signals (not arbitrary commands) and is unset in production.
-  case "${ENTRYPOINT_TEST_SCHEMA_LAUNCH_SIGNAL:-}" in
-    HUP|INT|TERM)
-      if [ -n "${ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE:-}" ]; then
-        echo "$!" > "$ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE"
-      fi
-      kill "-${ENTRYPOINT_TEST_SCHEMA_LAUNCH_SIGNAL}" "$$"
-      ;;
-    "") ;;
-    *)
-      echo "FATAL: invalid entrypoint launch test signal." >&2
-      exit 2
-      ;;
-  esac
-  schema_child_pid=$!
-  if [ -n "${ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE:-}" ]; then
-    echo "$schema_child_pid" > "$ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE"
-  fi
-  schema_launch_phase="running"
-  if [ -n "$schema_pending_signal" ]; then
-    kill "-$schema_pending_signal" "-$schema_child_pid" 2>/dev/null || true
-  else
-    # Keep `set -e` from bypassing signal handoff, then re-check trap state
-    # before allowing the normal wait path to proceed.
-    set +e
-    echo start > "$SCHEMA_LAUNCH_GATE"
-    launch_gate_status=$?
-    set -e
-    if [ -n "$schema_signal_status" ]; then
-      kill "-$schema_pending_signal" "-$schema_child_pid" 2>/dev/null || true
-    elif [ "$launch_gate_status" -ne 0 ]; then
-      kill -TERM "-$schema_child_pid" 2>/dev/null || true
-      wait "$schema_child_pid" 2>/dev/null || true
-      echo "FATAL: could not release schema-sync launch gate." >&2
-      exit "$launch_gate_status"
-    fi
-  fi
-  set +e
-  wait "$schema_child_pid"
-  psql_status=$?
-  if [ -n "$schema_signal_status" ]; then
-    # Some shells interrupt wait as soon as the trap runs. Reap the forwarded
-    # child before exiting so the lock session cannot outlive PID 1.
-    wait "$schema_child_pid" 2>/dev/null
-
-    # psql can exit before a `\!` descendant has handled the forwarded signal.
-    # Wait briefly for the private group to drain, then force any remaining
-    # schema-only descendants down. This never targets the entrypoint or app.
-    drain_attempt=0
-    while kill -0 "-$schema_child_pid" 2>/dev/null; do
-      drain_attempt=$((drain_attempt + 1))
-      if [ "$drain_attempt" -ge 50 ]; then
-        kill -KILL "-$schema_child_pid" 2>/dev/null || true
-        break
-      fi
-      sleep 0.1
-    done
-
-    # KILL is asynchronous. Do not let PID 1 exit (and potentially let the app
-    # supervisor restart it) until the schema process group has actually gone.
-    kill_attempt=0
-    while kill -0 "-$schema_child_pid" 2>/dev/null; do
-      kill_attempt=$((kill_attempt + 1))
-      if [ "$kill_attempt" -ge 50 ]; then
-        echo "FATAL: schema-sync process group $schema_child_pid survived SIGKILL." >&2
-        break
-      fi
-      sleep 0.1
-    done
-  fi
-  set -e
-  schema_launch_phase="done"
-  schema_child_pid=""
-  trap - HUP INT TERM
-
-  if [ -n "$schema_signal_status" ]; then
-    exit "$schema_signal_status"
-  fi
-
-  if [ "$psql_status" != "0" ]; then
-    echo "FATAL: schema sync psql session failed (exit $psql_status)." >&2
-    exit "$psql_status"
-  fi
-
-  status=$(cat "$STATUS_FILE")
-  harden_status=$(cat "$HARDEN_STATUS_FILE")
-  cleanup_schema_files
-  trap - EXIT
-  if [ "$status" != "0" ]; then
-    echo "FATAL: prisma db push failed (exit $status)." >&2
-    if [ "$APPLY_SCHEMA" = "safe" ]; then
-      echo "       This usually means the schema change includes a destructive" >&2
-      echo "       operation (drop column, narrow type, etc.). Review the diff." >&2
-      echo "       If the data loss is intentional, confirm the diff and backup" >&2
-      echo "       before using APPLY_SCHEMA=dangerous." >&2
-    fi
-    exit "$status"
-  fi
-  if [ "$harden_status" != "0" ]; then
-    echo "FATAL: schema hardening failed after lock/deadlock retries (exit $harden_status)." >&2
-    exit "$harden_status"
-  fi
-  echo "Schema sync complete."
+# A container that migrates refuses to start when BACKUP_ENABLED=true has no
+# usable destination (and warns when backups are off but a destination is
+# configured). One that only waits needs no destination.
+if [ "$runner_mode" = apply ]; then
+  supervise bash "$BACKUP_HOOK" --startup-notice
+  [ "$child_status" -eq 0 ] || exit "$child_status"
 fi
 
-# --- 3. Hand off to the container CMD ---
-exec "$@"
+# One id per container start, never reused: scheduled deletions wait for every
+# registered instance of an older release (scripts/db/lib/contracts.mjs).
+# A short foreground child: a stop signal during it is acted on (exit, no
+# runner, no CMD) as soon as it returns.
+WMP_INSTANCE_ID="$(node -p 'require("node:crypto").randomUUID()')"
+export WMP_INSTANCE_ID
+
+# The runner runs in the background so a stop signal reaches it: this shell is
+# PID 1, which ignores TERM unless it traps it. A stop during migrations ends
+# the runner (an interrupted wrapped migration rolls back; the next start
+# recovers it) and never starts the CMD.
+supervise node "$RUNNER" "$runner_mode" --role "$role"
+runner_status=$child_status
+if [ "$runner_status" -ne 0 ]; then
+  if [ "$is_server" = true ] && [ "${APPLY_SCHEMA:-}" = off ]; then
+    echo "FATAL: Migration wait failed or timed out: APPLY_SCHEMA=off set MIGRATE_ON_START=false." >&2
+    echo "       Remove APPLY_SCHEMA (the server migrates by default), or replace it with MIGRATE_ON_START=true." >&2
+  fi
+  exit "$runner_status"
+fi
+
+# --- 3. Drop backup settings and hand off to the container CMD ---
+# tini replaces this shell as PID 1 with the cleaned environment. The server
+# has no use for the non-secret backup location settings either.
+for name in $(env | sed -n 's/^\(BACKUP_S3_[A-Za-z0-9_]*\)=.*/\1/p'); do
+  unset "$name"
+done
+# The writer key pair goes even if that listing failed (the substitution's
+# status is not checked): fail closed for the secrets.
+unset BACKUP_S3_ACCESS_KEY_ID BACKUP_S3_SECRET_ACCESS_KEY
+exec tini -- "$@"

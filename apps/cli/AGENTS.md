@@ -87,8 +87,22 @@ cargo xtask sync-docs --check
 Releases are handled by the root `Release` GitHub Actions workflow and `dist` (cargo-dist).
 
 1. Bump `version` in `Cargo.toml`.
-2. Merge that change to `master`.
-3. Manually run the root `Release` workflow from `master` with the matching tag, for example `v0.1.1`.
+2. Merge that change to `main`.
+3. Manually run the root `Release` workflow from `main` with the matching tag, for example `v1.0.1`.
 4. The workflow builds all platforms, generates installers and checksums, publishes a GitHub Release, and publishes the app container to GHCR.
 
 Cargo-dist artifact behavior lives in `dist-workspace.toml`; root release workflow owns monorepo orchestration. See `docs/releasing.md`.
+
+## Relay protocol
+
+Server and wsmp 1.0 speak only relay 4.0 (`ws-model-proxy.relay.v4`). Upgrade the
+server and every node together when moving release lines. Optional capabilities
+are advertised through hello `features` and used only when reported.
+
+Keep the HTTP 426 refusal body keys and types (`type`, `failure`, `code`,
+`message`, `supportedVersions`, `supportedSubprotocol`), with `code: "upgrade_cli"`.
+Keep all five `/.well-known/wsmp` fields and their types (`serverVersion`,
+`protocolVersion`, `origin`, `installScript: "/install.sh"`,
+`enrollPath: "/api/node/enroll"`). Released CLIs parse these to print upgrade
+instructions, so their shapes must never change. Version numbers remain
+owner-only under the root rules. See [the handshake guide](docs/relay-protocol.md).

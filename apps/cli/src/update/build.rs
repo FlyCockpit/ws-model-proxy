@@ -44,6 +44,13 @@ pub fn target() -> String {
     format!("{arch}-{rest}")
 }
 
+/// Keep the compiled target so a self-update preserves the node's libc and
+/// resolver behavior. Availability is checked when selecting the artifact.
+/// The callback remains for callers that already pass manifest availability.
+pub fn release_target(compiled: &str, _available: impl Fn(&str) -> bool) -> String {
+    compiled.to_string()
+}
+
 /// `/proc/sys/kernel/osrelease` of a WSL kernel names Microsoft
 /// (`5.15.153.1-microsoft-standard-WSL2`).
 pub fn osrelease_is_wsl(text: &str) -> bool {
@@ -94,7 +101,8 @@ pub struct Evidence<'a> {
 /// one in a cargo `target/` directory or that cargo lists as built from git
 /// (or a local path) is a source build, one cargo lists from a registry is
 /// `cargo install`; anything else is unknown. Only the install scripts write
-/// a receipt, so a script install older than self-update reinstalls once. A release build (one with a compiled-in commit) is never taken for
+/// a receipt; an unrecognized install must be reinstalled to record its method.
+/// A release build (one with a compiled-in commit) is never taken for
 /// cargo's even when a stale `.crates2.json` entry names it.
 pub fn detect(evidence: &Evidence<'_>) -> InstallMethod {
     if let Some(receipt) = evidence.receipt {
@@ -246,6 +254,25 @@ mod tests {
         assert!(target.starts_with(std::env::consts::ARCH));
         #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
         assert_eq!(target, "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn release_targets_preserve_libc_regardless_of_available_artifacts() {
+        for compiled in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ] {
+            assert_eq!(release_target(compiled, |_| true), compiled);
+            assert_eq!(release_target(compiled, |_| false), compiled);
+            assert_eq!(
+                release_target(compiled, |target| target == "x86_64-unknown-linux-musl"),
+                compiled
+            );
+        }
     }
 
     #[test]

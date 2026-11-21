@@ -1,18 +1,7 @@
 /**
- * Relay protocol 3.0: every frame, both directions, as strict zod schemas.
- *
- * This is the S0 contract. `protocol.ts` becomes the codec around these schemas in S0b
- * (encode/parse, subprotocol header, parse-error descriptions); session code consumes the
- * inferred types. The Rust mirror is `apps/cli/src/protocol/frames.rs`; every fixture in
- * `apps/cli/tests/fixtures/relay-3.0/` parses on both sides (`frames.test.ts`, Rust
- * `protocol::frames::tests`).
- *
- * One clean bump from 2.4 (spec §4): the server accepts exactly `3.0`, there are no capability
- * flags, and later 0.4.0 work extends 3.0 in place.
- *
- * Kept frames (relay.*, context.count.*, term.*, exec.*, file.*, stt.*) keep their 2.4 shapes
- * with two deliberate renames: `endpointSlug` → `handle` (relay.request, stt.open) and
- * `file.op` drops `mode`/`readGrant` (the node's trust decides).
+ * Relay protocol 4.0: strict schemas for every frame in both directions.
+ * The Rust mirror is `apps/cli/src/protocol/frames.rs`; shared fixtures in
+ * `apps/cli/tests/fixtures/relay-4.0/` parse on both sides.
  */
 
 import {
@@ -101,8 +90,10 @@ import {
 
 // ── Version and transport constants ──
 
-export const RELAY_PROTOCOL_VERSION = "3.0";
-export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v3";
+import { RELAY_PROTOCOL_VERSION } from "@ws-model-proxy/api/contracts";
+
+export { RELAY_PROTOCOL_VERSION };
+export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v4";
 export const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
 export const RELAY_BINARY_CHUNK_MAX_BYTES = 1024 * 1024;
 export const RELAY_REQUEST_BODY_WINDOW_CHUNKS = 16;
@@ -111,7 +102,7 @@ export const RUNTIME_INVENTORY_CHUNK_MAX = 512;
 /**
  * Byte budget a sender fills a chunked frame (`runtime.define`, its result, `runtime.inventory`)
  * up to before starting the next chunk; leaves room under the 64 KiB control cap for the
- * envelope. Every frame of 3.0 must encode within `RELAY_JSON_CONTROL_MAX_BYTES`.
+ * envelope. Every frame of 4.0 must encode within `RELAY_JSON_CONTROL_MAX_BYTES`.
  */
 export const CHUNK_BUDGET_BYTES = 60 * 1024;
 /** Versions one define chunk names (put + keep + remove), so its answer fits one frame. */
@@ -287,7 +278,7 @@ export const instanceRecordSchema = z
     launchHash: sha256HexSchema,
     rank: rankSchema,
     intentHash: sha256HexSchema,
-    stepId: rowIdSchema.optional(),
+    stepId: rowIdSchema,
     phase: z.enum(["starting", "ready", "unhealthy", "stopping", "stopped", "unknown"]),
     unitName: z.string().regex(UNIT_NAME_PATTERN),
     port: portSchema,
@@ -865,11 +856,11 @@ export const runtimeJobResultFrameSchema = z
     message: "Only operator_closed carries an exit code.",
   });
 
-// ── Kept 2.4 frames ──
+// ── Interactive and data frames ──
 
 const fileOpId = base64Url16Schema;
 const fileOpEnvelope = { type: z.literal("file.op"), opId: fileOpId } as const;
-/** 2.4 `file.op` without `mode`/`readGrant`: Full control + `files.roots` decide on the node. */
+/** Full control and `files.roots` authorize file operations on the node. */
 export const fileOpFrameSchema = z.discriminatedUnion("op", [
   z.object({ ...fileOpEnvelope, op: z.literal("read"), args: readArgsSchema }).strict(),
   z.object({ ...fileOpEnvelope, op: z.literal("stat"), args: statArgsSchema }).strict(),
@@ -931,14 +922,14 @@ export const helloFrameSchema = z
         identityPublicKey: p256PublicKeySchema,
         /** Signature over the `hello.challenge` statement with the identity key. */
         identitySignature: p256SignatureSchema,
-        /** Browser-terminal key agreement key (kept from 2.4 capabilities). */
+        /** Browser-terminal key agreement key. */
         terminalPublicKey: p256PublicKeySchema,
         terminalIdentity: z
           .object({ publicKey: p256PublicKeySchema, signature: p256SignatureSchema })
           .strict()
           .optional(),
-        /** Commit, install method and target triple (self-update; absent on older CLIs). */
-        build: nodeBuildSchema.optional(),
+        /** Commit, install method and target triple. */
+        build: nodeBuildSchema,
         /** Sent only when there is something to say (`wsl: true`). */
         environment: nodeEnvironmentSchema.optional(),
       })
@@ -1058,9 +1049,8 @@ export const execStatusFrameSchema = z
 // ── wsmp self-update ──
 
 /**
- * Install this version (server → node, Full control, owner's browser only). Sent only to a node
- * whose hello reports `features.selfUpdate` (older CLIs ignore an unknown frame type, but the
- * server never expects them to act). `signature` is reserved for minisign (D9): null today.
+ * Install this version (server → node, Full control, owner's browser only). Every connected
+ * node reports `features.selfUpdate`. `signature` is reserved for signing: null today.
  */
 export const agentUpdateFrameSchema = z
   .object({
@@ -1114,9 +1104,8 @@ export const agentUpdateProgressFrameSchema = z
       .optional(),
     /**
      * With `refused` / `version_mismatch` only: the version the node could install instead (its
-     * Homebrew tap's). Sent only after a `hello.ok` with `features.agentUpdateAvailableVersion`
-     * (a 0.4.3 server's strict schema refuses it), and only by a wsmp that checks its tap's
-     * version before installing: so a refusal carrying it is what proves the node can be sent
+     * Homebrew tap's). The node checks its tap's version before installing, so a refusal
+     * carrying it proves the node can be sent
      * that version ("Install anyway"). A value the node could not install (not a release
      * version as the node reads one) is dropped: no offer, the refusal itself still stored.
      */
@@ -1328,8 +1317,7 @@ export const nodeToServerControlFrameSchema = z.discriminatedUnion("type", [
       /** startedAt + min(timeoutMs, the node's commandMaxMs). */
       endsBy: isoTimeSchema,
       /**
-       * Which shell ran it and how. Sent only after a `hello.ok` with `features.execRanWith`
-       * (a released 0.4.3 server refuses the field); released wsmp never sends it.
+       * Which shell ran it and how.
        */
       ranWith: nodeCommandRanWithSchema.optional(),
     })
@@ -1380,19 +1368,6 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
        * missing definitions yet. `none`: the node is Relay only, or nothing differs.
        */
       definitionSync: z.enum(["expect", "none"]),
-      /**
-       * Optional node frame fields this server accepts. A node sends one only when it is
-       * here (wsmp 0.4.3 ignores this field; an older server leaves it out).
-       */
-      features: z
-        .object({
-          /** `exec.started` may carry `ranWith`. */
-          execRanWith: z.literal(true).optional(),
-          /** A `version_mismatch` refusal in `agent.update.progress` may carry `availableVersion`. */
-          agentUpdateAvailableVersion: z.literal(true).optional(),
-        })
-        .strict()
-        .optional(),
     })
     .strict(),
   z
@@ -1631,7 +1606,7 @@ export const nodeToServerBinaryMetadataSchema = z.discriminatedUnion("type", [
   fileDataMetadataSchema,
 ]);
 
-/** Every control frame type of 3.0, by direction (the fixture test checks coverage). */
+/** Every control frame type of 4.0, by direction (the fixture test checks coverage). */
 export const NODE_TO_SERVER_CONTROL_TYPES: readonly NodeToServerControlFrame["type"][] = [
   ...new Set(nodeToServerControlFrameSchema.options.map((option) => option.shape.type.value)),
 ];

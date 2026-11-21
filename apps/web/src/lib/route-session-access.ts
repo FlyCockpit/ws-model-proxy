@@ -65,7 +65,7 @@ export function failedRouteSessionResolution(): RouteSessionResolution {
  *
  * Checks only "is there a session" — NOT `emailVerified`. Verification gates
  * privilege escalation (admin), not basic use — matching the server
- * (`protectedProcedure` has no verification check; admin gates do).
+ * (`session` contract access has no verification check; admin gates do).
  */
 export function decideProtectedRouteAccess(
   resolution: RouteSessionResolution,

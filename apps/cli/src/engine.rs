@@ -428,6 +428,11 @@ pub struct PromSample {
 /// Comments and malformed lines are skipped. At most
 /// `PROMETHEUS_SAMPLE_LIMIT` samples are kept.
 pub fn parse_prometheus(body: &str) -> Vec<PromSample> {
+    parse_prometheus_filtered(body, |_| true)
+}
+
+/// Apply the sample budget only to wanted metrics, before allocating labels.
+fn parse_prometheus_filtered(body: &str, keep: impl Fn(&str) -> bool) -> Vec<PromSample> {
     let mut samples = Vec::new();
     for line in body.lines() {
         if samples.len() >= PROMETHEUS_SAMPLE_LIMIT {
@@ -437,11 +442,40 @@ pub fn parse_prometheus(body: &str) -> Vec<PromSample> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some(sample) = parse_prometheus_line(line) {
+        let name = line
+            .split(|c: char| c == '{' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        // Reject irrelevant names before label parsing or any sample allocation.
+        if keep(name)
+            && let Some(sample) = parse_prometheus_line(line)
+        {
             samples.push(sample);
         }
     }
     samples
+}
+
+fn relevant_prometheus_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "process_start_time_seconds"
+            | "vllm:cache_config_info"
+            | "vllm:num_requests_running"
+            | "vllm:num_requests_waiting"
+            | "vllm:kv_cache_usage_perc"
+            | "vllm:gpu_cache_usage_perc"
+            | "vllm:prefix_cache_hits_total"
+            | "vllm:prefix_cache_hits"
+            | "vllm:prefix_cache_queries_total"
+            | "vllm:prefix_cache_queries"
+            | "sglang:num_running_reqs"
+            | "sglang:num_queue_reqs"
+            | "sglang:token_usage"
+            | "llamacpp:requests_processing"
+            | "llamacpp:requests_deferred"
+            | "llamacpp:kv_cache_usage_ratio"
+    )
 }
 
 fn parse_prometheus_line(line: &str) -> Option<PromSample> {
@@ -695,7 +729,7 @@ pub fn sample_load(
     let metrics = |limit| {
         fetch_route(agent, endpoint, "metrics", limit)
             .ok()
-            .map(|body| parse_prometheus(&body))
+            .map(|body| parse_prometheus_filtered(&body, relevant_prometheus_metric))
     };
     match kind {
         EngineKind::Vllm => metrics(METRICS_BODY_LIMIT).and_then(|samples| vllm_load(&samples)),
@@ -960,6 +994,64 @@ mod tests {
         assert_eq!(samples[0].value, 3.5);
         assert_eq!(samples[1].name, "bar");
         assert!(samples[2].value.is_infinite());
+    }
+
+    #[test]
+    fn engine_detection_still_recognizes_metrics_outside_the_load_allowlist() {
+        let detected = detect_with(
+            None,
+            &[],
+            fixture_fetch(&[("metrics", "vllm:request_latency_bucket{le=\"1\"} 1\n")]),
+        );
+        assert_eq!(detected.kind, Some(EngineKind::Vllm));
+        let detected = detect_with(
+            None,
+            &[],
+            fixture_fetch(&[("metrics", "sglang:request_latency_bucket{le=\"1\"} 1\n")]),
+        );
+        assert_eq!(detected.kind, Some(EngineKind::Sglang));
+    }
+
+    #[test]
+    fn irrelevant_histograms_do_not_exhaust_the_prometheus_sample_budget() {
+        let mut body = "request_latency_bucket{le=\"1\",model=\"unused\"} 1\n"
+            .repeat(PROMETHEUS_SAMPLE_LIMIT + 1);
+        body.push_str("vllm:num_requests_running 3\nvllm:num_requests_waiting 2\n");
+        let samples = parse_prometheus_filtered(&body, relevant_prometheus_metric);
+        assert_eq!(samples.len(), 2);
+        let load = vllm_load(&samples).expect("load after histogram");
+        assert_eq!(load.running, 3);
+        assert_eq!(load.waiting, Some(2));
+        let Some((base_url, server)) = serve_once(body.into_bytes(), None) else {
+            return;
+        };
+        let endpoint = EndpointConfig {
+            slug: "load".into(),
+            base_url,
+            ..EndpointConfig::default()
+        };
+        let load = sample_load(&http_agent(LOAD_TIMEOUT), &endpoint, EngineKind::Vllm);
+        server.join().expect("metrics server");
+        let load = load.expect("live gauge after histogram");
+        assert_eq!(load.running, 3);
+        assert_eq!(load.waiting, Some(2));
+    }
+
+    #[test]
+    fn prometheus_sample_cap_still_bounds_relevant_samples() {
+        let body = "vllm:num_requests_running{model=\"m\"} 1\n".repeat(PROMETHEUS_SAMPLE_LIMIT + 1);
+        assert_eq!(
+            parse_prometheus_filtered(&body, relevant_prometheus_metric).len(),
+            PROMETHEUS_SAMPLE_LIMIT
+        );
+        // Similar prefixes and malformed irrelevant label maps are never retained.
+        assert!(
+            parse_prometheus_filtered(
+                "vllm:num_requests_running_total{bad} 9\nother 4\n",
+                relevant_prometheus_metric
+            )
+            .is_empty()
+        );
     }
 
     #[test]

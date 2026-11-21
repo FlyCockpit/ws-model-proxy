@@ -2,9 +2,10 @@
 
 WS Model Proxy exposes its operations to MCP (Model Context Protocol) clients as
 an OAuth-protected resource at `/mcp`. The surface is on by default.
-`WMP_MCP_ENABLED` is the kill switch (`false` closes it). Everything else — the
-canonical URL, protocol profile, scopes, token lifetimes, and registration
-policy — is derived from configuration in code, not operator tuning.
+`WMP_MCP_ENABLED` is the kill switch (`false` closes it). The canonical URL,
+protocol profile, OAuth token lifetimes and registration policy are defined in
+code. Agent token expiry has a configurable maximum (see
+[Agent tokens and connections](#agent-tokens-and-connections)).
 
 The tool catalog (all 28 tools, their procedures, confirmation literals and rate
 limits, and every procedure kept off MCP with its reason) is the generated,
@@ -19,29 +20,35 @@ point to, and the server behavior around the tools.
 Agents work with the user's nouns: nodes, runtimes, pools, profiles, providers,
 requests and metrics.
 
-- **Levels.** A credential is Read-only (`READ`) or Full (`FULL`). READ
-  credentials see the 7 read tools (`*_get`, `requests_list`, `metrics_query`);
-  FULL credentials see all 28. A FULL tool called with a READ credential answers
-  exactly like an unknown tool. Even Full cannot touch sharing, API keys,
-  agent tokens, provider accounts, enrollment, hold lines or node trust; those
-  stay with people. An agent token's level is chosen when it is created; an
-  OAuth connection's level is chosen by the person on the consent page and can
-  be changed in Access → Agents (see [Scopes](#scopes)).
+- **Scopes.** Every credential includes `read`, which exposes 7 read tools.
+  Six optional scopes add the other tools; all seven together expose all 28. A tool
+  outside the credential's scopes is absent from `tools/list` and answers
+  exactly like an unknown tool when called. Even with every scope, agents
+  cannot change sharing, API keys, agent tokens, provider accounts, enrollment,
+  hold lines or node trust; those stay with people. A person chooses scopes
+  and allowed nodes at creation or consent and can edit both in Access → Agents
+  (see [Scopes](#scopes)).
+- **Owned nodes only.** Agents act only on their own user's nodes, within the
+  credential's node allowlist. A shared pool or runtime definition never grants
+  access to another user's nodes. This also applies to runtime placement,
+  profiles and model tests.
 - **Node trust.** Commands, files, secrets, metric commands and definition
   changes need a node at Full control. A Relay-only node relays inference for
   the definitions it held when it entered Relay only; agents cannot start,
-  stop or change anything there. Lowering only stops new agent access through
-  wsmp: software an agent already left on the node at Full control (a systemd
-  user service, say) keeps running as the same user and can even raise trust
-  locally. If you distrust what an agent did, reinstall the node.
+  stop or change anything there. Trust and credential scopes are independent.
+  Lowering trust or narrowing credential access does not remove software an
+  agent already left on the node at Full control (a systemd user service, say).
+  Host access has the daemon account's permissions, including access to its
+  credentials and settings. If you distrust what an agent did, reinstall the node.
 - **Notes.** Most writes take an optional `note` (1–500 characters);
   `node_command_queue_for_user` requires one, and the deletes,
   `runtime_start`, `runtime_stop` (except with `markStopped`), `profile_apply` and
   `model_test` take none.
   Say what you are trying; people see it beside the change (runtime version
   history, node activity, command log, queued commands).
-- **Deleting nodes.** `node_delete` removes an offline node only (refused with
-  `node_online` while it is connected, with no override); its always-on
+- **Deleting nodes.** `node_delete` removes a node that is not live: offline, or
+  still marked online after its heartbeat went stale (refused with `node_online`
+  while it is connected and heartbeating, with no override); its always-on
   runtimes go and instances with a part there stop. It is audited with the
   node's slug and id. People delete any node in the browser.
 - **Confirmation.** Deletes take `confirm: "DELETE"`, `node_command_run`
@@ -55,8 +62,8 @@ requests and metrics.
 
 `node_command_run` is for one-off work: downloads while experimenting, builds,
 diagnostics, benchmarks. It answers within about 15 seconds with the command's
-state; poll `node_command_get` (`waitMs` waits up to 30 s, `cancel` stops the
-command and everything it started). A command lives at most its timeout
+state; poll `node_command_get` (`waitMs` waits up to 30 s, `cancel` requests
+command cleanup). A command lives at most its timeout
 (default 1 hour) and never longer than the node's command lifetime (1 minute to
 24 hours). Each poll returns at most a 64 KiB output tail.
 
@@ -91,13 +98,31 @@ command and everything it started). A command lives at most its timeout
 
 A shell the node does not report is refused with `shell_unavailable`. A command
 the node could not start (its program missing, an argument cmd cannot be given)
-is refused as a bad request saying so. A node
-whose wsmp predates argv commands and `shell` refuses them (`upgrade_wsmp`);
+is refused as a bad request saying so. An unusable working directory is refused
+with `bad_cwd` (`BAD_REQUEST`), not `node_offline`: use an absolute path or a
+path beginning with `~` that resolves to an existing directory whose metadata
+the node can access. The daemon account's home directory must also be available,
+even with an explicit `cwd`. A later failure to start the process is
+`spawn_failed`. A node whose wsmp predates argv commands and `shell` refuses
+them (`upgrade_wsmp`);
 plain text without `shell` still works there.
 
+Agent host access (commands and files) lets the agent do whatever the wsmp
+daemon's OS user can do, including reading that account's node credential and
+identity key, editing wsmp's settings, and starting processes that survive
+cancellation. It is off until a person enables Full control at the node. Full
+control can only be raised locally; a person can lower it from the dashboard
+at any time. File tools' forbidden paths and output masking are guard rails,
+not a sandbox. No isolation mode exists.
+
+On Unix, cleanup kills the command's process group. Detached processes and user
+services can survive cancellation, timeout, trust lowering or credential
+narrowing. Browser terminals and queued commands run by a person have that
+account's host access too.
+
 Anything that should keep running or serve traffic must be a runtime. A server
-started with a command is invisible to the proxy and dies with the command. When
-a step needs a person (for example a `sudo` password), queue it with
+started with a command is invisible to the proxy and is subject to command
+cleanup. When a step needs a person (for example a `sudo` password), queue it with
 `node_command_queue_for_user`; it runs only when they press Run and Enter in
 Terminals. Poll its `id` with `node_command_get` as well: the answer has
 `queuedForUser: true` and the queued state (`QUEUED`, `RUN`, `DISMISSED`,
@@ -106,8 +131,9 @@ in their terminal.
 
 - **Expiry.** A queued command expires `expiresInHours` after it was queued
   (default 24, at most 168). Past that it reads as `EXPIRED` at once, and the
-  hourly retention sweep stores `EXPIRED`. Revoking or lowering the agent
-  credential that queued it expires it too. Decided commands (run, dismissed,
+  hourly retention sweep stores `EXPIRED`. Revoking the credential that queued
+  it expires it too. Narrowing expires it when the credential loses `commands`
+  or access to that node (`credential_lowered`). Decided commands (run, dismissed,
   expired, refused or withdrawn) are deleted 7 days later; the node audit keeps
   the command's digest for 90 days.
 - **Withdraw.** `node_command_get` with `cancel: true` withdraws a command that
@@ -241,7 +267,7 @@ acceptance then (its timeout counted from when the screen came up), so the
 run is never lost from Needs you.
 
 A node inventory that cannot be dated against the run's launch (a missing
-record, or a record from a node older than 0.4.0 without a step id) no longer
+record) no longer
 counts as a crash by itself: it makes a health probe due now, and the health
 thresholds decide (`failureThreshold` failed probes make it UNHEALTHY, and
 `unhealthyRestartMs` later it is stopped and restarted). A probe nobody answers
@@ -397,9 +423,7 @@ A spec has exactly one of:
     `WSMP_RESERVATION_<index>_NODE_ID` and, when placement gave it GPUs there,
     `WSMP_RESERVATION_<index>_GPUS` (indices such as `0,3`, the format the
     rank's own `CUDA_VISIBLE_DEVICES` gets); a stop of an earlier run gets the
-    nodes (and GPUs) that run got. A runtime with reservations needs a current `wsmp` on its
-    node: an older one cannot be told, so the start fails with `phaseReason`
-    `cli_upgrade_required` (upgrade `wsmp` there and start again). Agents may
+    nodes (and GPUs) that run got. Every 1.0 node supports reservation reporting. Agents may
     restart, stop, mark stopped or ask to release a runtime only while every
     node it holds, reservations included, is at Full control (`trust_relay`
     otherwise), and an agent's start fails `trust_relay` when a reservation's
@@ -545,6 +569,40 @@ and `pools_get` marks the alias `hides` and the share `hiddenByAlias`. Agents ma
 people-only. The model API accepts the key as `Authorization: Bearer`,
 `x-api-key` or `api-key`.
 
+### Node memory and placement
+
+Detected `memoryGb` uses the OS physical total (`memoryTotalMiB`), falling back to
+`unifiedMemoryMiB` only when no total was sent. `acceleratorMemoryGb` separately reports what
+the GPU can address. Browser/agent declarations still override node config, then detection,
+for each field. On AMD APUs, physical memory includes the BIOS VRAM carve-out; the GPU pool is
+carve-out + GTT (capped by TTM and physical RAM). Defaults often limit that pool to about half
+of RAM. Apple uses OS RAM and its separate wired GPU limit; GB10's pool equals OS RAM.
+
+`usableMemoryGb` subtracts reserved RAM, unified GPUs' reserved VRAM, and 2 GiB OS headroom on
+unified nodes. GPU-side memory means both VRAM claims on unified GPUs and `unified`-kind model
+entries (`memoryGb`). They consume both usable RAM and the node's shared accelerator budget:
+effective `acceleratorMemoryGb` minus unified GPUs' reserved VRAM, across all unified GPUs
+together. OS headroom is charged only to RAM. Unknown accelerator memory adds no extra cap.
+CPU entries (`ramGb`) and a discrete entry's `ramGb` consume RAM only.
+
+On detected AMD APUs, RAM-only claims cannot use the BIOS VRAM carve-out. With physical memory
+P, carve-out C, headroom H, GPU-side usage G and RAM-only usage R, placement requires G <= A,
+R + G <= P - H, and R <= P - C - H, before the corresponding reservations are deducted.
+GPU memory uses the carve-out first, then GTT system RAM. A declared `memoryGb` is an operator
+budget, so no carve-out is inferred from detection for that total. Apple's RAM figure shows
+physical memory while its wired limit still caps GPU-side memory. On a unified node
+GPU-side memory is capped by the effective `acceleratorMemoryGb`, not by a declared `memoryGb`
+(declare `acceleratorMemoryGb` to change it); one declared earlier is now a real cap; review
+old workarounds. Reservations and restart growth obey every pool, with old/new claims
+overlapping independently in each. Previews, runtime starts and profile applies share these
+rules. Refusals reuse `not_enough_memory` and name only the additional limits that failed.
+
+Use `wsmp hardware` to inspect the separate totals and detection notes. To increase AMD's
+GPU-addressable pool, raise `ttm.pages_limit` / `ttm.page_pool_size` kernel parameters (4 KiB
+pages on these machines) and reboot; `amdgpu.gttsize` is deprecated on recent kernels. See the
+[CLI hardware guidance](../apps/cli/README.md#run-the-relay) for units, an example and kernel
+version caveats. Live `MemAvailable` is a warning signal, not either placement limit.
+
 ### Node metric commands
 
 `node_update` takes `metricCommands`: at most 16 entries (32 KiB together) of
@@ -556,8 +614,7 @@ an argv when it is one program (`["nvidia-smi", "--query-gpu=power.draw",
 "--format=csv,noheader,nounits"]`): on Windows every PowerShell run costs a few
 hundred milliseconds of CPU, where an `.exe` starts at once. Name
 `shell: "cmd"` for Command Prompt text. A shell the node does not report is
-refused (`shell_unavailable`); the node must run this release's wsmp for
-`shell` or an argv, even `shell: "sh"` (older: `upgrade_wsmp`).
+refused (`shell_unavailable`).
 `format` is `lines` (`<metric> <value>` per line), `json` or `prometheus`.
 Without `map`, `json` reads a top-level number and `prometheus` the first sample,
 recorded as `name`. `map` names up to 16 metrics, each `{ series, labels?,
@@ -589,6 +646,13 @@ a bench by `source`. A test of a runtime
 pool's callable ID to exercise the pool. Rollups are written with each
 request's completion, so a finished test shows up at once.
 
+`model_test` needs `models:test`. A pool shared with the user can be tested only
+when all candidate node placements belong to that user and are allowed by the
+credential. If any candidate uses another user's node or a disallowed node, the
+whole target is refused like an unknown target; the agent cannot use a shared
+pool to reach someone else's hardware. This includes every distributed rank.
+Benches still require an owned pool or runtime; `:external` tests are refused.
+
 ### Node files
 
 `node_file_read` reads, stats, lists or searches under the folders the node
@@ -598,8 +662,10 @@ files; pass the etag you read as `ifMatch` so a file that changed since is
 refused instead of overwritten. The node enforces its own roots and refuses
 secret files.
 
-- **Who.** A Full agent token on the caller's own node at Full control.
-  People signed in to the web app use a browser terminal instead.
+- **Who.** An agent token or OAuth connection with `files`, on its own user's
+  allowed node at Full control. Even file reads require `files`; `read` alone
+  does not expose file tools. People signed in to the web app use a browser
+  terminal instead.
 - **Paths.** Absolute paths under the node's file roots only: `~` and relative
   paths are refused, not expanded. `nodes_get` lists the roots under
   `features.files.roots` and where they come from under `features.files.source`:
@@ -613,8 +679,8 @@ secret files.
   change wsmp itself: `login`, `trust full`, `secret`, `logout`, `run`,
   `terminal approve`, `recover --apply` and `service
   install|uninstall|env-sync`) refuses to run from a command, job or terminal
-  wsmp started. Do not try to widen them through `node_command_run`; ask the
-  person.
+  wsmp started. These subcommand guards do not prevent a standard shell command
+  from editing files as the daemon account. Ask the person to change roots.
 - **Reads paginate.** A read returns at most 400 lines and 32 KiB at a time
   (`limit` up to 2,000 lines), never `too_large` for files up to 64 MiB. When the file goes on, the
   result has `more: {startLine, byteOffset?}`: call again with
@@ -631,8 +697,9 @@ secret files.
   An `outcome: "unknown"` means the change may or may not have happened: stat
   the path before retrying.
 - **Audit.** Every operation writes a node activity row with the path, size,
-  outcome and credential, never the content. Revoking the token or banning the
-  owner cancels operations in flight.
+  outcome and credential, never the content. Revoking the credential or banning
+  the owner cancels operations in flight. Removing `files` or access to the
+  operation's node cancels it too.
 
 ### Results and errors
 
@@ -715,9 +782,9 @@ The generated `.env.example` files track these keys
 
 The MCP surface uses the Better Auth OAuth/JWKS tables plus the
 application-owned `McpGrant` table. Those models are in the Prisma schema
-whether or not the kill switch is off. Apply them with the repository's safe
-schema workflow (`pnpm db:push` locally; `APPLY_SCHEMA=safe` for additive
-deploys) before first use.
+whether or not the kill switch is off. The committed migrations create them:
+`pnpm db:migrate:apply` locally, and the server applies pending migrations on
+start in a deployment (`MIGRATE_ON_START`, [schema-migrations](./schema-migrations.md)).
 
 ### Flag-off behavior (emergency kill switch)
 
@@ -787,11 +854,24 @@ Two registration paths are enabled (CIMD = **Client ID Metadata Document**):
   public clients (`clientRegistrationRequirePKCE`), registration scope
   ceilings still cap what a registered client may declare, and user-facing
   OAuth client/resource CRUD is denied entirely.
-- Registration scope ceiling: the ceiling is `mcp:read mcp:write
-  offline_access`, and the provider persists that FULL set as the client's
-  registered capabilities even when the registration request omits `scope`.
-  Registered capabilities are not authorization: every requested scope is
-  still validated and consented to at authorize time.
+- Registration scope ceiling: `mcp:read`, the six fine scopes listed below
+  and `offline_access`. DCR registers exactly the requested scopes, without
+  expanding them; an absent, empty or whitespace-only `scope` registers the
+  whole ceiling, so a client that follows the `/mcp` challenge reaches consent.
+  CIMD registration uses the complete ceiling. Registered capabilities are not
+  authorization: scopes still require validation and consent at authorize time.
+- DCR narrowing is not atomic. Better Auth 1.7.18 stores a new DCR client with
+  the whole ceiling and only then lets wsmp narrow it to the requested scopes.
+  If that update fails, wsmp deletes the client and its resource links and
+  answers HTTP 500 without a `client_id` or secret. A crash between the two
+  writes, or a failed update whose client deletion fails too (the deletion is
+  best effort), leaves a client with the whole ceiling behind. Its `client_id` (32 random letters) and secret were
+  never returned. Using it would still need a person's consent, which shows
+  the scopes requested at authorize, and PKCE. It has no owner, consent or
+  tokens, so the cleanup sweep deletes it 24 hours after creation (see
+  [Retention and cleanup](#retention-and-cleanup)). This window is accepted
+  until Better Auth offers a way to store the requested scopes in its own
+  write.
 - Grant types are limited to `authorization_code` and `refresh_token`.
   `client_credentials` is never enabled (tools are user-bound).
 
@@ -825,66 +905,128 @@ separate policy change.
 
 ## Scopes
 
-Three scopes exist: `mcp:read`, `mcp:write`, and `offline_access`.
+Agent tokens and OAuth grants share seven agent scopes. `read` is required;
+requests to create or edit access without it are refused.
 
-- `/mcp` accepts `mcp:read` **or** `mcp:write` (`mcp:write` semantically
-  includes read).
-- An unauthenticated `/mcp` request gets a `WWW-Authenticate` challenge with
-  `scope="mcp:read mcp:write"`, the same scopes as `scopes_supported` in
-  `/.well-known/oauth-protected-resource`, so a client asks for both and the
-  consent page can offer Full. Read-only stays the consent default.
-- Write tools need a FULL request level, which for OAuth requires the literal
-  `mcp:write` (below). Scope matching is exact-token: padded or case-variant
-  tokens never match.
-- At the authorization endpoint, a missing or blank `scope` is rejected locally
-  with a non-redirecting OAuth `invalid_scope` error; the requested `resource`
-  set must contain the canonical `/mcp` URL or the request is rejected locally
-  with `invalid_target`. Neither check ever uses or redirects to a
-  caller-supplied redirect URI. Every present, well-formed request is forwarded
-  to Better Auth unchanged for client/redirect validation.
+| Agent scope | Tools |
+| --- | --- |
+| `read` | `nodes_get`, `runtimes_get`, `pools_get`, `profiles_get`, `providers_get`, `requests_list`, `metrics_query` |
+| `pools` | `pool_create`, `pool_update`, `pool_delete` |
+| `runtimes` | `runtime_create`, `runtime_update`, `runtime_delete`, `runtime_start`, `runtime_stop`, `profile_save`, `profile_apply`, `profile_delete` |
+| `nodes:manage` | `node_update`, `node_delete`, `node_secret_set` |
+| `commands` | `node_command_run`, `node_command_get`, `node_command_queue_for_user` |
+| `files` | `node_file_read`, `node_file_write`, `node_file_edit` |
+| `models:test` | `model_test` |
 
-An OAuth request's level is FULL only when its grant is Full and the access
-token carries `mcp:write`; otherwise it is READ. A client can therefore ask for
-less than the person allowed (omit `mcp:write`), never for more. The grant's
-level is the person's choice:
+### Allowed nodes
 
-- **Consent page.** When the client asks for `mcp:write`, the page offers
-  Read-only or Full, starting at Read-only (the agent token dialog's default)
-  and explaining Full in the dialog's words. A request without `mcp:write` is
-  approved Read-only and the page says so. The choice travels as the `level`
-  field of the person's `POST /api/auth/oauth2/consent` body (a cookie session
-  behind Better Auth's origin check, pinned by the signed `oauth_query`); a
-  missing `level` means Read-only. No authorize parameter, scope or signed-query
-  value is ever read as a level, so a client cannot pick Full. `FULL` without
-  `mcp:write` among the approved scopes, or any other value, is refused (400)
-  before a code is issued. When the approval issues a code, the level is
-  recorded on the exact grant generation the code exchanges into before the
-  response reaches the browser; if it cannot be recorded, the code is withheld
-  (500) and the remembered approval is forgotten, so the next authorize asks
-  again. A concurrent change to the same grant is retried on the fresh row.
-- **Access → Agents.** A person changes a connection between Read-only and
-  Full (`access.oauthGrants.setLevel`, a human procedure: cookie session with a
-  verified CSRF header; agents and agent tokens are refused). Raising asks for
-  confirmation, showing what Full allows. Full is offered (and accepted) only
-  for a connection whose remembered approval includes `mcp:write`
-  (`fullAvailable` in the list); otherwise the page says the agent must
-  reconnect asking for `mcp:write`.
+`nodeIds: null` means every node the credential's user owns, now and in the
+future. A list allows only those owned nodes; `[]` allows no nodes. Selecting
+another user's node is refused. A shared pool or runtime definition never
+changes node ownership or extends this list.
 
-Lowering to Read-only (in Access → Agents, or by choosing Read-only when the
-person approves the client again) takes effect at once: the next `/mcp`
-request and every node admission read the grant and see READ; the grant's
-in-flight write tool calls are aborted (read calls finish), and so is a write
-call whose request read the level just before the lowering; its running node
-commands and file ops are cancelled and the commands it queued for a person
-expire (`credential_lowered`). Nothing caches a grant's level, so there is no
-cached admission to drop. Runtime operations the grant already started (start,
-stop, restart) are not undone, as with a revocation. Raising takes effect on
-the next call. Every level
-write is audited (`audit_event`, actor USER, resource `mcp_grant`:
-`mcp_grant.consent` for the consent page, `mcp_grant.level` for Access →
-Agents, with the level before and after).
+The allowlist applies to node details and changes, commands, files, secrets,
+metrics, request logs, pool member changes and contributions, runtime placement
+and lifecycle actions, and profile changes. A direct lookup outside it answers
+like an unknown node or target. Automatic placement
+considers only allowed, owned nodes. A runtime or profile action that requires
+a disallowed node is refused, including a restart involving that node.
+`nodes_get` lists only allowed nodes; runtime instance rows, profile node rows,
+pool `runsOn` entries for your own nodes, and node metric groups are filtered.
+`requests_list` omits requests served on your own disallowed nodes, or by a
+hidden instance (below) on any node, including when filtering by runtime or
+version; an explicit disallowed or unknown node filter with a restricted
+allowlist answers not found. Requests served on other people's nodes remain,
+with the existing placement redaction for their pools, and so do requests that
+never reached a node or instance. Pool `runsOn` entries for other people's nodes
+also remain.
 
-An agent token's level is the one it was created with.
+Counts and traffic exclude your own disallowed nodes. A **hidden instance** is
+one whose runtime is bound to such a node or that has any rank or reservation
+on one; it is hidden as a whole, by the same rule everywhere. It is excluded
+from runtime summaries, pool member counts, status, health and load, profile
+running counts, and allowed-node instance and held resource counts. Pool
+`traffic24h` (requests, errors and sparkline), member p95 latency and traffic
+shares, request metrics and engine load in `metrics_query`, and `requests_list`
+exclude requests served on those nodes and requests a hidden instance served,
+even when its head on an allowed node served them. The shares of the visible
+members still add up to 1. A row that names no instance, or one whose runtime
+has since been deleted, is judged by its node only. An instance is judged by
+the ranks, reservations and binding it has now: after a restart moves its last
+reservation off a disallowed node and the replaced reservation rows are gone,
+traffic it served on an allowed node earlier counts as visible again. Fabric peer counts exclude
+those nodes too. Desired counts, configured limits and sharing counts remain
+configuration or account metadata. People and agents with `nodeIds: null` keep the full view;
+other owners' hardware keeps its existing visibility and redaction rules.
+
+Adding, contributing, changing or removing a member backed by your own runtime,
+withdrawing that contribution, or setting model capabilities is refused if the
+runtime is bound to or running on a disallowed node. Dropping a member during
+`pool_update` and deleting a pool that still contains such a member are refused
+too, as not found. Deleting a runtime also requires its nodes to be allowed.
+A pool owner can still remove another person's contribution under the existing
+pool permissions.
+
+### OAuth scopes
+
+- `mcp:read` is the required baseline for `/mcp` admission.
+- Fine scopes add their matching permissions: `mcp:pools`, `mcp:runtimes`,
+  `mcp:nodes:manage`, `mcp:commands`, `mcp:files`, `mcp:models:test`.
+- `offline_access` permits background renewal, not additional tools.
+
+An OAuth request uses the intersection of the grant's current agent scopes
+and the access token's OAuth scopes. The grant supplies the node allowlist.
+A token cannot exceed the person's grant, and a grant edit cannot make a token
+exceed its OAuth scopes.
+
+The unauthenticated `/mcp` challenge's `scope` and protected-resource metadata's
+`scopes_supported` list `mcp:read` plus all six fine scopes. The issuer's
+`scopes_supported` also includes `offline_access`. Scope names are case-sensitive.
+
+The removed `mcp:write` scope is refused with HTTP 400 `invalid_scope` at
+authorize (GET or POST), token requests and dynamic client registration;
+CIMD metadata naming it is refused too. Request `mcp:read` plus the fine scopes
+you need. See [Upgrading](../UPGRADING.md#agent-access) for stored-scope conversion
+and the one-time refresh of pre-upgrade access tokens.
+
+At the authorization endpoint, a missing or blank `scope` is rejected locally
+with a non-redirecting OAuth `invalid_scope` error. For a missing `scope`,
+Better Auth 1.7.18 would otherwise request every scope stored on the client
+(better-auth#12194), which for a client registered without `scope` is the whole
+ceiling; refusing a blank one is wsmp's own rule. The server refuses it before Better Auth sees it, and the provider's
+scope policy refuses it again for any internal dispatch, including a resumed
+sign-in or consent whose signed request has no scope. A request naming some
+scopes gets at most those: consent and refresh can only narrow them, and a code
+exchange ignores a `scope` parameter. The removed scope gets the
+same local response, with guidance listing the supported fine scopes. The
+requested `resource` set must contain the canonical `/mcp` URL or the request
+is rejected locally with `invalid_target`. Neither check uses or redirects to
+a caller-supplied redirect URI. Other well-formed requests are forwarded to
+Better Auth for client/redirect validation.
+
+### Consent and editing
+
+- **Consent page.** The person chooses permissions within the approved OAuth
+  ceiling and all owned nodes or a selected list. Read is fixed; the default
+  is read only and all owned nodes. The choice travels as `scopes` (agent wire
+  names) and `nodeIds` in `POST /api/auth/oauth2/consent`, with `accept` and the
+  signed `oauth_query`, behind the cookie session and origin check. Absent
+  fields default to `["read"]` and `null`. Unknown scopes, a set without
+  `read`, scopes above the OAuth ceiling and unowned nodes are refused before
+  a code is issued. Client URL parameters cannot choose these permissions.
+  The choice is recorded on the exact grant generation before the response
+  reaches the browser. If recording fails, the code is withheld (500) and the
+  remembered approval is forgotten, so the next authorize asks again.
+  Concurrent grant changes are retried against the fresh row.
+- **Access → Agents.** A person can edit scopes and allowed nodes for both
+  OAuth connections (`access.oauthGrants.setAccess`) and agent tokens
+  (`access.agentTokens.setAccess`). These are human procedures requiring a
+  cookie session and verified CSRF header. OAuth choices are limited to
+  `availableScopes`, derived from that connection generation's remembered
+  approval; reconnect requesting additional OAuth scopes to expand that ceiling.
+  The editor warns before saving a narrower scope set or node allowlist.
+  Broader access applies on the next request. See
+  [Grants and revocation](#grants-and-revocation) for narrowing and cancellation.
 
 ## Login, consent, and scope step-up
 
@@ -899,19 +1041,18 @@ The authorization flow uses Better Auth's signed OAuth transaction
   signed query) and signing in again creates a new session-derived grant
   generation that requires fresh consent.
 - `/{lang}/mcp-consent` — the consent page. It shows the requesting client,
-  the requested scopes and the access level (Read-only or Full, see
-  [Scopes](#scopes)), with Authorize and Deny. The level is part of what the
-  person approves. First use always prompts;
-  expanded scopes (for example stepping up from `mcp:read` to `mcp:write`)
-  prompt again for the full requested set, and the level chosen on that prompt
-  replaces the grant's level. A remembered consent is reused only when the
-  client, the user, the session-derived reference, the requested scopes
+  the requested OAuth scopes, permission choices and allowed nodes (see
+  [Scopes](#scopes)), with Authorize and Deny. First use always prompts;
+  expanded OAuth scopes (for example adding `mcp:commands` to `mcp:read`)
+  prompt again for the full requested set, and the chosen permissions and
+  nodes replace the grant's access. A remembered consent is reused only when
+  the client, the user, the session-derived reference, the requested scopes
   (every requested scope must be inside the remembered set), and the requested
   resources all match the stored consent row — and an explicit `prompt=consent`
-  overrides reuse and forces the page (whose choice again replaces the level).
-  A reused consent never changes the level: re-authorization keeps the level
-  the person last chose on the page or in Access → Agents. Denial is honored: the consent endpoint
-  answers HTTP 200 `{redirect: true, url}` pointing at the validated callback
+  overrides reuse and forces the page (whose choice again replaces access).
+  A reused consent never changes access: re-authorization keeps the permissions
+  and nodes the person last chose on the page or in Access → Agents. Denial is
+  honored: the consent endpoint answers HTTP 200 `{redirect: true, url}` pointing at the validated callback
   with `error=access_denied` — no code and no grant are minted. The page
   explains `offline_access` (background renewal, 72-hour inactivity expiry,
   revocable in Access → Agents). Remote client logos are never
@@ -942,18 +1083,46 @@ flag is off.
 Every OAuth access JWT carries a private `mcp_grant_id` claim bound to an
 application-owned `McpGrant` generation keyed by
 `(userId, clientId, referenceId)`, where the reference is an HMAC of the
-consenting session and the validated client. Each grant records a level
-(the person's choice on the consent page, created when the approval issues its
-code; Read-only for a grant created without the page). On every `/mcp` request
-the exact grant is loaded and must be active:
+consenting session and the validated client. Each grant stores agent scopes
+and the node allowlist (the person's consent choice, created when approval
+issues its code; `read` and all owned nodes by default). Each agent token also
+has its own grant, which stores its access. Every `/mcp` request loads the live
+grant; OAuth access is intersected with the token's scope ceiling.
+
+**Narrowing** means removing any scope, switching from all nodes to a list, or
+removing a node from a list. Saving a narrower choice, including at renewed
+consent, takes effect after the transaction commits:
+
+- Every in-flight MCP tool call of the credential is aborted, including reads.
+  A call that read access just before narrowing is aborted on registration too.
+- Running node commands are cancelled when `commands` or their node is no
+  longer allowed. File operations are cancelled when `files` or their node is
+  no longer allowed. Other command and file work keeps its authorization.
+- Pending commands queued for a person on newly disallowed nodes expire
+  (`credential_lowered`); removing `commands` expires all of that credential's
+  queued commands. Pending claim release requests are cleared when `runtimes`
+  or their node is no longer allowed.
+- Live scope and node checks also guard work starting during a narrowing race.
+  Runtime operations already started (start, stop, restart) are not undone.
+  Browser terminals belong to people, not agent credentials.
+
+Access changes are audited in `audit_event`, actor USER, resource `mcp_grant`:
+`mcp_grant.consent` for consent and `mcp_grant.access` for Access → Agents,
+with the scopes and node list before and after. Cancellation cannot remove
+persistence installed by commands (see
+[Commands versus runtimes](#commands-versus-runtimes)).
+
+The grant must remain active:
 
 - **Disconnecting** a connection (Access → Agents, `access.oauthGrants.revoke`)
   tombstones the grant, marks the client's refresh and access token rows for
   that person revoked (rows are not deleted, so replay evidence survives until
   the retention cleanup), deletes the remembered consent so reconnecting asks
   again. It also aborts the grant's in-flight tool calls, cancels its running
-  node commands and expires the commands it queued for a person. Authorization
-  codes still pending are not swept; they expire within minutes.
+  node commands and file operations, expires the commands it queued for a
+  person, and clears pending claim release requests. Pending authorization
+  codes for that client and user are swept in a separate transaction; a
+  conflict asks the person to retry without undoing token revocation.
 - **Refresh** requires the exact grant generation to remain active. A revoked
   generation can never refresh again.
 - **Self-contained JWTs** cannot be deleted server-side. Their residual
@@ -971,22 +1140,39 @@ the exact grant is loaded and must be active:
 
 ## Agent tokens and connections
 
-Access → Agents shows the MCP URL, the OAuth connections (client name, redirect
-host, level) with a Read-only / Full control and a Disconnect action, and agent
-tokens.
+Access → Agents shows the MCP URL, OAuth connections (client name, redirect
+host, permissions and nodes) with Edit access and Disconnect actions, and agent
+tokens with Edit access and Revoke actions.
 
 An **agent token** (`wsmp_agent_…`) is for a headless client; send it as
 `Authorization: Bearer <token>` to `/mcp`. A person creates it in the browser
 (`access.agentTokens.create` is a human procedure, never an MCP tool), choosing
-Read-only or Full and an expiry. The secret is shown once; the server keeps a
-digest.
+scopes, allowed nodes and an expiry. The secret is shown once; the server keeps
+a digest. Editing access does not require replacing the secret.
 
-- The expiry is a timestamp strictly in the future and at most 365 days
-  (`MCP_PAT_MAX_TTL_DAYS`) ahead. `null` (no expiry) is accepted only while
-  `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY` is on (its default). The form proposes 90
-  days.
-- A person may hold at most 10 active tokens; revoke one before creating
-  another.
+- The expiry must be strictly in the future and at most
+  `WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS` ahead (default 90, integer 1–3650).
+  Existing tokens are unchanged by this setting. `null` (no expiry) is accepted
+  only while `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY` is on (its default).
+  The form defaults to the smaller of 90 days and the configured maximum. It
+  offers 7, 30 and 90 days within that maximum, the maximum itself, a custom
+  date, and No expiry when allowed.
+- Turning `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY` off also blocks every existing
+  no-expiry agent token, everywhere a token is accepted: `/mcp` answers 401
+  with `WWW-Authenticate: Bearer error="invalid_token",
+  error_description="mcp_pat_no_expiry_blocked"` and the same reason in the
+  JSON-RPC `error.data.reason` (a revoked token, revoked grant or blocked owner
+  still gets its usual refusal first); node commands and file work it
+  authorized are refused at their next admission check, and running commands
+  it started are ended by the command sweep. Commands it already queued for
+  you stay queued: you can still run or dismiss them yourself. Blocked tokens
+  are not revoked or deleted. **Access → Agents** shows them as **Blocked by
+  policy**, and turning the flag back on makes them work again. Dated tokens,
+  API keys and OAuth connections are unaffected. The flag is read at startup,
+  so a change takes a restart; during a rolling deploy, instances on the old
+  and new setting can briefly disagree.
+- A person may hold at most 10 active tokens (blocked no-expiry tokens
+  count); revoke one before creating another.
 - Revoking a token aborts its in-flight tool calls, cancels its running node
   commands and expires the commands it queued. Expired and revoked tokens fail
   at `/mcp` like unknown ones.
@@ -1094,9 +1280,9 @@ There are **two distinct metadata documents**, each served at two paths:
   `/.well-known/oauth-protected-resource` and
   `/.well-known/oauth-protected-resource/mcp`. Fields: `resource` (the
   canonical `/mcp` URL), `authorization_servers`, `bearer_methods_supported`,
-  `dpop_signing_alg_values_supported`, `scopes_supported` (`mcp:read
-  mcp:write` — `offline_access` is authorization-server-only and filtered out
-  here).
+  `dpop_signing_alg_values_supported`, `scopes_supported` (`mcp:read` plus
+  `mcp:pools`, `mcp:runtimes`, `mcp:nodes:manage`, `mcp:commands`, `mcp:files`,
+  `mcp:models:test`; `offline_access` is authorization-server-only).
 - **RFC 8414 authorization-server metadata** (the OAuth issuer):
   `/.well-known/oauth-authorization-server/api/auth` and
   `/api/auth/.well-known/oauth-authorization-server`. Fields: `issuer`,
@@ -1127,7 +1313,7 @@ public HTTPS.)
   "client_name": "My WMP agent",
   "redirect_uris": ["http://127.0.0.1:8765/callback"],
   "grant_types": ["authorization_code", "refresh_token"],
-  "scope": "mcp:read mcp:write offline_access",
+  "scope": "mcp:read mcp:pools mcp:runtimes mcp:nodes:manage mcp:commands mcp:files mcp:models:test offline_access",
   "dpop_bound_access_tokens": true
 }
 ```
@@ -1305,16 +1491,20 @@ Operator procedure, not a unit test. Run against a server that leaves
 3. Login with 2FA.
 4. Consent including `offline_access`.
 5. Read — a read tool succeeds.
-6. Read-only write denial / step-up — a connection approved Read-only lists
-   only the read tools and a write tool answers as unknown, even with
-   `mcp:write`. Raise it to Full in Access → Agents (or re-authorize with
-   `prompt=consent` and choose Full) and repeat the write; lower it again and
-   the next write answers as unknown.
-7. Confirmation denial / success (Full agent token) — a delete without
-   `confirm`, then with `confirm: "DELETE"`.
+6. Scope denial / expansion — a connection with only `read` lists only the
+   read tools; `pool_create` answers as unknown even with `mcp:pools` on its
+   token. Add `pools` in Access → Agents and repeat; remove it and the next
+   call answers as unknown. A token with only `mcp:read` must still lack pool
+   writes after a grant expansion. Remove a node and check lookups, placement,
+   counts and traffic exclude it, and member removals and pool deletion refuse
+   runtimes bound to or running on it.
+7. Confirmation denial / success (agent token with `pools`) — `pool_delete`
+   without `confirm`, then with `confirm: "DELETE"`.
 8. Refresh rotation and retry — tokens rotate; a retried refresh within the
    window returns the cached response.
-9. Access → Agents connection listing, level change / disconnect.
+9. Access → Agents lists connections and tokens; edit scopes and nodes for
+   each, then disconnect or revoke. Narrow during a long read and a command:
+   both MCP calls abort; node command cleanup follows its remaining access.
 10. Post-revoke refresh, both branches — ORDER MATTERS: within the
     30-second window, first retry the **rotated ancestor** (it returns the
     cached pair whose access token gets 403 at `/mcp` — cached delivery, not

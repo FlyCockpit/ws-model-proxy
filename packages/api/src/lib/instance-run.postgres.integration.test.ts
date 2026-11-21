@@ -2,6 +2,7 @@ import { createRouterClient } from "@orpc/server";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { retryAnswers } from "../integration/retry-answers";
 import { CALLERS, contextFor } from "../routers/lane-c-test-helpers";
+import { TEST_NODE_FEATURES } from "./node-features-test-fixture";
 import type { RuntimeSpec } from "./runtime-spec";
 
 // `physicalLaunchIntents` (one $queryRaw with DISTINCT ON) on real PostgreSQL: per (instance,
@@ -77,6 +78,7 @@ integration("physicalLaunchIntents on PostgreSQL", () => {
             trust: "FULL",
             labels: [label],
             declaredResources: { kind: "unified", memoryGb: 66 },
+            features: TEST_NODE_FEATURES,
             portStart: 31000,
             portEnd: 31010,
           },

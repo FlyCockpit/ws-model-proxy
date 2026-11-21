@@ -1,15 +1,16 @@
 /**
- * The descriptor every 0.4.0 oRPC procedure contract uses. Implementations (S0c stubs, then
- * the lanes) bind it to the matching base procedure:
+ * The descriptor every oRPC procedure contract uses. `contractProcedure` /
+ * `publicContractProcedure` (`contract-procedure.ts`) bind it and enforce the access level
+ * through `assertAccess`:
  *
- * | access        | base procedure                         | MCP                  |
- * |---------------|----------------------------------------|----------------------|
- * | `public`      | `publicProcedure` (kept 0.3 plumbing)  | never                |
- * | `session`     | `protectedProcedure`                   | never                |
- * | `agent`       | `protectedProcedure` + tool checks     | through `tools` only |
- * | `human`       | `humanProcedure` (positive check)      | never                |
- * | `admin`       | `adminProcedure`                       | never                |
- * | `human_admin` | `humanProcedure` + admin               | never                |
+ * | access        | caller admitted                          | MCP                  |
+ * |---------------|------------------------------------------|----------------------|
+ * | `public`      | anyone                                   | never                |
+ * | `session`     | any signed-in session                    | never                |
+ * | `agent`       | a session, or an agent with tool checks  | through `tools` only |
+ * | `human`       | a human session (positive check)         | never                |
+ * | `admin`       | an admin session                         | never                |
+ * | `human_admin` | a human admin session                    | never                |
  *
  * `human` is a positive check (§6.3): a cookie-authenticated Better Auth session, the
  * CSRF/origin check, and no agent marker in context. A test calls every `human`/`human_admin`

@@ -1,12 +1,4 @@
-/**
- * The 0.4.0 API contract (S0 first deliverable): every oRPC procedure (spec §8.1a) with its
- * input/output zod and access level, the 28 MCP tools, the plain-HTTP node endpoints, and the
- * metrics vocabulary. Overview: `docs/contracts/0.4.0.md`.
- *
- * S0c binds each leaf to its base procedure (see `procedure.ts`) with a NOT_IMPLEMENTED
- * handler; the lanes then implement them without changing these shapes (a shape change is a
- * contract change and is reviewed as one).
- */
+/** Canonical schemas and access levels for oRPC, MCP, node HTTP endpoints and metrics. */
 
 import { accessContract } from "./access";
 import {
@@ -66,6 +58,7 @@ export const CSRF_REQUIRED_PROCEDURES: ReadonlySet<string> = new Set(
  */
 export const SENSITIVE_INPUT_PROCEDURES: ReadonlySet<string> = new Set(["nodes.secrets.set"]);
 
+export * from "./agent-scopes";
 export * from "./auth-context";
 export * from "./http";
 export {

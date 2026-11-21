@@ -3,6 +3,8 @@ import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Activity, LayoutDashboard, Settings, Users } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { WideContent } from "@/components/wide-content";
+import { useActiveTabScroll } from "@/hooks/use-active-tab-scroll";
 import { decideAdminRouteAccess } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
 
@@ -31,6 +33,7 @@ function AdminLayout() {
 function AdminNav() {
   const { lang } = Route.useParams();
   const { t } = useTranslation("admin");
+  const scrollRef = useActiveTabScroll();
   const NAV_ITEMS = [
     {
       to: "/$lang/admin" as const,
@@ -63,26 +66,28 @@ function AdminNav() {
       className="sticky top-0 z-30 border-b bg-background/80 backdrop-blur"
     >
       <div className="container mx-auto min-w-0 max-w-7xl">
-        <ul className="-mb-px flex gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain no-scrollbar px-4 py-2">
-          {NAV_ITEMS.map((item) => (
-            <li key={item.to} className="shrink-0">
-              <Link
-                to={item.to}
-                params={{ lang }}
-                activeOptions={{ exact: item.exact }}
-                className={cn(
-                  "inline-flex min-h-[44px] shrink-0 items-center gap-2 whitespace-nowrap rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
-                )}
-                activeProps={{
-                  className: "bg-muted text-foreground",
-                }}
-              >
-                <item.icon aria-hidden="true" className="size-4" />
-                <span>{item.label}</span>
-              </Link>
-            </li>
-          ))}
-        </ul>
+        <WideContent ref={scrollRef} className="no-scrollbar">
+          <ul className="-mb-px flex w-max gap-1 px-4 py-2">
+            {NAV_ITEMS.map((item) => (
+              <li key={item.to} className="shrink-0">
+                <Link
+                  to={item.to}
+                  params={{ lang }}
+                  activeOptions={{ exact: item.exact }}
+                  className={cn(
+                    "inline-flex min-h-[44px] shrink-0 items-center gap-2 whitespace-nowrap rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
+                  )}
+                  activeProps={{
+                    className: "bg-muted text-foreground",
+                  }}
+                >
+                  <item.icon aria-hidden="true" className="size-4" />
+                  <span>{item.label}</span>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </WideContent>
       </div>
     </nav>
   );

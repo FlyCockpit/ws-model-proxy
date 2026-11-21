@@ -129,10 +129,10 @@ function PoolOverview({ pool }: { pool: PoolView }) {
     <div className="flex min-w-0 flex-col gap-4">
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
         <div className="min-w-0 flex-1 space-y-1">
-          <h1 className="flex min-w-0 flex-wrap items-center gap-2 text-2xl font-semibold">
+          <h2 className="flex min-w-0 flex-wrap items-center gap-2 text-2xl font-semibold">
             <span className="break-all">{pool.name}</span>
             <StatusPill tone="info">{t(`dashboard:models.type.${pool.modelType}`)}</StatusPill>
-          </h1>
+          </h2>
           {pool.description ? (
             <p className="text-sm text-muted-foreground">{pool.description}</p>
           ) : null}

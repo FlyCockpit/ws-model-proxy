@@ -1,6 +1,6 @@
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDeep, mockReset } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
 
@@ -35,7 +35,13 @@ function client(role: string, auth?: CallerAuth) {
 const owner = { id: "u1", email: "u1@example.test", name: "U One", slug: "u-one" };
 
 beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-10-07T10:01:00Z"));
   mockReset(db);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("admin observability", () => {
@@ -53,7 +59,18 @@ describe("admin observability", () => {
             kind: "agent_token",
             userId: "admin",
             agentTokenId: "t",
-            level: "FULL",
+            access: {
+              scopes: [
+                "read",
+                "pools",
+                "runtimes",
+                "nodes:manage",
+                "commands",
+                "files",
+                "models:test",
+              ],
+              nodeIds: null,
+            },
           }),
         ),
       ).rejects.toBeTruthy();
@@ -76,6 +93,18 @@ describe("admin observability", () => {
         User: owner,
         _count: { Ranks: 2 },
       },
+      {
+        id: "n2",
+        slug: "stale",
+        connection: "ONLINE",
+        trust: "FULL",
+        trustChangedAt: null,
+        trustLowerRequestedAt: null,
+        cliVersion: "0.4.0",
+        lastHeartbeatAt: new Date("2026-10-07T09:57:00.000Z"),
+        User: owner,
+        _count: { Ranks: 0 },
+      },
     ] as never);
     db.node.count.mockResolvedValue(31);
     const result = await client("admin").nodes({ page: 2, pageSize: 10, ownerQuery: "one" });
@@ -90,6 +119,16 @@ describe("admin observability", () => {
           version: "0.4.0",
           lastHeartbeatAt: "2026-10-07T10:00:00.000Z",
           runningInstances: 2,
+        },
+        {
+          id: "n2",
+          slug: "stale",
+          owner,
+          connection: "OFFLINE",
+          trust: "FULL",
+          version: "0.4.0",
+          lastHeartbeatAt: "2026-10-07T09:57:00.000Z",
+          runningInstances: 0,
         },
       ],
       total: 31,

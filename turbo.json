@@ -48,14 +48,6 @@
         "VITE_*"
       ]
     },
-    "db:push": {
-      "cache": false,
-      "passThroughEnv": ["DATABASE_URL"]
-    },
-    "db:push:dangerous": {
-      "cache": false,
-      "passThroughEnv": ["DATABASE_URL", "ALLOW_NONLOCAL_DANGEROUS_DB_PUSH"]
-    },
     "db:generate": {
       "cache": false
     },
@@ -64,6 +56,8 @@
       "inputs": [
         "prisma/schema/**/*.prisma",
         "prisma/schema-hardening.sql",
+        "prisma/migrations/**",
+        "../../scripts/db/generate-initial-migrations.mjs",
         "../../scripts/docker-entrypoint.sh",
         "../../scripts/test-docker-entrypoint-schema.sh",
         "scripts/test-entrypoint-schema.mjs",

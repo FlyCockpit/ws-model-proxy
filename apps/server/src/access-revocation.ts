@@ -10,17 +10,16 @@
  * - a share: the grantee's realtime sessions are rechecked now (not at the next 60 s pass).
  * Browser terminals are opened by a signed-in person, never by an agent credential.
  *
- * `handleAccessLevelLowered`: an OAuth grant went from Full to Read-only and committed (Access →
- * Agents, or the person chose Read-only when approving the client again). Every later lookup
- * reads READ (`/mcp` reads the grant per request; node admissions and the command sweep require
- * a FULL grant), so only the work the Full level already started ends here: its in-flight write
- * tool calls (read calls go on), the node commands and file ops it started (agents reach nodes
- * only at Full) and the commands it queued for a person (`credential_lowered`). There is no
- * cached admission to drop: nothing caches a grant's level.
+ * Narrowing aborts every MCP call and only node work outside the new access.
  */
-import type { AccessLevelLoweredEvent, AccessRevokedEvent } from "@ws-model-proxy/api/context";
+import type { AccessRevokedEvent } from "@ws-model-proxy/api/context";
+import { agentHasScope } from "@ws-model-proxy/auth/agent-scopes";
+import type { AgentAccessNarrowedEvent } from "@ws-model-proxy/auth/mcp-grant-access";
 import prisma from "@ws-model-proxy/db";
-import { cancelFileOpsForToken } from "./relay/node-file-ops.js";
+import {
+  cancelFileOpsForNarrowedCredential,
+  cancelFileOpsForToken,
+} from "./relay/node-file-ops.js";
 
 export type EndAgentWorkInput = {
   userId: string;
@@ -38,22 +37,57 @@ export type AccessRevocationDeps = {
   endAgentWork(input: EndAgentWorkInput): Promise<void>;
 };
 
-export type AccessLevelLoweredDeps = {
-  /** Abort the grant's in-flight write tool calls (and writes still registering). */
-  cancelMcpWriteToolCalls(grantId: string): number;
-  endAgentWork(input: EndAgentWorkInput): Promise<void>;
+export type AgentAccessNarrowedDeps = {
+  cancelMcpToolCalls(credentialId: string): number;
+  endAgentWork(event: AgentAccessNarrowedEvent): Promise<void>;
 };
 
-export async function handleAccessLevelLowered(
-  event: AccessLevelLoweredEvent,
-  deps: AccessLevelLoweredDeps,
+export async function handleAgentAccessNarrowed(
+  event: AgentAccessNarrowedEvent,
+  deps: AgentAccessNarrowedDeps,
 ): Promise<void> {
-  deps.cancelMcpWriteToolCalls(event.grantId);
-  await deps.endAgentWork({
-    userId: event.userId,
-    credentialIds: [event.grantId],
-    outcome: "credential_lowered",
-  });
+  for (const id of narrowedCredentialIds(event)) deps.cancelMcpToolCalls(id);
+  await deps.endAgentWork(event);
+}
+
+export function narrowedCredentialIds(event: AgentAccessNarrowedEvent): string[] {
+  return event.agentTokenId ? [event.agentTokenId, event.grantId] : [event.grantId];
+}
+
+/** Cancels only work the new scope set / allowlist no longer permits. */
+export async function endNarrowedAgentWork(event: AgentAccessNarrowedEvent): Promise<void> {
+  const ids = narrowedCredentialIds(event);
+  for (const id of ids) cancelFileOpsForNarrowedCredential(id, event.after);
+  const commandsAllowed = agentHasScope(event.after, "commands");
+  const nodeIds = event.after.nodeIds;
+  if (!commandsAllowed || nodeIds !== null) {
+    await prisma.queuedNodeCommand.updateMany({
+      where: {
+        userId: event.userId,
+        state: "QUEUED",
+        OR: [{ agentTokenId: { in: ids } }, { mcpGrantId: { in: ids } }],
+        ...(commandsAllowed ? { nodeId: { notIn: [...(nodeIds ?? [])] } } : {}),
+      },
+      data: {
+        state: "EXPIRED",
+        decidedAt: new Date(),
+        decidedBy: null,
+        outcome: "credential_lowered",
+      },
+    });
+  }
+  const runtimesAllowed = agentHasScope(event.after, "runtimes");
+  if (!runtimesAllowed || nodeIds !== null) {
+    await prisma.claimReleaseRequest.updateMany({
+      where: {
+        userId: event.userId,
+        state: "PENDING",
+        OR: [{ agentTokenId: { in: ids } }, { mcpGrantId: { in: ids } }],
+        ...(runtimesAllowed ? { Rank: { nodeId: { notIn: [...(nodeIds ?? [])] } } } : {}),
+      },
+      data: { state: "CLEARED", pendingRankId: null, decidedAt: new Date() },
+    });
+  }
 }
 
 export async function handleAccessRevoked(

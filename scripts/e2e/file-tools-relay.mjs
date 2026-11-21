@@ -55,7 +55,8 @@ try {
   db = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   const { secret: agentToken } = await client.access.agentTokens.create({
     name: "File tools E2E",
-    level: "FULL",
+    scopes: ["read", "files"],
+    nodeIds: null,
     expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
   });
 

@@ -4,7 +4,7 @@
  * opened for its current dispatch (the browser terminal socket redeems it and attaches, also on
  * a Relay-only node); reopen and cancel are the lifecycle engine's (owner fence, step CHECKs).
  *
- * The procedures are human-only (`humanProcedure`, CSRF); nothing here trusts more than the
+ * The procedures are human-only (`human` contract access, CSRF); nothing here trusts more than the
  * user id they pass: every lookup is scoped to that owner.
  */
 import type {

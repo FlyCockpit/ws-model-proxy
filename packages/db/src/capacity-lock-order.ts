@@ -72,8 +72,9 @@
  *   writer holds, for at most `lock_timeout` 100 ms; the batch then rolls back
  *   and the entry is retried on the next run.
  * - D (deploy DDL): schema-hardening.sql takes every table in one up-front
- *   `LOCK TABLE ... NOWAIT` and is retried; `prisma db push` runs with a
- *   `lock_timeout` (packages/db/scripts/push-schema.mjs).
+ *   `LOCK TABLE ... NOWAIT`; the migration that carries it retries that
+ *   statement in a subtransaction loop (a failed attempt releases what it
+ *   took), so it never waits on a lock while holding one.
  *
  * Fences are transaction-scoped advisory locks named `LL:kind:id`, where the
  * two-digit level LL fixes the global order ({@link fences}):
@@ -832,8 +833,7 @@ export async function runCapacityOrderedTransaction<T>(
 }
 
 /**
- * The user's graph in the hardening contract's order (docs/contracts/0.4.0-schema-hardening.md,
- * "Delete rules"): the `NoAction` edges (instance → runtime/version, profile item → runtime,
+ * Delete dependent rows before their parents: the `NoAction` edges (instance → runtime/version, profile item → runtime,
  * runtime → current version, pricing → model/account, credential rotation) must be gone
  * before their parent, so the user cascade alone would fail at statement end.
  */

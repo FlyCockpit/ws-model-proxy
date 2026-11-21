@@ -31,8 +31,14 @@ function node(gpus: PlacementNode["gpus"]): PlacementNode {
     frozenFabrics: null,
     memoryGb: 64,
     gpus,
+    unifiedAcceleratorGb: null,
+    ramOnlyGb: null,
     liveFreeMemoryGb: null,
-    launch: null,
+    launch: {
+      platform: "linux",
+      management: new Set(["process", "service"]),
+      shells: new Set(["sh"]),
+    },
   };
 }
 

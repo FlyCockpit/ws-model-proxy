@@ -75,8 +75,8 @@ pools and an API key through the API, waits for the callable ID in `/v1/models`,
 removes the user (with cascading test state) on exit. A failover pool tries a failing
 member first and must replay the upload to the healthy one exactly once.
 
-Point it only at an isolated, schema-ready E2E Postgres database (`pnpm db:push` against
-it first). The harness does not apply or reset schema, starts its own server with fresh
+Point it only at an isolated, schema-ready E2E Postgres database (apply the migrations to it
+first: `DATABASE_URL=<that url> pnpm --filter @ws-model-proxy/db exec prisma migrate deploy`). The harness does not apply or reset schema, starts its own server with fresh
 secrets, and signs up its own person:
 
 ```sh

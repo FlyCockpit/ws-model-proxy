@@ -112,8 +112,8 @@ if (green) {
 console.log("\nFollow-ups this script does not automate (do these by hand or with an agent):");
 console.log("  1. Regenerate the --primary-* / --grey-* ramps in");
 console.log("     packages/ui/src/styles/globals.css so their hue matches the new --primary.");
-console.log("  2. Update the PWA theme_color/background_color hex in apps/web/vite.config.ts");
-console.log("     and the theme-color <meta> in apps/web/src/routes/__root.tsx.");
+console.log("  2. Update the PWA theme_color/background_color hex in apps/web/vite.config.ts.");
+console.log("     (theme-color has no <meta> in __root.tsx; ThemeColorSync sets it at runtime.)");
 console.log("  3. If a font was added, it's pinned in packages/ui/package.json and the old");
 console.log("     font's @import may remain in globals.css. Move the dep to the pnpm catalog");
 console.log(

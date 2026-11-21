@@ -1,6 +1,11 @@
 import { randomBytes } from "node:crypto";
 import type { NodeFileServices } from "@ws-model-proxy/api/context";
 import {
+  type AgentAccess,
+  agentHasScope,
+  agentNodeAllowed,
+} from "@ws-model-proxy/auth/agent-scopes";
+import {
   FILE_BODY_MAX_BYTES,
   FILE_OP_DEADLINE_MS,
   type FileErrorCode,
@@ -17,6 +22,7 @@ import {
   judgeNodeAgentAccess,
   type NodeAccessRefusal,
   type NodeAgentAccessVerdict,
+  narrowOpenNodeAgentAccess,
   readNodeAgentAccess,
   revokeOpenNodeAgentAccess,
   revokeOpenNodeAgentAccessForUser,
@@ -26,7 +32,7 @@ import { encodeRelayServerControlMessage } from "./protocol.js";
 import { relaySessionManager, type TrackedFileOp } from "./session-manager.js";
 
 /**
- * Node file ops (relay 3.0): the server side of `file.op`. One request runs admission
+ * Node file ops (relay 4.0): the server side of `file.op`. One request runs admission
  * (`node-access.ts`: FULL agent token, node at Full control, file roots configured), the
  * limits below, and then sends the frame; the node's `file.result` / `file.rejected` (and
  * `file.data` for a spilled text field) settles it. Ops are never queued, never retried, and
@@ -579,13 +585,16 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   const mutating = isMutatingFileOp(input.op);
   if (input.signal?.aborted) return { ok: false, code: "cancelled" };
 
-  const reads = await readNodeAgentAccess({
-    userId: input.userId,
-    tokenId: input.tokenId,
-    credentialKind: input.credentialKind ?? "agent_token",
-    expiresAt: input.expiresAt,
-    nodeId: input.nodeId,
-  });
+  const reads = await readNodeAgentAccess(
+    {
+      userId: input.userId,
+      tokenId: input.tokenId,
+      credentialKind: input.credentialKind ?? "agent_token",
+      expiresAt: input.expiresAt,
+      nodeId: input.nodeId,
+    },
+    mutating ? "file_write" : "file_read",
+  );
   // Never start new work for an aborted request.
   if (input.signal?.aborted) {
     closeNodeAgentAccess(reads);
@@ -735,6 +744,16 @@ function cancelFileOpsWhere(matches: (record: FileOpRecord) => boolean): void {
 export function cancelFileOpsForToken(tokenId: string): void {
   revokeOpenNodeAgentAccess(tokenId);
   cancelFileOpsWhere((record) => record.tokenId === tokenId);
+}
+
+/** End only file work outside the credential's new access. */
+export function cancelFileOpsForNarrowedCredential(tokenId: string, access: AgentAccess): void {
+  narrowOpenNodeAgentAccess(tokenId, access);
+  cancelFileOpsWhere(
+    (record) =>
+      record.tokenId === tokenId &&
+      (!agentHasScope(access, "files") || !agentNodeAllowed(access, record.nodeId)),
+  );
 }
 
 /**

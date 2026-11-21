@@ -78,8 +78,8 @@
 //! a stable sibling `.wsmp-lock-.wsmp-recover-<id>` protects final cleanup
 //! while the internal lock closes before unlink (NFS sillyrename avoidance).
 //! `wsmp recover` skips a directory it cannot lock and derives publication only
-//! against a surviving private v3 hardlink anchor's live descriptor. Legacy or
-//! missing anchors, directories and unsupported aliases retain ambiguity for
+//! against a surviving private v3 hardlink anchor's live descriptor. Missing
+//! anchors, directories and unsupported aliases retain ambiguity for
 //! manual resolution. Private INTENT/anchor integrity is required, as with the
 //! existing mode-0700 staging directory; malicious same-user tampering of all
 //! private metadata is not excluded. Exchange rename swaps `from <-> to` first so no object is

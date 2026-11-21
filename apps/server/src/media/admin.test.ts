@@ -82,7 +82,7 @@ describe("deleteAllMedia", () => {
         { id: "b", sizeBytes: 20 },
       ])
       .mockResolvedValueOnce([]);
-    prisma.mediaAsset.deleteMany.mockResolvedValue({ count: 2 });
+    prisma.mediaAsset.deleteMany.mockResolvedValue({ count: 1 });
 
     const result = await deleteAllMedia({ store, prisma: prisma as never });
 
@@ -90,9 +90,8 @@ describe("deleteAllMedia", () => {
     // Bytes are actually gone from disk.
     expect(await new LocalMediaStore(root).getStream("a")).toBeNull();
     expect(await new LocalMediaStore(root).getStream("b")).toBeNull();
-    expect(prisma.mediaAsset.deleteMany).toHaveBeenCalledWith({
-      where: { id: { in: ["a", "b"] } },
-    });
+    expect(prisma.mediaAsset.deleteMany).toHaveBeenCalledWith({ where: { id: "a" } });
+    expect(prisma.mediaAsset.deleteMany).toHaveBeenCalledWith({ where: { id: "b" } });
   });
 
   it("is a no-op on an empty store", async () => {
@@ -103,5 +102,39 @@ describe("deleteAllMedia", () => {
     const result = await deleteAllMedia({ store, prisma: prisma as never });
     expect(result).toEqual({ removed: 0, bytes: 0 });
     expect(prisma.mediaAsset.deleteMany).not.toHaveBeenCalled();
+  });
+  it("retains failed unlink metadata and excludes failures from later full batches and counts", async () => {
+    const store = new LocalMediaStore(root);
+    const prisma = fakePrisma();
+    const rows = Array.from({ length: 501 }, (_, i) => ({ id: `asset-${i}`, sizeBytes: i + 1 }));
+    prisma.mediaAsset.findMany
+      .mockResolvedValueOnce(rows.slice(0, 500))
+      .mockResolvedValueOnce(rows.slice(500));
+    prisma.mediaAsset.deleteMany.mockResolvedValue({ count: 1 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unlink = vi.spyOn(store, "delete").mockImplementation(async (id) => {
+      if (id === "asset-0") throw new Error("sensitive filename");
+    });
+    try {
+      const result = await deleteAllMedia({ store, prisma: prisma as never });
+      expect(result).toEqual({
+        removed: 500,
+        bytes: rows.reduce((sum, row) => sum + row.sizeBytes, 0) - 1,
+      });
+      expect(prisma.mediaAsset.deleteMany).not.toHaveBeenCalledWith({ where: { id: "asset-0" } });
+      expect(prisma.mediaAsset.findMany).toHaveBeenCalledTimes(2);
+      expect(prisma.mediaAsset.findMany).toHaveBeenLastCalledWith({
+        where: { id: { notIn: ["asset-0"] } },
+        select: { id: true, sizeBytes: true },
+        take: 500,
+      });
+      expect(warn).toHaveBeenCalledExactlyOnceWith(
+        "[media] admin asset deletion failed; retained for retry.",
+      );
+      expect(unlink).toHaveBeenCalledTimes(501);
+    } finally {
+      warn.mockRestore();
+      unlink.mockRestore();
+    }
   });
 });

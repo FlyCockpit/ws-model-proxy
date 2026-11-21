@@ -1,5 +1,5 @@
 /**
- * Engine facts a node observes for a running instance (relay 3.0 `engineFacts`), and the
+ * Engine facts a node observes for a running instance (relay 4.0 `engineFacts`), and the
  * instance columns they fill. They are automatic limit sources only: the effective limit is
  * the version's override ?? the instance's observed fact ?? the built-in default
  * (`runtime-defaults.ts`), so a fact never overwrites a person's setting.
@@ -28,7 +28,7 @@ export type EngineCountContextName = (typeof ENGINE_COUNT_CONTEXT_NAMES)[number]
 
 type WireFact<T> = { value: T; source: "probe" | "config" | "reader" };
 
-/** The relay 3.0 `engineFacts` object (validated by the relay's strict frame schema). */
+/** The relay 4.0 `engineFacts` object (validated by the relay's strict frame schema). */
 export type WireEngineFacts = {
   engine?: WireFact<EngineWire>;
   slots?: WireFact<number>;

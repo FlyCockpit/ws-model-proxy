@@ -1,21 +1,25 @@
--- Database invariants Prisma cannot express, for the 0.4.0 schema (fresh baseline: no
--- backfills). Idempotent; applied by the repository db:push wrappers
--- (apply-schema-hardening.mjs) as ONE transaction. Plan and ownership per object:
--- docs/contracts/0.4.0-schema-hardening.md. Sections follow the Prisma files.
+-- Database invariants Prisma cannot express. Idempotent, including data backfills before
+-- constraints. Never applied directly: migrations carry it. The newest migration with a
+-- `-- section hardening` block must hold exactly this body (its LOCK retried in a loop),
+-- and `pnpm db:validate` fails otherwise. Today that is 20261112000000_upgrade_to_1_0_0
+-- (scripts/db/generate-initial-migrations.mjs writes it). After 1.0.0 is released, a change
+-- here ships as a new migration (`pnpm db:migrate <name> --empty`) holding the whole new body
+-- in a `-- section hardening` block, re-applied like the former deploy hardening.
 
 BEGIN;
 
 -- DL-1 deploy lock order: this transaction takes EVERY table it touches in one statement, up
 -- front, in the strongest mode any later statement needs (ACCESS EXCLUSIVE), with NOWAIT. It
 -- never waits on a lock while holding one; a busy table fails the statement at once (55P03) and
--- apply-schema-hardening.mjs retries the whole transaction. verify-schema-hardening.mjs fails
+-- the migration that carries this body retries it in a subtransaction loop
+-- (scripts/db/generate-initial-migrations.mjs, upgradeHardening). verify-schema-hardening.mjs fails
 -- when a table named anywhere in this file is missing here.
 LOCK TABLE "user", session, node, node_credential, node_enrollment_code, node_enrollment_use,
   fabric, fabric_member, node_command, node_audit_event,
   queued_node_command, node_agent_update, node_agent_update_batch, runtime, runtime_version, runtime_model, runtime_share, runtime_instance,
   instance_rank, instance_reservation, claim_release_request, instance_step, runtime_operation, execution_target, profile, profile_node,
   profile_item, pool, pool_routing, pool_fallback, pool_advanced, pool_sidecar, pool_member,
-  pool_routing_rule, api_key, api_key_pool, agent_token, share, share_invite, provider_account,
+  pool_routing_rule, api_key, api_key_pool, agent_token, mcp_grant, share, share_invite, provider_account,
   provider_model,
   provider_credential, provider_pricing_version, spend_cap, spend_reservation, spend_settlement,
   usage_ledger, attempt_event, runtime_load_minute, node_metrics_minute, audit_event,
@@ -31,6 +35,25 @@ SELECT set_config('wsmp.fences', ',*,', true);
 
 -- Not a table: taken after the lock so the LOCK is the first statement.
 CREATE SEQUENCE IF NOT EXISTS admission_enqueue_sequence AS bigint MINVALUE 0 START 1;
+
+-- Remove retired completion declarations before capability readers become strict. Both
+-- inventories retain every other key, including all supported capability versions (1-4).
+UPDATE provider_model
+SET "capabilityMetadata" = CASE WHEN jsonb_typeof("capabilityMetadata" -> 'surfaces') = 'object'
+  THEN ("capabilityMetadata" - 'completions') #- '{surfaces,openaiCompletions}'
+  ELSE "capabilityMetadata" - 'completions' END
+WHERE jsonb_typeof("capabilityMetadata") = 'object'
+  AND ("capabilityMetadata" ? 'completions'
+    OR (jsonb_typeof("capabilityMetadata" -> 'surfaces') = 'object'
+      AND "capabilityMetadata" -> 'surfaces' ? 'openaiCompletions'));
+UPDATE provider_model
+SET "nativeCapabilities" = CASE WHEN jsonb_typeof("nativeCapabilities" -> 'surfaces') = 'object'
+  THEN ("nativeCapabilities" - 'completions') #- '{surfaces,openaiCompletions}'
+  ELSE "nativeCapabilities" - 'completions' END
+WHERE jsonb_typeof("nativeCapabilities") = 'object'
+  AND ("nativeCapabilities" ? 'completions'
+    OR (jsonb_typeof("nativeCapabilities" -> 'surfaces') = 'object'
+      AND "nativeCapabilities" -> 'surfaces' ? 'openaiCompletions'));
 
 -- ═══════════════════════════════ Shared helpers ═══════════════════════════════
 
@@ -98,15 +121,25 @@ $immutable_history$;
 
 -- A session for a user (or an impersonating admin) whose deletion is pending is refused. Reads
 -- the user rows FOR SHARE only (see the 0.4-dev rationale: no lock cycle with the mark/delete).
+-- A user's own session is also refused while an active ban is committed: Better Auth checks the
+-- ban before its separate session insert, so a sign-in racing a ban (or an archival, which bans
+-- and deletes sessions in one transaction) could otherwise keep a session the ban never saw.
+-- Impersonation sessions (impersonatedBy set) are left to Better Auth's admin rules.
 CREATE OR REPLACE FUNCTION refuse_session_for_deleting_user()
 RETURNS trigger LANGUAGE plpgsql AS $session_refuse_deleting_user$
 DECLARE
   pending boolean;
+  banned_now boolean;
 BEGIN
-  SELECT u."deletionRequestedAt" IS NOT NULL INTO pending
+  SELECT u."deletionRequestedAt" IS NOT NULL,
+         u.banned IS TRUE AND (u."banExpires" IS NULL OR u."banExpires" > now())
+    INTO pending, banned_now
     FROM "user" u WHERE u.id = NEW."userId" FOR SHARE;
   IF FOUND AND pending THEN
     RAISE EXCEPTION 'user deletion pending' USING ERRCODE = 'WMPD1';
+  END IF;
+  IF FOUND AND banned_now AND NEW."impersonatedBy" IS NULL THEN
+    RAISE EXCEPTION 'user banned' USING ERRCODE = 'WMPD1';
   END IF;
   IF NEW."impersonatedBy" IS NOT NULL THEN
     SELECT u."deletionRequestedAt" IS NOT NULL INTO pending
@@ -264,7 +297,7 @@ ALTER TABLE node ADD CONSTRAINT node_temporary_shape CHECK (
 );
 
 -- A node's address on a fabric (packages/api/src/lib/ip-literal.ts `isFabricIp`, Rust
--- `is_fabric_ip`; shared vectors in apps/cli/tests/fixtures/relay-3.0/rules/fabric-ip.json):
+-- `is_fabric_ip`; shared vectors in apps/cli/tests/fixtures/relay-4.0/rules/fabric-ip.json):
 -- the canonical text of one address (PostgreSQL's host() form: dotted quad without leading
 -- zeros, RFC 5952 IPv6), no prefix, zone or brackets, no embedded IPv4 in IPv6, and never
 -- 0.0.0.0/8, loopback, ::/96 (unspecified, ::1, IPv4-compatible) or IPv4-mapped.
@@ -798,11 +831,23 @@ FOR EACH ROW EXECUTE FUNCTION enforce_instance_node_owner();
 DROP TRIGGER IF EXISTS instance_step_node_owner ON instance_step;
 CREATE TRIGGER instance_step_node_owner BEFORE INSERT OR UPDATE OF "nodeId", "instanceId" ON instance_step
 FOR EACH ROW EXECUTE FUNCTION enforce_instance_node_owner();
--- Runs (packages/api/src/lib/instance-run.ts): an instance's runGeneration is its current run,
--- begun in the transaction that commits a restart. It never goes back; every new step belongs
--- to the instance's current run (a positive one: a legacy row with 0 is bootstrapped from its
--- steps before anything new is written); a step's generation never changes. Rows written before
--- runs existed are left as they are (only new inserts and updates are checked).
+-- An instance's current run is positive and monotonic; every new step belongs to it.
+-- Upgrade untouched rows once, reproducing the former resolver exactly: latest non-health
+-- generation, plus one for a committed STARTING/UNAVAILABLE restart not yet prepared.
+UPDATE runtime_instance i
+SET "runGeneration" = GREATEST(1,
+  COALESCE((SELECT MAX(s.generation) FROM instance_step s
+    WHERE s."instanceId" = i.id AND s.phase <> 'HEALTH'), 0)
+  + CASE WHEN i.phase IN ('STARTING', 'UNAVAILABLE') AND i."operationId" IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM instance_step s WHERE s."instanceId" = i.id
+        AND s.phase IN ('PREPARE', 'START', 'AFTER_JOIN', 'READINESS')
+        AND s.intent ->> 'operationId' = i."operationId")
+    THEN 1 ELSE 0 END)
+WHERE i."runGeneration" = 0;
+ALTER TABLE runtime_instance ALTER COLUMN "runGeneration" SET DEFAULT 1;
+ALTER TABLE runtime_instance DROP CONSTRAINT IF EXISTS runtime_instance_run_positive;
+ALTER TABLE runtime_instance ADD CONSTRAINT runtime_instance_run_positive CHECK ("runGeneration" >= 1);
+
 CREATE OR REPLACE FUNCTION enforce_instance_run_order()
 RETURNS trigger LANGUAGE plpgsql AS $instance_run_order$
 DECLARE
@@ -1200,6 +1245,9 @@ ALTER TABLE api_key ADD CONSTRAINT api_key_shape CHECK (
   AND "secretDigest" ~ '^[0-9a-f]{64}$'
   AND ("expiresAt" IS NULL OR "expiresAt" > "createdAt")
 );
+ALTER TABLE mcp_grant DROP CONSTRAINT IF EXISTS mcp_grant_scopes_read;
+ALTER TABLE mcp_grant ADD CONSTRAINT mcp_grant_scopes_read CHECK ('READ' = ANY(scopes));
+
 ALTER TABLE agent_token DROP CONSTRAINT IF EXISTS agent_token_shape;
 ALTER TABLE agent_token ADD CONSTRAINT agent_token_shape CHECK (
   length(btrim(name)) BETWEEN 1 AND 120

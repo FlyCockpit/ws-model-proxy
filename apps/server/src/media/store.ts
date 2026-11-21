@@ -214,7 +214,7 @@ export class LocalMediaStore implements MediaStore {
   }
 
   async delete(id: string): Promise<void> {
-    await rm(this.objectPath(id), { force: true }).catch(() => {});
+    await rm(this.objectPath(id), { force: true });
   }
 
   async sweepStaleTmp(olderThanMs: number): Promise<number> {

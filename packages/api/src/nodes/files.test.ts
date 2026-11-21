@@ -28,7 +28,10 @@ const OAUTH: CallerAuth = {
   kind: "oauth_access_token",
   userId: OWNER,
   grantId: "grant-1",
-  level: "FULL",
+  access: {
+    scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+    nodeIds: null,
+  },
 };
 
 function node(overrides: Record<string, unknown> = {}) {
@@ -61,7 +64,10 @@ describe("nodes.files: who may use them", () => {
   it.each([
     ["a person (cookie session)", PERSON],
     ["a Read-only agent token", READ_AGENT],
-    ["a Read-only OAuth grant", { ...OAUTH, level: "READ" } satisfies CallerAuth],
+    [
+      "a Read-only OAuth grant",
+      { ...OAUTH, access: { scopes: ["read"], nodeIds: null } } satisfies CallerAuth,
+    ],
   ] as const)("refuses %s before reading anything", async (_label, auth) => {
     const files = fileServices();
     await expect(

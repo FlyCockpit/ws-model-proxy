@@ -27,6 +27,7 @@ import {
   resolveExecutionPath,
   type SurfaceRequestRequirements,
 } from "@ws-model-proxy/api/lib/surface-capabilities";
+import { type AgentAccess, agentNodeAllowed } from "@ws-model-proxy/auth/agent-scopes";
 import prisma from "@ws-model-proxy/db";
 import { hmacDigestForPurpose } from "@ws-model-proxy/db/node-security";
 import {
@@ -505,32 +506,67 @@ function decodeUtf8Bytes(bytes: Uint8Array | null | undefined): string {
   return new TextDecoder().decode(bytes);
 }
 
-function bytesToReadableStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
-  return new ReadableStream({
-    start(controller) {
-      if (bytes.byteLength > 0) controller.enqueue(bytes);
-      controller.close();
-    },
-  });
-}
-
-async function readStreamBytes(body: ReadableStream<Uint8Array> | null): Promise<Uint8Array> {
-  if (!body) return new Uint8Array();
+/**
+ * Inspect only a bounded prefix of local errors. Replay every read chunk and
+ * then the remaining stream, so inspection never truncates the downstream body.
+ */
+async function readStreamBytes(
+  body: ReadableStream<Uint8Array>,
+  maxBytes = MAX_COMPAT_ERROR_BYTES,
+): Promise<{ bytes: Uint8Array; body: ReadableStream<Uint8Array> }> {
   const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
-  while (true) {
-    const result = await reader.read();
-    if (result.done) break;
-    if (result.value) chunks.push(result.value);
+  const held: Uint8Array[] = [];
+  const prefix: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const result = await reader.read();
+      if (result.done) break;
+      if (result.value.byteLength === 0) continue;
+      held.push(result.value);
+      const inspected = result.value.subarray(0, maxBytes - total);
+      prefix.push(inspected);
+      total += inspected.byteLength;
+    }
+  } catch (error) {
+    reader.releaseLock();
+    throw error;
   }
-  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
   const bytes = new Uint8Array(total);
   let offset = 0;
-  for (const chunk of chunks) {
+  for (const chunk of prefix) {
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return bytes;
+  return {
+    bytes,
+    body: new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const next = held.shift();
+        if (next) {
+          controller.enqueue(next);
+          return;
+        }
+        try {
+          const result = await reader.read();
+          if (result.done) {
+            reader.releaseLock();
+            controller.close();
+          } else controller.enqueue(result.value);
+        } catch (error) {
+          reader.releaseLock();
+          controller.error(error);
+        }
+      },
+      async cancel(reason) {
+        try {
+          await reader.cancel(reason);
+        } finally {
+          reader.releaseLock();
+        }
+      },
+    }),
+  };
 }
 
 type CalibrationCapacity = {
@@ -780,20 +816,16 @@ async function nativeContextCount({
 }): Promise<ContextCountTelemetry | null> {
   if (!operation.contextInput) return null;
   const capacity = selected.instance;
-  // Undefined is retained for compatibility with pre-capacity mocks/rows that
-  // behaved as native-first before countStrategy was projected here.
-  const countStrategy = capacity?.countStrategy ?? "ENGINE_REPORTED";
-  const registeredCounter = capacity
-    ? contextCounterRegistry.resolve({
-        runtimeIdentityKey: capacity.runtimeIdentityKey,
-        runtimeModel: capacity.runtimeModel,
-        runtimeRevision: capacity.runtimeRevision,
-        tokenizer: capacity.tokenizer,
-        tokenizerVersion: capacity.tokenizerVersion,
-        template: capacity.template,
-        templateVersion: capacity.templateVersion,
-      })
-    : null;
+  const countStrategy = capacity.countStrategy;
+  const registeredCounter = contextCounterRegistry.resolve({
+    runtimeIdentityKey: capacity.runtimeIdentityKey,
+    runtimeModel: capacity.runtimeModel,
+    runtimeRevision: capacity.runtimeRevision,
+    tokenizer: capacity.tokenizer,
+    tokenizerVersion: capacity.tokenizerVersion,
+    template: capacity.template,
+    templateVersion: capacity.templateVersion,
+  });
   const countWithConfiguredCounter = async () => {
     const useRegistry =
       countStrategy === "TOKENIZER" ||
@@ -803,15 +835,14 @@ async function nativeContextCount({
       input: operation.contextInput,
       counters: useRegistry && registeredCounter ? [registeredCounter] : [],
       useTokenEstimate: true,
-      imageTokenAllowance: capacity?.imageTokenAllowance,
+      imageTokenAllowance: capacity.imageTokenAllowance,
       signal: request.signal,
     });
     if (raw.exact || raw.method === "TOKENIZER_TEMPLATE") return raw;
     if (
-      !capacity ||
-      (countStrategy !== "CALIBRATED_ESTIMATE" &&
-        countStrategy !== "TOKENIZER" &&
-        countStrategy !== "TEMPLATE_AWARE")
+      countStrategy !== "CALIBRATED_ESTIMATE" &&
+      countStrategy !== "TOKENIZER" &&
+      countStrategy !== "TEMPLATE_AWARE"
     )
       return raw;
     const calibrated = calibratedContextTokens(
@@ -1224,6 +1255,7 @@ type RelayMetadataUpdate = {
 
 type RelayRequester = {
   userId: string;
+  agentAccess?: AgentAccess;
   /** Entry point, persisted on the RelayRequest and keyed in usage rollups. */
   source: RelayRequestSourceValue;
   limitKey: string;
@@ -1880,8 +1912,10 @@ async function readAdaptedNonstreamBody({
       if (result.done) break;
       bytes += result.value.byteLength;
       if (bytes > MODEL_API_MAX_REQUEST_BODY_BYTES) {
-        if (status >= 200 && status < 300)
+        if (status >= 200 && status < 300) {
+          await reader.cancel("oversized provider response discarded");
           throw new Error("adapted response exceeded bounded buffer");
+        }
         discardedOversizedError = true;
         chunks.length = 0;
         await reader.cancel("oversized provider error discarded");
@@ -3214,6 +3248,8 @@ function createResponseIdCapture() {
   let responseId: string | null = null;
   let captured = "";
   let sseBuffer = "";
+  let capturedChars = 0;
+  let captureFailed = false;
   const decoder = new TextDecoder();
 
   function tryJson(text: string) {
@@ -3234,10 +3270,17 @@ function createResponseIdCapture() {
 
   return {
     push(chunk: Uint8Array, streaming: boolean) {
-      if (responseId || captured.length >= RESPONSE_ID_CAPTURE_MAX_CHARS) return;
+      if (responseId || captureFailed) return;
       const text = decoder.decode(chunk, { stream: true });
+      capturedChars += text.length;
+      if (capturedChars > RESPONSE_ID_CAPTURE_MAX_CHARS) {
+        captureFailed = true;
+        captured = "";
+        sseBuffer = "";
+        return;
+      }
       if (!streaming) {
-        captured = `${captured}${text}`.slice(0, RESPONSE_ID_CAPTURE_MAX_CHARS);
+        captured = `${captured}${text}`;
         return;
       }
 
@@ -3252,6 +3295,7 @@ function createResponseIdCapture() {
       }
     },
     finish(streaming: boolean) {
+      if (captureFailed) return null;
       if (!responseId && streaming && sseBuffer) {
         processSseLine(sseBuffer.trimEnd());
       }
@@ -3523,8 +3567,11 @@ async function directModelRow(
   runtimeModelId: string,
   ownerUserId: string,
   instanceId?: string | null,
+  requester?: RelayRequester,
 ): Promise<DirectModelRelayRow | null> {
-  const routes = (await testRoutes(runtimeModelId, ownerUserId)).filter(hasHeadNode);
+  const routes = (await testRoutes(runtimeModelId, ownerUserId))
+    .filter(hasHeadNode)
+    .filter((route) => agentRouteAllowed(route, requester));
   const route = instanceId
     ? routes.find((candidate) => candidate.instance.id === instanceId)
     : (routes.find((candidate) => candidate.instance.ready && candidate.instance.nodeOnline) ??
@@ -3533,8 +3580,25 @@ async function directModelRow(
 }
 
 /** Every LOCAL route of a pool (one row per member and instance), in a stable order. */
-async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
-  return (await poolRoutes(poolId)).filter(hasHeadNode).map(poolMemberRow);
+function agentRouteAllowed(
+  route: { instance: LocalInstance; model: RouteServedModel },
+  requester?: RelayRequester,
+): boolean {
+  return (
+    requester?.agentAccess === undefined ||
+    (route.model.userId === requester.userId &&
+      agentNodeAllowed(requester.agentAccess, route.instance.nodeId))
+  );
+}
+
+async function poolMemberRows(
+  poolId: string,
+  requester?: RelayRequester,
+): Promise<PoolMemberRelayRow[]> {
+  return (await poolRoutes(poolId))
+    .filter(hasHeadNode)
+    .filter((route) => agentRouteAllowed(route, requester))
+    .map(poolMemberRow);
 }
 
 /**
@@ -3622,6 +3686,7 @@ function localSendBinding(
   return {
     requesterUserId: requester.userId,
     apiKeyId: requester.apiKeyId,
+    agentAccess: requester.agentAccess,
     engineOwnerUserId: selected.userId,
     runtimeModelId: selected.id,
     executionTargetId: selected.target.id,
@@ -3788,6 +3853,7 @@ async function relayDirect({
     target.id,
     target.ownerUserId,
     request.headers.get(TEST_INSTANCE_HEADER),
+    requester,
   );
   if (!selected) {
     await operation.dispose?.();
@@ -4052,8 +4118,8 @@ async function relayDirect({
         family: operation.family,
         contextCount: operation.contextCount,
         contextInput: operation.contextInput,
-        engineCountContext: selected.instance?.engineCountContext,
-        physicalMaxContext: selected.instance?.physicalMaxContext,
+        engineCountContext: selected.instance.engineCountContext,
+        physicalMaxContext: selected.instance.physicalMaxContext,
         effectiveContextCeiling: null,
         contextMargin: 0,
         manager,
@@ -4167,7 +4233,8 @@ async function relayDirect({
     }
     let startedBody = started.body;
     if (started.status >= 400 && started.status < 500) {
-      const errorBytes = await readStreamBytes(startedBody);
+      const inspectedError = await readStreamBytes(startedBody);
+      const errorBytes = inspectedError.bytes;
       const overflow = classifyEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes));
       if (overflow.overflow) {
         attempt.cancel("request_too_large");
@@ -4200,7 +4267,7 @@ async function relayDirect({
           overflow.snippet,
         );
       }
-      startedBody = bytesToReadableStream(errorBytes);
+      startedBody = inspectedError.body;
     }
     const stickiness = operation.responseStickiness;
     // The client sees EOF only once this response's binding is durable.
@@ -5102,14 +5169,8 @@ async function relayPool({
           }),
         );
       }
-      const bytes = new Uint8Array(await committedResult.response.arrayBuffer());
       const adapted = await externalBodyRead(
-        new ReadableStream({
-          start(controller) {
-            controller.enqueue(bytes);
-            controller.close();
-          },
-        }),
+        committedResult.response.body,
         source,
         operation.adaptation.requestedSurface,
         committedResult.response.status,
@@ -5128,7 +5189,7 @@ async function relayPool({
     }
   };
 
-  const listedMembers = await poolMemberRows(target.id);
+  const listedMembers = await poolMemberRows(target.id, requester);
   const members = forcedPoolMemberId
     ? listedMembers.filter((member) => member.memberId === forcedPoolMemberId)
     : listedMembers;
@@ -5471,7 +5532,7 @@ async function relayPool({
           .filter((member) =>
             contextTokensFitCeiling({
               tokens: operation.contextCount!.tokens,
-              physicalMaxContext: member.instance?.physicalMaxContext,
+              physicalMaxContext: member.instance.physicalMaxContext,
               effectiveContextCeiling: configuredContextCeilingForMember(member),
               contextMargin: contextMarginForMember(member),
             }),
@@ -5842,7 +5903,7 @@ async function relayPool({
     const member = memberById.get(poolMemberId);
     if (!member) return null;
     const ceiling = effectiveContextCeilingTokens(
-      member.instance?.physicalMaxContext,
+      member.instance.physicalMaxContext,
       configuredContextCeilingForMember(member),
     );
     return ceiling === null ? null : ceiling - contextMarginForMember(member);
@@ -5936,7 +5997,7 @@ async function relayPool({
     operation.contextCount = count;
     await updateContextCountMetadata(relayRequestId, count);
     const ceiling = effectiveContextCeilingTokens(
-      member.instance?.physicalMaxContext,
+      member.instance.physicalMaxContext,
       configuredContextCeilingForMember(member),
     );
     const margin = contextMarginForMember(member);
@@ -5944,7 +6005,7 @@ async function relayPool({
       count.exact &&
       !contextFitsLimits({
         count,
-        physicalMaxContext: member.instance?.physicalMaxContext,
+        physicalMaxContext: member.instance.physicalMaxContext,
         effectiveContextCeiling: configuredContextCeilingForMember(member),
         contextMargin: margin,
       })
@@ -6545,8 +6606,8 @@ async function relayPool({
             family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
             contextCount: operation.contextCount,
             contextInput: operation.contextInput,
-            engineCountContext: member.instance?.engineCountContext,
-            physicalMaxContext: member.instance?.physicalMaxContext,
+            engineCountContext: member.instance.engineCountContext,
+            physicalMaxContext: member.instance.physicalMaxContext,
             effectiveContextCeiling: configuredContextCeilingForMember(member),
             contextMargin: contextMarginForMember(member),
             manager,
@@ -6739,11 +6800,12 @@ async function relayPool({
 
       let startedBody = started.body;
       if (started.status >= 400 && started.status < 500) {
-        const errorBytes = await readStreamBytes(startedBody);
+        const inspectedError = await readStreamBytes(startedBody);
+        const errorBytes = inspectedError.bytes;
         const overflow = classifyEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes));
         if (overflow.overflow) {
           const thisCeiling = effectiveContextCeilingTokens(
-            member.instance?.physicalMaxContext,
+            member.instance.physicalMaxContext,
             configuredContextCeilingForMember(member),
           );
           // Retry each remaining engine at most once. Counts constrain only
@@ -6815,7 +6877,7 @@ async function relayPool({
             overflow.snippet,
           );
         }
-        startedBody = bytesToReadableStream(errorBytes);
+        startedBody = inspectedError.body;
       }
 
       if (adaptedSource && operation.adaptation && started.status >= 200 && started.status < 300) {
@@ -7317,7 +7379,7 @@ async function relayPool({
       if (failure === "request_too_large" && operation.contextCount?.exact) {
         const thisCeiling =
           effectiveContextCeilingTokens(
-            member.instance?.physicalMaxContext,
+            member.instance.physicalMaxContext,
             configuredContextCeilingForMember(member),
           ) ?? 1;
         const details = {
@@ -7506,7 +7568,7 @@ async function relaySelectedModelNoFailover({
   // pool; a removed member is no longer reachable through the pool (or its share), even for
   // a stored response. A TEST binding needs the caller's own served model on that target.
   const selectedPoolMember = requestedPoolId
-    ? (await poolMemberRows(requestedPoolId)).find(
+    ? (await poolMemberRows(requestedPoolId, requester)).find(
         (member) =>
           member.target.id === selectedExecutionTargetId &&
           member.model.id === selectedRuntimeModelId,
@@ -7518,6 +7580,7 @@ async function relaySelectedModelNoFailover({
       : null
     : ((await testRoutes(selectedRuntimeModelId, requester.userId))
         .filter(hasHeadNode)
+        .filter((route) => agentRouteAllowed(route, requester))
         .map(servedRoute)
         .find((route) => route.target.id === selectedExecutionTargetId) ?? null);
   if (!selected) {
@@ -7779,8 +7842,8 @@ async function relaySelectedModelNoFailover({
           family: operation.family,
           contextCount: operation.contextCount,
           contextInput: operation.contextInput,
-          engineCountContext: selected.instance?.engineCountContext,
-          physicalMaxContext: selected.instance?.physicalMaxContext,
+          engineCountContext: selected.instance.engineCountContext,
+          physicalMaxContext: selected.instance.physicalMaxContext,
           effectiveContextCeiling: null,
           contextMargin: 0,
           manager,
@@ -7816,7 +7879,8 @@ async function relaySelectedModelNoFailover({
     const started = await attempt.started;
     let startedBody = started.body;
     if (started.status >= 400 && started.status < 500) {
-      const errorBytes = await readStreamBytes(startedBody);
+      const inspectedError = await readStreamBytes(startedBody);
+      const errorBytes = inspectedError.bytes;
       const overflow = classifyEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes));
       if (overflow.overflow) {
         attempt.cancel("request_too_large");
@@ -7845,7 +7909,7 @@ async function relaySelectedModelNoFailover({
           overflow.snippet,
         );
       }
-      startedBody = bytesToReadableStream(errorBytes);
+      startedBody = inspectedError.body;
     }
     const stickiness = operation.responseStickiness;
     let affinityWrite: Promise<AffinitySessionBinding | null> | undefined;
@@ -8694,6 +8758,7 @@ export async function modelTestHandler({
   limiter,
   capacityRuntime,
   source = "AGENT_TEST",
+  agentAccess,
 }: {
   request: Request;
   userId: string;
@@ -8703,6 +8768,7 @@ export async function modelTestHandler({
   capacityRuntime: CapacityAdmissionRuntime;
   /** `TEST`: the person's Test page (its own slots, as Chat Test). */
   source?: "TEST" | "AGENT_TEST";
+  agentAccess?: AgentAccess;
 }): Promise<Response> {
   const prepared =
     kind === "transcription"
@@ -8733,6 +8799,7 @@ export async function modelTestHandler({
           : {
               ...requesterFromChatTestUser(userId, "AGENT_TEST"),
               limitKey: `model-test:${userId}`,
+              agentAccess,
             },
       targets,
       prepared,
@@ -9618,6 +9685,7 @@ export function createModelApiRoutes(dependencies: ModelApiRouteDependencies = {
       prepare: prepareMultipartModeledRequest,
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     }),
   );
 
@@ -9633,6 +9701,7 @@ export function createModelApiRoutes(dependencies: ModelApiRouteDependencies = {
       prepare: prepareJsonModeledRequest,
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     }),
   );
 
@@ -9677,6 +9746,7 @@ export function createModelApiRoutes(dependencies: ModelApiRouteDependencies = {
       prepare: prepareJsonModeledRequest,
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     }),
   );
 

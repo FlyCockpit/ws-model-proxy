@@ -19,18 +19,21 @@ import { env } from "@ws-model-proxy/env/web";
 import { Toaster } from "@ws-model-proxy/ui/components/sileo";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { type ReactNode } from "react";
-import { I18nextProvider } from "react-i18next";
+import { I18nextProvider, useTranslation } from "react-i18next";
 import BottomNav from "@/components/bottom-nav";
 import ErrorState from "@/components/error-state";
+import { FileDropGuard } from "@/components/file-drop-guard";
 import Header from "@/components/header";
 import { ThemeColorSync } from "@/components/theme-color-sync";
 import { ThemeProvider } from "@/components/theme-provider";
+import { UiLabelsBridge } from "@/components/ui-labels-bridge";
 import { useAppUpdate } from "@/hooks/use-app-update";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { useDocumentLang } from "@/hooks/use-document-lang";
 import { useHashTargetScroll } from "@/hooks/use-hash-target-scroll";
 import { useMobileKeyboard } from "@/hooks/use-mobile-keyboard";
 import { useNodeLiveUpdates } from "@/hooks/use-node-live-updates";
+import { useReloadOnIdentityChange } from "@/hooks/use-reload-on-identity-change";
 import { useStaleBuildRecovery } from "@/hooks/use-stale-build-recovery";
 import { useUserLocaleSync } from "@/hooks/use-user-locale-sync";
 import i18n from "@/i18n";
@@ -140,6 +143,8 @@ function RootShell({ children }: { children: ReactNode }) {
 }
 
 function RootComponent() {
+  const { t } = useTranslation("nav");
+  useReloadOnIdentityChange();
   useAppUpdate();
   useStaleBuildRecovery();
   useDocumentLang();
@@ -158,54 +163,76 @@ function RootComponent() {
   return (
     <I18nextProvider i18n={i18n}>
       <I18nReady>
-        <ThemeProvider
-          attribute="class"
-          defaultTheme="system"
-          enableSystem
-          disableTransitionOnChange
-          storageKey="vite-ui-theme"
-        >
-          <div
-            className={cn(
-              "grid h-svh min-w-0",
-              chromeHidden
-                ? // The keyboard covers the bottom safe area: the two overlap, never add up.
-                  "grid-rows-[1fr] pb-[max(0px,calc(var(--safe-area-bottom)-var(--keyboard-inset,0px)))]"
-                : [
-                    "grid-rows-[auto_1fr_auto] md:grid-rows-[auto_1fr] md:pb-0",
-                    !mobileKeyboardOpen && "pb-[calc(3.5rem_+_var(--safe-area-bottom))]",
-                  ],
-            )}
-            style={{
-              paddingTop: "var(--safe-area-top)",
-              paddingLeft: "var(--safe-area-left)",
-              paddingRight: "var(--safe-area-right)",
-            }}
+        <UiLabelsBridge>
+          <ThemeProvider
+            attribute="class"
+            defaultTheme="system"
+            enableSystem
+            disableTransitionOnChange
+            storageKey="vite-ui-theme"
           >
-            {chromeHidden ? null : <Header />}
-            {/* The only page scroller. [container-type:size] lets the sidebar use 100cqh; fixed
+            <a
+              href="#main-content"
+              onClick={(event) => {
+                event.preventDefault();
+                const main = document.getElementById("main-content");
+                if (main) {
+                  main.scrollTop = 0;
+                  main.focus({ preventScroll: true });
+                }
+              }}
+              className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-50 focus:inline-flex focus:min-h-11 focus:items-center focus:bg-background focus:px-4 focus:text-foreground focus:ring-2 focus:ring-ring"
+            >
+              {t("skipToContent")}
+            </a>
+            <div
+              className={cn(
+                "grid h-svh min-w-0 grid-cols-[minmax(0,1fr)]",
+                chromeHidden
+                  ? // The keyboard covers the bottom safe area: the two overlap, never add up.
+                    "grid-rows-[1fr] pb-[max(0px,calc(var(--safe-area-bottom)-var(--keyboard-inset,0px)))]"
+                  : [
+                      "grid-rows-[auto_1fr_auto] md:grid-rows-[auto_1fr] md:pb-0",
+                      !mobileKeyboardOpen && "pb-[calc(3.5rem_+_var(--safe-area-bottom))]",
+                    ],
+              )}
+              style={{
+                paddingTop: "var(--safe-area-top)",
+                paddingLeft: "var(--safe-area-left)",
+                paddingRight: "var(--safe-area-right)",
+              }}
+            >
+              {chromeHidden ? null : <Header />}
+              {/* The only page scroller. [container-type:size] lets the sidebar use 100cqh; fixed
                 descendants must be portaled. `relative` makes main the containing block of
                 absolutely positioned page content (sr-only labels and live regions), so it scrolls
                 and clips with the page instead of extending the document below the viewport. The
                 router saves and restores its scroll per history entry under this id and resets it
                 to the top on new navigations (router.tsx `scrollToTopSelectors`). */}
-            <main
-              data-scroll-restoration-id={MAIN_SCROLLER_ID}
-              className="relative min-h-0 min-w-0 overflow-y-auto overflow-x-clip [container-type:size]"
-            >
-              <Outlet />
-            </main>
-            <BottomNav hidden={mobileKeyboardOpen || chromeHidden} />
-          </div>
-          <ThemeColorSync />
-          <Toaster />
-          {import.meta.env.DEV && (
-            <>
-              <TanStackRouterDevtools position="bottom-left" />
-              <ReactQueryDevtools position="bottom" buttonPosition="bottom-right" />
-            </>
-          )}
-        </ThemeProvider>
+              <main
+                id="main-content"
+                tabIndex={-1}
+                data-scroll-restoration-id={MAIN_SCROLLER_ID}
+                className={cn(
+                  "relative min-h-0 min-w-0 overflow-y-auto overflow-x-clip overscroll-contain outline-none [container-type:size]",
+                  !chromeHidden && "[scrollbar-gutter:stable]",
+                )}
+              >
+                <Outlet />
+              </main>
+              <BottomNav hidden={mobileKeyboardOpen || chromeHidden} />
+            </div>
+            <ThemeColorSync />
+            <Toaster />
+            <FileDropGuard />
+            {import.meta.env.DEV && (
+              <>
+                <TanStackRouterDevtools position="bottom-left" />
+                <ReactQueryDevtools position="bottom" buttonPosition="bottom-right" />
+              </>
+            )}
+          </ThemeProvider>
+        </UiLabelsBridge>
       </I18nReady>
     </I18nextProvider>
   );

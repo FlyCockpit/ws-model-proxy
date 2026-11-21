@@ -1,5 +1,6 @@
 import type { ModelTestServiceInput } from "@ws-model-proxy/api/context";
 import { MCP_TOOLS } from "@ws-model-proxy/api/contracts";
+import { ALL_AGENT_SCOPES } from "@ws-model-proxy/auth/agent-scopes";
 import { RateLimiterMemory } from "rate-limiter-flexible";
 import { describe, expect, it, vi } from "vitest";
 
@@ -40,7 +41,7 @@ const AGENT = {
   kind: "agent_token" as const,
   userId: "me",
   agentTokenId: "tok",
-  level: "FULL" as const,
+  access: { scopes: ALL_AGENT_SCOPES, nodeIds: null },
 };
 
 const POOL_TARGET = {

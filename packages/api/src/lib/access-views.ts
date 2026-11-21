@@ -1,3 +1,5 @@
+import { mcpGrantAccessOf, mcpGrantAccessSelect } from "@ws-model-proxy/auth/mcp-grant-access";
+import { mcpPatBlockedByPolicy } from "@ws-model-proxy/auth/mcp-pat-limits";
 /** Row → view serializers for the Access procedures (`contracts/access.ts`). */
 import type { Prisma } from "@ws-model-proxy/db";
 import type { z } from "zod";
@@ -65,7 +67,7 @@ export function apiKeyView(row: ApiKeyRow): z.infer<typeof apiKeyViewSchema> {
 export const agentTokenSelect = {
   id: true,
   name: true,
-  level: true,
+  grant: { select: mcpGrantAccessSelect },
   lookupPrefix: true,
   createdAt: true,
   lastUsedAt: true,
@@ -74,16 +76,26 @@ export const agentTokenSelect = {
 } satisfies Prisma.AgentTokenSelect;
 export type AgentTokenRow = Prisma.AgentTokenGetPayload<{ select: typeof agentTokenSelect }>;
 
-export function agentTokenView(row: AgentTokenRow): z.infer<typeof agentTokenViewSchema> {
+/**
+ * `allowNoExpiry` is the deployment's `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY`: while it is off an
+ * unrevoked no-expiry token is listed as blocked by policy (refused, not revoked).
+ */
+export function agentTokenView(
+  row: AgentTokenRow,
+  allowNoExpiry: boolean,
+): z.infer<typeof agentTokenViewSchema> {
+  const access = mcpGrantAccessOf(row.grant);
   return {
     id: row.id,
     name: row.name,
-    level: row.level,
+    scopes: [...access.scopes],
+    nodeIds: access.nodeIds === null ? null : [...access.nodeIds],
     lookupPrefix: row.lookupPrefix,
     createdAt: iso(row.createdAt),
     lastUsedAt: isoOrNull(row.lastUsedAt),
     expiresAt: isoOrNull(row.expiresAt),
     revokedAt: isoOrNull(row.revokedAt),
+    blockedByPolicy: row.revokedAt === null && mcpPatBlockedByPolicy(row.expiresAt, allowNoExpiry),
   };
 }
 

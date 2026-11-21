@@ -6,7 +6,6 @@ import { RPCHandler } from "@orpc/server/fetch";
 import { SimpleCsrfProtectionHandlerPlugin } from "@orpc/server/plugins";
 import { ZodToJsonSchemaConverter } from "@orpc/zod/zod4";
 import {
-  type AccessLevelLoweredEvent,
   type Context as ApiContext,
   type ContextServices,
   createContext,
@@ -21,7 +20,10 @@ import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
 import { armAuthDbShutdownFence } from "@ws-model-proxy/auth/auth-db-shutdown-fence";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
-import { onMcpGrantLevelLowered } from "@ws-model-proxy/auth/mcp-grant-level";
+import {
+  type AgentAccessNarrowedEvent,
+  onMcpGrantAccessNarrowed,
+} from "@ws-model-proxy/auth/mcp-grant-access";
 import {
   createPasswordResetRequestHandler,
   createPasswordResetRequestValidator,
@@ -40,8 +42,10 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import {
   endAgentWork,
-  handleAccessLevelLowered,
+  endNarrowedAgentWork,
   handleAccessRevoked,
+  handleAgentAccessNarrowed,
+  narrowedCredentialIds,
 } from "./access-revocation.js";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
 import { resolveClientIp, withResolvedClientIp } from "./client-ip.js";
@@ -57,7 +61,10 @@ import { createMcpAdmissionGate } from "./mcp/admission.js";
 import { createMcpRequestHandler, type McpAuthInstance } from "./mcp/auth.js";
 import { createMcpTransport } from "./mcp/handler.js";
 import { bindMcpToolDispatch } from "./mcp/tool-dispatch.js";
-import { cancelMcpToolCallsForToken, cancelMcpWriteToolCallsForGrant } from "./mcp/tools.js";
+import {
+  cancelMcpToolCallsForNarrowedCredential,
+  cancelMcpToolCallsForToken,
+} from "./mcp/tools.js";
 import { mcpAuthorizeScopeGuard } from "./mcp-authorize-scope-guard.js";
 import { createMcpDiscoveryForwarder, MCP_WELL_KNOWN_PATHS } from "./mcp-discovery.js";
 import {
@@ -137,8 +144,11 @@ import {
   signupLimiter,
   signupRecipientLimiter,
 } from "./rate-limit.js";
-import { readinessResponse } from "./readiness.js";
-import { cancelNodeCommandsForCredentials } from "./relay/node-commands.js";
+import { buildCommit, readinessResponse } from "./readiness.js";
+import {
+  cancelNodeCommandsForCredentials,
+  cancelNodeCommandsForNarrowedCredential,
+} from "./relay/node-commands.js";
 import type { NodeIdentity } from "./relay/node-credential-auth.js";
 import { nodeFileServices } from "./relay/node-file-ops.js";
 import {
@@ -306,20 +316,22 @@ onSessionEnded((session) => {
   terminalBrowserHub.endSession(session.id, session.cause);
 });
 
-/**
- * A grant lowered from Full to Read-only (committed): its Full work ends now
- * (./access-revocation.ts). Shared by the Access page (`onAccessLevelLowered`) and the consent
- * page's re-approval (`onMcpGrantLevelLowered`, packages/auth/src/mcp-grant-level.ts).
- */
-const endLoweredGrantWork = (event: AccessLevelLoweredEvent): Promise<void> =>
-  handleAccessLevelLowered(event, {
-    cancelMcpWriteToolCalls: (grantId) => cancelMcpWriteToolCallsForGrant(grantId),
-    endAgentWork: async (input) => {
-      await endAgentWork(input);
-      await cancelNodeCommandsForCredentials(input);
+/** Shared by Access edits and consent re-approval after the access write commits. */
+const endNarrowedCredentialWork = (event: AgentAccessNarrowedEvent): Promise<void> =>
+  handleAgentAccessNarrowed(event, {
+    cancelMcpToolCalls: cancelMcpToolCallsForNarrowedCredential,
+    endAgentWork: async (narrowed) => {
+      await Promise.all([
+        endNarrowedAgentWork(narrowed),
+        cancelNodeCommandsForNarrowedCredential({
+          userId: narrowed.userId,
+          credentialIds: narrowedCredentialIds(narrowed),
+          access: narrowed.after,
+        }),
+      ]);
     },
   });
-onMcpGrantLevelLowered((event) => endLoweredGrantWork({ kind: "oauth_grant", ...event }));
+onMcpGrantAccessNarrowed(endNarrowedCredentialWork);
 
 /**
  * The server hooks procedures may call (packages/api `ContextServices`).
@@ -355,7 +367,7 @@ function contextServices(request: HonoContext | null): ContextServices {
           await cancelNodeCommandsForCredentials(input);
         },
       }),
-    onAccessLevelLowered: endLoweredGrantWork,
+    onAgentAccessNarrowed: endNarrowedCredentialWork,
   };
 }
 
@@ -769,6 +781,7 @@ export async function createApp(options: CreateAppOptions = {}) {
     const { status, body } = readinessResponse({
       postgres,
       userDeletionSweep: getUserDeletionSweepHealth(),
+      commit: buildCommit(env.BUILD_VERSION),
     });
     return c.json(body, status);
   });
@@ -1125,7 +1138,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   });
 
   if (env.NODE_ENV === "production") {
-    const { serveStatic } = await import("@hono/node-server/serve-static");
+    const { mountStaticClient } = await import("./static-client.js");
     const { fileURLToPath, pathToFileURL } = await import("node:url");
     const { dirname, join } = await import("node:path");
 
@@ -1137,26 +1150,9 @@ export async function createApp(options: CreateAppOptions = {}) {
     // so we hand both an absolute path computed from import.meta.url.
     const webDist = join(dirname(fileURLToPath(import.meta.url)), "../../web/dist");
 
-    // Serve static client assets (JS, CSS, images)
-    // Vite/rolldown content-hashes every file under /assets, so each URL is
-    // immutable: a code change produces a new filename, never a new body at the
-    // same URL. Safe to cache for a year. This middleware runs before the
-    // serveStatic below (sets the header, then defers to it).
-    // IMPORTANT: do NOT add long caching to the catch-all /* serveStatic or the
-    // SSR shell — index.html and version.json must stay revalidated so new
-    // deploys are picked up.
-    app.use("/assets/*", async (c, next) => {
-      c.header("Cache-Control", "public, max-age=31536000, immutable");
-      await next();
-    });
-    app.use("/assets/*", serveStatic({ root: join(webDist, "client") }));
-    // Browsers already bypass their HTTP cache for the SW script; this keeps
-    // proxies/CDNs from caching it heuristically and serving a stale SW.
-    app.use("/sw.js", async (c, next) => {
-      c.header("Cache-Control", "no-cache");
-      await next();
-    });
-    app.use("/*", serveStatic({ root: join(webDist, "client") }));
+    // Static client files (hashed /assets with a plain 404 for missing ones,
+    // the service worker, everything else in the client build): static-client.ts.
+    mountStaticClient(app, join(webDist, "client"));
 
     // Mount TanStack Start for SSR — handles all non-static requests. The bundle
     // is produced by `apps/web` at build time and doesn't exist when this file is

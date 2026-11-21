@@ -8,6 +8,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     BETTER_AUTH_URL: "https://proxy.example.com",
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret-0123",
+    WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: true,
   },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: mockDeep<PrismaClient>() }));
@@ -47,9 +48,12 @@ const FULL_AGENT: CallerAuth = {
   kind: "agent_token",
   userId: "owner",
   agentTokenId: "tok1",
-  level: "FULL",
+  access: {
+    scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+    nodeIds: null,
+  },
 };
-const READ_AGENT: CallerAuth = { ...FULL_AGENT, level: "READ" };
+const READ_AGENT: CallerAuth = { ...FULL_AGENT, access: { scopes: ["read"], nodeIds: null } };
 
 function operator(): NodeOperatorServices & {
   openTerminalTicket: ReturnType<typeof vi.fn>;
@@ -96,6 +100,9 @@ function featuresWith(platform: "linux" | "windows", shells: string[]) {
     mediaExpand: true,
     liveStt: true,
     secrets: [],
+    jobReservations: true,
+    rankIdle: true,
+    selfUpdate: { strategies: ["self-replace"], instancesSurvive: true, remote: "allowed" },
     launch: { platform, management: ["process", "service"], shells },
   };
 }
@@ -149,6 +156,41 @@ beforeEach(() => {
 describe("node commands", () => {
   const runInput = { nodeId: "node1", command: "ls -la", confirm: "RUN" as const };
 
+  it.each([
+    PERSON,
+    FULL_AGENT,
+    {
+      kind: "oauth_access_token",
+      userId: "owner",
+      grantId: "grant1",
+      access: { scopes: ["read", "commands"], nodeIds: null },
+    } satisfies CallerAuth,
+  ])("explains an unusable working directory for $kind commands", async (auth) => {
+    const ops = operator();
+    ops.startCommand.mockRejectedValue({ nodeReason: "bad_cwd" });
+    db.node.findFirst.mockResolvedValue(fullNode as never);
+    db.nodeCommand.create.mockResolvedValue(commandRow as never);
+    db.nodeCommand.updateMany.mockResolvedValue({ count: 1 });
+    await expect(
+      client(auth, ops).commands.run({ ...runInput, cwd: "/missing" }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message:
+        "Node box cannot use that working directory: use an absolute path or ~ for an existing, accessible directory on the node. Its home directory must also be available.",
+      data: { reason: "bad_cwd", subjectId: "node1" },
+    });
+    expect(ops.startCommand).toHaveBeenCalledTimes(1);
+    expect(ops.startCommand).toHaveBeenCalledWith(expect.objectContaining({ cwd: "/missing" }));
+    expect(db.nodeCommand.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ state: "FAILED" }) }),
+    );
+    expect(db.nodeAuditEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ outcome: "failed", reason: "start_failed" }),
+      }),
+    );
+  });
+
   it("refuses a browser call without the CSRF header (a cross-site form post)", async () => {
     const forged: CallerAuth = { ...PERSON, csrfVerified: false };
     await expect(client(forged, operator()).commands.run(runInput)).rejects.toMatchObject({
@@ -195,14 +237,44 @@ describe("node commands", () => {
     expect(db.agentToken.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({
       id: "tok1",
       userId: "owner",
-      level: "FULL",
+      grant: expect.objectContaining({ scopes: { has: "COMMANDS" } }),
       revokedAt: null,
+      // No-expiry tokens are live while WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY is on (mocked on).
+      OR: [{ expiresAt: null }, { expiresAt: { gt: expect.any(Date) } }],
     });
     expect(ops.startCommand).not.toHaveBeenCalled();
     expect(db.nodeAuditEvent.create.mock.calls[0]?.[0].data).toMatchObject({
       outcome: "failed",
       reason: "token_inactive",
     });
+  });
+
+  it("refuses a no-expiry agent token's command at the re-check while no-expiry tokens are off", async () => {
+    const { env } = (await import("@ws-model-proxy/env/server")) as unknown as {
+      env: { WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: boolean };
+    };
+    const ops = operator();
+    db.node.findFirst.mockResolvedValue(fullNode as never);
+    db.nodeCommand.create.mockResolvedValue(commandRow as never);
+    db.nodeCommand.updateMany.mockResolvedValue({ count: 1 });
+    // Returned even while off: the final verdict must not trust the SQL filter alone.
+    db.agentToken.findFirst.mockResolvedValue({ id: "tok1", expiresAt: null } as never);
+    try {
+      env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = false;
+      await expect(client(FULL_AGENT, ops).commands.run(runInput)).rejects.toMatchObject({
+        code: "FORBIDDEN",
+      });
+      expect(db.agentToken.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({
+        OR: [{ expiresAt: { gt: expect.any(Date) } }],
+      });
+      expect(ops.startCommand).not.toHaveBeenCalled();
+      expect(db.nodeAuditEvent.create.mock.calls[0]?.[0].data).toMatchObject({
+        outcome: "failed",
+        reason: "token_inactive",
+      });
+    } finally {
+      env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = true;
+    }
   });
 
   it("refuses a command whose owner was banned while it was being recorded", async () => {
@@ -386,7 +458,10 @@ describe("node commands", () => {
       kind: "oauth_access_token",
       userId: FULL_AGENT.userId,
       grantId: "grant-1",
-      level: "FULL",
+      access: {
+        scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+        nodeIds: null,
+      },
     };
     const ops = operator();
     ops.startCommand.mockRejectedValue(new Error("socket closed"));
@@ -559,7 +634,10 @@ describe("node_command_get cancel withdraws a queued command", () => {
     kind: "oauth_access_token",
     userId: "owner",
     grantId: "grant1",
-    level: "FULL",
+    access: {
+      scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+      nodeIds: null,
+    },
   };
 
   function queued(overrides: Record<string, unknown> = {}) {
@@ -850,4 +928,42 @@ describe("browser terminals and queued commands", () => {
     const listed = await client(PERSON).queued.list({});
     expect(listed.items[0]?.state).toBe("EXPIRED");
   });
+});
+
+describe("queued commands racing access narrowing", () => {
+  const oauthCaller: CallerAuth = {
+    kind: "oauth_access_token",
+    userId: "owner",
+    grantId: "grant1",
+    access: { scopes: ["read", "commands"], nodeIds: null },
+  };
+  it.each([FULL_AGENT, oauthCaller])(
+    "withdraws a queued row if live access lost commands or its node",
+    async (auth) => {
+      db.node.findFirst.mockResolvedValue(fullNode as never);
+      db.queuedNodeCommand.count.mockResolvedValue(0);
+      db.queuedNodeCommand.create.mockResolvedValue(queuedRow as never);
+      db.queuedNodeCommand.updateMany.mockResolvedValue({ count: 1 });
+      db.agentToken.findFirst.mockResolvedValue(null);
+      db.mcpGrant.findFirst.mockResolvedValue(null);
+      await expect(
+        client(auth, operator()).queued.enqueue({ nodeId: "node1", command: "pwd", note: "check" }),
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+      const lookup = auth.kind === "agent_token" ? db.agentToken.findFirst : db.mcpGrant.findFirst;
+      expect(db.queuedNodeCommand.create.mock.invocationCallOrder[0]).toBeLessThan(
+        lookup.mock.invocationCallOrder[0] ?? 0,
+      );
+      expect(db.queuedNodeCommand.updateMany.mock.calls[0]?.[0]).toMatchObject({
+        where: { state: "QUEUED", userId: "owner" },
+        data: { state: "WITHDRAWN" },
+      });
+      const where = lookup.mock.calls[0]?.[0]?.where;
+      expect(JSON.stringify(where)).toContain("COMMANDS");
+      expect(JSON.stringify(where)).toContain("node1");
+      expect(db.nodeAuditEvent.create.mock.calls[0]?.[0]?.data).toMatchObject({
+        reason: "access_narrowed",
+        outcome: "cancelled",
+      });
+    },
+  );
 });

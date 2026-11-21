@@ -1,27 +1,29 @@
 /**
- * Verifies prisma/schema-hardening.sql against the 0.4.0 schema.
+ * Verifies prisma/schema-hardening.sql and the migrations that carry it.
  *
  * Source checks (always): the file's transaction shape, one up-front LOCK covering every table
  * it names, the generated registry block equal to scripts/registry-checks.mjs output, every
- * hardening object of the plan (docs/contracts/0.4.0-schema-hardening.md) that has landed, and
- * the deploy wiring (every push path runs the retrying push and the hardening).
+ * required hardening object, the newest migration's `-- section hardening` block equal to the
+ * file (scripts/db/generate-initial-migrations.mjs), and the deploy wiring (the entrypoint runs
+ * the migration runner; nothing runs `prisma db push`).
  *
- * PostgreSQL integration (with SCHEMA_VALIDATION_DATABASE_URL): pushes the schema into a
- * throwaway schema, applies the hardening (twice: the second run must skip, a forced third must
- * succeed), then exercises each object: ownership, shapes, uniques, fences, and the delete-rule
- * cases of the plan. The schema is dropped afterwards.
+ * PostgreSQL integration (with SCHEMA_VALIDATION_DATABASE_URL): applies 0_init (the released
+ * 0.4.3 schema) into a throwaway schema, seeds 0.4.3 data, applies every later migration, checks
+ * the upgrade backfills, re-applies the hardening (it must be idempotent), then exercises each
+ * object: ownership, shapes, uniques, fences, and the delete-rule cases. The schema is dropped
+ * afterwards.
  */
-import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { readSection, upgradeHardening } from "../../../scripts/db/generate-initial-migrations.mjs";
 import { hardeningSqlBody } from "./hardening-sql.mjs";
 import { currentBlock, registryChecksSql } from "./registry-checks.mjs";
 
-const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const sqlPath = fileURLToPath(new URL("../prisma/schema-hardening.sql", import.meta.url));
 const schemaDir = fileURLToPath(new URL("../prisma/schema/", import.meta.url));
+const migrationsDir = fileURLToPath(new URL("../prisma/migrations/", import.meta.url));
 const sql = await readFile(sqlPath, "utf8");
 const prismaSources = (
   await Promise.all(
@@ -32,12 +34,21 @@ const prismaSources = (
       .map((name) => readFile(`${schemaDir}${name}`, "utf8")),
   )
 ).join("\n");
-const [packageJson, agentCompose, entrypoint, dangerousWrapper, applyScript] = await Promise.all([
+const migrations = await Promise.all(
+  (await readdir(migrationsDir, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort()
+    .map(async (name) => ({
+      name,
+      sql: await readFile(`${migrationsDir}${name}/migration.sql`, "utf8"),
+    })),
+);
+const [packageJson, rootPackageJson, agentCompose, entrypoint] = await Promise.all([
   readFile(new URL("../package.json", import.meta.url), "utf8"),
+  readFile(new URL("../../../package.json", import.meta.url), "utf8"),
   readFile(new URL("../../../docker-compose.agent.yml", import.meta.url), "utf8"),
   readFile(new URL("../../../scripts/docker-entrypoint.sh", import.meta.url), "utf8"),
-  readFile(new URL("../../../scripts/db-push-dangerous-local.sh", import.meta.url), "utf8"),
-  readFile(new URL("./apply-schema-hardening.mjs", import.meta.url), "utf8"),
 ]);
 
 // ── Source checks ──
@@ -51,13 +62,14 @@ if (generated !== registryChecksSql())
     "The registry block is stale: run `node scripts/registry-checks.mjs --write` in packages/db",
   );
 
-/** Objects the plan lands in S0a (shapes, ownership, fences, delete rules). */
+/** Required shapes, ownership checks, fences and delete rules. */
 const REQUIRED_OBJECTS = [
   // shared and auth
   "wsmp_registry_ok",
   "reject_immutable_history_mutation",
   "session_refuse_deleting_user",
   "user_deletion_marker_guard",
+  "mcp_grant_scopes_read",
   // nodes
   "node_shape_check",
   "node_port_range_check",
@@ -111,6 +123,7 @@ const REQUIRED_OBJECTS = [
   "instance_reservation_current_index",
   "instance_step_node_owner",
   "instance_run_order",
+  "runtime_instance_run_positive",
   "instance_step_run_order",
   "instance_step_shape",
   "instance_step_operator_shape",
@@ -201,26 +214,30 @@ for (const name of REQUIRED_OBJECTS)
   if (!new RegExp(`\\b${name}\\b`).test(sql))
     throw new Error(`schema-hardening.sql is missing ${name}`);
 
-for (const fragment of [
-  'error?.code === "40P01"',
-  'error?.code === "55P03"',
-  "MAX_ATTEMPTS",
-  "SCHEMA_HARDENING_FORCE",
-  "wmp_schema_hardening_state",
-]) {
-  if (!applyScript.includes(fragment))
-    throw new Error(`Missing schema retry fragment: ${fragment}`);
-}
+// The newest migration that carries the hardening holds exactly this file's body.
+const carriers = migrations.filter((migration) =>
+  migration.sql.includes("\n-- section hardening\n"),
+);
+const carrier = carriers.at(-1);
+if (!carrier) throw new Error("no migration carries a `-- section hardening` block");
+if (readSection(carrier.sql, "hardening") !== upgradeHardening(hardeningSqlBody(sql)).trim())
+  throw new Error(
+    `schema-hardening.sql differs from the hardening in migration ${carrier.name}: run \`node scripts/db/generate-initial-migrations.mjs\` (before 1.0.0 ships) or add a migration with the new body`,
+  );
 for (const [name, contents, fragment] of [
-  ["package db:push", packageJson, "node scripts/apply-schema-hardening.mjs"],
-  ["agent compose", agentCompose, "pnpm -F @ws-model-proxy/db db:push"],
-  ["container entrypoint", entrypoint, "apply-schema-hardening.mjs"],
-  ["dangerous local wrapper", dangerousWrapper, "apply-schema-hardening.mjs"],
-  ["package db:push", packageJson, "node scripts/push-schema.mjs &&"],
-  ["container entrypoint", entrypoint, "node scripts/push-schema.mjs $push_flags"],
-  ["dangerous local wrapper", dangerousWrapper, "node scripts/push-schema.mjs --accept-data-loss"],
+  ["container entrypoint", entrypoint, "scripts/db/migrate-runtime.mjs"],
+  ["agent compose", agentCompose, "prisma migrate deploy"],
 ]) {
   if (!contents.includes(fragment)) throw new Error(`${name} bypasses ${fragment}`);
+}
+for (const [name, contents] of [
+  ["packages/db package.json", packageJson],
+  ["root package.json", rootPackageJson],
+  ["container entrypoint", entrypoint],
+  ["agent compose", agentCompose],
+]) {
+  if (/\bdb push\b|\bdb:push\b/.test(contents))
+    throw new Error(`${name} still runs \`prisma db push\`; schema changes ship as migrations`);
 }
 
 // DL-1: the first statement locks every repository table named outside comments and literals.
@@ -262,8 +279,6 @@ if (!baseUrl) {
 // ── PostgreSQL integration ──
 
 const schema = `schema_validation_${randomBytes(8).toString("hex")}`;
-const prismaUrl = new URL(baseUrl);
-prismaUrl.searchParams.set("schema", schema);
 const schemaUrl = new URL(baseUrl);
 schemaUrl.searchParams.set("options", `-c search_path=${schema}`);
 schemaUrl.search = schemaUrl.searchParams.toString().replace(/\+/g, "%20");
@@ -271,25 +286,39 @@ const admin = new pg.Client({ connectionString: baseUrl });
 const client = new pg.Client({ connectionString: schemaUrl.toString() });
 const app = new pg.Client({ connectionString: schemaUrl.toString() });
 
-function runHardening(extraEnv = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["scripts/apply-schema-hardening.mjs"], {
-      cwd: packageRoot,
-      env: { ...process.env, ...extraEnv, DATABASE_URL: schemaUrl.toString() },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let output = "";
-    child.stdout.on("data", (chunk) => {
-      output += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      output += chunk;
-    });
-    child.once("error", reject);
-    child.once("exit", (code) =>
-      code === 0 ? resolve(output) : reject(new Error(`hardening exited ${code}:\n${output}`)),
-    );
-  });
+const migrationSql = (name) => {
+  const found = migrations.find((migration) => migration.name === name);
+  if (!found) throw new Error(`missing migration ${name}`);
+  return found.sql;
+};
+
+/** Apply migration files the way Prisma does (one wrapped transaction each), in this schema. */
+async function applyMigrations(names) {
+  const session = new pg.Client({ connectionString: schemaUrl.toString() });
+  await session.connect();
+  try {
+    await session.query("SET client_min_messages = warning");
+    for (const name of names) await session.query(migrationSql(name));
+  } finally {
+    await session.end().catch(() => undefined);
+  }
+}
+
+/** Re-apply the newest hardening body on its own session: it must be idempotent. */
+async function reapplyHardening() {
+  const session = new pg.Client({ connectionString: schemaUrl.toString() });
+  await session.connect();
+  try {
+    await session.query("SET client_min_messages = warning");
+    await session.query("BEGIN");
+    await session.query(readSection(carrier.sql, "hardening"));
+    await session.query("COMMIT");
+  } catch (error) {
+    await session.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    await session.end().catch(() => undefined);
+  }
 }
 
 let failures = 0;
@@ -327,17 +356,110 @@ const ALWAYS_ON = `'{"api":"openai","engine":"llama_cpp","modelType":"llm","addr
 try {
   await admin.connect();
   await admin.query(`CREATE SCHEMA ${schema}`);
-  execFileSync("pnpm", ["exec", "prisma", "db", "push"], {
-    cwd: packageRoot,
-    env: { ...process.env, DATABASE_URL: prismaUrl.toString() },
-    stdio: "pipe",
-  });
-  await runHardening();
-  const second = await runHardening();
-  if (!second.includes("skipping")) throw new Error(`second apply did not skip:\n${second}`);
-  await runHardening({ SCHEMA_HARDENING_FORCE: "1" });
-
+  // The released 0.4.3 schema first; the pre-upgrade rows go in under its hardening.
+  await applyMigrations(["0_init"]);
   await client.connect();
+  // 0.4.3's run-order trigger refuses a new step outside the current run; these steps predate it.
+  await client.query("SET wsmp.fences = ',*,'");
+  await client.query("ALTER TABLE instance_step DISABLE TRIGGER instance_step_run_order");
+  await client.query(`
+    INSERT INTO "user" (id, name, email, slug) VALUES ('upgrade-owner', 'Upgrade', 'upgrade@example.test', 'upgrade-owner');
+    INSERT INTO node (id, "userId", slug, trust) VALUES ('upgrade-node', 'upgrade-owner', 'upgrade', 'FULL');
+    INSERT INTO runtime (id, "userId", slug, name, kind, origin)
+      VALUES ('upgrade-runtime', 'upgrade-owner', 'upgrade', 'Upgrade', 'STARTABLE', 'SERVER');
+    INSERT INTO runtime_version (id, "runtimeId", version, editor, "editorUserId", "contentHash",
+      "launchHash", spec, api, engine, "modelType") VALUES
+      ('upgrade-version', 'upgrade-runtime', 1, 'USER', 'upgrade-owner', ${HEX("1")},
+        ${HEX("a")}, ${STARTABLE}, 'OPENAI', 'VLLM', 'LLM');
+    UPDATE runtime SET "currentVersionId" = 'upgrade-version' WHERE id = 'upgrade-runtime';
+    INSERT INTO runtime_operation (id, "userId", kind, actor, "actorUserId", summary, fingerprint)
+      VALUES ('upgrade-operation', 'upgrade-owner', 'RESTART', 'USER', 'upgrade-owner', '{}', ${HEX("f")});
+    INSERT INTO runtime_instance (id, "userId", "runtimeId", "versionId", "launchVersionId", handle,
+      "startedBy", "desiredState", phase, "operationId", "runGeneration")
+    SELECT 'upgrade-' || name, 'upgrade-owner', 'upgrade-runtime', 'upgrade-version', 'upgrade-version',
+      'i-' || lpad(index::text, 12, '0'), 'USER', 'RUNNING', phase::"InstancePhase", operation, run
+    FROM (VALUES
+      ('empty', 1, 'READY', NULL, 0),
+      ('latest', 2, 'READY', NULL, 0),
+      ('starting', 3, 'STARTING', 'upgrade-operation', 0),
+      ('unavailable', 4, 'UNAVAILABLE', 'upgrade-operation', 0),
+      ('prepared', 5, 'STARTING', 'upgrade-operation', 0),
+      ('current', 6, 'STARTING', 'upgrade-operation', 9)
+    ) AS cases(name, index, phase, operation, run);
+    INSERT INTO instance_step (id, "instanceId", "nodeId", rank, phase, sequence, generation, intent, "intentHash")
+    SELECT 'upgrade-step-' || name, 'upgrade-' || name, 'upgrade-node', 0, 'START', 500, 5,
+      CASE WHEN name = 'prepared' THEN '{"operationId":"upgrade-operation"}'::jsonb ELSE '{}'::jsonb END,
+      ${HEX("b")} FROM (VALUES ('latest'), ('starting'), ('unavailable'), ('prepared'), ('current')) AS cases(name);
+    INSERT INTO instance_step (id, "instanceId", "nodeId", rank, phase, sequence, generation, intent, "intentHash")
+      VALUES ('upgrade-health', 'upgrade-latest', 'upgrade-node', 0, 'HEALTH', 9900, 99, '{}', ${HEX("b")});
+    INSERT INTO provider_account (id, "userId", "providerType", label, "baseUrl", "endpointIdentity", "authType")
+      VALUES ('upgrade-account', 'upgrade-owner', 'generic', 'Upgrade', 'https://upstream.example.test', 'https://upstream.example.test', 'API_KEY');
+    INSERT INTO provider_model (id, "userId", "providerAccountId", "upstreamModelId", type,
+      "capabilityMetadata", "nativeCapabilities") VALUES
+      ('upgrade-model', 'upgrade-owner', 'upgrade-account', 'model', 'LLM',
+       '{"version":1,"protocol":"openai-compatible","completions":{"supported":true},"chatCompletions":{"supported":true}}',
+       '{"version":4,"protocol":"openai-compatible","surfaces":{"openaiCompletions":{"operations":["create"]},"openaiChatCompletions":{"operations":["create"]}}}');
+    INSERT INTO provider_model (id, "userId", "providerAccountId", "upstreamModelId", type, "nativeCapabilities") VALUES
+      ('upgrade-array', 'upgrade-owner', 'upgrade-account', 'array-model', 'LLM',
+       '{"surfaces":["openai-chat"],"streaming":true,"completions":true}');
+  `);
+  await client.query("ALTER TABLE instance_step ENABLE TRIGGER instance_step_run_order");
+  await client.query(`INSERT INTO mcp_grant (id, "userId", "clientId", "referenceId", level) VALUES
+    ('upgrade-read-grant', 'upgrade-owner', 'upgrade-read', 'r', 'READ'),
+    ('upgrade-full-grant', 'upgrade-owner', 'upgrade-full', 'f', 'FULL')`);
+  await client.query("RESET wsmp.fences");
+  await applyMigrations(migrations.slice(1).map((migration) => migration.name));
+  await expectValue(
+    "READ grant preserves read-only access",
+    `SELECT scopes::text || ':' || "allNodes"::text FROM mcp_grant WHERE id = 'upgrade-read-grant'`,
+    "{READ}:true",
+  );
+  await expectValue(
+    "FULL grant preserves all seven scopes",
+    `SELECT scopes::text || ':' || "allNodes"::text FROM mcp_grant WHERE id = 'upgrade-full-grant'`,
+    "{READ,POOLS,RUNTIMES,NODES_MANAGE,COMMANDS,FILES,MODELS_TEST}:true",
+  );
+  await expectValue(
+    "upgrade run backfill",
+    `SELECT string_agg("runGeneration"::text, ',' ORDER BY id)
+    FROM runtime_instance WHERE "userId" = 'upgrade-owner'`,
+    "9,1,5,5,6,6",
+  );
+  await expectValue(
+    "upgrade strips only retired capability keys",
+    `SELECT
+    "capabilityMetadata" = '{"version":1,"protocol":"openai-compatible","chatCompletions":{"supported":true}}'::jsonb
+    AND "nativeCapabilities" = '{"version":4,"protocol":"openai-compatible","surfaces":{"openaiChatCompletions":{"operations":["create"]}}}'::jsonb
+    FROM provider_model WHERE id = 'upgrade-model'`,
+    true,
+  );
+  await expectValue(
+    "upgrade preserves an array surface inventory",
+    `SELECT "nativeCapabilities" = '{"surfaces":["openai-chat"],"streaming":true}'::jsonb
+      FROM provider_model WHERE id = 'upgrade-array'`,
+    true,
+  );
+  await reapplyHardening();
+
+  await expectValue(
+    "reapplying leaves upgraded runs unchanged",
+    `SELECT string_agg("runGeneration"::text, ',' ORDER BY id)
+    FROM runtime_instance WHERE "userId" = 'upgrade-owner'`,
+    "9,1,5,5,6,6",
+  );
+  await client.query("SET wsmp.fences = ',*,'");
+  await expectFailure(
+    "positive run on insert",
+    `INSERT INTO runtime_instance (id, "userId", "runtimeId", "versionId", "launchVersionId", handle,
+    "startedBy", "desiredState", phase, "runGeneration") VALUES ('upgrade-zero', 'upgrade-owner', 'upgrade-runtime', 'upgrade-version', 'upgrade-version',
+    'i-000000000007', 'USER', 'RUNNING', 'READY', 0)`,
+    "23514",
+    /runtime_instance_run_positive/,
+  );
+  await client.query(`DELETE FROM runtime_instance WHERE "userId" = 'upgrade-owner'; -- policy: bounded-delete
+    UPDATE runtime SET "currentVersionId" = NULL WHERE id = 'upgrade-runtime';
+    DELETE FROM runtime WHERE id = 'upgrade-runtime'; -- policy: bounded-delete
+    DELETE FROM "user" WHERE id = 'upgrade-owner'`); // policy: bounded-delete
   // Fixture writer: the deploy/fixture marker satisfies every graph-write fence.
   await client.query("SET wsmp.fences = ',*,'");
   await client.query(`
@@ -697,7 +819,7 @@ try {
   // The shared fabric-IP vectors (TS isFabricIp, Rust is_fabric_ip) agree with the database.
   const fabricVectors = JSON.parse(
     await readFile(
-      new URL("../../../apps/cli/tests/fixtures/relay-3.0/rules/fabric-ip.json", import.meta.url),
+      new URL("../../../apps/cli/tests/fixtures/relay-4.0/rules/fabric-ip.json", import.meta.url),
       "utf8",
     ),
   );
@@ -1528,12 +1650,45 @@ try {
   );
 
   // ── auth ──
+  await client.query(`INSERT INTO mcp_grant (id, "userId", "clientId", "referenceId", "allNodes") VALUES
+    ('grant-a', 'owner-a', 'client-a', 'r', false), ('grant-b', 'owner-b', 'client-b', 'r', false)`);
+  await expectFailure(
+    "every grant requires READ",
+    `UPDATE mcp_grant SET scopes = ARRAY['FILES']::"AgentScope"[] WHERE id = 'grant-a'`,
+    "23514",
+    /mcp_grant_scopes_read/,
+  );
+  await client.query(
+    `INSERT INTO mcp_grant_node ("grantId", "nodeId", "userId") VALUES ('grant-a', 'node-a1', 'owner-a')`,
+  );
+  await expectFailure(
+    "grant nodes must share the grant owner",
+    `INSERT INTO mcp_grant_node ("grantId", "nodeId", "userId") VALUES ('grant-b', 'node-a2', 'owner-a')`,
+    "23503",
+  );
+  await expectFailure(
+    "grant nodes must share the node owner",
+    `INSERT INTO mcp_grant_node ("grantId", "nodeId", "userId") VALUES ('grant-a', 'node-b1', 'owner-a')`,
+    "23503",
+  );
   await client.query(`INSERT INTO "user" (id, name, email, slug, "deletionRequestedAt") VALUES
     ('deleting', 'D', 'd@example.test', 'deleting', now())`);
   await expectFailure(
     "session_refuse_deleting_user",
     `INSERT INTO session (id, "expiresAt", token, "userId") VALUES ('s-1', now() + interval '1 hour', 't-1', 'deleting')`,
     "WMPD1",
+  );
+  await client.query(`INSERT INTO "user" (id, name, email, slug, banned, "banExpires") VALUES
+    ('banned-now', 'B', 'banned-now@example.test', 'banned-now', true, NULL),
+    ('banned-past', 'P', 'banned-past@example.test', 'banned-past', true, now() - interval '1 hour')`);
+  await expectFailure(
+    "session_refuse_deleting_user refuses an actively banned user",
+    `INSERT INTO session (id, "expiresAt", token, "userId") VALUES ('s-2', now() + interval '1 hour', 't-2', 'banned-now')`,
+    "WMPD1",
+  );
+  // An expired ban does not block (Better Auth lifts it on sign-in).
+  await client.query(
+    `INSERT INTO session (id, "expiresAt", token, "userId") VALUES ('s-3', now() + interval '1 hour', 't-3', 'banned-past')`,
   );
   await expectFailure(
     "user_deletion_marker_guard",
@@ -1654,7 +1809,7 @@ try {
   const keptBefore = (
     await client.query(`SELECT count(*) FROM pool_sidecar WHERE "poolId" <> 'pool-b-own'`)
   ).rows[0].count;
-  await runHardening({ SCHEMA_HARDENING_FORCE: "1" });
+  await reapplyHardening();
   await expectValue(
     "applying the hardening removes a sidecar its owner may no longer use",
     `SELECT count(*) FROM pool_sidecar WHERE id = 'sc-b-use-2'`,

@@ -50,5 +50,6 @@
   "needsYou": {
     "badge_one": "{{count}} cosa te necesita",
     "badge_other": "{{count}} cosas te necesitan"
-  }
+  },
+  "skipToContent": "Saltar al contenido"
 }

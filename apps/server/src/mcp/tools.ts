@@ -4,17 +4,16 @@
  *
  * Exports for the server wiring:
  * - `registerMcpTools(server, ctx)`: the transport factory's `registerTools` seam
- *   (mcp/handler.ts). It lists the tools the request's level may call: READ tokens the 7
- *   read tools, FULL tokens all 28.
+ *   (mcp/handler.ts). It lists only tools whose scope the request holds.
  * - `cancelMcpToolCallsForToken(credentialId)`: aborts the in-flight tool calls of one
  *   agent token or OAuth grant (call it when the token is revoked).
- * - `cancelMcpWriteToolCallsForGrant(grantId)`: aborts the in-flight write tool calls of an
- *   OAuth grant lowered from Full to Read-only.
+ * - `cancelMcpToolCallsForNarrowedCredential(id)`: aborts every tool call on narrowing,
+ *   including late registrations with a stale access snapshot.
  * - `runMcpTool(contract, state)`: one call through the wrapper chain (tests drive it).
  *
  * The wrapper chain of one call:
  *   1. dispatch: the verified request's oRPC context (mcp/tool-dispatch.ts); none → fail closed;
- *   2. level: a FULL tool on a READ credential answers like an unknown tool;
+ *   2. scope: an out-of-scope tool answers like an unknown tool;
  *   3. rate limit (`contract.rateLimit`, per credential and key);
  *   4. input: the tool's contract schema; errors name the field path, never the value;
  *   5. route: the procedures in `contract.procedures` (see `routeToolCall`), each called
@@ -45,10 +44,12 @@ import type {
 } from "@modelcontextprotocol/server";
 import { call, getRouter, isProcedure, ORPCError } from "@orpc/server";
 import {
+  type AgentAccess,
   advertisedInputSchema,
-  MCP_READ_TOOLS,
+  agentToolAllowed,
   MCP_TOOLS,
   type McpToolContract,
+  type McpToolName,
   refusalReservationSchema,
   SENSITIVE_INPUT_PROCEDURES,
 } from "@ws-model-proxy/api/contracts";
@@ -71,7 +72,7 @@ export const MCP_TOOL_OUTPUT_MAX_BYTES = 256 * 1024;
 export const MCP_TOOL_OUTPUT_SDK_HEADROOM_BYTES = 1024;
 const OUTPUT_BUDGET_BYTES = MCP_TOOL_OUTPUT_MAX_BYTES - MCP_TOOL_OUTPUT_SDK_HEADROOM_BYTES;
 
-const READ_TOOL_NAMES: ReadonlySet<string> = new Set(MCP_READ_TOOLS);
+const TOOL_NAMES: ReadonlySet<string> = new Set(MCP_TOOLS.map((tool) => tool.name));
 
 // ── tools/list ──
 
@@ -107,9 +108,9 @@ export function toolSchemaTag(contract: McpToolContract): string {
   return tag;
 }
 
-/** Whether a credential of this level may see and call the tool. */
-export function mcpToolAllowed(name: string, level: "READ" | "FULL"): boolean {
-  return level === "FULL" || READ_TOOL_NAMES.has(name);
+/** Whether a credential holds the scope needed to see and call this known tool. */
+export function mcpToolAllowed(name: string, access: AgentAccess): boolean {
+  return TOOL_NAMES.has(name) && agentToolAllowed(access, name as McpToolName);
 }
 
 /**
@@ -118,9 +119,9 @@ export function mcpToolAllowed(name: string, level: "READ" | "FULL"): boolean {
  */
 export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): void {
   const dispatch = resolveMcpToolDispatch(ctx?.authInfo);
-  const level = dispatch?.credential.level ?? "READ";
+  const access = dispatch?.credential.access ?? { scopes: ["read"], nodeIds: null };
   for (const contract of MCP_TOOLS) {
-    if (!mcpToolAllowed(contract.name, level)) continue;
+    if (!mcpToolAllowed(contract.name, access)) continue;
     server.registerTool<StandardSchemaWithJSON, StandardSchemaWithJSON>(
       contract.name,
       {
@@ -134,8 +135,8 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
 
 // ── in-flight calls per credential (revocation) ──
 
-/** One in-flight call; `write`: a FULL-only tool (lowering a grant ends these). */
-type InFlightCall = { controller: AbortController; write: boolean };
+/** One in-flight call (all calls end on revocation or narrowing). */
+type InFlightCall = { controller: AbortController };
 const inFlight = new Map<string, Set<InFlightCall>>();
 
 function credentialId(credential: McpRequestCredential): string {
@@ -178,70 +179,50 @@ export function cancelMcpToolCallsForToken(id: string): number {
   return calls.size;
 }
 
-/**
- * OAuth grants lowered from Full to Read-only recently: grant id → `performance.now()` taken
- * after the lowering committed. A write call whose request read the grant's level BEFORE that
- * (`levelReadAt`, taken before the read) still carries the stale FULL; it is aborted when it
- * registers. Requests that read the level later see READ and never reach a write tool. A few
- * minutes covers every request between its level read and its call registration.
- */
-const LOWERED_REMEMBER_MS = 5 * 60_000;
-const recentlyLowered = new Map<string, number>();
+/** Credential id → narrowing commit time, compared with each request's access read. */
+const NARROWED_REMEMBER_MS = 5 * 60_000;
+const recentlyNarrowed = new Map<string, number>();
 
 /** Insertion order is lowering order (one window for all): stop at the first live entry. */
-function pruneLowered(now: number) {
-  for (const [key, at] of recentlyLowered) {
-    if (at + LOWERED_REMEMBER_MS > now) return;
-    recentlyLowered.delete(key);
+function pruneNarrowed(now: number) {
+  for (const [key, at] of recentlyNarrowed) {
+    if (at + NARROWED_REMEMBER_MS > now) return;
+    recentlyNarrowed.delete(key);
   }
 }
 
-function loweredSinceLevelRead(credential: McpRequestCredential): boolean {
-  if (credential.kind !== "oauth") return false;
-  pruneLowered(performance.now());
-  const at = recentlyLowered.get(credential.grantId);
-  return at !== undefined && at >= credential.levelReadAt;
+function narrowedSinceAccessRead(credential: McpRequestCredential): boolean {
+  pruneNarrowed(performance.now());
+  const at = recentlyNarrowed.get(credentialId(credential));
+  return at !== undefined && at >= credential.accessReadAt;
 }
 
-/**
- * An OAuth grant was lowered from Full to Read-only (committed): aborts its in-flight write
- * (FULL-only) tool calls and any write call still registering with the stale level. Read calls
- * go on; a later raise is honored from the next request (its level read is newer).
- */
-export function cancelMcpWriteToolCallsForGrant(grantId: string): number {
+/** Abort every call, and fence late registrations carrying an older access snapshot. */
+export function cancelMcpToolCallsForNarrowedCredential(id: string): number {
   const now = performance.now();
-  pruneLowered(now);
-  // Re-inserted at the end so the map stays in lowering order.
-  recentlyLowered.delete(grantId);
-  recentlyLowered.set(grantId, now);
-  const calls = inFlight.get(grantId);
+  pruneNarrowed(now);
+  recentlyNarrowed.delete(id);
+  recentlyNarrowed.set(id, now);
+  const calls = inFlight.get(id);
   if (!calls) return 0;
-  let aborted = 0;
-  for (const call of calls) {
-    if (!call.write) continue;
-    call.controller.abort();
-    aborted += 1;
-  }
-  return aborted;
+  for (const call of calls) call.controller.abort();
+  inFlight.delete(id);
+  return calls.size;
 }
 
-function trackCall(
-  credential: McpRequestCredential,
-  parent: AbortSignal | undefined,
-  write: boolean,
-) {
+function trackCall(credential: McpRequestCredential, parent: AbortSignal | undefined) {
   const controller = new AbortController();
   const onAbort = () => controller.abort();
   if (
     parent?.aborted ||
     revokedRecently(credentialId(credential)) ||
-    (write && loweredSinceLevelRead(credential))
+    narrowedSinceAccessRead(credential)
   )
     controller.abort();
   else parent?.addEventListener("abort", onAbort, { once: true });
   const id = credentialId(credential);
   const set = inFlight.get(id) ?? new Set<InFlightCall>();
-  const call: InFlightCall = { controller, write };
+  const call: InFlightCall = { controller };
   set.add(call);
   inFlight.set(id, set);
   return {
@@ -783,7 +764,7 @@ export async function runMcpTool(
     return toolError("Internal error", { error: { code: "INTERNAL_ERROR" } });
   }
   const { requestId, credential } = dispatch;
-  if (!mcpToolAllowed(contract.name, credential.level)) return unknownToolError(contract.name);
+  if (!mcpToolAllowed(contract.name, credential.access)) return unknownToolError(contract.name);
 
   const sensitive = toolInputIsSensitive(contract);
   const parsed = contract.input.safeParse(state.args ?? {});
@@ -807,7 +788,7 @@ export async function runMcpTool(
     return toolError("Internal error", { error: { code: "INTERNAL_ERROR" }, requestId });
   }
 
-  const tracked = trackCall(credential, dispatch.signal, !READ_TOOL_NAMES.has(contract.name));
+  const tracked = trackCall(credential, dispatch.signal);
   const invoke = state.invoke ?? invokeBoundProcedure;
   try {
     const outputs: unknown[] = [];

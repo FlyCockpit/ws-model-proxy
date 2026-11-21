@@ -72,6 +72,7 @@ function buildContext(
 describe("authRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    for (const mock of [db.user.update]) mock.mockClear();
   });
 
   describe("updateLocale", () => {

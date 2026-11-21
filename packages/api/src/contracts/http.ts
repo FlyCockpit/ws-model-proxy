@@ -6,13 +6,13 @@ import { z } from "zod";
 import { idSchema, nodeSlugSchema, nodeSlugShapeSchema } from "./common";
 import { removeAfterOfflineMsSchema } from "./nodes";
 
-export const RELAY_PROTOCOL = "3.0";
+export const RELAY_PROTOCOL_VERSION = "4.0";
 
 /** `GET /.well-known/wsmp`: what `wsmp login <url>` checks and pins (SEC-13). */
 export const wellKnownWsmpSchema = z
   .object({
     serverVersion: z.string(),
-    protocolVersion: z.literal(RELAY_PROTOCOL),
+    protocolVersion: z.literal(RELAY_PROTOCOL_VERSION),
     /** Canonical public origin (pinned by the node). */
     origin: z.string().url(),
     installScript: z.literal("/install.sh"),

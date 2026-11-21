@@ -1,4 +1,5 @@
 import { hasUntrustedStructure } from "@ws-model-proxy/auth/auth-logger-bridge";
+import { MCP_PAT_NO_EXPIRY_BLOCKED_REASON } from "@ws-model-proxy/auth/mcp-pat-limits";
 
 /**
  * Standards-compliant safe MCP error responses (Phase 4 item 5).
@@ -86,6 +87,44 @@ export function mcpUnauthorizedResponse({
       "WWW-Authenticate": `Bearer ${challenge}`,
     },
   });
+}
+
+/**
+ * 401 for a no-expiry agent token while `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY` is off. Typed so an
+ * agent (and its person) can tell "mint a dated token" apart from a wrong or revoked one: the
+ * challenge's `error_description` and the body's `error.data.reason` carry
+ * `mcp_pat_no_expiry_blocked`. Sent only after the secret verified, so it discloses nothing
+ * the caller does not already hold.
+ */
+export function mcpAgentTokenPolicyBlockedResponse({
+  resourceUrl,
+}: {
+  resourceUrl: string;
+}): Response {
+  const challenge = [
+    'error="invalid_token"',
+    `resource_metadata="${quoteAuthParam(mcpResourceMetadataUrl(resourceUrl))}"`,
+    `error_description="${MCP_PAT_NO_EXPIRY_BLOCKED_REASON}"`,
+  ].join(", ");
+  return new Response(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      error: {
+        code: AUTHORIZATION_ERROR_JSONRPC_CODE,
+        message: "Unauthorized",
+        data: {
+          reason: MCP_PAT_NO_EXPIRY_BLOCKED_REASON,
+          message:
+            "This agent token has no expiry, and this server no longer allows agent tokens without an expiry. Create a token with an expiry date, or ask the operator to allow no-expiry tokens again.",
+        },
+      },
+      id: null,
+    }),
+    {
+      status: 401,
+      headers: { "Content-Type": "application/json", "WWW-Authenticate": `Bearer ${challenge}` },
+    },
+  );
 }
 
 /**

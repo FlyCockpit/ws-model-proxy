@@ -77,6 +77,12 @@ describe("ResetPasswordCard under the real router", () => {
     const router = setup(`/en-US/reset-password?token=${TOKEN}`);
     const password = await screen.findByLabelText("auth:resetPassword.newPassword");
 
+    for (const label of ["auth:resetPassword.newPassword", "auth:resetPassword.confirmPassword"]) {
+      const input = screen.getByLabelText(label);
+      for (const token of ["h-11", "text-base", "md:h-8", "md:text-xs"]) {
+        expect(input.classList.contains(token)).toBe(true);
+      }
+    }
     // The address bar and the router's search no longer carry the token...
     await waitFor(() => expect(window.location.search).not.toContain("token"));
     await waitFor(() =>

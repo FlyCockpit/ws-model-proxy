@@ -4,7 +4,7 @@ use crate::protocol::parse_server_control;
 fn fixture(name: &str) -> String {
     std::fs::read_to_string(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/relay-3.0/frames/server-to-node")
+            .join("tests/fixtures/relay-4.0/frames/server-to-node")
             .join(name),
     )
     .expect("fixture")
@@ -399,7 +399,7 @@ fn bind_warnings_follow_the_server_rule() {
 fn partial(name: &str) -> String {
     std::fs::read_to_string(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/relay-3.0/partial/server-to-node")
+            .join("tests/fixtures/relay-4.0/partial/server-to-node")
             .join(name),
     )
     .expect("fixture")

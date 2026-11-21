@@ -110,26 +110,37 @@ describe("policy constants (Resolved defaults)", () => {
   });
 
   it("lists the enabled scopes and registration ceilings", () => {
-    expect(mcpConfig.MCP_SCOPES).toEqual(["mcp:read", "mcp:write", "offline_access"]);
+    expect(mcpConfig.MCP_SCOPES).toEqual([
+      "mcp:read",
+      "mcp:pools",
+      "mcp:runtimes",
+      "mcp:nodes:manage",
+      "mcp:commands",
+      "mcp:files",
+      "mcp:models:test",
+      "offline_access",
+    ]);
     expect(mcpConfig.MCP_CLIENT_REGISTRATION_DEFAULT_SCOPES).toEqual([
       "mcp:read",
       "offline_access",
     ]);
-    expect(mcpConfig.MCP_CLIENT_REGISTRATION_ALLOWED_EXTRA_SCOPES).toEqual(["mcp:write"]);
+    expect(mcpConfig.MCP_CLIENT_REGISTRATION_ALLOWED_EXTRA_SCOPES).toEqual([
+      "mcp:pools",
+      "mcp:runtimes",
+      "mcp:nodes:manage",
+      "mcp:commands",
+      "mcp:files",
+      "mcp:models:test",
+    ]);
   });
 });
 
 describe("protected-resource scope matcher (invariant 9)", () => {
-  it("satisfies the read baseline with either mcp:read or mcp:write", () => {
+  it("requires mcp:read even when fine scopes or the removed scope are present", () => {
     expect(mcpConfig.mcpScopesAllow("mcp:read", "read")).toBe(true);
-    expect(mcpConfig.mcpScopesAllow("mcp:write", "read")).toBe(true);
-    expect(mcpConfig.mcpScopesAllow("mcp:read mcp:write", "read")).toBe(true);
-  });
-
-  it("requires literal mcp:write for write", () => {
-    expect(mcpConfig.mcpScopesAllow("mcp:write", "write")).toBe(true);
-    expect(mcpConfig.mcpScopesAllow("mcp:read", "write")).toBe(false);
-    expect(mcpConfig.mcpScopesAllow("offline_access", "write")).toBe(false);
+    expect(mcpConfig.mcpScopesAllow("mcp:write", "read")).toBe(false);
+    expect(mcpConfig.mcpScopesAllow("mcp:pools", "read")).toBe(false);
+    expect(mcpConfig.mcpScopesAllow("mcp:read mcp:pools", "read")).toBe(true);
   });
 
   it("rejects missing, blank, unrelated, and superstring scopes", () => {
@@ -143,19 +154,19 @@ describe("protected-resource scope matcher (invariant 9)", () => {
 
   it("requires exact literal tokens — no trimming, no case folding (space-only splitting)", () => {
     // Wrong case never grants.
-    expect(mcpConfig.mcpScopesAllow("MCP:WRITE", "write")).toBe(false);
+    expect(mcpConfig.mcpScopesAllow("MCP:READ", "read")).toBe(false);
     // Padded tokens are literal, not trimmed into a match.
-    expect(mcpConfig.mcpScopesAllow("mcp:write ", "write")).toBe(false);
-    expect(mcpConfig.mcpScopesAllow(["mcp:write "], "write")).toBe(false);
-    expect(mcpConfig.mcpScopesAllow([" mcp:write"], "write")).toBe(false);
-    // Tab is NOT a separator — the token is "mcp:write\t", not "mcp:write".
-    expect(mcpConfig.mcpScopesAllow("mcp:write\t", "write")).toBe(false);
+    expect(mcpConfig.mcpScopesAllow("mcp:read ", "read")).toBe(false);
+    expect(mcpConfig.mcpScopesAllow(["mcp:read "], "read")).toBe(false);
+    expect(mcpConfig.mcpScopesAllow([" mcp:read"], "read")).toBe(false);
+    // Tab is NOT a separator — the token is "mcp:read\t", not "mcp:read".
+    expect(mcpConfig.mcpScopesAllow("mcp:read\t", "read")).toBe(false);
     // Exact tokens in combination still grant...
-    expect(mcpConfig.mcpScopesAllow("mcp:read mcp:write", "write")).toBe(true);
+    expect(mcpConfig.mcpScopesAllow("mcp:read mcp:read", "read")).toBe(true);
     // ...and repeated spaces merely produce empty tokens, which are ignored.
-    expect(mcpConfig.mcpScopesAllow("mcp:read  mcp:write", "write")).toBe(true);
+    expect(mcpConfig.mcpScopesAllow("mcp:read  mcp:read", "read")).toBe(true);
     // Array entries are used literally too.
-    expect(mcpConfig.parseMcpScopes(["mcp:write "])).toEqual(["mcp:write "]);
+    expect(mcpConfig.parseMcpScopes(["mcp:read "])).toEqual(["mcp:read "]);
     expect(mcpConfig.parseMcpScopes(["mcp:read", " mcp:read"])).toEqual(["mcp:read", " mcp:read"]);
   });
 
@@ -164,7 +175,7 @@ describe("protected-resource scope matcher (invariant 9)", () => {
       "mcp:read",
       "offline_access",
     ]);
-    expect(mcpConfig.parseMcpScopes(["mcp:write", "mcp:write"])).toEqual(["mcp:write"]);
+    expect(mcpConfig.parseMcpScopes(["mcp:read", "mcp:read"])).toEqual(["mcp:read"]);
     expect(mcpConfig.parseMcpScopes(undefined)).toEqual([]);
   });
 });

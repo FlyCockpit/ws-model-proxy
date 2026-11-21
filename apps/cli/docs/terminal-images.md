@@ -93,10 +93,9 @@ is, after the same printable-ASCII check; it quotes only POSIX paths itself.
 
 ## Encrypted wire extension
 
-This is an optional, compatible extension to relay protocol 3.0, which shipped
-in wsmp 0.4.0. No version number or key derivation changes are needed: older
-CLIs never advertise image support, and older browsers ignore the additional
-unicast capability frame. The server forwards ordinary `term.sealed`
+Image transfer is an optional capability of relay protocol 4.0, enabled only
+when the CLI advertises image support. It uses the terminal channel's existing
+key derivation and a unicast capability frame. The server forwards ordinary `term.sealed`
 frames and cannot inspect image bytes or returned paths. Existing terminal
 authentication, identity approval, and relay rate limits still apply.
 
@@ -136,8 +135,5 @@ and paces subsequent chunks to leave room for ordinary keystrokes. There is
 no automatic retry of a file write. A lost acknowledgement fails the upload
 without pasting a path. The user can retry with a fresh upload ID.
 
-An older CLI never advertises the capability, so the browser falls back to
-plain text when available, or shows an update message for an image-only
-paste. An older browser advances its receive sequence before its decoder
-rejects the unknown unicast capability frame; the receive chain catches that
-error and ordinary terminal output continues.
+When the CLI does not advertise image support, the browser falls back to plain
+text when available, or shows an update message for an image-only paste.

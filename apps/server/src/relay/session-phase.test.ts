@@ -19,7 +19,7 @@ function node(): RegisteredNode {
     nodeId: "node-1",
     slug: "box",
     connectionGeneration: 3,
-    protocolVersion: "3.0",
+    protocolVersion: "4.0",
     nodeVersion: "0.4.3",
     features: {} as RegisteredNode["features"],
     terminalPublicKey: "key",

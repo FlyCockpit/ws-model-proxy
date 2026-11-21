@@ -43,6 +43,7 @@ const appRouterApp = {
     privateNetworksAllowed: env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS,
     mcpEnabled: env.WMP_MCP_ENABLED,
     agentTokenNoExpiryAllowed: env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY,
+    agentTokenMaxLifetimeDays: env.WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS,
   })),
   features: contractProcedure(appContract.features).handler(async () => {
     const signupAccess = await getSignupAccessState();

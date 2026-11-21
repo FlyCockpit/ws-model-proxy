@@ -9,7 +9,7 @@ import { fabricIpSchema, runtimeBaseUrlSchema, runtimeSpecWarnings } from "./run
 
 const repoRoot = join(import.meta.dirname, "../../../..");
 const fabricVectors = JSON.parse(
-  readFileSync(join(repoRoot, "apps/cli/tests/fixtures/relay-3.0/rules/fabric-ip.json"), "utf8"),
+  readFileSync(join(repoRoot, "apps/cli/tests/fixtures/relay-4.0/rules/fabric-ip.json"), "utf8"),
 ) as { valid: string[]; invalid: string[] };
 
 describe("fabric IP literals (shared with Rust and SQL)", () => {

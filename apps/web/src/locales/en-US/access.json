@@ -2,7 +2,8 @@
   "status": {
     "active": "Active",
     "expired": "Expired",
-    "revoked": "Revoked"
+    "revoked": "Revoked",
+    "blocked": "Blocked by policy"
   },
   "fields": {
     "name": "Name",
@@ -66,16 +67,6 @@
     "tokensDescription": "Tokens you give an agent. Only you can create or revoke them; agents can never create tokens or share anything.",
     "create": "Create agent token",
     "createTitle": "New agent token",
-    "level": "Access",
-    "levelRead": "Read-only",
-    "levelFull": "Full",
-    "levelReadHint": "Reads pools, runtimes, nodes, metrics and the request log. Changes nothing.",
-    "levelFullHint": "Everything an agent may do: configure, start and stop runtimes, and run commands and edit files on Full-control nodes. It can never change who has access.",
-    "levelFor": "Access for {{name}}",
-    "levelChanged": "Access changed.",
-    "raiseTitle": "Give {{name}} Full access?",
-    "raiseConfirm": "Give Full access",
-    "fullUnavailable": "Read-only: this agent did not ask to make changes. To allow Full, reconnect it asking for mcp:write.",
     "creating": "Creating…",
     "created": "Agent token created",
     "empty": "No agent tokens yet.",
@@ -85,7 +76,7 @@
     "configExample": "Agent configuration",
     "copyConfig": "Copy configuration",
     "oauthTitle": "Connected with OAuth",
-    "oauthDescription": "Agents you approved in the browser. Read-only takes effect at once and ends the agent's running Full work; Full applies from its next call.",
+    "oauthDescription": "Agents you approved in the browser. Removing permissions or nodes ends affected work at once; added access applies from the next call.",
     "oauthEmpty": "No agents connected with OAuth.",
     "oauthLoadFailed": "Could not load OAuth connections.",
     "unnamedClient": "Unnamed agent",
@@ -93,7 +84,63 @@
     "disconnectTitle": "Disconnect {{name}}?",
     "disconnectDescription": "The agent must ask for your approval again to reconnect.",
     "disconnected": "Disconnected.",
-    "mcpOff": "MCP is turned off on this server, so agent tokens cannot be created."
+    "mcpOff": "MCP is turned off on this server, so agent tokens cannot be created.",
+    "scopesTitle": "Permissions",
+    "everything": "Everything",
+    "nodesTitle": "Nodes",
+    "allNodes": "All my nodes (now and later)",
+    "onlyNodes": "Only these nodes",
+    "nodesFailed": "Could not load your nodes.",
+    "noNodes": "You have no nodes yet.",
+    "noNodesSelected": "No nodes selected: this agent cannot access any node.",
+    "nodeCount_one": "{{count}} node",
+    "nodeCount_other": "{{count}} nodes",
+    "edit": "Edit access",
+    "editTitle": "Access for {{name}}",
+    "editDescription": "Choose what this agent may do and which of your nodes it may access.",
+    "narrowWarning": "Saving removes access immediately. In-flight calls end at once; commands and file work that are no longer allowed stop, and queued commands on excluded nodes are withdrawn.",
+    "accessChanged": "Access changed.",
+    "save": "Save access",
+    "saving": "Saving…",
+    "maxLifetime": "Expiring tokens last at most {{days}} days.",
+    "expiryDays_one": "{{count}} day",
+    "expiryDays_other": "{{count}} days",
+    "customDate": "Custom date",
+    "noExpiry": "No expiry",
+    "expiryInvalid": "Choose a date after today, at most {{days}} days ahead.",
+    "policyFailed": "Could not load the token expiry policy.",
+    "scopes": {
+      "read": {
+        "name": "Read",
+        "description": "View nodes, runtimes, pools, profiles, providers, metrics and request logs. Always included."
+      },
+      "pools": {
+        "name": "Pools",
+        "description": "Create, change and delete pools."
+      },
+      "runtimes": {
+        "name": "Runtimes",
+        "description": "Create, change, start and stop runtimes; save, apply and delete profiles."
+      },
+      "nodes_manage": {
+        "name": "Manage nodes",
+        "description": "Change nodes, delete offline nodes and manage node secrets."
+      },
+      "commands": {
+        "name": "Commands",
+        "description": "Run commands, read their output and queue commands for you to run."
+      },
+      "files": {
+        "name": "Files",
+        "description": "Read, write and edit files within the node’s allowed file roots."
+      },
+      "models_test": {
+        "name": "Test models",
+        "description": "Send test requests to models."
+      }
+    },
+    "blockedByPolicy": "This server no longer allows agent tokens without an expiry, so this token is refused. It is not revoked: it works again if the operator allows no-expiry tokens. Create a token with an expiry to keep the agent working.",
+    "noExpiryHint": "A token without expiry works until you revoke it, or until the operator stops allowing no-expiry tokens."
   },
   "shares": {
     "create": "Share",

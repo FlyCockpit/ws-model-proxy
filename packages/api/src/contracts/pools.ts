@@ -286,14 +286,14 @@ export const poolsContract = {
         ),
       })
       .strict(),
-    "Your pools (full view) and pools shared with you.",
+    "Your pools (full view) and pools shared with you. Allowlisted agents see live counts and traffic excluding their hidden nodes and hidden instances (any with a binding, rank or reservation on a hidden node).",
     ["pools_get"],
   ),
   get: query(
     "agent",
     z.object({ poolId: idSchema }).strict(),
     poolViewSchema,
-    "One pool: routing, cloud (read-only for agents), sidecars, advanced with sources, members with live load.",
+    "One pool: routing, cloud (read-only for agents), sidecars, advanced with sources, members with live load. Allowlisted agents see counts and traffic excluding their hidden nodes and hidden instances (any with a binding, rank or reservation on a hidden node).",
     ["pools_get"],
   ),
   history: {
@@ -370,7 +370,7 @@ export const poolsContract = {
       })
       .strict(),
     poolViewSchema,
-    "Edit a pool. Never: cloud mode, paid warm protection, own-key consent, own-hardware-only (human_only).",
+    "Edit a pool. Allowlisted agents cannot add, change or remove their own runtime members bound to or running on a disallowed node. Never: cloud mode, paid warm protection, own-key consent, own-hardware-only (human_only).",
     ["pool_update"],
   ),
   aliases: {
@@ -409,7 +409,7 @@ export const poolsContract = {
     "agent",
     z.object({ poolId: idSchema, confirm: confirmDeleteSchema.optional() }).strict(),
     okSchema,
-    "Delete a pool with its shares, share caps, contributed members, API-key entries and sidecar links.",
+    "Delete a pool with its shares, share caps, contributed members, API-key entries and sidecar links. Refused for allowlisted agents while their own runtime members are bound to or running on disallowed nodes.",
     ["pool_delete"],
   ),
   cloud: {
@@ -454,7 +454,7 @@ export const poolsContract = {
       "agent",
       z.object({ memberId: idSchema, note: noteSchema.optional() }).strict(),
       okSchema,
-      "The contributor (own members only) or the pool owner removes a contributed member.",
+      "The contributor (own members only) or the pool owner removes a contributed member. An allowlisted contributor cannot withdraw their runtime member bound to or running on a disallowed node.",
       ["pool_update"],
     ),
   },

@@ -18,6 +18,7 @@ import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-clien
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 import type { CallerAuth } from "../contracts/auth-context";
+import { TEST_NODE_FEATURES } from "../lib/node-features-test-fixture";
 import type { RuntimeSpec } from "../lib/runtime-spec";
 import type { NodeEnrollRequest } from "../nodes/enroll-exchange";
 import { retryAnswers, untilAnswered } from "./retry-answers";
@@ -178,7 +179,12 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
     // The relay hello (stand-in): Full control, online.
     await modules.fixtures.node.update({
       where: { id: nodeId },
-      data: { trust: "FULL", trustChangedAt: new Date(), connection: "ONLINE" },
+      data: {
+        trust: "FULL",
+        trustChangedAt: new Date(),
+        connection: "ONLINE",
+        features: TEST_NODE_FEATURES,
+      },
     });
 
     // ── Node definition: labels, hardware, a fabric ──
@@ -250,14 +256,22 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
   it("records an OAuth agent's writes by its grant", async () => {
     if (!modules) throw new Error("modules unavailable");
     const grant = await modules.fixtures.mcpGrant.create({
-      data: { userId: user.id, clientId: `client-${suffix}`, referenceId: suffix, level: "FULL" },
+      data: {
+        userId: user.id,
+        clientId: `client-${suffix}`,
+        referenceId: suffix,
+        scopes: ["READ", "POOLS", "RUNTIMES", "NODES_MANAGE", "COMMANDS", "FILES", "MODELS_TEST"],
+      },
       select: { id: true },
     });
     const agent = client({
       kind: "oauth_access_token",
       userId: user.id,
       grantId: grant.id,
-      level: "FULL",
+      access: {
+        scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+        nodeIds: null,
+      },
     });
     const runtime = await agent.runtimes.create({
       slug: `agent-${suffix}`,

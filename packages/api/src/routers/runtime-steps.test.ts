@@ -46,7 +46,10 @@ const FULL_AGENT: CallerAuth = {
   kind: "agent_token",
   userId: "owner",
   agentTokenId: "tok1",
-  level: "FULL",
+  access: {
+    scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+    nodeIds: null,
+  },
 };
 
 function services() {

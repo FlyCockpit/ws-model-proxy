@@ -1,4 +1,4 @@
-//! Relay 3.0 telemetry: `node.info`, `node.metrics` and `runtime.load`.
+//! Relay 4.0 telemetry: `node.info`, `node.metrics` and `runtime.load`.
 //!
 //! One sampling thread per relay session collects everything. The relay loop
 //! is a single blocking thread, so nothing here runs on it: the sampler hands

@@ -8,7 +8,8 @@
  *   4. Start the local Docker services — Postgres (`pnpm dev:services`,
  *      the canonical root docker-compose.dev.yml).
  *   5. Wait for Postgres to accept connections.
- *   6. Apply the schema (`pnpm db:push`).
+ *   6. Create this checkout's local databases (`pnpm db:worktree` — each git
+ *      worktree gets its own) and apply the migrations (`pnpm db:migrate:apply`).
  *   7. Check whether the global portless CLI is available for `pnpm dev`.
  *
  * After this, `pnpm dev` is the only remaining step.
@@ -218,10 +219,11 @@ async function waitForService(
 }
 
 // ---------------------------------------------------------------------------
-// 6. Apply schema
+// 6. Local databases + migrations
 // ---------------------------------------------------------------------------
 function runMigrations() {
-  run("pnpm", ["db:push"]);
+  run("pnpm", ["db:worktree"]);
+  run("pnpm", ["db:migrate:apply"]);
 }
 
 // ---------------------------------------------------------------------------

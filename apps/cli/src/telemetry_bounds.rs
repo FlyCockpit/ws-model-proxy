@@ -1,4 +1,4 @@
-//! Hold every telemetry frame to the server's strict 3.0 schemas.
+//! Hold every telemetry frame to the server's strict 4.0 schemas.
 //!
 //! The server validates `node.info`, `node.metrics` and `runtime.load` with
 //! strict zod schemas (`apps/server/src/relay/frames.ts`). Readings come from

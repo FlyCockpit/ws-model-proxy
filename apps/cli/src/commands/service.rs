@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
@@ -1088,54 +1088,493 @@ pub fn pinned_service_env() -> Result<Vec<(&'static str, String)>> {
         pin("WSMP_CONFIG", crate::paths::config_file()?)?,
         pin("WSMP_STATE_DIR", crate::paths::state_dir()?)?,
     ];
-    // The installing shell's PATH, frozen at install time; re-run install to
-    // refresh it. Skipped when unset, not UTF-8, or nothing usable is left.
-    if let Some(path) = std::env::var("PATH")
-        .ok()
-        .and_then(|path| service_path(&path, usable_service_path_dir))
-    {
+    // The installing shell's PATH, frozen at install time, without the
+    // directories that end with its shell or login session; re-run install
+    // to refresh it. Skipped when unset, not UTF-8, or nothing usable is left.
+    if let Some(path) = std::env::var("PATH").ok().and_then(|path| {
+        service_path(&path, inspect_service_path_dir, &SessionDirs::current()).path
+    }) {
         pinned.push(("PATH", path));
     }
     Ok(pinned)
 }
 
-/// The installing shell's `PATH` reduced to what a service should search:
-/// absolute directories `keep` accepts, each once, in order. Empty and
-/// relative entries (which would resolve against the service's working
-/// directory) are dropped. None when nothing is left.
-pub fn service_path(path: &str, keep: impl Fn(&Path) -> bool) -> Option<String> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for dir in std::env::split_paths(path) {
-        if dir.as_os_str().is_empty() || !dir.is_absolute() || dirs.contains(&dir) || !keep(&dir) {
-            continue;
-        }
-        dirs.push(dir);
-    }
-    if dirs.is_empty() {
-        return None;
-    }
-    std::env::join_paths(dirs).ok()?.into_string().ok()
+/// Why a directory on the installing shell's `PATH` lets another account
+/// plant a program the service runs. Reported by `wsmp service install`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathDirRisk {
+    /// Writable by every account (`mode & 0o002`): dropped from the pinned PATH.
+    WorldWritable { mode: u32 },
+    /// Writable by the members of a group other than the installer's own
+    /// private group: kept, with a warning.
+    GroupWritable {
+        mode: u32,
+        gid: u32,
+        group: Option<String>,
+    },
+    /// Owned by an account other than root and the installer: kept, with a
+    /// warning (its owner can write it whatever the mode says).
+    OtherOwner { uid: u32, owner: Option<String> },
 }
 
-/// An existing directory that other users cannot write to (a world-writable
-/// directory on the service's PATH would let them plant programs it runs).
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
-fn usable_service_path_dir(dir: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(dir) else {
-        return false;
+impl PathDirRisk {
+    /// Kept on the pinned PATH despite the risk (see [`review_service_path`]).
+    fn kept(&self) -> bool {
+        !matches!(self, Self::WorldWritable { .. })
+    }
+}
+
+/// The installing shell's `PATH` reduced to what a service should search,
+/// and the directories on it that other accounts can write.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ServicePath {
+    /// Absolute existing directories, each once, in order, without the
+    /// world-writable ones. None when nothing is left.
+    pub path: Option<String>,
+    /// Each directory with a [`PathDirRisk`], in `PATH` order; world-writable
+    /// ones were dropped, the others are in `path`.
+    pub risky: Vec<(PathBuf, Vec<PathDirRisk>)>,
+    /// Directories left off because they belong to the installing login
+    /// session or shell ([`service_path`]), in `PATH` order.
+    pub session: Vec<SessionEntry>,
+}
+
+/// Why a `PATH` directory of the installing shell is gone once that shell
+/// or login session ends, so a unit must not pin it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionScope {
+    /// One shell's own directory (fnm's `fnm_multishells/<id>`).
+    Shell,
+    /// The login session's runtime directory (`/run/user/<uid>`,
+    /// `$XDG_RUNTIME_DIR`): a tmpfs removed when the last session ends.
+    Login,
+    /// A temporary directory (`/tmp`, `/var/tmp`, `$TMPDIR`), cleared at boot
+    /// or by age.
+    Temporary,
+}
+
+/// A session directory [`service_path`] left off, and the stable directory
+/// it put in its place, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEntry {
+    pub dir: PathBuf,
+    pub scope: SessionScope,
+    pub replacement: Option<PathBuf>,
+}
+
+/// Where this system keeps per-session directories, read once from the
+/// environment ([`SessionDirs::current`]) or given by a test.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionDirs {
+    /// `$XDG_RUNTIME_DIR` when it is under `/run` or `/var/run` (where logind
+    /// puts it); `/run/user/<uid>` counts whatever it says.
+    pub runtime_dir: Option<PathBuf>,
+    /// `$TMPDIR` when it is macOS's per-user temporary directory
+    /// (`/var/folders/...`). Elsewhere a `$TMPDIR` can be a long-lived
+    /// scratch area holding real installs (an HPC `/scratch`), so it is not
+    /// taken to mean "temporary".
+    pub temp_dir: Option<PathBuf>,
+    /// Candidates for fnm's stable default-version directory
+    /// (`<fnm dir>/aliases/default/bin`), in preference order.
+    pub fnm_default_bins: Vec<PathBuf>,
+}
+
+/// Temporary directories on every Unix (`/private/...` is macOS's real path).
+const TEMPORARY_ROOTS: &[&str] = &["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
+
+impl SessionDirs {
+    pub fn current() -> Self {
+        Self::from_vars(|name| std::env::var_os(name), dirs::home_dir())
+    }
+
+    /// [`Self::current`] from given variables and home directory.
+    pub fn from_vars(
+        var: impl Fn(&str) -> Option<std::ffi::OsString>,
+        home: Option<PathBuf>,
+    ) -> Self {
+        let absolute = |name: &str| {
+            var(name)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+        };
+        let strictly_under = |dir: &Path, roots: &[&str]| {
+            roots
+                .iter()
+                .any(|root| dir.starts_with(root) && dir != Path::new(root))
+        };
+        let runtime_dir =
+            absolute("XDG_RUNTIME_DIR").filter(|dir| strictly_under(dir, &["/run", "/var/run"]));
+        let temp_dir = absolute("TMPDIR")
+            .filter(|dir| strictly_under(dir, &["/var/folders", "/private/var/folders"]));
+        let mut fnm_dirs: Vec<PathBuf> = Vec::new();
+        fnm_dirs.extend(absolute("FNM_DIR"));
+        if let Some(data) = absolute("XDG_DATA_HOME") {
+            fnm_dirs.push(data.join("fnm"));
+        }
+        if let Some(home) = &home {
+            fnm_dirs.push(home.join(".local/share/fnm"));
+            fnm_dirs.push(home.join(".fnm"));
+            fnm_dirs.push(home.join("Library/Application Support/fnm"));
+        }
+        SessionDirs {
+            runtime_dir,
+            temp_dir,
+            fnm_default_bins: fnm_dirs
+                .into_iter()
+                .map(|dir| dir.join("aliases/default/bin"))
+                .collect(),
+        }
+    }
+
+    /// Whether `dir` lives only as long as the installing shell or session.
+    pub fn scope_of(&self, dir: &Path) -> Option<SessionScope> {
+        if dir
+            .components()
+            .any(|part| part.as_os_str() == "fnm_multishells")
+        {
+            return Some(SessionScope::Shell);
+        }
+        if dir.starts_with("/run/user")
+            || self
+                .runtime_dir
+                .as_deref()
+                .is_some_and(|runtime| dir.starts_with(runtime))
+        {
+            return Some(SessionScope::Login);
+        }
+        if TEMPORARY_ROOTS.iter().any(|root| dir.starts_with(root))
+            || self
+                .temp_dir
+                .as_deref()
+                .is_some_and(|temp| dir.starts_with(temp))
+        {
+            return Some(SessionScope::Temporary);
+        }
+        None
+    }
+}
+
+/// The service's `PATH` from the installing shell's: [`review_service_path`]
+/// after leaving off every directory that ends with the shell or login
+/// session ([`SessionDirs::scope_of`]); a unit started at boot would
+/// otherwise search directories that no longer exist (or that someone else's
+/// later session reuses). fnm's per-shell directory is replaced by fnm's
+/// default-version directory when it exists, so the service still finds
+/// Node; `fnm default <version>` changes which one.
+pub fn service_path(
+    path: &str,
+    inspect: impl Fn(&Path) -> Option<Vec<PathDirRisk>>,
+    session: &SessionDirs,
+) -> ServicePath {
+    let mut kept: Vec<PathBuf> = Vec::new();
+    let mut dropped = Vec::new();
+    for dir in std::env::split_paths(path) {
+        match dir.is_absolute().then(|| session.scope_of(&dir)).flatten() {
+            None => kept.push(dir),
+            Some(scope) => {
+                if dropped.iter().any(|entry: &SessionEntry| entry.dir == dir) {
+                    continue;
+                }
+                let replacement = (scope == SessionScope::Shell)
+                    .then(|| {
+                        session.fnm_default_bins.iter().find(|candidate| {
+                            session.scope_of(candidate).is_none() && inspect(candidate).is_some()
+                        })
+                    })
+                    .flatten()
+                    .cloned();
+                if let Some(stable) = &replacement {
+                    kept.push(stable.clone());
+                }
+                dropped.push(SessionEntry {
+                    dir,
+                    scope,
+                    replacement,
+                });
+            }
+        }
+    }
+    let joined = std::env::join_paths(&kept)
+        .ok()
+        .and_then(|joined| joined.into_string().ok())
+        .unwrap_or_default();
+    let mut review = review_service_path(&joined, inspect);
+    review.session = dropped;
+    review
+}
+
+/// The `wsmp service install` notes for [`ServicePath::session`].
+pub fn session_path_notes(session: &[SessionEntry]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for entry in session {
+        let why = match entry.scope {
+            SessionScope::Shell => "it belongs to this one shell (fnm's per-shell directory)",
+            SessionScope::Login => {
+                "it is in this login session's runtime directory, which is removed at logout"
+            }
+            SessionScope::Temporary => "it is a temporary directory",
+        };
+        lines.push(format!(
+            "left `{}` off the service's PATH: {why}",
+            entry.dir.display()
+        ));
+        match (&entry.replacement, entry.scope) {
+            (Some(stable), _) => lines.push(format!(
+                "  the service uses fnm's default Node instead: `{}` (`fnm default <version>` changes it)",
+                stable.display()
+            )),
+            (None, SessionScope::Shell) => lines.push(
+                "  fnm has no default version, so the service will not find Node: run \
+                 `fnm default <version>`, then `wsmp service install` again"
+                    .to_owned(),
+            ),
+            (None, _) => {}
+        }
+    }
+    lines
+}
+
+/// Reduce `path` for the service. `inspect` returns None for a directory to
+/// skip silently (missing, not a directory) and otherwise its risks. Empty
+/// and relative entries (which would resolve against the service's working
+/// directory) are dropped, and so is a world-writable directory; a directory
+/// with only group-write or foreign-owner risks is kept (the service must
+/// still find the same engines as the installing shell) and reported.
+pub fn review_service_path(
+    path: &str,
+    inspect: impl Fn(&Path) -> Option<Vec<PathDirRisk>>,
+) -> ServicePath {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut risky = Vec::new();
+    for dir in std::env::split_paths(path) {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() || seen.contains(&dir) {
+            continue;
+        }
+        seen.push(dir.clone());
+        let Some(risks) = inspect(&dir) else {
+            continue;
+        };
+        let keep = risks.iter().all(PathDirRisk::kept);
+        if !risks.is_empty() {
+            risky.push((dir.clone(), risks));
+        }
+        if keep {
+            dirs.push(dir);
+        }
+    }
+    let path = if dirs.is_empty() {
+        None
+    } else {
+        std::env::join_paths(dirs)
+            .ok()
+            .and_then(|joined| joined.into_string().ok())
     };
+    ServicePath {
+        path,
+        risky,
+        session: Vec::new(),
+    }
+}
+
+/// The facts [`path_dir_risks`] judges, read from one directory.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct DirFacts {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+/// The installing account: who may own PATH directories, and which group is
+/// its own private one (only it is a member).
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Installer {
+    uid: u32,
+    /// The primary gid when it is a user private group (named like the user,
+    /// no other members); None otherwise.
+    private_gid: Option<u32>,
+}
+
+/// The risks of one existing directory. Root and the installer may own it;
+/// group write is fine only for root's group (gid 0) on a root-owned
+/// directory, or for the installer's private group.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn path_dir_risks(
+    facts: DirFacts,
+    installer: Installer,
+    group_name: impl Fn(u32) -> Option<String>,
+    user_name: impl Fn(u32) -> Option<String>,
+) -> Vec<PathDirRisk> {
+    let mut risks = Vec::new();
+    if facts.mode & 0o002 != 0 {
+        risks.push(PathDirRisk::WorldWritable {
+            mode: facts.mode & 0o7777,
+        });
+    }
+    let trusted_group =
+        (facts.gid == 0 && facts.uid == 0) || installer.private_gid == Some(facts.gid);
+    if facts.mode & 0o020 != 0 && !trusted_group {
+        risks.push(PathDirRisk::GroupWritable {
+            mode: facts.mode & 0o7777,
+            gid: facts.gid,
+            group: group_name(facts.gid),
+        });
+    }
+    if facts.uid != 0 && facts.uid != installer.uid {
+        risks.push(PathDirRisk::OtherOwner {
+            uid: facts.uid,
+            owner: user_name(facts.uid),
+        });
+    }
+    risks
+}
+
+/// Whether a `/etc/passwd` text names an account other than `user` whose
+/// primary group is `gid` (it can write that group's directories too).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn primary_group_of_another(passwd: &str, gid: u32, user: &str) -> bool {
+    passwd.lines().any(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        fields.len() >= 4
+            && !line.starts_with('#')
+            && fields[0] != user
+            && fields[3].parse::<u32>() == Ok(gid)
+    })
+}
+
+/// [`review_service_path`]'s inspector for this system: None for a missing
+/// entry or a non-directory (the target of a symlink counts), else its risks.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn inspect_service_path_dir(dir: &Path) -> Option<Vec<PathDirRisk>> {
+    let metadata = fs::metadata(dir).ok()?;
     if !metadata.is_dir() {
-        return false;
+        return None;
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o002 == 0
+        use nix::unistd::{Gid, Group, Uid, User};
+        use std::os::unix::fs::MetadataExt;
+        let uid = Uid::effective();
+        let user = User::from_uid(uid).ok().flatten();
+        let gid = Gid::effective();
+        // A user private group: named like the user, no other listed member,
+        // and no other local account with it as its primary group (members
+        // by primary gid are not listed in `group.mem`).
+        // Unreadable: not provably private, so warn (fail closed).
+        let passwd = fs::read_to_string("/etc/passwd").ok();
+        let private_gid = match (user, Group::from_gid(gid).ok().flatten(), passwd) {
+            (Some(user), Some(group), Some(passwd))
+                if group.name == user.name
+                    && group.mem.iter().all(|m| *m == user.name)
+                    && !primary_group_of_another(&passwd, gid.as_raw(), &user.name) =>
+            {
+                Some(gid.as_raw())
+            }
+            _ => None,
+        };
+        Some(path_dir_risks(
+            DirFacts {
+                mode: metadata.mode(),
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+            },
+            Installer {
+                uid: uid.as_raw(),
+                private_gid,
+            },
+            |gid| {
+                Group::from_gid(Gid::from_raw(gid))
+                    .ok()
+                    .flatten()
+                    .map(|group| group.name)
+            },
+            |uid| {
+                User::from_uid(Uid::from_raw(uid))
+                    .ok()
+                    .flatten()
+                    .map(|user| user.name)
+            },
+        ))
     }
     #[cfg(not(unix))]
     {
-        true
+        Some(Vec::new())
     }
+}
+
+/// The `wsmp service install` warning for [`ServicePath::risky`]: each
+/// directory, why, and how to tighten it. Empty when nothing is risky.
+pub fn service_path_warnings(risky: &[(PathBuf, Vec<PathDirRisk>)]) -> Vec<String> {
+    if risky.is_empty() {
+        return Vec::new();
+    }
+    let kept = risky
+        .iter()
+        .filter(|(_, risks)| risks.iter().all(PathDirRisk::kept))
+        .count();
+    let mut lines = vec![format!(
+        "warning: {} director{} on your PATH can be written by other accounts; a program planted there runs as this service (as you) when it starts an engine:",
+        risky.len(),
+        if risky.len() == 1 { "y" } else { "ies" }
+    )];
+    for (dir, risks) in risky {
+        let shown = dir.display();
+        let dropped = !risks.iter().all(PathDirRisk::kept);
+        let mut why = Vec::new();
+        let mut fix = Vec::new();
+        for risk in risks {
+            match risk {
+                PathDirRisk::WorldWritable { mode } => {
+                    why.push(format!("writable by every account (mode {mode:04o})"));
+                    fix.push(format!("`chmod o-w {shown}`"));
+                }
+                PathDirRisk::GroupWritable { mode, gid, group } => {
+                    let group = match group {
+                        Some(name) => format!("`{name}` (gid {gid})"),
+                        None => format!("gid {gid}"),
+                    };
+                    why.push(format!(
+                        "writable by every member of group {group} (mode {mode:04o})"
+                    ));
+                    fix.push(format!("`chmod g-w {shown}` (as its owner, or with sudo)"));
+                }
+                PathDirRisk::OtherOwner { uid, owner } => {
+                    let owner = match owner {
+                        Some(name) => format!("`{name}` (uid {uid})"),
+                        None => format!("uid {uid}"),
+                    };
+                    why.push(format!("owned by {owner}, who can always write it"));
+                    fix.push(
+                        "have root `chown` it to root or to you, or keep it off the service's PATH"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        lines.push(format!(
+            "  {shown}: {}; {}. To tighten: {}",
+            why.join(", "),
+            if dropped {
+                "left OFF the service's PATH"
+            } else {
+                "kept on the service's PATH"
+            },
+            fix.join(", then ")
+        ));
+    }
+    if kept > 0 {
+        lines.push(
+            "  to keep a directory off the service's PATH instead, re-run with it removed, e.g. \
+             `PATH=/usr/local/bin:/usr/bin:/bin wsmp service install`; after tightening, re-run \
+             `wsmp service install` to refresh this check"
+                .to_owned(),
+        );
+    } else {
+        lines.push("  after tightening, re-run `wsmp service install` to put it back on the service's PATH".to_owned());
+    }
+    lines
 }
 
 /// Render a systemd user unit for the relay. `pinned` holds non-secret
@@ -1298,8 +1737,101 @@ fn say(to_stderr: bool, text: impl std::fmt::Display) -> Result<()> {
     }
 }
 
+/// Why `wsmp service install` refuses on Linux, decided before anything is
+/// written; None to go ahead.
+///
+/// - As root: always. The service is a systemd user unit, and runtimes
+///   (transient user units), the update dead-man (a user timer), the in-job
+///   guard and every command, terminal and file tool the web app runs here
+///   run as the account wsmp runs as. As root that would give the server
+///   root on this machine, so wsmp asks for an ordinary account instead
+///   ([`root_install_refusal`]). `reachable` is not asked.
+/// - Otherwise when `systemctl --user` cannot reach the user manager
+///   (`reachable`), which would fail only after the unit was written.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn linux_install_refusal(
+    root: bool,
+    reachable: impl FnOnce() -> std::result::Result<(), String>,
+    account: &str,
+    server: Option<&str>,
+) -> Option<String> {
+    if root {
+        return Some(format!(
+            "{}\n  to run the relay as root anyway, without a service (in a container, say): \
+             `wsmp run` in the foreground",
+            root_install_refusal(server)
+        ));
+    }
+    let why = reachable().err()?;
+    Some(format!(
+        "`systemctl --user` cannot reach your systemd user manager, so the relay service \
+         cannot be installed; nothing was written ({why})\n  \
+         this happens when the manager is not running for `{account}` (no login session, and \
+         lingering off), or without systemd (a container). If lingering is already on and the \
+         manager is only slow to answer, run `wsmp service install` again\n  \
+         fix it once (as an administrator): sudo loginctl enable-linger {account}\n  \
+         then run `wsmp service install` again (lingering starts your user manager now and \
+         at every boot); without systemd, run `wsmp run` in the foreground instead"
+    ))
+}
+
+/// What wsmp says, as root, instead of installing its service (`wsmp service
+/// install`, and `wsmp login` before it enrolls): why, and the commands that
+/// set wsmp up under an ordinary account. `server` fills in the commands
+/// when known.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn root_install_refusal(server: Option<&str>) -> String {
+    let server = server.unwrap_or("<server>");
+    format!(
+        "wsmp does not install its relay service as root; nothing was written. the service is \
+         a systemd user unit, and the runtimes, node commands, browser terminals and file tools \
+         the web app runs on this node all run as the account wsmp runs as: as root, the server \
+         would control this machine as root\n\
+         run wsmp as an ordinary account instead (any unprivileged account; `wsmp` here); as \
+         root, once:\n  \
+         useradd --create-home --shell /bin/bash wsmp\n  \
+         usermod -aG video,render wsmp    # GPU access for engines, where these groups exist\n  \
+         loginctl enable-linger wsmp      # its service starts at boot, without a login\n  \
+         su - wsmp\n\
+         then, as `wsmp`:\n  \
+         curl -fsSL {server}/install.sh | sh\n  \
+         ~/.cargo/bin/wsmp login {server} --code <enrollment code>\n\
+         if this machine is already enrolled as root, run `wsmp logout` as root and delete \
+         that node in the web app"
+    )
+}
+
+/// Whether `systemctl --user` reaches a user manager (with [`user_bus_env`]):
+/// why not, as one line (`systemctl`'s own error, a timeout, a missing
+/// `systemctl`), when it does not. Bounded and quiet.
+#[cfg(target_os = "linux")]
+fn user_manager_reachable() -> std::result::Result<(), String> {
+    run_finite_within(
+        "systemctl",
+        &["--user", "show", "--property=Version"],
+        std::time::Duration::from_secs(15),
+    )
+    .map_err(|error| {
+        format!("{error:#}")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub fn install(to_stderr: bool) -> Result<()> {
+    let server = crate::config::Config::load()
+        .ok()
+        .and_then(|config| config.server_url);
+    if let Some(refusal) = linux_install_refusal(
+        nix::unistd::Uid::effective().is_root(),
+        user_manager_reachable,
+        &login_account(),
+        server.as_deref(),
+    ) {
+        anyhow::bail!(refusal);
+    }
     let file = service_file()?;
     let executable = executable()?;
     let pinned = pinned_service_env()?;
@@ -1310,9 +1842,7 @@ pub fn install(to_stderr: bool) -> Result<()> {
     // rewritten above, then reloaded and (re)started.
     run_command("systemctl", &["--user", "enable", "--now", LINUX_UNIT])?;
     // Restart so an already-running unit picks up a replaced binary/unit.
-    let _ = Command::new("systemctl")
-        .args(["--user", "restart", LINUX_UNIT])
-        .status();
+    run_finite("systemctl", &["--user", "restart", LINUX_UNIT])?;
     print_install_notes(&pinned, to_stderr)?;
     say(
         to_stderr,
@@ -1391,12 +1921,14 @@ fn uninstall() -> Result<()> {
     let file = service_file()?;
     let _ = Command::new("systemctl")
         .args(["--user", "disable", "--now", LINUX_UNIT])
+        .envs(user_bus_env())
         .status();
     if file.exists() {
         fs::remove_file(&file).with_context(|| format!("removing `{}`", file.display()))?;
     }
     let _ = Command::new("systemctl")
         .args(["--user", "daemon-reload"])
+        .envs(user_bus_env())
         .status();
     output::line("uninstalled relay service")
 }
@@ -1425,6 +1957,13 @@ fn uninstall() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn status() -> Result<()> {
+    // Checked first: `systemctl status` exits non-zero for a stopped unit,
+    // which is exactly when this warning matters.
+    if installed()
+        && let Some(warning) = linger_status_warning(linger_on(), &login_account())
+    {
+        output::diagnostic(format!("warning: {warning}"))?;
+    }
     run_command("systemctl", &["--user", "status", LINUX_UNIT])
 }
 
@@ -1449,12 +1988,7 @@ fn restart() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn restart() -> Result<()> {
-    require_installed()?;
-    let domain = launchd_domain()?;
-    run_command(
-        "launchctl",
-        &["kickstart", "-k", &format!("{domain}/{MACOS_LABEL}")],
-    )?;
+    restart_quietly(Restart::Loaded)?;
     output::line(format!("restarted `{MACOS_LABEL}`"))
 }
 
@@ -1534,42 +2068,155 @@ fn print_install_notes(pinned: &[(&str, String)], to_stderr: bool) -> Result<()>
     for (name, value) in pinned {
         say(to_stderr, format!("service pins `{name}` to `{value}`"))?;
     }
+    // The same review pinned_service_env made of this PATH, now reported.
+    if let Ok(path) = std::env::var("PATH") {
+        let review = service_path(&path, inspect_service_path_dir, &SessionDirs::current());
+        for line in session_path_notes(&review.session)
+            .into_iter()
+            .chain(service_path_warnings(&review.risky))
+        {
+            say(to_stderr, line)?;
+        }
+    }
     say(
         to_stderr,
         "node secrets are read from `secrets.env` (`wsmp secret`); the service needs no environment file",
     )?;
     #[cfg(target_os = "linux")]
-    match linger_on() {
-        Some(true) => {}
-        Some(false) => say(
-            to_stderr,
-            "warning: lingering is off, so this node cannot start runtimes and the service \
-             stops when you log out; enable it once with `loginctl enable-linger \"$USER\"`",
-        )?,
-        None => say(
-            to_stderr,
-            "tip: for a user service that survives logout and can start runtimes, run \
-             `loginctl enable-linger \"$USER\"`",
-        )?,
+    {
+        let account = login_account();
+        let outcome = ensure_linger(linger_on, || enable_linger(&account));
+        for line in linger_install_lines(outcome, &account) {
+            say(to_stderr, line)?;
+        }
     }
     Ok(())
 }
 
-/// Whether logind keeps this user's manager running without a session;
-/// `None` when `loginctl` cannot say.
-#[cfg(target_os = "linux")]
-fn linger_on() -> Option<bool> {
-    let uid = nix::unistd::Uid::effective().as_raw().to_string();
-    let output = Command::new("loginctl")
-        .args(["show-user", &uid, "-p", "Linger"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// What `wsmp service install` found and did about systemd lingering.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LingerOutcome {
+    /// Already on: nothing to do.
+    AlreadyOn,
+    /// Was off; `loginctl enable-linger` for this account turned it on.
+    Enabled,
+    /// Off, and enabling it as this account was refused (logind's polkit
+    /// rule, or no logind answer): the person must run the command.
+    Refused,
+    /// `loginctl` could not say (no logind, a container), before and after
+    /// trying to enable it.
+    Unknown,
+}
+
+/// Turn lingering on for the installing account unless it is on. `query`
+/// reads the state (`None`: unknown), `enable` tries
+/// `loginctl enable-linger <account>` (never sudo, never a password
+/// prompt); the state is read again after it, so only a confirmed `yes`
+/// counts as enabled.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn ensure_linger(
+    query: impl Fn() -> Option<bool>,
+    enable: impl FnOnce(),
+) -> LingerOutcome {
+    let before = query();
+    if before == Some(true) {
+        return LingerOutcome::AlreadyOn;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Some(crate::runtimes::executor::native::linger_enabled(&text))
+    // Unknown is tried too: `loginctl show-user` fails for an account with
+    // no session and no lingering, which is lingering off. Without logind
+    // the try fails at once.
+    enable();
+    match (before, query()) {
+        (_, Some(true)) => LingerOutcome::Enabled,
+        (None, _) => LingerOutcome::Unknown,
+        (Some(_), _) => LingerOutcome::Refused,
+    }
+}
+
+/// The install notes for a [`LingerOutcome`], naming `account` in the
+/// exact command to run.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn linger_install_lines(outcome: LingerOutcome, account: &str) -> Vec<String> {
+    match outcome {
+        LingerOutcome::AlreadyOn => Vec::new(),
+        LingerOutcome::Enabled => vec![format!(
+            "enabled systemd lingering for `{account}` (`loginctl enable-linger {account}`): the \
+             service now starts at boot and keeps running after you log out"
+        )],
+        LingerOutcome::Refused => vec![
+            format!(
+                "warning: systemd lingering is off for `{account}` and wsmp could not turn it on \
+                 as you, so this service stops when you log out, does not start at boot, and the \
+                 node cannot start runtimes"
+            ),
+            format!("  fix it once (as an administrator): sudo loginctl enable-linger {account}"),
+        ],
+        LingerOutcome::Unknown => vec![format!(
+            "warning: could not read systemd lingering for `{account}` (`loginctl show-user`); \
+             without it this service stops when you log out and does not start at boot. If \
+             logind runs here, enable it once: loginctl enable-linger {account}"
+        )],
+    }
+}
+
+/// The `wsmp status` / `wsmp service status` warning for an installed user
+/// service without lingering; None when lingering is on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn linger_status_warning(linger: Option<bool>, account: &str) -> Option<String> {
+    match linger {
+        Some(true) => None,
+        Some(false) => Some(format!(
+            "systemd lingering is off for `{account}`: the relay service stops when you log out \
+             and does not start at boot, and the node cannot start runtimes. Fix: \
+             `loginctl enable-linger {account}` (or `wsmp service install`, which tries it)"
+        )),
+        None => Some(format!(
+            "could not read systemd lingering for `{account}`: if the relay service stops at \
+             logout, run `loginctl enable-linger {account}`"
+        )),
+    }
+}
+
+/// Bound on each `loginctl` call: logind answers at once or not at all.
+#[cfg(target_os = "linux")]
+const LOGINCTL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The installing account's login name (its uid when it has none).
+#[cfg(target_os = "linux")]
+pub(crate) fn login_account() -> String {
+    let uid = nix::unistd::Uid::effective();
+    nix::unistd::User::from_uid(uid)
+        .ok()
+        .flatten()
+        .map_or_else(|| uid.as_raw().to_string(), |user| user.name)
+}
+
+/// Whether logind keeps this user's manager running without a session;
+/// `None` when `loginctl` cannot say. Bounded.
+#[cfg(target_os = "linux")]
+pub(crate) fn linger_on() -> Option<bool> {
+    let uid = nix::unistd::Uid::effective().as_raw().to_string();
+    let args = ["show-user".to_string(), uid, "-p".into(), "Linger".into()];
+    match crate::telemetry::run_bounded("loginctl", &args, LOGINCTL_TIMEOUT, 4096) {
+        crate::telemetry::Bounded::Output(text) => {
+            Some(crate::runtimes::executor::native::linger_enabled(&text))
+        }
+        _ => None,
+    }
+}
+
+/// `loginctl --no-ask-password enable-linger <account>`: logind's polkit
+/// rule usually lets an account set its own lingering. Bounded and quiet;
+/// the caller reads the state again to see whether it worked.
+#[cfg(target_os = "linux")]
+fn enable_linger(account: &str) {
+    let args = [
+        "--no-ask-password".to_string(),
+        "enable-linger".into(),
+        account.to_string(),
+    ];
+    let _ = crate::telemetry::run_bounded("loginctl", &args, LOGINCTL_TIMEOUT, 4096);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1711,15 +2358,53 @@ fn run_finite(program: &str, args: &[&str]) -> Result<()> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_finite_within(program: &str, args: &[&str], timeout: std::time::Duration) -> Result<()> {
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-    let (ok, output) = crate::update::deadman::run_bounded(program, &args, &[], timeout)?;
+    let (ok, output) =
+        crate::update::deadman::run_bounded(program, &args, &service_manager_env(), timeout)?;
     anyhow::ensure!(ok, "`{program}` failed: {}", output.trim());
     Ok(())
+}
+
+/// Extra environment for a service-manager command: [`user_bus_env`] on
+/// Linux, nothing on macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn service_manager_env() -> Vec<(&'static str, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        user_bus_env()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+/// `XDG_RUNTIME_DIR` for a `systemctl --user` or `journalctl --user` call.
+/// A shell from `su - <user>` or `sudo -iu <user>` has none, so `systemctl`
+/// cannot find the user manager's bus, although logind runs that manager
+/// (with lingering on) at `/run/user/<uid>`. Nothing when it is set.
+#[cfg(target_os = "linux")]
+pub(crate) fn user_bus_env() -> Vec<(&'static str, String)> {
+    user_bus_env_for(
+        std::env::var_os("XDG_RUNTIME_DIR").is_some(),
+        nix::unistd::Uid::effective().as_raw(),
+    )
+}
+
+/// [`user_bus_env`] for a given state: `set` is whether `XDG_RUNTIME_DIR` is.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn user_bus_env_for(set: bool, uid: u32) -> Vec<(&'static str, String)> {
+    if set {
+        Vec::new()
+    } else {
+        vec![("XDG_RUNTIME_DIR", format!("/run/user/{uid}"))]
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_command(program: &str, args: &[impl AsRef<std::ffi::OsStr>]) -> Result<()> {
     let status = Command::new(program)
         .args(args)
+        .envs(service_manager_env())
         .status()
         .with_context(|| format!("running `{program}`"))?;
     if status.success() {
@@ -1784,25 +2469,13 @@ fn launchd_domain() -> Result<String> {
 ///
 /// Built everywhere so its rendering tests run on every CI platform.
 #[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod task_names;
+
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod windows_task {
     /// Kept in the state dir; marks the service as installed.
     pub const DEFINITION_FILE: &str = "wsmp-relay-task.xml";
     pub const LOG_FILE: &str = "relay.log";
-
-    /// One task per Windows user: Task Scheduler names are machine-wide.
-    pub fn task_name(user: &str) -> String {
-        let user: String = user
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                    ch
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        format!("wsmp-relay-{user}")
-    }
 
     /// One argument for a Windows command line, as `CommandLineToArgvW` (and
     /// Rust's own argument parser) reads it back.
@@ -1937,14 +2610,193 @@ pub(crate) mod windows_task {
     }
 }
 
+/// This account, for the scheduled-task names ([`task_names`]): its SID,
+/// `USERNAME` (the 0.4.x names) and its absolute state directory.
 #[cfg(windows)]
-fn windows_user() -> Result<String> {
-    std::env::var("USERNAME").context("`USERNAME` is not set")
+pub(crate) fn windows_account() -> Result<task_names::Account> {
+    let state_dir = std::path::absolute(crate::paths::state_dir()?)
+        .context("resolving the state directory")?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("the state directory is not valid UTF-8"))?;
+    Ok(task_names::Account {
+        sid: wsmp_windows::current_user_sid().context("reading this user's SID")?,
+        user: std::env::var("USERNAME").ok(),
+        state_dir,
+    })
 }
 
+/// Task Scheduler through `schtasks` and PowerShell, every call bounded.
+#[cfg(windows)]
+pub(crate) struct SystemTasks;
+
+#[cfg(windows)]
+impl task_names::Tasks for SystemTasks {
+    fn exists(&self, name: &str) -> Result<task_names::Presence> {
+        use task_names::Presence;
+        if schtasks(&["/Query", "/TN", name]).is_ok() {
+            return Ok(Presence::Present);
+        }
+        // `/Query /TN` fails the same way (exit 1, localized text) for a
+        // missing task, one this account may not read, and a broken service.
+        // Task Scheduler's COM API tells them apart by HRESULT: 0x80070002
+        // (not found) and 0x80070005 (access denied). Names are
+        // `[A-Za-z0-9._-]` (task_names::sanitize): single quotes suffice.
+        let script = format!(
+            "$s = New-Object -ComObject Schedule.Service; $s.Connect(); \
+             try {{ $null = $s.GetFolder('\\').GetTask('{name}'); 'present' }} \
+             catch {{ $e = $_.Exception; while ($e.InnerException) {{ $e = $e.InnerException }}; \
+             switch ($e.HResult) {{ -2147024894 {{ 'absent' }} -2147024891 {{ 'unreadable' }} default {{ throw }} }} }}"
+        );
+        let argv = ["-NoProfile", "-NonInteractive", "-Command", &script].map(str::to_string);
+        if let Ok((true, stdout, _)) = crate::update::deadman::run_bounded_split(
+            "powershell",
+            &argv,
+            &[],
+            FINITE_COMMAND_TIMEOUT,
+        ) {
+            match stdout.trim() {
+                "present" => return Ok(Presence::Present),
+                "absent" => return Ok(Presence::Absent),
+                "unreadable" => return Ok(Presence::Unreadable),
+                _ => {}
+            }
+        }
+        // No PowerShell (blocked by policy): the full listing, which fails
+        // as a whole on any broken task and is kept only up to 1 MiB
+        // (`run_bounded_split`), so a long one is an error, never "absent".
+        let listing =
+            schtasks(&["/Query", "/FO", "CSV", "/NH"]).context("listing the scheduled tasks")?;
+        anyhow::ensure!(
+            listing.len() < (1 << 20) - 4096,
+            "the scheduled-task listing is too long to read whole"
+        );
+        Ok(if task_names::csv_lists_task(&listing, name) {
+            Presence::Present
+        } else {
+            Presence::Absent
+        })
+    }
+    fn definition(&self, name: &str) -> Option<String> {
+        // Names are `[A-Za-z0-9._-]` (task_names::sanitize): single quotes
+        // suffice. UTF-8 output so a non-ASCII path reads back as written.
+        let script = format!(
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+             Export-ScheduledTask -TaskName '{name}' -TaskPath '\\' -ErrorAction Stop"
+        );
+        let argv = ["-NoProfile", "-NonInteractive", "-Command", &script].map(str::to_string);
+        match crate::update::deadman::run_bounded_split(
+            "powershell",
+            &argv,
+            &[],
+            FINITE_COMMAND_TIMEOUT,
+        ) {
+            Ok((true, stdout, _)) if stdout.contains("<Task") => Some(stdout),
+            _ => None,
+        }
+    }
+    fn create(&self, name: &str, xml_file: &str) -> Result<()> {
+        schtasks(&["/Create", "/TN", name, "/XML", xml_file, "/F"]).map(|_| ())
+    }
+    fn end(&self, name: &str) {
+        end_windows_task(name);
+    }
+    fn delete(&self, name: &str) -> Result<()> {
+        schtasks(&["/Delete", "/TN", name, "/F"]).map(|_| ())
+    }
+}
+
+/// The relay task's names for this account.
+#[cfg(windows)]
+fn relay_task_names() -> Result<(task_names::TaskNames, task_names::Account)> {
+    let account = windows_account()?;
+    Ok((
+        task_names::TaskNames::new(task_names::RELAY_PREFIX, &account),
+        account,
+    ))
+}
+
+/// The relay task commands act on: the SID-named one, or this account's
+/// 0.4.x task on a node updated from 0.4.x ([`task_names::active_name`]).
 #[cfg(windows)]
 fn windows_task_name() -> Result<String> {
-    Ok(windows_task::task_name(&windows_user()?))
+    let (names, account) = relay_task_names()?;
+    task_names::active_name(&SystemTasks, &names, &account)
+}
+
+/// An update has not confirmed yet (its dead-man may still roll back). A
+/// state that cannot be read counts as pending: moving the task during a
+/// trial from 0.4.x would leave its rollback without a task to restart.
+#[cfg(windows)]
+fn update_trial_pending() -> bool {
+    match crate::update::update_dir().and_then(|dir| crate::update::state::load(&dir)) {
+        Ok(current) => current.is_some_and(|current| current.in_progress()),
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "the update state could not be read; treating an update as on trial"
+            );
+            true
+        }
+    }
+}
+
+/// `wsmp update` to a build older than 1.0 on Windows, while a relay
+/// service is installed (its definition file, or a SID-named task left
+/// without one): refused. That build only knows the 0.4.x task names, so it
+/// would neither restart a SID-named relay task nor remove the SID-named
+/// dead-man this update arms.
+#[cfg(windows)]
+pub fn refuse_pre_sid_downgrade(version: &str) -> Result<()> {
+    if task_names::uses_sid_names(version) {
+        return Ok(());
+    }
+    let (names, _) = relay_task_names()?;
+    let task = task_names::Tasks::exists(&SystemTasks, &names.current)?;
+    anyhow::ensure!(
+        !installed() && task == task_names::Presence::Absent,
+        "wsmp {version} predates 1.0 and only knows the 0.4 scheduled-task names; run `wsmp service uninstall` first, then install {version} with its installer and run its `wsmp service install`"
+    );
+    Ok(())
+}
+
+/// Elsewhere there is no scheduled task to keep.
+#[cfg(not(windows))]
+pub fn refuse_pre_sid_downgrade(_version: &str) -> Result<()> {
+    Ok(())
+}
+
+/// `wsmp update` to `version`: move a node installed by 0.4.x onto the
+/// SID-named relay task, from the definition file its install wrote, before
+/// the restart. Only for a 1.0+ target (an older build looks for the old
+/// name) and only when the definition file is there. Never on a restart or a
+/// rollback: a rollback to 0.4.x must find the task 0.4.x knows.
+#[cfg(windows)]
+pub fn migrate_relay_task_for(version: &str) -> Result<()> {
+    if !task_names::uses_sid_names(version) {
+        return Ok(());
+    }
+    let file = service_file()?;
+    if !file.exists() {
+        return Ok(());
+    }
+    let file_arg = path_text("the task definition", &file)?.to_string();
+    let (names, account) = relay_task_names()?;
+    match task_names::migrate(&SystemTasks, &names, &account, &file_arg)? {
+        Some(moved) => {
+            for note in moved.notes() {
+                tracing::info!("{note}");
+            }
+            moved.into_result()
+        }
+        None => Ok(()),
+    }
+}
+
+/// Elsewhere there is no scheduled task to move.
+#[cfg(not(windows))]
+pub fn migrate_relay_task_for(_version: &str) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2042,11 +2894,24 @@ pub fn install(to_stderr: bool) -> Result<()> {
     }
     fs::write(&file, windows_task::utf16_bytes(&xml))
         .with_context(|| format!("writing `{}`", file.display()))?;
-    let name = windows_task_name()?;
-    schtasks(&["/Create", "/TN", &name, "/XML", &file_arg, "/F"])?;
+    let (names, account) = relay_task_names()?;
+    // Registered under the SID name; this account's 0.4.x task, if any, is
+    // ended and deleted after it (task_names::register). While an update from
+    // 0.4.x is on trial, the 0.4.x name stays (its rollback restarts it).
+    let registered = task_names::register(
+        &SystemTasks,
+        &names,
+        &account,
+        &file_arg,
+        update_trial_pending(),
+    )?;
+    let name = registered.name.clone();
     // Reinstall or upgrade: a running relay is replaced by the new binary.
     end_windows_task(&name);
     schtasks(&["/Run", "/TN", &name])?;
+    for note in registered.notes() {
+        say(to_stderr, note)?;
+    }
     for (option, value) in [
         ("--config", &config),
         ("--state-dir", &state_dir),
@@ -2065,15 +2930,19 @@ pub fn install(to_stderr: bool) -> Result<()> {
     say(
         to_stderr,
         format!("installed and started the scheduled task `{name}`"),
-    )
+    )?;
+    registered.into_result()
 }
 
 #[cfg(windows)]
 fn uninstall() -> Result<()> {
-    let name = windows_task_name()?;
-    end_windows_task(&name);
-    // Already gone is fine.
-    let _ = schtasks(&["/Delete", "/TN", &name, "/F"]);
+    let (names, account) = relay_task_names()?;
+    // The SID-named task and this account's 0.4.x one; already gone is fine.
+    // A failed query or delete stops here, with the definition file kept.
+    let done = task_names::unregister(&SystemTasks, &names, &account)?;
+    for note in done.notes() {
+        output::diagnostic(note)?;
+    }
     let file = service_file()?;
     if file.exists() {
         fs::remove_file(&file).with_context(|| format!("removing `{}`", file.display()))?;
@@ -2108,46 +2977,151 @@ fn logs(args: &LogsArgs) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
 
     let path = windows_log_file()?;
-    let text = fs::read(&path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    let mut file = fs::File::open(&path)
         .with_context(|| format!("no relay service log at `{}` yet", path.display()))?;
+    let identity = |file: &fs::File| -> Result<_> {
+        let id = wsmp_windows::file_identity(file)?;
+        Ok((id.volume, id.index))
+    };
+    let mut previous_identity = identity(&file)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    drop(file);
+    let mut follow = LogFollow::new(&bytes);
+    let shown = if args.follow {
+        &bytes[..bytes.len() - follow.pending.len()]
+    } else {
+        &bytes
+    };
+    let text = String::from_utf8_lossy(shown);
     for line in windows_task::last_lines(&text, args.lines as usize) {
         output::line(line)?;
     }
     if !args.follow {
         return Ok(());
     }
-    let mut position = text.len() as u64;
-    let mut pending = String::new();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let Ok(mut file) = fs::File::open(&path) else {
             continue;
         };
-        let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
-        if len < position {
-            // Rolled over: the new file starts from the top.
-            position = 0;
-            pending.clear();
-        }
-        if len == position {
+        let current_identity = identity(&file)?;
+        let len = file.metadata()?.len();
+        follow.observe_file(len, current_identity != previous_identity);
+        previous_identity = current_identity;
+        if len == follow.position {
             continue;
         }
-        file.seek(SeekFrom::Start(position))?;
+        file.seek(SeekFrom::Start(follow.position))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        position += bytes.len() as u64;
-        pending.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(end) = pending.find('\n') {
-            let line: String = pending.drain(..=end).collect();
-            output::line(line.trim_end_matches(['\r', '\n']))?;
+        for line in follow.push(&bytes) {
+            output::line(line)?;
         }
+    }
+}
+
+/// Follow raw bytes: a UTF-8 code point may straddle any two reads. Decode only
+/// completed lines, retaining their unfinished suffix across reads.
+#[cfg(any(windows, test))]
+struct LogFollow {
+    position: u64,
+    pending: Vec<u8>,
+}
+
+#[cfg(any(windows, test))]
+impl LogFollow {
+    fn new(initial: &[u8]) -> Self {
+        let start = initial
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |end| end + 1);
+        Self {
+            position: initial.len() as u64,
+            pending: initial[start..].to_vec(),
+        }
+    }
+
+    fn observe_file(&mut self, len: u64, replaced: bool) {
+        if replaced || len < self.position {
+            self.position = 0;
+            self.pending.clear();
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.position += bytes.len() as u64;
+        self.pending.extend_from_slice(bytes);
+        let Some(end) = self.pending.iter().rposition(|byte| *byte == b'\n') else {
+            return Vec::new();
+        };
+        let lines = self.pending[..=end]
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(|line| {
+                String::from_utf8_lossy(line)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string()
+            })
+            .collect();
+        self.pending.drain(..=end);
+        lines
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_follow_tracks_raw_offsets_and_preserves_split_utf8() {
+        let initial = b"bad \xff\n\xe2";
+        let mut log = LogFollow::new(initial);
+        assert_eq!(log.position, initial.len() as u64);
+        assert!(log.push(b"\x82").is_empty());
+        assert_eq!(log.push(b"\xac\r\nnext \xff\n"), ["€", "next �"]);
+        assert_eq!(
+            log.position,
+            (initial.len() + 1 + b"\xac\r\nnext \xff\n".len()) as u64
+        );
+        assert!(log.pending.is_empty());
+    }
+
+    #[test]
+    fn log_follow_discards_partial_lines_on_truncation_and_replacement() {
+        let mut log = LogFollow::new(b"old partial \xe2");
+        log.observe_file(2, false);
+        assert_eq!(log.position, 0);
+        assert_eq!(log.push(b"new\n"), ["new"]);
+        assert!(log.push(b"partial").is_empty());
+        log.observe_file(100, true);
+        assert_eq!(log.position, 0);
+        assert_eq!(log.push(b"replacement\n"), ["replacement"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finite_service_commands_propagate_failure_before_success() {
+        let error = run_finite("sh", &["-c", "echo restart-refused >&2; exit 1"])
+            .expect_err("restart failed");
+        assert!(format!("{error:#}").contains("restart-refused"));
+        assert!(run_finite("wsmp-nonexistent-service-command", &[]).is_err());
+    }
+
+    #[test]
+    fn loaded_restart_bootstraps_an_unloaded_launch_agent() {
+        let mut launchd = FakeLaunchd::new(false);
+        launchd
+            .restart(Restart::Loaded)
+            .expect("restart unloaded agent");
+        assert_eq!(
+            launchd.calls(),
+            ["print err", "bootstrap ok", "kickstart ok"]
+        );
+        let mut launchd = FakeLaunchd::new(false);
+        launchd.bootstrap_failures = u32::MAX;
+        assert!(launchd.restart(Restart::Loaded).is_err());
+        assert!(!launchd.calls().contains(&"kickstart ok"));
+    }
 
     #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
@@ -2375,30 +3349,6 @@ mod tests {
         anyhow::bail!("nothing must be written")
     }
 
-    /// The unit and wrapper of wsmp before 0.4.0 (`0c336eea`), which ran
-    /// `daemon start --foreground` and read an `EnvironmentFile`.
-    #[cfg(unix)]
-    fn pre_0_4_template(kind: ServiceKind, executable: &str) -> String {
-        match kind {
-            ServiceKind::SystemdUnit => format!(
-                "[Unit]\nDescription=WS Model Proxy relay\nAfter=network-online.target\n\
-                 Wants=network-online.target\n\n[Service]\nType=simple\n\
-                 ExecStart={executable} daemon start --foreground\nRestart=on-failure\n\
-                 RestartSec=5\n# Optional: CLI-token / endpoint-header env vars (see `wsmp service env-sync`).\n\
-                 # The leading `-` means a missing file is not fatal (device credentials still work).\n\
-                 EnvironmentFile=-/u/.config/ws-model-proxy/service.env\nWorkingDirectory=%h\n\
-                 StandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n"
-            ),
-            _ => format!(
-                "#!/bin/sh\n# Generated by `wsmp service install`. Sources the private env file\n\
-                 # (CLI-token / endpoint-header vars) without storing secrets in the plist.\n\
-                 set -eu\nENV_FILE='/u/service.env'\nif [ -f \"$ENV_FILE\" ]; then\n\tset -a\n\
-                 \t# shellcheck disable=SC1090\n\t. \"$ENV_FILE\"\n\tset +a\nfi\n\
-                 exec '{executable}' daemon start --foreground\n"
-            ),
-        }
-    }
-
     /// wsmp's files are recognized by the complete opening every template had,
     /// whatever follows (a file cut short after it too); a file by hand is not,
     /// nor one with only part of the opening (empty, cut short inside it, or a
@@ -2437,12 +3387,6 @@ mod tests {
                     );
                 }
             }
-        }
-        for kind in [ServiceKind::SystemdUnit, ServiceKind::LaunchdWrapper] {
-            assert!(
-                kind.generated(pre_0_4_template(kind, &keg.old).as_bytes()),
-                "{kind:?}"
-            );
         }
         for (kind, by_hand) in [
             (
@@ -2496,11 +3440,6 @@ mod tests {
                 (
                     "an older wsmp's Cellar path",
                     keg.render_for(kind, &keg.old, &pins()),
-                    kind.mode(),
-                ),
-                (
-                    "the pre-0.4.0 template",
-                    pre_0_4_template(kind, &keg.old),
                     kind.mode(),
                 ),
                 (
@@ -2838,12 +3777,6 @@ mod tests {
         );
         canonical();
         reset();
-        // An older wsmp's wrapper and a plist cut short: both.
-        std::fs::write(&wrapper, pre_0_4_template(wrapper_kind, &keg.old)).expect("w");
-        let plist_text = keg.render(plist_kind);
-        std::fs::write(&plist, &plist_text[..plist_text.len() / 3]).expect("plist");
-        keg.pair(&recording).expect("both written");
-        canonical();
         // Done: the next update writes nothing.
         keg.pair(&never_publish).expect("done");
         reset();
@@ -3210,10 +4143,23 @@ mod tests {
                         self.path("config.json").display().to_string(),
                     ),
                     ("WSMP_STATE_DIR", self.path("state").display().to_string()),
-                    ("PATH", self.path_env()),
+                    ("PATH", self.pinned_path()),
                 ],
             )
             .expect("render")
+        }
+
+        /// The `PATH` the unit pins from [`Self::path_env`]: the fake bin is
+        /// in a temporary directory, which [`service_path`] leaves off.
+        fn pinned_path(&self) -> String {
+            if SessionDirs::current()
+                .scope_of(&self.path("fakebin"))
+                .is_some()
+            {
+                "/usr/bin:/bin".to_owned()
+            } else {
+                self.path_env()
+            }
         }
 
         fn stable_unit(&self) -> String {
@@ -4781,8 +5727,14 @@ mod tests {
 
     #[test]
     fn windows_task_names_are_per_user_and_safe() {
-        assert_eq!(windows_task::task_name("jo"), "wsmp-relay-jo");
-        assert_eq!(windows_task::task_name(r"Jo Doe\x"), "wsmp-relay-Jo_Doe_x");
+        assert_eq!(
+            task_names::task_name(task_names::RELAY_PREFIX, "S-1-5-21-1-2-3-1001"),
+            "wsmp-relay-S-1-5-21-1-2-3-1001"
+        );
+        assert_eq!(
+            task_names::legacy_task_name(task_names::RELAY_PREFIX, r"Jo Doe\x"),
+            "wsmp-relay-Jo_Doe_x"
+        );
         assert_eq!(windows_task::last_lines("a\nb\nc\n", 2), ["b", "c"]);
         assert_eq!(windows_task::last_lines("a\n", 5), ["a"]);
     }
@@ -4830,35 +5782,542 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn risks_for(dir: &Path) -> Option<Vec<PathDirRisk>> {
+        match dir.to_str()? {
+            "/missing" => None,
+            "/tmp/open" => Some(vec![PathDirRisk::WorldWritable { mode: 0o1777 }]),
+            "/usr/local/bin" => Some(vec![PathDirRisk::GroupWritable {
+                mode: 0o2775,
+                gid: 50,
+                group: Some("staff".to_owned()),
+            }]),
+            "/opt/alice/bin" => Some(vec![PathDirRisk::OtherOwner {
+                uid: 1001,
+                owner: Some("alice".to_owned()),
+            }]),
+            _ => Some(Vec::new()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn session_dirs() -> SessionDirs {
+        SessionDirs {
+            runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            temp_dir: Some(PathBuf::from("/var/folders/xy/T")),
+            fnm_default_bins: vec![
+                PathBuf::from("/opt/fnm-not-installed/aliases/default/bin"),
+                PathBuf::from("/home/me/.local/share/fnm/aliases/default/bin"),
+            ],
+        }
+    }
+
+    #[cfg(unix)]
+    fn installed_dirs(dir: &Path) -> Option<Vec<PathDirRisk>> {
+        match dir.to_str()? {
+            "/opt/fnm-not-installed/aliases/default/bin" | "/missing" => None,
+            _ => Some(Vec::new()),
+        }
+    }
+
+    /// The Ubuntu 26.04 field bug: the unit pinned
+    /// `/run/user/1000/fnm_multishells/<id>/bin` from the installing shell.
+    /// Every directory that ends with the shell or login session is left
+    /// off, fnm's per-shell one is replaced by fnm's default (once), and the
+    /// stable entries keep their order.
+    #[cfg(unix)]
     #[test]
-    fn service_path_keeps_only_absolute_usable_directories_once() {
-        let keep = |dir: &Path| dir != Path::new("/tmp/open");
+    fn service_path_leaves_off_session_directories_and_uses_fnms_default() {
+        let review = service_path(
+            "/run/user/1000/fnm_multishells/4123_1763040000000/bin:/home/me/.cargo/bin:\
+             /run/user/1000/bin:/tmp/build/bin:/var/folders/xy/T/tool/bin:/usr/local/bin:\
+             /usr/bin:/home/me/.cache/fnm_multishells/99/bin:/var/tmp/x:/bin",
+            installed_dirs,
+            &session_dirs(),
+        );
+        assert_eq!(
+            review.path.as_deref(),
+            Some(
+                "/home/me/.local/share/fnm/aliases/default/bin:/home/me/.cargo/bin:\
+                 /usr/local/bin:/usr/bin:/bin"
+            )
+        );
+        let scopes: Vec<(&str, SessionScope, bool)> = review
+            .session
+            .iter()
+            .map(|entry| {
+                (
+                    entry.dir.to_str().expect("utf-8"),
+                    entry.scope,
+                    entry.replacement.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            scopes,
+            [
+                (
+                    "/run/user/1000/fnm_multishells/4123_1763040000000/bin",
+                    SessionScope::Shell,
+                    true
+                ),
+                ("/run/user/1000/bin", SessionScope::Login, false),
+                ("/tmp/build/bin", SessionScope::Temporary, false),
+                ("/var/folders/xy/T/tool/bin", SessionScope::Temporary, false),
+                (
+                    "/home/me/.cache/fnm_multishells/99/bin",
+                    SessionScope::Shell,
+                    true
+                ),
+                ("/var/tmp/x", SessionScope::Temporary, false),
+            ]
+        );
+        let notes = session_path_notes(&review.session);
+        assert!(
+            notes[0].starts_with(
+                "left `/run/user/1000/fnm_multishells/4123_1763040000000/bin` off the service's PATH"
+            ) && notes[1].contains("/home/me/.local/share/fnm/aliases/default/bin"),
+            "{notes:?}"
+        );
+        // The rendered unit carries no session directory at all.
+        let unit = render_systemd_user_unit(
+            "/home/me/.cargo/bin/wsmp",
+            &[("PATH", review.path.expect("a PATH"))],
+        )
+        .expect("unit");
+        assert!(!unit.contains("/run/user") && !unit.contains("fnm_multishells"));
+        assert!(!unit.contains("/tmp/"), "{unit}");
+    }
+
+    /// `/run/user/<uid>` is a login directory even when `XDG_RUNTIME_DIR`
+    /// is unset (an `su` shell, a cron job); without fnm's default the
+    /// install says how to give the service a Node.
+    #[cfg(unix)]
+    #[test]
+    fn service_path_without_runtime_dir_or_fnm_default() {
+        let session = SessionDirs::default();
+        let review = service_path(
+            "/run/user/1000/fnm_multishells/1_2/bin:/usr/bin:/run/user/1000/fnm_multishells/1_2/bin",
+            installed_dirs,
+            &session,
+        );
+        assert_eq!(review.path.as_deref(), Some("/usr/bin"));
+        assert_eq!(review.session.len(), 1, "a repeated entry is noted once");
+        let notes = session_path_notes(&review.session);
+        assert!(notes[1].contains("`fnm default <version>`"), "{notes:?}");
+        // Nothing but session directories: no PATH pinned at all.
+        assert_eq!(
+            service_path("/run/user/1000/bin:/tmp/x", installed_dirs, &session).path,
+            None
+        );
+        // Lookalikes are not session directories.
+        for stable in [
+            "/run/users/bin",
+            "/run/systemd/bin",
+            "/tmpfoo/bin",
+            "/opt/run/user/bin",
+        ] {
+            assert_eq!(session.scope_of(Path::new(stable)), None, "{stable}");
+        }
+    }
+
+    /// Only where the system keeps per-session directories counts: a
+    /// `$TMPDIR` scratch area (HPC `/scratch`) or a `$XDG_RUNTIME_DIR`
+    /// pointing at home keeps the installs under it on the PATH.
+    #[cfg(unix)]
+    #[test]
+    fn session_dirs_trust_only_system_session_roots() {
+        fn vars(
+            pairs: &'static [(&'static str, &'static str)],
+        ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
+            }
+        }
+        let home = Some(PathBuf::from("/home/me"));
+        let odd = SessionDirs::from_vars(
+            vars(&[("TMPDIR", "/scratch"), ("XDG_RUNTIME_DIR", "/home/me")]),
+            home.clone(),
+        );
+        assert_eq!((&odd.runtime_dir, &odd.temp_dir), (&None, &None));
         assert_eq!(
             service_path(
-                "/usr/bin::relative/bin:./bin:/tmp/open:/usr/bin:/home/me/.local/bin:",
-                keep
+                "/scratch/me/miniconda/bin:/home/me/.cargo/bin:/run/user/1000/bin",
+                installed_dirs,
+                &odd
             )
+            .path
             .as_deref(),
-            Some("/usr/bin:/home/me/.local/bin")
+            Some("/scratch/me/miniconda/bin:/home/me/.cargo/bin")
         );
-        assert_eq!(service_path("", keep), None);
-        assert_eq!(service_path(":relative", keep), None);
+        let usual = SessionDirs::from_vars(
+            vars(&[
+                ("TMPDIR", "/var/folders/xy/abc/T/"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("FNM_DIR", "/opt/fnm"),
+            ]),
+            home,
+        );
+        assert_eq!(
+            usual.runtime_dir.as_deref(),
+            Some(Path::new("/run/user/1000"))
+        );
+        assert_eq!(
+            usual.temp_dir.as_deref(),
+            Some(Path::new("/var/folders/xy/abc/T/"))
+        );
+        assert_eq!(
+            usual.fnm_default_bins[0],
+            PathBuf::from("/opt/fnm/aliases/default/bin")
+        );
+        assert_eq!(
+            usual.scope_of(Path::new("/var/folders/xy/abc/T/fnm/bin")),
+            Some(SessionScope::Temporary)
+        );
+        // The roots themselves are never taken as the session directory.
+        let roots = SessionDirs::from_vars(
+            vars(&[("TMPDIR", "/var/folders"), ("XDG_RUNTIME_DIR", "/run")]),
+            None,
+        );
+        assert_eq!((&roots.runtime_dir, &roots.temp_dir), (&None, &None));
+    }
+
+    #[test]
+    fn root_is_refused_before_anything_is_written_or_asked() {
+        let asked = std::cell::Cell::new(false);
+        let refusal = linux_install_refusal(
+            true,
+            || {
+                asked.set(true);
+                Ok(())
+            },
+            "root",
+            Some("https://wsmp.example.com"),
+        )
+        .expect("root is refused");
+        assert!(!asked.get(), "root never probes the user manager");
+        assert!(
+            refusal.starts_with(
+                "wsmp does not install its relay service as root; nothing was written"
+            )
+        );
+        // The exact commands, with the server filled in.
+        for command in [
+            "useradd --create-home --shell /bin/bash wsmp",
+            "loginctl enable-linger wsmp",
+            "su - wsmp",
+            "curl -fsSL https://wsmp.example.com/install.sh | sh",
+            "~/.cargo/bin/wsmp login https://wsmp.example.com --code <enrollment code>",
+            "`wsmp logout`",
+            "`wsmp run` in the foreground",
+        ] {
+            assert!(refusal.contains(command), "{command}: {refusal}");
+        }
+        // Root is told to run nothing with sudo: it needs none.
+        assert!(!refusal.contains("sudo"), "{refusal}");
+        // No server known: a placeholder.
+        let unknown = root_install_refusal(None);
+        assert!(
+            unknown.contains("curl -fsSL <server>/install.sh | sh"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_user_manager_is_refused_before_the_unit_is_written() {
+        let refusal = linux_install_refusal(
+            false,
+            || Err("`systemctl` failed: Failed to connect to bus".to_string()),
+            "ada",
+            None,
+        )
+        .expect("no user manager is refused");
+        assert!(refusal.contains("nothing was written"), "{refusal}");
+        // systemctl's own reason is kept, so a timeout reads differently from no manager.
+        assert!(refusal.contains("Failed to connect to bus"), "{refusal}");
+        assert!(
+            refusal.contains("sudo loginctl enable-linger ada"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("`wsmp run` in the foreground"),
+            "{refusal}"
+        );
+        // A reachable manager: install goes ahead.
+        assert_eq!(linux_install_refusal(false, || Ok(()), "ada", None), None);
+    }
+
+    #[test]
+    fn a_shell_without_a_runtime_dir_still_reaches_the_user_bus() {
+        // `su - ada` / `sudo -iu ada`: no XDG_RUNTIME_DIR, so name logind's.
+        assert_eq!(
+            user_bus_env_for(false, 1000),
+            vec![("XDG_RUNTIME_DIR", "/run/user/1000".to_string())]
+        );
+        // A login session's own value is kept as it is.
+        assert!(user_bus_env_for(true, 1000).is_empty());
+    }
+
+    #[test]
+    fn linger_is_enabled_when_off_and_reread_before_claiming_it() {
+        use std::cell::{Cell, RefCell};
+        // Off, and enabling works.
+        let state = Cell::new(Some(false));
+        let tried = Cell::new(0);
+        let outcome = ensure_linger(
+            || state.get(),
+            || {
+                tried.set(tried.get() + 1);
+                state.set(Some(true));
+            },
+        );
+        assert_eq!((outcome, tried.get()), (LingerOutcome::Enabled, 1));
+        // Off, and logind refuses: still off after the try.
+        let tried = RefCell::new(0);
+        assert_eq!(
+            ensure_linger(|| Some(false), || *tried.borrow_mut() += 1),
+            LingerOutcome::Refused
+        );
+        assert_eq!(*tried.borrow(), 1);
+        // On: nothing is tried.
+        let never = || panic!("must not try");
+        assert_eq!(
+            ensure_linger(|| Some(true), never),
+            LingerOutcome::AlreadyOn
+        );
+        // Unknown (no session and no lingering makes `show-user` fail): tried,
+        // and enabled once the state reads `yes`; still unknown otherwise.
+        let state = Cell::new(None);
+        assert_eq!(
+            ensure_linger(|| state.get(), || state.set(Some(true))),
+            LingerOutcome::Enabled
+        );
+        let tried = Cell::new(false);
+        assert_eq!(
+            ensure_linger(|| None, || tried.set(true)),
+            LingerOutcome::Unknown
+        );
+        assert!(tried.get());
+        // An enable that leaves the state unreadable is not claimed as done.
+        let state = Cell::new(Some(false));
+        assert_eq!(
+            ensure_linger(|| state.get(), || state.set(None)),
+            LingerOutcome::Refused
+        );
+    }
+
+    #[test]
+    fn linger_notes_name_the_exact_command() {
+        assert!(linger_install_lines(LingerOutcome::AlreadyOn, "alice").is_empty());
+        let enabled = linger_install_lines(LingerOutcome::Enabled, "alice");
+        assert!(enabled[0].starts_with("enabled systemd lingering for `alice`"));
+        let refused = linger_install_lines(LingerOutcome::Refused, "alice");
+        assert!(refused[0].starts_with("warning: systemd lingering is off for `alice`"));
+        assert_eq!(
+            refused[1],
+            "  fix it once (as an administrator): sudo loginctl enable-linger alice"
+        );
+        let unknown = linger_install_lines(LingerOutcome::Unknown, "alice");
+        assert!(
+            unknown[0].ends_with("loginctl enable-linger alice"),
+            "{unknown:?}"
+        );
+        assert_eq!(linger_status_warning(Some(true), "alice"), None);
+        assert!(
+            linger_status_warning(Some(false), "alice")
+                .is_some_and(|warning| warning.contains("`loginctl enable-linger alice`"))
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn service_path_directories_must_exist_and_not_be_world_writable() {
+    fn service_path_keeps_only_absolute_usable_directories_once() {
+        let review = review_service_path(
+            "/usr/bin::relative/bin:./bin:/tmp/open:/missing:/usr/bin:/home/me/.local/bin:",
+            risks_for,
+        );
+        assert_eq!(review.path.as_deref(), Some("/usr/bin:/home/me/.local/bin"));
+        assert_eq!(
+            review.risky,
+            vec![(
+                PathBuf::from("/tmp/open"),
+                vec![PathDirRisk::WorldWritable { mode: 0o1777 }]
+            )]
+        );
+        assert_eq!(review_service_path("", risks_for), ServicePath::default());
+        assert_eq!(
+            review_service_path(":relative:/missing", risks_for).path,
+            None
+        );
+    }
+
+    /// C-12: group-writable and foreign-owned directories stay on the pinned
+    /// PATH (the service must find the same engines) and are reported once,
+    /// in PATH order; a world-writable one is still dropped.
+    #[cfg(unix)]
+    #[test]
+    fn service_path_keeps_group_writable_and_foreign_owned_directories_and_reports_them() {
+        let review = review_service_path(
+            "/usr/local/bin:/usr/bin:/opt/alice/bin:/tmp/open:/usr/local/bin",
+            risks_for,
+        );
+        assert_eq!(
+            review.path.as_deref(),
+            Some("/usr/local/bin:/usr/bin:/opt/alice/bin")
+        );
+        let dirs: Vec<_> = review.risky.iter().map(|(dir, _)| dir.clone()).collect();
+        assert_eq!(
+            dirs,
+            ["/usr/local/bin", "/opt/alice/bin", "/tmp/open"].map(PathBuf::from)
+        );
+        let warning = service_path_warnings(&review.risky).join("\n");
+        assert!(
+            warning.starts_with(
+                "warning: 3 directories on your PATH can be written by other accounts"
+            ),
+            "{warning}"
+        );
+        assert!(warning.contains(
+            "  /usr/local/bin: writable by every member of group `staff` (gid 50) (mode 2775); kept on the service's PATH. To tighten: `chmod g-w /usr/local/bin`"
+        ), "{warning}");
+        assert!(warning.contains(
+            "  /opt/alice/bin: owned by `alice` (uid 1001), who can always write it; kept on the service's PATH. To tighten: have root `chown` it"
+        ), "{warning}");
+        assert!(warning.contains(
+            "  /tmp/open: writable by every account (mode 1777); left OFF the service's PATH. To tighten: `chmod o-w /tmp/open`"
+        ), "{warning}");
+        assert!(
+            warning.contains("wsmp service install`; after tightening"),
+            "{warning}"
+        );
+        assert!(service_path_warnings(&[]).is_empty());
+        let one = service_path_warnings(&review.risky[2..]);
+        assert!(
+            one[0].starts_with("warning: 1 directory on your PATH"),
+            "{one:?}"
+        );
+        assert!(
+            one.last().is_some_and(|line| line.contains("put it back")),
+            "{one:?}"
+        );
+    }
+
+    #[test]
+    fn path_dir_risks_trust_root_the_installer_and_its_private_group_only() {
+        let me = Installer {
+            uid: 1000,
+            private_gid: Some(1000),
+        };
+        let names = |id: u32| Some(format!("name{id}"));
+        let risks = |mode, uid, gid, installer| {
+            path_dir_risks(DirFacts { mode, uid, gid }, installer, names, names)
+        };
+        // Root's and the installer's own directories, 0755 or private-group 0775.
+        assert!(risks(0o40755, 0, 0, me).is_empty());
+        assert!(risks(0o40775, 0, 0, me).is_empty());
+        assert!(risks(0o40755, 1000, 1000, me).is_empty());
+        assert!(risks(0o40775, 1000, 1000, me).is_empty());
+        assert!(risks(0o40755, 1000, 50, me).is_empty());
+        // Debian's historical root:staff 2775 /usr/local/bin.
+        assert_eq!(
+            risks(0o42775, 0, 50, me),
+            vec![PathDirRisk::GroupWritable {
+                mode: 0o2775,
+                gid: 50,
+                group: Some("name50".to_owned())
+            }]
+        );
+        // A root-owned directory whose group is someone's private group.
+        assert_eq!(risks(0o40775, 0, 1000, me), Vec::new());
+        assert_eq!(
+            risks(0o40775, 0, 1001, me).len(),
+            1,
+            "another account's group can write it"
+        );
+        // A shared primary group (e.g. `users`) is not private.
+        let shared = Installer {
+            uid: 1000,
+            private_gid: None,
+        };
+        assert_eq!(risks(0o40775, 1000, 100, shared).len(), 1);
+        // Another account's directory, whatever its mode.
+        assert_eq!(
+            risks(0o40755, 1001, 1001, me),
+            vec![PathDirRisk::OtherOwner {
+                uid: 1001,
+                owner: Some("name1001".to_owned())
+            }]
+        );
+        // Everything at once; world-writable is what drops it.
+        let all = risks(0o40777, 1001, 1001, me);
+        assert_eq!(all.len(), 3, "{all:?}");
+        assert!(matches!(all[0], PathDirRisk::WorldWritable { mode: 0o777 }));
+        assert!(!all.iter().all(PathDirRisk::kept));
+    }
+
+    #[test]
+    fn a_group_another_account_has_as_its_primary_group_is_not_private() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      jo:x:1000:1000:Jo:/home/jo:/bin/bash\n\
+                      # comment:x:1:1000\n\
+                      svc:x:1001:1000::/srv:/usr/sbin/nologin\n";
+        assert!(primary_group_of_another(passwd, 1000, "jo"));
+        assert!(
+            primary_group_of_another(passwd, 1000, "svc"),
+            "jo has it too"
+        );
+        assert!(!primary_group_of_another(passwd, 0, "root"));
+        assert!(!primary_group_of_another(
+            "jo:x:1000:1000::/home/jo:/bin/sh\n",
+            1000,
+            "jo"
+        ));
+        assert!(!primary_group_of_another("", 1000, "jo"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_service_path_dir_reads_real_directories() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().expect("tempdir");
         let private = root.path().join("private");
         let open = root.path().join("open");
+        let group = root.path().join("group");
+        let file = root.path().join("file");
         fs::create_dir(&private).expect("private");
         fs::create_dir(&open).expect("open");
+        fs::create_dir(&group).expect("group");
+        fs::write(&file, b"").expect("file");
         fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).expect("chmod");
         fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).expect("chmod");
-        assert!(usable_service_path_dir(&private));
-        assert!(!usable_service_path_dir(&open));
-        assert!(!usable_service_path_dir(&root.path().join("missing")));
+        fs::set_permissions(&group, fs::Permissions::from_mode(0o775)).expect("chmod");
+        assert_eq!(inspect_service_path_dir(&private), Some(Vec::new()));
+        let open_risks = inspect_service_path_dir(&open).expect("a directory");
+        assert!(
+            open_risks
+                .iter()
+                .any(|risk| matches!(risk, PathDirRisk::WorldWritable { .. })),
+            "{open_risks:?}"
+        );
+        // Group write on our own directory is a risk unless the group is our
+        // private one; either way the directory is kept.
+        let group_risks = inspect_service_path_dir(&group).expect("a directory");
+        assert!(group_risks.iter().all(PathDirRisk::kept), "{group_risks:?}");
+        assert_eq!(inspect_service_path_dir(&file), None);
+        assert_eq!(inspect_service_path_dir(&root.path().join("missing")), None);
+        let path = format!(
+            "{}:{}:{}",
+            private.display(),
+            open.display(),
+            group.display()
+        );
+        let review = review_service_path(&path, inspect_service_path_dir);
+        assert_eq!(
+            review.path,
+            Some(format!("{}:{}", private.display(), group.display()))
+        );
     }
 
     /// R6-B-2 / R6-A-1: each place in a unit has its own rule for `$`:

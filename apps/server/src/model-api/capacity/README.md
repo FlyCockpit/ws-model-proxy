@@ -5,7 +5,7 @@ membership capacity; `PoolMember` and `ExecutionTarget` rows define reservation 
 policy; waiting `CapacityWaiter` rows determine whether reserved work is queued. No process-local
 counter grants capacity.
 
-## Writer classes and fences (DL-1)
+## Writer classes and fences
 
 Capacity admission, release, reclaim, relay telemetry, rollups and provider attempt accounting are
 writer class **H** (hot path): they take only capacity/attempt/scope fences (transaction advisory
@@ -140,7 +140,7 @@ false and retry on the next run. A shrinking set needs no retry; extra fences ar
 - Warm-session protection (`../warm-protection.ts`) never touches the store: it reorders and
   filters candidates before the attempt is built, so it adds no waiter state and no lock.
 
-## Lease ownership from admission to release (F2-CAP-1)
+## Lease ownership from admission to release
 
 `StoreCapacityAdmissionRuntime.acquire` attaches one `CapacityLeaseOwner` to the admitted handle,
 keyed by lease ID and fencing token. Before exposing the handle it confirms ownership with a
@@ -152,12 +152,12 @@ heartbeat cannot leave dispatch running past its lease. A false renewal, watchdo
 abort, runtime shutdown, or explicit release abort the handle's signal before starting durable
 release. Late heartbeat results cannot restart a stopped owner.
 
-A thrown renewal (F2-CAP-5) is retried after 1 s, 2 s, then every 4 s while the last
+A thrown renewal is retried after 1 s, 2 s, then every 4 s while the last
 *acknowledged* TTL still covers the delay plus a 2 s margin; when no retry fits, the owner releases
 before the TTL ends. An error never extends or re-arms the watchdog: only a successful renewal
 does, measured from that query's start. A `false` result is never retried.
 
-Lease loss has its own abort reason (F2-CAP-3): `CapacityLeaseLostError` (`lease-loss.ts`, with a
+Lease loss has its own abort reason: `CapacityLeaseLostError` (`lease-loss.ts`, with a
 `kind`: `ownership_lost`, `heartbeat_timeout`, `heartbeat_failed`, `max_lifetime`,
 `request_scope_closed`). Dispatches classify on `signal.reason`, never on `signal.aborted`: a lost
 lease is the server-only failure `capacity_lease_lost` (HTTP 503, attempt/relay `errorClass`,
@@ -222,8 +222,8 @@ direct PostgreSQL/session-preserving connections are required. A failed initiali
 checkout. Replacement connections run the same initialization.
 
 Renewal fails closed on a lost fence and never retries a false ownership result. Route exits
-must still release or hand off to the response wrapper, but a missing release no longer leaks
-(F2-CAP-6): every owner registers with the `CapacityRequestScope` (`request-scope.ts`, an
+must still release or hand off to the response wrapper, but a missing release no longer leaks:
+every owner registers with the `CapacityRequestScope` (`request-scope.ts`, an
 `AsyncLocalStorage` scope installed as middleware on the model API and Chat Test routes, and
 around the MCP chat diagnostic). The scope closes when the handler throws, returns a bodyless
 response, or its response body reaches EOF, errors or is cancelled; it logs and releases any owner

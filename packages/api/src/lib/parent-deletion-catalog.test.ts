@@ -91,6 +91,7 @@ const GRAPH_TABLES: Record<string, string> = {
   oauth_access_token: "OAuth tokens (retention cleanup)",
   oauth_refresh_token: "OAuth tokens (retention cleanup)",
   mcp_grant: "per client grant",
+  mcp_grant_node: "same-owner grant allowlist entries",
   agent_token: "agent tokens",
   node: "configuration",
   node_credential: "one active per node",

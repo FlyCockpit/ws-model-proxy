@@ -340,7 +340,7 @@
     },
     "trustCard": {
       "title": "Confianza",
-      "fullDescription": "El servidor puede ejecutar comandos, editar archivos, abrir terminales y cambiar definiciones en este nodo (personas y agentes con acceso total).",
+      "fullDescription": "El servidor puede ejecutar comandos, editar archivos, abrir terminales y cambiar definiciones en este nodo (personas, y agentes cuyo acceso lo permite).",
       "relayDescription": "El servidor solo retransmite solicitudes a lo que este nodo ya tiene. Las personas aún pueden iniciar y detener esas definiciones; nada más cambia de forma remota.",
       "changed": "Cambió",
       "lower": "Bajar a solo retransmisión",
@@ -861,7 +861,8 @@
     "agent_update_opted_out": "El operador de la máquina desactivó las actualizaciones remotas en la configuración de wsmp de esa máquina.",
     "agent_update_unsupported": "Esta instalación de wsmp no puede actualizarse sola. Ejecuta en el nodo el comando que se muestra.",
     "agent_update_platform": "Las actualizaciones desde el navegador aún no están disponibles en la plataforma de este nodo. Ejecuta en el nodo el comando que se muestra.",
-    "agent_update_current": "El nodo ya corre el wsmp de este servidor."
+    "agent_update_current": "El nodo ya corre el wsmp de este servidor.",
+    "bad_cwd": "No se puede usar ese directorio de trabajo en el nodo. Usa una ruta absoluta o ~ para un directorio existente y accesible y comprueba que la cuenta del nodo tenga un directorio personal."
   },
   "models": {
     "loadFailed": "No se pudieron cargar tus modelos.",
@@ -1610,8 +1611,8 @@
       "command_failed": "el comando de salud falló",
       "status_not_running": "el comando de estado no dijo que corre"
     },
+    "cliUpgradeRequired": "Este nodo necesita una versión más reciente de wsmp. Actualiza wsmp en el nodo y vuelve a iniciar la instancia.",
     "processDetached": "El comando de inicio entregó su servidor a otro proceso (por ejemplo `docker compose up -d`), así que el nodo no puede vigilarlo ni detenerlo. Usa management \"service\" con comandos de stop y status, y detén a mano lo que siga corriendo.",
-    "cliUpgradeRequired": "El wsmp del nodo de este runtime es demasiado antiguo para ejecutarlo. Actualiza wsmp en el nodo y reinícialo; luego vuelve a iniciar el runtime.",
     "needsOperator": {
       "STEP": "Un paso te espera",
       "RESTART": "Requiere reinicio",

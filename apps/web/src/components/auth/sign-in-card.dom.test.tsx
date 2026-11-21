@@ -117,6 +117,12 @@ describe("SignInCard mode parity", () => {
     renderCard({ mode: "standard", redirectTo: undefined });
     expect(screen.getByText("auth:login.signinTitle")).toBeTruthy();
     expect(screen.getByLabelText("auth:fields.email")).toBeTruthy();
+    for (const label of ["auth:fields.email", "auth:fields.password"]) {
+      const input = screen.getByLabelText(label);
+      for (const token of ["h-11", "text-base", "md:h-8", "md:text-xs"]) {
+        expect(input.classList.contains(token)).toBe(true);
+      }
+    }
     expect(screen.getByLabelText("auth:fields.password")).toBeTruthy();
     expect(screen.getByText("auth:login.signupHint")).toBeTruthy();
     expect(screen.queryByText("auth:mcpLogin.title")).toBeNull();

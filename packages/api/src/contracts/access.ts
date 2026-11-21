@@ -1,6 +1,6 @@
 import { z } from "zod";
+import { AGENT_SCOPES } from "./agent-scopes";
 import {
-  AGENT_LEVEL,
   API_KEY_SCOPE,
   currencySchema,
   emailSchema,
@@ -14,6 +14,20 @@ import {
   PRIORITY_CLASS,
 } from "./common";
 import { mutation, query } from "./procedure";
+
+export const agentScopesSchema = z
+  .array(z.enum(AGENT_SCOPES))
+  .max(7)
+  .refine((scopes) => scopes.includes("read"), { message: "Agent access requires read." })
+  .transform((scopes) => [...new Set(scopes)]);
+export const agentNodeIdsSchema = z
+  .array(idSchema)
+  .max(10000)
+  .transform((ids) => [...new Set(ids)])
+  .nullable();
+export const agentAccessSchema = z
+  .object({ scopes: agentScopesSchema, nodeIds: agentNodeIdsSchema })
+  .strict();
 
 export const apiKeyViewSchema = z
   .object({
@@ -33,12 +47,15 @@ export const agentTokenViewSchema = z
   .object({
     id: idSchema,
     name: z.string(),
-    level: z.enum(AGENT_LEVEL),
+    scopes: agentScopesSchema,
+    nodeIds: agentNodeIdsSchema,
     lookupPrefix: z.string(),
     createdAt: isoDateSchema,
     lastUsedAt: isoDateSchema.nullable(),
     expiresAt: isoDateSchema.nullable(),
     revokedAt: isoDateSchema.nullable(),
+    /** Unrevoked, no expiry, and refused because this server no longer allows no-expiry tokens. */
+    blockedByPolicy: z.boolean(),
   })
   .strict();
 
@@ -48,9 +65,14 @@ export const oauthConnectionViewSchema = z
     clientId: z.string(),
     clientName: z.string().nullable(),
     redirectHost: z.string().nullable(),
-    level: z.enum(AGENT_LEVEL),
-    /** The approval included `mcp:write`, so Full can apply (else Full is refused). */
-    fullAvailable: z.boolean(),
+    scopes: agentScopesSchema,
+    nodeIds: agentNodeIdsSchema,
+    availableScopes: z.array(z.enum(AGENT_SCOPES)),
+    /**
+     * This connection is the one an approval in the current browser session writes (grants are
+     * keyed by a session-derived reference). The consent page prefills only from it.
+     */
+    currentSession: z.boolean(),
     createdAt: isoDateSchema,
     revokedAt: isoDateSchema.nullable(),
   })
@@ -159,13 +181,22 @@ export const accessContract = {
       z
         .object({
           name: nameSchema,
-          level: z.enum(AGENT_LEVEL),
+          scopes: agentScopesSchema,
+          nodeIds: agentNodeIdsSchema,
           /** Null only when the server allows tokens without expiry. */
           expiresAt: isoDateSchema.nullable(),
         })
         .strict(),
       z.object({ token: agentTokenViewSchema, secret: z.string() }).strict(),
-      "Create an agent token (Read-only or Full); the secret is shown once.",
+      "Create an agent token with scopes and a node allowlist; the secret is shown once.",
+    ),
+    setAccess: mutation(
+      "human",
+      z
+        .object({ agentTokenId: idSchema, scopes: agentScopesSchema, nodeIds: agentNodeIdsSchema })
+        .strict(),
+      agentAccessSchema,
+      "Change an agent token's access; narrowing ends work immediately.",
     ),
     revoke: mutation(
       "human",
@@ -187,11 +218,13 @@ export const accessContract = {
       okSchema,
       "Disconnect an OAuth agent.",
     ),
-    setLevel: mutation(
+    setAccess: mutation(
       "human",
-      z.object({ grantId: idSchema, level: z.enum(AGENT_LEVEL) }).strict(),
-      z.object({ level: z.enum(AGENT_LEVEL) }).strict(),
-      "Change an OAuth agent's access (Read-only or Full). Lowering ends its Full work now.",
+      z
+        .object({ grantId: idSchema, scopes: agentScopesSchema, nodeIds: agentNodeIdsSchema })
+        .strict(),
+      agentAccessSchema,
+      "Change an OAuth agent's access; narrowing ends work immediately.",
     ),
   },
   shares: {

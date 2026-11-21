@@ -1,5 +1,6 @@
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
+import { MCP_FINE_SCOPES } from "@ws-model-proxy/auth/agent-scopes";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDeep, mockReset } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
@@ -10,6 +11,7 @@ const envMock = vi.hoisted(() => ({
     BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret-0123",
     WMP_MCP_ENABLED: true,
     WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: false,
+    WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS: 90,
   },
 }));
 vi.mock("@ws-model-proxy/env/server", () => envMock);
@@ -35,6 +37,7 @@ vi.mock("@ws-model-proxy/mailer", () => mailer);
 const spend = vi.hoisted(() => ({ sharesSpend: vi.fn(), shareSpendCurrencies: vi.fn() }));
 vi.mock("@ws-model-proxy/db/spend", () => spend);
 
+import { deriveMcpConsentReferenceId } from "@ws-model-proxy/auth/mcp-grant";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { credentialDigest } from "@ws-model-proxy/db/node-security";
 import type { Context } from "../context";
@@ -70,8 +73,24 @@ function client(auth: CallerAuth | AnonymousAuth = PERSON, services?: Context["s
 }
 
 const NOT_A_PERSON: ReadonlyArray<[string, CallerAuth]> = [
-  ["Full agent token", { kind: "agent_token", userId: "owner", agentTokenId: "t", level: "FULL" }],
-  ["OAuth token", { kind: "oauth_access_token", userId: "owner", grantId: "g", level: "FULL" }],
+  [
+    "Full agent token",
+    {
+      kind: "agent_token",
+      userId: "owner",
+      agentTokenId: "t",
+      access: { scopes: ["read", "commands"], nodeIds: null },
+    },
+  ],
+  [
+    "OAuth token",
+    {
+      kind: "oauth_access_token",
+      userId: "owner",
+      grantId: "g",
+      access: { scopes: ["read", "commands"], nodeIds: null },
+    },
+  ],
   ["API key", { kind: "api_key", userId: "owner", apiKeyId: "k" }],
   ["cookie without CSRF", { ...PERSON, csrfVerified: false }],
 ];
@@ -91,7 +110,7 @@ const keyRow = {
 const tokenRow = {
   id: "tok1",
   name: "claude",
-  level: "FULL" as const,
+  grant: { scopes: ["READ", "COMMANDS"] as Array<"READ" | "COMMANDS">, allNodes: true, Nodes: [] },
   lookupPrefix: "wsmp_agent_abcdefghijkl",
   createdAt: now,
   lastUsedAt: null,
@@ -148,6 +167,7 @@ beforeEach(() => {
   mailer.isEmailConfigured.mockReturnValue(false);
   envMock.env.WMP_MCP_ENABLED = true;
   envMock.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = false;
+  envMock.env.WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS = 90;
   inTransaction();
   // The fence protocol: requireOwnerFences reads back what acquireFences took.
   db.$queryRaw.mockImplementation((async (query: TemplateStringsArray) =>
@@ -183,17 +203,27 @@ describe("only a person may mint credentials or grant access", () => {
     ["apiKeys.revoke", (c) => c.apiKeys.revoke({ apiKeyId: "key1" })],
     [
       "agentTokens.create",
-      (c) => c.agentTokens.create({ name: "x", level: "FULL", expiresAt: null }),
+      (c) =>
+        c.agentTokens.create({
+          name: "x",
+          scopes: ["read", "commands"],
+          nodeIds: null,
+          expiresAt: null,
+        }),
     ],
     ["agentTokens.revoke", (c) => c.agentTokens.revoke({ agentTokenId: "tok1" })],
     ["oauthGrants.revoke", (c) => c.oauthGrants.revoke({ grantId: "g" })],
     [
-      "oauthGrants.setLevel (raise)",
-      (c) => c.oauthGrants.setLevel({ grantId: "g", level: "FULL" }),
+      "oauthGrants.setAccess (raise)",
+      (c) =>
+        c.oauthGrants.setAccess({
+          grantId: "g",
+          access: { scopes: ["read", "commands"], nodeIds: null },
+        }),
     ],
     [
-      "oauthGrants.setLevel (lower)",
-      (c) => c.oauthGrants.setLevel({ grantId: "g", level: "READ" }),
+      "oauthGrants.setAccess (lower)",
+      (c) => c.oauthGrants.setAccess({ grantId: "g", scopes: ["read"], nodeIds: null }),
     ],
     [
       "shares.create",
@@ -321,24 +351,68 @@ describe("agent tokens", () => {
     db.agentToken.create.mockResolvedValue(tokenRow);
     const result = await client().agentTokens.create({
       name: "claude",
-      level: "FULL",
+      scopes: ["read", "commands"],
+      nodeIds: null,
       expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
     });
     expect(result.secret).toMatch(/^wsmp_agent_/);
     expect(db.mcpGrant.create.mock.calls[0]?.[0].data).toMatchObject({
       userId: "owner",
-      level: "FULL",
+      scopes: ["READ", "COMMANDS"],
+      allNodes: true,
       referenceId: "pat",
     });
     const data = db.agentToken.create.mock.calls[0]?.[0].data;
-    expect(data).toMatchObject({ userId: "owner", level: "FULL", grantId: "grant1" });
+    expect(data).toMatchObject({ userId: "owner", grantId: "grant1" });
+    expect(data).not.toHaveProperty("scopes");
     expect(data?.secretDigest).toBe(credentialDigest("agentToken", result.secret));
     expect(JSON.stringify(data)).not.toContain(result.secret);
+    expect(db.mcpGrantNode.createMany).not.toHaveBeenCalled();
+  });
+
+  it("mints a token limited to some nodes as separate same-owner allowlist rows", async () => {
+    db.agentToken.count.mockResolvedValue(0);
+    db.node.findMany.mockResolvedValue([{ id: "n1" }, { id: "n2" }] as never);
+    db.mcpGrant.create.mockResolvedValue({ id: "grant1" } as never);
+    db.agentToken.create.mockResolvedValue(tokenRow);
+    await client().agentTokens.create({
+      name: "limited",
+      scopes: ["read", "files"],
+      nodeIds: ["n1", "n2"],
+      expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+    });
+    const grantData = db.mcpGrant.create.mock.calls[0]?.[0].data;
+    expect(grantData).toMatchObject({ allNodes: false });
+    // A nested create cannot set `userId` (it is part of both composite relations).
+    expect(grantData).not.toHaveProperty("Nodes");
+    expect(db.mcpGrantNode.createMany.mock.calls[0]?.[0]?.data).toEqual([
+      { grantId: "grant1", nodeId: "n1", userId: "owner" },
+      { grantId: "grant1", nodeId: "n2", userId: "owner" },
+    ]);
+  });
+
+  it("lists an unrevoked no-expiry token as blocked by policy only while no-expiry tokens are off", async () => {
+    const neverRow = { ...tokenRow, id: "tok-never", expiresAt: null };
+    const revokedNever = { ...neverRow, id: "tok-revoked", revokedAt: now };
+    db.agentToken.findMany.mockResolvedValue([tokenRow, neverRow, revokedNever] as never);
+    const blocked = async () =>
+      Object.fromEntries(
+        (await client().agentTokens.list()).tokens.map((token) => [
+          token.id,
+          token.blockedByPolicy,
+        ]),
+      );
+    expect(await blocked()).toEqual({ tok1: false, "tok-never": true, "tok-revoked": false });
+    envMock.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = true;
+    expect(await blocked()).toEqual({ tok1: false, "tok-never": false, "tok-revoked": false });
+    // Listing never revokes or rewrites a token.
+    expect(db.agentToken.update).not.toHaveBeenCalled();
+    expect(db.agentToken.updateMany).not.toHaveBeenCalled();
   });
 
   it("refuses a token without expiry unless the server allows it", async () => {
     await expect(
-      client().agentTokens.create({ name: "x", level: "READ", expiresAt: null }),
+      client().agentTokens.create({ name: "x", scopes: ["read"], nodeIds: null, expiresAt: null }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.agentToken.create).not.toHaveBeenCalled();
   });
@@ -347,7 +421,8 @@ describe("agent tokens", () => {
     await expect(
       client().agentTokens.create({
         name: "x",
-        level: "READ",
+        scopes: ["read"],
+        nodeIds: null,
         expiresAt: new Date(Date.now() + 400 * 86_400_000).toISOString(),
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
@@ -358,7 +433,8 @@ describe("agent tokens", () => {
     await expect(
       client().agentTokens.create({
         name: "x",
-        level: "READ",
+        scopes: ["read"],
+        nodeIds: null,
         expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
       }),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
@@ -369,7 +445,8 @@ describe("agent tokens", () => {
     await expect(
       client().agentTokens.create({
         name: "x",
-        level: "READ",
+        scopes: ["read"],
+        nodeIds: null,
         expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
       }),
     ).rejects.toMatchObject({ code: "CONFLICT" });
@@ -582,160 +659,224 @@ describe("Contributing", () => {
   });
 });
 
-describe("OAuth connection level", () => {
-  function grantRow(level: "READ" | "FULL", clientId = "https://client.example.com/meta") {
-    db.mcpGrant.findFirst.mockResolvedValue({
-      id: "g1",
-      clientId,
-      referenceId: "ref1",
-      level,
-    } as never);
+describe("editable credential access", () => {
+  const read = { scopes: ["read"] as ["read"], nodeIds: null };
+  const commands = { scopes: ["read", "commands"] as ["read", "commands"], nodeIds: null };
+  function grantRow(scopes = ["READ", "COMMANDS"], clientId = "https://client.example/meta") {
+    const row = { id: "g1", clientId, referenceId: "ref1", scopes, allNodes: true, Nodes: [] };
+    db.mcpGrant.findFirst.mockResolvedValue(row as never);
+    return row;
   }
-  function writeApproved(clientId = "https://client.example.com/meta") {
-    db.oauthConsent.findMany.mockResolvedValue([{ clientId, referenceId: "ref1" }] as never);
+  function approved(scopes = ["mcp:read", ...MCP_FINE_SCOPES]) {
+    db.oauthConsent.findFirst.mockResolvedValue({ scopes } as never);
   }
-
-  it("refuses Full for a connection whose approval did not include mcp:write", async () => {
-    grantRow("READ");
-    db.oauthConsent.findMany.mockResolvedValue([]);
+  it("refuses scopes beyond the exact generation's OAuth ceiling", async () => {
+    grantRow(["READ"]);
+    approved(["mcp:files"]);
     await expect(
-      client().oauthGrants.setLevel({ grantId: "g1", level: "FULL" }),
+      client().oauthGrants.setAccess({ grantId: "g1", ...commands }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
-    expect(db.oauthConsent.findMany.mock.calls[0]?.[0]?.where).toEqual({
-      userId: "owner",
-      clientId: { in: ["https://client.example.com/meta"] },
-      scopes: { has: "mcp:write" },
-    });
     expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+    expect(db.oauthConsent.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      userId: "owner",
+      clientId: "https://client.example/meta",
+      referenceId: "ref1",
+    });
   });
-
-  it("lists whether Full can apply to each connection", async () => {
+  it("lists scopes, nodes and the ceiling for each generation", async () => {
     db.mcpGrant.findMany.mockResolvedValue([
+      { ...grantRow(), clientId: "c1", createdAt: now, revokedAt: null },
       {
-        id: "g1",
-        clientId: "c1",
-        referenceId: "ref1",
-        level: "READ",
-        createdAt: now,
-        revokedAt: null,
-      },
-      {
+        ...grantRow(["READ"]),
         id: "g2",
         clientId: "c1",
         referenceId: "ref2",
-        level: "READ",
         createdAt: now,
         revokedAt: null,
       },
     ] as never);
     db.oauthClient.findMany.mockResolvedValue([]);
-    writeApproved("c1");
+    db.oauthConsent.findMany.mockResolvedValue([
+      { clientId: "c1", referenceId: "ref1", scopes: ["mcp:commands"] },
+    ] as never);
     const { connections } = await client().oauthGrants.list();
-    expect(connections.map((row) => [row.grantId, row.fullAvailable])).toEqual([
-      ["g1", true],
-      ["g2", false],
+    expect(connections.map((row) => [row.grantId, row.availableScopes])).toEqual([
+      ["g1", ["read", "commands"]],
+      ["g2", ["read"]],
+    ]);
+    expect(connections[0]).toMatchObject(commands);
+  });
+  it("marks only the connection an approval in this session would write", async () => {
+    const mine = deriveMcpConsentReferenceId({
+      secret: "test-secret-test-secret-test-secret-0123",
+      sessionId: "s",
+      clientId: "c1",
+    });
+    db.mcpGrant.findMany.mockResolvedValue([
+      {
+        ...grantRow(),
+        clientId: "c1",
+        referenceId: "other-session",
+        createdAt: now,
+        revokedAt: null,
+      },
+      {
+        ...grantRow(["READ"]),
+        id: "g2",
+        clientId: "c1",
+        referenceId: mine,
+        createdAt: now,
+        revokedAt: null,
+      },
+    ] as never);
+    db.oauthClient.findMany.mockResolvedValue([]);
+    db.oauthConsent.findMany.mockResolvedValue([]);
+    const { connections } = await client().oauthGrants.list();
+    expect(connections.map((row) => [row.grantId, row.currentSession])).toEqual([
+      ["g1", false],
+      ["g2", true],
     ]);
   });
-
-  it("lowers Full to Read-only conditionally, audits it as the person, then ends Full work", async () => {
-    grantRow("FULL");
+  it("audits narrowing and notifies after commit", async () => {
+    grantRow();
+    approved();
     db.mcpGrant.updateMany.mockResolvedValue({ count: 1 });
-    const lowered = vi.fn(async () => undefined);
-    const result = await client(PERSON, { onAccessLevelLowered: lowered }).oauthGrants.setLevel({
-      grantId: "g1",
-      level: "READ",
-    });
-    expect(result).toEqual({ level: "READ" });
-    expect(db.mcpGrant.findFirst.mock.calls[0]?.[0]?.where).toEqual({
-      id: "g1",
-      userId: "owner",
-      revokedAt: null,
-    });
-    // Conditional on the level read: a concurrent change is never overwritten silently.
-    expect(db.mcpGrant.updateMany.mock.calls[0]?.[0]).toEqual({
-      where: { id: "g1", userId: "owner", revokedAt: null, level: "FULL" },
-      data: { level: "READ" },
+    const narrowed = vi.fn(async () => undefined);
+    expect(
+      await client(PERSON, { onAgentAccessNarrowed: narrowed }).oauthGrants.setAccess({
+        grantId: "g1",
+        ...read,
+      }),
+    ).toEqual(read);
+    expect(db.mcpGrant.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { scopes: { equals: ["READ", "COMMANDS"] }, allNodes: true },
+      data: { scopes: ["READ"], allNodes: true },
     });
     expect(db.auditEvent.create.mock.calls[0]?.[0]?.data).toMatchObject({
-      userId: "owner",
+      action: "mcp_grant.access",
       actor: "USER",
-      actorUserId: "owner",
-      action: "mcp_grant.level",
-      resourceType: "mcp_grant",
-      resourceId: "g1",
-      before: { level: "FULL" },
-      after: { level: "READ" },
+      before: commands,
+      after: read,
     });
-    expect(db.auditEvent.create.mock.calls[0]?.[0]?.data).not.toHaveProperty("mcpGrantId");
-    expect(lowered).toHaveBeenCalledWith({ kind: "oauth_grant", userId: "owner", grantId: "g1" });
+    expect(narrowed).toHaveBeenCalledWith({
+      kind: "oauth_grant",
+      userId: "owner",
+      grantId: "g1",
+      agentTokenId: null,
+      before: commands,
+      after: read,
+    });
   });
-
-  it("raises Read-only to Full without ending anything (it applies from the next call)", async () => {
-    grantRow("READ");
-    writeApproved();
+  it("raises access from the next request and skips unchanged writes", async () => {
+    grantRow(["READ"]);
+    approved();
     db.mcpGrant.updateMany.mockResolvedValue({ count: 1 });
-    const lowered = vi.fn(async () => undefined);
-    const result = await client(PERSON, { onAccessLevelLowered: lowered }).oauthGrants.setLevel({
-      grantId: "g1",
-      level: "FULL",
-    });
-    expect(result).toEqual({ level: "FULL" });
-    expect(db.mcpGrant.updateMany.mock.calls[0]?.[0]?.data).toEqual({ level: "FULL" });
-    expect(db.auditEvent.create).toHaveBeenCalledTimes(1);
-    expect(lowered).not.toHaveBeenCalled();
-  });
-
-  it("writes and audits nothing when the level is unchanged", async () => {
-    grantRow("READ");
-    const lowered = vi.fn(async () => undefined);
-    await client(PERSON, { onAccessLevelLowered: lowered }).oauthGrants.setLevel({
-      grantId: "g1",
-      level: "READ",
-    });
+    const narrowed = vi.fn(async () => undefined);
+    expect(
+      await client(PERSON, { onAgentAccessNarrowed: narrowed }).oauthGrants.setAccess({
+        grantId: "g1",
+        ...commands,
+      }),
+    ).toEqual(commands);
+    expect(narrowed).not.toHaveBeenCalled();
+    db.mcpGrant.updateMany.mockClear();
+    db.auditEvent.create.mockClear();
+    await client().oauthGrants.setAccess({ grantId: "g1", ...read });
     expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
     expect(db.auditEvent.create).not.toHaveBeenCalled();
-    expect(lowered).not.toHaveBeenCalled();
   });
-
-  it("refuses an agent token's grant, a revoked one and another person's alike", async () => {
-    grantRow("FULL", "pat:tok1");
-    await expect(
-      client().oauthGrants.setLevel({ grantId: "g1", level: "READ" }),
-    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  it("refuses a PAT grant and unknown/revoked/other-user grants alike", async () => {
+    grantRow(["READ"], "pat:tok1");
+    await expect(client().oauthGrants.setAccess({ grantId: "g1", ...read })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
     db.mcpGrant.findFirst.mockResolvedValue(null);
     await expect(
-      client().oauthGrants.setLevel({ grantId: "theirs", level: "FULL" }),
+      client().oauthGrants.setAccess({ grantId: "theirs", ...read }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
-    expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
-    expect(db.auditEvent.create).not.toHaveBeenCalled();
   });
-
-  it("reports a concurrent change (revoked or re-levelled meanwhile) instead of writing over it", async () => {
-    grantRow("FULL");
+  it("reports a conditional conflict without notification", async () => {
+    grantRow();
+    approved();
     db.mcpGrant.updateMany.mockResolvedValue({ count: 0 });
-    const lowered = vi.fn(async () => undefined);
+    const narrowed = vi.fn(async () => undefined);
     await expect(
-      client(PERSON, { onAccessLevelLowered: lowered }).oauthGrants.setLevel({
+      client(PERSON, { onAgentAccessNarrowed: narrowed }).oauthGrants.setAccess({
         grantId: "g1",
-        level: "READ",
+        ...read,
       }),
     ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(narrowed).not.toHaveBeenCalled();
     expect(db.auditEvent.create).not.toHaveBeenCalled();
-    expect(lowered).not.toHaveBeenCalled();
   });
-
-  it("keeps a committed lowering even when ending the Full work fails", async () => {
-    grantRow("FULL");
+  it("keeps a committed narrowing if live cleanup fails", async () => {
+    grantRow();
+    approved();
     db.mcpGrant.updateMany.mockResolvedValue({ count: 1 });
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const result = await client(PERSON, {
-      onAccessLevelLowered: async () => {
-        throw new Error("relay down");
-      },
-    }).oauthGrants.setLevel({ grantId: "g1", level: "READ" });
-    expect(result).toEqual({ level: "READ" });
-    expect(errors).toHaveBeenCalled();
-    errors.mockRestore();
+    try {
+      expect(
+        await client(PERSON, {
+          onAgentAccessNarrowed: async () => {
+            throw new Error("offline");
+          },
+        }).oauthGrants.setAccess({ grantId: "g1", ...read }),
+      ).toEqual(read);
+      expect(errors).toHaveBeenCalled();
+    } finally {
+      errors.mockRestore();
+    }
+  });
+  it("edits token access using its grant, with owned node validation and narrowing notification", async () => {
+    const grant = grantRow();
+    db.agentToken.findFirst.mockResolvedValue({ id: "tok1", grant } as never);
+    db.node.findMany.mockResolvedValue([{ id: "n1" }] as never);
+    db.mcpGrant.updateMany.mockResolvedValue({ count: 1 });
+    const narrowed = vi.fn(async () => undefined);
+    const access = { scopes: ["read", "commands"] as ["read", "commands"], nodeIds: ["n1"] };
+    expect(
+      await client(PERSON, { onAgentAccessNarrowed: narrowed }).agentTokens.setAccess({
+        agentTokenId: "tok1",
+        ...access,
+      }),
+    ).toEqual(access);
+    expect(db.mcpGrantNode.createMany.mock.calls[0]?.[0]?.data).toEqual([
+      { grantId: "g1", userId: "owner", nodeId: "n1" },
+    ]);
+    expect(narrowed).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "agent_token", agentTokenId: "tok1" }),
+    );
+  });
+  it("refuses an unowned allowlist node and an access set without read", async () => {
+    const grant = grantRow();
+    db.agentToken.findFirst.mockResolvedValue({ id: "tok1", grant } as never);
+    db.node.findMany.mockResolvedValue([]);
+    await expect(
+      client().agentTokens.setAccess({ agentTokenId: "tok1", ...read, nodeIds: ["theirs"] }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(
+      client().agentTokens.setAccess({ agentTokenId: "tok1", scopes: ["files"], nodeIds: null }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+  it("enforces the configured lifetime with a precise error, independently of no-expiry", async () => {
+    envMock.env.WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS = 7;
+    await expect(
+      client().agentTokens.create({
+        name: "x",
+        ...read,
+        expiresAt: new Date(Date.now() + 8 * 86400000).toISOString(),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: "Expiry must be at most 7 days ahead.",
+    });
+    envMock.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = true;
+    db.agentToken.count.mockResolvedValue(0);
+    db.mcpGrant.create.mockResolvedValue({ id: "grant1" } as never);
+    db.agentToken.create.mockResolvedValue(tokenRow);
+    await expect(
+      client().agentTokens.create({ name: "x", ...read, expiresAt: null }),
+    ).resolves.toHaveProperty("secret");
   });
 });
 

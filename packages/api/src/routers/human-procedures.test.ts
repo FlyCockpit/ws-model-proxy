@@ -47,10 +47,29 @@ const session = {
 
 /** Every caller that is NOT a verified person (§6.3, review #8). */
 const NOT_A_PERSON: ReadonlyArray<[string, CallerAuth | AnonymousAuth]> = [
-  ["Full agent token", { kind: "agent_token", userId: "owner", agentTokenId: "t", level: "FULL" }],
+  [
+    "Full agent token",
+    {
+      kind: "agent_token",
+      userId: "owner",
+      agentTokenId: "t",
+      access: {
+        scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+        nodeIds: null,
+      },
+    },
+  ],
   [
     "OAuth access token",
-    { kind: "oauth_access_token", userId: "owner", grantId: "g", level: "FULL" },
+    {
+      kind: "oauth_access_token",
+      userId: "owner",
+      grantId: "g",
+      access: {
+        scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+        nodeIds: null,
+      },
+    },
   ],
   ["API key", { kind: "api_key", userId: "owner", apiKeyId: "k" }],
   [
@@ -146,7 +165,23 @@ describe("session, admin and agent procedures", () => {
     const client = createRouterClient(appRouter, {
       context: {
         session,
-        auth: { kind: "agent_token", userId: "owner", agentTokenId: "t", level: "FULL" },
+        auth: {
+          kind: "agent_token",
+          userId: "owner",
+          agentTokenId: "t",
+          access: {
+            scopes: [
+              "read",
+              "pools",
+              "runtimes",
+              "nodes:manage",
+              "commands",
+              "files",
+              "models:test",
+            ],
+            nodeIds: null,
+          },
+        },
       } satisfies Context,
     });
     await expect(procedureAt(client, "nodes.enrollmentCodes.list")({})).rejects.toMatchObject({
@@ -158,7 +193,23 @@ describe("session, admin and agent procedures", () => {
     const client = createRouterClient(appRouter, {
       context: {
         session,
-        auth: { kind: "agent_token", userId: "owner", agentTokenId: "t", level: "FULL" },
+        auth: {
+          kind: "agent_token",
+          userId: "owner",
+          agentTokenId: "t",
+          access: {
+            scopes: [
+              "read",
+              "pools",
+              "runtimes",
+              "nodes:manage",
+              "commands",
+              "files",
+              "models:test",
+            ],
+            nodeIds: null,
+          },
+        },
       } satisfies Context,
     });
     vi.mocked(prisma).node.findMany.mockResolvedValueOnce([]);

@@ -23,6 +23,8 @@ import { ORPCError } from "@orpc/server";
 import { histogramQuantile, LATENCY_HISTOGRAM_BUCKETS } from "@ws-model-proxy/config/usage-metrics";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { z } from "zod";
+import type { AgentAccess } from "../contracts/agent-scopes";
+import { agentNodeAllowed } from "../contracts/agent-scopes";
 import {
   type GroupBy,
   METRICS_MAX_GROUPS,
@@ -36,6 +38,13 @@ import {
   RANGE_MS,
   STEP_MS,
 } from "../contracts/metrics";
+import {
+  andServedVisibly,
+  type HiddenServing,
+  hiddenServing,
+  LOAD_SERVED,
+  ROLLUP_SERVED,
+} from "./agent-hidden-serving";
 import { realTraffic, testTraffic } from "./test-traffic";
 
 export type MetricsQueryInput = z.output<typeof metricsQueryInputSchema>;
@@ -43,15 +52,52 @@ export type MetricsQueryOutput = z.infer<typeof metricsQueryOutputSchema>;
 
 // ── Scope resolution (owner-scoped) ──
 
-type ResolvedScope =
+/** A rank's node, with its instance. */
+type RankNode = { instanceId: string; nodeId: string };
+
+type ResolvedScopeBase =
   | { kind: "pool"; id: string; shared: boolean; runtimeIds: string[] }
-  | { kind: "runtime"; id: string; nodeIds: string[] }
-  | { kind: "version"; id: string; nodeIds: string[] }
+  | {
+      kind: "runtime" | "version";
+      id: string;
+      nodeIds: string[];
+      boundNodeId: string | null;
+      rankNodes: RankNode[];
+    }
   | { kind: "node"; id: string }
-  | { kind: "instance"; id: string; nodeIds: string[] };
+  | {
+      kind: "instance";
+      id: string;
+      /** Where its ranks run (the node gauges this scope shows). */
+      nodeIds: string[];
+      /** Every node it touches (bound node, ranks, reservations): an agent needs all of them. */
+      authorityNodeIds: string[];
+    };
+
+type ResolvedScope = ResolvedScopeBase & {
+  /**
+   * An agent's node allowlist: the caller's OWN nodes outside it, and the hidden instances
+   * (`agent-hidden-serving.ts`; anyone's instance with a binding, rank or reservation on one of
+   * them). Request and load rows served there are left out; node gauges only by node. Rows on
+   * other people's nodes (a share holder's traffic to a shared pool) stay unless a hidden
+   * instance served them.
+   */
+  hidden?: HiddenServing;
+};
 
 const notFound = () =>
   new ORPCError("NOT_FOUND", { message: "No such pool, runtime, version, node or instance." });
+
+/** Where each instance's ranks run, by instance (so a hidden instance's can be left out). */
+function rankNodesOf(
+  instances: readonly { id: string; Ranks: readonly { nodeId: string | null }[] }[],
+): RankNode[] {
+  return instances.flatMap((instance) =>
+    instance.Ranks.flatMap((rank) =>
+      rank.nodeId === null ? [] : [{ instanceId: instance.id, nodeId: rank.nodeId }],
+    ),
+  );
+}
 
 function uniq(values: ReadonlyArray<string | null | undefined>): string[] {
   return [...new Set(values.filter((value): value is string => !!value))];
@@ -94,17 +140,17 @@ async function resolveScope(
       select: {
         id: true,
         nodeId: true,
-        Instances: { select: { Ranks: { select: { nodeId: true } } }, take: 100 },
+        Instances: { select: { id: true, Ranks: { select: { nodeId: true } } }, take: 100 },
       },
     });
     if (!runtime) throw notFound();
+    const rankNodes = rankNodesOf(runtime.Instances);
     return {
       kind: "runtime",
       id: runtime.id,
-      nodeIds: uniq([
-        runtime.nodeId,
-        ...runtime.Instances.flatMap((instance) => instance.Ranks.map((rank) => rank.nodeId)),
-      ]),
+      boundNodeId: runtime.nodeId,
+      rankNodes,
+      nodeIds: uniq([runtime.nodeId, ...rankNodes.map((rank) => rank.nodeId)]),
     };
   }
   if ("version" in scope) {
@@ -113,17 +159,17 @@ async function resolveScope(
       select: {
         id: true,
         Runtime: { select: { nodeId: true } },
-        Instances: { select: { Ranks: { select: { nodeId: true } } }, take: 100 },
+        Instances: { select: { id: true, Ranks: { select: { nodeId: true } } }, take: 100 },
       },
     });
     if (!version) throw notFound();
+    const rankNodes = rankNodesOf(version.Instances);
     return {
       kind: "version",
       id: version.id,
-      nodeIds: uniq([
-        version.Runtime.nodeId,
-        ...version.Instances.flatMap((instance) => instance.Ranks.map((rank) => rank.nodeId)),
-      ]),
+      boundNodeId: version.Runtime.nodeId,
+      rankNodes,
+      nodeIds: uniq([version.Runtime.nodeId, ...rankNodes.map((rank) => rank.nodeId)]),
     };
   }
   if ("node" in scope) {
@@ -136,13 +182,23 @@ async function resolveScope(
   }
   const instance = await prisma.runtimeInstance.findFirst({
     where: { id: scope.instance, userId },
-    select: { id: true, Ranks: { select: { nodeId: true } } },
+    select: {
+      id: true,
+      Runtime: { select: { nodeId: true } },
+      Ranks: { select: { nodeId: true } },
+      Reservations: { select: { nodeId: true } },
+    },
   });
   if (!instance) throw notFound();
   return {
     kind: "instance",
     id: instance.id,
     nodeIds: uniq(instance.Ranks.map((rank) => rank.nodeId)),
+    authorityNodeIds: uniq([
+      instance.Runtime?.nodeId,
+      ...instance.Ranks.map((rank) => rank.nodeId),
+      ...(instance.Reservations ?? []).map((reservation) => reservation.nodeId),
+    ]),
   };
 }
 
@@ -283,7 +339,10 @@ function requestWhere(
       parts.push(Prisma.sql`"instanceId" = ${scope.id}`);
       break;
   }
-  return Prisma.join(parts, " AND ");
+  const where = Prisma.join(parts, " AND ");
+  return scope.hidden === undefined
+    ? where
+    : Prisma.sql`${where}${andServedVisibly(scope.hidden, ROLLUP_SERVED)}`;
 }
 
 function requestColumns(histograms: readonly HistogramName[]): Prisma.Sql {
@@ -422,7 +481,8 @@ function loadPlan(
       break;
   }
   const where = Prisma.sql`l."ownerUserId" = ${userId} AND ${filter}
-    AND l."bucketStart" >= ${window.from} AND l."bucketStart" < ${window.to}`;
+    AND l."bucketStart" >= ${window.from} AND l."bucketStart" < ${window.to}
+    ${scope.hidden === undefined ? Prisma.empty : andServedVisibly(scope.hidden, LOAD_SERVED)}`;
   const group = loadGroup(groupBy);
   return {
     family: "load",
@@ -449,6 +509,12 @@ function nodePlan(
   customNames: readonly string[],
 ): FamilyPlan | null {
   let nodes: Prisma.Sql;
+  // Nodes found through engine load: not through a hidden instance's load (the gauges of a
+  // hidden node itself are left out below).
+  const hiddenLoad =
+    scope.hidden === undefined
+      ? Prisma.empty
+      : andServedVisibly({ nodeIds: [], instanceIds: scope.hidden.instanceIds }, ROLLUP_SERVED);
   switch (scope.kind) {
     case "node":
       nodes = Prisma.sql`n."nodeId" = ${scope.id}`;
@@ -458,7 +524,7 @@ function nodePlan(
       // Nodes the caller's member runtimes ran on in the range (and their current nodes).
       nodes = Prisma.sql`n."nodeId" IN (SELECT DISTINCT "nodeId" FROM runtime_load_minute
         WHERE "ownerUserId" = ${userId} AND "runtimeId" = ANY(${scope.runtimeIds}::text[])
-          AND "bucketStart" >= ${window.from} AND "bucketStart" < ${window.to}
+          AND "bucketStart" >= ${window.from} AND "bucketStart" < ${window.to}${hiddenLoad}
         UNION SELECT "nodeId" FROM runtime WHERE id = ANY(${scope.runtimeIds}::text[]) AND "nodeId" IS NOT NULL)`;
       break;
     case "runtime":
@@ -474,12 +540,18 @@ function nodePlan(
       nodes = Prisma.sql`(n."nodeId" = ANY(${scope.nodeIds}::text[]) OR n."nodeId" IN (
         SELECT DISTINCT "nodeId" FROM runtime_load_minute WHERE "ownerUserId" = ${userId}
           AND ${column} = ${scope.id}
-          AND "bucketStart" >= ${window.from} AND "bucketStart" < ${window.to}))`;
+          AND "bucketStart" >= ${window.from} AND "bucketStart" < ${window.to}${hiddenLoad}))`;
       break;
     }
   }
   const where = Prisma.sql`n."ownerUserId" = ${userId} AND ${nodes}
-    AND n."bucketStart" >= ${window.from} AND n."bucketStart" < ${window.to}`;
+    AND n."bucketStart" >= ${window.from} AND n."bucketStart" < ${window.to}
+    ${
+      // Node gauges belong to a node, not an instance: only the hidden nodes are left out.
+      scope.hidden === undefined || scope.hidden.nodeIds.length === 0
+        ? Prisma.empty
+        : Prisma.sql`AND NOT (COALESCE(n."nodeId", '') = ANY(${[...scope.hidden.nodeIds]}::text[]))`
+    }`;
   const group = grouped ? Prisma.sql`n."nodeId"` : zero();
   const aggregates = nodeAggregates(customNames);
   return {
@@ -751,8 +823,26 @@ export async function runMetricsQuery(
   userId: string,
   input: MetricsQueryInput,
   now: Date = new Date(),
+  access?: AgentAccess,
 ): Promise<MetricsQueryOutput> {
+  if (access && "node" in input.scope && !agentNodeAllowed(access, input.scope.node))
+    throw notFound();
   const scope = await resolveScope(userId, input.scope);
+  let hiddenNodes: string[] = [];
+  if (access) {
+    // An agent's target must be on the caller's own nodes, inside its allowlist (defence in
+    // depth beside the owner-scoped lookups above). Only an allowlist hides rows: the caller's
+    // own nodes outside it; rows on other people's nodes (a share holder's traffic) stay.
+    const owned = (await prisma.node.findMany({ where: { userId }, select: { id: true } })).map(
+      (node) => node.id,
+    );
+    const ownedSet = new Set(owned);
+    const hidden = owned.filter((id) => !agentNodeAllowed(access, id));
+    const usable = (id: string) => ownedSet.has(id) && agentNodeAllowed(access, id);
+    if (scope.kind === "node" && !usable(scope.id)) throw notFound();
+    if (scope.kind === "instance" && !scope.authorityNodeIds.every(usable)) throw notFound();
+    hiddenNodes = hidden;
+  }
   const metrics = [...new Set(input.metrics)];
   const families = new Map<MetricFamily, Metric[]>();
   for (const metric of metrics) {
@@ -772,6 +862,19 @@ export async function runMetricsQuery(
       });
   }
   const window = windowOf(input, now);
+  if (hiddenNodes.length > 0) {
+    scope.hidden = await hiddenServing(prisma, hiddenNodes);
+    // The node gauges a runtime or version shows: not the nodes only a hidden instance ran on.
+    if (scope.kind === "runtime" || scope.kind === "version") {
+      const excluded = new Set(scope.hidden.instanceIds);
+      scope.nodeIds = uniq([
+        scope.boundNodeId,
+        ...scope.rankNodes
+          .filter((rank) => !excluded.has(rank.instanceId))
+          .map((rank) => rank.nodeId),
+      ]);
+    }
+  }
   const grouped = input.groupBy !== undefined;
   const histograms = [
     ...new Set(metrics.map(histogramOf).filter((name): name is HistogramName => name !== null)),

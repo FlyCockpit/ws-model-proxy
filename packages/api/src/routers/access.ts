@@ -9,17 +9,26 @@
 import { randomBytes } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import {
+  type AgentScope,
+  agentScopeToDb,
+  oauthScopeCeiling,
+} from "@ws-model-proxy/auth/agent-scopes";
+import {
   canonicalMcpResource,
   isMcpPatClientId,
   MCP_PAT_GRANT_REFERENCE,
   MCP_PAT_MAX_ACTIVE_PER_USER,
   mcpPatClientId,
 } from "@ws-model-proxy/auth/mcp-config";
+import { deriveMcpConsentReferenceId } from "@ws-model-proxy/auth/mcp-grant";
 import {
-  MCP_GRANT_LEVEL_AUDIT,
-  setActiveMcpGrantLevel,
-} from "@ws-model-proxy/auth/mcp-grant-level";
-import { MCP_PAT_MAX_TTL_DAYS, mcpPatExpiryRejection } from "@ws-model-proxy/auth/mcp-pat-limits";
+  type AgentAccessNarrowedEvent,
+  assertOwnedAgentNodes,
+  MCP_GRANT_ACCESS_AUDIT,
+  mcpGrantAccessOf,
+  mcpGrantAccessSelect,
+  setActiveMcpGrantAccess,
+} from "@ws-model-proxy/auth/mcp-grant-access";
 import { hasProvedEmail } from "@ws-model-proxy/auth/proved-email";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
@@ -78,6 +87,30 @@ async function notifyRevoked(
       "[access] ending a revoked credential's live work failed",
       error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
     );
+  }
+}
+
+async function notifyNarrowed(context: Context, event: AgentAccessNarrowedEvent): Promise<void> {
+  try {
+    await context.services?.onAgentAccessNarrowed?.(event);
+  } catch (error) {
+    console.error(
+      "[access] ending a narrowed credential's work failed",
+      error instanceof Error ? error.constructor.name : typeof error,
+    );
+  }
+}
+async function validateAgentNodes(
+  tx: Prisma.TransactionClient,
+  userId: string,
+  nodeIds: readonly string[] | null,
+): Promise<void> {
+  try {
+    await assertOwnedAgentNodes(tx, userId, nodeIds);
+  } catch (error) {
+    if (error instanceof Error && error.message === "One or more selected nodes do not exist.")
+      throw notFound("That node does not exist.");
+    throw error;
   }
 }
 
@@ -237,7 +270,7 @@ const agentTokens = {
       select: agentTokenSelect,
     });
     return {
-      tokens: rows.map(agentTokenView),
+      tokens: rows.map((row) => agentTokenView(row, env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY === true)),
       mcpUrl: canonicalMcpResource(env.BETTER_AUTH_URL),
     };
   }),
@@ -257,15 +290,20 @@ const agentTokens = {
       }
     } else {
       expiresAt = new Date(input.expiresAt);
-      const rejection = mcpPatExpiryRejection(expiresAt.getTime(), now.getTime());
-      if (rejection === "past") throw badRequest("Expiry must be in the future.");
-      if (rejection === "too_far") {
-        throw badRequest(`Expiry must be at most ${MCP_PAT_MAX_TTL_DAYS} days ahead.`);
+      if (expiresAt.getTime() <= now.getTime()) throw badRequest("Expiry must be in the future.");
+      if (
+        expiresAt.getTime() - now.getTime() >
+        env.WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS * 86_400_000
+      ) {
+        throw badRequest(
+          `Expiry must be at most ${env.WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS} days ahead.`,
+        );
       }
     }
     const tokenId = newAgentTokenId();
     const secret = generateProductCredentialSecret("agentToken");
     const row = await runSerializableTransaction(async (tx) => {
+      await validateAgentNodes(tx, userId, input.nodeIds);
       const active = await tx.agentToken.count({ where: { userId, ...activeWhere(now) } });
       if (active >= MCP_PAT_MAX_ACTIVE_PER_USER) {
         throw new ORPCError("CONFLICT", {
@@ -277,16 +315,23 @@ const agentTokens = {
           userId,
           clientId: mcpPatClientId(tokenId),
           referenceId: MCP_PAT_GRANT_REFERENCE,
-          level: input.level,
+          scopes: input.scopes.map(agentScopeToDb),
+          allNodes: input.nodeIds === null,
         },
         select: { id: true },
       });
+      // Separate rows: `userId` belongs to both composite relations, so a nested create cannot
+      // set it (the FKs then prove the node and the grant have the same owner).
+      if (input.nodeIds?.length) {
+        await tx.mcpGrantNode.createMany({
+          data: input.nodeIds.map((nodeId) => ({ grantId: grant.id, nodeId, userId })),
+        });
+      }
       return tx.agentToken.create({
         data: {
           id: tokenId,
           userId,
           name: input.name,
-          level: input.level,
           lookupPrefix: credentialLookupPrefix(secret),
           secretDigest: credentialDigest("agentToken", secret),
           grantId: grant.id,
@@ -295,7 +340,44 @@ const agentTokens = {
         select: agentTokenSelect,
       });
     });
-    return { token: agentTokenView(row), secret };
+    return { token: agentTokenView(row, env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY === true), secret };
+  }),
+
+  setAccess: contractProcedure(c.agentTokens.setAccess).handler(async ({ context, input }) => {
+    const userId = userIdOf(context);
+    const change = await runSerializableTransaction(async (tx) => {
+      const token = await tx.agentToken.findFirst({
+        where: { id: input.agentTokenId, userId, ...activeWhere(new Date()) },
+        select: { id: true, grant: { select: { id: true, ...mcpGrantAccessSelect } } },
+      });
+      if (!token) throw notFound("That key, token, connection, share or invite does not exist.");
+      await validateAgentNodes(tx, userId, input.nodeIds);
+      const change = await setActiveMcpGrantAccess(tx, {
+        grantId: token.grant.id,
+        userId,
+        expected: mcpGrantAccessOf(token.grant),
+        access: input,
+        action: MCP_GRANT_ACCESS_AUDIT.access,
+      });
+      if (!change)
+        throw new ORPCError("CONFLICT", {
+          message: "This token changed meanwhile. Reload and try again.",
+        });
+      return change;
+    });
+    if (change.narrowed && change.before)
+      await notifyNarrowed(context, {
+        kind: "agent_token",
+        userId,
+        grantId: change.grantId,
+        agentTokenId: input.agentTokenId,
+        before: change.before,
+        after: change.after,
+      });
+    return {
+      scopes: [...change.after.scopes],
+      nodeIds: change.after.nodeIds === null ? null : [...change.after.nodeIds],
+    };
   }),
 
   revoke: contractProcedure(c.agentTokens.revoke).handler(async ({ context, input }) => {
@@ -345,23 +427,26 @@ function generationKey(clientId: string, referenceId: string): string {
   return `${clientId}\0${referenceId}`;
 }
 
-/**
- * The grant generations (client, consent reference) whose remembered approval includes
- * `mcp:write`: only those can ever act at Full (a request is Full only when its token carries
- * `mcp:write`).
- */
-async function writeApprovedGenerations(
+/** OAuth ceilings are tied to the exact consent generation, never just the client. */
+async function approvedGenerations(
   userId: string,
   clientIds: readonly string[],
-): Promise<Set<string>> {
-  if (clientIds.length === 0) return new Set();
+): Promise<Map<string, AgentScope[]>> {
+  if (!clientIds.length) return new Map();
   const consents = await prisma.oauthConsent.findMany({
-    where: { userId, clientId: { in: [...clientIds] }, scopes: { has: "mcp:write" } },
-    select: { clientId: true, referenceId: true },
+    where: { userId, clientId: { in: [...clientIds] } },
+    select: { clientId: true, referenceId: true, scopes: true },
   });
-  return new Set(
+  return new Map(
     consents.flatMap((consent) =>
-      consent.referenceId === null ? [] : [generationKey(consent.clientId, consent.referenceId)],
+      consent.referenceId === null
+        ? []
+        : [
+            [
+              generationKey(consent.clientId, consent.referenceId),
+              oauthScopeCeiling(consent.scopes),
+            ],
+          ],
     ),
   );
 }
@@ -377,7 +462,7 @@ const oauthGrants = {
         id: true,
         clientId: true,
         referenceId: true,
-        level: true,
+        ...mcpGrantAccessSelect,
         createdAt: true,
         revokedAt: true,
       },
@@ -388,7 +473,7 @@ const oauthGrants = {
         where: { clientId: { in: clientIds } },
         select: { clientId: true, name: true, redirectUris: true },
       }),
-      writeApprovedGenerations(userId, clientIds),
+      approvedGenerations(userId, clientIds),
     ]);
     const byClientId = new Map(clients.map((client) => [client.clientId, client]));
     return {
@@ -401,8 +486,18 @@ const oauthGrants = {
             clientId: grant.clientId,
             clientName: client?.name ?? null,
             redirectHost: client ? redirectHostOf(client.redirectUris) : null,
-            level: grant.level,
-            fullAvailable: writeApproved.has(generationKey(grant.clientId, grant.referenceId)),
+            scopes: [...mcpGrantAccessOf(grant).scopes],
+            nodeIds: grant.allNodes ? null : grant.Nodes.map((node) => node.nodeId),
+            availableScopes: writeApproved.get(
+              generationKey(grant.clientId, grant.referenceId),
+            ) ?? ["read"],
+            currentSession:
+              grant.referenceId ===
+              deriveMcpConsentReferenceId({
+                secret: env.BETTER_AUTH_SECRET,
+                sessionId: context.session.session.id,
+                clientId: grant.clientId,
+              }),
             createdAt: grant.createdAt.toISOString(),
             revokedAt: grant.revokedAt?.toISOString() ?? null,
           };
@@ -453,63 +548,51 @@ const oauthGrants = {
     return { ok: true as const };
   }),
 
-  /**
-   * A person sets a connection's level (human: cookie session + CSRF, never an agent). Lowering
-   * is read by the next lookup (`/mcp` and node admissions read the grant every time) and ends
-   * the work the Full level started (`onAccessLevelLowered`); raising applies from the next
-   * call. Audited like the consent page's choice (`mcp_grant.level`).
-   */
-  setLevel: contractProcedure(c.oauthGrants.setLevel).handler(async ({ context, input }) => {
+  setAccess: contractProcedure(c.oauthGrants.setAccess).handler(async ({ context, input }) => {
     const userId = userIdOf(context);
-    const grant = await prisma.mcpGrant.findFirst({
-      where: { id: input.grantId, userId, revokedAt: null },
-      select: { id: true, clientId: true, referenceId: true, level: true },
-    });
-    if (!grant || isMcpPatClientId(grant.clientId))
-      throw notFound("That key, token, connection, share or invite does not exist.");
-    if (
-      input.level === "FULL" &&
-      !(await writeApprovedGenerations(userId, [grant.clientId])).has(
-        generationKey(grant.clientId, grant.referenceId),
-      )
-    ) {
-      // Its tokens carry no mcp:write, so Full could never apply (and the consent page never
-      // offers it): the agent must reconnect asking for mcp:write.
-      throw badRequest(
-        "This agent did not ask to make changes when it connected. Reconnect it asking for mcp:write.",
-      );
-    }
-    const change = await prisma.$transaction((tx) =>
-      setActiveMcpGrantLevel(tx, {
+    const change = await runSerializableTransaction(async (tx) => {
+      const grant = await tx.mcpGrant.findFirst({
+        where: { id: input.grantId, userId, revokedAt: null },
+        select: { id: true, clientId: true, referenceId: true, ...mcpGrantAccessSelect },
+      });
+      if (!grant || isMcpPatClientId(grant.clientId))
+        throw notFound("That key, token, connection, share or invite does not exist.");
+      const consent = await tx.oauthConsent.findFirst({
+        where: { userId, clientId: grant.clientId, referenceId: grant.referenceId },
+        select: { scopes: true },
+      });
+      const ceiling = oauthScopeCeiling(consent?.scopes ?? []);
+      if (input.scopes.some((scope) => !ceiling.includes(scope)))
+        throw badRequest(
+          "This agent did not request those OAuth scopes. Reconnect it with the required scopes.",
+        );
+      await validateAgentNodes(tx, userId, input.nodeIds);
+      const change = await setActiveMcpGrantAccess(tx, {
         grantId: grant.id,
         userId,
-        expected: grant.level,
-        level: input.level,
-        action: MCP_GRANT_LEVEL_AUDIT.level,
-      }),
-    );
-    if (change === null) {
-      throw new ORPCError("CONFLICT", {
-        message: "This connection changed meanwhile. Reload and try again.",
+        expected: mcpGrantAccessOf(grant),
+        access: input,
+        action: MCP_GRANT_ACCESS_AUDIT.access,
       });
-    }
-    if (change.lowered) {
-      // Committed: a failed cleanup must not turn the lowering into an error (every lookup
-      // already reads READ).
-      try {
-        await context.services?.onAccessLevelLowered?.({
-          kind: "oauth_grant",
-          userId,
-          grantId: grant.id,
+      if (!change)
+        throw new ORPCError("CONFLICT", {
+          message: "This connection changed meanwhile. Reload and try again.",
         });
-      } catch (error) {
-        console.error(
-          "[access] ending a lowered grant's Full work failed",
-          error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-        );
-      }
-    }
-    return { level: change.after };
+      return change;
+    });
+    if (change.narrowed && change.before)
+      await notifyNarrowed(context, {
+        kind: "oauth_grant",
+        userId,
+        grantId: change.grantId,
+        agentTokenId: null,
+        before: change.before,
+        after: change.after,
+      });
+    return {
+      scopes: [...change.after.scopes],
+      nodeIds: change.after.nodeIds === null ? null : [...change.after.nodeIds],
+    };
   }),
 };
 

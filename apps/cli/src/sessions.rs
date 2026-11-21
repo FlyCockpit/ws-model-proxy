@@ -98,10 +98,6 @@ const EXEC_OUTPUT_DRAIN: Duration = Duration::from_millis(500);
 /// long, whichever comes first. A background or disowned job that still holds
 /// the PTY must not keep a dead terminal in its slot.
 const TERMINAL_OUTPUT_DRAIN: Duration = Duration::from_millis(500);
-/// Map key for a handshake that names no viewer. Never a valid wire viewer id.
-/// Every accepted handshake carries a valid id, so this is only a fallback.
-const LEGACY_VIEWER: &str = "";
-
 const REASON_DISABLED: &str = "disabled";
 /// A command refused because the node is at Relay only.
 const REASON_TRUST_RELAY: &str = "trust_relay";
@@ -199,7 +195,7 @@ fn send_note(tx: &SyncSender<FromWorker>, mut note: FromWorker, stop: &AtomicBoo
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        // `SyncSender::send_timeout` is not stable on the 1.88 MSRV. Poll with
+        // `SyncSender::send_timeout` is not stable on the 1.89 MSRV. Poll with
         // try_send so a full channel still applies backpressure without dropping
         // output, and so shutdown can unblock the reader.
         match tx.try_send(note) {
@@ -391,7 +387,7 @@ fn identity_still_approved(state_dir: &Path, identity_raw: &[u8; 65]) -> bool {
     }
 }
 
-/// `viewer_id` selects the v2 transcript (protocol 2.5); `None` is v1.
+/// Approval signatures bind the viewer as well as the terminal and both nonces.
 #[allow(clippy::too_many_arguments)]
 fn approval_signature_ok(
     identity_raw: &[u8; 65],
@@ -406,27 +402,19 @@ fn approval_signature_ok(
     let Ok(signature) = terminal_crypto::decode_exact(signature, 64) else {
         return false;
     };
-    match viewer_id {
-        Some(viewer_id) => terminal_crypto::verify_approval_signature_v2(
-            identity_raw,
-            &signature,
-            terminal_id,
-            viewer_id,
-            browser_public,
-            browser_nonce,
-            cli_public,
-            cli_nonce,
-        ),
-        None => terminal_crypto::verify_approval_signature(
-            identity_raw,
-            &signature,
-            terminal_id,
-            browser_public,
-            browser_nonce,
-            cli_public,
-            cli_nonce,
-        ),
-    }
+    let Some(viewer_id) = viewer_id else {
+        return false;
+    };
+    terminal_crypto::verify_approval_signature_v2(
+        identity_raw,
+        &signature,
+        terminal_id,
+        viewer_id,
+        browser_public,
+        browser_nonce,
+        cli_public,
+        cli_nonce,
+    )
 }
 
 struct PreparedHandshake {
@@ -1597,17 +1585,10 @@ struct PendingTerminal {
 }
 
 /// `(terminalId, viewerId)`.
-type PendingKey = (String, String);
+type PendingKey = (String, Option<String>);
 
 fn pending_key(terminal_id: &str, viewer_id: Option<&str>) -> PendingKey {
-    (
-        terminal_id.to_string(),
-        viewer_id.unwrap_or(LEGACY_VIEWER).to_string(),
-    )
-}
-
-fn wire_viewer(viewer_key: &str) -> Option<&str> {
-    (viewer_key != LEGACY_VIEWER).then_some(viewer_key)
+    (terminal_id.to_string(), viewer_id.map(str::to_string))
 }
 
 pub(crate) struct TerminalRegistry {
@@ -1759,7 +1740,9 @@ impl TerminalRegistry {
         approved_identity: Option<[u8; 65]>,
     ) -> Vec<OutboundFrame> {
         let terminal_id = handshake.terminal_id;
-        let viewer_id = handshake.viewer_id;
+        let Some(viewer_id) = handshake.viewer_id else {
+            return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
+        };
         // Also reached from `auth` for an open approved after the shutdown began.
         if self.lifecycle.is_shut_down() {
             return vec![*handshake_rejected(handshake, REASON_SPAWN_FAILED)];
@@ -1775,23 +1758,14 @@ impl TerminalRegistry {
             Ok(path) => path,
             Err(_) => return vec![*handshake_rejected(handshake, REASON_BAD_CWD)],
         };
-        let keys = match viewer_id {
-            Some(viewer_id) => terminal_crypto::derive_direction_keys_v2(
-                startup.key(),
-                &prepared.browser_public,
-                &prepared.browser_nonce,
-                &cli_nonce,
-                terminal_id,
-                viewer_id,
-            ),
-            None => terminal_crypto::derive_direction_keys(
-                startup.key(),
-                &prepared.browser_public,
-                &prepared.browser_nonce,
-                &cli_nonce,
-                terminal_id,
-            ),
-        };
+        let keys = terminal_crypto::derive_direction_keys_v2(
+            startup.key(),
+            &prepared.browser_public,
+            &prepared.browser_nonce,
+            &cli_nonce,
+            terminal_id,
+            viewer_id,
+        );
         let keys = match keys {
             Ok(keys) => keys,
             Err(error) => {
@@ -1826,7 +1800,7 @@ impl TerminalRegistry {
                 return vec![*handshake_rejected(handshake, REASON_SPAWN_FAILED)];
             }
         };
-        let viewer_key = viewer_id.unwrap_or(LEGACY_VIEWER);
+        let viewer_key = viewer_id;
         let mut viewers = BTreeMap::new();
         viewers.insert(
             viewer_key.to_string(),
@@ -1842,7 +1816,7 @@ impl TerminalRegistry {
                 .image_worker
                 .session(paste_quoting(startup, prepared.shell.as_deref())),
             // The opener is the first writer.
-            writer: viewer_id.map(str::to_string),
+            writer: Some(viewer_id.to_string()),
             pty_size: (prepared.cols, prepared.rows),
             out,
             // The opener views it.
@@ -1853,13 +1827,11 @@ impl TerminalRegistry {
         };
         let mut frames = vec![OutboundFrame::Control(NodeFrame::TermOpened {
             terminal_id: terminal_id.to_string(),
-            viewer_id: viewer_id.map(str::to_string),
+            viewer_id: Some(viewer_id.to_string()),
             cli_nonce: terminal_crypto::encode_b64url(&cli_nonce),
         })];
-        if let Some(viewer_id) = viewer_id {
-            frames.extend(session.join_frames(terminal_id, viewer_id));
-            frames.push(term_writer(terminal_id, Some(viewer_id)));
-        }
+        frames.extend(session.join_frames(terminal_id, viewer_id));
+        frames.push(term_writer(terminal_id, Some(viewer_id)));
         self.sessions.insert(terminal_id.to_string(), session);
         frames
     }
@@ -2087,31 +2059,24 @@ impl TerminalRegistry {
         approved_identity: Option<[u8; 65]>,
     ) -> Vec<OutboundFrame> {
         let terminal_id = handshake.terminal_id;
-        let viewer_id = handshake.viewer_id;
-        let keys = match viewer_id {
-            Some(viewer_id) => terminal_crypto::derive_direction_keys_v2(
-                startup.key(),
-                &prepared.browser_public,
-                &prepared.browser_nonce,
-                &cli_nonce,
-                terminal_id,
-                viewer_id,
-            ),
-            None => terminal_crypto::derive_direction_keys(
-                startup.key(),
-                &prepared.browser_public,
-                &prepared.browser_nonce,
-                &cli_nonce,
-                terminal_id,
-            ),
+        let Some(viewer_id) = handshake.viewer_id else {
+            return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
         };
+        let keys = terminal_crypto::derive_direction_keys_v2(
+            startup.key(),
+            &prepared.browser_public,
+            &prepared.browser_nonce,
+            &cli_nonce,
+            terminal_id,
+            viewer_id,
+        );
         let Ok(keys) = keys else {
             return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
         };
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return vec![*handshake_rejected(handshake, REASON_NOT_FOUND)];
         };
-        let viewer_key = viewer_id.unwrap_or(LEGACY_VIEWER);
+        let viewer_key = viewer_id;
         if session.viewers.contains_key(viewer_key) {
             return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
         }
@@ -2121,7 +2086,7 @@ impl TerminalRegistry {
         );
         let mut frames = vec![OutboundFrame::Control(NodeFrame::TermAttached {
             terminal_id: terminal_id.to_string(),
-            viewer_id: viewer_id.map(str::to_string),
+            viewer_id: Some(viewer_id.to_string()),
             cli_nonce: terminal_crypto::encode_b64url(&cli_nonce),
         })];
         frames.extend(session.join_frames(terminal_id, viewer_key));
@@ -2316,7 +2281,7 @@ impl TerminalRegistry {
                     );
                     return vec![OutboundFrame::Control(NodeFrame::TermInputDropped {
                         terminal_id: terminal_id.to_string(),
-                        viewer_id: wire_viewer(&viewer_key).map(str::to_string),
+                        viewer_id: Some(viewer_key.to_string()),
                     })];
                 }
                 let mut frames = match self.claim_writer(terminal_id, &viewer_key) {
@@ -2468,7 +2433,7 @@ impl TerminalRegistry {
         tracing::warn!(terminal_id, "terminal input queue is full; dropping input");
         Some(OutboundFrame::Control(NodeFrame::TermInputDropped {
             terminal_id: terminal_id.to_string(),
-            viewer_id: wire_viewer(viewer_key).map(str::to_string),
+            viewer_id: Some(viewer_key.to_string()),
         }))
     }
 
@@ -2575,7 +2540,7 @@ impl TerminalRegistry {
             self.pending.remove(&key);
             frames.push(term_rejected(
                 &key.0,
-                wire_viewer(&key.1),
+                key.1.as_deref(),
                 REASON_EXPIRED,
                 None,
             ));
@@ -3245,9 +3210,6 @@ pub(crate) struct ExecRegistry {
     /// Where a PowerShell command's script is written (Windows): beside the table, in the state
     /// directory; in the temporary directory in tests that do not persist.
     scripts: PathBuf,
-    /// The connected server accepts `exec.started`'s `ranWith` (its `hello.ok` said
-    /// `features.execRanWith`). Set for each connection at registration.
-    report_ran_with: bool,
 }
 
 /// Remove the scripts commands left in `dir` (`<command id>.ps1`).
@@ -3335,14 +3297,7 @@ impl ExecRegistry {
             lifecycle: Lifecycle::Open,
             table: None,
             scripts: std::env::temp_dir().join(format!("wsmp-exec-scripts-{}", std::process::id())),
-            report_ran_with: false,
         }
-    }
-
-    /// Whether `exec.started` carries `ranWith`: only when this connection's server said it
-    /// accepts it (an older server refuses a field it does not know).
-    pub(crate) fn set_report_ran_with(&mut self, report: bool) {
-        self.report_ran_with = report;
     }
 
     /// Persist running commands to `path`, and report the ones a previous
@@ -3541,7 +3496,7 @@ impl ExecRegistry {
             }
         };
         let lifetime = Duration::from_millis(timeout_ms).min(self.command_max);
-        let ran_with = self.report_ran_with.then_some(process.ran_with);
+        let ran_with = process.ran_with;
         match spawn_exec(&self.tx, command_id, process, &line.text(), &cwd, lifetime) {
             Ok(session) => {
                 let frame = NodeFrame::ExecStarted {
@@ -4141,6 +4096,27 @@ mod tests {
             ..Config::default()
         };
         TerminalStartup::from_key(CliTerminalKey::generate().expect("key"), &config)
+    }
+
+    #[test]
+    fn relay_only_refuses_text_and_argv_before_creating_scripts() {
+        let startup =
+            TerminalStartup::from_key(CliTerminalKey::generate().expect("key"), &Config::default());
+        let (tx, _rx) = channel();
+        let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
+        let scripts = tempfile::tempdir().expect("scripts parent");
+        execs.scripts = scripts.path().join("never-created");
+        let argv = vec!["nonexistent-program".to_string()];
+        for line in [ExecLine::Text("echo should-not-run"), ExecLine::Argv(&argv)] {
+            let frames = execs.start(&startup, "relay-only", &line, None, None, TEST_TIMEOUT_MS);
+            assert!(matches!(
+                frames.as_slice(),
+                [OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })]
+                    if reason == REASON_TRUST_RELAY
+            ));
+            assert!(execs.sessions.is_empty());
+            assert!(!execs.scripts.exists());
+        }
     }
 
     /// A registry whose terminals run a shell that waits `seconds` and
@@ -4903,9 +4879,10 @@ mod tests {
         let cli = CliTerminalKey::generate().expect("cli");
         let browser_nonce = [4_u8; 16];
         let cli_nonce = [5_u8; 16];
-        let signature = terminal_crypto::sign_approval(
+        let signature = terminal_crypto::sign_approval_v2(
             &identity,
             "term-a",
+            "AQIDBAUGBwgJCgsMDQ4PEA",
             browser.public_raw(),
             &browser_nonce,
             cli.public_raw(),
@@ -4917,7 +4894,7 @@ mod tests {
             &identity_raw,
             &encoded,
             "term-a",
-            None,
+            Some("AQIDBAUGBwgJCgsMDQ4PEA"),
             browser.public_raw(),
             &browser_nonce,
             cli.public_raw(),
@@ -4929,7 +4906,7 @@ mod tests {
             &identity_raw,
             &encoded,
             "term-a",
-            None,
+            Some("AQIDBAUGBwgJCgsMDQ4PEA"),
             browser.public_raw(),
             &browser_nonce,
             cli.public_raw(),

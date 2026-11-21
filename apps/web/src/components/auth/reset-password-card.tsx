@@ -155,6 +155,7 @@ function ResetPasswordForm({
           <div className="space-y-2">
             <Label htmlFor={field.name}>{t("auth:resetPassword.newPassword")}</Label>
             <Input
+              className="h-11 text-base md:h-8 md:text-xs"
               id={field.name}
               name={field.name}
               type="password"
@@ -177,6 +178,7 @@ function ResetPasswordForm({
           <div className="space-y-2">
             <Label htmlFor={field.name}>{t("auth:resetPassword.confirmPassword")}</Label>
             <Input
+              className="h-11 text-base md:h-8 md:text-xs"
               id={field.name}
               name={field.name}
               type="password"

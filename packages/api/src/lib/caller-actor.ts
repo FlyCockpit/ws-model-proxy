@@ -7,7 +7,9 @@
  * neither.
  */
 import { ORPCError } from "@orpc/server";
+import { type AgentScope, agentHasScope, agentNodeAllowed } from "../contracts/agent-scopes";
 import type { AnonymousAuth, CallerAuth } from "../contracts/auth-context";
+import { notFound } from "./refuse";
 
 export type CallerActor = {
   actor: "USER" | "AGENT";
@@ -17,11 +19,31 @@ export type CallerActor = {
 };
 
 /**
- * Defense in depth for writes: the MCP layer offers write tools only to FULL credentials, and a
- * procedure refuses a Read-only agent that reaches a write anyway.
+ * Defense in depth: procedures require their domain scope as well as the central tool check.
  */
+export function assertAgentScope(auth: CallerAuth | AnonymousAuth, scope: AgentScope): void {
+  if (
+    (auth.kind === "agent_token" || auth.kind === "oauth_access_token") &&
+    !agentHasScope(auth.access, scope)
+  )
+    throw new ORPCError("FORBIDDEN", { message: "This credential does not allow this operation." });
+}
+export function assertAgentNode(
+  auth: CallerAuth | AnonymousAuth,
+  nodeId: string,
+  message = "That node does not exist.",
+): void {
+  if (
+    (auth.kind === "agent_token" || auth.kind === "oauth_access_token") &&
+    !agentNodeAllowed(auth.access, nodeId)
+  )
+    throw notFound(message);
+}
 export function assertMayWrite(auth: CallerAuth | AnonymousAuth): void {
-  if ((auth.kind === "agent_token" || auth.kind === "oauth_access_token") && auth.level !== "FULL")
+  if (
+    (auth.kind === "agent_token" || auth.kind === "oauth_access_token") &&
+    !auth.access.scopes.some((scope) => scope !== "read")
+  )
     throw new ORPCError("FORBIDDEN", { message: "A Read-only agent cannot change anything." });
 }
 

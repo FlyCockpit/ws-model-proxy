@@ -96,16 +96,11 @@ pub fn format_hardware(hardware: &Hardware) -> Vec<String> {
                 .map_or_else(unknown, escape_single_line)
         ),
         format!(
-            "memory: {}",
+            "memory total: {}",
             hardware.memory_total_mib.map_or_else(unknown, size)
         ),
     ];
-    if hardware.node_kind == NodeKind::Unified {
-        lines.push(format!(
-            "model memory (unified pool): {}",
-            hardware.unified_memory_mib.map_or_else(unknown, size)
-        ));
-    } else if hardware.node_kind == NodeKind::Discrete {
+    if hardware.node_kind != NodeKind::Cpu {
         lines.push(format!(
             "accelerator memory: {}",
             hardware.accelerator_memory_mib.map_or_else(unknown, size)
@@ -145,15 +140,16 @@ mod tests {
     use crate::hardware::fixtures::{MACHINES, sources};
 
     #[test]
-    fn the_text_report_names_the_pool_for_each_recorded_machine() {
+    fn the_text_report_separates_physical_and_accelerator_memory() {
         let strix = format_hardware(&assemble(sources("strix-halo")));
         assert_eq!(strix[0], "kind: unified");
-        assert!(strix.contains(&"model memory (unified pool): 120.5 GiB (123392 MiB)".into()));
+        assert!(strix.contains(&"memory total: 125.0 GiB (128006 MiB)".into()));
+        assert!(strix.contains(&"accelerator memory: 120.5 GiB (123392 MiB)".into()));
         assert!(strix.iter().any(|line| line
             == "  amd:0  AMD Radeon 8060S Graphics  integrated  vram 0.5 GiB (512 MiB)  gtt 120.0 GiB (122880 MiB)  gfx1151  1002:1586"));
 
         let spark = format_hardware(&assemble(sources("dgx-spark-gb10")));
-        assert!(spark.contains(&"model memory (unified pool): 119.5 GiB (122357 MiB)".into()));
+        assert!(spark.contains(&"accelerator memory: 119.5 GiB (122357 MiB)".into()));
         assert!(
             spark
                 .iter()

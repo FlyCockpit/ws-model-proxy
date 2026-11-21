@@ -414,6 +414,10 @@ const RS = "packages/api/src/lib/reservations.ts";
 const SM = "apps/server/src/relay/session-manager.ts";
 const DB = "packages/db/src";
 const CENSUS: Record<string, [number, string]> = {
+  "apps/server/src/database-backfill-startup.ts | readLegacyRows | $queryRaw | raw": [
+    1,
+    "Read-only startup check for unbackfilled run generations and retired capability keys; never writes a run, claim or step.",
+  ],
   "apps/server/src/model-api/cache-affinity-generation.ts | instanceByHandleSql | Prisma.sql | fragment":
     [1, "Reads an instance id by node and handle (SELECT only)."],
   "apps/server/src/model-api/cache-affinity-generation.ts | persistAffinityCounterEpoch | Prisma.sql | fragment":
@@ -664,6 +668,10 @@ const CENSUS: Record<string, [number, string]> = {
     1,
     "The one managed phase write (`lib/instance-phase.ts`: the move asserted, the columns built). Its callers are pinned (CONSUMERS): STOPPING (gangStop), STOPPED / FAILED (settleStopped, retake's node_deleted), STARTING after retakeInstanceClaims began the run (retake), READY after this run's READINESS (afterStep, after `owned`), health (recordHealth), and the named exemption of same-run UNAVAILABLE and recovery (watchInstance, run resolved first).",
   ],
+  "packages/api/src/lib/agent-hidden-serving.ts | andServedVisibly | Prisma.raw | opaque": [
+    2,
+    "Read-only traffic/load filters: a serving column name from a fixed literal union (node, instance); the hidden node and instance ids are bound array parameters.",
+  ],
   "packages/api/src/lib/claim-release.ts | releaseClaim | instanceRank.updateMany | claim": [
     1,
     "The one TypeScript release: proof bound, owned and fresh, or never-ran, or a person's HELD_UNKNOWN release.",
@@ -682,8 +690,6 @@ const CENSUS: Record<string, [number, string]> = {
     1,
     "A rank's proven-stopped boundary (stoppedThroughRun, only grows) after a leading stop succeeded or was satisfied (claim untouched).",
   ],
-  "packages/api/src/lib/instance-run.ts | resolveRun | runtimeInstance.updateMany | runGeneration":
-    [1, "A legacy row's one-time bootstrap (WHERE runGeneration = 0)."],
   "packages/api/src/lib/metrics-query.ts | bucketExpr | Prisma.raw | opaque": [
     1,
     "A time-bucket expression from fixed step names (read-only metrics).",
@@ -897,14 +903,18 @@ const SQL_ELSEWHERE: Record<string, [number, string]> = {
     2,
     "Self-update authority locks: the node row (policy, trust, stored connection) and the claimed node_agent_update row.",
   ],
+  "packages/api/src/lib/agent-hidden-serving.ts | fragment-other": [
+    2,
+    "Read-only exclusion conjuncts over rollup and load rows: hidden node and instance ids as bound array parameters.",
+  ],
   "packages/api/src/lib/metrics-query.ts | fragment-other": [
-    54,
-    "Read-only metrics over rollup tables.",
+    56,
+    "Read-only metrics over rollup tables, including two node-allowlist filter fragments (the load filter naming run tables is listed in CENSUS).",
   ],
   "packages/api/src/lib/metrics-query.ts | raw-other": [7, "Read-only metrics over rollup tables."],
   "packages/api/src/lib/overview-summary.ts | fragment-other": [
     2,
-    "Read-only overview over rollup tables.",
+    "Read-only overview and pool traffic over rollup tables (hidden serving filters come from agent-hidden-serving.ts).",
   ],
   "packages/api/src/lib/overview-summary.ts | raw-other": [
     3,

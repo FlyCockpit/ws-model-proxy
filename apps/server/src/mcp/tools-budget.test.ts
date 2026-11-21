@@ -4,6 +4,8 @@ import {
   CLIENT_INFO_META_KEY,
   PROTOCOL_VERSION_META_KEY,
 } from "@modelcontextprotocol/server";
+import type { AgentScope } from "@ws-model-proxy/auth/agent-scopes";
+import { ALL_AGENT_SCOPES } from "@ws-model-proxy/auth/agent-scopes";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
@@ -21,7 +23,7 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
-const { MCP_READ_TOOLS, MCP_TOOL_NAMES } = await import("@ws-model-proxy/api/contracts");
+const { MCP_READ_TOOLS, MCP_TOOL_NAMES, MCP_TOOLS } = await import("@ws-model-proxy/api/contracts");
 const { createMcpTransport } = await import("./handler");
 const { bindMcpToolDispatch } = await import("./tool-dispatch");
 const { testDispatch } = await import("./tools.test-helper");
@@ -33,9 +35,9 @@ const { testDispatch } = await import("./tools.test-helper");
  */
 const TOOLS_LIST_TOKEN_BUDGET = 6_500;
 
-async function listTools(level: "READ" | "FULL") {
+async function listTools(scopes: readonly AgentScope[]) {
   const authInfo: AuthInfo = { token: "test", clientId: "c", scopes: ["mcp:read"] };
-  bindMcpToolDispatch(authInfo, testDispatch(level));
+  bindMcpToolDispatch(authInfo, testDispatch(scopes));
   const handler = createMcpTransport();
   const response = await handler.fetch(
     new Request("http://proxy.example.com/mcp", {
@@ -68,19 +70,31 @@ async function listTools(level: "READ" | "FULL") {
 }
 
 describe("the server's tools/list", () => {
-  it("lists all 28 tools for FULL credentials within the token budget (chars / 4)", async () => {
-    const tools = await listTools("FULL");
+  it("lists all 28 tools for credentials with all scopes within the token budget (chars / 4)", async () => {
+    const tools = await listTools(ALL_AGENT_SCOPES);
     expect(tools.map((entry) => entry.name)).toEqual([...MCP_TOOL_NAMES]);
     const tokens = Math.ceil(JSON.stringify({ tools }).length / 4);
     console.info(`[budget] tools/list: ${tokens} tokens for ${tools.length} tools`);
     expect(tokens).toBeLessThanOrEqual(TOOLS_LIST_TOKEN_BUDGET);
   });
 
+  it.each(ALL_AGENT_SCOPES.filter((scope) => scope !== "read"))(
+    "lists baseline plus exactly the tools for %s",
+    async (scope) => {
+      const tools = await listTools(["read", scope]);
+      expect(tools.map((entry) => entry.name)).toEqual(
+        MCP_TOOLS.filter((tool) => tool.scope === "read" || tool.scope === scope).map(
+          (tool) => tool.name,
+        ),
+      );
+    },
+  );
+
   it("advertises only name, description and the compact input schema", async () => {
-    for (const entry of await listTools("FULL")) {
+    for (const entry of await listTools(ALL_AGENT_SCOPES)) {
       expect(Object.keys(entry).sort(), entry.name).toEqual(["description", "inputSchema", "name"]);
     }
-    const runtimeCreate = (await listTools("FULL")).find(
+    const runtimeCreate = (await listTools(ALL_AGENT_SCOPES)).find(
       (entry) => entry.name === "runtime_create",
     );
     const schema = runtimeCreate?.inputSchema as
@@ -90,7 +104,7 @@ describe("the server's tools/list", () => {
     expect(properties?.spec).toMatchObject({ type: "object" });
   });
 
-  it("lists only the read tools for READ credentials", async () => {
-    expect((await listTools("READ")).map((entry) => entry.name)).toEqual([...MCP_READ_TOOLS]);
+  it("lists only the read tools for baseline credentials", async () => {
+    expect((await listTools(["read"])).map((entry) => entry.name)).toEqual([...MCP_READ_TOOLS]);
   });
 });

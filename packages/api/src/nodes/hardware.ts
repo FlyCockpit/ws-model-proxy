@@ -272,7 +272,8 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
   const info = parseNodeInfo(input.nodeInfo);
   const node = parseNodeDeclared(info?.declared) ?? {};
 
-  const detectedMemoryMiB = info?.unifiedMemoryMiB ?? info?.memoryTotalMiB;
+  // OS physical memory and the GPU-addressable pool are independent (AMD TTM, Apple wired limit).
+  const detectedMemoryMiB = info?.memoryTotalMiB ?? info?.unifiedMemoryMiB;
   const detectedGpus = info?.gpus ?? [];
   const detectedVramMiB = detectedGpus.reduce(
     (sum, gpu) => sum + (gpu.apu === true ? 0 : (gpu.vramTotalMiB ?? 0)),
@@ -370,6 +371,35 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
     liveFreeMemoryGb: live.freeMemoryGb,
     liveFreeAcceleratorGb: live.freeAcceleratorGb,
   };
+}
+
+/**
+ * Host RAM cannot allocate an AMD APU's BIOS VRAM carve-out. Detection reports physical
+ * memory including that carve-out; GPU allocations can use it before spilling into host RAM.
+ * A declared memory total is an operator budget, so do not infer a deduction from detection.
+ * GPU reservations reduce the total/shared pools, not this RAM-only pool; reserved RAM and
+ * OS headroom reduce both host and total RAM. Null means no additional RAM-only constraint.
+ */
+export function ramOnlyMemoryBudgetGb(
+  hardware: EffectiveHardware,
+  nodeInfo: unknown,
+): number | null {
+  if (hardware.memoryGb.source !== "detected" || hardware.memoryGb.value === null) return null;
+  const info = parseNodeInfo(nodeInfo);
+  if (info?.memoryTotalMiB === undefined) return null;
+  // The CLI adds the carve-out of the first AMD APU it finds to `memoryTotalMiB` (MemTotal
+  // excludes it): deduct exactly that one, so the RAM-only cap is MemTotal.
+  const apu = (info.gpus ?? []).find((gpu) => gpu.vendor === "amd" && gpu.apu === true);
+  const carveoutMiB = apu?.vramTotalMiB ?? 0;
+  if (carveoutMiB === 0) return null;
+  return round(
+    Math.max(
+      0,
+      (info.memoryTotalMiB - carveoutMiB) / 1024 -
+        (hardware.reservedMemoryGb.value ?? 0) -
+        (hardware.kind.value === "unified" ? UNIFIED_HEADROOM_GB : 0),
+    ),
+  );
 }
 
 /** An address on an interface, without its prefix length. */

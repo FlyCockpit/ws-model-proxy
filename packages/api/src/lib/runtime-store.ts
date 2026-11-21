@@ -11,7 +11,7 @@ import type { runtimeAdvancedPatchSchema, runtimeLimitsPatchSchema } from "../co
 import { type CallerActor } from "./caller-actor";
 import { instancePhaseData } from "./instance-phase";
 import { resolveRun } from "./instance-run";
-import { refuseAbout } from "./refuse";
+import { notFound } from "./refuse";
 import { applyJsonPatch } from "./registry-view";
 import type { RequestCompat } from "./request-compat";
 import { retakeInstanceClaims } from "./reservations";
@@ -226,7 +226,7 @@ export async function ownedNode(userId: string, nodeId: string, db: Tx = prisma)
     where: { id: nodeId, userId },
     select: { id: true, slug: true, trust: true, trustLowerRequestedAt: true },
   });
-  if (!node) throw refuseAbout("unknown_node", nodeId, "That node does not exist.");
+  if (!node) throw notFound("That node does not exist.");
   return node;
 }
 

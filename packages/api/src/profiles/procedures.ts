@@ -9,7 +9,9 @@ import type { Context } from "../context";
 import { contractProcedure } from "../contract-procedure";
 import { agentRulesApply, isHumanCaller } from "../contracts/auth-context";
 import { profilesContract as c, type profileViewSchema } from "../contracts/profiles";
-import { assertMayWrite, callerActor } from "../lib/caller-actor";
+import { hiddenNodeIds, instanceVisible } from "../lib/agent-hidden-nodes";
+import { assertAgentInstanceNodes, nodeVisibleToAgent } from "../lib/agent-node-access";
+import { assertAgentNode, assertAgentScope, callerActor } from "../lib/caller-actor";
 import { graphDelete, graphWrite, instanceCapacityFences } from "../lib/graph-write";
 import {
   agentBlockedNodeWithCleanup,
@@ -221,19 +223,43 @@ export function toProfileView(row: ProfileRow, instances: readonly RunningInstan
   };
 }
 
-async function loadProfileViews(userId: string, profileId?: string): Promise<ProfileView[]> {
+async function loadProfileViews(
+  userId: string,
+  profileId?: string,
+  auth?: Context["auth"],
+): Promise<ProfileView[]> {
   const rows = await prisma.profile.findMany({
     where: { userId, ...(profileId ? { id: profileId } : {}) },
     orderBy: { name: "asc" },
     select: profileSelect,
   });
   const nodeIds = [...new Set(rows.flatMap((row) => row.Nodes.map((node) => node.nodeId)))];
+  const hidden = new Set(auth ? await hiddenNodeIds(prisma, auth) : []);
   const instances = await runningInstancesOn(userId, nodeIds);
-  return rows.map((row) => toProfileView(row, instances));
+  return rows.map((row) => {
+    if (!auth) return toProfileView(row, instances);
+    const visible = {
+      ...row,
+      Nodes: row.Nodes.filter((node) => nodeVisibleToAgent(auth, node.nodeId)),
+      Items: row.Items.map((item) => ({
+        ...item,
+        nodeIds: item.nodeIds.filter((id) => nodeVisibleToAgent(auth, id)),
+      })),
+    };
+    return toProfileView(
+      visible,
+      // runningInstancesOn selects STARTABLE runtimes only; they have no bound node.
+      instances.filter((instance) => instanceVisible(instance, hidden, null)),
+    );
+  });
 }
 
-async function loadProfileView(userId: string, profileId: string): Promise<ProfileView> {
-  const [view] = await loadProfileViews(userId, profileId);
+async function loadProfileView(
+  userId: string,
+  profileId: string,
+  auth?: Context["auth"],
+): Promise<ProfileView> {
+  const [view] = await loadProfileViews(userId, profileId, auth);
   if (!view) throw notFound("That profile does not exist.");
   return view;
 }
@@ -266,6 +292,8 @@ async function loadPlanInput(
   });
   if (!profile) throw notFound("That profile does not exist.");
   const ownedIds = profile.Nodes.map((node) => node.nodeId);
+  for (const nodeId of ownedIds)
+    assertAgentNode(context.auth, nodeId, "That profile does not exist.");
   const now = new Date();
   const [nodes, versions, instances, claimants, fabrics, required] = await Promise.all([
     db.node.findMany({
@@ -290,6 +318,15 @@ async function loadPlanInput(
     requiredDefinitionsByNode(db, { userId, nodeIds: ownedIds }),
   ]);
 
+  if (nodes.length !== ownedIds.length) throw notFound("That profile does not exist.");
+  for (const instance of instances)
+    await assertAgentInstanceNodes(
+      db,
+      context.auth,
+      userId,
+      instance,
+      "That profile does not exist.",
+    );
   const planNodes = new Map<string, PlanNode>();
   for (const node of nodes) {
     const placement = placementNodeOf(node, now, required.get(node.id) ?? new Set());
@@ -304,6 +341,8 @@ async function loadPlanInput(
       heldVersionIds: placement.heldVersionIds,
       requiredVersionIds: placement.requiredVersionIds,
       memoryGb: placement.memoryGb,
+      unifiedAcceleratorGb: placement.unifiedAcceleratorGb,
+      ramOnlyGb: placement.ramOnlyGb,
       gpus: placement.gpus,
       liveFreeMemoryGb: placement.liveFreeMemoryGb,
       launch: placement.launch,
@@ -356,15 +395,15 @@ async function loadPlanInput(
 
 export const profileProcedures = {
   list: contractProcedure(c.list).handler(async ({ context }) => ({
-    profiles: await loadProfileViews(context.session.user.id),
+    profiles: await loadProfileViews(context.session.user.id, undefined, context.auth),
   })),
 
   get: contractProcedure(c.get).handler(async ({ context, input }) =>
-    loadProfileView(context.session.user.id, input.profileId),
+    loadProfileView(context.session.user.id, input.profileId, context.auth),
   ),
 
   save: contractProcedure(c.save).handler(async ({ context, input }) => {
-    assertMayWrite(context.auth);
+    assertAgentScope(context.auth, "runtimes");
     const userId = context.session.user.id;
     const actor = callerActor(context.auth, userId);
     const person = isHumanCaller(context.auth);
@@ -375,6 +414,15 @@ export const profileProcedures = {
     let profileId: string;
     try {
       profileId = await graphWrite([userId], async (tx) => {
+        for (const nodeId of nodeIds) {
+          if (!nodeVisibleToAgent(context.auth, nodeId))
+            throw refuseAbout(
+              "unknown_node",
+              nodeId,
+              `No node of yours has the id ${nodeId}.`,
+              "NOT_FOUND",
+            );
+        }
         const owned = await tx.node.findMany({
           where: { userId, id: { in: nodeIds } },
           select: { id: true },
@@ -405,6 +453,8 @@ export const profileProcedures = {
             })
           : null;
         if (input.profileId && !existing) throw notFound("That profile does not exist.");
+        for (const node of existing?.Nodes ?? [])
+          assertAgentNode(context.auth, node.nodeId, "That profile does not exist.");
 
         // Hold lines are people's: lib/profile-save.ts is the one rule (security).
         const savePlan = planProfileSave({
@@ -546,34 +596,44 @@ export const profileProcedures = {
   }),
 
   delete: contractProcedure(c.delete).handler(async ({ context, input }) => {
-    assertMayWrite(context.auth);
+    assertAgentScope(context.auth, "runtimes");
     const userId = context.session.user.id;
     await graphDelete({ userId, profileIds: [input.profileId] }, async (tx) => {
       await lockProfileRows(tx, userId, input.profileId, []);
       const profile = await tx.profile.findFirst({
         where: { id: input.profileId, userId },
-        select: { id: true, Nodes: { where: { hold: true }, select: { nodeId: true } } },
+        select: {
+          id: true,
+          Nodes: { select: { nodeId: true, hold: true, Node: { select: { userId: true } } } },
+        },
       });
       if (!profile) throw notFound("That profile does not exist.");
+      for (const node of profile.Nodes) {
+        assertAgentNode(context.auth, node.nodeId, "That profile does not exist.");
+        if (
+          (context.auth.kind === "agent_token" || context.auth.kind === "oauth_access_token") &&
+          node.Node.userId !== userId
+        )
+          throw notFound("That profile does not exist.");
+      }
       if (agentRulesApply(context.auth)) {
         // Deleting drops hold lines and releases the holds the profile set: people only.
         const holding = await tx.node.count({ where: { userId, holdProfileId: profile.id } });
-        if (profile.Nodes.length > 0 || holding > 0)
+        if (profile.Nodes.some((node) => node.hold) || holding > 0)
           throw refuse(
             "human_only",
             "This profile has hold lines; only a person deletes it.",
             "FORBIDDEN",
           );
       }
-      // Its holds stay: the FK sets holdProfileId null, so they become a person's holds
-      // (docs/contracts/0.4.0.md), released only by a person.
+      // Its holds stay: the FK sets holdProfileId null, so only a person may release them.
       await tx.profile.deleteMany({ where: { id: profile.id, userId } });
     });
     return { ok: true as const };
   }),
 
   apply: contractProcedure(c.apply).handler(async ({ context, input }) => {
-    if (!input.preview) assertMayWrite(context.auth);
+    if (!input.preview) assertAgentScope(context.auth, "runtimes");
     const userId = context.session.user.id;
     if (input.preview) {
       const { input: planInput } = await loadPlanInput(context, userId, input.profileId);

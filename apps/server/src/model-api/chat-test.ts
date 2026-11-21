@@ -1,12 +1,12 @@
 import type { Session } from "@ws-model-proxy/auth";
-import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
 import prisma from "@ws-model-proxy/db";
 import { Hono } from "hono";
+import { forcedTwoFactorResponse } from "../force-2fa-gate.js";
 import { relaySessionManager } from "../relay/session-manager.js";
 import { capacityRequestScopeMiddleware } from "./capacity/request-scope.js";
 import { type DiagnosticCoreDependencies, diagnosticsCapacityRuntime } from "./diagnostics.js";
 import { modelApiConcurrencyLimiter } from "./limits.js";
-import { openAiErrorBody, openAiFailureJsonResponse } from "./openai-errors.js";
+import { openAiFailureJsonResponse } from "./openai-errors.js";
 import { observeRelayRequests } from "./relay-request-observer.js";
 import {
   anthropicMessagesHandler,
@@ -115,26 +115,17 @@ export function createChatTestRoutes({
   manager = relaySessionManager,
   concurrencyLimiter = modelApiConcurrencyLimiter,
   capacityRuntime,
-  twoFactorRequired = isForceTwoFactorRequired,
+  twoFactorRequired,
   readUpstreamExcerpt = settledUpstreamExcerpt,
 }: ChatTestRouteDependencies = {}) {
   const app = new Hono<{ Variables: ChatTestVariables }>();
-  // The dashboard's force-2FA rule (`protectedProcedure`, the terminal and
+  // The dashboard's force-2FA rule (contract access checks, the terminal and
   // Chat Test realtime sockets): while the policy is on, a signed-in user who
   // has not enrolled cannot drive Chat Test with their cookie. No session
   // falls through to each route's own 401.
   app.use("*", async (c, next) => {
-    const user = c.get("session")?.user;
-    if (user && !user.twoFactorEnabled && (await twoFactorRequired())) {
-      return c.json(
-        openAiErrorBody({
-          message: "Two-factor authentication setup is required.",
-          type: "invalid_request_error",
-          code: "two_factor_required",
-        }),
-        403,
-      );
-    }
+    const denied = await forcedTwoFactorResponse(c.get("session"), twoFactorRequired);
+    if (denied) return denied;
     await next();
   });
   // One module-lifetime diagnostics capacity runtime, shared with the MCP

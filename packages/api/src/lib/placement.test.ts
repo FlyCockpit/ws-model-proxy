@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { TEST_NODE_FEATURES } from "./node-features-test-fixture";
 import {
   type PlacementContext,
   type PlacementFabric,
@@ -31,8 +32,14 @@ function node(id: string, overrides: Partial<PlacementNode> = {}): PlacementNode
     frozenFabrics: null,
     memoryGb: 126,
     gpus: [],
+    unifiedAcceleratorGb: null,
+    ramOnlyGb: null,
     liveFreeMemoryGb: null,
-    launch: null,
+    launch: {
+      platform: "linux",
+      management: new Set(["process", "service"]),
+      shells: new Set(["sh"]),
+    },
     ...overrides,
   };
 }
@@ -761,17 +768,19 @@ describe("trust, labels and frozen definitions", () => {
     const refused = planner.place({ ...request(), launch: { ...request().launch, ...launch } });
     expect(refused.ok).toBe(false);
     if (!refused.ok) expect(refused.refusal.reason).toBe("unsupported_platform");
-    // A service runs on the Mac; a node that does not say is not checked.
+    // A service runs on the Mac; a node without a launch report cannot launch.
     const service = {
       management: "service" as const,
       commands: [{ start: "brew services start x" }],
     };
     const placed = ok(planner.place({ ...request(), launch: { ...request().launch, ...service } }));
     expect(placed.start.placements[0]?.nodeId).toBe("mac");
-    const unknown = new PlacementPlanner(context({ nodes: [node("old")] }));
-    expect(ok(unknown.place({ ...request(), launch: { ...request().launch, ...launch } })).ok).toBe(
-      true,
+    const unknown = new PlacementPlanner(
+      context({ nodes: [node("unavailable", { launch: null })] }),
     );
+    const unavailable = unknown.place({ ...request(), launch: { ...request().launch, ...launch } });
+    expect(unavailable.ok).toBe(false);
+    if (!unavailable.ok) expect(unavailable.refusal.reason).toBe("unsupported_platform");
   });
 });
 
@@ -1471,7 +1480,7 @@ function nodeRow(overrides: Partial<PlacementNodeRow> = {}): PlacementNodeRow {
     heldFabricsHash: null,
     declaredResources: { memoryGb: 128 },
     nodeInfo: null,
-    features: null,
+    features: TEST_NODE_FEATURES,
     nodeMetrics: null,
     nodeMetricsAt: null,
     ...overrides,
@@ -2161,5 +2170,474 @@ describe("definition slots (RUNTIME_DEFINITIONS_MAX)", () => {
       entry.id === "h1" ? { ...entry, trust: "RELAY" as const } : entry,
     );
     ok(new PlacementPlanner(context({ nodes: room })).place(request({ nodeIds: ["h1"] })));
+  });
+});
+
+describe("unified accelerator capacity independent of physical RAM", () => {
+  function strix(declaredResources: unknown = null): PlacementNode {
+    return placementNodeOf(
+      nodeRow({
+        id: "strix",
+        slug: "strix",
+        declaredResources,
+        nodeInfo: {
+          nodeKind: "unified",
+          memoryTotalMiB: 126136,
+          unifiedMemoryMiB: 63324,
+          acceleratorMemoryMiB: 63324,
+          gpus: [{ vendor: "amd", index: 0, vramTotalMiB: 512, apu: true }],
+        },
+      }),
+      new Date(),
+      new Set(),
+    );
+  }
+  const gpu = (vramGb: number, ramGb = 0): RuntimeResource => ({
+    kind: "discrete",
+    gpuCount: 1,
+    vendor: "amd",
+    vramGb,
+    ...(ramGb ? { ramGb } : {}),
+  });
+  const cpu = (ramGb: number): RuntimeResource => ({ kind: "cpu", ramGb });
+  const req = (resource: RuntimeResource, pinned = true) =>
+    request({ resources: [resource], ...(pinned ? { nodeIds: ["strix"] } : {}) });
+  const planner = (nodes = [strix()], instances: PlacementInstance[] = []) =>
+    new PlacementPlanner(context({ nodes, instances, fabrics: [] }));
+  const claim = (vramGb: number, overrides: Partial<PlacementInstance> = {}): PlacementInstance =>
+    running("old", ["strix"], 0, {
+      ranks: [
+        {
+          nodeId: "strix",
+          port: 30000,
+          distPort: null,
+          claim: "HELD",
+          resources: { ...gpu(vramGb), gpus: ["amd:0"], unifiedGpus: ["amd:0"] },
+        },
+      ],
+      ...overrides,
+    });
+  function refused(result: PlacementResult) {
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected accelerator refusal");
+    expect(result.refusal.reason).toBe("not_enough_memory");
+    expect(result.refusal.message).toContain("Unified accelerator limit");
+    return result.refusal;
+  }
+
+  it("allows 100 GiB RAM claims, but refuses 70 GiB GPU VRAM in pinned and automatic previews", () => {
+    expect(planner().place(req(cpu(100))).ok).toBe(true);
+    refused(planner().place(req({ kind: "unified", memoryGb: 100 })));
+    for (const pinned of [true, false]) {
+      const result = refused(planner().place(req(gpu(70), pinned)));
+      expect(result.message).toContain("61.84 GiB usable, 61.84 GiB free");
+    }
+    // A refused preview leaves the pure planner's budgets untouched.
+    const p = planner();
+    refused(p.place(req(gpu(70))));
+    expect(p.place(req(gpu(61.84))).ok).toBe(true);
+  });
+
+  it("charges unified entries to the shared pool in previews, replay, restarts and stops", () => {
+    const unified = (memoryGb: number): RuntimeResource => ({ kind: "unified", memoryGb });
+    const p = planner();
+    expect(p.place(req(unified(40))).ok).toBe(true);
+    refused(p.place(req(gpu(30))));
+    expect(p.place(req(cpu(70))).ok).toBe(true);
+    for (const state of ["HELD", "HELD_UNKNOWN"] as const) {
+      const old = claim(40);
+      old.ranks = [{ ...old.ranks[0]!, resources: unified(40), claim: state }];
+      refused(
+        planner([strix()], [old]).place({ ...req(unified(30)), preempt: state === "HELD_UNKNOWN" }),
+      );
+      expect(
+        planner([strix()], [old]).place({
+          ...req(unified(60)),
+          restart: { instanceId: "old", ports: [30000], distPort: null },
+        }).ok,
+      ).toBe(true);
+      refused(
+        planner([strix()], [old]).place({
+          ...req(unified(70)),
+          restart: { instanceId: "old", ports: [30000], distPort: null },
+        }),
+      );
+      if (state === "HELD") {
+        expect(
+          ok(planner([strix()], [old]).place({ ...req(unified(60)), preempt: true })).stops,
+        ).toHaveLength(1);
+        old.running = false;
+        expect(ok(planner([strix()], [old]).place(req(unified(60)))).start.blockedBy).toContain(
+          "old",
+        );
+      }
+    }
+    expect(planner([{ ...strix(), unifiedAcceleratorGb: null }]).place(req(unified(100))).ok).toBe(
+      true,
+    );
+  });
+
+  it("charges unified reservations and overlaps their superseded claims independently", () => {
+    const n = { ...strix(), labels: ["apu"] };
+    const runner = node("runner");
+    const reserved = (memoryGb: number, restart = false): PlacementRequest => ({
+      ...request({ nodeIds: ["runner"], resources: [cpu(1)] }),
+      launch: {
+        ...request({ resources: [cpu(1)] }).launch,
+        reservations: [{ labels: ["apu"], resources: { kind: "unified", memoryGb } }],
+      },
+      ...(restart
+        ? {
+            restart: {
+              instanceId: "old",
+              ports: [30000],
+              distPort: null,
+              reservationNodeIds: ["strix"],
+            },
+          }
+        : {}),
+    });
+    const p = planner([n, runner]);
+    expect(ok(p.place(reserved(40))).start.reservations[0]?.memoryGb).toBe(40);
+    expect(refused(p.place(reserved(30))).reservation?.index).toBe(0);
+    const old = running("old", ["runner"], 1);
+    const reservation = {
+      nodeId: "strix",
+      port: 0,
+      distPort: null,
+      claim: "HELD" as const,
+      reservation: true,
+      resources: { kind: "unified", memoryGb: 40 },
+    };
+    old.ranks = [...old.ranks, reservation, { ...reservation, previous: true }];
+    expect(planner([n, runner], [old]).place(reserved(60, true)).ok).toBe(true);
+    refused(planner([n, runner], [old]).place(reserved(70, true)));
+    expect(planner([n, runner], [old]).place(req(gpu(21.84))).ok).toBe(true);
+  });
+
+  it("names only failed additional limits for RAM-bound GPU claims", () => {
+    for (const pinned of [true, false]) {
+      const result = planner([{ ...strix(), memoryGb: 10 }]).place(req(gpu(20), pinned));
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("expected RAM refusal");
+      expect(result.refusal.message).not.toContain("accelerator limit");
+      expect(result.refusal.message).not.toContain("RAM-only limit");
+      refused(planner([{ ...strix(), memoryGb: 10 }]).place(req(gpu(70), pinned)));
+    }
+    // The restart's 40 GiB is already held: its accelerator growth fits, only total RAM fails.
+    for (const pinned of [true, false]) {
+      const old = claim(40);
+      const heldRam = claim(0, { id: "host", runtimeId: "host" });
+      heldRam.ranks = [{ ...heldRam.ranks[0]!, port: 30001, resources: cpu(70) }];
+      const result = planner([strix()], [old, heldRam]).place({
+        ...req(gpu(60), pinned),
+        restart: { instanceId: "old", ports: [30000], distPort: null },
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("expected restart RAM refusal");
+      expect(result.refusal.message).not.toContain("accelerator limit");
+    }
+    const runner = node("runner");
+    const r = request({ nodeIds: ["runner"], resources: [cpu(1)] });
+    r.launch.reservations = [{ labels: ["apu"], resources: gpu(20) }];
+    const result = planner([{ ...strix(), memoryGb: 10, labels: ["apu"] }, runner]).place(r);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected reservation refusal");
+    expect(result.refusal.message).not.toContain("accelerator limit");
+  });
+
+  function uma96(declaredResources: unknown = null): PlacementNode {
+    // CLI fixture: MemTotal 32376932 KiB, 96 GiB carve-out, 15809 MiB GTT.
+    return placementNodeOf(
+      nodeRow({
+        id: "strix",
+        slug: "strix",
+        declaredResources,
+        nodeInfo: {
+          nodeKind: "unified",
+          memoryTotalMiB: 129922,
+          acceleratorMemoryMiB: 114113,
+          gpus: [{ vendor: "amd", index: 0, apu: true, vramTotalMiB: 98304 }],
+        },
+      }),
+      new Date(),
+      new Set(),
+    );
+  }
+
+  it("excludes the UMA96 carve-out from RAM-only claims while GPU allocations can use it", () => {
+    const n = uma96();
+    expect(n.memoryGb).toBe(124.88);
+    expect(n.ramOnlyGb).toBe(28.88);
+    for (const pinned of [true, false]) {
+      const result = planner([n]).place(req(cpu(100), pinned));
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("expected RAM-only refusal");
+      expect(result.refusal.message).toContain("RAM-only limit");
+      expect(result.refusal.message).not.toContain("accelerator limit");
+    }
+    expect(planner([n]).place(req(cpu(25))).ok).toBe(true);
+    for (const resource of [gpu(90), { kind: "unified", memoryGb: 90 } as const]) {
+      const p = planner([n]);
+      expect(p.place(req(resource)).ok).toBe(true);
+      expect(p.place(req(cpu(25))).ok).toBe(true); // R=25, G=90, total=115 <= 124.88.
+      expect(p.place(req(cpu(4))).ok).toBe(false); // R=29 > 28.88, total=119 still fits.
+      expect(planner([n]).place(req(gpu(90, 25))).ok).toBe(true);
+      expect(planner([n]).place(req(gpu(90, 29))).ok).toBe(false);
+    }
+    const p = planner([n]);
+    expect(p.place(req(cpu(25))).ok).toBe(true);
+    expect(p.place(req(gpu(100))).ok).toBe(false); // total=125 > 124.88, both sub-pools fit.
+  });
+
+  it("checks the RAM-only pool only for claims that use host RAM, even when it is over-committed", () => {
+    // 40 GiB of host RAM admitted before the carve-out grew: the RAM-only pool is 11.12 GiB over.
+    const held = claim(0, { id: "host", runtimeId: "host" });
+    held.ranks = [{ ...held.ranks[0]!, port: 30001, resources: cpu(40) }];
+    const unified = planner([uma96()], [held]).place(req({ kind: "unified", memoryGb: 20 }));
+    expect(unified.ok).toBe(true);
+    expect(planner([uma96()], [held]).place(req(gpu(20))).ok).toBe(true);
+    const host = planner([uma96()], [held]).place(req(cpu(1), true));
+    expect(host.ok).toBe(false);
+    if (host.ok) throw new Error("expected RAM-only refusal");
+    expect(host.refusal.message).toContain("RAM-only limit");
+    // A GPU-only start refused by total RAM does not blame the RAM-only pool.
+    const big = planner([uma96()], [held]).place(req({ kind: "unified", memoryGb: 90 }, true));
+    expect(big.ok).toBe(false);
+    if (big.ok) throw new Error("expected total RAM refusal");
+    expect(big.refusal.message).not.toContain("RAM-only limit");
+  });
+
+  it("keeps declarations authoritative and separates RAM reserves from GPU reserves", () => {
+    expect(uma96({ memoryGb: 120 }).ramOnlyGb).toBeNull();
+    expect(planner([uma96({ memoryGb: 120 })]).place(req(cpu(100))).ok).toBe(true);
+    const n = uma96({ reservedMemoryGb: 3, reservedVramGb: { "amd:0": 8 } });
+    expect(n.ramOnlyGb).toBe(25.88); // GPU reservation uses the carve-out, not host RAM.
+    expect(n.memoryGb).toBe(113.88);
+    expect(planner([n]).place(req(cpu(25))).ok).toBe(true);
+    expect(planner([n]).place(req(cpu(26))).ok).toBe(false);
+  });
+
+  it("overlaps RAM-only usage independently when restarting CPU memory as GPU memory", () => {
+    const old = claim(90);
+    old.ranks = [{ ...old.ranks[0]!, resources: gpu(90, 25) }];
+    const restart = { instanceId: "old", ports: [30000], distPort: null };
+    expect(planner([uma96()], [old]).place({ ...req(cpu(25)), restart }).ok).toBe(true);
+    expect(planner([uma96()], [old]).place({ ...req(cpu(29)), restart }).ok).toBe(false);
+    // Previous host memory stays held even when the current claim uses the carve-out.
+    old.ranks = [
+      { ...old.ranks[0]!, resources: { kind: "unified", memoryGb: 90 } },
+      { ...old.ranks[0]!, resources: cpu(25), previous: true },
+    ];
+    const p = planner([uma96()], [old]);
+    expect(p.place(req(cpu(3))).ok).toBe(true);
+    expect(p.place(req(cpu(1))).ok).toBe(false);
+    // Replacing GPU memory with host memory grows the host component, even if total RAM shrinks.
+    old.ranks = [{ ...old.ranks[0]!, resources: { kind: "unified", memoryGb: 90 } }];
+    expect(planner([uma96()], [old]).place({ ...req(cpu(29)), restart }).ok).toBe(false);
+  });
+
+  it("replays, frees, and reserves RAM-only usage, keeping unknown usage held", () => {
+    for (const state of ["HELD", "HELD_UNKNOWN"] as const) {
+      const old = claim(0);
+      old.ranks = [{ ...old.ranks[0]!, resources: cpu(25), claim: state }];
+      expect(planner([uma96()], [old]).place(req(cpu(5))).ok).toBe(false);
+      const result = planner([uma96()], [old]).place({ ...req(cpu(25)), preempt: true });
+      expect(result.ok).toBe(state === "HELD");
+      old.running = false;
+      expect(planner([uma96()], [old]).place(req(cpu(25))).ok).toBe(state === "HELD");
+    }
+    const runner = node("runner");
+    const r = request({ nodeIds: ["runner"], resources: [cpu(1)] });
+    r.launch.reservations = [{ labels: ["apu"], resources: cpu(25) }];
+    const p = planner([{ ...uma96(), labels: ["apu"] }, runner]);
+    expect(p.place(r).ok).toBe(true);
+    const miss = p.place(r);
+    expect(miss.ok).toBe(false);
+    if (miss.ok) throw new Error("expected reservation refusal");
+    expect(miss.refusal.message).toContain("RAM-only limit");
+  });
+
+  it("takes each admitted claim from the accelerator budget as well as RAM", () => {
+    const p = planner();
+    expect(p.place(req(gpu(40))).ok).toBe(true);
+    expect(refused(p.place(req(gpu(40)))).message).toContain("21.84 GiB free");
+    expect(p.place(req(gpu(21.84))).ok).toBe(true);
+    expect(p.place(req(cpu(50))).ok).toBe(true);
+    expect(p.place(req(cpu(10))).ok).toBe(false); // RAM is charged too.
+  });
+
+  it("shares one accelerator limit across multiple unified GPUs", () => {
+    const n = strix();
+    n.gpus = [...n.gpus, { key: "amd:1", vendor: "amd", vramGb: 0, unified: true }];
+    refused(planner([n]).place(req({ kind: "discrete", gpuCount: 2, vramGb: 40 })));
+    expect(planner([n]).place(req({ kind: "discrete", gpuCount: 2, vramGb: 30 })).ok).toBe(true);
+  });
+
+  it("subtracts unified GPU reservations from both budgets and OS headroom only from RAM", () => {
+    const n = strix({ reservedMemoryGb: 10, reservedVramGb: { "amd:0": 6 } });
+    expect(n.memoryGb).toBe(105.18);
+    expect(n.unifiedAcceleratorGb).toBeCloseTo(55.84);
+    refused(planner([n]).place(req(gpu(56))));
+    expect(planner([n]).place(req(gpu(55.84))).ok).toBe(true);
+    const zero = strix({ reservedVramGb: { "amd:0": 100 } });
+    expect(zero.unifiedAcceleratorGb).toBe(0);
+    refused(planner([zero]).place(req(gpu(1))));
+  });
+
+  it("can choose dedicated GPUs without consuming the unified accelerator pool", () => {
+    const n = strix();
+    n.gpus = [...n.gpus, { key: "amd:1", vendor: "amd", vramGb: 80, unified: false }];
+    const p = planner([n]);
+    const dedicated = ok(p.place(req(gpu(70))));
+    expect(dedicated.start.placements[0]?.resources.gpus).toEqual(["amd:1"]);
+    expect(p.place(req(gpu(60))).ok).toBe(true);
+    // Dedicated VRAM never consumed node RAM (only the unified claim's 60 GiB does).
+    expect(p.place(req(cpu(60))).ok).toBe(true);
+  });
+
+  it("uses effective declared accelerator memory and leaves unknown pools uncapped", () => {
+    const n = strix({ acceleratorMemoryGb: 80 });
+    expect(planner([n]).place(req(gpu(70))).ok).toBe(true);
+    expect(planner([{ ...strix(), unifiedAcceleratorGb: null }]).place(req(gpu(100))).ok).toBe(
+      true,
+    );
+  });
+
+  it("replays held and unknown claims, including old claims without recorded GPU keys", () => {
+    for (const resources of [
+      { ...gpu(40), gpus: ["amd:0"], unifiedGpus: ["amd:0"] },
+      gpu(40),
+      { ...gpu(40), gpus: ["amd:9"], unifiedGpus: ["amd:9"] },
+    ]) {
+      const held = claim(40);
+      held.ranks = [{ ...held.ranks[0]!, resources, claim: "HELD_UNKNOWN" }];
+      const p = planner([strix()], [held]);
+      refused(p.place(req(gpu(40))));
+      expect(p.place(req(cpu(70))).ok).toBe(true);
+      refused(p.place({ ...req(gpu(40)), preempt: true }));
+    }
+  });
+
+  it("overlaps restart VRAM independently of RAM, charging only growth", () => {
+    const old = claim(40);
+    const restart = { instanceId: "old", ports: [30000], distPort: null };
+    expect(planner([strix()], [old]).place({ ...req(gpu(40)), restart }).ok).toBe(true);
+    expect(planner([strix()], [old]).place({ ...req(gpu(60)), restart }).ok).toBe(true);
+    refused(planner([strix()], [old]).place({ ...req(gpu(70)), restart }));
+    // Exchanging CPU RAM for GPU VRAM has zero RAM growth, but still needs accelerator growth.
+    const ram = running("old", ["strix"], 0);
+    ram.ranks = [{ ...ram.ranks[0]!, resources: cpu(100) }];
+    refused(planner([strix()], [ram]).place({ ...req(gpu(70)), restart }));
+    // Current + previous overlap (40, not 80), separate instances still add.
+    old.ranks = [...old.ranks, { ...old.ranks[0]!, previous: true }];
+    expect(planner([strix()], [old]).place(req(gpu(21.84))).ok).toBe(true);
+    refused(planner([strix()], [old]).place(req(gpu(22))));
+  });
+
+  it("refuses a restart while its old claim exceeds the shrunk accelerator pool", () => {
+    const old = claim(70);
+    const result = planner([strix()], [old]).place({
+      ...req(gpu(60)),
+      restart: { instanceId: "old", ports: [30000], distPort: null },
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected overlap refusal");
+    expect(result.refusal.reason).toBe("restart_overlap_no_room");
+    expect(result.refusal.message).toContain("Unified accelerator limit");
+    expect(result.refusal.message.slice(0, 500)).toContain("61.84 GiB");
+  });
+
+  it("prefers the tighter accelerator fit when RAM budgets tie", () => {
+    const large = { ...strix(), id: "a", slug: "a", unifiedAcceleratorGb: 90 };
+    const small = { ...strix(), id: "z", slug: "z" };
+    expect(nodesOf(planner([large, small]).place(req(gpu(40), false)))).toEqual(["z"]);
+  });
+
+  it("enforces a restart's total VRAM growth even if it moves to another unified GPU", () => {
+    const n = strix();
+    n.gpus = [...n.gpus, { key: "amd:1", vendor: "amd", vramGb: 0, unified: true }];
+    const old = claim(40);
+    const restart = { instanceId: "old", ports: [30000], distPort: null };
+    expect(
+      planner([n], [old]).place({ ...req({ kind: "discrete", gpuCount: 2, vramGb: 30 }), restart })
+        .ok,
+    ).toBe(true);
+    refused(
+      planner([n], [old]).place({ ...req({ kind: "discrete", gpuCount: 2, vramGb: 32 }), restart }),
+    );
+  });
+
+  it("returns accelerator capacity on preemption and draining stops, but keeps unknown claims", () => {
+    const old = claim(40);
+    const p = planner([strix()], [old]);
+    const result = ok(p.place({ ...req(gpu(60)), preempt: true }));
+    expect(result.stops.map((stop) => stop.instanceId)).toEqual(["old"]);
+    const draining = claim(40, { running: false });
+    const queued = ok(planner([strix()], [draining]).place(req(gpu(60))));
+    expect(queued.warnings.map((warning) => warning.code)).toContain("waits_for_stop");
+  });
+
+  it("fits and takes accelerator capacity for reservations and names it in reservation refusals", () => {
+    const n = { ...strix(), labels: ["apu"] };
+    const runner = node("runner");
+    const reserved = (vram: number): PlacementRequest => {
+      const r = request({ nodeIds: ["runner"], resources: [cpu(1)] });
+      r.launch.reservations = [{ labels: ["apu"], resources: gpu(vram) }];
+      return r;
+    };
+    const p = planner([n, runner]);
+    const miss = refused(p.place(reserved(70)));
+    expect(miss.reservation?.index).toBe(0);
+    expect(miss.message).toContain("61.84 GiB");
+    expect(ok(p.place(reserved(40))).start.reservations).toHaveLength(1);
+    refused(p.place(reserved(40)));
+    const held = claim(40);
+    held.ranks = [{ ...held.ranks[0]!, reservation: true }];
+    refused(planner([n, runner], [held]).place(reserved(40)));
+  });
+
+  it("overlaps reservation restarts and replays superseded reservations against the pool", () => {
+    const n = { ...strix(), labels: ["apu"] };
+    const runner = node("runner");
+    const old = running("old", ["runner"], 1);
+    const reserved = {
+      nodeId: "strix",
+      port: 0,
+      distPort: null,
+      claim: "HELD" as const,
+      resources: { ...gpu(40), gpus: ["amd:0"], unifiedGpus: ["amd:0"] },
+      reservation: true,
+    };
+    old.ranks = [...old.ranks, reserved, { ...reserved, previous: true }];
+    const restart = (vramGb: number) => {
+      const r = request({
+        nodeIds: ["runner"],
+        resources: [cpu(1)],
+        restart: {
+          instanceId: "old",
+          ports: [30000],
+          distPort: null,
+          reservationNodeIds: ["strix"],
+        },
+      });
+      r.launch.reservations = [{ labels: ["apu"], resources: gpu(vramGb) }];
+      return r;
+    };
+    expect(planner([n, runner], [old]).place(restart(60)).ok).toBe(true);
+    expect(refused(planner([n, runner], [old]).place(restart(70))).reservation?.index).toBe(0);
+    expect(planner([n, runner], [old]).place(req(gpu(21.84))).ok).toBe(true);
+  });
+
+  it("keeps Apple GPU wired limits separate and GB10 constrained by OS headroom", () => {
+    const apple = { ...strix(), memoryGb: 126, unifiedAcceleratorGb: 96, ramOnlyGb: null };
+    expect(planner([apple]).place(req(cpu(110))).ok).toBe(true);
+    refused(planner([apple]).place(req(gpu(100))));
+    refused(planner([apple]).place(req({ kind: "unified", memoryGb: 100 })));
+    expect(planner([apple]).place(req({ kind: "unified", memoryGb: 96 })).ok).toBe(true);
+    expect(planner([apple]).place(req(gpu(96))).ok).toBe(true);
+    const gb10 = { ...strix(), memoryGb: 117.49, unifiedAcceleratorGb: 119.49, ramOnlyGb: null };
+    expect(planner([gb10]).place(req(gpu(117.49))).ok).toBe(true);
+    expect(planner([gb10]).place(req(gpu(118))).ok).toBe(false);
   });
 });

@@ -29,7 +29,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 vi.mock("@ws-model-proxy/db", () => ({ default: { mcpGrant: grants } }));
 
 import { requireMcpAuth } from "@better-auth/mcp";
-import { MCP_RESOURCE_SCOPES } from "../../../packages/auth/src/mcp-config";
+import { MCP_RESOURCE_SCOPES, MCP_SCOPES } from "../../../packages/auth/src/mcp-config";
 import { resolveMcpPlugins } from "../../../packages/auth/src/mcp-plugins";
 import { createMcpDiscoveryForwarder, MCP_WELL_KNOWN_PATHS } from "./mcp-discovery";
 
@@ -198,9 +198,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
       expect(doc.token_endpoint).toBe(`${ISSUER}/oauth2/token`);
       expect(doc.jwks_uri).toBe(`${ISSUER}/jwks`);
       expect(doc.revocation_endpoint).toBe(`${ISSUER}/oauth2/revoke`);
-      expect(doc.scopes_supported).toEqual(
-        expect.arrayContaining(["mcp:read", "mcp:write", "offline_access"]),
-      );
+      expect(doc.scopes_supported).toEqual([...MCP_SCOPES]);
       // CIMD and RFC 7591 DCR are both advertised.
       expect(doc.client_id_metadata_document_supported).toBe(true);
       expect(doc.registration_endpoint).toBe(`${ISSUER}/oauth2/register`);
@@ -246,9 +244,10 @@ describe("MCP discovery aliases against the real installed handler", () => {
       expect(doc.resource).toBe(CANONICAL);
       expect(doc.authorization_servers).toEqual([ISSUER]);
       expect(doc.bearer_methods_supported).toEqual(["header"]);
-      expect(doc.scopes_supported).toEqual(["mcp:read", "mcp:write"]);
-      // The /mcp WWW-Authenticate challenge names the same scopes (mcp/auth.ts).
-      expect(doc.scopes_supported).toEqual([...MCP_RESOURCE_SCOPES]);
+      // Discovery and challenges both advertise read plus every fine scope.
+      expect(doc.scopes_supported).toEqual(
+        MCP_SCOPES.filter((scope) => scope !== "offline_access"),
+      );
     });
 
     it("HEAD matches the GET status and content-type with an EMPTY body", async () => {
@@ -303,9 +302,8 @@ describe("MCP discovery aliases against the real installed handler", () => {
       redirect_uris: ["https://client.example.com/callback"],
     });
     expect(typeof registration.client_id).toBe("string");
-    expect(String(registration.scope).split(" ").sort()).toEqual(
-      ["mcp:read", "mcp:write", "offline_access"].sort(),
-    );
+    // No `scope` requested: the whole ceiling, in canonical order; consent still decides access.
+    expect(String(registration.scope).split(" ")).toEqual([...MCP_SCOPES]);
   });
 
   it("JWKS stays GET-only: HEAD /api/auth/jwks is NOT given a HEAD adapter (upstream 404)", async () => {
@@ -317,8 +315,8 @@ describe("MCP discovery aliases against the real installed handler", () => {
   });
 });
 
-describe("the /mcp challenge and the resource document name the same scopes", () => {
-  it("an unauthenticated request is told mcp:read and mcp:write (so consent can offer Full)", async () => {
+describe("the /mcp challenge advertises every real resource scope", () => {
+  it("an unauthenticated request is told every permission the person may approve", async () => {
     const auth = buildAuth();
     // The options mcp/auth.ts passes, through the REAL upstream challenge builder.
     const wrapped = requireMcpAuth(auth, async () => new Response("ok"), {
@@ -329,6 +327,8 @@ describe("the /mcp challenge and the resource document name the same scopes", ()
     });
     const res = await wrapped(new Request(CANONICAL, { method: "POST" }));
     expect(res.status).toBe(401);
-    expect(res.headers.get("www-authenticate") ?? "").toContain('scope="mcp:read mcp:write"');
+    expect(res.headers.get("www-authenticate") ?? "").toContain(
+      `scope="${MCP_RESOURCE_SCOPES.join(" ")}"`,
+    );
   });
 });

@@ -1,5 +1,6 @@
 import { embeddingContractsMatch } from "@ws-model-proxy/api/lib/embedding-contract";
 import { nodeIsLive } from "@ws-model-proxy/api/lib/node-liveness";
+import { type AgentAccess, agentNodeAllowed } from "@ws-model-proxy/auth/agent-scopes";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
@@ -30,6 +31,7 @@ export class LocalSendRefused extends Error {
 /** Snapshot of the EXACT destination used to construct the request body. */
 export type LocalSendBinding = {
   requesterUserId: string;
+  agentAccess?: AgentAccess;
   apiKeyId?: string | null;
   /** The owner of the served model (the pool owner, or a contributor). */
   engineOwnerUserId: string;
@@ -59,6 +61,13 @@ async function checkPermission(tx: Prisma.TransactionClient, input: LocalSendBin
     throw new LocalSendRefused(reason);
   };
   const pool = input.pool;
+  // Sharing a pool never delegates access to somebody else's node.
+  if (
+    input.agentAccess &&
+    (input.engineOwnerUserId !== input.requesterUserId ||
+      !agentNodeAllowed(input.agentAccess, input.nodeId))
+  )
+    deny("ACCESS_REVOKED");
   if (!input.executionTargetId || !input.capacityId || !input.nodeId || !input.engineOwnerUserId)
     deny("MEMBER_UNAVAILABLE");
   // All fences precede graph rows. Management writers cannot acquire a fence
@@ -178,6 +187,20 @@ async function checkPermission(tx: Prisma.TransactionClient, input: LocalSendBin
     node.userId !== input.engineOwnerUserId
   )
     deny("MEMBER_UNAVAILABLE");
+  if (input.agentAccess && target?.Instance) {
+    const access = input.agentAccess;
+    const ranks = await tx.instanceRank.findMany({
+      where: { instanceId: input.capacityId! },
+      select: { nodeId: true },
+    });
+    if (ranks.some((rank) => rank.nodeId === null)) deny("MEMBER_UNAVAILABLE");
+    const nodeIds = [...new Set([input.nodeId, ...ranks.flatMap((rank) => rank.nodeId ?? [])])];
+    if (nodeIds.some((id) => !agentNodeAllowed(access, id))) deny("ACCESS_REVOKED");
+    const ownedNodes = await tx.node.count({
+      where: { id: { in: nodeIds }, userId: input.requesterUserId },
+    });
+    if (ownedNodes !== nodeIds.length) deny("ACCESS_REVOKED");
+  }
   if (
     pool?.embeddingContract &&
     !embeddingContractsMatch(pool.embeddingContract, target!.RuntimeModel?.embeddingContract)

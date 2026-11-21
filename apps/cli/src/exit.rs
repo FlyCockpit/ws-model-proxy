@@ -14,7 +14,7 @@
 //!      or the server is too old). Re-run the server's `install.sh` (or upgrade
 //!      the server), then restart wsmp. The systemd unit lists this in
 //!      `RestartPreventExitStatus=` too and sets `WSMP_STOP_ON_PROTOCOL_MISMATCH`;
-//!      under an older unit without it, the relay retries every 5 minutes.
+//!      elsewhere, the relay retries every 5 minutes.
 //!  75  the relay installed an update and exits so its service manager starts
 //!      the new binary (`EX_TEMPFAIL`). systemd restarts it (`Restart=on-failure`;
 //!      75 is not in `RestartPreventExitStatus=`), launchd's `KeepAlive` does,

@@ -1,6 +1,5 @@
 {
   "custom": "Valor no válido.",
-  "invalidDate": "Ingresa una fecha válida.",
   "invalidElement": "Valor no válido.",
   "invalidEnum": "Debe ser uno de: {{options}}.",
   "invalidKey": "Clave no válida.",

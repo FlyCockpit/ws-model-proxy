@@ -190,3 +190,12 @@ describe("LocalMediaStore.getStream", () => {
     expect(await store.getStream("asset-dir")).toBeNull();
   });
 });
+
+describe("LocalMediaStore.delete", () => {
+  it("tolerates a missing object but propagates real unlink failures", async () => {
+    const store = new LocalMediaStore(root);
+    await expect(store.delete("missing")).resolves.toBeUndefined();
+    await mkdir(join(root, "objects", "as", "asset-directory"), { recursive: true });
+    await expect(store.delete("asset-directory")).rejects.toThrow();
+  });
+});

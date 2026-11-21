@@ -16,22 +16,22 @@ const METADATA = "https://proxy.example.com/.well-known/oauth-protected-resource
 describe("mcpInsufficientScopeResponse", () => {
   it("403 with the exact Bearer insufficient_scope challenge (error, scope, resource_metadata, error_description)", () => {
     const res = mcpInsufficientScopeResponse({
-      requiredScopes: ["mcp:write"],
+      requiredScopes: ["mcp:pools"],
       resourceUrl: RESOURCE,
-      description: "This action requires the mcp:write scope.",
+      description: "This action requires the mcp:pools scope.",
     });
     expect(res.status).toBe(403);
     expect(res.headers.get("content-type")).toBe("application/json");
     expect(res.headers.get("www-authenticate")).toBe(
-      `Bearer error="insufficient_scope", scope="mcp:write", ` +
+      `Bearer error="insufficient_scope", scope="mcp:pools", ` +
         `resource_metadata="${METADATA}", ` +
-        `error_description="This action requires the mcp:write scope."`,
+        `error_description="This action requires the mcp:pools scope."`,
     );
   });
 
   it("body is the authorization-layer JSON-RPC error grammar (code -32000, id null)", async () => {
     const res = mcpInsufficientScopeResponse({
-      requiredScopes: ["mcp:write"],
+      requiredScopes: ["mcp:pools"],
       resourceUrl: RESOURCE,
       description: "write scope missing",
     });
@@ -44,16 +44,16 @@ describe("mcpInsufficientScopeResponse", () => {
 
   it("deduplicates the required scopes into the challenge's scope attribute", () => {
     const res = mcpInsufficientScopeResponse({
-      requiredScopes: ["mcp:write", "mcp:write"],
+      requiredScopes: ["mcp:pools", "mcp:pools"],
       resourceUrl: RESOURCE,
       description: "write scope missing",
     });
-    expect(res.headers.get("www-authenticate")).toContain('scope="mcp:write"');
+    expect(res.headers.get("www-authenticate")).toContain('scope="mcp:pools"');
   });
 
   it("escapes quotes/backslashes in the description (quoted-string safe)", () => {
     const res = mcpInsufficientScopeResponse({
-      requiredScopes: ["mcp:write"],
+      requiredScopes: ["mcp:pools"],
       resourceUrl: RESOURCE,
       description: 'a "quoted \\ backslash" description',
     });
@@ -65,7 +65,7 @@ describe("mcpInsufficientScopeResponse", () => {
   it("truncates an over-long description to the 120-character bound", () => {
     const long = "x".repeat(300);
     const res = mcpInsufficientScopeResponse({
-      requiredScopes: ["mcp:write"],
+      requiredScopes: ["mcp:pools"],
       resourceUrl: RESOURCE,
       description: long,
     });
@@ -80,7 +80,7 @@ describe("mcpInsufficientScopeResponse", () => {
     // resource URL is normalized away, never doubled.
     expect(mcpResourceMetadataUrl(RESOURCE)).toBe(METADATA);
     const res = mcpInsufficientScopeResponse({
-      requiredScopes: ["mcp:write"],
+      requiredScopes: ["mcp:pools"],
       resourceUrl: "https://proxy.example.com/mcp/",
       description: "write scope missing",
     });

@@ -60,7 +60,7 @@ afterEach(() => {
 });
 
 const server: AgentUpdateOverview["server"] = {
-  version: "0.4.3",
+  version: "1.0.1",
   commit: "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   sourceBuild: false,
 };
@@ -71,7 +71,7 @@ function nodeView(overrides: Partial<NodeAgentUpdateView> = {}): NodeAgentUpdate
     nodeId: "node-1",
     slug: "spark-1",
     connection: "ONLINE",
-    version: "0.4.2",
+    version: "1.0.0",
     build: {
       commit: "2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       installMethod: "script",
@@ -104,7 +104,7 @@ describe("AgentUpdatePanel", () => {
   it("shows the version, build, Outdated and an Update button", () => {
     wrap(<AgentUpdatePanel server={server} view={nodeView()} />);
     expect(screen.getByText(`${K}.outdated`)).toBeTruthy();
-    expect(screen.getByText("0.4.2")).toBeTruthy();
+    expect(screen.getByText("1.0.0")).toBeTruthy();
     expect(screen.getByText("2222222")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: `${K}.update` }));
     return vi.waitFor(() => expect(startFn).toHaveBeenCalledWith({ nodeId: "node-1" }));
@@ -183,8 +183,8 @@ describe("AgentUpdatePanel", () => {
             phase: "rolled_back",
             reason: null,
             detail: "<b>panic</b> at definition sync",
-            fromVersion: "0.4.2",
-            toVersion: "0.4.3",
+            fromVersion: "1.0.0",
+            toVersion: "1.0.1",
             force: false,
             strategy: "self-replace",
             createdAt: "2026-10-28T10:00:00.000Z",
@@ -210,8 +210,8 @@ describe("AgentUpdatePanel", () => {
             phase: "downloading",
             reason: null,
             detail: null,
-            fromVersion: "0.4.2",
-            toVersion: "0.4.3",
+            fromVersion: "1.0.0",
+            toVersion: "1.0.1",
             force: false,
             strategy: "self-replace",
             createdAt: "2026-10-28T10:00:00.000Z",
@@ -231,15 +231,15 @@ describe("AgentUpdatePanel", () => {
       <AgentUpdatePanel
         server={server}
         view={nodeView({
-          version: "0.4.3",
+          version: "1.0.1",
           outdated: false,
           latest: {
             id: "u-1",
             phase: "restarting",
             reason: null,
             detail: null,
-            fromVersion: "0.4.2",
-            toVersion: "0.4.3",
+            fromVersion: "1.0.0",
+            toVersion: "1.0.1",
             force: false,
             strategy: "self-replace",
             createdAt: "2026-10-28T10:00:00.000Z",
@@ -259,8 +259,8 @@ describe("AgentUpdatePanel", () => {
       phase: "confirmed" as const,
       reason: null,
       detail: null,
-      fromVersion: "0.4.2",
-      toVersion: "0.4.3",
+      fromVersion: "1.0.0",
+      toVersion: "1.0.1",
       force: false,
       strategy: "self-replace",
       createdAt: "2026-10-28T10:00:00.000Z",
@@ -270,7 +270,7 @@ describe("AgentUpdatePanel", () => {
     const { unmount } = wrap(
       <AgentUpdatePanel
         server={server}
-        view={nodeView({ version: "0.4.3", outdated: false, latest: confirmed })}
+        view={nodeView({ version: "1.0.1", outdated: false, latest: confirmed })}
       />,
     );
     expect(screen.getByText(`${K}.confirmed`, { exact: false })).toBeTruthy();
@@ -292,8 +292,8 @@ describe("AgentUpdatePanel", () => {
             phase: "waiting_idle",
             reason: null,
             detail: null,
-            fromVersion: "0.4.2",
-            toVersion: "0.4.3",
+            fromVersion: "1.0.0",
+            toVersion: "1.0.1",
             force: false,
             strategy: "self-replace",
             createdAt: "2026-10-28T10:00:00.000Z",
@@ -320,7 +320,7 @@ describe("AgentUpdatePanel", () => {
             reason: "restarting",
             detail: null,
             fromVersion: null,
-            toVersion: "0.4.3",
+            toVersion: "1.0.1",
             force: false,
             strategy: "self-replace",
             createdAt: "2026-10-28T10:00:00.000Z",
@@ -338,9 +338,9 @@ describe("AgentUpdatePanel", () => {
       id: "u-1",
       phase: "refused",
       reason: "version_mismatch",
-      detail: "the Homebrew tap `flycockpit/tap` has wsmp 0.4.4, not 0.4.3",
-      fromVersion: "0.4.2",
-      toVersion: "0.4.3",
+      detail: "the Homebrew tap `flycockpit/tap` has wsmp 1.0.2, not 1.0.1",
+      fromVersion: "1.0.0",
+      toVersion: "1.0.1",
       force: false,
       strategy: "homebrew",
       createdAt: "2026-10-29T10:00:00.000Z",
@@ -394,10 +394,10 @@ describe("AgentUpdatePanel", () => {
     wrap(
       <AgentUpdatePanel
         server={server}
-        view={nodeView({ ...homebrew, availableVersion: "0.4.4", availableVersionAhead: true })}
+        view={nodeView({ ...homebrew, availableVersion: "1.0.2", availableVersionAhead: true })}
       />,
     );
-    const values = JSON.stringify({ version: "0.4.4", server: "0.4.3", slug: "spark-1" });
+    const values = JSON.stringify({ version: "1.0.2", server: "1.0.1", slug: "spark-1" });
     // The tap is ahead of the server: upgrading the server is the advice.
     expect(screen.getByText(`${K}.anyway.offer(${values})`)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: `${K}.anyway.button(${values})` }));
@@ -406,7 +406,7 @@ describe("AgentUpdatePanel", () => {
     expect(startFn).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: `${K}.anyway.confirm(${values})` }));
     await vi.waitFor(() =>
-      expect(startFn).toHaveBeenCalledWith({ nodeId: "node-1", version: "0.4.4" }),
+      expect(startFn).toHaveBeenCalledWith({ nodeId: "node-1", version: "1.0.2" }),
     );
   });
 
@@ -416,8 +416,8 @@ describe("AgentUpdatePanel", () => {
       phase: "failed",
       reason: "version_mismatch",
       detail: null,
-      fromVersion: "0.4.2",
-      toVersion: "0.4.3",
+      fromVersion: "1.0.0",
+      toVersion: "1.0.1",
       force: false,
       createdAt: "2026-10-29T10:00:00.000Z",
       updatedAt: "2026-10-29T10:00:05.000Z",
@@ -500,15 +500,15 @@ describe("AgentUpdatePanel", () => {
       version: "0.4.1",
       build: { commit: null, installMethod: "homebrew", target: "aarch64-apple-darwin" },
       selfUpdate: { strategies: ["homebrew"], instancesSurvive: false, remote: "allowed" },
-      availableVersion: "0.4.2",
+      availableVersion: "1.0.0",
       availableVersionAhead: false,
       latest: {
         id: "u-1",
         phase: "refused",
         reason: "version_mismatch",
-        detail: "the Homebrew tap `flycockpit/tap` has wsmp 0.4.2, not 0.4.3 yet",
+        detail: "the Homebrew tap `flycockpit/tap` has wsmp 1.0.0, not 1.0.1 yet",
         fromVersion: "0.4.1",
-        toVersion: "0.4.3",
+        toVersion: "1.0.1",
         force: false,
         strategy: "homebrew",
         createdAt: "2026-10-29T10:00:00.000Z",
@@ -517,7 +517,7 @@ describe("AgentUpdatePanel", () => {
       },
     } as unknown as Partial<NodeAgentUpdateView>;
     wrap(<AgentUpdatePanel server={server} view={nodeView(homebrew)} />);
-    const values = JSON.stringify({ version: "0.4.2", server: "0.4.3", slug: "spark-1" });
+    const values = JSON.stringify({ version: "1.0.0", server: "1.0.1", slug: "spark-1" });
     expect(screen.getByText(`${K}.anyway.offerBehind(${values})`)).toBeTruthy();
     expect(screen.queryByText(`${K}.anyway.offer(${values})`)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: `${K}.anyway.button(${values})` }));
@@ -531,7 +531,7 @@ describe("AgentUpdatePanel", () => {
       <AgentUpdatePanel
         server={server}
         view={nodeView({
-          version: "0.4.4",
+          version: "1.0.2",
           outdated: false,
           newerThanServer: true,
           canUpdate: false,

@@ -263,7 +263,7 @@ pub fn parse_intent(bytes: &[u8]) -> Result<Intent, String> {
         .get("version")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    if version != 2 && version != u64::from(INTENT_VERSION) {
+    if version != u64::from(INTENT_VERSION) {
         return Err(format!("INTENT version {version} is not supported"));
     }
     serde_json::from_value(value).map_err(|err| format!("INTENT is malformed: {err}"))
@@ -333,6 +333,21 @@ fn from_hex(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_current_journal_version_is_accepted() {
+        let current = Intent::delete(Path::new("/test"));
+        let mut value = serde_json::to_value(&current).expect("json");
+        assert!(parse_intent(&serde_json::to_vec(&value).expect("json")).is_ok());
+        for version in [0, 1, 2, 4] {
+            value["version"] = version.into();
+            assert!(
+                parse_intent(&serde_json::to_vec(&value).expect("json"))
+                    .expect_err("unsupported version")
+                    .contains("not supported")
+            );
+        }
+    }
 
     #[test]
     fn round_trips_non_utf8_path_bytes() {

@@ -14,13 +14,12 @@
 // win (dotenv default).
 // ---------------------------------------------------------------------------
 
-import { loadRootDotenv, warnIfStaleServerEnv } from "./root-dotenv.ts";
+import { loadRootDotenv } from "./root-dotenv.ts";
 
 export {
   findRepoRoot,
   loadRootDotenv,
   resolveRootEnvPath,
-  warnIfStaleServerEnv,
 } from "./root-dotenv.ts";
 
 // Hermetic subprocesses (notably protocol E2E tests) can opt out explicitly so
@@ -29,5 +28,4 @@ export {
 // configuration setting.
 if (process.env.WSMP_DISABLE_DOTENV !== "1") {
   loadRootDotenv();
-  warnIfStaleServerEnv();
 }

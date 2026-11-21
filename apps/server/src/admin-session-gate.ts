@@ -1,15 +1,15 @@
+import { checkAdminAuthority } from "@ws-model-proxy/api";
 import { auth, type Session } from "@ws-model-proxy/auth";
 import { cookieSessionHeaders } from "@ws-model-proxy/auth/cookie-session";
-import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
-import { isAdminRole } from "@ws-model-proxy/auth/roles";
 
 type AdminSessionGateResult =
   | { ok: true; session: Session }
   | { ok: false; status: 401 | 403; error: string; errorDescription: string };
 
 // This gate protects Better-Auth plugin endpoints whose request surface is
-// reached without any oRPC context, so it re-implements the same rule as the
-// oRPC `requireAdmin` middleware: verified email, admin role, and forced 2FA.
+// reached without any oRPC context. It applies the one registered rule,
+// `checkAdminAuthority` in `@ws-model-proxy/api` (the same parts `assertAccess`
+// checks for the admin levels): verified email, admin role, and forced 2FA.
 export async function requireVerifiedAdminSession(
   headers: Headers,
 ): Promise<AdminSessionGateResult> {
@@ -31,30 +31,16 @@ export async function requireVerifiedAdminSession(
     };
   }
 
-  if (!session.user.emailVerified) {
+  const authority = await checkAdminAuthority(session);
+  if (!authority.ok) {
     return {
       ok: false,
       status: 403,
       error: "access_denied",
-      errorDescription: "Verified admin access required",
-    };
-  }
-
-  if (!isAdminRole(session.user.role)) {
-    return {
-      ok: false,
-      status: 403,
-      error: "access_denied",
-      errorDescription: "Verified admin access required",
-    };
-  }
-
-  if ((await isForceTwoFactorRequired()) && !session.user.twoFactorEnabled) {
-    return {
-      ok: false,
-      status: 403,
-      error: "access_denied",
-      errorDescription: "Two-factor authentication setup is required",
+      errorDescription:
+        authority.reason === "two-factor"
+          ? "Two-factor authentication setup is required"
+          : "Verified admin access required",
     };
   }
 

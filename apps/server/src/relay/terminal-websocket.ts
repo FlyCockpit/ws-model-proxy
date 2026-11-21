@@ -1198,26 +1198,41 @@ export class TerminalBrowserHub {
 
   /**
    * The admission read again, for one open or attach: the session still exists, is the
-   * socket's and has not expired, and its owner is neither banned nor being deleted. Otherwise
-   * the socket closes (4401) and this answers false. A failed read closes the socket too
-   * (1011 `admission_failed`): like admission, it fails closed. The shells it viewed are only
-   * detached, and the browser reconnects.
+   * socket's and has not expired, its owner is neither banned nor being deleted, and the
+   * force-2FA policy does not apply to an unenrolled owner. Otherwise the socket closes (4401)
+   * and this answers false. A failed read, of the session or of the policy, closes the socket
+   * too (1011 `admission_failed`): like admission, it fails closed. The shells it viewed are
+   * only detached, and the browser reconnects.
    */
   private async credentialStillValid(conn: BrowserConn): Promise<boolean> {
     let row: {
       userId: string;
       expiresAt: Date;
-      user: { deletionRequestedAt: Date | null; banned: boolean | null; banExpires: Date | null };
+      user: {
+        twoFactorEnabled: boolean | null;
+        deletionRequestedAt: Date | null;
+        banned: boolean | null;
+        banExpires: Date | null;
+      };
     } | null;
+    let twoFactorRequired: boolean;
     try {
       row = await prisma.session.findUnique({
         where: { id: conn.sessionId },
         select: {
           userId: true,
           expiresAt: true,
-          user: { select: { deletionRequestedAt: true, banned: true, banExpires: true } },
+          user: {
+            select: {
+              twoFactorEnabled: true,
+              deletionRequestedAt: true,
+              banned: true,
+              banExpires: true,
+            },
+          },
         },
       });
+      twoFactorRequired = await isForceTwoFactorRequired();
     } catch (error) {
       console.error("[terminal] session re-read failed", errorKind(error));
       if (this.bySocket.get(conn.socket) === conn) this.refuse(conn, 1011, "admission_failed");
@@ -1231,6 +1246,10 @@ export class TerminalBrowserHub {
     }
     if (!row.user || userCredentialAccessBlocked(row.user, now)) {
       this.expire(conn, "user_deletion_pending");
+      return false;
+    }
+    if (twoFactorRequired && !row.user.twoFactorEnabled) {
+      this.expire(conn, "two_factor_required");
       return false;
     }
     return true;

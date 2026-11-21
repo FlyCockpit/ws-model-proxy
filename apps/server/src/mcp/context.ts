@@ -1,13 +1,14 @@
 import type { ContextServices, Context as ProductionContext } from "@ws-model-proxy/api/context";
 import type { CallerAuth } from "@ws-model-proxy/api/contracts";
 import type { Session } from "@ws-model-proxy/auth";
+import type { AgentAccess } from "@ws-model-proxy/auth/agent-scopes";
 
 /**
  * The oRPC context of one MCP request.
  *
  * MCP requests arrive with a verified agent credential (an agent token or an OAuth access
  * token), not a Better Auth cookie. Procedures check `context.auth` (who is calling, with the
- * credential's level) and read `context.session.user` (the live user row), so the MCP path
+ * credential's access) and read `context.session.user` (the live user row), so the MCP path
  * builds a synthetic session from the verified principal plus the full Prisma user row.
  *
  * SECURITY INVARIANT: the synthetic session never contains the presented credential (or any
@@ -23,22 +24,17 @@ export const MCP_SYNTHETIC_SESSION_TOKEN = "mcp-synthetic-session";
 /** The full live user row (never a projection). */
 export type McpSessionUser = Session["user"];
 
-/** An agent credential level: READ tokens see the read tools, FULL tokens all 28. */
-export type McpLevel = "READ" | "FULL";
-
 /** How a request was admitted (never inferred from a client id). */
 export type McpRequestCredential =
-  | { kind: "agent_token"; tokenId: string; level: McpLevel; expiresAt: Date | null }
   | {
-      kind: "oauth";
+      kind: "agent_token";
+      tokenId: string;
       grantId: string;
-      level: McpLevel;
-      /**
-       * `performance.now()` taken just before the grant (and so `level`) was read. A grant
-       * lowered after it may still have been read as FULL (mcp/tools.ts aborts its writes).
-       */
-      levelReadAt: number;
-    };
+      access: AgentAccess;
+      accessReadAt: number;
+      expiresAt: Date | null;
+    }
+  | { kind: "oauth"; grantId: string; access: AgentAccess; accessReadAt: number };
 
 /** The agent `CallerAuth` of a verified MCP credential. */
 export type McpCallerAuth = Extract<CallerAuth, { kind: "agent_token" | "oauth_access_token" }>;
@@ -76,8 +72,13 @@ export function createMcpSyntheticSession({
 /** The caller identity procedures see for a verified credential. */
 export function mcpCallerAuth(userId: string, credential: McpRequestCredential): McpCallerAuth {
   return credential.kind === "agent_token"
-    ? { kind: "agent_token", userId, agentTokenId: credential.tokenId, level: credential.level }
-    : { kind: "oauth_access_token", userId, grantId: credential.grantId, level: credential.level };
+    ? { kind: "agent_token", userId, agentTokenId: credential.tokenId, access: credential.access }
+    : {
+        kind: "oauth_access_token",
+        userId,
+        grantId: credential.grantId,
+        access: credential.access,
+      };
 }
 
 /** Build the oRPC context for one verified MCP request. */

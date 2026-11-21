@@ -1,5 +1,5 @@
 /**
- * The relay 3.0 codec around the frame contract (`./frames.ts`): parse node frames, encode
+ * The relay 4.0 codec around the frame contract (`./frames.ts`): parse node frames, encode
  * server frames, binary framing (4-byte metadata length + JSON metadata + body), the websocket
  * subprotocol, and parse-error descriptions that never echo a value.
  *
@@ -37,39 +37,19 @@ export {
   RELAY_SUBPROTOCOL,
   type RelayFailure,
 };
-/** Kept names for the model API (the 2.x types were `RelayClient/ServerControlMessage`). */
-export type RelayClientControlMessage = NodeToServerControlFrame;
-export type RelayServerControlMessage = ServerToNodeControlFrame;
 
 export type RelayProtocolErrorCode = (typeof RELAY_PROTOCOL_ERROR_CODES)[number];
 
-/** The one protocol this server speaks (3.0 is a clean bump: no capability flags). */
+/** The one protocol this server speaks. */
 export const RELAY_PROTOCOL_VERSIONS = [RELAY_PROTOCOL_VERSION] as const;
 
 export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires relay protocol ${RELAY_PROTOCOL_VERSION}. Upgrade wsmp and restart it.`;
 /**
- * A hello at this protocol that the schema rejects: before a release, the protocol number stays
- * put while the hello grows required fields, so an older wsmp of the same protocol lands here
- * (as does a newer build with fields this server does not know: the hello is strict).
+ * A hello may use the current protocol but differ from this build's strict schema. The coded
+ * refusal tells its operator to install the matching wsmp build.
  */
 export const RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE =
   "This wsmp build does not match the server: its hello was rejected. Re-run the server's install.sh to install the matching wsmp, then restart it.";
-/**
- * A hello without `features.selfUpdate`: a wsmp older than self-update (0.4.2 and earlier). It
- * is refused by capability, not by a protocol bump, so a wsmp that can update itself is never
- * turned away at hello: the server sends it the update instead (`apps/cli/docs/releasing.md`).
- */
-export const RELAY_SELF_UPDATE_REQUIRED_MESSAGE =
-  "This server needs a newer wsmp, one that can update itself. Re-run the server's install.sh (install.ps1 on Windows), or run `brew upgrade wsmp` if you installed it with Homebrew, then restart wsmp.";
-
-/** Whether a parsed hello may register: only a wsmp that can update itself is let in. */
-export function helloCanSelfUpdate(
-  hello: Extract<NodeToServerControlFrame, { type: "hello" }>,
-): boolean {
-  return Boolean(hello.features.selfUpdate);
-}
-export const RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE =
-  "This wsmp speaks a newer relay protocol than the server. Upgrade WS Model Proxy and restart wsmp.";
 
 /** 4-byte metadata length + 64 KiB metadata + 1 MiB body. Shared by both sockets. */
 export const RELAY_WS_MAX_PAYLOAD_BYTES =
@@ -145,13 +125,13 @@ function issuePaths(error: z.ZodError): string {
 
 /**
  * Encode one server frame. Throws {@link RelayProtocolError} (and sends nothing) when the
- * frame fails the 3.0 contract, is over 64 KiB, or holds text the node cannot read.
+ * frame fails the current contract, is over 64 KiB, or holds text the node cannot read.
  */
 export function encodeRelayServerControlMessage(frame: ServerToNodeControlFrame): string {
   const checked = serverToNodeControlFrameSchema.safeParse(frame);
   if (!checked.success) {
     throw new RelayProtocolError(
-      `${frame.type} fails the relay 3.0 contract at ${issuePaths(checked.error)}.`,
+      `${frame.type} fails the relay 4.0 contract at ${issuePaths(checked.error)}.`,
     );
   }
   const encoded = stringifyWellFormed(frame);
@@ -161,7 +141,7 @@ export function encodeRelayServerControlMessage(frame: ServerToNodeControlFrame)
   return encoded;
 }
 
-/** Parse one node control frame (size cap, JSON, strict 3.0 schema). */
+/** Parse one node control frame (size cap, JSON, strict 4.0 schema). */
 export function parseRelayClientControlFrame(frame: string): NodeToServerControlFrame {
   if (utf8Length(frame) > RELAY_JSON_CONTROL_MAX_BYTES) {
     throw new RelayProtocolError(OVERSIZE_MESSAGE);
@@ -171,8 +151,8 @@ export function parseRelayClientControlFrame(frame: string): NodeToServerControl
 }
 
 /**
- * True for a hello that is not 3.0 (an older or newer wsmp). Checked before the strict schema
- * so such a node gets a coded `protocol.error` it can print instead of "malformed message".
+ * A hello with a different protocol is checked before the strict schema, so the node receives
+ * a coded `protocol.error` instead of an opaque malformed-message error.
  */
 export function helloNeedsUpgrade(frame: string): boolean {
   if (utf8Length(frame) > RELAY_JSON_CONTROL_MAX_BYTES) return false;
@@ -212,8 +192,8 @@ function versionField(value: unknown, pattern: RegExp): string | null {
 }
 
 /**
- * The protocol and wsmp versions a refused hello claimed (2.x hellos carry `cli.version`, 3.0
- * ones `node.version`). Anything that is not a short version-shaped string is dropped.
+ * The protocol and wsmp versions a refused hello claimed. Values without a short version
+ * shape are dropped.
  */
 export function rejectedHelloFacts(frame: string): {
   protocolVersion: string | null;
@@ -229,13 +209,13 @@ export function rejectedHelloFacts(frame: string): {
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return none;
   const record = parsed as Record<string, unknown>;
-  const holder = [record.node, record.cli].find(
-    (value): value is Record<string, unknown> =>
-      value !== null && typeof value === "object" && !Array.isArray(value),
-  );
+  const holder = record.node;
   return {
     protocolVersion: versionField(record.protocolVersion, REJECTED_PROTOCOL_PATTERN),
-    cliVersion: holder ? versionField(holder.version, REJECTED_CLI_VERSION_PATTERN) : null,
+    cliVersion:
+      holder !== null && typeof holder === "object" && !Array.isArray(holder)
+        ? versionField((holder as Record<string, unknown>).version, REJECTED_CLI_VERSION_PATTERN)
+        : null,
   };
 }
 
@@ -293,7 +273,7 @@ export function encodeRelayBinaryFrame(
     throw new RelayProtocolError("Binary body chunk exceeds 1 MiB.");
   }
   if (!serverToNodeBinaryMetadataSchema.safeParse(metadata).success) {
-    throw new RelayProtocolError(`${metadata.type} metadata fails the relay 3.0 contract.`);
+    throw new RelayProtocolError(`${metadata.type} metadata fails the relay 4.0 contract.`);
   }
   if (metadata.type === "stt.audio" && !sttAudioBodyValid(body.byteLength)) {
     throw new RelayProtocolError(

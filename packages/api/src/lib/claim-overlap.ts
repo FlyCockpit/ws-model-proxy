@@ -7,7 +7,8 @@
  *
  * For one instance on one node, with `current` its current claims and `previous` the replaced
  * run's: memory = max(Σcurrent, Σprevious); GPUs = the union of their keys, each key's VRAM the
- * larger of the two sides; ports = the union (ports are not counted here: every claim's ports
+ * larger of the two sides; GPU-side and RAM-only memory each = max(Σcurrent, Σprevious),
+ * independent of total memory and per-GPU VRAM; ports = the union (not counted here: every claim's ports
  * stay taken). Different instances (and different nodes) always add.
  *
  * Pure. The placement planner (`placement.ts`) and the node views (`nodes/hardware.ts`) both
@@ -17,35 +18,53 @@
 /** What claims take on one node: memory (GiB; VRAM of a unified GPU included) and VRAM per GPU. */
 export type ClaimUsage = {
   memoryGb: number;
+  /** GPU-side memory: unified entries plus VRAM on unified GPUs; overlaps independently. */
+  sharedVramGb: number;
+  /** RAM-only usage: CPU memory and discrete claims’ host RAM, excluding GPU-side memory. */
+  ramOnlyGb: number;
   /** GiB of VRAM per dedicated GPU key (`vendor:index`). */
   gpus: ReadonlyMap<string, number>;
 };
 
-export const NO_USAGE: ClaimUsage = { memoryGb: 0, gpus: new Map() };
+export const NO_USAGE: ClaimUsage = { memoryGb: 0, sharedVramGb: 0, ramOnlyGb: 0, gpus: new Map() };
 
 /** Everything these claims take together (they all run at once). */
 export function sumUsage(usages: readonly ClaimUsage[]): ClaimUsage {
   let memoryGb = 0;
+  let sharedVramGb = 0;
+  let ramOnlyGb = 0;
   const gpus = new Map<string, number>();
   for (const usage of usages) {
     memoryGb += usage.memoryGb;
+    sharedVramGb += usage.sharedVramGb;
+    ramOnlyGb += usage.ramOnlyGb;
     for (const [key, gb] of usage.gpus) gpus.set(key, (gpus.get(key) ?? 0) + gb);
   }
-  return { memoryGb, gpus };
+  return { memoryGb, sharedVramGb, ramOnlyGb, gpus };
 }
 
 /** The larger of two usages, component by component (the union of their GPUs). */
 export function maxUsage(a: ClaimUsage, b: ClaimUsage): ClaimUsage {
   const gpus = new Map(a.gpus);
   for (const [key, gb] of b.gpus) gpus.set(key, Math.max(gpus.get(key) ?? 0, gb));
-  return { memoryGb: Math.max(a.memoryGb, b.memoryGb), gpus };
+  return {
+    memoryGb: Math.max(a.memoryGb, b.memoryGb),
+    sharedVramGb: Math.max(a.sharedVramGb, b.sharedVramGb),
+    ramOnlyGb: Math.max(a.ramOnlyGb, b.ramOnlyGb),
+    gpus,
+  };
 }
 
 /** `a - b`, component by component (`b`'s GPUs absent from `a` count as 0 there). */
 export function subtractUsage(a: ClaimUsage, b: ClaimUsage): ClaimUsage {
   const gpus = new Map(a.gpus);
   for (const [key, gb] of b.gpus) gpus.set(key, (gpus.get(key) ?? 0) - gb);
-  return { memoryGb: a.memoryGb - b.memoryGb, gpus };
+  return {
+    memoryGb: a.memoryGb - b.memoryGb,
+    sharedVramGb: a.sharedVramGb - b.sharedVramGb,
+    ramOnlyGb: a.ramOnlyGb - b.ramOnlyGb,
+    gpus,
+  };
 }
 
 /**
@@ -85,6 +104,8 @@ export function overlapMemoryGb(
   groups: ReadonlyArray<{ current: readonly number[]; previous: readonly number[] }>,
 ): number {
   const memory = (values: readonly number[]): ClaimUsage => ({
+    sharedVramGb: 0,
+    ramOnlyGb: 0,
     memoryGb: values.reduce((sum, value) => sum + value, 0),
     gpus: new Map(),
   });

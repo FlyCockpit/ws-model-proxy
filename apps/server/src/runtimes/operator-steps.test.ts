@@ -124,8 +124,8 @@ describe("runtime step services", () => {
     engine.cancelStep.mockResolvedValueOnce(undefined);
     expect(await services.cancel({ userId: "user-1", stepId: "step-1" })).toEqual({ ok: true });
     engine.cancelStep.mockRejectedValueOnce(new Error("database"));
-    await expect(services.cancel({ userId: "user-1", stepId: "step-1" })).rejects.toThrow(
-      "database",
-    );
+    await expect(services.cancel({ userId: "user-1", stepId: "step-1" })).rejects.toMatchObject({
+      message: "database",
+    });
   });
 });

@@ -38,7 +38,7 @@ function op(name: (typeof FILE_OPS)[number], extra: Record<string, unknown> = {}
   };
 }
 
-describe("relay 3.0 file frames", () => {
+describe("relay 4.0 file frames", () => {
   it.each(FILE_OPS)("file.op %s is strict at every level and carries no mode or grant", (name) => {
     expect(fileOpFrameSchema.parse(op(name))).toEqual(op(name));
     expect(fileOpFrameSchema.safeParse(op(name, { extra: 1 })).success).toBe(false);

@@ -387,3 +387,71 @@ describe("cloud members on the model API", () => {
     expect(db.$transaction).toHaveBeenCalled();
   });
 });
+
+describe("bounded external nonstream adaptation", () => {
+  it.each([false, true])(
+    "reads the provider stream directly with oversize=%s",
+    async (oversized) => {
+      resolve.listCallableTargetsForApiKey.mockResolvedValue({
+        pools: [{ ...OWNER_PAID_POOL, protocolAdaptationEnabled: true }],
+        tests: [],
+      });
+      const cancel = vi.fn();
+      let pulls = 0;
+      const chunk = new Uint8Array(1024 * 1024).fill(120);
+      const json = new TextEncoder().encode(
+        JSON.stringify({
+          id: "chat-1",
+          object: "chat.completion",
+          model: "openai/gpt-x",
+          choices: [
+            { index: 0, message: { role: "assistant", content: "hello" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      );
+      const providerResponse = new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            pulls++;
+            if (oversized) controller.enqueue(chunk);
+            else {
+              controller.enqueue(json);
+              controller.close();
+            }
+          },
+          cancel,
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+      const arrayBuffer = vi.spyOn(providerResponse, "arrayBuffer");
+      overflow.dispatchPublicOverflow.mockResolvedValue(dispatched(providerResponse));
+      const response = await app().request("/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_key_test",
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "owner/chat:external",
+          messages: [{ role: "user", content: "hello" }],
+          max_tokens: 20,
+        }),
+      });
+      expect(arrayBuffer).not.toHaveBeenCalled();
+      if (oversized) {
+        expect(response.status).toBeGreaterThanOrEqual(400);
+        expect(cancel).toHaveBeenCalledOnce();
+        expect(pulls).toBeLessThanOrEqual(34);
+      } else {
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({
+          type: "message",
+          content: [{ type: "text", text: "hello" }],
+        });
+      }
+      expect(overflow.dispatchPublicOverflow).toHaveBeenCalledOnce();
+    },
+  );
+});

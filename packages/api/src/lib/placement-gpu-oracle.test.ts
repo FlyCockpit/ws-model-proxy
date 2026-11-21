@@ -14,7 +14,9 @@ import {
 // placed fits.
 //
 // The model: node memory holds every claim's RAM plus the VRAM of each unified GPU it uses; a
-// dedicated GPU holds the VRAM of each claim on it. A restart's old and new claims overlap: on
+// dedicated GPU holds the VRAM of each claim on it. Finite shared accelerator pools hold
+// unified-GPU VRAM; finite RAM-only pools hold host RAM. Both pools may change after admission.
+// A restart's old and new claims overlap independently in all pools: on
 // every resource the instance takes the larger of the two. A claim fits when, with it placed, the
 // resources it is on are within their size: node memory (every claim is on it) and each GPU it
 // uses. Another claim's over-commit of a GPU it does not use is not its concern.
@@ -23,7 +25,15 @@ type Vendor = "nvidia" | "amd";
 type Gpu = { key: string; vendor: Vendor; vramGb: number; unified: boolean };
 type Claim = { ramGb: number; vramGb: number; keys: string[] };
 type Needs = { ramGb: number; gpuCount: number; vramGb: number; vendor: Vendor | null };
-type Case = { memoryGb: number; gpus: Gpu[]; claims: Claim[]; needs: Needs; restart: boolean };
+type Case = {
+  acceleratorGb: number | null;
+  ramOnlyGb: number | null;
+  memoryGb: number;
+  gpus: Gpu[];
+  claims: Claim[];
+  needs: Needs;
+  restart: boolean;
+};
 
 /** Deterministic: the same seed generates the same cases. */
 function random(seed: number) {
@@ -40,23 +50,32 @@ function random(seed: number) {
 }
 
 /** What each resource holds: node memory, and each dedicated GPU's VRAM. */
-type Usage = { memoryGb: number; gpus: Map<string, number> };
+type Usage = { sharedGb: number; ramOnlyGb: number; memoryGb: number; gpus: Map<string, number> };
 
 function usageOf(gpus: readonly Gpu[], claim: Claim): Usage {
-  const usage: Usage = { memoryGb: claim.ramGb, gpus: new Map() };
+  const usage: Usage = {
+    memoryGb: claim.ramGb,
+    sharedGb: 0,
+    ramOnlyGb: claim.ramGb,
+    gpus: new Map(),
+  };
   for (const key of claim.keys) {
     const gpu = gpus.find((candidate) => candidate.key === key);
     if (!gpu) continue;
-    if (gpu.unified) usage.memoryGb += claim.vramGb;
-    else usage.gpus.set(key, (usage.gpus.get(key) ?? 0) + claim.vramGb);
+    if (gpu.unified) {
+      usage.memoryGb += claim.vramGb;
+      usage.sharedGb += claim.vramGb;
+    } else usage.gpus.set(key, (usage.gpus.get(key) ?? 0) + claim.vramGb);
   }
   return usage;
 }
 
 function sum(usages: readonly Usage[]): Usage {
-  const total: Usage = { memoryGb: 0, gpus: new Map() };
+  const total: Usage = { memoryGb: 0, sharedGb: 0, ramOnlyGb: 0, gpus: new Map() };
   for (const usage of usages) {
     total.memoryGb += usage.memoryGb;
+    total.sharedGb += usage.sharedGb;
+    total.ramOnlyGb += usage.ramOnlyGb;
     for (const [key, gb] of usage.gpus) total.gpus.set(key, (total.gpus.get(key) ?? 0) + gb);
   }
   return total;
@@ -66,10 +85,23 @@ function sum(usages: readonly Usage[]): Usage {
 function overlap(a: Usage, b: Usage): Usage {
   const gpus = new Map(a.gpus);
   for (const [key, gb] of b.gpus) gpus.set(key, Math.max(gpus.get(key) ?? 0, gb));
-  return { memoryGb: Math.max(a.memoryGb, b.memoryGb), gpus };
+  return {
+    memoryGb: Math.max(a.memoryGb, b.memoryGb),
+    sharedGb: Math.max(a.sharedGb, b.sharedGb),
+    ramOnlyGb: Math.max(a.ramOnlyGb, b.ramOnlyGb),
+    gpus,
+  };
 }
 
-function fits(memoryGb: number, gpus: readonly Gpu[], usage: Usage): boolean {
+function fits(
+  memoryGb: number,
+  gpus: readonly Gpu[],
+  usage: Usage,
+  acceleratorGb: number | null,
+  ramOnlyGb: number | null,
+): boolean {
+  if (usage.sharedGb > (acceleratorGb ?? Infinity) + 1e-9) return false;
+  if (usage.ramOnlyGb > (ramOnlyGb ?? Infinity) + 1e-9) return false;
   if (usage.memoryGb > memoryGb + 1e-9) return false;
   for (const [key, gb] of usage.gpus) {
     const gpu = gpus.find((candidate) => candidate.key === key);
@@ -93,6 +125,11 @@ function withClaim(c: Case, added: Claim): Usage {
 function placementFits(c: Case, added: Claim): boolean {
   const after = withClaim(c, added);
   if (after.memoryGb > c.memoryGb + 1e-9) return false;
+  // Each sub-pool binds only a claim that uses it.
+  if (usageOf(c.gpus, added).ramOnlyGb > 0 && after.ramOnlyGb > (c.ramOnlyGb ?? Infinity) + 1e-9)
+    return false;
+  if (usageOf(c.gpus, added).sharedGb > 0 && after.sharedGb > (c.acceleratorGb ?? Infinity) + 1e-9)
+    return false;
   for (const key of added.keys) {
     const gpu = c.gpus.find((candidate) => candidate.key === key);
     if (!gpu) return false;
@@ -128,6 +165,8 @@ function oracleFits(c: Case): boolean {
 function generate(seed: number): Case | null {
   const r = random(seed);
   const memoryGb = r.pick([32, 48, 64, 96, 128]);
+  let acceleratorGb = r.chance(0.8) ? r.int(0, memoryGb) : null;
+  let ramOnlyGb = r.chance(0.8) ? r.int(0, memoryGb) : null;
   const vendors: Vendor[] = r.chance(0.5) ? ["nvidia"] : ["nvidia", "amd"];
   const counts = new Map<Vendor, number>();
   const gpus: Gpu[] = Array.from({ length: r.int(1, 4) }, () => {
@@ -157,7 +196,15 @@ function generate(seed: number): Case | null {
       keys,
     };
     // Only claims that fit together: a node nothing over-committed.
-    if (fits(memoryGb, gpus, sum([...claims, claim].map((one) => usageOf(gpus, one)))))
+    if (
+      fits(
+        memoryGb,
+        gpus,
+        sum([...claims, claim].map((one) => usageOf(gpus, one))),
+        acceleratorGb,
+        ramOnlyGb,
+      )
+    )
       claims.push(claim);
   }
   // Sometimes the node shrank since: its memory, or a dedicated GPU, below what its claims hold.
@@ -170,6 +217,8 @@ function generate(seed: number): Case | null {
       gpu.vramGb = Math.max(0, (used.gpus.get(gpu.key) ?? 0) - r.pick([2, 4, 8]));
     } else shrunkMemory = Math.max(0, used.memoryGb - r.pick([2, 4, 8]));
   }
+  if (r.chance(0.15)) acceleratorGb = r.int(0, memoryGb);
+  if (r.chance(0.15)) ramOnlyGb = r.int(0, memoryGb);
   const restart = claims.length > 0 && r.chance(0.4);
   const gpuCount = r.int(0, Math.min(3, gpus.length));
   const needs: Needs = {
@@ -179,7 +228,7 @@ function generate(seed: number): Case | null {
     vendor: gpuCount && r.chance(0.4) ? r.pick(vendors) : null,
   };
   if (gpuCount === 0 && needs.ramGb === 0) return null;
-  return { memoryGb: shrunkMemory, gpus, claims, needs, restart };
+  return { acceleratorGb, ramOnlyGb, memoryGb: shrunkMemory, gpus, claims, needs, restart };
 }
 
 function resourcesOf(claim: Claim, gpus: readonly Gpu[]) {
@@ -242,9 +291,15 @@ function plannerOf(c: Case, legacy: readonly boolean[] = [], admittedAs: readonl
     requiredVersionIds: new Set(),
     frozenFabrics: null,
     memoryGb: c.memoryGb,
+    unifiedAcceleratorGb: c.acceleratorGb,
+    ramOnlyGb: c.ramOnlyGb,
     gpus: c.gpus.map((gpu) => ({ ...gpu })),
     liveFreeMemoryGb: null,
-    launch: null,
+    launch: {
+      platform: "linux",
+      management: new Set(["process", "service"]),
+      shells: new Set(["sh"]),
+    },
   };
   const instances: PlacementInstance[] = c.claims.map((claim, index) => ({
     id: index === 0 && c.restart ? "target" : `c${index}`,
@@ -400,6 +455,8 @@ describe("GPU placement against a brute-force model", () => {
       const gpuCount = r.int(1, 2);
       const c: Case = {
         memoryGb: 128,
+        acceleratorGb: r.int(0, 128),
+        ramOnlyGb: r.int(0, 128),
         gpus,
         claims,
         needs: { ramGb: 0, gpuCount, vramGb: r.pick([4, 8, 12]), vendor: "nvidia" },

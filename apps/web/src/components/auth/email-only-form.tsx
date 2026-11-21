@@ -46,6 +46,7 @@ export function EmailOnlyForm({
           <div className="space-y-2">
             <Label htmlFor={field.name}>{t("auth:fields.email")}</Label>
             <Input
+              className="h-11 text-base md:h-8 md:text-xs"
               id={field.name}
               name={field.name}
               type="email"

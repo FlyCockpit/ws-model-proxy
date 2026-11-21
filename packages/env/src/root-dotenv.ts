@@ -53,20 +53,3 @@ export function loadRootDotenv(options?: { moduleDir?: string; cwd?: string }): 
   loadEnv({ path: rootEnvPath, quiet: true });
   return rootEnvPath;
 }
-
-/** Warn if a legacy per-app env file still exists under apps/server. */
-export function warnIfStaleServerEnv(options?: { moduleDir?: string; cwd?: string }): void {
-  const moduleDir = options?.moduleDir ?? import.meta.dirname;
-  const cwd = options?.cwd ?? process.cwd();
-  const repoRoot = findRepoRoot(moduleDir) ?? findRepoRoot(cwd);
-  if (!repoRoot) return;
-
-  const staleEnvPath = path.join(repoRoot, "apps/server/.env");
-  if (fs.existsSync(staleEnvPath)) {
-    console.warn(
-      "[env] Found apps/server/.env — this file is no longer read. " +
-        "The canonical .env location is the repository root. " +
-        "Move its contents to the root .env and delete apps/server/.env to silence this warning.",
-    );
-  }
-}

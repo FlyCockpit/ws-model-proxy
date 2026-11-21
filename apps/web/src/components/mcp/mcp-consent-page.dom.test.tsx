@@ -3,26 +3,43 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MCP_FINE_SCOPES } from "@ws-model-proxy/auth/agent-scopes";
 import { StrictMode } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-/**
- * Consent failure-state tests (Phase 6, Part H pass 2 — R83/R84 F4):
- * the "invalid" phase (consent API error, thrown failure, approval response
- * without a redirect) must render the LOCALIZED terminal invalid-request
- * card — the approval buttons may never reappear for a transaction that can
- * no longer be completed.
- */
+const FULL_OAUTH_SCOPE = `mcp:read ${MCP_FINE_SCOPES.join(" ")}`;
+
+/** Consent failures stay terminal; only signature/expiry errors use the invalid-request copy. */
 
 const consentMock = vi.hoisted(() => vi.fn());
 const publicClientMock = vi.hoisted(() => vi.fn());
+const connectionsMock = vi.hoisted(() => vi.fn());
 const assignMock = vi.hoisted(() => vi.fn());
+
+vi.mock("@/utils/orpc", () => ({
+  orpc: {
+    access: {
+      oauthGrants: {
+        list: { queryOptions: () => ({ queryKey: ["connections"], queryFn: connectionsMock }) },
+      },
+    },
+    nodes: {
+      list: {
+        queryOptions: () => ({
+          queryKey: ["nodes", "list"],
+          queryFn: async () => ({ nodes: [{ id: "own-node", slug: "my-node", name: null }] }),
+        }),
+      },
+    },
+  },
+}));
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
     t: (key: string, opts?: Record<string, unknown>) => {
       if (opts && typeof opts.client === "string") return `${key}:${opts.client}`;
       if (opts && typeof opts.scope === "string") return `${key}:${opts.scope}`;
+      if (opts && typeof opts.scopes === "string") return `${key}:${opts.scopes}`;
       return key;
     },
     i18n: { language: "en-US" },
@@ -36,6 +53,10 @@ vi.mock("@/lib/auth-client", () => ({
 }));
 
 import { McpConsentPage } from "./mcp-consent-page";
+
+beforeEach(() => {
+  connectionsMock.mockResolvedValue({ connections: [] });
+});
 
 const USABLE_SEARCH = {
   client_id: "mcp-client-1",
@@ -108,7 +129,7 @@ describe("McpConsentPage failure states (R83/R84 F4)", () => {
     expect(assignMock).not.toHaveBeenCalled();
   });
 
-  it("renders the terminal invalid card when the consent call throws", async () => {
+  it("renders a generic failure card when the consent call throws", async () => {
     publicClientMock.mockResolvedValue({
       data: { client_id: "mcp-client-1", client_name: "Client", client_uri: "https://c" },
       error: null,
@@ -123,12 +144,12 @@ describe("McpConsentPage failure states (R83/R84 F4)", () => {
     await user.click(screen.getByText("auth:mcpConsent.accept"));
 
     await waitFor(() => {
-      expect(screen.getByText("auth:mcpConsent.invalidTitle")).toBeTruthy();
+      expect(screen.getByText("auth:mcpConsent.failedTitle")).toBeTruthy();
     });
     expect(screen.queryByText("auth:mcpConsent.accept")).toBeNull();
   });
 
-  it("renders the terminal invalid card when an APPROVAL response carries no redirect", async () => {
+  it("renders a generic failure card when an APPROVAL response carries no redirect", async () => {
     publicClientMock.mockResolvedValue({
       data: { client_id: "mcp-client-1", client_name: "Client", client_uri: "https://c" },
       error: null,
@@ -145,7 +166,7 @@ describe("McpConsentPage failure states (R83/R84 F4)", () => {
     await user.click(screen.getByText("auth:mcpConsent.accept"));
 
     await waitFor(() => {
-      expect(screen.getByText("auth:mcpConsent.invalidTitle")).toBeTruthy();
+      expect(screen.getByText("auth:mcpConsent.failedTitle")).toBeTruthy();
     });
     expect(screen.queryByText("auth:mcpConsent.accept")).toBeNull();
     expect(assignMock).not.toHaveBeenCalled();
@@ -392,18 +413,18 @@ describe("McpConsentPage redirect host", () => {
   });
 });
 
-describe("McpConsentPage access level choice", () => {
+describe("McpConsentPage access choice", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
 
-  const WRITE_SEARCH = { client_id: "mcp-client-1", scope: "mcp:read mcp:write", sig: "sig-1" };
+  const FULL_SEARCH = { client_id: "mcp-client-1", scope: FULL_OAUTH_SCOPE, sig: "sig-1" };
 
   function approveResponds() {
     publicClientMock.mockResolvedValue({
-      data: { client_id: "mcp-client-1", client_name: "Client", client_uri: "https://c" },
+      data: { client_id: "mcp-client-1", client_name: "Client" },
       error: null,
     });
     consentMock.mockResolvedValue({
@@ -412,73 +433,336 @@ describe("McpConsentPage access level choice", () => {
     });
   }
 
-  it("offers Read-only or Full in the token dialog's words, starting at Read-only like the dialog", async () => {
+  it("starts with fixed read only even when all permissions were requested", async () => {
     approveResponds();
-    renderPage(WRITE_SEARCH);
-    await waitFor(() => {
-      expect(screen.getByText("access:agents.levelFull")).toBeTruthy();
-    });
-    expect(screen.getByText("access:agents.levelRead")).toBeTruthy();
-    expect(screen.getByText("access:agents.levelReadHint")).toBeTruthy();
-    expect(screen.queryByText("access:agents.levelFullHint")).toBeNull();
+    renderPage(FULL_SEARCH);
+    const read = await screen.findByRole("checkbox", { name: /access:agents.scopes.read.name/ });
+    expect(read.getAttribute("aria-checked")).toBe("true");
+    expect(read.getAttribute("aria-disabled")).toBe("true");
+    expect(
+      screen
+        .getByRole("checkbox", { name: /access:agents.scopes.files.name/ })
+        .getAttribute("aria-checked"),
+    ).toBe("false");
     await userEvent.setup().click(screen.getByText("auth:mcpConsent.accept"));
-    await waitFor(() => {
-      expect(consentMock).toHaveBeenCalledWith({ accept: true, level: "READ" });
-    });
+    await waitFor(() =>
+      expect(consentMock).toHaveBeenCalledWith({ accept: true, scopes: ["read"], nodeIds: null }),
+    );
   });
 
-  it("sends Full only when the person chooses it, and explains what Full allows", async () => {
+  it("Everything selects all seven scopes, with a chosen node allowlist", async () => {
     approveResponds();
-    renderPage(WRITE_SEARCH);
+    renderPage(FULL_SEARCH);
     const user = userEvent.setup();
-    await waitFor(() => {
-      expect(screen.getByText("access:agents.levelFull")).toBeTruthy();
-    });
-    await user.click(screen.getByText("access:agents.levelFull"));
-    expect(screen.getByText("access:agents.levelFullHint")).toBeTruthy();
+    await user.click(await screen.findByRole("button", { name: "access:agents.everything" }));
+    await user.click(screen.getByRole("radio", { name: "access:agents.onlyNodes" }));
+    await user.click(await screen.findByRole("checkbox", { name: "my-node" }));
     await user.click(screen.getByText("auth:mcpConsent.accept"));
-    await waitFor(() => {
-      expect(consentMock).toHaveBeenCalledWith({ accept: true, level: "FULL" });
-    });
+    await waitFor(() =>
+      expect(consentMock).toHaveBeenCalledWith({
+        accept: true,
+        scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+        nodeIds: ["own-node"],
+      }),
+    );
   });
 
-  it("ignores a level the client put in the authorization URL", async () => {
+  it("ignores access the client put in the authorization URL", async () => {
     approveResponds();
-    renderPage({ ...WRITE_SEARCH, level: "FULL" });
-    await waitFor(() => {
-      expect(screen.getByText("auth:mcpConsent.accept")).toBeTruthy();
+    renderPage({
+      ...FULL_SEARCH,
+      scopes: ["read", "files"],
+      nodeIds: ["own-node"],
+      level: "FULL",
     });
-    expect(screen.getByText("access:agents.levelReadHint")).toBeTruthy();
-    await userEvent.setup().click(screen.getByText("auth:mcpConsent.accept"));
-    await waitFor(() => {
-      expect(consentMock).toHaveBeenCalledWith({ accept: true, level: "READ" });
-    });
+    await userEvent.setup().click(await screen.findByText("auth:mcpConsent.accept"));
+    await waitFor(() =>
+      expect(consentMock).toHaveBeenCalledWith({ accept: true, scopes: ["read"], nodeIds: null }),
+    );
   });
 
-  it("offers no Full for a read-only request and approves it as Read-only", async () => {
+  it("offers only read for a read-only request", async () => {
     approveResponds();
-    renderPage(USABLE_SEARCH);
-    await waitFor(() => {
-      expect(screen.getByText("auth:mcpConsent.readOnlyRequested")).toBeTruthy();
-    });
-    expect(screen.queryByText("access:agents.levelFull")).toBeNull();
-    await userEvent.setup().click(screen.getByText("auth:mcpConsent.accept"));
-    await waitFor(() => {
-      expect(consentMock).toHaveBeenCalledWith({ accept: true, level: "READ" });
-    });
+    renderPage();
+    await screen.findByText("auth:mcpConsent.requestedCeiling:access:agents.scopes.read.name");
+    expect(screen.getAllByRole("checkbox")).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "access:agents.everything" })).toBeNull();
   });
 
-  it("a denial carries no level", async () => {
+  it("limits Everything and individual choices to a fine scope ceiling", async () => {
     approveResponds();
-    renderPage(WRITE_SEARCH);
+    renderPage({ ...FULL_SEARCH, scope: "mcp:read mcp:files mcp:models:test" });
     const user = userEvent.setup();
-    await waitFor(() => {
-      expect(screen.getByText("access:agents.levelFull")).toBeTruthy();
-    });
-    await user.click(screen.getByText("access:agents.levelFull"));
+    await user.click(await screen.findByRole("button", { name: "access:agents.everything" }));
+    expect(screen.getAllByRole("checkbox")).toHaveLength(3);
+    await user.click(screen.getByRole("radio", { name: "access:agents.onlyNodes" }));
+    await user.click(screen.getByText("auth:mcpConsent.accept"));
+    await waitFor(() =>
+      expect(consentMock).toHaveBeenCalledWith({
+        accept: true,
+        scopes: ["read", "files", "models:test"],
+        nodeIds: [],
+      }),
+    );
+  });
+
+  it("still explains offline access and unknown OAuth scopes alongside the chooser", async () => {
+    approveResponds();
+    renderPage({ ...FULL_SEARCH, scope: "mcp:read mcp:files offline_access custom:scope" });
+    await screen.findByText("auth:mcpConsent.scopes.offline_access.description");
+    expect(screen.getByText("auth:mcpConsent.scopes.additionalName:custom:scope")).toBeTruthy();
+    expect(screen.queryByText("auth:mcpConsent.scopes.additionalName:mcp:files")).toBeNull();
+  });
+
+  it("a denial carries no access", async () => {
+    approveResponds();
+    renderPage(FULL_SEARCH);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "access:agents.everything" }));
     await user.click(screen.getByText("auth:mcpConsent.deny"));
-    await waitFor(() => {
-      expect(consentMock).toHaveBeenCalledWith({ accept: false });
+    await waitFor(() => expect(consentMock).toHaveBeenCalledWith({ accept: false }));
+  });
+});
+
+describe("renewed consent", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  function saved(overrides: Record<string, unknown> = {}) {
+    return {
+      clientId: "mcp-client-1",
+      scopes: ["read", "files"],
+      nodeIds: ["own-node"],
+      availableScopes: ["read", "files", "commands"],
+      currentSession: true,
+      revokedAt: null,
+      ...overrides,
+    };
+  }
+  function setup(connections: ReturnType<typeof saved>[], scope = FULL_OAUTH_SCOPE) {
+    publicClientMock.mockResolvedValue({
+      data: { client_id: "mcp-client-1", client_name: "Client" },
+      error: null,
     });
+    consentMock.mockResolvedValue({
+      data: { redirect: true, url: "https://client.example/cb?code=x" },
+      error: null,
+    });
+    connectionsMock.mockResolvedValue({ connections });
+    return renderPage({ ...USABLE_SEARCH, scope });
+  }
+
+  it("preserves the active matching connection and its node restriction when approved unchanged", async () => {
+    setup([
+      saved({ clientId: "other-client", nodeIds: null }),
+      saved({ revokedAt: "2026-11-01T00:00:00.000Z", nodeIds: null }),
+      saved(),
+    ]);
+    expect(
+      (await screen.findByRole<HTMLInputElement>("radio", { name: "access:agents.onlyNodes" }))
+        .checked,
+    ).toBe(true);
+    expect(
+      (await screen.findByRole("checkbox", { name: "my-node" })).getAttribute("aria-checked"),
+    ).toBe("true");
+    expect(
+      screen
+        .getByRole("checkbox", { name: /access:agents.scopes.files.name/ })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
+    expect(screen.queryByText("auth:mcpConsent.narrowWarning")).toBeNull();
+    expect(screen.queryByText("auth:mcpConsent.widenNotice")).toBeNull();
+    await userEvent.setup().click(screen.getByText("auth:mcpConsent.accept"));
+    await waitFor(() =>
+      expect(consentMock).toHaveBeenCalledWith({
+        accept: true,
+        scopes: ["read", "files"],
+        nodeIds: ["own-node"],
+      }),
+    );
+  });
+
+  it("clips saved scopes to the request ceiling and warns about the resulting narrowing", async () => {
+    setup([saved({ scopes: ["read", "files", "commands"] })], "mcp:read mcp:files");
+    await screen.findByText("auth:mcpConsent.narrowWarning");
+    expect(
+      screen
+        .getByRole("checkbox", { name: /access:agents.scopes.files.name/ })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
+    expect(screen.queryByRole("checkbox", { name: /commands.name/ })).toBeNull();
+    expect(
+      screen.getByText(
+        "auth:mcpConsent.requestedCeiling:access:agents.scopes.read.name, access:agents.scopes.files.name",
+      ),
+    ).toBeTruthy();
+    await userEvent.setup().click(screen.getByText("auth:mcpConsent.accept"));
+    await waitFor(() =>
+      expect(consentMock).toHaveBeenCalledWith({
+        accept: true,
+        scopes: ["read", "files"],
+        nodeIds: ["own-node"],
+      }),
+    );
+  });
+
+  it.each(["scope", "all nodes", "added node"])("shows a widening notice for %s", async (kind) => {
+    setup([saved({ nodeIds: kind === "added node" ? [] : ["own-node"] })]);
+    const user = userEvent.setup();
+    await screen.findByText("auth:mcpConsent.accept");
+    if (kind === "scope")
+      await user.click(
+        screen.getByRole("checkbox", { name: /access:agents.scopes.commands.name/ }),
+      );
+    else if (kind === "all nodes")
+      await user.click(screen.getByRole("radio", { name: "access:agents.allNodes" }));
+    else await user.click(await screen.findByRole("checkbox", { name: "my-node" }));
+    expect(screen.getByRole("status").textContent).toBe("auth:mcpConsent.widenNotice");
+    expect(screen.queryByText("auth:mcpConsent.narrowWarning")).toBeNull();
+  });
+
+  it("shows the existing narrowing warning when the person removes a scope or node", async () => {
+    setup([saved()]);
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("checkbox", { name: /access:agents.scopes.files.name/ }),
+    );
+    expect(screen.getByRole("alert").textContent).toBe("auth:mcpConsent.narrowWarning");
+    await user.click(screen.getByRole("checkbox", { name: /access:agents.scopes.files.name/ }));
+    expect(screen.queryByRole("alert")).toBeNull();
+    await user.click(await screen.findByRole("checkbox", { name: "my-node" }));
+    expect(screen.getByRole("alert").textContent).toBe("auth:mcpConsent.narrowWarning");
+  });
+
+  it("ignores revoked connections, other clients and other sessions, preserving first-consent defaults", async () => {
+    setup([
+      saved({ revokedAt: "2026-11-01T00:00:00.000Z" }),
+      saved({ clientId: "other-client" }),
+      // Another browser session's connection: this approval writes a new one, not that one.
+      saved({ currentSession: false, scopes: ["read", "files", "commands"], nodeIds: null }),
+    ]);
+    await userEvent.setup().click(await screen.findByText("auth:mcpConsent.accept"));
+    await waitFor(() =>
+      expect(consentMock).toHaveBeenCalledWith({ accept: true, scopes: ["read"], nodeIds: null }),
+    );
+  });
+
+  it("waits for saved access rather than offering a default approval during loading", async () => {
+    publicClientMock.mockResolvedValue({
+      data: { client_id: "mcp-client-1", client_name: "Client" },
+      error: null,
+    });
+    let release: (value: unknown) => void = () => {};
+    connectionsMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    renderPage({ ...USABLE_SEARCH, scope: FULL_OAUTH_SCOPE });
+    await act(async () => {});
+    expect(screen.queryByText("auth:mcpConsent.accept")).toBeNull();
+    await act(async () => {
+      release({ connections: [saved()] });
+    });
+    expect(await screen.findByRole("radio", { name: "access:agents.onlyNodes" })).toBeTruthy();
+  });
+
+  it("waits for a fresh connection lookup even when Access left cached defaults", async () => {
+    publicClientMock.mockResolvedValue({
+      data: { client_id: "mcp-client-1", client_name: "Client" },
+      error: null,
+    });
+    let release: (value: unknown) => void = () => {};
+    connectionsMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["connections"], { connections: [] });
+    vi.stubGlobal("location", { assign: assignMock, search: SIGNED_RAW_SEARCH });
+    render(
+      <QueryClientProvider client={client}>
+        <McpConsentPage search={{ ...USABLE_SEARCH, scope: FULL_OAUTH_SCOPE }} />
+      </QueryClientProvider>,
+    );
+    await act(async () => {});
+    expect(screen.queryByText("auth:mcpConsent.accept")).toBeNull();
+    await act(async () => {
+      release({ connections: [saved()] });
+    });
+    expect(
+      (await screen.findByRole<HTMLInputElement>("radio", { name: "access:agents.onlyNodes" }))
+        .checked,
+    ).toBe(true);
+  });
+
+  it("keeps the chooser stable when saved access is refreshed in the background", async () => {
+    const { client } = setup([saved()]);
+    await screen.findByRole("checkbox", { name: "my-node" });
+    await act(async () => {
+      client.setQueryData(["connections"], {
+        connections: [saved({ scopes: ["read"], nodeIds: null })],
+      });
+    });
+    expect(
+      screen.getByRole<HTMLInputElement>("radio", { name: "access:agents.onlyNodes" }).checked,
+    ).toBe(true);
+    expect(
+      screen
+        .getByRole("checkbox", { name: /access:agents.scopes.files.name/ })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
+  });
+
+  it("shows both notices when adding a scope while removing a node", async () => {
+    setup([saved()]);
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("checkbox", { name: /access:agents.scopes.commands.name/ }),
+    );
+    await user.click(await screen.findByRole("checkbox", { name: "my-node" }));
+    expect(screen.getByRole("alert").textContent).toBe("auth:mcpConsent.narrowWarning");
+    expect(screen.getByRole("status").textContent).toBe("auth:mcpConsent.widenNotice");
+  });
+
+  it("blocks approval when saved access cannot be loaded", async () => {
+    publicClientMock.mockResolvedValue({
+      data: { client_id: "mcp-client-1", client_name: "Client" },
+      error: null,
+    });
+    connectionsMock.mockRejectedValue(new Error("network"));
+    renderPage();
+    await screen.findByText("auth:mcpConsent.connectionsFailed");
+    expect(screen.queryByText("auth:mcpConsent.accept")).toBeNull();
+  });
+
+  it.each([
+    { code: "BAD_REQUEST", status: 400 },
+    { error: "invalid_scope" },
+    { error: "server_error", status: 500 },
+  ])("does not call an ordinary consent failure an expired signature: %j", async (error) => {
+    setup([]);
+    consentMock.mockResolvedValue({ data: null, error });
+    await userEvent.setup().click(await screen.findByText("auth:mcpConsent.accept"));
+    await screen.findByText("auth:mcpConsent.failedDescription");
+    expect(screen.queryByText("auth:mcpConsent.invalidDescription")).toBeNull();
+    expect(assignMock).not.toHaveBeenCalled();
+  });
+
+  it("recognizes the provider's error field for signature or expiry rejection", async () => {
+    setup([]);
+    consentMock.mockResolvedValue({
+      data: null,
+      error: { error: "invalid_signature", status: 400 },
+    });
+    await userEvent.setup().click(await screen.findByText("auth:mcpConsent.accept"));
+    await screen.findByText("auth:mcpConsent.invalidDescription");
+    expect(screen.queryByText("auth:mcpConsent.failedDescription")).toBeNull();
   });
 });

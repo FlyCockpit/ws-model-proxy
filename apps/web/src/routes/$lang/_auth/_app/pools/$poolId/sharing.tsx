@@ -61,7 +61,7 @@ function PoolSharingPage() {
   });
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      <PageHeading page="poolSharing" />
+      <PageHeading page="poolSharing" level={2} />
       {pool.isPending ? (
         <SharingSkeleton />
       ) : pool.isError ? (

@@ -17,7 +17,7 @@ export function createFixturePrismaClient(databaseUrl: string) {
   const url = new URL(databaseUrl);
   const existing = url.searchParams.get("options");
   url.searchParams.set("options", `${existing ? `${existing} ` : ""}-c wsmp.fences=,*,`);
-  // URLSearchParams writes spaces as "+"; spell them %20 (see push-schema.mjs).
+  // URLSearchParams writes spaces as "+"; spell them %20 so no parser reads a literal plus.
   url.search = url.searchParams.toString().replace(/\+/g, "%20");
   return createPrismaClient(url.toString());
 }

@@ -28,6 +28,7 @@ import { useTranslation } from "react-i18next";
 import { CodeSnippet } from "@/components/code-snippet";
 import { InlineRetry } from "@/components/inline-retry";
 import { LiveUpdatesNotice } from "@/components/live-updates-notice";
+import { refusalMessage } from "@/components/nodes/refusal";
 import { PageHeading } from "@/components/page-stub";
 import { OperatorStepItem } from "@/components/runtimes/operator-step-item";
 import { TerminalNodeRow } from "@/components/terminal-node-row";
@@ -86,6 +87,7 @@ const KNOWN_REJECTIONS: ReadonlySet<string> = new Set([
   "invalid",
   "ticket_invalid",
   "bad_handshake",
+  "bad_cwd",
   "step_detached",
   "browser_identity_unavailable",
 ]);
@@ -196,12 +198,21 @@ function TerminalWorkspace({
   const active = tabs.find((tab) => tab.localId === activeLocalId) ?? null;
   const [announcement, setAnnouncement] = useState("");
   const tabName = (tab: TerminalTab) => slugOf(tab.cliDeviceId) ?? t("terminals:unknownNode");
+  // A tab still opening has no terminal id, so it has no place in the saved order to move to.
+  const canMove = (tab: TerminalTab) => layout.ready && tab.terminalId !== null && tabs.length > 1;
   const moveTab = (from: number, to: number) => {
     const moved = tabs[from];
-    if (!moved || to < 0 || to >= tabs.length || to === from) return;
-    layout.saveTabOrder(moveItem(tabs, from, to).map((tab) => tab.terminalId));
+    if (!moved || !canMove(moved) || to < 0 || to >= tabs.length || to === from) return;
+    const saved = layout.saveTabOrder(moveItem(tabs, from, to).map((tab) => tab.terminalId));
+    if (!saved) return;
+    // Announce where the tab now shows: tabs still opening stay after the saved ones.
+    const position = applySavedOrder(sessions.tabs, (tab) => tab.terminalId, saved).indexOf(moved);
     setAnnouncement(
-      t("terminals:order.moved", { name: tabName(moved), position: to + 1, count: tabs.length }),
+      t("terminals:order.moved", {
+        name: tabName(moved),
+        position: position + 1,
+        count: tabs.length,
+      }),
     );
   };
   const reorder = usePointerReorder({ axis: "x", onMove: moveTab });
@@ -215,6 +226,7 @@ function TerminalWorkspace({
     const current = tabs[index];
     if (
       current &&
+      canMove(current) &&
       event.altKey &&
       event.shiftKey &&
       (event.key === "ArrowLeft" || event.key === "ArrowRight")
@@ -273,7 +285,7 @@ function TerminalWorkspace({
                   <Button
                     key={tab.localId}
                     ref={reorder.itemRef(index)}
-                    {...reorder.handleProps(index)}
+                    {...(canMove(tab) ? reorder.handleProps(index) : {})}
                     id={tabIdOf(tab.localId)}
                     type="button"
                     role="tab"
@@ -282,8 +294,10 @@ function TerminalWorkspace({
                     tabIndex={tab.localId === activeLocalId ? 0 : -1}
                     variant={tab.localId === activeLocalId ? "secondary" : "ghost"}
                     size="touch"
-                    aria-keyshortcuts="Alt+Shift+ArrowLeft Alt+Shift+ArrowRight"
-                    title={tabs.length > 1 ? t("terminals:order.moveTabHint") : undefined}
+                    aria-keyshortcuts={
+                      canMove(tab) ? "Alt+Shift+ArrowLeft Alt+Shift+ArrowRight" : undefined
+                    }
+                    title={canMove(tab) ? t("terminals:order.moveTabHint") : undefined}
                     className={cn(
                       "shrink-0 select-none font-mono [-webkit-touch-callout:none]",
                       reorder.drag?.from === index && "opacity-50",
@@ -622,7 +636,7 @@ function TerminalNodes({ ready, openTerminal }: { ready: boolean; openTerminal: 
   const moveNode = (from: number, to: number) => {
     const moved = list[from];
     if (!moved || to < 0 || to >= list.length || to === from) return;
-    layout.saveNodeOrder(moveItem(list, from, to).map((node) => node.id));
+    if (!layout.saveNodeOrder(moveItem(list, from, to).map((node) => node.id))) return;
     setAnnouncement(
       t("terminals:order.moved", {
         name: moved.name ?? moved.slug,
@@ -663,7 +677,7 @@ function TerminalNodes({ ready, openTerminal }: { ready: boolean; openTerminal: 
                 key={node.id}
                 node={node}
                 reorder={
-                  list.length > 1
+                  list.length > 1 && layout.ready
                     ? {
                         rowRef: reorder.itemRef(index),
                         handleId: nodeHandleIdOf(node.id),
@@ -870,7 +884,7 @@ function QueuedCommands({
   openTerminal: OpenTerminal;
   slugOf: (nodeId: string) => string | undefined;
 }) {
-  const { t } = useTranslation(["terminals"]);
+  const { t } = useTranslation(["terminals", "dashboard"]);
   const queryClient = useQueryClient();
   const queued = useQuery(orpc.nodes.queued.list.queryOptions({ input: { state: "QUEUED" } }));
   // Recently closed ones with how they ended (decided rows are deleted after 7 days; the list
@@ -901,7 +915,7 @@ function QueuedCommands({
         if (typed) toast.info(t("terminals:typedCommandHint"));
         else toast.warning(t("terminals:typedCommandNotTyped"));
       },
-      onError: (error) => toast.error(refusalText(error)),
+      onError: (error) => toast.error(refusalMessage(t, error)),
       onSettled: invalidate,
     }),
   );

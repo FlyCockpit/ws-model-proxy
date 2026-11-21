@@ -9,6 +9,9 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   env: { BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!" },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: {} }));
+vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
+  isForceTwoFactorRequired: vi.fn(async () => false),
+}));
 
 const {
   createMediaConfigHandler,
@@ -29,7 +32,8 @@ const NOW = 1_700_000_000_000;
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x11, 0x22, 0x33, 0x44]);
 
 function fakePrisma() {
-  return {
+  const prisma = {
+    $transaction: vi.fn(),
     appSetting: {
       findUnique: vi.fn().mockResolvedValue(null),
     },
@@ -40,11 +44,15 @@ function fakePrisma() {
       create: vi.fn(),
       update: vi.fn(),
       delete: vi.fn(),
-      deleteMany: vi.fn(),
+      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
       aggregate: vi.fn().mockResolvedValue({ _sum: { sizeBytes: 0 } }),
       count: vi.fn(),
     },
   };
+  prisma.$transaction.mockImplementation(async (run: (tx: typeof prisma) => Promise<unknown>) =>
+    run(prisma),
+  );
+  return prisma;
 }
 
 type SessionApp = Hono<{ Variables: { session: unknown } }>;
@@ -352,7 +360,9 @@ describe("GET /media/:id (signed fetch)", () => {
     const res = await app.request(path);
 
     expect(res.status).toBe(404);
-    expect(prisma.mediaAsset.delete).toHaveBeenCalledWith({ where: { id: "asset-exp" } });
+    expect(prisma.mediaAsset.deleteMany).toHaveBeenCalledWith({
+      where: { id: "asset-exp", expiresAt: { lte: new Date(NOW) } },
+    });
     // The bytes were removed too.
     expect(await new LocalMediaStore(root).getStream("asset-exp")).toBeNull();
   });
@@ -578,7 +588,7 @@ describe("POST /api/internal/media/admin/purge-expired", () => {
     prisma.mediaAsset.findMany
       .mockResolvedValueOnce([{ id: "old-1" }, { id: "old-2" }])
       .mockResolvedValueOnce([]);
-    prisma.mediaAsset.deleteMany.mockResolvedValue({ count: 2 });
+    prisma.mediaAsset.deleteMany.mockResolvedValue({ count: 1 });
 
     const app = withSession(new Hono<{ Variables: { session: unknown } }>(), "admin-1");
     app.post(
@@ -593,7 +603,7 @@ describe("POST /api/internal/media/admin/purge-expired", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ removed: 2 });
     expect(prisma.mediaAsset.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { expiresAt: { lte: new Date(NOW) } } }),
+      expect.objectContaining({ where: { expiresAt: { lte: new Date(NOW) }, id: { notIn: [] } } }),
     );
   });
 
@@ -643,5 +653,122 @@ describe("POST /api/internal/media/admin/delete-all", () => {
     const res = await app.request("/api/internal/media/admin/delete-all", { method: "POST" });
     expect(res.status).toBe(501);
     expect(prisma.mediaAsset.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("media forced 2FA", () => {
+  const handlers = [
+    ["upload", "/api/internal/media", createMediaUploadHandler],
+    ["sign", "/api/internal/media/sign", createMediaSignHandler],
+  ] as const;
+
+  it.each(handlers)(
+    "blocks %s before config, body parsing, or database work",
+    async (_name, path, handler) => {
+      const getConfig = vi.fn(() => config);
+      const prisma = fakePrisma();
+      const app = withSession(new Hono<{ Variables: { session: unknown } }>(), "user-1");
+      app.post(
+        path,
+        handler({ getConfig, prisma: prisma as never, twoFactorRequired: async () => true }),
+      );
+      const response = await app.request(path, { method: "POST", body: "malformed" });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({
+        error: {
+          message: "Two-factor authentication setup is required.",
+          type: "invalid_request_error",
+          param: null,
+          code: "two_factor_required",
+        },
+      });
+      expect(getConfig).not.toHaveBeenCalled();
+      expect(prisma.mediaAsset.findMany).not.toHaveBeenCalled();
+      expect(prisma.mediaAsset.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(handlers)(
+    "allows enrolled sessions through the %s gate",
+    async (_name, path, handler) => {
+      const app = new Hono<{ Variables: { session: unknown } }>();
+      app.use("*", async (c, next) => {
+        c.set("session", { user: { id: "user-1", twoFactorEnabled: true } });
+        await next();
+      });
+      app.post(path, handler({ getConfig: () => config, twoFactorRequired: async () => true }));
+      const response = await app.request(path, { method: "POST", body: "malformed" });
+      expect(response.status).toBe(400);
+    },
+  );
+});
+
+describe("lazy media expiry races and failures", () => {
+  it("keeps a refreshed asset's bytes when the conditional deletion matches nothing", async () => {
+    const store = new LocalMediaStore(root);
+    const staged = await store.stage(Readable.from([PNG]));
+    await staged.commit("refreshed");
+    const prisma = fakePrisma();
+    prisma.mediaAsset.findUnique.mockResolvedValue({
+      mime: "image/png",
+      expiresAt: new Date(NOW - 1),
+    });
+    prisma.mediaAsset.deleteMany.mockResolvedValue({ count: 0 });
+    const app = new Hono();
+    app.get(
+      "/media/:id",
+      createMediaGetHandler({
+        getConfig: () => config,
+        prisma: prisma as never,
+        now: () => NOW,
+      }),
+    );
+    const signed = new URL(
+      buildSignedMediaUrl({ id: "refreshed", publicBaseUrl: config.publicBaseUrl, now: NOW }).url,
+    );
+    const response = await app.request(signed.pathname + signed.search);
+    expect(response.status).toBe(404);
+    expect(prisma.mediaAsset.deleteMany).toHaveBeenCalledWith({
+      where: { id: "refreshed", expiresAt: { lte: new Date(NOW) } },
+    });
+    const object = await store.getStream("refreshed");
+    expect(object).not.toBeNull();
+    object?.stream.destroy();
+  });
+
+  it("returns 404 and a sanitized retry log when lazy unlink fails", async () => {
+    const prisma = fakePrisma();
+    prisma.mediaAsset.findUnique.mockResolvedValue({
+      mime: "image/png",
+      expiresAt: new Date(NOW - 1),
+    });
+    const store = new LocalMediaStore(root);
+    const unlink = vi.spyOn(store, "delete").mockRejectedValue(new Error("private path"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const app = new Hono();
+      app.get(
+        "/media/:id",
+        createMediaGetHandler({
+          getConfig: () => config,
+          makeStore: () => store,
+          prisma: prisma as never,
+          now: () => NOW,
+        }),
+      );
+      const signed = new URL(
+        buildSignedMediaUrl({ id: "failed", publicBaseUrl: config.publicBaseUrl, now: NOW }).url,
+      );
+      const response = await app.request(signed.pathname + signed.search);
+      expect(response.status).toBe(404);
+      expect(prisma.$transaction).toHaveBeenCalledOnce();
+      expect(unlink).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledExactlyOnceWith(
+        "[media] lazy expiry deletion failed; retained for retry.",
+      );
+    } finally {
+      unlink.mockRestore();
+      warn.mockRestore();
+    }
   });
 });

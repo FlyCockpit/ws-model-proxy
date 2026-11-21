@@ -1,11 +1,13 @@
 import type { Session } from "@ws-model-proxy/auth";
 import { Hono } from "hono";
+import { forcedTwoFactorResponse } from "../force-2fa-gate.js";
 import { runPoolMemberTest } from "./diagnostics.js";
 import type { ModelApiConcurrencyLimiter } from "./limits.js";
 
 type Variables = { session: Session | null };
 
 export type PoolMemberTestDependencies = {
+  twoFactorRequired?: () => Promise<boolean>;
   manager?: Parameters<typeof runPoolMemberTest>[0]["manager"];
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
   capacityRuntime?: Parameters<typeof runPoolMemberTest>[0]["capacityRuntime"];
@@ -22,6 +24,7 @@ export function createPoolMemberTestRoutes({
   manager,
   concurrencyLimiter,
   capacityRuntime,
+  twoFactorRequired,
 }: PoolMemberTestDependencies = {}) {
   const app = new Hono<{ Variables: Variables }>();
 
@@ -30,6 +33,8 @@ export function createPoolMemberTestRoutes({
     if (!session?.user) {
       return c.json({ ok: false, error: "Authentication is required." }, 401);
     }
+    const denied = await forcedTwoFactorResponse(session, twoFactorRequired);
+    if (denied) return denied;
     const result = await runPoolMemberTest({
       userId: session.user.id,
       memberId: c.req.param("memberId"),

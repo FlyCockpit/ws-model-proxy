@@ -9,6 +9,7 @@ import { env } from "@ws-model-proxy/env/server";
 import { WebSocketServer } from "ws";
 import { createApp } from "./app.js";
 import { installBetterCallErrorLogShim } from "./better-call-error-log-shim.js";
+import { assertDatabaseBackfilled } from "./database-backfill-startup.js";
 import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
 import { startAffinityAuthorityMaintenance } from "./model-api/cache-affinity-maintenance.js";
@@ -44,6 +45,7 @@ import { RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { flushRuntimeLoadRollup, stopRuntimeLoadRollup } from "./relay/runtime-load-rollup.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
+import { installUpgradeRefusalBodies } from "./relay/upgrade-refusal-body.js";
 import { startRelayMaintenance } from "./relay-maintenance.js";
 import { installServerShutdown } from "./server-shutdown.js";
 import { configureHttpServerTimeouts } from "./server-timeouts.js";
@@ -60,6 +62,14 @@ import { selectWebSocketSubprotocol } from "./websocket-subprotocols.js";
 // before ANY request handling; see better-call-error-log-shim.ts for the
 // removal condition (TEMPORARY shim).
 installBetterCallErrorLogShim();
+
+if (!env.BACKUP_ENABLED) {
+  console.log(
+    "[backup] Automatic database backups are OFF. Migrations proceed without backups. " +
+      "Enable pre-migration backups with BACKUP_ENABLED=true and a writable /backups mount or BACKUP_S3_*; " +
+      "for daily backups also run the optional backup-schedule service with BACKUP_SCHEDULE=daily.",
+  );
+}
 
 // Reject wildcard CORS origin — it disables credential support and effectively
 // opens the API to any website. Fail hard at startup so the misconfiguration
@@ -117,6 +127,7 @@ async function waitForDependencies() {
 }
 
 await waitForDependencies();
+await assertDatabaseBackfilled();
 
 // ---------------------------------------------------------------------------
 // Start listening
@@ -142,6 +153,7 @@ const server = serve(
     console.log(`Server is running on http://localhost:${info.port}`);
   },
 );
+installUpgradeRefusalBodies(server);
 
 // Keep the application-side idle timeout slightly longer than the common
 // reverse-proxy idle window. This prevents a proxy from selecting a socket

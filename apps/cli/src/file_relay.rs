@@ -1,4 +1,4 @@
-//! Node file ops (relay 3.0 `file.op`): the CLI side.
+//! Node file ops (relay 4.0 `file.op`): the CLI side.
 //!
 //! One [`FileRelay`] lives for one relay session (the daemon builds it beside
 //! its terminal and exec registries). It never touches the filesystem on the
@@ -63,7 +63,7 @@ pub fn is_read_op(op: &str) -> bool {
     matches!(op, "read" | "stat" | "list" | "search")
 }
 
-/// The wire name of an op, or `None` for a name 3.0 does not have.
+/// The wire name of an op, or `None` for a name 4.0 does not have.
 pub fn op_kind(op: &str) -> Option<FileOpKind> {
     Some(match op {
         "read" => FileOpKind::Read,

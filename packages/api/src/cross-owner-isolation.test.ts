@@ -225,6 +225,11 @@ function callerRow(): Record<string, unknown> {
     banExpires: null,
     deletionRequestedAt: null,
     name: "tok",
+    clientId: "https://client.example/meta",
+    referenceId: "r",
+    scopes: ["READ"],
+    allNodes: true,
+    Nodes: [],
     expiresAt: null,
     role: "user",
     twoFactorEnabled: false,
@@ -432,11 +437,27 @@ const session = {
 const CREDENTIALS: ReadonlyArray<[string, CallerAuth]> = [
   [
     "Full agent token",
-    { kind: "agent_token", userId: ATTACKER, agentTokenId: "tok-b", level: "FULL" },
+    {
+      kind: "agent_token",
+      userId: ATTACKER,
+      agentTokenId: "tok-b",
+      access: {
+        scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+        nodeIds: null,
+      },
+    },
   ],
   [
     "Full OAuth grant",
-    { kind: "oauth_access_token", userId: ATTACKER, grantId: "grant-b", level: "FULL" },
+    {
+      kind: "oauth_access_token",
+      userId: ATTACKER,
+      grantId: "grant-b",
+      access: {
+        scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+        nodeIds: null,
+      },
+    },
   ],
   [
     "cookie with CSRF",
@@ -469,6 +490,15 @@ const ADDRESS_SPEC = {
  * entry in EXEMPT.
  */
 const CASES: ReadonlyArray<[string, unknown]> = [
+  [
+    "access.agentTokens.create",
+    { name: "x", scopes: ["read"], nodeIds: ["node-a"], expiresAt: future().toISOString() },
+  ],
+  [
+    "access.agentTokens.setAccess",
+    { agentTokenId: "tok-a", scopes: ["read"], nodeIds: ["node-a"] },
+  ],
+  ["access.oauthGrants.setAccess", { grantId: "grant-a", scopes: ["read"], nodeIds: ["node-a"] }],
   ["nodes.get", { nodeId: "node-a" }],
   ["nodes.credentials.list", { nodeId: "node-a" }],
   ["nodes.activity.list", { nodeId: "node-a" }],
@@ -751,11 +781,9 @@ const EXEMPT: Readonly<Record<string, Exemption>> = {
   "access.apiKeys.create": ACCESS,
   "access.apiKeys.revoke": ACCESS,
   "access.agentTokens.list": ACCESS,
-  "access.agentTokens.create": ACCESS,
   "access.agentTokens.revoke": ACCESS,
   "access.oauthGrants.list": ACCESS,
   "access.oauthGrants.revoke": ACCESS,
-  "access.oauthGrants.setLevel": ACCESS,
   "access.shares.list": ACCESS,
   "access.shares.create": ACCESS,
   "access.shares.update": ACCESS,

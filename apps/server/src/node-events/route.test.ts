@@ -58,8 +58,8 @@ function setup(
       userLimiter: new RateLimiterMemory({ points: options.userPoints ?? 100, duration: 60 }),
     }),
   );
-  const request = (headers: Record<string, string> = {}) =>
-    app.request(`${APP}${NODE_EVENTS_PATH}`, { headers });
+  const request = (headers: Record<string, string> = {}, signal?: AbortSignal) =>
+    app.request(`${APP}${NODE_EVENTS_PATH}`, { headers, signal });
   return { app, hub, request, checkSession };
 }
 
@@ -173,5 +173,43 @@ describe("GET /api/dashboard/events", () => {
     const response = await pending;
     expect(response.status).toBe(401);
     expect(hub.size).toBe(0);
+  });
+
+  it("gives the slot back when the client leaves while its session is read", async () => {
+    const hub = new NodeEventHub({ perUser: 1, perServer: 10 });
+    let release: (verdict: Verdict) => void = () => {};
+    const { request } = setup({
+      hub,
+      verdict: () =>
+        new Promise<Verdict>((resolve) => {
+          release = resolve;
+        }),
+    });
+    const client = new AbortController();
+    const pending = request({}, client.signal);
+    await vi.waitFor(() => expect(hub.size).toBe(1));
+    client.abort();
+    release("ok");
+    const response = await pending;
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "client_gone" });
+    expect(hub.size).toBe(0);
+  });
+
+  it("ends an open stream when its client leaves, even if nothing cancels it", async () => {
+    const hub = new NodeEventHub({ perUser: 1, perServer: 10 });
+    const { request } = setup({ hub });
+    const client = new AbortController();
+    const response = await request({}, client.signal);
+    expect(response.status).toBe(200);
+    expect(hub.size).toBe(1);
+    client.abort();
+    expect(hub.size).toBe(0);
+    // The stream was closed, not left open: what was queued reads, then it ends.
+    expect(await response.text()).toBe('retry: 3000\n\nevent: hello\ndata: {"v":1}\n\n');
+    // The freed slot admits the next tab.
+    const next = await request();
+    expect(next.status).toBe(200);
+    await next.body?.cancel();
   });
 });

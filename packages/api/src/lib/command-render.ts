@@ -3,7 +3,7 @@
  * node's renderer (`apps/cli/src/runtimes/render.rs` `render`, `typed_values`, `substitute`):
  * the same `{{name}}` syntax, raw substitution (no quoting or escaping: every value is typed
  * first), the same value checks and the same refusals. The shared vectors in
- * `apps/cli/tests/fixtures/relay-3.0/rules/command-render.json` are checked by both sides
+ * `apps/cli/tests/fixtures/relay-4.0/rules/command-render.json` are checked by both sides
  * (`command-render.test.ts`, `render/tests.rs`).
  *
  * What only the node knows is never guessed: `fabric_ip`, `fabric_iface` and

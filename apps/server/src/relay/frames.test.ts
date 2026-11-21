@@ -27,7 +27,7 @@ import {
   serverToNodeControlFrameSchema,
 } from "./frames.js";
 
-const FIXTURES = fileURLToPath(new URL("../../../cli/tests/fixtures/relay-3.0/", import.meta.url));
+const FIXTURES = fileURLToPath(new URL("../../../cli/tests/fixtures/relay-4.0/", import.meta.url));
 
 function load(dir: string): Array<[string, Record<string, unknown>]> {
   const path = join(FIXTURES, dir);
@@ -56,7 +56,7 @@ describe("how a node command ran", () => {
   });
   const accepts = (frame: unknown) => nodeToServerControlFrameSchema.safeParse(frame).success;
 
-  it("accepts exec.started with and without ranWith (released wsmp sends none)", () => {
+  it("accepts exec.started with and without ranWith", () => {
     expect(accepts(started())).toBe(true);
     expect(accepts(started({ shell: "pwsh", mode: "shell" }))).toBe(true);
     expect(accepts(started({ shell: null, mode: "direct" }))).toBe(true);
@@ -74,11 +74,11 @@ describe("how a node command ran", () => {
     expect(accepts(started({ mode: "direct" }))).toBe(false);
   });
 
-  it("hello.ok may carry features, or not", () => {
+  it("hello.ok needs no feature negotiation", () => {
     const hello = {
       type: "hello.ok",
       id: "h-1",
-      protocolVersion: "3.0",
+      protocolVersion: "4.0",
       nodeId: "nd5q6w7e8r9t0y1u2i3o4p5a6",
       definitionSync: "none",
     };
@@ -86,17 +86,28 @@ describe("how a node command ran", () => {
     expect(
       serverToNodeControlFrameSchema.safeParse({ ...hello, features: { execRanWith: true } })
         .success,
-    ).toBe(true);
+    ).toBe(false);
     expect(
       serverToNodeControlFrameSchema.safeParse({
         ...hello,
         features: { execRanWith: true, agentUpdateAvailableVersion: true },
       }).success,
-    ).toBe(true);
+    ).toBe(false);
   });
 });
 
-describe("relay 3.0 frames", () => {
+describe("command start rejections", () => {
+  it("accepts the node's bad_cwd reason unchanged", () => {
+    const rejected = {
+      type: "exec.rejected",
+      commandId: "AAAAAAAAAAAAAAAAAAAAAA",
+      reason: "bad_cwd",
+    };
+    expect(nodeToServerControlFrameSchema.parse(rejected)).toEqual(rejected);
+  });
+});
+
+describe("relay 4.0 frames", () => {
   const nodeToServer = load("frames/node-to-server");
   const serverToNode = load("frames/server-to-node");
 
@@ -325,13 +336,13 @@ describe("runtime job results", () => {
 });
 
 /**
- * wsmp self-update (contract §1–§2). The CLI implementer adds the matching fixtures under
- * `apps/cli/tests/fixtures/relay-3.0/frames/{server-to-node,node-to-server}/agent.update*.json`
- * (the "fixture for every frame type" check above needs them); these are the contract's JSON.
+ * Self-update frames share the same strict JSON contract in the server and CLI.
  */
 describe("self-update frames", () => {
   const helloFixture = () =>
-    structuredClone(load("frames/node-to-server").find(([name]) => name === "hello.json")?.[1]) as {
+    structuredClone(
+      load("frames/node-to-server").find(([name]) => name === "hello-self-update.json")?.[1],
+    ) as {
       node: Record<string, unknown>;
       features: Record<string, unknown>;
     };
@@ -353,7 +364,7 @@ describe("self-update frames", () => {
     detail: "wsmp config set remote-updates allowed",
   };
 
-  it("accepts the new hello fields, and an older hello without them", () => {
+  it("accepts build and self-update facts, including an unknown commit", () => {
     const hello = helloFixture();
     hello.node.build = {
       commit: "0123456789abcdef0123456789abcdef01234567",
@@ -380,6 +391,18 @@ describe("self-update frames", () => {
 
   it("refuses malformed hello additions", () => {
     const cases: Array<(hello: ReturnType<typeof helloFixture>) => void> = [
+      (h) => {
+        delete h.node.build;
+      },
+      (h) => {
+        delete h.features.selfUpdate;
+      },
+      (h) => {
+        delete h.features.jobReservations;
+      },
+      (h) => {
+        delete h.features.rankIdle;
+      },
       (h) => {
         h.node.build = { commit: "ABC", installMethod: "script", target: "x" };
       },

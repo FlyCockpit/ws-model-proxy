@@ -25,6 +25,7 @@ function hello(extra: Partial<NodeHelloFacts> = {}): NodeHelloFacts {
     identityPublicKey: "key",
     trust: "full",
     features: {} as never,
+    build: { commit: null, installMethod: "script", target: "x86_64-unknown-linux-gnu" },
     definitions: [],
     heldMetricCommandsHash: null,
     heldFabricsHash: null,
@@ -62,7 +63,7 @@ describe("registerNodeHello stores the self-update facts", () => {
     await registerNodeHello({
       identity,
       hello: hello({ build, environment: { wsl: true } }),
-      protocolVersion: "3.0",
+      protocolVersion: "4.0",
     });
     expect(db.node.update.mock.calls[0]?.[0].data).toMatchObject({
       cliVersion: "0.4.3",
@@ -71,10 +72,10 @@ describe("registerNodeHello stores the self-update facts", () => {
     });
   });
 
-  it("clears them for a hello without them (an older or downgraded wsmp)", async () => {
-    await registerNodeHello({ identity, hello: hello(), protocolVersion: "3.0" });
+  it("stores the required build and clears an absent environment", async () => {
+    await registerNodeHello({ identity, hello: hello(), protocolVersion: "4.0" });
     expect(db.node.update.mock.calls[0]?.[0].data).toMatchObject({
-      cliBuild: DbNull,
+      cliBuild: { commit: null, installMethod: "script", target: "x86_64-unknown-linux-gnu" },
       environment: DbNull,
     });
   });

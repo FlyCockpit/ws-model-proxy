@@ -59,21 +59,27 @@ export async function deleteAllMedia({
 }): Promise<DeleteAllResult> {
   let removed = 0;
   let bytes = 0;
+  const skippedIds: string[] = [];
 
   for (;;) {
     const batch = await prisma.mediaAsset.findMany({
+      where: { id: { notIn: skippedIds } },
       select: { id: true, sizeBytes: true },
       take: DELETE_BATCH,
     });
     if (batch.length === 0) break;
 
-    for (const { id } of batch) {
-      await store.delete(id);
+    for (const { id, sizeBytes } of batch) {
+      try {
+        await store.delete(id);
+        const { count } = await prisma.mediaAsset.deleteMany({ where: { id } });
+        removed += count;
+        bytes += count * sizeBytes;
+      } catch {
+        console.warn("[media] admin asset deletion failed; retained for retry.");
+        skippedIds.push(id);
+      }
     }
-    await prisma.mediaAsset.deleteMany({ where: { id: { in: batch.map((a) => a.id) } } });
-
-    removed += batch.length;
-    bytes += batch.reduce((sum, a) => sum + a.sizeBytes, 0);
 
     if (batch.length < DELETE_BATCH) break;
   }

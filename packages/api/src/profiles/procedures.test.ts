@@ -2,6 +2,8 @@ import { createRouterClient } from "@orpc/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDeep, mockReset } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
+import { TEST_NODE_FEATURES } from "../lib/node-features-test-fixture";
+import { type RuntimeResource, runtimeSpecSchema } from "../lib/runtime-spec";
 
 vi.mock("@ws-model-proxy/db", () => ({
   default: mockDeep<PrismaClient>(),
@@ -49,6 +51,7 @@ const client = (auth: CallerAuth = PERSON, services?: Parameters<typeof contextF
   createRouterClient(profilesRouter, { context: contextFor(auth, services) });
 
 const fullNode = (id: string, trust: "RELAY" | "FULL" = "FULL") => ({
+  userId: "owner-1",
   id,
   slug: id,
   trust,
@@ -57,6 +60,8 @@ const fullNode = (id: string, trust: "RELAY" | "FULL" = "FULL") => ({
 
 function planState(
   options: {
+    resource?: RuntimeResource;
+    nodeInfo?: unknown;
     trust?: "RELAY" | "FULL";
     personHold?: boolean;
     running?: boolean;
@@ -68,7 +73,9 @@ function planState(
   db.profile.findFirst.mockResolvedValueOnce({
     id: "p-1",
     Nodes: [{ nodeId: "a", hold: false, holdNote: null }],
-    Items: [],
+    Items: options.resource
+      ? [{ id: "it-1", position: 0, runtimeId: "rt-1", versionId: "v-1", count: 1, nodeIds: ["a"] }]
+      : [],
   } as never);
   db.node.findMany.mockResolvedValueOnce([
     {
@@ -85,12 +92,33 @@ function planState(
       portEnd: 30010,
       heldDefinitions: [],
       declaredResources: null,
-      nodeInfo: null,
+      features: TEST_NODE_FEATURES,
+      nodeInfo: options.nodeInfo ?? null,
       nodeMetrics: null,
       nodeMetricsAt: null,
     },
   ] as never);
-  db.runtimeVersion.findMany.mockResolvedValueOnce([]);
+  db.runtimeVersion.findMany.mockResolvedValueOnce(
+    options.resource
+      ? ([
+          {
+            id: "v-1",
+            runtimeId: "rt-1",
+            Runtime: { slug: "model", currentVersionId: "v-1", origin: "SERVER" },
+            spec: runtimeSpecSchema.parse({
+              launch: {
+                management: "process",
+                groupSize: 1,
+                resources: [options.resource],
+                labels: [],
+                commands: [{ start: "serve", status: "status" }],
+                health: { intervalMs: 10000, failureThreshold: 3, successThreshold: 1 },
+              },
+            }),
+          },
+        ] as never)
+      : [],
+  );
   db.runtimeInstance.findMany.mockResolvedValueOnce(
     options.running
       ? ([
@@ -139,6 +167,56 @@ describe("profiles.apply", () => {
     expect(out.mode).toBe("preview");
     expect(db.runtimeOperation.create).not.toHaveBeenCalled();
   });
+
+  it.each([
+    [
+      "unified GPU",
+      { kind: "discrete", gpuCount: 1, vendor: "amd", vramGb: 70 },
+      126136,
+      63324,
+      512,
+      "Unified accelerator limit",
+    ],
+    [
+      "unified entry",
+      { kind: "unified", memoryGb: 70 },
+      126136,
+      63324,
+      512,
+      "Unified accelerator limit",
+    ],
+    ["UMA96 CPU", { kind: "cpu", ramGb: 100 }, 129922, 114113, 98304, "RAM-only limit"],
+  ] as const)(
+    "enforces the %s budget in profile preview and apply",
+    async (_name, resource, total, pool, carveout, limit) => {
+      const options = {
+        resource,
+        nodeInfo: {
+          nodeKind: "unified",
+          memoryTotalMiB: total,
+          acceleratorMemoryMiB: pool,
+          gpus: [{ vendor: "amd", index: 0, apu: true, vramTotalMiB: carveout }],
+        },
+      };
+      planState(options);
+      const out = await client().apply({ profileId: "p-1", preview: true });
+      expect(out.mode).toBe("preview");
+      if (out.mode !== "preview") throw new Error("expected preview");
+      expect(out.preview.starts).toEqual([]);
+      expect(out.preview.refusals).toEqual([
+        expect.objectContaining({
+          reason: "not_enough_memory",
+          message: expect.stringContaining(limit),
+        }),
+      ]);
+      planState(options);
+      await expect(
+        client().apply({ profileId: "p-1", fingerprint: out.preview.fingerprint }),
+      ).rejects.toMatchObject({ data: { reason: "not_enough_memory" } });
+      expect(db.runtimeOperation.create).not.toHaveBeenCalled();
+      expect(db.runtimeInstance.create).not.toHaveBeenCalled();
+    },
+  );
 
   it("requires a person to echo the preview fingerprint", async () => {
     planState();
@@ -505,7 +583,10 @@ describe("profiles.save validation", () => {
 
 describe("profiles.delete", () => {
   it("leaves the profile's holds to become a person's (FK SET NULL), never released", async () => {
-    db.profile.findFirst.mockResolvedValueOnce({ id: "p-1", Nodes: [{ nodeId: "a" }] } as never);
+    db.profile.findFirst.mockResolvedValueOnce({
+      id: "p-1",
+      Nodes: [{ nodeId: "a", hold: true, Node: { userId: "owner-1" } }],
+    } as never);
     db.profile.deleteMany.mockResolvedValueOnce({ count: 1 });
     await client().delete({ profileId: "p-1" });
     expect(db.profile.findFirst.mock.calls[0]?.[0]?.where).toEqual({
@@ -521,7 +602,10 @@ describe("profiles.delete", () => {
     ["cookie without CSRF", CSRF_LESS],
   ] as const) {
     it(`refuses a ${label} deleting a profile with hold lines`, async () => {
-      db.profile.findFirst.mockResolvedValueOnce({ id: "p-1", Nodes: [{ nodeId: "a" }] } as never);
+      db.profile.findFirst.mockResolvedValueOnce({
+        id: "p-1",
+        Nodes: [{ nodeId: "a", hold: true, Node: { userId: "owner-1" } }],
+      } as never);
       db.node.count.mockResolvedValueOnce(0);
       await expect(client(auth).delete({ profileId: "p-1" })).rejects.toMatchObject({
         data: { reason: "human_only" },
@@ -579,6 +663,7 @@ describe("hold writes on apply", () => {
         portEnd: 30010,
         heldDefinitions: [],
         declaredResources: null,
+        features: TEST_NODE_FEATURES,
         nodeInfo: null,
         nodeMetrics: null,
         nodeMetricsAt: null,
@@ -685,6 +770,7 @@ describe("apply write checks", () => {
         portEnd: 30010,
         heldDefinitions: [],
         declaredResources: null,
+        features: TEST_NODE_FEATURES,
         nodeInfo: null,
         nodeMetrics: null,
         nodeMetricsAt: null,
@@ -772,4 +858,90 @@ describe("profiles.save races and empty hold lists", () => {
     ).rejects.toMatchObject({ code: "CONFLICT" });
     expect(db.profileNode.deleteMany).not.toHaveBeenCalled();
   });
+});
+
+describe("profile live counts with a node allowlist", () => {
+  for (const kind of ["agent_token", "oauth_access_token"] as const) {
+    for (const [label, nodeIds, expected] of [
+      ["allowlisted", ["a"], 1],
+      ["all nodes", null, 3],
+      ["person", null, 3],
+    ] as const) {
+      it(`${kind} ${label}: runningNow excludes ranks and superseded reservations on hidden nodes`, async () => {
+        const access = { scopes: ["read"] as const, nodeIds };
+        const auth: CallerAuth =
+          label === "person"
+            ? PERSON
+            : kind === "agent_token"
+              ? { kind, userId: PERSON.userId, agentTokenId: "t", access }
+              : { kind, userId: PERSON.userId, grantId: "g", access };
+        db.node.findMany.mockResolvedValue([{ id: "a" }, { id: "hidden" }] as never);
+        db.profile.findMany.mockResolvedValue([
+          {
+            id: "p-1",
+            slug: "profile",
+            name: "Profile",
+            description: null,
+            editor: "USER",
+            editorUserId: PERSON.userId,
+            updatedAt: new Date(),
+            Nodes: [
+              { nodeId: "a", hold: false, holdNote: null },
+              { nodeId: "hidden", hold: false, holdNote: null },
+            ],
+            Items: [
+              {
+                id: "item-1",
+                position: 0,
+                runtimeId: "rt-1",
+                versionId: "v-1",
+                count: 3,
+                nodeIds: [],
+                Runtime: { slug: "rt", currentVersionId: "v-1" },
+                Version: { version: 1 },
+              },
+            ],
+            Operations: [],
+          },
+        ] as never);
+        const base = {
+          runtimeId: "rt-1",
+          launchVersionId: "v-1",
+          desiredState: "RUNNING",
+          phase: "READY",
+          Ranks: [{ rank: 0, nodeId: "a", claim: "HELD", Node: fullNode("a") }],
+          Reservations: [],
+        };
+        db.runtimeInstance.findMany.mockResolvedValue([
+          { ...base, id: "visible" },
+          // A released historical rank is still hidden by runtimes.get's row predicate.
+          {
+            ...base,
+            id: "hidden-rank",
+            Ranks: [
+              ...base.Ranks,
+              { rank: 1, nodeId: "hidden", claim: "RELEASED", Node: fullNode("hidden") },
+            ],
+          },
+          {
+            ...base,
+            id: "hidden-reservation",
+            Reservations: [
+              { index: 0, nodeId: "hidden", supersededGeneration: 1, Node: fullNode("hidden") },
+            ],
+          },
+        ] as never);
+        const profile = await client(auth).get({ profileId: "p-1" });
+        // Rankless ALWAYS_ON instances bound to hidden nodes never enter profile counts.
+        expect(db.runtimeInstance.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({ Runtime: { kind: "STARTABLE" } }),
+          }),
+        );
+        expect(profile.items[0]?.runningNow).toBe(expected);
+        expect(profile.items[0]?.count).toBe(3);
+        expect(profile.satisfied).toBe(expected === 3);
+      });
+    }
+  }
 });

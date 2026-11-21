@@ -211,7 +211,9 @@ export function createModelApiFileUploadHandler(deps: ModelApiFilesDeps = {}) {
         maxUploadBytes: await getAttachmentLimit(config),
         maxBytesPerUser: config.maxBytesPerUser,
         prisma,
-        now: new Date(nowMs),
+        // Read the clock after staging (uploadMedia calls it), so dedup and
+        // expiry decisions use the time the bytes actually landed.
+        now: () => new Date(now()),
       });
       const signed = buildSignedMediaUrl({
         id: result.id,

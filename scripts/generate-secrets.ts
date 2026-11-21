@@ -803,7 +803,7 @@ function postamble() {
   } else {
     say("    1. Add these to your platform's environment/secrets store.");
   }
-  say("    2. Set APPLY_SCHEMA=safe for the first schema-changing deploy, then back to off.");
+  say("    2. Take a database backup before upgrading; the server applies migrations on start.");
   say("    3. Review README.md production notes before taking real traffic.");
   say("");
 }

@@ -70,37 +70,54 @@ unless the owner explicitly asks for it in the current task. That covers:
 - The release switches in `apps/server/src/node-http.ts`
   (`CLI_RELEASE_BINARIES_BY_DEFAULT`, `CLI_PREVIEW_BRANCH`).
 
-Relay protocol 3.0 is permanent: every server from 0.4.3 on must keep working
-with every released wsmp from 0.4.3 on, for all the features that wsmp has.
+Each release line uses one relay protocol. Server and wsmp 1.0 speak only relay
+4.0 with WebSocket subprotocol `ws-model-proxy.relay.v4`; upgrade the server and
+every node together when the protocol changes.
 
-- A new capability is new frames or optional fields on 3.0. The server uses it
-  only with nodes that report it (a hello `features` entry, as
-  `features.selfUpdate` does). A node that does not report it simply does not
-  get that feature; everything it did before keeps working.
-- Never bump the protocol, add version negotiation, or gate behaviour on
-  version numbers. Never remove, rename or retype a field, add a value to an
-  existing enum, or add a field that limits what a node may do.
-- The rules and the CI test that enforces them
-  (`apps/server/src/relay/released-compat.test.ts`) are in
-  `apps/cli/docs/releasing.md`, "Keeping old nodes updatable".
-- If a change cannot follow these rules, stop and tell the owner instead of
-  bumping anything.
+- Refuse other subprotocols with HTTP 426 and `code: "upgrade_cli"`. Preserve
+  the refusal body keys and types: `type`, `failure`, `code`, `message`,
+  `supportedVersions`, `supportedSubprotocol`.
+- Preserve all five `/.well-known/wsmp` fields and their types: `serverVersion`,
+  `protocolVersion`, `origin`, `installScript` (`/install.sh`), and `enrollPath`
+  (`/api/node/enroll`). Released CLIs parse this response and the 426 refusal to
+  print upgrade instructions; their shapes must never change.
+- Advertise new optional capabilities through hello `features`, and use them
+  only with nodes that report support.
+- Version numbers remain owner-only. See `apps/cli/docs/releasing.md` for the
+  release process and `apps/cli/docs/relay-protocol.md` for the handshake.
 
 ## Data and Schema
 
-- The Prisma schema lives in `packages/db/prisma/schema/`.
-- Use `pnpm db:push` for local safe schema sync.
-- Use `APPLY_SCHEMA=off|safe|dangerous` for deployment-time schema sync through `scripts/docker-entrypoint.sh`.
-- Treat `APPLY_SCHEMA=dangerous` and `pnpm db:push:dangerous` as destructive operations requiring explicit review.
+- The Prisma schema lives in `packages/db/prisma/schema/`; committed migrations in
+  `packages/db/prisma/migrations/` ([docs/schema-migrations.md](docs/schema-migrations.md)).
+- Schema changes: edit the schema, `pnpm db:migrate <name>` (generates SQL only), review and
+  edit the SQL, `pnpm db:migrate:apply`, commit schema and migration folder together. A
+  migration on the default branch is immutable; fix mistakes with a new one.
+- Local databases are per checkout (`pnpm db:worktree`); `pnpm db:reset:local` recreates only
+  this checkout's own database, and only one carrying the disposable-local mark (`pnpm db:worktree`
+  and the dev compose volume set it; `EXPECTED_DB` never widens a reset). Agents never run
+  `pnpm db:worktree --adopt`; hand it to the user. `scripts/assert-local-database.sh` guards every
+  local wrapper.
+- Production applies migrations only through the image's runner (`MIGRATE_ON_START`, default
+  true for the server, or the `migrate` command). `APPLY_SCHEMA` is a deprecated 1.x alias.
+- `packages/db/prisma/schema-hardening.sql` (checks, triggers, fences Prisma cannot express) is
+  carried by migrations, never applied directly; `pnpm db:validate` checks the newest
+  migration's copy matches it.
 
 Never run:
 
 - `prisma migrate reset`
-- `prisma migrate dev`
-- `prisma migrate deploy`
-- `prisma db push --force-reset`
-- `prisma db drop`
-- Raw SQL `DROP TABLE`, `DROP DATABASE`, `TRUNCATE`, or `DELETE` without a `WHERE` clause
+- `prisma migrate dev` (`pnpm db:migrate` generates migrations instead)
+- `prisma db push` (any flags, incl. `--force-reset` / `--accept-data-loss`); it bypasses
+  the migration history
+- `prisma db drop` / `dropdb`
+- Raw SQL `DROP DATABASE`, `DROP SCHEMA`, `DROP TABLE`, `TRUNCATE`, or `DELETE` without a
+  `WHERE` clause, except inside a reviewed migration file
+  (`packages/db/prisma/migrations/*/{migration,contract}.sql`)
+
+Allowed: `prisma migrate deploy` and `prisma migrate diff` through the wrappers and the image
+runner; `prisma migrate resolve` only in the documented recovery steps, run by the operator
+(never by an agent).
 
 ## Web Conventions
 
@@ -140,6 +157,22 @@ Never run:
 - Use the existing `BottomNav`; do not add a second mobile nav.
 - Do not use `transition: all` or Tailwind `transition-all`.
 - Use lucide icons where an existing icon fits.
+- The root shell grid has one explicit `grid-cols-[minmax(0,1fr)]` column, so
+  header or page min-content can never widen the viewport. Shell `<main>` keeps
+  `overscroll-contain` and `[scrollbar-gutter:stable]` (no gutter while a
+  terminal is maximized), `id="main-content"`, `tabIndex={-1}`, and a localized
+  skip-to-content link before the grid.
+- Do not add page view transitions (`defaultViewTransition`, `viewTransitionName`):
+  the old and new page must never be on screen together.
+- A confirmed change or loss of the signed-in identity does a full document load
+  (`useReloadOnIdentityChange`); explicit sign-out marks itself with
+  `markExplicitSignOut()` and then `window.location.assign`s the login page, so no
+  query cache from the previous account survives. Every other navigation is a
+  router navigation; do not add internal `<a href>` links or `location` reloads.
+- The root `FileDropGuard` stops a stray file drop from navigating the tab. A
+  component that accepts dropped files registers with `useFileDropTarget`.
+- Section tab strips reveal their active tab by setting the strip's `scrollLeft`
+  (`useActiveTabScroll`), never with `scrollIntoView`, which also scrolls `<main>`.
 
 ## React Rules
 
@@ -156,6 +189,8 @@ Never run:
 
 ```sh
 pnpm db:validate
+pnpm db:test-unit
+CHECK_DATABASE_URL=<disposable superuser url> pnpm db:check-migrations --base origin/main
 pnpm check-types
 pnpm --filter web check-types
 pnpm test

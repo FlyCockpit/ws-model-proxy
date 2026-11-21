@@ -41,6 +41,7 @@ function fakePrisma() {
       findUnique: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       delete: vi.fn(),
       aggregate: vi.fn().mockResolvedValue({ _sum: { sizeBytes: 0 } }),
     },
@@ -214,7 +215,6 @@ describe("POST /v1/files (upload)", () => {
       sizeBytes: PNG.length,
       createdAt: originalCreatedAt,
     });
-    prisma.mediaAsset.update.mockResolvedValue({});
 
     const app = new Hono();
     app.post(
@@ -243,9 +243,89 @@ describe("POST /v1/files (upload)", () => {
     expect(body.created_at).not.toBe(Math.floor(NOW / 1000));
     // Dedup path refreshes TTL instead of creating a new row.
     expect(prisma.mediaAsset.create).not.toHaveBeenCalled();
-    expect(prisma.mediaAsset.update).toHaveBeenCalledWith({
-      where: { id: "asset-dedup" },
+    expect(prisma.mediaAsset.updateMany).toHaveBeenCalledWith({
+      where: { id: "asset-dedup", expiresAt: { gt: new Date(NOW) } },
       data: { expiresAt: new Date(NOW + 24 * 60 * 60 * 1000) },
+    });
+  });
+
+  it("creates a new asset when a dedup candidate disappears before its conditional refresh", async () => {
+    const prisma = fakePrisma();
+    prisma.mediaAsset.findFirst.mockResolvedValue({
+      id: "asset-gone",
+      mime: "image/png",
+      sizeBytes: PNG.length,
+      createdAt: new Date(NOW - 60_000),
+    });
+    prisma.mediaAsset.updateMany.mockResolvedValue({ count: 0 });
+    prisma.mediaAsset.create.mockImplementation(async ({ data }: { data: { id: string } }) => ({
+      id: data.id,
+      createdAt: new Date(NOW),
+    }));
+    const app = new Hono();
+    app.post(
+      "/v1/files",
+      createModelApiFileUploadHandler({
+        authenticate: tokenFor("user-1"),
+        getConfig: () => config,
+        prisma: prisma as never,
+        getTtlHours: async () => 24,
+        now: () => NOW,
+      }),
+    );
+    const form = new FormData();
+    form.set("file", new Blob([PNG], { type: "image/png" }), "x.png");
+    const res = await app.request("/v1/files", { method: "POST", body: form, headers: bearer() });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { id: string };
+    expect(body.id).not.toBe("asset-gone");
+    expect(prisma.mediaAsset.create).toHaveBeenCalledOnce();
+    const stored = await new LocalMediaStore(root).getStream(body.id);
+    expect(stored).not.toBeNull();
+    stored?.stream.destroy();
+  });
+
+  it("checks dedup expiry and refreshes TTL using the clock after staging", async () => {
+    const prisma = fakePrisma();
+    prisma.mediaAsset.findFirst.mockResolvedValue({
+      id: "asset-dedup",
+      mime: "image/png",
+      sizeBytes: PNG.length,
+      createdAt: new Date(NOW - 60_000),
+    });
+    let clock = NOW;
+    const afterStaging = NOW + 120_000;
+    const store = new LocalMediaStore(root);
+    const stage = store.stage.bind(store);
+    vi.spyOn(store, "stage").mockImplementation(async (...args) => {
+      const staged = await stage(...args);
+      clock = afterStaging;
+      return staged;
+    });
+    const app = new Hono();
+    app.post(
+      "/v1/files",
+      createModelApiFileUploadHandler({
+        authenticate: tokenFor("user-1"),
+        getConfig: () => config,
+        prisma: prisma as never,
+        makeStore: () => store,
+        getTtlHours: async () => 24,
+        now: () => clock,
+      }),
+    );
+    const form = new FormData();
+    form.set("file", new Blob([PNG], { type: "image/png" }), "x.png");
+    const res = await app.request("/v1/files", { method: "POST", body: form, headers: bearer() });
+    expect(res.status).toBe(200);
+    expect(prisma.mediaAsset.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ expiresAt: { gt: new Date(afterStaging) } }),
+      }),
+    );
+    expect(prisma.mediaAsset.updateMany).toHaveBeenCalledWith({
+      where: { id: "asset-dedup", expiresAt: { gt: new Date(afterStaging) } },
+      data: { expiresAt: new Date(afterStaging + 24 * 60 * 60 * 1000) },
     });
   });
 

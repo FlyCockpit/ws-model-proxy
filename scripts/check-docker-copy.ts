@@ -12,7 +12,7 @@
  * that never shows up in `pnpm build`, tests, or typecheck. This script makes
  * that omission a fast, CI-visible error instead.
  *
- * The invariants it enforces (see AGENTS.md § Dockerfiles — keep server and
+ * The invariants it enforces (see AGENTS.md, Core Rules — keep server and
  * worker in sync):
  *
  *   1. Each `builder` stage installs the whole workspace (`pnpm install
@@ -42,7 +42,10 @@
  *                   never installed ahead of time and never reaches a runner.
  *
  * Runner workspace manifests are deliberately not checked as an install
- * closure. Runtime files invoked by the entrypoint are checked separately.
+ * closure. Runtime files invoked by the entrypoint (the migration runner and
+ * the backup/restore commands) are checked separately: each is copied to the
+ * same path, with every file it reaches. The HEALTHCHECK `--start-period` is
+ * checked against the migration startup gate parsed from the runner's source.
  *
  * Dependency-free by design (node:fs only) — no new packages, safe to run in the
  * CI `lint` job alongside `pnpm env:check`.
@@ -67,26 +70,29 @@ const RUNNER = "runner";
 // Single production image — no worker Dockerfile in this repo.
 const DOCKERFILES = ["Dockerfile"];
 
-// A follower may wait up to the entrypoint's advisory-lock timeout before the
-// schema leader's `prisma db push` and hardening run. Reserve additional time
-// for that bounded apply phase and application boot before failed health
-// probes count toward an unhealthy rollout: push-schema.mjs retries lock
-// conflicts for at most ~90s (8 attempts, 5s lock_timeout, <=8s backoff),
-// apply-schema-hardening.mjs for at most 60s, plus the runs and boot.
-const SCHEMA_APPLY_AND_BOOT_SLACK_SECONDS = 170;
+// The HEALTHCHECK start-period must fund the whole migration gate in front of
+// the CMD: the runner's fixed wait (connection retries plus the runner lock, or
+// a follower's wait), the leader's own apply (the optional backup plus `prisma
+// migrate deploy`: APPLY_BUDGET_SLACK), and every other timed step of a start,
+// parsed from the runner's source (BUDGET_SOURCES): the one-time 0.4.3
+// adoption, the pre-deploy catalog read, the scheduled deletions run budget
+// plus the bookkeeping that may run past it, the image-schema diff, the
+// deletions' catalog read, registration, and the runner-table steps
+// (RUNTIME_STEPS × RUNTIME_STEP_TIMEOUT_MS):
+// 540 > 300 + 120 + 30 + 10 + 30 + 5 + 20 + 5 + 5 + 5 × 2 = 535.
+const APPLY_BUDGET_SLACK = 120;
+const BUDGET_SOURCES = ["scripts/db/migrate-runtime.mjs", "scripts/db/lib/contracts.mjs"];
 
-// Runtime artifacts invoked by the production entrypoint. Unlike workspace
-// manifests, these are deliberately copied one-by-one into the minimal runner
-// image, so guard them explicitly against Dockerfile drift.
-const REQUIRED_RUNNER_COPIES = [
-  {
-    source: "/app/packages/db/scripts/apply-schema-hardening.mjs",
-    destination: "./packages/db/scripts/apply-schema-hardening.mjs",
-  },
-  {
-    source: "/app/packages/db/scripts/push-schema.mjs",
-    destination: "./packages/db/scripts/push-schema.mjs",
-  },
+// Runtime scripts the production entrypoint invokes. The runner stage copies
+// files one by one, so each of these, and every file they reach through
+// relative imports or sibling-script calls, must be copied to the same path.
+const RUNTIME_ENTRY_SCRIPTS = [
+  "/app/scripts/db/migrate-runtime.mjs",
+  "/app/scripts/backup/pre-migrate.sh",
+  "/app/scripts/backup/restore.sh",
+  "/app/scripts/backup/schedule.mjs",
+  "/app/scripts/backup/drill.mjs",
+  "/app/scripts/backup/host.sh",
 ];
 
 /** Discover on-disk workspace members: `apps/*` / `packages/*` with a package.json. */
@@ -152,32 +158,69 @@ function healthcheckStartPeriodSeconds(text: string): number | null {
   return null;
 }
 
-/**
- * Parse the entrypoint's bounded Postgres advisory-lock wait. This is sourced
- * from the actual command rather than duplicated, so extending the wait cannot
- * silently leave the health-check budget too short.
- */
-function schemaLockTimeoutSeconds(text: string): number | null {
-  const seconds = text.match(/SET\s+lock_timeout\s*=\s*'(\d+)s'/i)?.[1];
-  return seconds === undefined ? null : Number(seconds);
+/** `export const <NAME> = <number>;` from the runner's source. */
+function exportedNumber(text: string, name: string): number | null {
+  const value = text.match(new RegExp(`export const ${name}\\s*=\\s*([\\d_]+)`))?.[1];
+  return value ? Number(value.replaceAll("_", "")) : null;
 }
 
-function healthcheckSchemaBudgetErrors(
+/** The startup budget: every timed step of a start, in order, in seconds. */
+type StartupBudget = { parts: Array<{ label: string; seconds: number }> };
+
+/** Millisecond constants, each one timed step (label = the constant's name). */
+const BUDGET_STEPS = [
+  "WAIT_TIMEOUT_MS",
+  "BASELINE_COMPARE_TIMEOUT_MS",
+  "PREDEPLOY_CATALOG_TIMEOUT_MS",
+  "CONTRACT_RUN_BUDGET_MS",
+  "CONTRACT_PREAMBLE_TIMEOUT_MS",
+  "IMAGE_SCHEMA_TIMEOUT_MS",
+  "CONTRACTS_CATALOG_TIMEOUT_MS",
+  "REGISTER_TIMEOUT_MS",
+];
+
+/** Parse the budget from the concatenated BUDGET_SOURCES; null when any part is missing. */
+function startupBudget(text: string): StartupBudget | null {
+  const parts: StartupBudget["parts"] = [];
+  for (const name of BUDGET_STEPS) {
+    const ms = exportedNumber(text, name);
+    if (ms === null) return null;
+    parts.push({ label: name, seconds: ms / 1000 });
+    if (name === "WAIT_TIMEOUT_MS")
+      parts.push({ label: "apply budget", seconds: APPLY_BUDGET_SLACK });
+  }
+  const steps = exportedNumber(text, "RUNTIME_STEPS");
+  const stepMs = exportedNumber(text, "RUNTIME_STEP_TIMEOUT_MS");
+  if (steps === null || stepMs === null) return null;
+  parts.push({
+    label: `RUNTIME_STEPS ${steps} × RUNTIME_STEP_TIMEOUT_MS`,
+    seconds: (steps * stepMs) / 1000,
+  });
+  return { parts };
+}
+
+/**
+ * The HEALTHCHECK start-period must EXCEED the migration startup gate: the
+ * image sits in the entrypoint's gate before the CMD process exists, and
+ * Docker only exempts failed probes during --start-period. Pure for --self-test.
+ */
+function healthcheckStartPeriodErrors(
   dockerfile: string,
   text: string,
-  schemaLockTimeoutSeconds: number,
+  budget: StartupBudget,
 ): string[] {
   const startPeriod = healthcheckStartPeriodSeconds(text);
   if (startPeriod === null) {
     return [
-      `${dockerfile}: missing HEALTHCHECK --start-period=<N>s; the schema-sync startup budget cannot be verified.`,
+      `${dockerfile}: missing HEALTHCHECK --start-period=<N>s; the migration startup budget cannot be verified.`,
     ];
   }
-  const required = schemaLockTimeoutSeconds + SCHEMA_APPLY_AND_BOOT_SLACK_SECONDS;
+  const required = budget.parts.reduce((sum, part) => sum + part.seconds, 0);
   if (startPeriod > required) return [];
   return [
-    `${dockerfile}: HEALTHCHECK --start-period=${startPeriod}s must exceed the schema startup budget ` +
-      `(${schemaLockTimeoutSeconds}s advisory-lock wait + ${SCHEMA_APPLY_AND_BOOT_SLACK_SECONDS}s apply/boot slack = ${required}s).`,
+    `${dockerfile}: HEALTHCHECK --start-period=${startPeriod}s must exceed the migration startup gate: ` +
+      `${budget.parts.map((part) => `${part.label} ${part.seconds}s`).join(" + ")} ` +
+      `(${BUDGET_SOURCES.join(", ")}) = ${required}s.`,
   ];
 }
 
@@ -197,12 +240,22 @@ export function relativeReferences(source: string): string[] {
   ];
   for (const pattern of patterns)
     for (const match of source.matchAll(pattern)) if (match[1]) found.add(match[1]);
+  // Shell siblings: "$HERE/x.mjs" and "$(cd "$(dirname "$0")" && pwd)/x.mjs".
+  for (const match of source.matchAll(
+    /(?:\$HERE|\$\{HERE\}|&& pwd\))\/([A-Za-z0-9._-]+\.(?:mjs|sh))/g,
+  ))
+    if (match[1]) found.add(`./${match[1]}`);
   return [...found];
 }
 
 type RunnerCopy = { source: string; destination: string };
 
-/** `COPY [--flags] --from=builder <source> <destination>` lines of the runner stage. */
+/**
+ * The runner stage's COPY lines, as `/app/<path>` sources and `./<path>`
+ * destinations: `COPY [--flags] --from=builder <source> <destination>`, and
+ * build-context copies (`COPY a b ./dir/`), where every source lands at
+ * `<dir>/<basename>`.
+ */
 export function runnerBuilderCopies(dockerfileText: string): RunnerCopy[] {
   const copies: RunnerCopy[] = [];
   let currentStage = "";
@@ -214,10 +267,24 @@ export function runnerBuilderCopies(dockerfileText: string): RunnerCopy[] {
     }
     if (currentStage !== RUNNER) continue;
     const fields = line.split(/\s+/);
-    if (fields[0]?.toUpperCase() !== "COPY" || !fields.includes("--from=builder")) continue;
-    const source = fields.at(-2);
-    const destination = fields.at(-1);
-    if (source && destination) copies.push({ source, destination });
+    if (fields[0]?.toUpperCase() !== "COPY") continue;
+    if (fields.includes("--from=builder")) {
+      const source = fields.at(-2);
+      const destination = fields.at(-1);
+      if (source && destination) copies.push({ source, destination });
+      continue;
+    }
+    if (fields.some((field) => field.startsWith("--from="))) continue;
+    const operands = fields.slice(1).filter((field) => !field.startsWith("--"));
+    const destination = operands.pop();
+    if (!destination?.startsWith("./")) continue;
+    for (const source of operands) {
+      const target =
+        operands.length > 1 || destination.endsWith("/")
+          ? posix.join(destination, posix.basename(source))
+          : destination;
+      copies.push({ source: `/app/${source}`, destination: `./${posix.normalize(target)}` });
+    }
   }
   return copies;
 }
@@ -265,28 +332,33 @@ export function missingRuntimeReferences(
 }
 
 {
-  // Regression fixture: the pass-8 image copied push-schema.mjs without the
-  // helper it imports. The closure check must report it.
+  // Regression fixture: an image that copies a runtime script without a
+  // module it imports. The closure check must report it.
   const files: Record<string, string> = {
-    "packages/db/scripts/push-schema.mjs": `import { a } from "./helper.mjs";\nconst x = await import("./lazy.mjs");\nconst root = new URL("..", import.meta.url);\nconst sql = new URL("../prisma/x.sql", import.meta.url);`,
-    "packages/db/scripts/helper.mjs": `export { b } from "./nested.mjs";`,
-    "packages/db/scripts/lazy.mjs": "",
-    "packages/db/scripts/nested.mjs": "",
+    "scripts/db/migrate-runtime.mjs": `import { a } from "./lib/helper.mjs";\nconst x = await import("./lazy.mjs");\nconst root = new URL("..", import.meta.url);`,
+    "scripts/db/lib/helper.mjs": `export { b } from "./nested.mjs";`,
+    "scripts/db/lazy.mjs": "",
+    "scripts/db/lib/nested.mjs": "",
+    "scripts/backup/pre-migrate.sh": `HERE="$(cd "$(dirname "$0")" && pwd)"\nnode "$HERE/lib.mjs" pg-env\nnode "$HERE/s3.mjs" upload`,
+    "scripts/backup/lib.mjs": "",
   };
   const fixture = `FROM node AS runner
 COPY --from=builder /app/packages/db/prisma ./packages/db/prisma
-COPY --from=builder /app/packages/db/scripts/push-schema.mjs ./packages/db/scripts/push-schema.mjs
-COPY --from=builder /app/packages/db/scripts/lazy.mjs ./packages/db/scripts/lazy.mjs
+COPY scripts/db/migrate-runtime.mjs scripts/db/lazy.mjs ./scripts/db/
+COPY scripts/backup/pre-migrate.sh \\
+     scripts/backup/lib.mjs \\
+     ./scripts/backup/
 `;
   const result = missingRuntimeReferences(
-    ["/app/packages/db/scripts/push-schema.mjs"],
+    ["/app/scripts/db/migrate-runtime.mjs", "/app/scripts/backup/pre-migrate.sh"],
     runnerBuilderCopies(fixture),
     (path) => files[path] ?? null,
-    (path) => path === "packages/db",
+    (path) => path === "scripts" || path === "scripts/db",
   );
   deepStrictEqual(result.sort(), [
-    "/app/packages/db/scripts/helper.mjs (referenced by /app/packages/db/scripts/push-schema.mjs)",
-    "/app/packages/db/scripts/nested.mjs (referenced by /app/packages/db/scripts/helper.mjs)",
+    "/app/scripts/backup/s3.mjs (referenced by /app/scripts/backup/pre-migrate.sh)",
+    "/app/scripts/db/lib/helper.mjs (referenced by /app/scripts/db/migrate-runtime.mjs)",
+    "/app/scripts/db/lib/nested.mjs (referenced by /app/scripts/db/lib/helper.mjs)",
   ]);
 }
 
@@ -295,11 +367,20 @@ if (process.argv.includes("--self-test")) {
 HEALTHCHECK --interval=30s --timeout=5s --start-period=${startPeriod}s \\
   CMD node -e "process.exit(0)"
 `;
-  deepStrictEqual(schemaLockTimeoutSeconds("SET lock_timeout = '300s';"), 300);
-  deepStrictEqual(healthcheckSchemaBudgetErrors("Dockerfile", healthcheckFixture(480), 300), []);
-  deepStrictEqual(healthcheckSchemaBudgetErrors("Dockerfile", healthcheckFixture(470), 300), [
-    "Dockerfile: HEALTHCHECK --start-period=470s must exceed the schema startup budget (300s advisory-lock wait + 170s apply/boot slack = 470s).",
-  ]);
+  const budget = startupBudget(
+    "export const WAIT_TIMEOUT_MS = 300_000;\nexport const BASELINE_COMPARE_TIMEOUT_MS = 30_000;\n" +
+      "export const PREDEPLOY_CATALOG_TIMEOUT_MS = 10_000;\nexport const CONTRACT_RUN_BUDGET_MS = 30_000;\n" +
+      "export const CONTRACT_PREAMBLE_TIMEOUT_MS = 5_000;\nexport const IMAGE_SCHEMA_TIMEOUT_MS = 20_000;\n" +
+      "export const CONTRACTS_CATALOG_TIMEOUT_MS = 5_000;\nexport const REGISTER_TIMEOUT_MS = 5_000;\n" +
+      "export const RUNTIME_STEPS = 5;\nexport const RUNTIME_STEP_TIMEOUT_MS = 2_000;\n",
+  );
+  if (!budget) throw new Error("startupBudget did not parse the fixture");
+  deepStrictEqual(healthcheckStartPeriodErrors("Dockerfile", healthcheckFixture(540), budget), []);
+  deepStrictEqual(
+    healthcheckStartPeriodErrors("Dockerfile", healthcheckFixture(535), budget).length,
+    1,
+  );
+  deepStrictEqual(startupBudget("export const WAIT_TIMEOUT_MS = 300_000;"), null);
   console.log("Docker runtime regression checks passed.");
   process.exit(0);
 }
@@ -376,24 +457,23 @@ function parseStages(dockerfile: string): Map<string, Set<string>> {
 
 const errors: string[] = [];
 
-// The application CMD does not exist until docker-entrypoint.sh has acquired
-// the schema lock and, when requested, completed Prisma plus hardening. Docker
-// counts failed health probes after --start-period, so keep that period beyond
-// the entrypoint's own lock wait and the reserved apply/boot window.
-const schemaLockTimeout = schemaLockTimeoutSeconds(
-  readFileSync(resolve(ROOT, "scripts/docker-entrypoint.sh"), "utf8"),
+// The application CMD does not exist until docker-entrypoint.sh has run the
+// migration runner. Docker counts failed health probes after --start-period,
+// so that period must exceed every timed step of the gate.
+const budget = startupBudget(
+  BUDGET_SOURCES.map((source) => readFileSync(resolve(ROOT, source), "utf8")).join("\n"),
 );
-if (schemaLockTimeout === null) {
+if (budget === null) {
   errors.push(
-    "scripts/docker-entrypoint.sh: cannot parse the schema advisory lock timeout — update schemaLockTimeoutSeconds() to match the source shape.",
+    `${BUDGET_SOURCES.join(", ")}: cannot parse the startup budget constants (${BUDGET_STEPS.join(", ")}, RUNTIME_STEPS, RUNTIME_STEP_TIMEOUT_MS) — update startupBudget() to match the source.`,
   );
 } else {
   for (const dockerfile of DOCKERFILES) {
     errors.push(
-      ...healthcheckSchemaBudgetErrors(
+      ...healthcheckStartPeriodErrors(
         dockerfile,
         readFileSync(resolve(ROOT, dockerfile), "utf8"),
-        schemaLockTimeout,
+        budget,
       ),
     );
   }
@@ -408,35 +488,18 @@ for (const dockerfile of DOCKERFILES) {
   const dockerfileText = readFileSync(resolve(ROOT, dockerfile), "utf8");
   const stages = parseStages(dockerfile);
 
-  for (const required of REQUIRED_RUNNER_COPIES) {
-    let currentStage = "";
-    const found = [...logicalLines(dockerfileText)].some(({ line }) => {
-      const stageMatch = /^FROM\s+(?:--\S+\s+)*\S+\s+AS\s+(\S+)/i.exec(line);
-      if (stageMatch) {
-        currentStage = stageMatch[1] ?? "";
-        return false;
-      }
-      const fields = line.split(/\s+/);
-      return (
-        currentStage === RUNNER &&
-        fields[0]?.toUpperCase() === "COPY" &&
-        fields.at(-2) === required.source &&
-        fields.at(-1) === required.destination
-      );
-    });
-    if (!found) {
-      errors.push(
-        `${dockerfile}: missing runtime COPY for "${required.source}" to "${required.destination}".`,
-      );
-    }
+  const runnerCopies = runnerBuilderCopies(dockerfileText);
+  for (const entry of RUNTIME_ENTRY_SCRIPTS) {
+    if (!coveringCopy(runnerCopies, entry))
+      errors.push(`${dockerfile} (${RUNNER}): missing runtime COPY for "${entry}" (same path).`);
   }
 
   // Runtime scripts reach other files through relative imports and
   // `new URL(..., import.meta.url)`; the runner copies files one by one, so
   // every file in that closure must be copied to the same path.
   for (const reference of missingRuntimeReferences(
-    REQUIRED_RUNNER_COPIES.map((required) => required.source),
-    runnerBuilderCopies(dockerfileText),
+    RUNTIME_ENTRY_SCRIPTS,
+    runnerCopies,
     (repoPath) => {
       const path = resolve(ROOT, repoPath);
       return existsSync(path) && statSync(path).isFile() ? readFileSync(path, "utf8") : null;

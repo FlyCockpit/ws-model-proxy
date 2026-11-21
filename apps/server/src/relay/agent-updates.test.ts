@@ -20,7 +20,7 @@ import type { CliReleaseManifest } from "../node-http.js";
 import { createAgentUpdates } from "./agent-updates.js";
 
 const MANIFEST: CliReleaseManifest = {
-  version: "0.4.2",
+  version: "1.0.0",
   commit: null,
   releaseUrl: "https://r.example",
   sourceBuild: false,
@@ -62,7 +62,7 @@ describe("the self-update relay port", () => {
     const frame = {
       type: "agent.update" as const,
       updateId: "AAAAAAAAAAAAAAAAAAAAAA",
-      version: "0.4.2",
+      version: "1.0.0",
       artifactUrl: "https://r.example/a",
       sha256: "a".repeat(64),
       signature: null,
@@ -85,7 +85,7 @@ describe("the self-update relay port", () => {
     const frame = {
       type: "agent.update" as const,
       updateId: "AAAAAAAAAAAAAAAAAAAAAA",
-      version: "0.4.2",
+      version: "1.0.0",
       artifactUrl: "https://r.example/a",
       sha256: "a".repeat(64),
       signature: null,
@@ -137,7 +137,7 @@ describe("the self-update relay port", () => {
       },
       source: () => ({ kind: "source", rev }),
     });
-    expect(await updates.port.release()).toEqual({ kind: "source", version: "0.4.2", commit: rev });
+    expect(await updates.port.release()).toEqual({ kind: "source", version: "1.0.0", commit: rev });
     expect(await updates.port.server()).toMatchObject({
       sourceBuild: true,
       commit: rev,

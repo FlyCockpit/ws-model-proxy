@@ -35,6 +35,14 @@ updates:
     cooldown:
       default-days: 3
 
+  # Compose images, including the standalone database development service.
+  - package-ecosystem: docker-compose
+    directories: ["/", "/packages/db"]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+
   # Cargo — covers the Rust CLI workspace.
   - package-ecosystem: cargo
     directory: /apps/cli
@@ -50,7 +58,7 @@ updates:
   #
   # NOTE: Versions in pnpm-workspace.yaml#catalog are NOT updated automatically.
   # The catalog uses pnpm's `catalog:` protocol and Dependabot does not rewrite
-  # those entries. Bump catalog versions manually per patterns/dependencies.md.
+  # those entries. Bump catalog versions manually in pnpm-workspace.yaml.
   - package-ecosystem: npm
     directory: /
     schedule:

@@ -1,10 +1,9 @@
-//! Relay protocol 3.0: the frame types (`frames`), the runtime definition
+//! Relay protocol 4.0: the frame types (`frames`), the runtime definition
 //! shape (`runtime_spec`), canonical JSON for `launchHash` (`canonical`), and
 //! the codec the daemon uses on top of them.
 //!
-//! The server accepts exactly protocol 3.0 and so does this CLI. Between
-//! releases a server extends 3.0 in place, so a field this build does not
-//! know in a server frame or binary metadata is ignored, at any depth, except
+//! The server and CLI speak protocol 4.0. A field this build does not know
+//! in a server frame or binary metadata is ignored, at any depth, except
 //! in runtime definitions (`runtime.define`'s `put` entries and `node` part,
 //! and the `runtime_spec` types), which stay strict and are refused part by
 //! part (`runtime_store::repair`). Frames are then checked for the
@@ -62,21 +61,32 @@ pub fn operator_terminals_supported() -> bool {
     cfg!(any(unix, windows))
 }
 
-/// The fatal error for a `protocol.error` (or an older server's reply) that
-/// arrives before `hello.ok`. A reply without a code comes from a server that
-/// does not speak 3.0: say plainly to upgrade the server. A coded
-/// `upgrade_cli` names the CLI and how to install the matching one.
-pub fn hello_rejection_message(message: &str, code: Option<&ProtocolErrorCode>) -> String {
+/// Parse a relay version with exactly two unsigned decimal components.
+pub(crate) fn relay_protocol_major(version: &str) -> Option<u64> {
+    let (major, minor) = version.split_once('.')?;
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|byte| byte.is_ascii_digit())
+        || !minor.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    minor.parse::<u64>().ok()?;
+    major.parse().ok()
+}
+
+/// The fatal error for a refusal before `hello.ok`.
+pub fn hello_rejection_message(message: &str, code: &ProtocolErrorCode) -> String {
     match code {
-        Some(ProtocolErrorCode::UpgradeServer) | None => format!(
-            "the server rejected relay protocol {RELAY_PROTOCOL_VERSION} (`{message}`); upgrade the WS Model Proxy server or use an older wsmp"
+        ProtocolErrorCode::UpgradeServer => format!(
+            "the server sent an unexpected reply for relay protocol {RELAY_PROTOCOL_VERSION} (`{message}`); upgrade the WS Model Proxy server"
         ),
-        Some(ProtocolErrorCode::UpgradeCli) => format!(
-            "relay protocol error: {message} This wsmp speaks relay protocol {RELAY_PROTOCOL_VERSION}. \
+        ProtocolErrorCode::UpgradeCli => format!(
+            "relay protocol error: {message} This wsmp speaks relay protocol {RELAY_PROTOCOL_VERSION}; upgrade wsmp. \
              Install the server's build by re-running its install.sh \
              (`curl -fsSL https://<your server>/install.sh | sh`), then restart wsmp"
         ),
-        Some(_) => format!("relay protocol error: {message}"),
+        _ => format!("relay protocol error: {message}"),
     }
 }
 
@@ -233,7 +243,7 @@ pub enum FrameFault {
 pub fn control_frame_fault(text: &str) -> FrameFault {
     if text.len() > RELAY_JSON_CONTROL_MAX_BYTES {
         // Byte 256 can fall inside a multibyte char; `&str` indexing panics.
-        // Walk back. `floor_char_boundary` is not stable on MSRV 1.88.
+        // Walk back. `floor_char_boundary` is not stable on MSRV 1.89.
         let mut end = 256.min(text.len());
         while end > 0 && !text.is_char_boundary(end) {
             end -= 1;
@@ -362,7 +372,7 @@ fn classify_binary_metadata(frame: &[u8]) -> FrameFault {
     interactive_fault(&value, false)
 }
 
-/// Every server control frame type of protocol 3.0.
+/// Every server control frame type of protocol 4.0.
 fn known_server_frame(type_name: &str) -> bool {
     matches!(
         type_name,
@@ -457,7 +467,7 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
             None => FrameFault::Ignore,
         };
     }
-    // A malformed frame of a known 3.0 type is a broken server; a frame type
+    // A malformed frame of a known 4.0 type is a broken server; a frame type
     // this protocol does not have is refused and dropped.
     if text_frame && known_server_frame(type_name) {
         return FrameFault::Fatal;
@@ -491,6 +501,15 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_versions_use_numeric_major_components() {
+        assert_eq!(relay_protocol_major("3.0"), Some(3));
+        assert_eq!(relay_protocol_major("10.0"), Some(10));
+        for bad in ["3", "3.", ".0", "+3.0", "3.0.0", " 3.0", "3.x", "3.0\n"] {
+            assert_eq!(relay_protocol_major(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn a_malformed_update_is_refused_by_id_and_never_fatal() {
@@ -591,7 +610,7 @@ mod tests {
 
     fn server_fixtures(dir: &str) -> Vec<(String, String)> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/relay-3.0")
+            .join("tests/fixtures/relay-4.0")
             .join(dir);
         let mut fixtures: Vec<(String, String)> = std::fs::read_dir(&dir)
             .expect("fixture dir")
@@ -699,7 +718,7 @@ mod tests {
     fn runtime_definitions_stay_strict() {
         let text = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/relay-3.0/frames/server-to-node/runtime.define.json"),
+                .join("tests/fixtures/relay-4.0/frames/server-to-node/runtime.define.json"),
         )
         .expect("fixture");
         let json: Value = serde_json::from_str(&text).expect("json");
@@ -767,7 +786,7 @@ mod tests {
     #[test]
     fn a_protocol_error_code_from_a_later_server_is_read_as_unknown() {
         let frame = parse_server_control(
-            r#"{"type":"protocol.error","failure":"protocol_error","code":"brand_new","message":"m","supportedVersions":["3.0"]}"#,
+            r#"{"type":"protocol.error","failure":"protocol_error","code":"brand_new","message":"m","supportedVersions":["4.0"]}"#,
         )
         .expect("parses");
         assert!(matches!(
@@ -953,14 +972,17 @@ mod tests {
 
     #[test]
     fn rejection_messages_name_who_must_upgrade() {
-        let message = hello_rejection_message("Malformed relay protocol message.", None);
+        let message =
+            hello_rejection_message("Upgrade the server.", &ProtocolErrorCode::UpgradeServer);
         assert!(
-            message.contains(&format!("rejected relay protocol {RELAY_PROTOCOL_VERSION}")),
+            message.contains(&format!(
+                "unexpected reply for relay protocol {RELAY_PROTOCOL_VERSION}"
+            )),
             "{message}"
         );
         assert!(message.contains("upgrade the WS Model Proxy server"));
         let reply = "This server requires a newer wsmp. Upgrade wsmp and restart it.";
-        let upgrade_cli = hello_rejection_message(reply, Some(&ProtocolErrorCode::UpgradeCli));
+        let upgrade_cli = hello_rejection_message(reply, &ProtocolErrorCode::UpgradeCli);
         assert!(
             upgrade_cli.starts_with(&format!("relay protocol error: {reply}")),
             "{upgrade_cli}"

@@ -95,7 +95,11 @@ describe("isUserBanned — installed admin-hook parity (frozen clock)", () => {
 
     let upstreamBanned = false;
     try {
-      const hook = admin().init().options.databaseHooks.session.create.before;
+      const plugin = admin();
+      // better-auth 1.7.15+ passes the AuthContext to init(); the hook only falls
+      // back to it when the call ctx has no internalAdapter, and the ctx below has one.
+      type InitAuthContext = Parameters<typeof plugin.init>[0];
+      const hook = plugin.init({} as InitAuthContext).options.databaseHooks.session.create.before;
       type HookCtx = Parameters<typeof hook>[1];
       // Only `userId` is read from the session row; the full row shape
       // satisfies the typed hook signature. The ctx is a PARTIAL mock (two

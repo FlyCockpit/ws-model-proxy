@@ -6,6 +6,7 @@ import { getRequestHeader } from "@tanstack/react-start/server";
 
 import ErrorState from "./components/error-state";
 import Loader from "./components/loader";
+import NotFound from "./components/not-found";
 import i18n from "./i18n";
 import { MAIN_SCROLLER_SELECTOR } from "./lib/main-scroller";
 import { routeTree } from "./routeTree.gen";
@@ -55,6 +56,7 @@ export function getRouter() {
     defaultPreloadStaleTime: 0,
     defaultPendingComponent: () => <Loader />,
     defaultErrorComponent: ErrorState,
+    defaultNotFoundComponent: NotFound,
     context: { orpc, queryClient },
     // The document never scrolls; <main> does. Back/forward restore its position (keyed by
     // its data-scroll-restoration-id) and a new navigation starts it at the top. In-page

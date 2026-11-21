@@ -1,6 +1,7 @@
 import { createRouterClient } from "@orpc/server";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { retryAnswers } from "../integration/retry-answers";
+import { TEST_NODE_FEATURES } from "../lib/node-features-test-fixture";
 import type { RuntimeSpec } from "../lib/runtime-spec";
 import { CALLERS, contextFor } from "./lane-c-test-helpers";
 
@@ -103,6 +104,7 @@ integration("reservations on PostgreSQL", () => {
             trust: "FULL",
             labels: [...labels],
             declaredResources: { kind: "unified", memoryGb: 66 },
+            features: TEST_NODE_FEATURES,
             portStart: 31000,
             portEnd: 31010,
           },
@@ -120,6 +122,7 @@ integration("reservations on PostgreSQL", () => {
           trust: "FULL",
           labels: ["r-w1"],
           declaredResources: { kind: "unified", memoryGb: 66 },
+          features: TEST_NODE_FEATURES,
           portStart: 31000,
           portEnd: 31010,
         },
@@ -549,6 +552,7 @@ integration("reservations on PostgreSQL", () => {
             trust: "FULL",
             labels: [`r-gh${index}`],
             declaredResources: { kind: "unified", memoryGb: 256 },
+            features: TEST_NODE_FEATURES,
             portStart: 31000,
             portEnd: 31010,
           },
@@ -565,6 +569,7 @@ integration("reservations on PostgreSQL", () => {
             trust: "FULL",
             labels: ["r-gshared"],
             declaredResources: { kind: "unified", memoryGb: 66 },
+            features: TEST_NODE_FEATURES,
             portStart: 31000,
             portEnd: 31010,
           },
@@ -666,6 +671,7 @@ integration("reservations on PostgreSQL", () => {
             trust: "FULL",
             labels: [...labels],
             declaredResources: { kind: "unified", memoryGb: 66 },
+            features: TEST_NODE_FEATURES,
             portStart: 31000,
             portEnd: 31010,
           },
@@ -825,6 +831,7 @@ integration("reservations on PostgreSQL", () => {
             trust: "FULL",
             labels: [...labels],
             declaredResources: { kind: "unified", memoryGb: 66 },
+            features: TEST_NODE_FEATURES,
             portStart: 31000,
             portEnd: 31010,
           },

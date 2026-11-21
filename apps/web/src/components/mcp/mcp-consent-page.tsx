@@ -1,4 +1,12 @@
+import { useForm } from "@tanstack/react-form";
 import { useQuery } from "@tanstack/react-query";
+import {
+  AGENT_SCOPES,
+  type AgentScope,
+  accessNarrowed,
+  MCP_FINE_SCOPES,
+  oauthScopeCeiling,
+} from "@ws-model-proxy/api/contracts";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -10,13 +18,16 @@ import {
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-  type AgentLevel,
-  AgentLevelChoice,
-  DEFAULT_AGENT_LEVEL,
-} from "@/components/access/agent-level-choice";
+import { AgentAccessChoice } from "@/components/access/agent-access-choice";
+import { InlineRetry } from "@/components/inline-retry";
 import { useLocationSearch } from "@/hooks/use-location-search";
 import { useMcpConsentSubmit } from "@/hooks/use-mcp-consent-submit";
+import {
+  agentAccessSchema,
+  agentScopeLabelKey,
+  defaultAgentAccess,
+  type EditableAgentAccess,
+} from "@/lib/agent-access";
 import { authClient } from "@/lib/auth-client";
 import {
   explainableMcpScopes,
@@ -25,6 +36,7 @@ import {
   signedRedirectHost,
   toMcpPublicClientInfo,
 } from "@/lib/mcp-oauth-search";
+import { orpc } from "@/utils/orpc";
 
 /**
  * MCP OAuth consent page UI (Phase 6) — rendered by the
@@ -67,9 +79,14 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
   const { phase, submit } = useMcpConsentSubmit();
   // The raw URL, as the consent call forwards it (the router's search is re-serialized).
   const rawSearch = useLocationSearch();
-  // The person's choice only (never read from the URL the client built); the same default as
-  // the agent token dialog.
-  const [level, setLevel] = useState<AgentLevel>(DEFAULT_AGENT_LEVEL);
+  const availableScopes = oauthScopeCeiling(info.scopes);
+  const connections = useQuery({
+    ...orpc.access.oauthGrants.list.queryOptions(),
+    enabled: info.usable,
+    retry: false,
+    staleTime: 0,
+    refetchOnMount: "always",
+  });
 
   const client = useQuery({
     queryKey: ["mcp-consent-client", info.clientId],
@@ -92,16 +109,21 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
     );
   }
 
+  if (phase === "error") {
+    return (
+      <ConsentTerminalCard
+        title={t("auth:mcpConsent.failedTitle")}
+        description={t("auth:mcpConsent.failedDescription")}
+      />
+    );
+  }
+
   if (
     phase === "invalid" ||
     !info.usable ||
     client.isError ||
     (client.isSuccess && client.data === null)
   ) {
-    // "invalid" is the terminal phase for consent API errors (invalid
-    // signature / expired transaction), thrown failures, and approval
-    // responses without a redirect (R83/R84 F4) — the approval buttons must
-    // NOT reappear for a transaction that can no longer be completed.
     return (
       <ConsentTerminalCard
         title={t("auth:mcpConsent.invalidTitle")}
@@ -110,13 +132,20 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
     );
   }
 
-  if (client.isPending || phase === "submitting") {
+  if (
+    client.isPending ||
+    connections.isPending ||
+    (!connections.isFetchedAfterMount && !connections.isError) ||
+    phase === "submitting"
+  ) {
     return (
       <div className="flex min-w-0 items-center justify-center px-4 py-10">
         <div className="w-full max-w-md space-y-4">
           <Skeleton className="mx-auto h-8 w-48" />
-          <Skeleton className="h-6 w-full" />
-          <Skeleton className="h-6 w-full" />
+          {availableScopes.map((scope) => (
+            <Skeleton key={scope} className="h-14 w-full" />
+          ))}
+          <Skeleton className="h-24 w-full" />
           <Skeleton className="h-11 w-full" />
           <Skeleton className="h-11 w-full" />
         </div>
@@ -134,12 +163,77 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
     );
   }
 
-  const clientInfo = client.data;
-  const clientName = clientInfo?.name ?? clientInfo?.clientId ?? t("auth:mcpConsent.unknownClient");
-  const scopeRows = explainableMcpScopes(info.scopes);
-  // Full is offered only when the agent asked to make changes (`mcp:write`): a token without
-  // it can never act at Full, and the server refuses Full for it.
-  const fullAvailable = info.scopes.includes("mcp:write");
+  if (connections.isError) {
+    return (
+      <div className="mx-auto w-full max-w-md p-4">
+        <InlineRetry
+          message={t("auth:mcpConsent.connectionsFailed")}
+          onRetry={() => connections.refetch()}
+        />
+      </div>
+    );
+  }
+  const existing = connections.data.connections.find(
+    // Grants are keyed by a session-derived reference: only this session's connection is the
+    // one this approval replaces (another session's stays as it is).
+    (connection) =>
+      connection.clientId === info.clientId &&
+      connection.currentSession &&
+      connection.revokedAt === null,
+  );
+  return (
+    <McpConsentReview
+      clientName={client.data?.name ?? client.data?.clientId ?? t("auth:mcpConsent.unknownClient")}
+      redirectHost={redirectHost}
+      requestedScopes={info.scopes}
+      availableScopes={availableScopes}
+      existingAccess={existing}
+      submit={submit}
+    />
+  );
+}
+
+/** Mount after saved access loads; background refetches cannot reset the person's edits. */
+function McpConsentReview({
+  clientName,
+  redirectHost,
+  requestedScopes,
+  availableScopes,
+  existingAccess,
+  submit,
+}: {
+  clientName: string;
+  redirectHost: string;
+  requestedScopes: readonly string[];
+  availableScopes: AgentScope[];
+  existingAccess: EditableAgentAccess | undefined;
+  submit: ReturnType<typeof useMcpConsentSubmit>["submit"];
+}) {
+  const { t } = useTranslation(["auth", "access"]);
+  const [initialAccess] = useState<EditableAgentAccess>(() =>
+    existingAccess
+      ? {
+          scopes: existingAccess.scopes.filter((scope) => availableScopes.includes(scope)),
+          nodeIds: existingAccess.nodeIds === null ? null : [...existingAccess.nodeIds],
+        }
+      : defaultAgentAccess(),
+  );
+  const form = useForm({
+    defaultValues: initialAccess,
+    validators: { onSubmit: agentAccessSchema },
+    onSubmit: async ({ value }) => {
+      await submit(true, {
+        ...value,
+        scopes: value.scopes.filter((scope) => availableScopes.includes(scope)),
+      });
+    },
+  });
+  // The chooser explains agent permissions. Still disclose refresh/offline access and
+  // other OAuth scopes, which are separate from the permissions the person can choose.
+  const agentOAuthScopes: readonly string[] = ["mcp:read", ...MCP_FINE_SCOPES];
+  const otherScopes = explainableMcpScopes(
+    requestedScopes.filter((scope) => !agentOAuthScopes.includes(scope)),
+  );
 
   return (
     <div className="flex min-w-0 items-center justify-center px-4 py-10">
@@ -157,15 +251,59 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
           </p>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="space-y-3">
-            <p className="text-sm font-medium">{t("auth:mcpConsent.scopesTitle")}</p>
-            <ul className="space-y-3">
-              {scopeRows.length === 0 ? (
-                <li className="text-sm text-muted-foreground">{t("auth:mcpConsent.noScopes")}</li>
-              ) : (
-                scopeRows.map((row) => (
+          <form.Field name="scopes">
+            {(scopesField) => (
+              <form.Field name="nodeIds">
+                {(nodesField) => (
+                  <AgentAccessChoice
+                    value={{ scopes: scopesField.state.value, nodeIds: nodesField.state.value }}
+                    availableScopes={availableScopes}
+                    onChange={(next) => {
+                      scopesField.handleChange(next.scopes);
+                      nodesField.handleChange(next.nodeIds);
+                    }}
+                  />
+                )}
+              </form.Field>
+            )}
+          </form.Field>
+          {availableScopes.length < AGENT_SCOPES.length ? (
+            <p className="text-sm text-muted-foreground">
+              {t("auth:mcpConsent.requestedCeiling", {
+                scopes: availableScopes
+                  .map((scope) => t(`access:agents.scopes.${agentScopeLabelKey[scope]}.name`))
+                  .join(", "),
+              })}
+            </p>
+          ) : null}
+          <form.Subscribe selector={(state) => state.values}>
+            {(value) =>
+              existingAccess ? (
+                <>
+                  {accessNarrowed(existingAccess, value) ? (
+                    <p
+                      role="alert"
+                      className="rounded-md border border-destructive/40 p-3 text-sm text-destructive"
+                    >
+                      {t("auth:mcpConsent.narrowWarning")}
+                    </p>
+                  ) : null}
+                  {accessNarrowed(value, existingAccess) ? (
+                    <p role="status" className="rounded-md border p-3 text-sm">
+                      {t("auth:mcpConsent.widenNotice")}
+                    </p>
+                  ) : null}
+                </>
+              ) : null
+            }
+          </form.Subscribe>
+          {otherScopes.length > 0 ? (
+            <div className="min-w-0 space-y-2">
+              <p className="text-sm font-medium">{t("auth:mcpConsent.scopesTitle")}</p>
+              <ul className="space-y-3">
+                {otherScopes.map((row) => (
                   <li key={row.raw} className="min-w-0 space-y-1">
-                    <p className="min-w-0 break-words text-sm font-medium">
+                    <p className="break-words text-sm font-medium">
                       {row.key === null
                         ? t("auth:mcpConsent.scopes.additionalName", { scope: row.raw })
                         : t(`auth:mcpConsent.scopes.${row.key}.name`)}
@@ -176,25 +314,15 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
                         : t(`auth:mcpConsent.scopes.${row.key}.description`)}
                     </p>
                   </li>
-                ))
-              )}
-            </ul>
-          </div>
-          {fullAvailable ? (
-            <AgentLevelChoice value={level} onChange={setLevel} />
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              {t("auth:mcpConsent.readOnlyRequested")}
-            </p>
-          )}
+                ))}
+              </ul>
+            </div>
+          ) : null}
           <p className="text-xs text-muted-foreground">{t("auth:mcpConsent.manageNote")}</p>
           <div className="space-y-2">
             {/* Submitting renders the skeleton above, so these are only
                 reachable in the review phase. */}
-            <Button
-              className="min-h-[44px] w-full"
-              onClick={() => void submit(true, fullAvailable ? level : DEFAULT_AGENT_LEVEL)}
-            >
+            <Button className="min-h-[44px] w-full" onClick={() => void form.handleSubmit()}>
               {t("auth:mcpConsent.accept")}
             </Button>
             <Button

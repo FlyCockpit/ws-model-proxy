@@ -25,8 +25,14 @@ function node(id: string, overrides: Partial<PlacementNode> = {}): PlacementNode
     frozenFabrics: null,
     memoryGb: 126,
     gpus: [],
+    unifiedAcceleratorGb: null,
+    ramOnlyGb: null,
     liveFreeMemoryGb: null,
-    launch: null,
+    launch: {
+      platform: "linux",
+      management: new Set(["process", "service"]),
+      shells: new Set(["sh"]),
+    },
     ...overrides,
   };
 }

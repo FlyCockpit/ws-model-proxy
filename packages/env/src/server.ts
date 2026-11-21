@@ -42,6 +42,8 @@ export const env = createEnv({
     BETTER_AUTH_URL: originUrl("BETTER_AUTH_URL"),
     CORS_ORIGIN: originUrl("CORS_ORIGIN").optional(),
     SIGNUP_ENABLED: strictBooleanFlag(),
+    // Automatic migration/pre-drop backups are opt-in, even when storage is mounted.
+    BACKUP_ENABLED: strictBooleanFlag(),
     // On a fresh production database with public signup disabled, this is the
     // sole address that may create the bootstrap administrator. Transform it
     // into the exact database identity used by the auth hook, so case and
@@ -161,12 +163,8 @@ export const env = createEnv({
       .regex(/^https:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?(\/[A-Za-z0-9._~%+@-]+)*\/?$/)
       .transform((url) => url.replace(/\/+$/, ""))
       .optional(),
-    // Agent tokens default to 90 days when expiresAt is omitted.
-    // This flag still allows an explicit no-expiry (null) mint. Turn it off
-    // to refuse that choice; an omitted expiry stays 90 days, and a chosen
-    // timestamp must still fall within MCP_PAT_MAX_TTL_DAYS (see
-    // packages/auth/src/mcp-config.ts). Mint time only; existing tokens are
-    // unaffected. The flag's own default stays true.
+    // Mint-time policies; existing tokens are unaffected.
+    WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS: z.coerce.number().int().min(1).max(3650).default(90),
     WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: strictBooleanFlag(true),
     WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: strictBooleanFlag(),
     // Browser terminals one user may have open at once, across all CLIs.
@@ -195,13 +193,6 @@ export const env = createEnv({
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,
 });
-
-/** 0.4.0 replaced the RATE_LIMIT_* settings with WMP_RATE_LIMIT_SCALE: say so once. */
-const legacyRateLimitKeys = Object.keys(process.env).filter((key) => key.startsWith("RATE_LIMIT_"));
-if (legacyRateLimitKeys.length > 0)
-  console.warn(
-    `[env] ${legacyRateLimitKeys.join(", ")} ${legacyRateLimitKeys.length === 1 ? "is" : "are"} no longer read: rate limits are built in, scaled by WMP_RATE_LIMIT_SCALE.`,
-  );
 
 export const SIGNUP_ENABLED: boolean = env.SIGNUP_ENABLED;
 

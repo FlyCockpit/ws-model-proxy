@@ -11,7 +11,14 @@
  *   usable memory. A service runtime (no served models) claims its declared resources too.
  * - GPUs: a `discrete` rank takes `gpuCount` GPUs of one vendor (`vendor`, when set) that each
  *   have `vramGb` free. A unified GPU (GB10, an APU) has no VRAM of its own: what a rank takes on it
- *   comes out of the node's usable memory. Claims are replayed in a fixed order with the same best-fit rule, so which
+ *   comes out of the node's usable memory AND its shared accelerator budget, when known.
+ *   The latter is effective accelerator memory minus unified GPUs' reserved VRAM, with no
+ *   OS headroom deduction (the 2 GiB OS reserve is on system memory only). RAM-only claims
+ *   do not consume it. Unified-kind entries also charge their memory to this shared pool.
+ *   Host RAM (cpu.ramGb and discrete.ramGb) additionally fits the detected RAM-only budget,
+ *   which excludes an AMD APU BIOS carve-out: R <= P - C - H, while R + G <= P - H and G <= A.
+ *   Reservations reduce the corresponding pools. All unified GPUs share the accelerator budget.
+ *   Claims are replayed in a fixed order with the same best-fit rule, so which
  *   GPU a claim holds is deterministic and freeing it gives back exactly what it took.
  * - Ports: every claim's `port` and `distPort` stay taken until the claim is released, also
  *   for an instance this plan stops (its start queues behind the stop, `blockedBy`).
@@ -142,12 +149,16 @@ export type PlacementNode = {
   frozenFabrics: readonly PlacementFrozenFabric[] | "current" | null;
   /** Usable node memory (GiB) before any claim (`effectiveHardware().usableMemoryGb`). */
   memoryGb: number;
+  /** Unified node's GPU-addressable memory minus unified GPU reservations; unknown: no cap. */
+  unifiedAcceleratorGb: number | null;
+  /** Host RAM budget excluding a detected AMD APU carve-out; null: no extra cap. */
+  ramOnlyGb: number | null;
   gpus: readonly PlacementGpu[];
   /** Free memory from a live `node.metrics` sample, or null. Warnings only. */
   liveFreeMemoryGb: number | null;
   /**
-   * What runtime launches the node can run (`launchCapabilities`); null when it does not say
-   * (not checked: the node refuses what it cannot run).
+   * What runtime launches the node can run (`launchCapabilities`); null means no launch
+   * mechanism is available, so placement refuses it.
    */
   launch: LaunchCapabilities | null;
 };
@@ -331,9 +342,15 @@ export type PlacementResult =
 
 // ── Resources ──
 
-type Needs = { memoryGb: number; gpuCount: number; vramGb: number; vendor: GpuVendor | null };
+type Needs = {
+  memoryGb: number;
+  unifiedMemoryGb: number;
+  gpuCount: number;
+  vramGb: number;
+  vendor: GpuVendor | null;
+};
 
-const NO_NEEDS: Needs = { memoryGb: 0, gpuCount: 0, vramGb: 0, vendor: null };
+const NO_NEEDS: Needs = { memoryGb: 0, unifiedMemoryGb: 0, gpuCount: 0, vramGb: 0, vendor: null };
 
 /**
  * The GPUs a discrete claim holds, as the planner recorded them in the rank's `resources`
@@ -368,12 +385,13 @@ export function resourceNeeds(resources: unknown): Needs {
     case "none":
       return NO_NEEDS;
     case "unified":
-      return { ...NO_NEEDS, memoryGb: resource.memoryGb };
+      return { ...NO_NEEDS, memoryGb: resource.memoryGb, unifiedMemoryGb: resource.memoryGb };
     case "cpu":
       return { ...NO_NEEDS, memoryGb: resource.ramGb };
     case "discrete":
       return {
         memoryGb: resource.ramGb ?? 0,
+        unifiedMemoryGb: 0,
         gpuCount: resource.gpuCount,
         vramGb: resource.vramGb,
         vendor: resource.vendor ?? null,
@@ -411,6 +429,8 @@ class PortClaims {
 
 type Budget = {
   memoryGb: number;
+  unifiedAcceleratorGb: number | null;
+  ramOnlyGb: number | null;
   gpus: GpuBudget[];
   ports: PortClaims;
   /**
@@ -423,6 +443,8 @@ type Budget = {
 function cloneBudget(budget: Budget): Budget {
   return {
     memoryGb: budget.memoryGb,
+    unifiedAcceleratorGb: budget.unifiedAcceleratorGb,
+    ramOnlyGb: budget.ramOnlyGb,
     gpus: budget.gpus.map((gpu) => ({ ...gpu })),
     ports: new PortClaims(budget.ports),
     definitions: new Set(budget.definitions),
@@ -444,11 +466,13 @@ function definitionSlotsFull(budget: Budget, request: PlacementRequest) {
 }
 
 /**
- * What a GPU has free for a rank: its own VRAM, or on a unified GPU the node memory left once
- * the rank's own memory (`reserveGb`) is taken.
+ * What a GPU has free: dedicated VRAM, or the smaller of remaining shared accelerator room
+ * and node RAM after the rank's own memory (`reserveGb`).
  */
 function gpuFreeGb(budget: Budget, gpu: GpuBudget, reserveGb: number): number {
-  return gpu.unified ? budget.memoryGb - reserveGb : gpu.freeGb;
+  return gpu.unified
+    ? Math.min(budget.memoryGb - reserveGb, budget.unifiedAcceleratorGb ?? Infinity)
+    : gpu.freeGb;
 }
 
 /** How many of these GPU keys are unified (their VRAM comes out of node memory). */
@@ -522,6 +546,11 @@ function pickGpus(budget: Budget, needs: Needs): string[] | null {
 function freshFits(budget: Budget, needs: Needs, gpuKeys: readonly string[]): boolean {
   const shared = unifiedCount(budget, gpuKeys);
   if (needs.memoryGb + shared * needs.vramGb > budget.memoryGb + EPSILON) return false;
+  const sharedGb = needs.unifiedMemoryGb + shared * needs.vramGb;
+  if (sharedGb > 0 && sharedGb > (budget.unifiedAcceleratorGb ?? Infinity) + EPSILON) return false;
+  // Each sub-pool is checked only for a claim that uses it, like the accelerator pool above.
+  const hostGb = needs.memoryGb - needs.unifiedMemoryGb;
+  if (hostGb > 0 && hostGb > (budget.ramOnlyGb ?? Infinity) + EPSILON) return false;
   for (const key of gpuKeys) {
     const gpu = budget.gpus.find((candidate) => candidate.key === key);
     if (gpu && !gpu.unified && gpu.freeGb + EPSILON < needs.vramGb) return false;
@@ -536,6 +565,16 @@ function freshFits(budget: Budget, needs: Needs, gpuKeys: readonly string[]): bo
 function overFits(budget: Budget, needs: Needs, gpuKeys: readonly string[], floor: Floor): boolean {
   const take = overlapGrowth(floor.floor, floor.placed, usageOf(budget, needs, gpuKeys));
   if (!grows(take.memoryGb, budget.memoryGb)) return false;
+  if (
+    needs.memoryGb - needs.unifiedMemoryGb > 0 &&
+    !grows(take.ramOnlyGb, budget.ramOnlyGb ?? Infinity)
+  )
+    return false;
+  if (
+    (needs.unifiedMemoryGb > 0 || unifiedCount(budget, gpuKeys) > 0) &&
+    !grows(take.sharedVramGb, budget.unifiedAcceleratorGb ?? Infinity)
+  )
+    return false;
   // On each GPU the new claim uses (one only its old run holds is freed once that run stops:
   // its over-commit there is not the new claim's to cover).
   for (const [key, gb] of take.gpus) {
@@ -552,19 +591,26 @@ function overFits(budget: Budget, needs: Needs, gpuKeys: readonly string[], floo
  */
 function usageOf(budget: Budget, needs: Needs, gpuKeys: readonly string[]): ClaimUsage {
   let memoryGb = needs.memoryGb;
+  let sharedVramGb = needs.unifiedMemoryGb;
+  const ramOnlyGb = needs.memoryGb - needs.unifiedMemoryGb;
   const gpus = new Map<string, number>();
   for (const key of gpuKeys) {
     const gpu = budget.gpus.find((candidate) => candidate.key === key);
     if (!gpu) continue;
-    if (gpu.unified) memoryGb += needs.vramGb;
-    else gpus.set(key, (gpus.get(key) ?? 0) + needs.vramGb);
+    if (gpu.unified) {
+      memoryGb += needs.vramGb;
+      sharedVramGb += needs.vramGb;
+    } else gpus.set(key, (gpus.get(key) ?? 0) + needs.vramGb);
   }
-  return { memoryGb, gpus };
+  return { memoryGb, sharedVramGb, ramOnlyGb, gpus };
 }
 
 /** Takes (sign 1) or gives back (sign -1) a usage. */
 function applyUsage(budget: Budget, usage: ClaimUsage, sign: 1 | -1): void {
   budget.memoryGb -= sign * usage.memoryGb;
+  if (budget.ramOnlyGb !== null) budget.ramOnlyGb -= sign * usage.ramOnlyGb;
+  if (budget.unifiedAcceleratorGb !== null)
+    budget.unifiedAcceleratorGb -= sign * usage.sharedVramGb;
   for (const [key, gb] of usage.gpus) {
     const gpu = budget.gpus.find((candidate) => candidate.key === key);
     if (gpu) gpu.freeGb -= sign * gb;
@@ -598,18 +644,35 @@ function pickGpusOver(budget: Budget, needs: Needs, floor: Floor): string[] | nu
     gpu.unified
       ? overlapGrowth(floor.floor, floor.placed, {
           memoryGb: needs.memoryGb + needs.vramGb,
+          sharedVramGb: needs.vramGb,
+          ramOnlyGb: needs.memoryGb,
           gpus: new Map(),
         }).memoryGb
       : (overlapGrowth(floor.floor, floor.placed, {
           memoryGb: 0,
+          sharedVramGb: 0,
+          ramOnlyGb: 0,
           gpus: new Map([[gpu.key, needs.vramGb]]),
         }).gpus.get(gpu.key) ?? 0);
-  const left = (gpu: GpuBudget) => (gpu.unified ? budget.memoryGb : gpu.freeGb) - growth(gpu);
+  const acceleratorGrowth = overlapGrowth(floor.floor, floor.placed, {
+    memoryGb: 0,
+    sharedVramGb: needs.vramGb,
+    ramOnlyGb: 0,
+    gpus: new Map(),
+  }).sharedVramGb;
+  const left = (gpu: GpuBudget) =>
+    gpu.unified
+      ? Math.min(
+          budget.memoryGb - growth(gpu),
+          (budget.unifiedAcceleratorGb ?? Infinity) - acceleratorGrowth,
+        )
+      : gpu.freeGb - growth(gpu);
   const fitting = budget.gpus
     .filter(
       (gpu) =>
         (needs.vendor === null || gpu.vendor === needs.vendor) &&
-        grows(growth(gpu), gpu.unified ? budget.memoryGb : gpu.freeGb),
+        grows(growth(gpu), gpu.unified ? budget.memoryGb : gpu.freeGb) &&
+        (!gpu.unified || grows(acceleratorGrowth, budget.unifiedAcceleratorGb ?? Infinity)),
     )
     .sort(
       (a, b) =>
@@ -637,7 +700,12 @@ function pickGpusOver(budget: Budget, needs: Needs, floor: Floor): string[] | nu
 function claimUsage(budget: Budget, needs: Needs, resources: unknown): ClaimUsage {
   if (needs.gpuCount === 0) return usageOf(budget, needs, []);
   const holds = claimVramHolds(resources, budget.gpus);
-  return { memoryGb: needs.memoryGb + holds.sharedGb, gpus: holds.dedicated };
+  return {
+    memoryGb: needs.memoryGb + holds.sharedGb,
+    sharedVramGb: holds.sharedGb,
+    ramOnlyGb: needs.memoryGb,
+    gpus: holds.dedicated,
+  };
 }
 
 /**
@@ -787,7 +855,12 @@ function instanceMemoryGb(instance: PlacementInstance): number {
     const group = byNode.get(rank.nodeId) ?? { current: [], previous: [] };
     byNode.set(rank.nodeId, group);
     const memoryGb = resourceNeeds(rank.resources).memoryGb + gpuGb(rank.resources);
-    (rank.previous ? group.previous : group.current).push({ memoryGb, gpus: new Map() });
+    (rank.previous ? group.previous : group.current).push({
+      memoryGb,
+      sharedVramGb: 0,
+      ramOnlyGb: 0,
+      gpus: new Map(),
+    });
   }
   return [...byNode.values()].reduce(
     (sum, group) => sum + overlapUsage(group.current, group.previous).memoryGb,
@@ -908,6 +981,42 @@ function refusal(reason: RefusalReason, subjectId: string | null, message?: stri
   return { reason, subjectId, message: message ?? MESSAGES[reason] ?? reason };
 }
 
+/** Name only the additional pools that fail, independently of the total RAM constraint. */
+function memoryLimits(
+  node: PlacementNode,
+  budget: Budget | undefined,
+  needs: Needs,
+  floor?: Floor,
+): string {
+  if (!budget) return "";
+  const limits: string[] = [];
+  const ramTake = floor
+    ? overlapGrowth(floor.floor, floor.placed, usageOf(budget, needs, [])).ramOnlyGb
+    : needs.memoryGb - needs.unifiedMemoryGb;
+  if (
+    node.ramOnlyGb !== null &&
+    needs.memoryGb - needs.unifiedMemoryGb > 0 &&
+    ramTake > (budget.ramOnlyGb ?? Infinity) + EPSILON
+  )
+    limits.push(
+      ` RAM-only limit on ${node.slug}: ${gib(node.ramOnlyGb)} usable, ${gib(Math.max(0, budget.ramOnlyGb ?? 0))} free; host RAM cannot use the APU BIOS VRAM carve-out.`,
+    );
+  if (node.unifiedAcceleratorGb !== null) {
+    // Ignore RAM here so a RAM-only failure never blames an accelerator pool with enough room.
+    // Keep dedicated GPU limits: a fitting dedicated alternative means the shared cap did not fail.
+    const trial = { ...budget, memoryGb: Infinity, ramOnlyGb: null };
+    const fitsPool = (b: Budget) => {
+      const keys = floor ? pickGpusOver(b, needs, floor) : pickGpus(b, needs);
+      return keys !== null && (floor ? overFits(b, needs, keys, floor) : freshFits(b, needs, keys));
+    };
+    if (!fitsPool(trial) && fitsPool({ ...trial, unifiedAcceleratorGb: null }))
+      limits.push(
+        ` Unified accelerator limit on ${node.slug}: ${gib(node.unifiedAcceleratorGb)} usable, ${gib(Math.max(0, budget.unifiedAcceleratorGb ?? 0))} free for GPU-side memory (unified entries and VRAM across all unified GPUs).`,
+      );
+  }
+  return limits.join("");
+}
+
 function gib(value: number): string {
   return `${Math.round(value * 100) / 100} GiB`;
 }
@@ -1024,6 +1133,8 @@ export class PlacementPlanner {
         node.id,
         {
           memoryGb: node.memoryGb,
+          unifiedAcceleratorGb: node.unifiedAcceleratorGb,
+          ramOnlyGb: node.ramOnlyGb,
           gpus: [...node.gpus]
             .sort((a, b) => compareCodePoints(a.key, b.key))
             .map((gpu) => ({
@@ -1121,7 +1232,11 @@ export class PlacementPlanner {
         !("refusal" in this.#chooseOnce(request, true))
       )
         chosen = {
-          refusal: refusal("restart_overlap_no_room", chosen.refusal.subjectId),
+          refusal: refusal(
+            "restart_overlap_no_room",
+            chosen.refusal.subjectId,
+            `${chosen.refusal.message} ${MESSAGES.restart_overlap_no_room}`,
+          ),
         };
     } catch (error) {
       if (!(error instanceof WorkBudgetSpent)) throw error;
@@ -1534,7 +1649,7 @@ export class PlacementPlanner {
       if (choice) return choice;
       // The rank fits somewhere, but no node for it leaves its reservations room.
       if (this.#reservationRefusal) return { refusal: this.#reservationRefusal };
-      return { refusal: this.#autoRefusal(reasons, request, eligible) };
+      return { refusal: this.#autoRefusal(reasons, request, eligible, working) };
     }
 
     // Multi-node: one fabric. No fabric with enough members at all → no_shared_fabric.
@@ -1584,7 +1699,7 @@ export class PlacementPlanner {
       );
       return { refusal: refusal(reason ?? "not_enough_nodes", null) };
     }
-    return { refusal: this.#autoRefusal(reasons, request, eligible) };
+    return { refusal: this.#autoRefusal(reasons, request, eligible, working) };
   }
 
   /**
@@ -1967,6 +2082,12 @@ export class PlacementPlanner {
           node,
           reason: "not_enough_memory",
           freeGb: working.budgets.get(node.id)?.memoryGb ?? 0,
+          memoryLimits: memoryLimits(
+            node,
+            working.budgets.get(node.id),
+            resourceNeeds(entry.reservation.resources),
+            working.floors.get(node.id),
+          ),
         });
       else fitting.push(choice);
     }
@@ -2001,6 +2122,12 @@ export class PlacementPlanner {
             node,
             reason: "not_enough_memory",
             freeGb: working.budgets.get(node.id)?.memoryGb ?? 0,
+            memoryLimits: memoryLimits(
+              node,
+              working.budgets.get(node.id),
+              resourceNeeds(entry.reservation.resources),
+              working.floors.get(node.id),
+            ),
           });
         else choices.push(choice);
       }
@@ -2082,6 +2209,12 @@ export class PlacementPlanner {
             node,
             reason: "not_enough_memory",
             freeGb: working.budgets.get(node.id)?.memoryGb ?? 0,
+            memoryLimits: memoryLimits(
+              node,
+              working.budgets.get(node.id),
+              resourceNeeds(reservation.resources),
+              working.floors.get(node.id),
+            ),
           });
         else choices.push(choice);
       }
@@ -2131,6 +2264,12 @@ export class PlacementPlanner {
                     node,
                     reason: "not_enough_memory",
                     freeGb: working.budgets.get(node.id)?.memoryGb ?? 0,
+                    memoryLimits: memoryLimits(
+                      node,
+                      working.budgets.get(node.id),
+                      resourceNeeds(option.reservation.resources),
+                      working.floors.get(node.id),
+                    ),
                   },
                 ]
               : option.misses,
@@ -2349,7 +2488,7 @@ export class PlacementPlanner {
   #ineligible(node: PlacementNode, request: PlacementRequest): RefusalReason | null {
     if (!request.launch.labels.every((label) => node.labels.includes(label)))
       return "label_mismatch";
-    if (node.launch && !launchRunsOn(request.launch, node.launch)) return "unsupported_platform";
+    if (!node.launch || !launchRunsOn(request.launch, node.launch)) return "unsupported_platform";
     if (this.#context.agent && node.trust !== "FULL") return "trust_relay";
     if (
       request.checkFrozen &&
@@ -2455,7 +2594,7 @@ export class PlacementPlanner {
     return refusal(
       "not_enough_memory",
       node.id,
-      `This node has ${gib(Math.max(0, budget?.memoryGb ?? 0))} free for a rank that needs ${gib(needs.memoryGb)}${needs.gpuCount ? ` and ${needs.gpuCount} GPU(s) with ${gib(needs.vramGb)} each` : ""}${request.preempt ? ", even after stopping what may be stopped" : ""}.`,
+      `This node has ${gib(Math.max(0, budget?.memoryGb ?? 0))} free for a rank that needs ${gib(needs.memoryGb)}${needs.gpuCount ? ` and ${needs.gpuCount} GPU(s) with ${gib(needs.vramGb)} each` : ""}${request.preempt ? ", even after stopping what may be stopped" : ""}.${memoryLimits(node, budget, needs, working.floors.get(node.id))}`,
     );
   }
 
@@ -2463,6 +2602,7 @@ export class PlacementPlanner {
     reasons: ReadonlySet<RefusalReason>,
     request: PlacementRequest,
     eligible: readonly PlacementNode[],
+    working: Working,
   ): PlacementRefusal {
     const { launch } = request;
     if (eligible.length < launch.groupSize) {
@@ -2472,11 +2612,24 @@ export class PlacementPlanner {
     const reason = REASON_ORDER.find((candidate) => reasons.has(candidate)) ?? "not_enough_nodes";
     if (reason !== "not_enough_memory") return refusal(reason, null);
     const needs = resourceNeeds(rankResources(launch, 0));
-    const most = Math.max(0, ...eligible.map((node) => this.#budgets.get(node.id)?.memoryGb ?? 0));
+    const most = Math.max(
+      0,
+      ...eligible.map((node) => working.budgets.get(node.id)?.memoryGb ?? 0),
+    );
+    const limitedNode = eligible
+      .filter((node) =>
+        memoryLimits(node, working.budgets.get(node.id), needs, working.floors.get(node.id)),
+      )
+      .sort(
+        (a, b) =>
+          (working.budgets.get(b.id)?.unifiedAcceleratorGb ?? 0) -
+            (working.budgets.get(a.id)?.unifiedAcceleratorGb ?? 0) ||
+          compareCodePoints(a.slug, b.slug),
+      )[0];
     return refusal(
       "not_enough_memory",
       null,
-      `No ${launch.groupSize > 1 ? "set of eligible nodes in one fabric" : "eligible node"} has room: a rank needs ${gib(needs.memoryGb)}${needs.gpuCount ? ` and ${needs.gpuCount} GPU(s) with ${gib(needs.vramGb)} each` : ""}; the most memory free on one node is ${gib(most)}${request.preempt ? ", even after stopping what may be stopped" : ""}.`,
+      `No ${launch.groupSize > 1 ? "set of eligible nodes in one fabric" : "eligible node"} has room: a rank needs ${gib(needs.memoryGb)}${needs.gpuCount ? ` and ${needs.gpuCount} GPU(s) with ${gib(needs.vramGb)} each` : ""}; the most memory free on one node is ${gib(most)}${request.preempt ? ", even after stopping what may be stopped" : ""}.${limitedNode ? memoryLimits(limitedNode, working.budgets.get(limitedNode.id), needs, working.floors.get(limitedNode.id)) : ""}`,
     );
   }
 
@@ -2557,6 +2710,7 @@ type ReservationMiss = {
   reason: "not_enough_memory" | "node_offline" | "node_held" | "trust_relay" | "runtime_node";
   /** Memory free on the node (for `not_enough_memory`). */
   freeGb: number;
+  memoryLimits?: string;
 };
 
 /** Up to three node slugs, then how many more. */
@@ -2600,7 +2754,7 @@ function reservationRefusal(
         memory.length === 1
           ? `${closest.node.slug} has ${free}`
           : `not enough room on ${slugList(memory.map((miss) => miss.node))} (the most is ${free} on ${closest.node.slug})`
-      }, and it needs ${gib(needs.memoryGb)}${needs.gpuCount ? ` and ${needs.gpuCount} GPU(s) with ${gib(needs.vramGb)} each` : ""}${options.preempt ? ", even after stopping what may be stopped" : ""}`,
+      }, and it needs ${gib(needs.memoryGb)}${needs.gpuCount ? ` and ${needs.gpuCount} GPU(s) with ${gib(needs.vramGb)} each` : ""}${options.preempt ? ", even after stopping what may be stopped" : ""}${closest.memoryLimits ?? ""}`,
     });
   }
   for (const [reason, text] of [
@@ -2662,10 +2816,15 @@ function rankChoice(
   waits: boolean,
   definition: string | null,
 ): RankChoice {
-  // VRAM on a unified GPU is node memory: it counts in the memory left over (`take`).
-  const gpuLeft = budget.gpus
-    .filter((gpu) => !gpu.unified && fitted.gpuKeys.includes(gpu.key))
-    .reduce((sum, gpu) => sum + gpu.freeGb - (fitted.take.gpus.get(gpu.key) ?? 0), 0);
+  // Unified VRAM counts in RAM left over and the shared accelerator room (once per pool).
+  const gpuLeft =
+    ((fitted.needs.unifiedMemoryGb > 0 || unifiedCount(budget, fitted.gpuKeys) > 0) &&
+    budget.unifiedAcceleratorGb !== null
+      ? budget.unifiedAcceleratorGb - fitted.take.sharedVramGb
+      : 0) +
+    budget.gpus
+      .filter((gpu) => !gpu.unified && fitted.gpuKeys.includes(gpu.key))
+      .reduce((sum, gpu) => sum + gpu.freeGb - (fitted.take.gpus.get(gpu.key) ?? 0), 0);
   return {
     node,
     victims,

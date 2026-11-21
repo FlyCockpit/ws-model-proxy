@@ -72,6 +72,7 @@ export const appContract = {
         privateNetworksAllowed: z.boolean(),
         mcpEnabled: z.boolean(),
         agentTokenNoExpiryAllowed: z.boolean(),
+        agentTokenMaxLifetimeDays: z.number().int().min(1).max(3650),
       })
       .strict(),
     "Product switches of this server for a signed-in person (was deploymentFlags).",

@@ -11,7 +11,8 @@ export function announceShared(
     | { kind: "share" }
     | { kind: "invite"; invite: { expiresAt: string }; link: string | null },
   email: string,
-  t: (key: string, options?: Record<string, unknown>) => string,
+  // Options are required: i18next 27's TFunction no longer matches an optional-options signature.
+  t: (key: string, options: Record<string, unknown>) => string,
   onLink: (link: InviteLink) => void,
 ) {
   if (result.kind === "share") toast.success(t("access:shares.shared", { email }));

@@ -171,12 +171,15 @@ pub(super) fn exchange_with(
     primitive: Primitive,
 ) -> Result<(), Errno> {
     run(primitive, || {
-        #[cfg(target_os = "linux")]
+        // glibc: nix's libc wrapper (the durability tests inject faults into it
+        // through LD_PRELOAD). musl and macOS: rustix, which issues renameat2
+        // directly on Linux (nix wraps it only for glibc) and renamex_np on macOS.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
         {
             use nix::fcntl::{RenameFlags, renameat2};
             renameat2(dir_from, from, dir_to, to, RenameFlags::RENAME_EXCHANGE)
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
         {
             use rustix::fs::{RenameFlags, renameat_with};
             renameat_with(dir_from, from, dir_to, to, RenameFlags::EXCHANGE)
@@ -194,12 +197,12 @@ pub(super) fn no_replace(
     primitive: Primitive,
 ) -> Result<(), Errno> {
     run(primitive, || {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
         {
             use nix::fcntl::{RenameFlags, renameat2};
             renameat2(dir_from, from, dir_to, to, RenameFlags::RENAME_NOREPLACE)
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(all(target_os = "linux", not(target_env = "gnu")), target_os = "macos"))]
         {
             use rustix::fs::{RenameFlags, renameat_with};
             renameat_with(dir_from, from, dir_to, to, RenameFlags::NOREPLACE)

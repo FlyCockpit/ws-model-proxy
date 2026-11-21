@@ -1,19 +1,11 @@
-/**
- * oRPC base procedures. Every 0.4.0 procedure is bound to its contract through
- * `contract-procedure.ts`, which picks the access check from the contract's access tag; the
- * named bases below are the same checks for code outside the contract tree.
- */
-import { ORPCError, os } from "@orpc/server";
+/** Contract-bound procedure access checks shared by all transports. */
+import { ORPCError } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
 import { isAdminRole } from "@ws-model-proxy/auth/roles";
 import type { Context } from "./context";
 import { callerMayReach, isHumanCaller } from "./contracts/auth-context";
 import type { ProcedureAccess } from "./contracts/procedure";
-
-const o = os.$context<Context>();
-
-export const publicProcedure = o;
 
 function forbidden(message: string) {
   return new ORPCError("FORBIDDEN", { message });
@@ -31,6 +23,24 @@ async function assertTwoFactorPolicy(session: Session): Promise<void> {
 
 function isVerifiedAdmin(session: Session): boolean {
   return session.user.emailVerified && isAdminRole(session.user.role);
+}
+
+export type AdminAuthorityFailure = "not-admin" | "two-factor";
+
+/**
+ * The admin authority rule: verified email, admin role, then the forced-2FA policy. The one
+ * definition: `assertAccess` applies the same two parts for the admin levels, and HTTP surfaces
+ * reached without an oRPC context (`apps/server/src/admin-session-gate.ts`) call this instead of
+ * re-deriving it.
+ */
+export async function checkAdminAuthority(
+  session: Session,
+): Promise<{ ok: true } | { ok: false; reason: AdminAuthorityFailure }> {
+  if (!isVerifiedAdmin(session)) return { ok: false, reason: "not-admin" };
+  if ((await isForceTwoFactorRequired()) && !session.user.twoFactorEnabled) {
+    return { ok: false, reason: "two-factor" };
+  }
+  return { ok: true };
 }
 
 /**
@@ -65,27 +75,5 @@ export async function assertAccess(access: ProcedureAccess, context: Context): P
   await assertTwoFactorPolicy(session);
   return session;
 }
-
-function accessMiddleware(access: Exclude<ProcedureAccess, "public">) {
-  return o.middleware(async ({ context, next }) => {
-    const session = await assertAccess(access, context);
-    return next({ context: { session } });
-  });
-}
-
-/** A signed-in person on `/rpc` (cookie session). */
-export const protectedProcedure = o.use(accessMiddleware("session"));
-
-/** A signed-in person, or an MCP agent token whose tool calls this procedure. */
-export const agentProcedure = o.use(accessMiddleware("agent"));
-
-/** Only a person: cookie session with a verified CSRF header (§6.3). Never MCP. */
-export const humanProcedure = o.use(accessMiddleware("human"));
-
-/** A verified admin; NOT_FOUND for everyone else. */
-export const adminProcedure = o.use(accessMiddleware("admin"));
-
-/** A verified admin acting as a person (CSRF verified). */
-export const humanAdminProcedure = o.use(accessMiddleware("human_admin"));
 
 export { isHumanCaller };

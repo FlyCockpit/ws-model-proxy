@@ -5,6 +5,7 @@ import {
   PROTOCOL_VERSION_META_KEY,
 } from "@modelcontextprotocol/server";
 import { ORPCError } from "@orpc/server";
+import { ALL_AGENT_SCOPES } from "@ws-model-proxy/auth/agent-scopes";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ProcedureInvoker } from "./tools";
 
@@ -77,7 +78,7 @@ describe("secret canary", () => {
 
   for (const contract of SENSITIVE_TOOLS) {
     describe(contract.name, () => {
-      const dispatch = () => testDispatch("FULL");
+      const dispatch = () => testDispatch(ALL_AGENT_SCOPES);
 
       it("a valid call (through the bound stub procedure and a stand-in) never echoes it", async () => {
         const viaRouter = await runMcpTool(contract, { dispatch: dispatch(), args: valid });
@@ -130,7 +131,7 @@ describe("secret canary", () => {
       });
 
       it("the MCP wire body of a call never carries it", async () => {
-        const authInfo: AuthInfo = { token: "t", clientId: "c", scopes: ["mcp:read", "mcp:write"] };
+        const authInfo: AuthInfo = { token: "t", clientId: "c", scopes: ["mcp:read", "mcp:pools"] };
         bindMcpToolDispatch(authInfo, dispatch());
         const bodies: string[] = [];
         for (const args of [valid, { ...valid, extra: CANARY }, { ...valid, name: CANARY }]) {

@@ -1,0 +1,67 @@
+name: Bug report
+description: Report something that does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security problems here; use private vulnerability reporting (see SECURITY.md).
+        Never paste API keys, node credentials, enrollment codes, prompts or model output containing personal data.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Server
+        - Web dashboard
+        - wsmp CLI
+        - MCP
+        - Docs
+    validations:
+      required: true
+  - type: input
+    id: server_version
+    attributes:
+      label: Server version or commit
+    validations:
+      required: true
+  - type: input
+    id: wsmp_version
+    attributes:
+      label: wsmp version
+      description: Output of wsmp --version, or N/A if no node is involved.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, browser, container runtime, model runtime or MCP client, as relevant.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output with personal data and secrets removed.
+      render: text

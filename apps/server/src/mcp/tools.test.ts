@@ -1,4 +1,5 @@
 import { ORPCError } from "@orpc/server";
+import { ALL_AGENT_SCOPES } from "@ws-model-proxy/auth/agent-scopes";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
@@ -19,7 +20,7 @@ vi.mock("@ws-model-proxy/db", async () => {
 const { MCP_READ_TOOLS, MCP_TOOL_NAMES, MCP_TOOLS } = await import("@ws-model-proxy/api/contracts");
 const {
   cancelMcpToolCallsForToken,
-  cancelMcpWriteToolCallsForGrant,
+  cancelMcpToolCallsForNarrowedCredential,
   mcpToolAllowed,
   resetMcpToolRateLimitsForTests,
   routeToolCall,
@@ -41,18 +42,22 @@ function structured(result: { structuredContent?: unknown }): Record<string, unk
 beforeEach(() => resetMcpToolRateLimitsForTests());
 afterEach(() => vi.restoreAllMocks());
 
-describe("MCP tool levels", () => {
-  it("READ credentials get exactly the 7 read tools, FULL all 28", () => {
-    expect(MCP_TOOL_NAMES.filter((name) => mcpToolAllowed(name, "READ"))).toEqual([
-      ...MCP_READ_TOOLS,
-    ]);
-    expect(MCP_TOOL_NAMES.filter((name) => mcpToolAllowed(name, "FULL"))).toHaveLength(28);
+describe("MCP tool scopes", () => {
+  it("baseline credentials get exactly the 7 read tools; all scopes get all 28", () => {
+    expect(
+      MCP_TOOL_NAMES.filter((name) => mcpToolAllowed(name, { scopes: ["read"], nodeIds: null })),
+    ).toEqual([...MCP_READ_TOOLS]);
+    expect(
+      MCP_TOOL_NAMES.filter((name) =>
+        mcpToolAllowed(name, { scopes: ALL_AGENT_SCOPES, nodeIds: null }),
+      ),
+    ).toHaveLength(28);
   });
 
-  it("a FULL tool called with a READ credential answers like an unknown tool and calls nothing", async () => {
+  it("an out-of-scope tool answers like an unknown tool and calls nothing", async () => {
     const invoke = vi.fn();
     const result = await runMcpTool(tool("pool_delete"), {
-      dispatch: testDispatch("READ"),
+      dispatch: testDispatch(["read"]),
       args: { poolId: "p", confirm: "DELETE" },
       invoke,
     });
@@ -259,7 +264,7 @@ describe("routing to procedures", () => {
   it("passes confirm through to the procedure (it checks it too)", async () => {
     const invoke = vi.fn(async () => ({ ok: true }));
     await runMcpTool(tool("pool_delete"), {
-      dispatch: testDispatch("FULL"),
+      dispatch: testDispatch(ALL_AGENT_SCOPES),
       args: { poolId: "p", confirm: "DELETE" },
       invoke,
     });
@@ -275,7 +280,7 @@ describe("routing to procedures", () => {
 describe("through the bound router", () => {
   it("an agent reaches the procedure: a pool it cannot see is NOT_FOUND", async () => {
     const result = await runMcpTool(tool("metrics_query"), {
-      dispatch: testDispatch("READ"),
+      dispatch: testDispatch(["read"]),
       args: { metrics: ["ttft_p95"], range: "24h", step: "5m", scope: { pool: "p" } },
     });
     expect(result.isError).toBe(true);
@@ -284,7 +289,7 @@ describe("through the bound router", () => {
 
   it("procedure input validation answers with paths only", async () => {
     const result = await runMcpTool(tool("nodes_get"), {
-      dispatch: testDispatch("READ"),
+      dispatch: testDispatch(["read"]),
       args: { nodeId: 7 },
     });
     expect(result.isError).toBe(true);
@@ -318,7 +323,7 @@ describe("errors and output", () => {
       ],
     };
     const result = await runMcpTool(tool("runtimes_get"), {
-      dispatch: testDispatch("READ"),
+      dispatch: testDispatch(["read"]),
       args: { runtimeId: "rt-1", versions: true },
       invoke: async (path) =>
         path === "runtimes.get" ? { id: "rt-1", instanceList: [instance] } : [{ version: 1 }],
@@ -358,7 +363,7 @@ describe("errors and output", () => {
       nodes,
     });
     const result = await runMcpTool(tool("runtimes_get"), {
-      dispatch: testDispatch("READ"),
+      dispatch: testDispatch(["read"]),
       args: {},
       invoke: async () => ({ runtimes: [row([{ id: "node-1", slug: "box" }]), row([])] }),
     });
@@ -376,7 +381,7 @@ describe("errors and output", () => {
     const unknown = { instances: 1, running: 1, waiting: null, p95LatencyMs: null };
     const known = { instances: 2, running: 2, waiting: 3, p95LatencyMs: 840 };
     const one = await runMcpTool(tool("pools_get"), {
-      dispatch: testDispatch("READ"),
+      dispatch: testDispatch(["read"]),
       args: { poolId: "pool-1" },
       invoke: async () => pool(unknown),
     });
@@ -386,7 +391,7 @@ describe("errors and output", () => {
       members: [{ id: "m-1", live: { instances: 1, running: 1 } }],
     });
     const list = await runMcpTool(tool("pools_get"), {
-      dispatch: testDispatch("READ"),
+      dispatch: testDispatch(["read"]),
       args: {},
       invoke: async () => ({ pools: [pool(known), pool(unknown)], sharedWithMe: [] }),
     });
@@ -401,7 +406,7 @@ describe("errors and output", () => {
 
   it("copies a refusal's fixed message and reason", async () => {
     const result = await runMcpTool(tool("runtime_start"), {
-      dispatch: testDispatch("FULL"),
+      dispatch: testDispatch(ALL_AGENT_SCOPES),
       args: { runtimeId: "r" },
       invoke: async () => {
         throw new ORPCError("FORBIDDEN", {
@@ -441,9 +446,15 @@ describe("errors and output", () => {
       requiredVersionIds: new Set<string>(),
       frozenFabrics: null,
       memoryGb: 126,
+      unifiedAcceleratorGb: null,
+      ramOnlyGb: null,
       gpus: [],
       liveFreeMemoryGb: null,
-      launch: null,
+      launch: {
+        platform: "linux" as const,
+        management: new Set(["process", "service"] as const),
+        shells: new Set(["sh"] as const),
+      },
     });
     const placed = new PlacementPlanner({
       callerId: "u",
@@ -467,7 +478,7 @@ describe("errors and output", () => {
     if (placed.ok) throw new Error("expected a reservation refusal");
     expect(placed.refusal.message.length).toBeGreaterThan(500);
     const result = await runMcpTool(tool("runtime_start"), {
-      dispatch: testDispatch("FULL"),
+      dispatch: testDispatch(ALL_AGENT_SCOPES),
       args: { runtimeId: "r" },
       invoke: async () => {
         throw refusalOf(placed.refusal);
@@ -485,7 +496,7 @@ describe("errors and output", () => {
 
   it("leaves out a reservation that does not have the refusal shape", async () => {
     const result = await runMcpTool(tool("runtime_start"), {
-      dispatch: testDispatch("FULL"),
+      dispatch: testDispatch(ALL_AGENT_SCOPES),
       args: { runtimeId: "r" },
       invoke: async () => {
         throw new ORPCError("CONFLICT", {
@@ -499,7 +510,7 @@ describe("errors and output", () => {
 
   it("leads a refusal's text with its reason, for clients that show agents the text only", async () => {
     const result = await runMcpTool(tool("node_command_run"), {
-      dispatch: testDispatch("FULL"),
+      dispatch: testDispatch(ALL_AGENT_SCOPES),
       args: { nodeId: "node-1", command: "Get-Date", shell: "pwsh", confirm: "RUN" },
       invoke: async () => {
         throw new ORPCError("BAD_REQUEST", {
@@ -522,13 +533,36 @@ describe("errors and output", () => {
     });
   });
 
+  it("preserves bad_cwd in command refusal text and structured output", async () => {
+    const message =
+      "Node box cannot use that working directory: use an absolute path or ~ for an existing, accessible directory on the node. Its home directory must also be available.";
+    const result = await runMcpTool(tool("node_command_run"), {
+      dispatch: testDispatch(ALL_AGENT_SCOPES),
+      args: { nodeId: "node-1", command: "pwd", cwd: "/missing", confirm: "RUN" },
+      invoke: async () => {
+        throw new ORPCError("BAD_REQUEST", {
+          message,
+          data: { reason: "bad_cwd", subjectId: "node-1" },
+        });
+      },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content).toEqual([{ type: "text", text: `bad_cwd: ${message}` }]);
+    expect(structured(result).error).toEqual({
+      code: "BAD_REQUEST",
+      reason: "bad_cwd",
+      subjectId: "node-1",
+      message,
+    });
+  });
+
   it("keeps the code and message of a relay or node that did not answer", async () => {
     for (const [code, message] of [
       ["SERVICE_UNAVAILABLE", "The relay is not available."],
       ["BAD_GATEWAY", "The node did not answer the secret write."],
     ] as const) {
       const result = await runMcpTool(tool("node_command_run"), {
-        dispatch: testDispatch("FULL"),
+        dispatch: testDispatch(ALL_AGENT_SCOPES),
         args: { nodeId: "node-1", command: "uptime", confirm: "RUN" },
         invoke: async () => {
           throw new ORPCError(code, { message });
@@ -549,7 +583,7 @@ describe("errors and output", () => {
 
   it("keeps a procedure's own message on a BAD_REQUEST without issues or reason", async () => {
     const result = await runMcpTool(tool("runtime_start"), {
-      dispatch: testDispatch("FULL"),
+      dispatch: testDispatch(ALL_AGENT_SCOPES),
       args: { runtimeId: "r", preview: true, count: 1 },
       invoke: async () => {
         throw new ORPCError("BAD_REQUEST", { message: "That start was refused." });
@@ -564,7 +598,7 @@ describe("errors and output", () => {
 
   it("lists procedure validation issues as path and message", async () => {
     const result = await runMcpTool(tool("runtime_start"), {
-      dispatch: testDispatch("FULL"),
+      dispatch: testDispatch(ALL_AGENT_SCOPES),
       args: { runtimeId: "r" },
       invoke: async () => {
         throw new ORPCError("BAD_REQUEST", {
@@ -589,7 +623,7 @@ describe("errors and output", () => {
     const message =
       "nodeId is only for always-on runtimes (which require it); to pin a startable runtime use spec.launch.labels, runtime_start nodeIds, or a profile.";
     const result = await runMcpTool(tool("runtime_create"), {
-      dispatch: testDispatch("FULL"),
+      dispatch: testDispatch(ALL_AGENT_SCOPES),
       args: { slug: "ds", name: "DS", nodeId: "n", spec: {} },
       invoke: async () => {
         throw new ORPCError("BAD_REQUEST", {
@@ -603,7 +637,7 @@ describe("errors and output", () => {
 
   it("a sensitive tool's validation text names paths and codes, never messages", async () => {
     const result = await runMcpTool(tool("node_secret_set"), {
-      dispatch: testDispatch("FULL"),
+      dispatch: testDispatch(ALL_AGENT_SCOPES),
       args: { nodeId: "n", name: "WSMP_SECRET_HF", value: "hf_secret_value" },
       invoke: async () => {
         throw new ORPCError("BAD_REQUEST", {
@@ -622,7 +656,7 @@ describe("errors and output", () => {
 
   it("a sensitive tool's errors carry no procedure message", async () => {
     const result = await runMcpTool(tool("node_secret_set"), {
-      dispatch: testDispatch("FULL"),
+      dispatch: testDispatch(ALL_AGENT_SCOPES),
       args: { nodeId: "n", name: "WSMP_SECRET_HF", value: "hf_secret_value" },
       invoke: async () => {
         throw new ORPCError("BAD_REQUEST", { message: "value hf_secret_value is bad" });
@@ -651,7 +685,7 @@ describe("errors and output", () => {
       { runtimeId: "rt-1", instanceId: "inst-1", preview: true },
     ]) {
       const result = await runMcpTool(tool("runtime_start"), {
-        dispatch: testDispatch("FULL"),
+        dispatch: testDispatch(ALL_AGENT_SCOPES),
         args,
       });
       expect(result.isError).toBe(true);
@@ -666,7 +700,7 @@ describe("errors and output", () => {
   it("hides unknown failures behind a generic error with the request id", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const result = await runMcpTool(tool("nodes_get"), {
-      dispatch: testDispatch("READ"),
+      dispatch: testDispatch(["read"]),
       args: {},
       invoke: async () => {
         throw new Error("SELECT * FROM secret_table");
@@ -678,7 +712,7 @@ describe("errors and output", () => {
 
   it("combines multi-procedure outputs and redacts credentials", async () => {
     const result = await runMcpTool(tool("providers_get"), {
-      dispatch: testDispatch("READ"),
+      dispatch: testDispatch(["read"]),
       args: {},
       invoke: async (path) =>
         path === "providers.accounts.list"
@@ -695,7 +729,7 @@ describe("errors and output", () => {
 describe("rate limits", () => {
   it("limits start/stop/apply per credential", async () => {
     const invoke = vi.fn(async () => ({}));
-    const dispatch = testDispatch("FULL");
+    const dispatch = testDispatch(ALL_AGENT_SCOPES);
     const results = [];
     for (let index = 0; index < 11; index += 1)
       results.push(
@@ -708,7 +742,7 @@ describe("rate limits", () => {
 
   it("counts model_test only for bench runs (2 per minute)", async () => {
     const invoke = vi.fn(async () => ({}));
-    const dispatch = testDispatch("FULL");
+    const dispatch = testDispatch(ALL_AGENT_SCOPES);
     const contract = tool("model_test");
     const plain = { target: { runtimeId: "r" }, prompt: "hi" };
     const bench = { ...plain, bench: { repeat: 2, concurrency: 1 } };
@@ -729,7 +763,7 @@ describe("cancellation", () => {
       started = resolve;
     });
     const call = runMcpTool(tool("nodes_get"), {
-      dispatch: testDispatch("READ", { tokenId: "revoked-token" }),
+      dispatch: testDispatch(["read"], { tokenId: "revoked-token" }),
       args: {},
       invoke: () => {
         started();
@@ -747,7 +781,7 @@ describe("cancellation", () => {
     cancelMcpToolCallsForToken("late-token");
     const invoke = vi.fn(async () => ({}));
     const result = await runMcpTool(tool("nodes_get"), {
-      dispatch: testDispatch("READ", { tokenId: "late-token" }),
+      dispatch: testDispatch(["read"], { tokenId: "late-token" }),
       args: {},
       invoke,
     });
@@ -755,69 +789,75 @@ describe("cancellation", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
-  it("lowering a grant to Read-only aborts its in-flight write calls and lets its reads finish", async () => {
-    const grantId = "lowered-grant";
-    let writeStarted: () => void = () => undefined;
-    const writeRunning = new Promise<void>((resolve) => {
-      writeStarted = resolve;
-    });
-    let readStarted: () => void = () => undefined;
-    const readRunning = new Promise<void>((resolve) => {
-      readStarted = resolve;
-    });
-    let finishRead: (value: unknown) => void = () => undefined;
-    const write = runMcpTool(tool("pool_delete"), {
-      dispatch: testOAuthDispatch("FULL", { grantId }),
-      args: { poolId: "p", confirm: "DELETE" },
-      invoke: () => {
-        writeStarted();
-        return new Promise(() => undefined);
-      },
-    });
-    const read = runMcpTool(tool("nodes_get"), {
-      dispatch: testOAuthDispatch("FULL", { grantId }),
-      args: {},
-      invoke: () => {
-        readStarted();
-        return new Promise((resolve) => {
-          finishRead = resolve;
-        });
-      },
-    });
-    await Promise.all([writeRunning, readRunning]);
-    expect(cancelMcpWriteToolCallsForGrant(grantId)).toBe(1);
-    expect(structured(await write).error).toEqual({ code: "REQUEST_ABORTED" });
-    finishRead({ nodes: [] });
-    expect((await read).isError).toBeUndefined();
-  });
+  it.each(["oauth", "agent_token"] as const)(
+    "narrowing %s aborts every in-flight call, including reads",
+    async (kind) => {
+      const grantId = `narrowed-${kind}`;
+      const dispatch = () =>
+        kind === "oauth"
+          ? testOAuthDispatch(ALL_AGENT_SCOPES, { grantId })
+          : testDispatch(ALL_AGENT_SCOPES, { tokenId: grantId });
+      let writeStarted: () => void = () => undefined;
+      const writeRunning = new Promise<void>((resolve) => {
+        writeStarted = resolve;
+      });
+      let readStarted: () => void = () => undefined;
+      const readRunning = new Promise<void>((resolve) => {
+        readStarted = resolve;
+      });
+      const write = runMcpTool(tool("pool_delete"), {
+        dispatch: dispatch(),
+        args: { poolId: "p", confirm: "DELETE" },
+        invoke: () => {
+          writeStarted();
+          return new Promise(() => undefined);
+        },
+      });
+      const read = runMcpTool(tool("nodes_get"), {
+        dispatch: dispatch(),
+        args: {},
+        invoke: () => {
+          readStarted();
+          return new Promise(() => undefined);
+        },
+      });
+      await Promise.all([writeRunning, readRunning]);
+      expect(cancelMcpToolCallsForNarrowedCredential(grantId)).toBe(2);
+      expect(structured(await write).error).toEqual({ code: "REQUEST_ABORTED" });
+      expect(structured(await read).error).toEqual({ code: "REQUEST_ABORTED" });
+    },
+  );
 
-  it("aborts a write that registers after the lowering with a level read before it; not a newer read", async () => {
+  it("aborts a write that registers after narrowing with an older access snapshot; permits a newer snapshot", async () => {
     const grantId = "lowered-late-grant";
     const readBefore = performance.now();
-    cancelMcpWriteToolCallsForGrant(grantId);
+    cancelMcpToolCallsForNarrowedCredential(grantId);
     const stale = vi.fn(async () => ({}));
     const staleResult = await runMcpTool(tool("pool_delete"), {
-      dispatch: testOAuthDispatch("FULL", { grantId, levelReadAt: readBefore }),
+      dispatch: testOAuthDispatch(ALL_AGENT_SCOPES, { grantId, accessReadAt: readBefore }),
       args: { poolId: "p", confirm: "DELETE" },
       invoke: stale,
     });
     expect(structured(staleResult).error).toEqual({ code: "REQUEST_ABORTED" });
     expect(stale).not.toHaveBeenCalled();
 
-    // A read call on the same stale request is not a write: it runs.
+    // Read calls also carry the stale access snapshot.
     const reads = vi.fn(async () => ({ nodes: [] }));
     const readResult = await runMcpTool(tool("nodes_get"), {
-      dispatch: testOAuthDispatch("FULL", { grantId, levelReadAt: readBefore }),
+      dispatch: testOAuthDispatch(ALL_AGENT_SCOPES, { grantId, accessReadAt: readBefore }),
       args: {},
       invoke: reads,
     });
-    expect(readResult.isError).toBeUndefined();
-    expect(reads).toHaveBeenCalledTimes(1);
+    expect(structured(readResult).error).toEqual({ code: "REQUEST_ABORTED" });
+    expect(reads).not.toHaveBeenCalled();
 
-    // Raised again afterwards: a request that read the level after the lowering writes.
+    // Raised again afterwards: a request that read access after the lowering writes.
     const fresh = vi.fn(async () => ({ ok: true }));
     const freshResult = await runMcpTool(tool("pool_delete"), {
-      dispatch: testOAuthDispatch("FULL", { grantId, levelReadAt: performance.now() + 1 }),
+      dispatch: testOAuthDispatch(ALL_AGENT_SCOPES, {
+        grantId,
+        accessReadAt: performance.now() + 1,
+      }),
       args: { poolId: "p", confirm: "DELETE" },
       invoke: fresh,
     });
@@ -825,10 +865,31 @@ describe("cancellation", () => {
     expect(fresh).toHaveBeenCalledTimes(1);
   });
 
+  it("aborts agent-token calls registered with a snapshot from before narrowing", async () => {
+    const tokenId = "narrowed-agent-token";
+    const accessReadAt = performance.now();
+    cancelMcpToolCallsForNarrowedCredential(tokenId);
+    const invoke = vi.fn(async () => ({}));
+    const result = await runMcpTool(tool("nodes_get"), {
+      dispatch: testDispatch(["read"], { tokenId, accessReadAt }),
+      args: {},
+      invoke,
+    });
+    expect(structured(result).error).toEqual({ code: "REQUEST_ABORTED" });
+    expect(invoke).not.toHaveBeenCalled();
+    const fresh = await runMcpTool(tool("nodes_get"), {
+      dispatch: testDispatch(["read"], { tokenId, accessReadAt: performance.now() + 1 }),
+      args: {},
+      invoke,
+    });
+    expect(fresh.isError).toBeUndefined();
+    expect(invoke).toHaveBeenCalledOnce();
+  });
+
   it("stops when the request's signal aborts", async () => {
     const controller = new AbortController();
     const call = runMcpTool(tool("nodes_get"), {
-      dispatch: testDispatch("READ", { signal: controller.signal }),
+      dispatch: testDispatch(["read"], { signal: controller.signal }),
       args: {},
       invoke: () => new Promise(() => undefined),
     });

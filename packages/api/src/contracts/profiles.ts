@@ -68,14 +68,14 @@ export const profilesContract = {
     "agent",
     noInputSchema,
     z.object({ profiles: z.array(profileViewSchema) }).strict(),
-    "Profiles: owned nodes, pinned items, satisfied now, last apply.",
+    "Profiles: owned nodes, pinned items, satisfied now, last apply. Allowlisted agents count only instances without ranks or reservations on hidden nodes; pinned counts remain configuration.",
     ["profiles_get"],
   ),
   get: query(
     "agent",
     z.object({ profileId: idSchema }).strict(),
     profileViewSchema,
-    "One profile.",
+    "One profile. Allowlisted agents count only instances without ranks or reservations on hidden nodes; pinned counts remain configuration.",
     ["profiles_get"],
   ),
   save: mutation(

@@ -1,12 +1,10 @@
 /**
  * The body of schema-hardening.sql without its outer `BEGIN;` / `COMMIT;`.
  *
- * apply-schema-hardening.mjs runs the body inside its own transaction and
- * records the version-gate key before COMMIT, so the key and the DDL commit
- * together. That holds only if the file's own transaction statements are
- * really removed: a `COMMIT;` left in the body would commit the DDL (and
- * release the deploy locks) before the key is recorded. So this parser is
- * strict and fails closed:
+ * scripts/db/generate-initial-migrations.mjs copies the body into a migration,
+ * whose own transactional wrapper must be the only transaction: a `COMMIT;`
+ * left in the body would commit part of the migration (and release its
+ * locks) before the rest ran. So this parser is strict and fails closed:
  * - the outer `BEGIN;` and `COMMIT;` must each be alone on their line;
  * - only blank lines and `--` comments may precede `BEGIN;` or follow
  *   `COMMIT;`;

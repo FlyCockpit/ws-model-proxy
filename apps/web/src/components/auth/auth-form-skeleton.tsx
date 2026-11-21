@@ -9,9 +9,9 @@ export function AuthFormSkeleton() {
         <Skeleton className="mx-auto h-4 w-56" />
       </div>
       <div className="space-y-4">
-        <Skeleton className="h-10 w-full" />
-        <Skeleton className="h-10 w-full" />
-        <Skeleton className="h-10 w-full" />
+        <Skeleton className="h-11 w-full md:h-8" />
+        <Skeleton className="h-11 w-full md:h-8" />
+        <Skeleton className="h-11 w-full md:h-8" />
       </div>
     </div>
   );

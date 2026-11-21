@@ -63,7 +63,7 @@ describe("explainableMcpScopes", () => {
   it("maps the three MCP scopes and flags unknown tokens", () => {
     expect(explainableMcpScopes(["mcp:read", "mcp:write", "offline_access"])).toEqual([
       { raw: "mcp:read", key: "read" },
-      { raw: "mcp:write", key: "write" },
+      { raw: "mcp:write", key: null },
       { raw: "offline_access", key: "offline_access" },
     ]);
     expect(explainableMcpScopes(["admin:everything"])).toEqual([

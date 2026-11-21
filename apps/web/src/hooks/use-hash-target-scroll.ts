@@ -51,7 +51,9 @@ export function revealHashTarget(id: string, timeoutMs = HASH_TARGET_WAIT_MS): (
   const reveal = (element: Element) => {
     stop();
     // A fixed element does not move with <main>; scrolling "to" it only jumps the page.
-    if (getComputedStyle(element).position !== "fixed") {
+    if (element.matches(MAIN_SCROLLER_SELECTOR)) {
+      element.scrollTop = 0;
+    } else if (getComputedStyle(element).position !== "fixed") {
       element.scrollIntoView({ block: "start" });
     }
     if (isFocusable(element)) element.focus({ preventScroll: true });

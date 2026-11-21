@@ -2,7 +2,7 @@ name: PR checks
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
 
 # Cancel superseded runs when a PR is force-pushed.
 concurrency:
@@ -25,12 +25,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26
+          node-version: 26.13.1
           cache: pnpm
 
       - name: Install dependencies
@@ -58,12 +58,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26
+          node-version: 26.13.1
 
       - name: Restore workspace
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -88,12 +88,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26
+          node-version: 26.13.1
 
       - name: Restore workspace
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -118,12 +118,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26
+          node-version: 26.13.1
 
       - name: Restore workspace
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -148,12 +148,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26
+          node-version: 26.13.1
 
       - name: Restore workspace
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -180,12 +180,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26
+          node-version: 26.13.1
 
       - name: Restore workspace
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -297,32 +297,48 @@ jobs:
           fi
 
       # Forbid destructive Prisma commands in Dockerfile and package.json scripts.
-      # CLAUDE.md: "Dangerous Commands — Never Run These"
+      # CLAUDE.md: "Data and Schema" (never run). `prisma migrate deploy` is
+      # allowed: the migration runner and the wrappers apply committed,
+      # reviewed migrations with it (docs/schema-migrations.md).
+      # Reviewed exceptions, by exact file:
+      #   scripts/db/lib/scratch-db.mjs — the one helper that drops a whole
+      #     database: this checkout's exact local DB, or scratch DBs the CI
+      #     migration checks created on a disposable Postgres;
+      #   scripts/backup/restore.mjs — the restore path (validated target,
+      #     confirmation, pre-restore backup, migration lock);
+      #   scripts/db/lib/sql.mjs — the migration analyzer names TRUNCATE to
+      #     classify it;
+      #   scripts/db/test-*.mjs, scripts/backup/test-*.mjs, *.test.mjs —
+      #     tests against disposable databases;
+      #   packages/db/prisma/migrations/**/{migration,contract}.sql —
+      #     reviewed SQL validated separately by the migrations job;
+      #   packages/db/scripts/verify-schema-hardening.mjs — drops its own
+      #     throwaway schema.
       - name: Forbid destructive Prisma commands
         run: |
           if grep -rnE \
-            '(migrate reset|migrate dev|migrate deploy|db push --force-reset|db drop|--accept-data-loss|DROP TABLE|DROP DATABASE|\bTRUNCATE\b|DELETE FROM[[:space:]]+[^;]+;)' \
+            '(migrate reset|migrate dev|db push --force-reset|db drop|--accept-data-loss|DROP TABLE|DROP DATABASE|DROP SCHEMA|\bTRUNCATE\b|DELETE FROM[[:space:]]+[^;]+;)' \
             Dockerfile Dockerfile.dev package.json docker-compose*.yml scripts/ apps/ packages/ .github/workflows/ \
-            | grep -v 'scripts/docker-entrypoint.sh:' \
-          | grep -v 'scripts/db-push-dangerous-local.sh:' \
-          | grep -v 'scripts/test-docker-entrypoint-schema.sh:' \
             | grep -v 'policy: bounded-delete' \
             | grep -v '.github/workflows/pr-checks.yml:' \
-            | grep -vE '^packages/db/scripts/(push-schema|pre-push-null-cleanup|verify-schema-hardening)\.mjs:' \
+            | grep -vE '^scripts/db/lib/(scratch-db|sql)\.mjs:' \
+            | grep -vE '^scripts/backup/restore\.mjs:' \
+            | grep -vE '^scripts/(db|backup)/(test-[a-z-]+|[a-z-]+\.test|lib/[a-z-]+\.test)\.mjs:' \
+            | grep -vE '^packages/db/prisma/migrations/[^/]+/(migration|contract)\.sql:' \
+            | grep -vE '^packages/db/scripts/verify-schema-hardening\.mjs:' \
             | grep -vE '\.test\.ts:[0-9]+:[[:space:]]*expect\(.*\)\.toContain\("DELETE FROM [a-z_]+"\);$' \
             | grep -v '/dist/' \
             | grep -v 'node_modules'; then
-            echo "::error::Found forbidden destructive Prisma or SQL command. Use the documented db:push flow and explicit local-only dangerous script instead."
+            echo "::error::Found forbidden destructive Prisma or SQL command. Schema changes ship as reviewed migrations (pnpm db:migrate <name>, docs/schema-migrations.md)."
             exit 1
           fi
-          # The deploy push wrapper, its NULL cleanup and the schema verifier
-          # name --accept-data-loss (the flag APPLY_SCHEMA=dangerous passes
-          # through, and the verifier asserts). Everything else stays forbidden
-          # in them.
+          # The schema verifier and the migration runner may name nothing
+          # destructive beyond the verifier's own throwaway schema.
           if grep -nE \
-            '(migrate reset|migrate dev|migrate deploy|db push --force-reset|db drop|DROP TABLE|DROP DATABASE|\bTRUNCATE\b|DELETE FROM[[:space:]]+[^;]+;)' \
-            packages/db/scripts/push-schema.mjs packages/db/scripts/pre-push-null-cleanup.mjs \
+            '(migrate reset|migrate dev|db push --|db drop|--accept-data-loss|DROP TABLE|DROP DATABASE|\bTRUNCATE\b|DELETE FROM[[:space:]]+[^;]+;)' \
             packages/db/scripts/verify-schema-hardening.mjs \
+            scripts/db/migrate-runtime.mjs \
+            scripts/docker-entrypoint.sh \
             | grep -v 'policy: bounded-delete'; then
             echo "::error::Found forbidden destructive Prisma or SQL command in a deploy schema script."
             exit 1
@@ -359,19 +375,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # The upgrade suite (lifecycle-upgrade.postgres.integration.test.ts) builds the
-          # released schema from commit 94bbe08a; with REQUIRE_POSTGRES_INTEGRATION it fails
-          # rather than skip when that commit is missing.
-          fetch-depth: 0
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26
+          node-version: 26.13.1
 
       - name: Restore workspace
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -383,13 +394,13 @@ jobs:
             packages/db/prisma/generated
           key: workspace-${{ github.sha }}
 
-      - name: Validate schema and hardening against PostgreSQL
+      - name: Validate schema, migrations and hardening against PostgreSQL
         run: pnpm db:validate
 
-      - name: Apply validation schema
+      - name: Apply migrations to the validation database
         env:
           DATABASE_URL: ${{ env.SCHEMA_VALIDATION_DATABASE_URL }}
-        run: pnpm --filter @ws-model-proxy/db db:push
+        run: pnpm --filter @ws-model-proxy/db exec prisma migrate deploy
 
       - name: Server PostgreSQL integration suites
         run: pnpm --filter server test:postgres
@@ -425,12 +436,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26
+          node-version: 26.13.1
 
       - name: Restore workspace
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -442,13 +453,80 @@ jobs:
             packages/db/prisma/generated
           key: workspace-${{ github.sha }}
 
-      - name: Apply validation schema
+      - name: Apply migrations to the validation database
         env:
           DATABASE_URL: ${{ env.SCHEMA_VALIDATION_DATABASE_URL }}
-        run: pnpm --filter @ws-model-proxy/db db:push
+        run: pnpm --filter @ws-model-proxy/db exec prisma migrate deploy
 
       - name: API PostgreSQL integration suites (core flows)
         run: pnpm --filter @ws-model-proxy/api test:postgres
+
+  # ── Migrations (docs/schema-migrations.md) ────────────────────────
+  # Consistency, ordering, immutability, applies-with-data (fixtures) and
+  # safety for the running release, against the base branch, on a
+  # throwaway PostgreSQL 17 (the supported server major). It creates and
+  # removes its own wmp_check_* databases there.
+
+  migrations:
+    name: Migration checks
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          # Throwaway server that exists only for this job; trust auth keeps
+          # any credential-shaped URL out of the repository.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      CHECK_DATABASE_URL: postgresql://postgres@localhost:5432/postgres
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The checks compare against the base branch's migration history.
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.13.1
+
+      - name: Restore workspace
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+            packages/*/node_modules
+            packages/db/prisma/generated
+          key: workspace-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      - name: Fetch the base branch
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+
+      - name: Check migrations
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: pnpm db:check-migrations --base "origin/${BASE_REF}"
+
+      - name: Adopt the released 0.4.3 database and compare with fresh migrations
+        run: pnpm db:test-adopt-released
 
   # ── React Doctor (React health scan: hooks, a11y, perf, security) ─
 
@@ -467,12 +545,12 @@ jobs:
           fetch-depth: 0
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26
+          node-version: 26.13.1
 
       - name: Restore workspace
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -507,12 +585,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26
+          node-version: 26.13.1
 
       - name: Restore workspace
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -539,12 +617,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26
+          node-version: 26.13.1
 
       # pnpm audit reads pnpm-lock.yaml directly — no install needed.
       #
@@ -568,7 +646,7 @@ jobs:
           fetch-depth: 0
 
       - name: TruffleHog OSS
-        uses: trufflesecurity/trufflehog@31ce31ee1abbcc7dc8eee5764c17121c3044c8b2 # v3.99.7
+        uses: trufflesecurity/trufflehog@ea68ca03c865c5f324e86e849ced20ed3cf9dbbb # v3.99.8
         with:
           extra_args: --results=verified,unknown
 
@@ -630,8 +708,9 @@ jobs:
           provenance: false
 
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@8f28faec26515256b6d22074d1d2a8986f4cbd87 # untagged master (2026-10-21), after v0.36.0: bundles trivy v0.76.1
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
+          version: v0.76.2
           image-ref: ${{ github.event.repository.name }}-${{ matrix.image }}-pr:${{ github.sha }}
           severity: HIGH,CRITICAL
           exit-code: '1'

@@ -27,7 +27,8 @@ import {
   type releaseRequestViewSchema,
 } from "../contracts/runtimes";
 import { loadAgentNames } from "../lib/agent-names";
-import { type CallerActor, callerActor } from "../lib/caller-actor";
+import { assertAgentInstanceNodes } from "../lib/agent-node-access";
+import { assertAgentScope, type CallerActor, callerActor } from "../lib/caller-actor";
 import { RELEASE_REQUEST_TTL_MS, releaseClaim } from "../lib/claim-release";
 import { graphWrite, instanceCapacityFences } from "../lib/graph-write";
 import { agentBlockedNode, OCCUPANCY_SELECT } from "../lib/instance-occupancy";
@@ -62,6 +63,7 @@ function personOf(context: SignedInContext): CallerActor {
 
 /** Only an agent asks (a person releases directly on the runtime page). */
 function agentOf(context: SignedInContext): CallerActor {
+  assertAgentScope(context.auth, "runtimes");
   const actor = callerActor(context.auth, userIdOf(context));
   if (actor.actor !== "AGENT")
     throw new ORPCError("FORBIDDEN", {
@@ -143,6 +145,7 @@ const RANK_SELECT = {
   Node: {
     select: {
       id: true,
+      userId: true,
       trust: true,
       trustLowerRequestedAt: true,
       connection: true,
@@ -375,6 +378,7 @@ export const runtimeReleaseRequests = {
             input.instanceId,
             input.nodeNumber,
           );
+          await assertAgentInstanceNodes(tx, context.auth, userId, instance);
           if (rank.claim !== "HELD_UNKNOWN") {
             if (rank.claim === "HELD")
               throw refuse(
@@ -450,7 +454,8 @@ export const runtimeReleaseRequests = {
     return graphWrite(
       [userId],
       async (tx) => {
-        const { rank } = await ownedRank(tx, userId, input.instanceId, input.nodeNumber);
+        const { instance, rank } = await ownedRank(tx, userId, input.instanceId, input.nodeNumber);
+        await assertAgentInstanceNodes(tx, context.auth, userId, instance);
         // Only the agent credential that asked takes its request back.
         const row = await tx.claimReleaseRequest.findFirst({
           where: {

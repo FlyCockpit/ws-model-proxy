@@ -284,17 +284,12 @@ fn an_argv_cannot_run_in_sh_on_windows() {
     );
 }
 
-/// Start `line` and return its `exec.started`'s `ranWith`, with the server accepting it or not.
-fn started_ran_with(
-    line: &ExecLine<'_>,
-    shell: Option<CommandShell>,
-    report: bool,
-) -> Option<RanWith> {
+/// Start `line` and return its `exec.started`'s `ranWith`, for a registered server.
+fn started_ran_with(line: &ExecLine<'_>, shell: Option<CommandShell>) -> RanWith {
     let (tx, _rx) = channel();
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
     let scripts = tempfile::tempdir().expect("scripts");
     execs.scripts = scripts.path().to_path_buf();
-    execs.set_report_ran_with(report);
     let frames = execs.start(
         &enabled_startup(false),
         &fresh_id(),
@@ -312,22 +307,20 @@ fn started_ran_with(
 }
 
 #[test]
-fn ran_with_is_sent_only_to_a_server_that_accepts_it() {
+fn ran_with_is_always_sent() {
     #[cfg(not(windows))]
     let (text, program) = ("true", "true");
     #[cfg(windows)]
     let (text, program) = ("Write-Output hi", "whoami");
-    assert_eq!(started_ran_with(&ExecLine::Text(text), None, false), None);
     let argv = vec![program.to_string()];
-    assert_eq!(started_ran_with(&ExecLine::Argv(&argv), None, false), None);
     assert_eq!(
-        started_ran_with(&ExecLine::Argv(&argv), None, true),
-        Some(RanWith {
+        started_ran_with(&ExecLine::Argv(&argv), None),
+        RanWith {
             shell: None,
             mode: RanMode::Direct
-        })
+        }
     );
-    let text_ran = started_ran_with(&ExecLine::Text(text), None, true).expect("ran with");
+    let text_ran = started_ran_with(&ExecLine::Text(text), None);
     assert_eq!(text_ran.mode, RanMode::Shell);
     #[cfg(not(windows))]
     assert_eq!(text_ran.shell, Some(CommandShell::Sh));

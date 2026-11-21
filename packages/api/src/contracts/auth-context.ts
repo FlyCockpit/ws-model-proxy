@@ -10,7 +10,7 @@
  *   `CSRF_REQUIRED_PROCEDURES` (every `human`/`human_admin` procedure, queries included) on
  *   every deployment shape, same-origin or not; the set is derived from the contract's access
  *   tags, never kept by hand.
- * - `agent_token`, `oauth_access_token`: an MCP call (`/mcp`), with the token's level.
+ * - `agent_token`, `oauth_access_token`: an MCP call (`/mcp`), with the credential's scopes and node allowlist.
  * - `api_key`: `/v1` only; never reaches a procedure.
  *
  * Rules (a positive check, not "no agent marker"):
@@ -24,6 +24,10 @@
  *   `isHumanCaller(auth)`.
  * - `public`: any.
  */
+import type { AgentAccess } from "./agent-scopes";
+
+export type { AgentAccess } from "./agent-scopes";
+
 import type { ProcedureAccess } from "./procedure";
 
 export const CALLER_KINDS = [
@@ -36,8 +40,8 @@ export type CallerKind = (typeof CALLER_KINDS)[number];
 
 export type CallerAuth =
   | { kind: "cookie_session"; userId: string; sessionId: string; csrfVerified: boolean }
-  | { kind: "agent_token"; userId: string; agentTokenId: string; level: "READ" | "FULL" }
-  | { kind: "oauth_access_token"; userId: string; grantId: string; level: "READ" | "FULL" }
+  | { kind: "agent_token"; userId: string; agentTokenId: string; access: AgentAccess }
+  | { kind: "oauth_access_token"; userId: string; grantId: string; access: AgentAccess }
   | { kind: "api_key"; userId: string; apiKeyId: string };
 
 export type AnonymousAuth = { kind: "anonymous" };

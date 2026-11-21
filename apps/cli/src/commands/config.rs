@@ -156,6 +156,9 @@ pub fn run(args: &Args) -> Result<()> {
         }
         Sub::Show => {
             let cfg = Config::load_required()?;
+            if let Some(warning) = cfg.retired_command_policy_warning {
+                output::diagnostic(format!("warning: {warning}"))?;
+            }
             let mut shown = serde_json::to_value(&cfg)?;
             let (roots, source) =
                 crate::config::effective_file_roots(&cfg, dirs::home_dir().as_deref());
@@ -210,11 +213,7 @@ pub fn run(args: &Args) -> Result<()> {
                 })
                 .transpose()?;
             // The pin dropped by setting the server again without the flag.
-            let cleared = Config::update(false, |cfg| {
-                cfg.server_url = Some(url.clone());
-                let previous = std::mem::replace(&mut cfg.public_origin, public_origin.clone());
-                Ok(previous.filter(|_| public_origin.is_none()))
-            })?;
+            let cleared = set_server(url, public_origin.clone())?;
             // The CLI's traffic goes to the connect URL; a plain-http public
             // origin is only a name and needs no warning.
             if let Some(warning) = server_url_http_warning(url) {
@@ -463,4 +462,447 @@ struct SetValue<'a> {
 struct SetFlag {
     key: &'static str,
     value: bool,
+}
+
+/// Persist the command's validated addresses under one config lock.
+fn set_server(url: &str, public_origin: Option<String>) -> Result<Option<String>> {
+    set_server_with_savers(
+        url,
+        public_origin,
+        Config::save,
+        crate::state::save_node_credential,
+    )
+}
+
+fn set_server_with_savers(
+    url: &str,
+    public_origin: Option<String>,
+    save_config: impl Fn(&Config) -> Result<()>,
+    save_credential: impl FnOnce(&crate::state::NodeCredential) -> Result<()>,
+) -> Result<Option<String>> {
+    let _lock = crate::config::ConfigLock::exclusive()?;
+    let previous_config = Config::load()?;
+    let mut cfg = previous_config.clone();
+    // Only move an enrollment paired with the previous config.
+    let credential = crate::state::load_node_credential()?.filter(|credential| {
+        crate::auth::credential_matches_server(
+            credential,
+            cfg.server_url.as_deref(),
+            cfg.public_origin.as_deref(),
+        )
+    });
+    cfg.server_url = Some(url.to_string());
+    let previous = std::mem::replace(&mut cfg.public_origin, public_origin.clone());
+    // Save config first: an interruption between saves leaves a legacy-style
+    // pair, which the next daemon startup accepts.
+    save_config(&cfg)?;
+    if let Some(mut credential) = credential {
+        credential.server = url.to_string();
+        if let Err(error) = save_credential(&credential) {
+            if let Err(rollback) = save_config(&previous_config) {
+                return Err(error.context(format!(
+                    "restoring the previous config also failed: {rollback:#}; retry `wsmp config set-server`"
+                )));
+            }
+            return Err(error);
+        }
+    }
+    Ok(previous.filter(|_| public_origin.is_none()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{NodeCredential, load_node_credential, save_node_credential};
+
+    fn isolated_paths(test_name: &str, run: impl FnOnce()) {
+        const CHILD_ROOT: &str = "WSMP_SET_SERVER_FAILURE_TEST_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            let root = tempfile::tempdir().expect("tempdir");
+            let result =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", test_name, "--nocapture"])
+                    .env(CHILD_ROOT, root.path())
+                    .output()
+                    .expect("isolated test");
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        };
+        let root = PathBuf::from(root);
+        crate::paths::pin(
+            Some(root.join("config/config.json")),
+            Some(root.join("state")),
+        )
+        .expect("isolated paths");
+        run();
+    }
+
+    #[test]
+    fn show_warns_about_retired_command_policy_on_stderr_only() {
+        const CHILD_ROOT: &str = "WSMP_CONFIG_SHOW_RETIRED_TEST_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            // Run the unit-test executable, never the wsmp binary. Capture
+            // stderr independently of stdout, including for JSON output.
+            for mode in ["standard", "isolated"] {
+                let root = tempfile::tempdir().expect("tempdir");
+                std::fs::write(
+                    root.path().join("config.json"),
+                    serde_json::json!({ "agentCommands": mode }).to_string(),
+                )
+                .expect("prerelease config");
+                let result = std::process::Command::new(
+                    std::env::current_exe().expect("test executable"),
+                )
+                .args([
+                    "--exact",
+                    "commands::config::tests::show_warns_about_retired_command_policy_on_stderr_only",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, root.path())
+                .output()
+                .expect("isolated unit test");
+                let stderr = String::from_utf8(result.stderr).expect("stderr");
+                let stdout = String::from_utf8(result.stdout).expect("stdout");
+                assert!(result.status.success(), "{stderr}\n{stdout}");
+                assert_eq!(stderr.lines().count(), 2, "{stderr}");
+                assert_eq!(
+                    stderr.matches("warning: The agentCommands setting was removed in wsmp 1.0 and is ignored.").count(),
+                    2,
+                    "{stderr}"
+                );
+                assert_eq!(stderr.contains("wsmp trust relay"), mode == "isolated");
+                assert!(!stdout.contains("agentCommands"), "{stdout}");
+                assert!(!stdout.contains("retiredCommandPolicyWarning"), "{stdout}");
+            }
+            return;
+        };
+        let root = PathBuf::from(root);
+        crate::paths::pin(Some(root.join("config.json")), Some(root.join("state")))
+            .expect("isolated paths");
+        for json in [false, true] {
+            run(&Args {
+                json,
+                command: Sub::Show,
+            })
+            .expect("config show");
+        }
+    }
+
+    #[test]
+    fn set_server_rolls_back_config_when_credential_save_fails() {
+        isolated_paths(
+            "commands::config::tests::set_server_rolls_back_config_when_credential_save_fails",
+            || {
+                let original = Config {
+                    server_url: Some("https://example.invalid".into()),
+                    public_origin: Some("https://public.invalid".into()),
+                    cli_slug: Some("spark-1".into()),
+                    ..Config::default()
+                };
+                original.save().expect("initial config");
+                let credential = NodeCredential {
+                    node_id: "node-1".into(),
+                    slug: "spark-1".into(),
+                    server: "https://example.invalid".into(),
+                    credential: "test-only-token".into(),
+                };
+                save_node_credential(&credential).expect("initial credential");
+                let error = set_server_with_savers(
+                    "https://moved.invalid",
+                    None,
+                    Config::save,
+                    |candidate| {
+                        let saved = Config::load_required().expect("config saved first");
+                        assert_eq!(saved.server_url.as_deref(), Some("https://moved.invalid"));
+                        assert!(saved.public_origin.is_none());
+                        assert_eq!(candidate.server, "https://moved.invalid");
+                        anyhow::bail!("injected credential save failure")
+                    },
+                )
+                .expect_err("credential save fails");
+                assert_eq!(error.to_string(), "injected credential save failure");
+                assert_eq!(
+                    serde_json::to_value(Config::load_required().expect("restored config"))
+                        .expect("json"),
+                    serde_json::to_value(&original).expect("json")
+                );
+                assert_eq!(
+                    load_node_credential().expect("credential"),
+                    Some(credential)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn set_server_does_not_save_credential_when_config_save_fails() {
+        isolated_paths(
+            "commands::config::tests::set_server_does_not_save_credential_when_config_save_fails",
+            || {
+                Config {
+                    server_url: Some("https://example.invalid".into()),
+                    ..Config::default()
+                }
+                .save()
+                .expect("initial config");
+                let original = NodeCredential {
+                    node_id: "node-1".into(),
+                    slug: "spark-1".into(),
+                    server: "https://example.invalid".into(),
+                    credential: "test-only-token".into(),
+                };
+                save_node_credential(&original).expect("initial credential");
+                let error = set_server_with_savers(
+                    "https://moved.invalid",
+                    None,
+                    |_| anyhow::bail!("injected config save failure"),
+                    |_| panic!("credential must not be saved"),
+                )
+                .expect_err("config save fails");
+                assert_eq!(error.to_string(), "injected config save failure");
+                assert_eq!(
+                    Config::load_required()
+                        .expect("config")
+                        .server_url
+                        .as_deref(),
+                    Some("https://example.invalid")
+                );
+                assert_eq!(load_node_credential().expect("credential"), Some(original));
+            },
+        );
+    }
+
+    #[test]
+    fn set_server_reports_rollback_failure_and_keeps_the_credential_error() {
+        isolated_paths(
+            "commands::config::tests::set_server_reports_rollback_failure_and_keeps_the_credential_error",
+            || {
+                Config {
+                    server_url: Some("https://example.invalid".into()),
+                    ..Config::default()
+                }
+                .save()
+                .expect("initial config");
+                let original = NodeCredential {
+                    node_id: "node-1".into(),
+                    slug: "spark-1".into(),
+                    server: "https://example.invalid".into(),
+                    credential: "test-only-token".into(),
+                };
+                save_node_credential(&original).expect("initial credential");
+                let saves = std::cell::Cell::new(0);
+                let error = set_server_with_savers(
+                    "https://moved.invalid",
+                    None,
+                    |config| {
+                        saves.set(saves.get() + 1);
+                        if saves.get() == 2 {
+                            anyhow::bail!("injected rollback failure");
+                        }
+                        config.save()
+                    },
+                    |_| anyhow::bail!("injected credential save failure"),
+                )
+                .expect_err("both saves fail");
+                assert_eq!(saves.get(), 2);
+                let message = format!("{error:#}");
+                assert!(message.contains("injected rollback failure"));
+                assert!(message.contains("injected credential save failure"));
+                assert!(message.contains("retry `wsmp config set-server`"));
+                assert_eq!(
+                    load_node_credential().expect("credential"),
+                    Some(original.clone())
+                );
+                let config = Config::load_required().expect("config");
+                assert_eq!(config.server_url.as_deref(), Some("https://moved.invalid"));
+                assert_eq!(
+                    crate::auth::CredentialPairing::default()
+                        .resolve_credential(
+                            config.server_url.as_deref(),
+                            config.public_origin.as_deref()
+                        )
+                        .expect("startup accepts the interrupted pair"),
+                    original.credential
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn credential_pairing_rereads_replacements_and_restart_accepts_the_new_pair() {
+        isolated_paths(
+            "commands::config::tests::credential_pairing_rereads_replacements_and_restart_accepts_the_new_pair",
+            || {
+                let original = NodeCredential {
+                    node_id: "node-1".into(),
+                    slug: "spark-1".into(),
+                    server: "https://legacy.invalid".into(),
+                    credential: "test-only-token".into(),
+                };
+                save_node_credential(&original).expect("legacy credential");
+                let configured = Some("http://192.168.1.10:3000");
+                let mut running = crate::auth::CredentialPairing::default();
+                assert_eq!(
+                    running
+                        .resolve_credential(configured, None)
+                        .expect("legacy startup without pin"),
+                    original.credential
+                );
+                let refreshed = NodeCredential {
+                    credential: "refreshed-test-token".into(),
+                    ..original.clone()
+                };
+                save_node_credential(&refreshed).expect("refresh");
+                assert_eq!(
+                    running
+                        .resolve_credential(configured, None)
+                        .expect("same-server refresh"),
+                    refreshed.credential
+                );
+                let replaced = NodeCredential {
+                    server: "https://replacement.invalid".into(),
+                    ..refreshed
+                };
+                save_node_credential(&replaced).expect("replacement enrollment");
+                let message = running
+                    .resolve_credential(configured, None)
+                    .expect_err("changed enrollment")
+                    .to_string();
+                assert!(message.contains("wsmp service restart"));
+                assert!(message.contains("restart `wsmp run`"));
+                let mut restarted = crate::auth::CredentialPairing::default();
+                assert_eq!(
+                    restarted
+                        .resolve_credential(configured, None)
+                        .expect("restart accepts new startup pair"),
+                    replaced.credential
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn set_server_then_connect_preserves_enrollment_and_private_storage() {
+        const CHILD_ROOT: &str = "WSMP_SET_SERVER_TEST_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            // Path overrides are process-wide. Run this test alone in a child
+            // rather than changing another parallel test's config or state.
+            let root = tempfile::tempdir().expect("tempdir");
+            let result = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", "commands::config::tests::set_server_then_connect_preserves_enrollment_and_private_storage", "--nocapture"])
+                .env(CHILD_ROOT, root.path())
+                .output().expect("isolated test");
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        };
+        let root = PathBuf::from(root);
+        crate::paths::pin(
+            Some(root.join("config/config.json")),
+            Some(root.join("state")),
+        )
+        .expect("isolated paths");
+        let original = NodeCredential {
+            node_id: "node-1".into(),
+            slug: "spark-1".into(),
+            server: "https://example.invalid/enrolled".into(),
+            credential: "test-only-token".into(),
+        };
+        let config = Config {
+            server_url: Some("https://example.invalid".into()),
+            ..Config::default()
+        };
+        config.save().expect("initial config");
+        save_node_credential(&original).expect("enrollment");
+        let set_server = |url: &str, public_origin: Option<&str>| {
+            // Exercise the command's mutation independently of the process
+            // ancestry guard: the test runner may itself be a wsmp job.
+            super::set_server(url, public_origin.map(str::to_string)).expect("set-server");
+        };
+        let connect = || {
+            let config = Config::load_required().expect("config");
+            crate::auth::CredentialPairing::default().resolve_credential(
+                config.server_url.as_deref(),
+                config.public_origin.as_deref(),
+            )
+        };
+        set_server("http://192.168.1.10:3000", Some("https://example.invalid"));
+        let moved = load_node_credential()
+            .expect("credential")
+            .expect("enrolled");
+        assert_eq!(
+            moved,
+            NodeCredential {
+                server: "http://192.168.1.10:3000".into(),
+                ..original.clone()
+            }
+        );
+        assert_eq!(connect().expect("connect over LAN"), original.credential);
+        // A pre-upgrade LAN config can still hold its public login address.
+        save_node_credential(&original).expect("old enrollment address");
+        assert_eq!(connect().expect("legacy LAN connect"), original.credential);
+        set_server("https://moved.invalid", None);
+        assert_eq!(
+            connect().expect("connect after domain move"),
+            original.credential
+        );
+        assert_eq!(
+            load_node_credential()
+                .expect("credential")
+                .expect("enrolled")
+                .server,
+            "https://moved.invalid"
+        );
+        assert!(
+            Config::load_required()
+                .expect("config")
+                .public_origin
+                .is_none()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(crate::paths::node_credential_file().expect("path"))
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(crate::paths::state_dir().expect("path"))
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        // Do not relabel an enrollment unrelated to the previous config.
+        save_node_credential(&original).expect("unrelated credential");
+        set_server("https://another.invalid", None);
+        assert_eq!(
+            load_node_credential()
+                .expect("credential")
+                .expect("enrolled"),
+            original
+        );
+        assert_eq!(
+            connect().expect("startup accepts the pre-existing pair"),
+            original.credential
+        );
+        crate::state::remove_node_credential().expect("remove fixture credential");
+        set_server("https://unenrolled.invalid", None);
+        assert!(load_node_credential().expect("credential").is_none());
+    }
 }

@@ -1,5 +1,6 @@
 import { DEFAULT_LOCALE, type Locale } from "@ws-model-proxy/config/locales";
 import { env } from "@ws-model-proxy/env/server";
+import { MCP_FINE_SCOPES } from "./agent-scopes";
 
 /**
  * Pure MCP configuration.
@@ -45,22 +46,18 @@ export const MCP_CIMD_REGISTRATION_POLICY = {
 // ---------------------------------------------------------------------------
 
 /** Every scope this MCP server can mint. */
-export const MCP_SCOPES = ["mcp:read", "mcp:write", "offline_access"] as const;
+export const MCP_SCOPES = ["mcp:read", ...MCP_FINE_SCOPES, "offline_access"] as const;
 
 export type McpScope = (typeof MCP_SCOPES)[number];
 
-/**
- * The resource scopes: `scopes_supported` in /.well-known/oauth-protected-resource and the
- * `scope` of the /mcp `WWW-Authenticate` challenge. Naming `mcp:write` there lets an OAuth
- * client request it, so the consent page can offer Full; Read-only stays its default.
- */
-export const MCP_RESOURCE_SCOPES = ["mcp:read", "mcp:write"] as const;
+/** Resource metadata and challenges advertise every permission the person may approve. */
+export const MCP_RESOURCE_SCOPES = ["mcp:read", ...MCP_FINE_SCOPES] as const;
 
-/** CIMD client-registration ceiling: default scopes granted at registration. */
+/** Provider/CIMD ceiling defaults; DCR without a requested subset retains MCP_SCOPES. */
 export const MCP_CLIENT_REGISTRATION_DEFAULT_SCOPES = ["mcp:read", "offline_access"] as const;
 
 /** CIMD client-registration ceiling: extra scopes a client may add. */
-export const MCP_CLIENT_REGISTRATION_ALLOWED_EXTRA_SCOPES = ["mcp:write"] as const;
+export const MCP_CLIENT_REGISTRATION_ALLOWED_EXTRA_SCOPES = MCP_FINE_SCOPES;
 
 /** Synthetic OAuth client-id prefix for MCP personal access tokens. */
 export const MCP_PAT_CLIENT_ID_PREFIX = "pat:" as const;
@@ -152,7 +149,7 @@ export const MCP_CONSENT_PAGE_PATH_DEFAULT: string = mcpConsentPagePath();
  * Split/deduplicate an OAuth `scope` claim (space-separated string or list)
  * into a clean scope array. Splitting is on the ASCII space `" "` ONLY:
  * tokens are used literally (never trimmed into validity, no case folding)
- * so padded or case-variant tokens like `"mcp:write "` / `"MCP:WRITE"` do
+ * so padded or case-variant tokens like `"mcp:read "` / `"MCP:READ"` do
  * NOT match the literal scope names. A string with leading/trailing
  * whitespace is malformed and grants nothing (fail closed by not-granting,
  * never by rejecting the input); inner empty tokens from repeated spaces
@@ -166,19 +163,10 @@ export function parseMcpScopes(scope: string | readonly string[] | null | undefi
   return [...new Set(scope ?? [])];
 }
 
-/**
- * Scope predicate for protected-resource admission (invariant 9):
- * - read baseline is satisfied by either `mcp:read` or `mcp:write`;
- * - write requires the literal `mcp:write`.
- *
- * Pure over the presented scope string/array — it never mutates or widens the
- * granted scopes. Later parts (Phase 2/4) reuse this as the single matcher.
- */
+/** Protected-resource admission requires the literal mcp:read baseline. */
 export function mcpScopesAllow(
   scope: string | readonly string[] | null | undefined,
-  requirement: "read" | "write",
+  requirement: "read",
 ): boolean {
-  const granted = new Set(parseMcpScopes(scope));
-  if (requirement === "write") return granted.has("mcp:write");
-  return granted.has("mcp:read") || granted.has("mcp:write");
+  return requirement === "read" && parseMcpScopes(scope).includes("mcp:read");
 }

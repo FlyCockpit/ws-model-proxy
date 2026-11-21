@@ -1,5 +1,5 @@
 /**
- * 0.4.0 runtime definition (`RuntimeVersion.spec`, relay 3.0 `runtime.define`).
+ * Runtime definition (`RuntimeVersion.spec`, relay 4.0 `runtime.define`).
  *
  * One schema for both runtime kinds: an ALWAYS_ON spec has `address` and no `launch`; a
  * STARTABLE spec has `launch` and no `address`. The kind is derived from that and must equal
@@ -7,7 +7,7 @@
  *
  * The server and the node validate the same rules. The Rust mirror is
  * `apps/cli/src/protocol/runtime_spec.rs`; shared fixtures live in
- * `apps/cli/tests/fixtures/relay-3.0/`. `launchHash = sha256(canonicalJson(spec))`
+ * `apps/cli/tests/fixtures/relay-4.0/`. `launchHash = sha256(canonicalJson(spec))`
  * (`runtime-launch-hash.ts`) is the only definition identity a node sees.
  *
  * Pure module (no Node built-ins): the web Definition form validates with it too.
@@ -810,7 +810,7 @@ const NEVER_STOPPED_STATUS = new Set(["", "true", ":", "exit 0", "/bin/true", "/
  * `:`, `exit 0`, `/bin/true` and `/usr/bin/true`, compared after collapsing spaces, tabs and
  * line breaks and dropping trailing semicolons. Nothing else is parsed. The node's twin is
  * `status_can_report_stopped` (`apps/cli/src/protocol/runtime_spec.rs`); shared vectors in
- * `apps/cli/tests/fixtures/relay-3.0/rules/status-command.json`.
+ * `apps/cli/tests/fixtures/relay-4.0/rules/status-command.json`.
  */
 export function statusCanReportStopped(command: string): boolean {
   let text = command
@@ -879,21 +879,6 @@ export const nodeMetricCommandSchema = z
     message: "cmd cannot run an argv.",
   });
 export type NodeMetricCommand = z.infer<typeof nodeMetricCommandSchema>;
-
-/**
- * Whether a metric command has a shape only a node that reports `features.launch` can read: an
- * argv or a `shell`. A released CLI without it reads `command` as text and refuses unknown
- * fields, and a `runtime.define` it cannot parse ends its session, so it is never sent one.
- */
-export function metricCommandNeedsLaunch(command: NodeMetricCommand): boolean {
-  return typeof command.command !== "string" || command.shell !== undefined;
-}
-
-/** Whether the node reports `features.launch` (it reads argv and `shell` metric commands). */
-export function reportsLaunchFeatures(features: unknown): boolean {
-  const parsed = nodeFeaturesSchema.safeParse(features);
-  return parsed.success && parsed.data.launch !== undefined;
-}
 
 /** Canonical UTF-8 size, or null when the value cannot be hashed (other issues report why). */
 export function canonicalBytes(value: unknown): number | null {
@@ -1120,24 +1105,11 @@ export const nodeFeaturesSchema = z
       .max(64),
     mediaExpand: z.boolean(),
     liveStt: z.boolean(),
-    /**
-     * The node reads a job's `reservations` (relay 3.0, added after 0.4.2). Absent on older
-     * CLIs, which refuse a job carrying them: a start that needs them is refused with
-     * `cli_upgrade_required` instead.
-     */
-    jobReservations: z.boolean().optional(),
-    /**
-     * One runtime step runner outlives the node's relay connections, and its stop and status
-     * results and inventory records say whether the rank had another step that may launch in
-     * flight (`rankIdle`, the only stop proof: `proofHolds` in `claim-release.ts`). The server
-     * sends runtime jobs only to a node with it; an older CLI is told to upgrade.
-     */
-    rankIdle: z.boolean().optional(),
-    /**
-     * What runtime launches the node can run (placement leaves out a node that cannot run a
-     * runtime's launch: `unsupported_platform`). Absent on older CLIs: placement then reads the
-     * node's `executionMechanism` (`launchCapabilities`).
-     */
+    /** The node reads runtime job reservations. */
+    jobReservations: z.boolean(),
+    /** Stop and status observations report whether another step may still launch. */
+    rankIdle: z.boolean(),
+    /** What this node can launch; absent when no launch mechanism is available. */
     launch: z
       .object({
         platform: z.enum(NODE_PLATFORMS),
@@ -1156,11 +1128,8 @@ export const nodeFeaturesSchema = z
     secrets: z
       .array(z.object({ name: nodeSecretNameSchema, updatedAt: z.iso.datetime() }).strict())
       .max(NODE_SECRETS_MAX),
-    /**
-     * How this install of wsmp can update itself (`agent.update`). Absent on CLIs older than
-     * self-update: the server never sends them `agent.update` and shows the manual command.
-     */
-    selfUpdate: nodeSelfUpdateSchema.optional(),
+    /** How this install of wsmp updates itself. */
+    selfUpdate: nodeSelfUpdateSchema,
   })
   .strict();
 export type NodeFeatures = z.infer<typeof nodeFeaturesSchema>;

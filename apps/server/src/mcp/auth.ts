@@ -1,6 +1,7 @@
 import { requireMcpAuth } from "@better-auth/mcp";
 import type { AuthInfo } from "@modelcontextprotocol/server";
 import type { ContextServices } from "@ws-model-proxy/api/context";
+import { oauthScopeCeiling } from "@ws-model-proxy/auth/agent-scopes";
 import {
   MCP_ISSUER,
   MCP_RESOURCE_SCOPES,
@@ -10,6 +11,7 @@ import {
   parseMcpScopes,
 } from "@ws-model-proxy/auth/mcp-config";
 import { MCP_GRANT_ID_CLAIM } from "@ws-model-proxy/auth/mcp-grant";
+import { readMcpGrantAccess } from "@ws-model-proxy/auth/mcp-grant-access";
 import type prismaClientDefault from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { Context } from "hono";
@@ -20,17 +22,18 @@ import { MCP_CLOSE_SHADOW_AWAIT_MS } from "../shutdown-timeouts";
 import { createMcpAdmissionGate, type McpAdmission, type McpAdmissionGate } from "./admission";
 import {
   type AgentTokenIdentity,
+  agentTokenBlockedByPolicy,
   authenticateAgentToken,
   isAgentTokenSecret,
 } from "./agent-token-access";
 import {
   createMcpContext,
   type McpContext,
-  type McpLevel,
   type McpRequestCredential,
   type McpSessionUser,
 } from "./context";
 import {
+  mcpAgentTokenPolicyBlockedResponse,
   mcpForbiddenResponse,
   mcpInternalErrorResponse,
   mcpInvalidRequestResponse,
@@ -58,8 +61,9 @@ import {
  * application-owned admission sequence (each step fails closed):
  *
  *   1. nonempty string `sub` + `client_id` claims;
- *   2. scope claim parsed + deduped (`parseMcpScopes` — the SAME pure
- *      parser the protected-resource matcher uses);
+ *   2. legacy `mcp:write` tokens rejected with 401 before other scope
+ *      evaluation; scope claim parsed + deduped (`parseMcpScopes` — the
+ *      SAME pure parser the protected-resource matcher uses);
  *   3. the actually-presented Bearer/DPoP credential extracted from the
  *      Authorization header;
  *   4. the verified payload converted to SDK v2 `AuthInfo`;
@@ -74,9 +78,10 @@ import {
  *   9. `AuthInfo` passed to the transport's `.fetch(request, { authInfo })`.
  *
  * The scope predicate: the ENDPOINT baseline is the read baseline
- * (`requiredScopes: ["mcp:read"]` with a matcher where `mcp:write` also
- * satisfies it — exactly `mcpScopesAllow(scope, "read")`); literal
- * `mcp:write` for write tools is enforced at tool dispatch (Phase 5).
+ * (`requiredScopes: ["mcp:read"]`, matched literally). The upstream scope
+ * matcher hands legacy tokens to step 2 solely for rejection, so write-only
+ * tokens get invalid_token before insufficient_scope. Each tool's effective
+ * scope is enforced at tool dispatch.
  */
 
 /** The auth-instance shape the upstream wrapper needs ($context for DPoP replay). */
@@ -84,7 +89,7 @@ export type McpAuthInstance = Parameters<typeof requireMcpAuth>[0];
 
 /** Minimal Prisma surface this module uses (mocked in tests via mockDeep). */
 export type McpAuthPrisma = {
-  mcpGrant: Pick<typeof prismaClientDefault.mcpGrant, "findUnique">;
+  mcpGrant: typeof prismaClientDefault.mcpGrant;
   user: Pick<typeof prismaClientDefault.user, "findUnique">;
 };
 
@@ -169,30 +174,18 @@ const defaultConsumeIdentityQuota = async (
   }
 };
 
-/**
- * The upstream scope matcher: `mcp:write` satisfies the read baseline.
- * Only `mcp:read` is configured as a required scope; the matcher applies
- * `mcpScopesAllow` semantics verbatim (never widens granted scopes).
- */
-/**
- * Read-baseline scope matcher (mcp:write implies mcp:read). Exported for the
- * scope-predicate tests; production consumes it directly at the
- * `isScopeSatisfied` seam below.
- */
+/** Required scopes match literally; /mcp admission requires mcp:read. */
 export function mcpReadBaselineMatcher(requiredScope: string, grantedScopes: ReadonlySet<string>) {
-  return mcpScopesAllow([...grantedScopes], requiredScope === "mcp:read" ? "read" : "write");
+  return requiredScope === "mcp:read"
+    ? mcpScopesAllow([...grantedScopes], "read")
+    : grantedScopes.has(requiredScope);
 }
 
 async function loadMcpGrant(prisma: McpAuthPrisma, id: string) {
   return prisma.mcpGrant.findUnique({
     where: { id },
-    select: { id: true, userId: true, clientId: true, revokedAt: true, level: true },
+    select: { id: true, userId: true, clientId: true, revokedAt: true },
   });
-}
-
-/** An OAuth request is FULL only when its grant is FULL and the token carries mcp:write. */
-export function oauthLevel(grantLevel: McpLevel, scopes: readonly string[]): McpLevel {
-  return grantLevel === "FULL" && mcpScopesAllow([...scopes], "write") ? "FULL" : "READ";
 }
 
 /** Extract the presented Bearer/DPoP credential from the Authorization header. */
@@ -221,9 +214,8 @@ export interface McpVerifiedRequest {
    */
   signal: AbortSignal;
   /**
-   * How this request was admitted, with its level. The agent-token branch
-   * takes it from the token row; the OAuth path from the grant and the
-   * token's scopes. Never inferred from `clientId`.
+   * How this request was admitted, with a live grant access snapshot. OAuth access is
+   * intersected with the presented token's scope ceiling. Never inferred from `clientId`.
    */
   credential: McpRequestCredential;
 }
@@ -529,9 +521,13 @@ async function handleAdmittedRequest(
       resource: resourceUrl,
       requiredScopes: ["mcp:read"],
       // The challenge names every resource scope (not just the read baseline), so a client
-      // can ask for mcp:write and the consent page can offer Full.
+      // can request the fine scopes and the consent page can offer every permission.
       challengeScopes: MCP_RESOURCE_SCOPES,
-      isScopeSatisfied: mcpReadBaselineMatcher,
+      // Upstream checks scopes after signature/issuer/audience verification,
+      // before our handler. Hand legacy tokens to step 2 ONLY to reject them
+      // with invalid_token, including those lacking the read baseline.
+      isScopeSatisfied: (requiredScope, grantedScopes) =>
+        grantedScopes.has("mcp:write") || mcpReadBaselineMatcher(requiredScope, grantedScopes),
     },
   );
   try {
@@ -568,7 +564,7 @@ async function handleAdmittedRequest(
         claims: {
           sub: identity.userId,
           client_id: mcpPatClientId(identity.id),
-          scope: identity.level === "FULL" ? "mcp:read mcp:write" : "mcp:read",
+          scope: identity.access.scopes.map((scope) => `mcp:${scope}`).join(" "),
           [MCP_GRANT_ID_CLAIM]: identity.grantId,
           ...(identity.expiresAt ? { exp: Math.floor(identity.expiresAt.getTime() / 1000) } : {}),
         },
@@ -775,7 +771,22 @@ async function handleVerifiedRequest({
     });
   }
 
-  // 2. Scope claim parsed + deduped (shared pure parser).
+  // 2. Reject legacy scopes BEFORE parsing/evaluating the current scope set.
+  // Inspect exact ASCII-space-delimited tokens even when padding would make
+  // parseMcpScopes fail closed. Array entries remain literal, as in that parser.
+  const scopeTokens =
+    typeof claims.scope === "string"
+      ? claims.scope.split(" ")
+      : Array.isArray(claims.scope)
+        ? claims.scope
+        : [];
+  if (scopeTokens.includes("mcp:write")) {
+    return mcpUnauthorizedResponse({
+      description: "This token predates wsmp 1.0 scopes; refresh it or sign in again.",
+      resourceUrl,
+    });
+  }
+  // Current scope claim parsed + deduped (shared pure parser).
   const scopes = parseMcpScopes(
     typeof claims.scope === "string" || Array.isArray(claims.scope) ? claims.scope : null,
   );
@@ -800,10 +811,14 @@ async function handleVerifiedRequest({
     });
   }
   let grant: Awaited<ReturnType<typeof loadMcpGrant>>;
-  // Before the read: a lowering committed after this instant may not be in what it returns.
-  const levelReadAt = performance.now();
+  // Before the read: a narrowing committed afterwards may not appear in this snapshot.
+  let accessReadAt: number;
+  let grantAccess: Awaited<ReturnType<typeof readMcpGrantAccess>>;
   try {
     grant = await loadMcpGrant(options.prisma, grantIdClaim);
+    if (signal.aborted) return mcpRequestAbortedResponse();
+    accessReadAt = performance.now();
+    grantAccess = grant ? await readMcpGrantAccess(options.prisma, grantIdClaim) : null;
   } catch (error) {
     mcpSanitizedLog(
       `grant lookup failed (${error instanceof Error ? error.constructor.name : typeof error})`,
@@ -814,6 +829,7 @@ async function handleVerifiedRequest({
   if (signal.aborted) return mcpRequestAbortedResponse();
   if (
     grant === null ||
+    grantAccess == null ||
     grant.userId !== sub ||
     grant.clientId !== clientId ||
     grant.revokedAt !== null
@@ -827,22 +843,25 @@ async function handleVerifiedRequest({
     return mcpForbiddenResponse();
   }
 
-  // The request's level: an agent token's own level; an OAuth grant's level,
-  // and FULL only when the access token also carries mcp:write.
+  const ceiling = oauthScopeCeiling(scopes);
+  const access =
+    agentToken !== null
+      ? grantAccess
+      : {
+          scopes: grantAccess.scopes.filter((scope) => ceiling.includes(scope)),
+          nodeIds: grantAccess.nodeIds,
+        };
   const mcpCredential: McpRequestCredential =
     agentToken !== null
       ? {
           kind: "agent_token",
           tokenId: agentToken.id,
-          level: agentToken.level,
+          grantId: grant.id,
+          access,
+          accessReadAt,
           expiresAt: agentToken.expiresAt,
         }
-      : {
-          kind: "oauth",
-          grantId: grant.id,
-          level: oauthLevel(grant.level, scopes),
-          levelReadAt,
-        };
+      : { kind: "oauth", grantId: grant.id, access, accessReadAt };
 
   // 6-7. Live user: missing → 401; active ban or pending deletion → 403; forced 2FA not set up → 403.
   // FULL Prisma user row (invariant 5): the synthetic oRPC context must
@@ -921,6 +940,13 @@ async function handleVerifiedRequest({
   // Final fence: once the signal is aborted, the verified seam and the
   // transport fetch (factory!) are never entered.
   if (signal.aborted) return mcpRequestAbortedResponse();
+  // No-expiry agent token while WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY is off: a typed 401, judged
+  // synchronously here, after the grant re-read (a revoked token already got its 403) and the
+  // owner checks, with no await between this decision and the transport.
+  if (agentToken !== null && agentTokenBlockedByPolicy(agentToken)) {
+    mcpSanitizedLog("rejected: no-expiry agent token blocked by policy", { sub, clientId });
+    return mcpAgentTokenPolicyBlockedResponse({ resourceUrl });
+  }
 
   // 4 + 8 + 9. AuthInfo from the VERIFIED payload; synthetic oRPC context
   // (never contains the access token); pass AuthInfo to the handler request

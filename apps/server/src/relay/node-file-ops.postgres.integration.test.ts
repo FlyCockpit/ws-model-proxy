@@ -63,21 +63,32 @@ integration("node file ops (PostgreSQL)", () => {
       },
     });
     await db.mcpGrant.create({
-      data: { id: tokenGrantId, userId, clientId: "token", referenceId: tokenId, level: "FULL" },
+      data: {
+        id: tokenGrantId,
+        userId,
+        clientId: "token",
+        referenceId: tokenId,
+        scopes: ["READ", "FILES"],
+      },
     });
     await db.agentToken.create({
       data: {
         id: tokenId,
         userId,
         name: "files",
-        level: "FULL",
         lookupPrefix: `lp${suffix}`,
         secretDigest: createHash("sha256").update(tokenId).digest("hex"),
         grantId: tokenGrantId,
       },
     });
     await db.mcpGrant.create({
-      data: { id: oauthGrantId, userId, clientId: "client", referenceId: "ref", level: "FULL" },
+      data: {
+        id: oauthGrantId,
+        userId,
+        clientId: "client",
+        referenceId: "ref",
+        scopes: ["READ", "FILES"],
+      },
     });
     relay.getLiveNodeState.mockReturnValue({
       nodeId,
@@ -200,9 +211,9 @@ integration("node file ops (PostgreSQL)", () => {
     );
   });
 
-  it("refuses a revoked token and a token of another level from the database", async () => {
+  it("refuses a revoked token and a token without files scope from the database", async () => {
     const sentBefore = relay.dispatchFileOp.mock.calls.length;
-    await m.fixture.agentToken.update({ where: { id: tokenId }, data: { level: "READ" } });
+    await m.fixture.mcpGrant.update({ where: { id: tokenGrantId }, data: { scopes: ["READ"] } });
     await expect(
       m.ops.runFileOp({
         userId,
@@ -215,7 +226,7 @@ integration("node file ops (PostgreSQL)", () => {
     ).resolves.toMatchObject({ ok: false, code: "token_inactive" });
     await m.fixture.agentToken.update({
       where: { id: tokenId },
-      data: { level: "FULL", revokedAt: new Date() },
+      data: { revokedAt: new Date() },
     });
     await expect(
       m.ops.runFileOp({

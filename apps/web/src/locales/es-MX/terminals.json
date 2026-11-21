@@ -94,7 +94,8 @@
     "bad_handshake": "Falló el intercambio seguro con el nodo.",
     "other": "La terminal fue rechazada ({{reason}}).",
     "step_detached": "Esta terminal se desconectó. Ábrela de nuevo desde Pasos que te esperan.",
-    "browser_identity_unavailable": "No se pudo cargar la identidad de terminal de este navegador, y este nodo la requiere. Recarga la página para intentarlo de nuevo."
+    "browser_identity_unavailable": "No se pudo cargar la identidad de terminal de este navegador, y este nodo la requiere. Recarga la página para intentarlo de nuevo.",
+    "bad_cwd": "El nodo no puede usar su directorio personal para abrir esta terminal."
   },
   "steps": {
     "title": "Pasos que te esperan",

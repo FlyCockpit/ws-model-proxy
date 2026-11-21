@@ -4,7 +4,7 @@
 // This module performs browser I/O (decode, canvas, FileReader) and applies
 // that pure policy so model payloads stay compatible with local vision servers.
 //
-// Size budget rationale (see asset-plan.md "Size limits"):
+// Size budgets leave room for base64 images and JSON framing in each request:
 //   - The session Test routes enforce the global 10 MB Hono body limit.
 //   - The CLI relay streams request bodies; the 10 MB internal route body limit
 //     is the remaining ceiling for base64-through-relay.

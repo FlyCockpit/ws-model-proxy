@@ -89,7 +89,7 @@ impl TrustAuthority {
     pub fn lower(&self) -> bool {
         use std::sync::atomic::Ordering;
         // A CAS loop rather than `fetch_update`, which current Rust deprecates for a
-        // replacement newer than our MSRV (1.88).
+        // replacement newer than our MSRV (1.89).
         let mut previous = self.state.load(Ordering::SeqCst);
         loop {
             let next = (previous >> 1).saturating_add(1) << 1;
@@ -167,6 +167,9 @@ impl TerminalStartup {
         config: &Config,
         home: Option<&std::path::Path>,
     ) -> Self {
+        if let Some(warning) = config.retired_command_policy_warning {
+            tracing::warn!("{warning}");
+        }
         let (file_roots, file_roots_source) = crate::config::effective_file_roots(config, home);
         Self {
             key,
@@ -423,6 +426,59 @@ mod tests {
 
     fn key() -> CliTerminalKey {
         CliTerminalKey::generate().expect("key")
+    }
+
+    #[test]
+    fn retired_command_policy_warns_once_at_startup_without_changing_trust_or_features() {
+        let _capture = crate::logging::test_capture_lock();
+        for mode in [None, Some("standard"), Some("isolated")] {
+            for trust in [TrustValue::Relay, TrustValue::Full] {
+                let log = tempfile::NamedTempFile::new().expect("log");
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(std::sync::Mutex::new(log.reopen().expect("log writer")))
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .finish();
+                let mut json = serde_json::json!({ "trust": trust });
+                if let Some(mode) = mode {
+                    json["agentCommands"] = mode.into();
+                }
+                let config: Config = serde_json::from_value(json).expect("prerelease config");
+                tracing::subscriber::with_default(subscriber, || {
+                    let startup = TerminalStartup::from_key_with_home(key(), &config, None);
+                    assert_eq!(startup.trust_value(), trust);
+                    let baseline = TerminalStartup::from_key_with_home(
+                        key(),
+                        &Config {
+                            trust: Some(trust),
+                            ..Config::default()
+                        },
+                        None,
+                    );
+                    assert_eq!(
+                        serde_json::to_value(startup.features()).expect("features"),
+                        serde_json::to_value(baseline.features()).expect("baseline features")
+                    );
+                });
+                let logged = std::fs::read_to_string(log.path()).expect("read log");
+                let expected = match mode {
+                    Some("isolated") => Some(
+                        "The agentCommands setting was removed in wsmp 1.0 and is ignored. Agent commands now follow this node's trust level: at Full control they run as this user. Lower trust with `wsmp trust relay` if you relied on isolated.",
+                    ),
+                    Some(_) => {
+                        Some("The agentCommands setting was removed in wsmp 1.0 and is ignored.")
+                    }
+                    None => None,
+                };
+                if let Some(expected) = expected {
+                    assert_eq!(logged.lines().count(), 1, "{logged}");
+                    assert!(logged.contains("WARN"), "{logged}");
+                    assert!(logged.trim_end().ends_with(expected), "{logged}");
+                } else {
+                    assert!(logged.is_empty(), "{logged}");
+                }
+            }
+        }
     }
 
     #[test]

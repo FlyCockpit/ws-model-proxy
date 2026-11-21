@@ -1,5 +1,5 @@
 /**
- * Relay 3.0 node sessions: one authenticated websocket per node (`wsmp`), registered by its
+ * Relay 4.0 node sessions: one authenticated websocket per node (`wsmp`), registered by its
  * signed `hello`, then carrying model requests, browser terminals, file ops, live
  * speech-to-text and telemetry.
  *
@@ -113,7 +113,6 @@ import {
   describeRelayControlParseError,
   encodeRelayBinaryFrame,
   encodeRelayServerControlMessage,
-  helloCanSelfUpdate,
   helloNeedsUpgrade,
   isCurrentProtocolHello,
   parseRelayBinaryFrame,
@@ -121,8 +120,6 @@ import {
   protocolErrorMessage,
   RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-  RELAY_SELF_UPDATE_REQUIRED_MESSAGE,
-  RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
   RELAY_STALE_AFTER_MS,
   RELAY_UNREGISTERED_STALE_AFTER_MS,
   RELAY_UPGRADE_REQUIRED_MESSAGE,
@@ -889,8 +886,6 @@ export class RelaySessionManager {
     trust: NodeTrustWire;
     operatorTerminals: boolean;
     terminalShells: readonly string[];
-    jobReservations: boolean;
-    rankIdle: boolean;
     /** `features.selfUpdate` as the node last reported it (hello, `node.state`). */
     selfUpdate: NodeSelfUpdate | null;
   } | null {
@@ -903,8 +898,6 @@ export class RelaySessionManager {
       trust: session.trust,
       operatorTerminals: this.operatorTerminalsAllowed(session),
       terminalShells: node.features.terminals.shells ?? [],
-      jobReservations: node.features.jobReservations === true,
-      rankIdle: node.features.rankIdle === true,
       selfUpdate: node.features.selfUpdate ?? null,
     };
   }
@@ -1491,18 +1484,19 @@ export class RelaySessionManager {
   async handleTextFrame(socket: RelaySocket, frame: string, now = new Date()) {
     const session = this.sessionsBySocket.get(socket);
     if (!session) return;
-    // A hello that is not 3.0 gets a message it can print (an "upgrade wsmp" text), not an
-    // opaque schema rejection.
+    // Refuse a different protocol before applying the strict current hello schema.
     if (preRegistration(session.phase) && helloNeedsUpgrade(frame)) {
       const rejected = rejectedHelloFacts(frame);
-      const reason = refusedRelayProtocolReason(rejected.protocolVersion);
-      const code = reason === "cli_too_new" ? "upgrade_server" : "upgrade_cli";
+      const code =
+        refusedRelayProtocolReason(rejected.protocolVersion) === "cli_too_new"
+          ? "upgrade_server"
+          : "upgrade_cli";
       console.error("[relay] refused a hello this server does not speak", { ...rejected, code });
       closeWithProtocolError(
         socket,
         code,
         code === "upgrade_server"
-          ? RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE
+          ? "This wsmp uses a newer relay protocol. Upgrade the WS Model Proxy server."
           : RELAY_UPGRADE_REQUIRED_MESSAGE,
       );
       await recordRejectedNodeHello(session.identity, rejected, now).catch((error: unknown) => {
@@ -1544,18 +1538,6 @@ export class RelaySessionManager {
     }
 
     if (message.type === "hello") {
-      // A wsmp older than self-update: refused by capability (it could never take an update).
-      if (preRegistration(session.phase) && !helloCanSelfUpdate(message)) {
-        console.error("[relay] refused a hello without self-update", { code: "upgrade_cli" });
-        closeWithProtocolError(socket, "upgrade_cli", RELAY_SELF_UPDATE_REQUIRED_MESSAGE);
-        await recordRejectedNodeHello(session.identity, rejectedHelloFacts(frame), now).catch(
-          (recordError: unknown) => {
-            console.error("[relay] recording a refused hello failed", errorName(recordError));
-          },
-        );
-        await this.removeSession(socket, now);
-        return;
-      }
       await this.handleHello(session, message, now);
       return;
     }
@@ -1575,16 +1557,16 @@ export class RelaySessionManager {
     switch (message.type) {
       case "heartbeat": {
         session.lastHeartbeatAt = now;
-        // Same durable fence as the disconnect: only while the row still describes THIS
-        // session's connection.
-        await writeNodeHeartbeat(node.nodeId, node.connectionGeneration, now).catch(
-          (error: unknown) => console.error("[relay] heartbeat write failed", errorName(error)),
-        );
         this.sendControl(session, {
           type: "heartbeat.pong",
           id: message.id,
           receivedAt: now.toISOString(),
         });
+        // Answer before database work so a stalled write cannot trip the node's peer timeout.
+        // Same durable fence as the disconnect: only THIS session's connection is updated.
+        await writeNodeHeartbeat(node.nodeId, node.connectionGeneration, now).catch(
+          (error: unknown) => console.error("[relay] heartbeat write failed", errorName(error)),
+        );
         // Reconcile with what is stored: a lowering another server process committed reaches
         // this session within a heartbeat.
         if (readyNode(session.phase)) void this.syncTrust(node.nodeId);
@@ -1975,8 +1957,6 @@ export class RelaySessionManager {
       protocolVersion: message.protocolVersion,
       nodeId: registration.nodeId,
       definitionSync,
-      // What this server accepts on top of the released 3.0 node frames.
-      features: { execRanWith: true, agentUpdateAvailableVersion: true },
     });
     acknowledgeHello(session);
     // Again now it is acknowledged: a lowering pending (or one that came during the awaits
@@ -2289,12 +2269,12 @@ export class RelaySessionManager {
           connection: "OFFLINE",
           generation: connectionGeneration,
         });
-      }
-      if (ref) {
-        try {
-          this.frameHandlers.nodeDisconnected?.(ref);
-        } catch (error) {
-          console.error("[relay] node disconnected handler failed", errorName(error));
+        if (ref) {
+          try {
+            this.frameHandlers.nodeDisconnected?.(ref);
+          } catch (error) {
+            console.error("[relay] node disconnected handler failed", errorName(error));
+          }
         }
       }
     };
@@ -2366,8 +2346,8 @@ export class RelaySessionManager {
 
   /**
    * A hello's registration committed (node ONLINE) after its session was detached. Undo it
-   * unless another live session owns the node; a live owner accepted under an older
-   * generation adopts the newer one so its own later disconnect still matches the row.
+   * unless a newer live session owns the node. An older owner adopts the committed generation
+   * for its disconnect write, then reconnects to recover exchanges under its old generation.
    */
   private async settleDetachedRegistration(
     nodeId: string,
@@ -2378,8 +2358,15 @@ export class RelaySessionManager {
     const owner = this.sessionsByNodeId.get(nodeId);
     if (owner) {
       const node = liveNode(owner.phase);
-      if (node && node.connectionGeneration < connectionGeneration)
+      if (node && node.connectionGeneration < connectionGeneration) {
         node.connectionGeneration = connectionGeneration;
+        this.teardownInteractiveWork(owner);
+        owner.socket.close(1000, "replaced");
+        await this.detachSession(owner.socket, {
+          now,
+          failureClass: "WEBSOCKET_DISCONNECTED",
+        })?.();
+      }
       return;
     }
     await this.writeNodeDisconnected(nodeId, {
@@ -2395,10 +2382,22 @@ export class RelaySessionManager {
         liveNode(session.phase) !== null &&
         now.getTime() - session.lastHeartbeatAt.getTime() > RELAY_STALE_AFTER_MS,
     );
+    const writes: Array<() => Promise<void>> = [];
     for (const session of staleSessions) {
+      if (
+        !this.isCurrent(session) ||
+        now.getTime() - session.lastHeartbeatAt.getTime() <= RELAY_STALE_AFTER_MS
+      )
+        continue;
       this.teardownInteractiveWork(session);
       session.socket.close(1001, "stale");
-      await this.detachSession(session.socket, { now, failureClass: "STALE_SESSION" })?.();
+      const write = this.detachSession(session.socket, { now, failureClass: "STALE_SESSION" });
+      if (write) writes.push(write);
+    }
+    const results = await Promise.allSettled(writes.map((write) => write()));
+    for (const result of results) {
+      if (result.status === "rejected")
+        console.error("[relay] stale session disconnect failed", errorName(result.reason));
     }
   }
 
@@ -2976,8 +2975,9 @@ export class RelaySessionManager {
     message: NodeInfoFrame | NodeMetricsFrame,
     now: Date,
   ) {
-    const nodeId = this.sessionNodeId(session);
-    if (!nodeId) return;
+    const node = liveNode(session.phase);
+    if (!node) return;
+    const { nodeId, connectionGeneration } = node;
     const nowMs = now.getTime();
     if (message.type === "node.info") {
       if (
@@ -2988,9 +2988,12 @@ export class RelaySessionManager {
       }
       session.nodeInfoAcceptedAtMs = nowMs;
       const { type: _type, ...info } = message;
-      await writeNodeTelemetry(nodeId, { nodeInfo: info, nodeInfoAt: now }).catch(
-        (error: unknown) =>
-          console.error("[relay] storing node telemetry failed", errorName(error)),
+      await writeNodeTelemetry(
+        nodeId,
+        { nodeInfo: info, nodeInfoAt: now },
+        { connectionGeneration },
+      ).catch((error: unknown) =>
+        console.error("[relay] storing node telemetry failed", errorName(error)),
       );
       return;
     }

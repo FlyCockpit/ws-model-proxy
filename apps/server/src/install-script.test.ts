@@ -1,6 +1,6 @@
 /**
  * `/install.sh` rendering and behavior. The rendered script runs under `sh` (and `dash` where it
- * is installed) against stub `curl`, `uname`, `getconf` and `cargo` commands and a local fixture
+ * is installed) against stub `curl`, `uname`, `getconf`, `ldd` and `cargo` commands and a local fixture
  * release, so nothing touches the network or a real toolchain.
  */
 
@@ -29,6 +29,7 @@ vi.mock("@ws-model-proxy/api/nodes/enroll-exchange", () => ({
 const {
   CLI_PREVIEW_BRANCH,
   CLI_RELEASE_BINARIES_BY_DEFAULT,
+  CLI_RELEASE_MIN_GLIBC,
   CLI_RELEASE_TARGETS,
   CLI_REPOSITORY,
   cliInstallSource,
@@ -130,12 +131,22 @@ describe("install.sh rendering", () => {
   });
 });
 
-type Machine = { os?: string; arch?: string; glibc?: string | null; appleSilicon?: boolean };
+type Machine = {
+  os?: string;
+  arch?: string;
+  /** `getconf GNU_LIBC_VERSION` (default 2.35); null: getconf fails, as on musl. */
+  glibc?: string | null;
+  /** `ldd --version`'s first line; default: musl's ldd, which fails. */
+  ldd?: string;
+  appleSilicon?: boolean;
+};
 type Fixture = {
   sums?: (sum: string, archive: string) => string | null;
   corrupt?: boolean;
-  /** The archive's target (default x86_64 Linux). */
+  /** The only archive's target: a release (or old mirror) with one Linux flavour. */
   target?: string;
+  /** Every archive's target (default: both x86_64 Linux flavours, as a 1.x release). */
+  targets?: string[];
   /** What the archive holds at wsmp-<target>/wsmp. */
   binary?: "ok" | "missing";
 };
@@ -163,21 +174,32 @@ function run(
   writeFileSync(log, "");
   prepare(home);
 
-  const target = fixture.target ?? "x86_64-unknown-linux-gnu";
-  const archive = `wsmp-${target}.tar.xz`;
-  mkdirSync(join(release, `wsmp-${target}`));
-  const inside = fixture.binary === "missing" ? "README.md" : "wsmp";
-  writeFileSync(join(release, `wsmp-${target}/${inside}`), '#!/bin/sh\necho "wsmp 0.4.0"\n', {
-    mode: 0o755,
-  });
-  execFileSync("tar", ["-cJf", archive, `wsmp-${target}`], { cwd: release });
-  const sum = createHash("sha256")
-    .update(readFileSync(join(release, archive)))
-    .digest("hex");
-  if (fixture.corrupt) writeFileSync(join(release, archive), "tampered");
-  const sums = fixture.sums
-    ? fixture.sums(sum, archive)
-    : `${"0".repeat(64)} *source.tar.gz\n${sum} *${archive}\n`;
+  const targets = fixture.targets ?? [
+    fixture.target ?? "x86_64-unknown-linux-gnu",
+    ...(fixture.target ? [] : ["x86_64-unknown-linux-musl"]),
+  ];
+  const lines = [`${"0".repeat(64)} *source.tar.gz`];
+  let sum = "";
+  let archive = "";
+  for (const target of targets) {
+    const name = `wsmp-${target}.tar.xz`;
+    mkdirSync(join(release, `wsmp-${target}`));
+    const inside = fixture.binary === "missing" ? "README.md" : "wsmp";
+    writeFileSync(join(release, `wsmp-${target}/${inside}`), '#!/bin/sh\necho "wsmp 0.4.0"\n', {
+      mode: 0o755,
+    });
+    execFileSync("tar", ["-cJf", name, `wsmp-${target}`], { cwd: release });
+    const digest = createHash("sha256")
+      .update(readFileSync(join(release, name)))
+      .digest("hex");
+    if (fixture.corrupt) writeFileSync(join(release, name), "tampered");
+    lines.push(`${digest} *${name}`);
+    if (!archive) {
+      sum = digest;
+      archive = name;
+    }
+  }
+  const sums = fixture.sums ? fixture.sums(sum, archive) : `${lines.join("\n")}\n`;
   if (sums !== null) writeFileSync(join(release, "sha256.sum"), sums);
 
   const stub = (name: string, body: string) =>
@@ -201,7 +223,16 @@ cp "$src" "$dest"`,
     `case "$1" in -s) echo '${machine.os ?? "Linux"}' ;; -m) echo '${machine.arch ?? "x86_64"}' ;; esac`,
   );
   const glibc = machine.glibc === undefined ? "2.35" : machine.glibc;
-  stub("getconf", glibc === null ? "exit 1" : `echo 'glibc ${glibc}'`);
+  stub(
+    "getconf",
+    `echo "getconf $*" >> '${log}'\n${glibc === null ? "exit 1" : `echo 'glibc ${glibc}'`}`,
+  );
+  stub(
+    "ldd",
+    machine.ldd === undefined
+      ? `echo "ldd $*" >> '${log}'\necho 'musl libc (x86_64)' >&2\nexit 1`
+      : `echo "ldd $*" >> '${log}'\necho '${machine.ldd}'`,
+  );
   stub("cargo", `echo "cargo $*" >> '${log}'`);
   // hw.optional.arm64: 1 on Apple silicon (also under Rosetta), missing on Intel.
   stub("sysctl", machine.appleSilicon ? "echo 1" : "exit 1");
@@ -242,12 +273,132 @@ describe.skipIf(!canRun)("install.sh behavior", () => {
     }
   });
 
+  const floor = `${CLI_RELEASE_MIN_GLIBC.major}.${CLI_RELEASE_MIN_GLIBC.minor}`;
+  const receiptTarget = (home: string) =>
+    JSON.parse(readFileSync(join(home, ".local/state/ws-model-proxy/install.json"), "utf8")).target;
+  const both = (arch: string) => [`${arch}-unknown-linux-gnu`, `${arch}-unknown-linux-musl`];
+
+  it("installs the GNU build on glibc at or above the floor, as 0.4.x did", () => {
+    expect(floor).toBe("2.34");
+    for (const glibc of [floor, "2.35", "2.39", "2.100", "3.0"]) {
+      for (const arch of ["x86_64", "aarch64"]) {
+        const out = run(releaseScript, { arch, glibc }, { targets: both(arch) });
+        const target = `${arch}-unknown-linux-gnu`;
+        expect(out.status).toBe(0);
+        expect(out.output).toContain("checksum verified");
+        expect(out.installed).not.toBeNull();
+        expect(out.calls).toContain(`${RELEASE}/wsmp-${target}.tar.xz`);
+        expect(out.calls).not.toContain("-unknown-linux-musl.tar.xz");
+        expect(out.calls).not.toMatch(/^cargo /m);
+        expect(receiptTarget(out.home)).toBe(target);
+      }
+    }
+  });
+
+  it("installs the static musl build on musl (Alpine) and on glibc below the floor", () => {
+    for (const glibc of [null, "2.17", "2.31", "2.33", "invalid", "musl 1.2"]) {
+      for (const arch of ["x86_64", "aarch64"]) {
+        const out = run(releaseScript, { arch, glibc }, { targets: both(arch) });
+        const target = `${arch}-unknown-linux-musl`;
+        expect(out.status).toBe(0);
+        expect(out.installed).not.toBeNull();
+        expect(out.calls).toContain(`${RELEASE}/wsmp-${target}.tar.xz`);
+        expect(out.calls).not.toContain("-unknown-linux-gnu.tar.xz");
+        expect(out.calls).not.toMatch(/^cargo /m);
+        expect(receiptTarget(out.home)).toBe(target);
+      }
+    }
+  });
+
+  it("reads glibc from ldd where getconf cannot tell", () => {
+    const gnu = run(
+      releaseScript,
+      { glibc: null, ldd: "ldd (Ubuntu GLIBC 2.35-0ubuntu3.8) 2.35" },
+      { targets: both("x86_64") },
+    );
+    expect(gnu.status).toBe(0);
+    expect(receiptTarget(gnu.home)).toBe("x86_64-unknown-linux-gnu");
+    for (const ldd of ["ldd (GNU libc) 2.31", "ldd (GNU libc) 2.33"]) {
+      const old = run(releaseScript, { glibc: null, ldd }, { targets: both("x86_64") });
+      expect(old.status).toBe(0);
+      expect(receiptTarget(old.home)).toBe("x86_64-unknown-linux-musl");
+    }
+  });
+
   it("maps arm64 to the aarch64 archive", () => {
-    const out = run(releaseScript, { arch: "arm64" });
+    const out = run(releaseScript, { arch: "arm64" }, { targets: both("aarch64") });
     expect(out.calls).toContain(`${RELEASE}/wsmp-aarch64-unknown-linux-gnu.tar.xz`);
-    // The fixture has only the x86_64 archive: a missing download stops the install.
-    expect(out.status).not.toBe(0);
-    expect(out.installed).toBeNull();
+    expect(out.status).toBe(0);
+    expect(out.installed).not.toBeNull();
+  });
+
+  it("installs a GNU-only mirror (pre-1.0 releases) on new glibc and builds from source on old", () => {
+    const fits = run(releaseScript, { glibc: "2.35" }, { target: "x86_64-unknown-linux-gnu" });
+    expect(fits.status).toBe(0);
+    expect(receiptTarget(fits.home)).toBe("x86_64-unknown-linux-gnu");
+    for (const glibc of [null, "2.17", "2.33", "invalid"]) {
+      const out = run(releaseScript, { glibc }, { target: "x86_64-unknown-linux-gnu" });
+      expect(out.status).toBe(0);
+      expect(out.output).toContain(
+        `only GNU Linux binaries, which need glibc ${floor} or newer; building from source instead`,
+      );
+      expect(out.calls).toContain(`cargo install --git ${CLI_REPOSITORY} --tag v${SERVER_VERSION}`);
+      expect(out.calls).not.toContain(`${RELEASE}/wsmp-x86_64-unknown-linux-gnu.tar.xz`);
+    }
+  });
+
+  it("installs the musl build when a release lists no GNU archive", () => {
+    const out = run(releaseScript, { glibc: "2.35" }, { target: "x86_64-unknown-linux-musl" });
+    expect(out.status).toBe(0);
+    expect(out.output).toContain("has no wsmp-x86_64-unknown-linux-gnu.tar.xz; installing");
+    expect(receiptTarget(out.home)).toBe("x86_64-unknown-linux-musl");
+  });
+
+  it("fails closed on a checksum mismatch of either flavour", () => {
+    for (const glibc of ["2.35", null]) {
+      const out = run(releaseScript, { glibc }, { corrupt: true });
+      expect(out.status).not.toBe(0);
+      expect(out.output).toContain("checksum mismatch");
+      expect(out.installed).toBeNull();
+      expect(out.calls).not.toMatch(/^cargo /m);
+    }
+  });
+
+  it("never falls back past a listed archive with a malformed checksum", () => {
+    for (const [glibc, listed, other, line] of [
+      ["2.35", "gnu", "musl", "bad *"],
+      [null, "musl", "gnu", "bad *"],
+      // A digest-less line: the file name is the first field.
+      ["2.35", "gnu", "musl", "*"],
+      ["2.35", "gnu", "musl", ""],
+    ] as const) {
+      const out = run(
+        releaseScript,
+        { glibc },
+        {
+          targets: [`x86_64-unknown-linux-${other}`],
+          sums: (sum, archive) =>
+            `${line}wsmp-x86_64-unknown-linux-${listed}.tar.xz\n${sum} *${archive}\n`,
+        },
+      );
+      expect(out.status).not.toBe(0);
+      expect(out.installed).toBeNull();
+      expect(out.calls).not.toContain(`wsmp-x86_64-unknown-linux-${other}.tar.xz`);
+      expect(out.calls).not.toMatch(/^cargo /m);
+    }
+  });
+
+  it("keeps the glibc floor in step with the release gate", () => {
+    const release = readFileSync(join(repoRoot, ".github/workflows/release.yml"), "utf8");
+    const ci = readFileSync(join(repoRoot, ".github/workflows/cli-ci.yml"), "utf8");
+    for (const workflow of [release, ci]) {
+      const floors = [...workflow.matchAll(/check-glibc-floor\.sh \S+ (\S+)/g)].map((m) => m[1]);
+      expect(floors.length).toBeGreaterThan(0);
+      for (const found of floors) expect(found).toBe(floor);
+    }
+    const dist = readFileSync(join(repoRoot, "apps/cli/dist-workspace.toml"), "utf8");
+    expect(dist).toMatch(/^x86_64-unknown-linux-gnu = "ubuntu-22\.04"$/m);
+    expect(dist).toMatch(/^aarch64-unknown-linux-gnu = "ubuntu-22\.04-arm"$/m);
   });
 
   it("fails closed on a checksum mismatch", () => {
@@ -261,7 +412,7 @@ describe.skipIf(!canRun)("install.sh behavior", () => {
   it("fails closed when sha256.sum is missing, lacks the archive, or is malformed", () => {
     const cases: Fixture["sums"][] = [
       () => null,
-      () => `${"a".repeat(64)} *wsmp-aarch64-unknown-linux-gnu.tar.xz\n`,
+      () => `${"a".repeat(64)} *wsmp-aarch64-unknown-linux-musl.tar.xz\n`,
       (sum, archive) => `${sum.slice(1)} *${archive}\n`,
       (sum, archive) => `${sum.replace(/^./, "g")} *${archive}\n`,
       (sum, archive) => `${sum} *other-${archive}\n`,
@@ -339,12 +490,7 @@ describe.skipIf(!canRun)("install.sh behavior", () => {
   });
 
   it("builds this version's tag from source where no binary fits", () => {
-    const machines: Machine[] = [
-      { arch: "riscv64" },
-      { glibc: "2.31" }, // Ubuntu 20.04
-      { glibc: null }, // musl (Alpine)
-      { os: "FreeBSD" },
-    ];
+    const machines: Machine[] = [{ arch: "riscv64" }, { os: "FreeBSD" }];
     for (const machine of machines) {
       const out = run(releaseScript, machine);
       expect(out.status).toBe(0);

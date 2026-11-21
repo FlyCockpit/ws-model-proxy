@@ -11,8 +11,8 @@ import {
 } from "@ws-model-proxy/ui/components/dropdown-menu";
 import { User } from "lucide-react";
 import { useTranslation } from "react-i18next";
-
 import { useAuthSession } from "@/hooks/use-auth-session";
+import { markExplicitSignOut } from "@/hooks/use-reload-on-identity-change";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { getNavItems, toLangRoute } from "@/lib/nav-items";
 
@@ -80,17 +80,18 @@ export default function UserMenuContent() {
               // the time a signed-in user opens this menu, the session adapter
               // has already loaded the chunk, so this resolves from cache.
               const { authClient } = await import("@/lib/auth-client");
-              authClient.signOut({
-                fetchOptions: {
-                  onSuccess: () => {
-                    navigate({
-                      to: "/$lang/login",
-                      params: { lang },
-                      search: { redirectTo: undefined },
-                    });
+              const undoSignOutMark = markExplicitSignOut();
+              try {
+                const result = await authClient.signOut({
+                  fetchOptions: {
+                    onSuccess: () => window.location.assign(`/${lang}/login`),
+                    onError: undoSignOutMark,
                   },
-                },
-              });
+                });
+                if (result.error) undoSignOutMark();
+              } catch {
+                undoSignOutMark();
+              }
             }}
           >
             {t("userMenu.signOut")}

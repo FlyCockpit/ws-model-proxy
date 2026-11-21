@@ -7,7 +7,7 @@ import {
 import {
   encodeRelayBinaryFrame,
   encodeRelayServerControlMessage,
-  type RelayClientControlMessage,
+  type NodeToServerControlFrame,
 } from "./protocol.js";
 import type { RelayFailure } from "./relay-failure.js";
 import {
@@ -95,7 +95,7 @@ const STT_RELAY_BUSY_RETRY_MS = 25;
 /** 24 kHz s16le mono. */
 export const STT_PCM_BYTES_PER_SECOND = 48_000;
 
-export type SttClientMessage = Extract<RelayClientControlMessage, { type: `stt.${string}` }>;
+export type SttClientMessage = Extract<NodeToServerControlFrame, { type: `stt.${string}` }>;
 
 /** One CLI relay connection as the hub sees it. Identity is the key. */
 export interface SttRelayLink {

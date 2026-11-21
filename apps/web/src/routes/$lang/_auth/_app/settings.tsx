@@ -25,10 +25,7 @@ function SettingsLayout() {
     <div className="min-w-0 max-w-4xl">
       <h1 className="text-2xl font-semibold mb-6">{t("title")}</h1>
       <div className="flex flex-col gap-6 md:flex-row md:gap-8">
-        <nav
-          className="w-full min-w-0 md:w-48 flex-shrink-0"
-          style={{ viewTransitionName: "settings-subnav" }}
-        >
+        <nav className="w-full min-w-0 md:w-48 flex-shrink-0">
           <div className="-mx-4 flex flex-row gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain px-4 no-scrollbar md:mx-0 md:flex-col md:overflow-x-visible md:overflow-y-visible md:overscroll-auto md:px-0">
             {navItems.map((item) => (
               <Link
@@ -36,10 +33,10 @@ function SettingsLayout() {
                 to={item.to}
                 params={{ lang }}
                 activeOptions={{ exact: item.exact }}
-                className="flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors md:shrink"
+                className="flex min-h-11 shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors md:shrink"
                 activeProps={{
                   className:
-                    "flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm bg-accent text-accent-foreground transition-colors md:shrink",
+                    "flex min-h-11 shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm bg-accent text-accent-foreground transition-colors md:shrink",
                 }}
               >
                 <item.icon className="size-4" />

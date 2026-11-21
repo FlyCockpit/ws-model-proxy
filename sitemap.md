@@ -1,6 +1,6 @@
 # Sitemap
 
-Routes of the web app (`apps/web/src/routes/`), 0.4.0 information architecture (spec §7).
+Routes of the web app (`apps/web/src/routes/`).
 Navigation lives in `apps/web/src/lib/nav-items.ts`; signed-in pages render inside the app frame
 (`routes/$lang/_auth/_app.tsx`, `components/app-frame.tsx`).
 
@@ -18,12 +18,12 @@ and `/llms.txt` (the locale root); auth and MCP routes are intentionally exclude
 | `/` | Redirects to `/{lang}`. |
 | `/{lang}/` | Landing. Signed-in people go to Overview (or Get started until onboarding is done). |
 | `/{lang}/login` | Sign in (email/password, optional two-factor; "Forgot password?" when SMTP is configured). |
-| `/{lang}/signup` | Sign up. The first account becomes admin; later accounts follow the sign-up setting. |
+| `/{lang}/signup` | Sign up. In production, the first account becomes admin only if its email matches `ADMIN_EMAIL` after trimming whitespace and lowercasing; other public accounts are users and follow the sign-up setting (or a valid share invite). |
 | `/{lang}/verify-email` | Verify email (only when SMTP is configured). |
 | `/{lang}/forgot-password` | Request a password-reset link by email (signed-out only; reset needs SMTP, otherwise the page says so). Always answers "if an account exists, we sent a link". |
 | `/{lang}/reset-password` | Landing page for the emailed reset link (`?token=` or `?error=INVALID_TOKEN`): new password and confirmation, invalid/expired link offers a new one; success goes to sign in and signs the account out everywhere. |
 | `/{lang}/mcp-login` | Agent sign-in for OAuth (feature-gated by `WMP_MCP_ENABLED`; not in SEO). |
-| `/{lang}/mcp-consent` | Agent consent: Read-only (default) or Full (offered when the agent asks for `mcp:write`), what Full allows (commands and files on Full-control nodes), and the client's redirect host (feature-gated; not in SEO). |
+| `/{lang}/mcp-consent` | Agent consent: required read, optional fine scopes within the OAuth ceiling, all owned nodes or a selected list, and the client's redirect host (feature-gated; not in SEO). |
 
 ## Authenticated Routes
 
@@ -57,7 +57,7 @@ All require an active session (`_auth` layout).
 | `/{lang}/providers/{accountId}` | Key (replace/revoke), models (enable, type, pricing), monthly cap, data collection, usage. |
 | `/{lang}/access` | Redirects to `/{lang}/access/api-keys`. |
 | `/{lang}/access/api-keys` | API keys (all pools or selected pools), expiry, base URL and example. |
-| `/{lang}/access/agents` | MCP URL, OAuth connections (level: change Read-only / Full, disconnect), agent tokens (Read-only / Full, expiry). |
+| `/{lang}/access/agents` | MCP URL, OAuth connections (edit access: permissions and allowed nodes, disconnect), agent tokens (permissions, allowed nodes, expiry; edit access). |
 | `/{lang}/access/shares` | Shares you made and shares you received; your own-key choice for shared pools; share a pool or a runtime definition by e-mail (a direct share only to a verified mailbox, otherwise an invite link shown once without SMTP); runtime definitions you share; pending pool and runtime invites (resend, withdraw). |
 | `/{lang}/access/contributions` | Pools you may contribute to (add a served model), what you contribute, runtime definitions shared with you (fork). |
 | `/{lang}/activity` | Metrics explorer: scope (pool / runtime / version / node), metric, range and step, compare versions. |

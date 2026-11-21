@@ -2,8 +2,8 @@ import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-
 import { WideContent } from "@/components/wide-content";
+import { useActiveTabScroll } from "@/hooks/use-active-tab-scroll";
 
 /** Pages of the 0.4.0 skeleton (`dashboard:pages.<key>`). */
 export type StubPageKey =
@@ -38,11 +38,12 @@ export type StubPageKey =
   | "activityRequests"
   | "activityCommands";
 
-export function PageHeading({ page }: { page: StubPageKey }) {
+export function PageHeading({ page, level = 1 }: { page: StubPageKey; level?: 1 | 2 }) {
+  const Heading = level === 1 ? "h1" : "h2";
   const { t } = useTranslation(["dashboard"]);
   return (
     <div className="min-w-0 space-y-1">
-      <h1 className="text-2xl font-semibold">{t(`dashboard:pages.${page}.title`)}</h1>
+      <Heading className="text-2xl font-semibold">{t(`dashboard:pages.${page}.title`)}</Heading>
       <p className="text-sm text-muted-foreground">{t(`dashboard:pages.${page}.description`)}</p>
     </div>
   );
@@ -70,8 +71,9 @@ export function SectionTabs({
   ariaLabel: string;
 }) {
   const { t } = useTranslation(["dashboard"]);
+  const scrollRef = useActiveTabScroll();
   return (
-    <WideContent>
+    <WideContent ref={scrollRef}>
       <nav aria-label={ariaLabel} className="flex w-max gap-1">
         {tabs.map((tab) => (
           <span key={tab.key}>{tab.render(TAB_CLASS, TAB_ACTIVE_CLASS, t(tab.labelKey))}</span>

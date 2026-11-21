@@ -37,6 +37,16 @@ describe("credential helpers", () => {
     expect(
       credentialStatus({ ...base, expiresAt: null, revokedAt: "2026-02-01T00:00:00Z" }, now),
     ).toBe("revoked");
+    // A no-expiry agent token refused while the server disallows no-expiry tokens.
+    expect(
+      credentialStatus({ ...base, expiresAt: null, revokedAt: null, blockedByPolicy: true }, now),
+    ).toBe("blocked");
+    expect(
+      credentialStatus(
+        { ...base, expiresAt: null, revokedAt: "2026-02-01T00:00:00Z", blockedByPolicy: true },
+        now,
+      ),
+    ).toBe("revoked");
   });
 
   it("keeps a one-year expiry inside the server's 365-day cap", () => {

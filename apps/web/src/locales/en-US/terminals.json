@@ -94,7 +94,8 @@
     "bad_handshake": "The secure handshake with the node failed.",
     "other": "The terminal was refused ({{reason}}).",
     "step_detached": "This terminal was disconnected. Open it again from Steps waiting for you.",
-    "browser_identity_unavailable": "This browser's terminal identity could not be loaded, and this node requires it. Reload the page to try again."
+    "browser_identity_unavailable": "This browser's terminal identity could not be loaded, and this node requires it. Reload the page to try again.",
+    "bad_cwd": "The node cannot use its home directory to open this terminal."
   },
   "steps": {
     "title": "Steps waiting for you",

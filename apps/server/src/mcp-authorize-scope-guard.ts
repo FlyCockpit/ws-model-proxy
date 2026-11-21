@@ -1,3 +1,8 @@
+import {
+  MCP_MISSING_SCOPE_DESCRIPTION,
+  MCP_REMOVED_WRITE_DESCRIPTION,
+  requestsRemovedMcpWrite,
+} from "@ws-model-proxy/auth/agent-scopes";
 import { canonicalMcpResource } from "@ws-model-proxy/auth/mcp-config";
 import { env } from "@ws-model-proxy/env/server";
 import type { MiddlewareHandler } from "hono";
@@ -5,13 +10,20 @@ import type { MiddlewareHandler } from "hono";
 /**
  * Server-side authorization request boundary (Phase 2).
  *
- * Better Auth 1.7 has no `defaultScope` option: a missing/blank `scope` on
- * `/api/auth/oauth2/authorize` must be rejected HERE, locally and
- * non-redirecting, because forwarding it would let Better Auth produce a
- * redirected protocol error using the caller's (still unvalidated)
- * redirect_uri. Any PRESENT scope is forwarded UNCHANGED so Better Auth
- * validates the client, redirect URI, and scope values first — application
- * code never parses/rebuilds unsupported-scope redirects.
+ * Better Auth 1.7 has no `defaultScope` option. A MISSING `scope` on
+ * `/api/auth/oauth2/authorize` would default to every scope stored on the
+ * client (better-auth#12194; a DCR client registered without `scope` stores
+ * the whole ceiling), so it is rejected HERE. A blank one (Better Auth would
+ * split it into no scopes, or refuse a tab-joined value) is refused too, as
+ * wsmp policy. Both answers are local and non-redirecting: wsmp's chosen
+ * boundary, so the caller never sees a protocol error before the client and
+ * redirect URI are validated (Better Auth itself redirects errors only to a
+ * registered URI, else its error page). The scope-policy plugin repeats the
+ * refusal at the provider for dispatches that skip this guard. The removed
+ * mcp:write scope is also refused locally. Any other PRESENT scope is
+ * forwarded UNCHANGED so Better Auth validates the client, redirect URI, and
+ * scope values first — application code never parses/rebuilds
+ * unsupported-scope redirects.
  *
  * RFC 8707 resource indicator: the authorize request must ask for THIS
  * server's canonical MCP resource (`<BETTER_AUTH_URL>/mcp`, mcp-config
@@ -20,56 +32,18 @@ import type { MiddlewareHandler } from "hono";
  * `invalid_target`, never via the caller's redirect_uri, for the same
  * unvalidated-redirect reason as the scope rule.
  *
- * PARITY-REPLICATION (pass 3): every parsing decision below replicates the
- * INSTALLED downstream consumer (better-call@1.4.0 `getBody` + the
- * oauth-provider@1.7.3 query parsing) verbatim, so the guard judges exactly
- * the request Better Auth would judge — no more, no less:
+ * Parsing matches installed better-call 1.4.5 / oauth-provider 1.7.18:
+ * - Only the exact base media type application/x-www-form-urlencoded is
+ *   accepted for POST (case-insensitive, parameters excluded). Hybrid types,
+ *   JSON and multipart are forwarded unchanged for the handler's 415.
+ * - Form entries use the last value per key, including BOM-prefixed keys
+ *   being distinct from scope/resource. A resource value is never split.
+ * - GET duplicate scopes are left to downstream validation; repeated resource
+ *   keys are treated as a set that must contain this server's resource.
  *
- * - Applicability (better-call getBody allowlist): the content-type BASE
- *   (`(ct ?? "").toLowerCase().split(";")[0].trim()`) is admissible iff it
- *   INCLUDES `application/x-www-form-urlencoded` (`===` is subsumed). Any
- *   other POST content type (pure application/json, multipart/form-data,
- *   text/plain, missing) is NOT applicable — forwarded unchanged, and
- *   better-call rejects it with 415 before any redirect could happen.
- * - JSON branch: an admissible type whose FULL (lowercased) value matches
- *   `/^application\/([a-z0-9.+-]*\+)?json/i` is parsed as JSON downstream
- *   (the JSON regex is checked BEFORE the form branch in getBody) — this
- *   admits the whole hybrid family like
- *   `application/json+application/x-www-form-urlencoded`.
- * - Form branch: better-call reads `request.formData()` and object-assigns
- *   entries in iteration order, so the LAST value per key is what Better
- *   Auth sees — including the fact that a BOM-prefixed `\uFEFFscope` key is
- *   simply NOT `scope` (downstream then defaults to the full scope set,
- *   which is exactly the shape this boundary exists to reject locally).
- *   `resource` on the form path is therefore the LAST occurrence ONLY, as a
- *   single string — no space-splitting, no union across occurrences.
- * - JSON branch `resource`: absent → local invalid_target; string → exact
- *   membership on that value; array → membership across elements (arrays
- *   are schema-legitimate there); other types → forward (downstream
- *   invalid_request).
- * - GET query (GET ONLY — HEAD is not-applicable: the provider registers
- *   GET/POST, so better-call findRoute 404s a HEAD authorize request and
- *   the guard must not be broader than the route it fronts): a SINGLE
- *   blank `scope` occurrence → local
- *   invalid_scope; MULTIPLE `scope` occurrences → forward unchanged
- *   (downstream redirects invalid_request "scope must not appear more than
- *   once" — acceptable, and never decided locally). `resource`:
- *   `getAll` 0 → local invalid_target; 1 → membership on that single
- *   UNSPLIT value; >1 → membership across ALL occurrences (arrays are
- *   schema-legitimate for GET query parameters).
- *
- * Scope is always judged before resource. The request body is inspected
- * through `request.clone()` only, so the original body is never consumed
- * and the downstream auth handler receives the exact bytes. A JSON-branch
- * body that fails to parse is FORWARDED — downstream fails on the same
- * bytes itself (SyntaxError → APIError 400, no leak). A form-branch body
- * that fails `formData()` (e.g. `text/application/x-www-form-urlencoded`
- * passes the substring allowlist but undici refuses to form-parse it) is
- * rejected LOCALLY with 400 `invalid_request`, non-redirecting (same
- * unvalidated-redirect_uri rationale; RFC 6749 §5.2 malformed-request
- * semantics) — forwarding it would surface as a downstream 500 plus a raw
- * TypeError on the console. While `WMP_MCP_ENABLED` is off the guard is
- * inactive: pure pass-through, nothing read, nothing cloned.
+ * Scope is judged before resource. Only a clone is read, preserving the body
+ * bytes for Better Auth. Form parsing failures are local non-redirecting 400s.
+ * While WMP_MCP_ENABLED is off this middleware does not inspect requests.
  *
  * APPLICABILITY (L18, pass 4): the guard fires only when the RAW request
  * pathname is EXACTLY the authorize path. better-call routes on the raw
@@ -86,26 +60,14 @@ export type AuthorizeBoundaryDecision =
   | "forward"
   | "not-applicable"
   | "invalid-scope"
+  | "removed-scope"
   | "invalid-target"
   | "invalid-request";
 
 const FORM_CONTENT_TYPE = "application/x-www-form-urlencoded";
-/** better-call getBody: JSON is matched on the FULL normalized content type. */
-const JSON_CONTENT_TYPE_REGEX = /^application\/([a-z0-9.+-]*\+)?json/i;
-
-/** better-call getBody allowlist: base (before `;`) INCLUDES the form type. */
-function contentTypeBase(contentType: string | null): string {
-  return (contentType ?? "").toLowerCase().split(";")[0]?.trim() ?? "";
-}
-
+/** better-call getBody allowlist compares the exact base media type. */
 function isFormAdmissible(contentType: string | null): boolean {
-  return contentTypeBase(contentType).includes(FORM_CONTENT_TYPE);
-}
-
-function isJsonBranch(contentType: string | null): boolean {
-  return (
-    isFormAdmissible(contentType) && JSON_CONTENT_TYPE_REGEX.test((contentType ?? "").toLowerCase())
-  );
+  return (contentType ?? "").toLowerCase().split(";")[0]?.trim() === FORM_CONTENT_TYPE;
 }
 
 function isBlankScope(scope: string | null | undefined): boolean {
@@ -115,7 +77,7 @@ function isBlankScope(scope: string | null | undefined): boolean {
 /**
  * Whether a requested resource set contains the canonical MCP resource
  * (membership — used for the schema-legitimate list shapes: repeated GET
- * query occurrences and JSON-branch arrays).
+ * query occurrences).
  */
 export function requestedResourcesIncludeCanonical(
   resources: readonly string[],
@@ -130,37 +92,13 @@ function inspectQuery(params: URLSearchParams, canonical: string): AuthorizeBoun
   const scopes = params.getAll("scope");
   if (scopes.length > 1) return "forward";
   if (scopes.length === 0 || isBlankScope(scopes[0])) return "invalid-scope";
+  if (requestsRemovedMcpWrite(scopes[0])) return "removed-scope";
   const resources = params.getAll("resource");
   if (resources.length === 0) return "invalid-target";
   if (resources.length === 1) {
     return resources[0] === canonical ? "forward" : "invalid-target";
   }
   return requestedResourcesIncludeCanonical(resources, canonical) ? "forward" : "invalid-target";
-}
-
-function inspectJsonObject(
-  body: Record<string, unknown>,
-  canonical: string,
-): AuthorizeBoundaryDecision {
-  const scope = body.scope;
-  if (scope === undefined || (typeof scope === "string" && isBlankScope(scope))) {
-    return "invalid-scope";
-  }
-  if (typeof scope !== "string") return "forward"; // downstream invalid_request
-  const resource = body.resource;
-  if (resource === undefined) return "invalid-target";
-  if (typeof resource === "string") {
-    return resource === canonical ? "forward" : "invalid-target";
-  }
-  if (Array.isArray(resource)) {
-    return requestedResourcesIncludeCanonical(
-      resource.filter((entry): entry is string => typeof entry === "string"),
-      canonical,
-    )
-      ? "forward"
-      : "invalid-target";
-  }
-  return "forward"; // non-string non-array: downstream invalid_request
 }
 
 async function inspectFormPost(
@@ -171,11 +109,7 @@ async function inspectFormPost(
   try {
     form = await request.clone().formData();
   } catch {
-    // The content type passed the substring allowlist but undici refuses to
-    // form-parse it (e.g. `text/application/x-www-form-urlencoded`). Judge
-    // it HERE: forwarding would let downstream's formData() throw the same
-    // TypeError as a non-APIError → 500 + raw-TypeError log. Local 400
-    // invalid_request, non-redirecting (RFC 6749 §5.2 malformed request).
+    // Keep malformed form requests local; never redirect using an unvalidated URI.
     return "invalid-request";
   }
   // LAST value per key, in iteration order — exactly better-call's
@@ -186,25 +120,10 @@ async function inspectFormPost(
   }
   const scope = last.get("scope");
   if (scope === undefined || isBlankScope(scope)) return "invalid-scope";
+  if (requestsRemovedMcpWrite(scope)) return "removed-scope";
   const resource = last.get("resource");
   if (resource === undefined) return "invalid-target";
   return resource === canonical ? "forward" : "invalid-target";
-}
-
-async function inspectJsonPost(
-  request: Request,
-  canonical: string,
-): Promise<AuthorizeBoundaryDecision> {
-  let body: unknown;
-  try {
-    body = await request.clone().json();
-  } catch {
-    return "not-applicable"; // downstream: 400 invalid JSON on the same bytes
-  }
-  if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    return "forward"; // downstream body validation rejects non-objects
-  }
-  return inspectJsonObject(body as Record<string, unknown>, canonical);
 }
 
 /**
@@ -229,7 +148,6 @@ export async function inspectAuthorizeRequest(
   if (request.method === "POST") {
     const contentType = request.headers.get("content-type");
     if (!isFormAdmissible(contentType)) return "not-applicable";
-    if (isJsonBranch(contentType)) return inspectJsonPost(request, canonical);
     return inspectFormPost(request, canonical);
   }
   return "not-applicable";
@@ -252,10 +170,7 @@ function authorizationErrorBody(error: string, errorDescription: string): Respon
  * this point).
  */
 export function invalidAuthorizeScopeResponse(): Response {
-  return authorizationErrorBody(
-    "invalid_scope",
-    "The authorization request must specify a non-empty scope.",
-  );
+  return authorizationErrorBody("invalid_scope", MCP_MISSING_SCOPE_DESCRIPTION);
 }
 
 /**
@@ -271,11 +186,8 @@ export function invalidAuthorizeTargetResponse(): Response {
 }
 
 /**
- * RFC 6749 §5.2-style error response for a form-admissible body that cannot
- * be form-parsed at all (exotic content types like
- * `text/application/x-www-form-urlencoded` that pass better-call's substring
- * allowlist but are refused by the body parser). Same local,
- * non-redirecting shape as the other rejections.
+ * RFC 6749 §5.2-style error response for a form body that cannot be parsed.
+ * Same local, non-redirecting shape as the other rejections.
  */
 export function invalidAuthorizeRequestResponse(): Response {
   return authorizationErrorBody(
@@ -293,6 +205,8 @@ export const mcpAuthorizeScopeGuard: MiddlewareHandler = async (c, next) => {
   // c.req.path would decode it and wrongly trigger the guard.
   if (new URL(c.req.raw.url).pathname !== MCP_AUTHORIZE_PATH) return next();
   const decision = await inspectAuthorizeRequest(c.req.raw, env.BETTER_AUTH_URL);
+  if (decision === "removed-scope")
+    return authorizationErrorBody("invalid_scope", MCP_REMOVED_WRITE_DESCRIPTION);
   if (decision === "invalid-scope") return invalidAuthorizeScopeResponse();
   if (decision === "invalid-target") return invalidAuthorizeTargetResponse();
   if (decision === "invalid-request") return invalidAuthorizeRequestResponse();

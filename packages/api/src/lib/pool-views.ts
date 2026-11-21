@@ -8,7 +8,10 @@ import {
 import type { Prisma } from "@ws-model-proxy/db";
 import type { z } from "zod";
 import type { poolAdvancedViewSchema } from "../contracts/advanced";
+import type { AnonymousAuth, CallerAuth } from "../contracts/auth-context";
 import type { MEMBER_STATUS, poolMemberViewSchema, poolViewSchema } from "../contracts/pools";
+import { instanceVisible } from "./agent-hidden-nodes";
+import { nodeVisibleToAgent } from "./agent-node-access";
 import { embeddingContractSchema } from "./embedding-contract";
 import { type InstanceLiveLoad, NO_LIVE_LOAD } from "./live-load";
 import { jsonObject, registryView } from "./registry-view";
@@ -31,14 +34,28 @@ export const MEMBER_INCLUDE = {
               phase: true,
               engineSlots: true,
               Ranks: {
-                where: { claim: "HELD" },
-                select: { nodeId: true, Node: { select: { slug: true, userId: true } } },
+                select: {
+                  nodeId: true,
+                  claim: true,
+                  Node: { select: { slug: true, userId: true } },
+                },
               },
+              Reservations: { select: { nodeId: true } },
             },
           },
         },
       },
-      Targets: { select: { health: true } },
+      Targets: {
+        select: {
+          health: true,
+          Instance: {
+            select: {
+              Ranks: { select: { nodeId: true } },
+              Reservations: { select: { nodeId: true } },
+            },
+          },
+        },
+      },
     },
   },
   Share: { select: { Grantee: { select: { email: true } } } },
@@ -205,6 +222,27 @@ export function memberView(
   };
 }
 
+/** Project member health and live state through the caller's request-wide hidden-node set. */
+export function visibleMember(member: MemberRow, hidden: ReadonlySet<string>): MemberRow {
+  const model = member.RuntimeModel;
+  if (!model || hidden.size === 0) return member;
+  return {
+    ...member,
+    RuntimeModel: {
+      ...model,
+      Targets: model.Targets.filter((target) =>
+        instanceVisible(target.Instance ?? { Ranks: [] }, hidden, model.Runtime.nodeId),
+      ),
+      Runtime: {
+        ...model.Runtime,
+        Instances: model.Runtime.Instances.filter((instance) =>
+          instanceVisible(instance, hidden, model.Runtime.nodeId),
+        ),
+      },
+    },
+  };
+}
+
 /**
  * Pool status for the Models page: the best of the LOCAL members routing may use (contributed
  * members are skipped while the owner routes to their own hardware only).
@@ -290,21 +328,28 @@ export function poolView(
   traffic: Traffic = EMPTY_TRAFFIC,
   cloudEnabled = false,
   live: MembersLive = NO_MEMBERS_LIVE,
+  auth?: CallerAuth | AnonymousAuth,
+  hiddenNodeIds: readonly string[] = [],
 ): z.infer<typeof poolViewSchema> {
+  const hidden = new Set(hiddenNodeIds);
+  const members = pool.Members.map((member) => visibleMember(member, hidden));
   const mode = pool.Fallback?.mode ?? "OFF";
   const embedding = embeddingContractSchema.safeParse(pool.Fallback?.embeddingContract);
   const runsOn = new Map<
     string,
     { nodeId: string; slug: string; mine: boolean; instances: number }
   >();
-  for (const member of pool.Members) {
+  for (const member of members) {
     const runtime = member.RuntimeModel?.Runtime;
     if (!runtime || member.state === "DISABLED") continue;
     for (const instance of runtime.Instances) {
       if (instance.phase !== "READY") continue;
+      const heldRanks = instance.Ranks.filter(
+        (rank) => rank.claim === undefined || rank.claim === "HELD",
+      );
       const nodes =
-        instance.Ranks.length > 0
-          ? instance.Ranks.flatMap((rank) =>
+        heldRanks.length > 0
+          ? heldRanks.flatMap((rank) =>
               rank.nodeId && rank.Node
                 ? [{ id: rank.nodeId, slug: rank.Node.slug, userId: rank.Node.userId }]
                 : [],
@@ -313,6 +358,7 @@ export function poolView(
             ? [runtime.Node]
             : [];
       for (const node of nodes) {
+        if (node.userId === callerId && auth && !nodeVisibleToAgent(auth, node.id)) continue;
         const entry = runsOn.get(node.id) ?? {
           nodeId: node.id,
           slug: node.slug,
@@ -361,7 +407,7 @@ export function poolView(
     })),
     advanced: poolAdvancedView(pool.Advanced),
     rules: pool.RoutingRules.map(ruleView),
-    members: pool.Members.map((member) => memberView(member, live)),
+    members: members.map((member) => memberView(member, live)),
     sharesCount: pool._count.Shares,
     runsOn: [...runsOn.values()],
     traffic24h: traffic,

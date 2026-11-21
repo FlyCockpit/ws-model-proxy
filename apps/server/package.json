@@ -1,5 +1,6 @@
 {
   "name": "server",
+  "private": true,
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
@@ -7,15 +8,16 @@
     "check-types": "tsc --noEmit",
     "compile": "bun build --compile --minify --sourcemap --bytecode ./src/index.ts --outfile server",
     "dev": "tsx watch src/index.ts",
-    "freeze-relay-release": "tsx scripts/freeze-relay-release.ts",
     "start": "node dist/index.mjs",
     "test": "vitest run --passWithNoTests",
     "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism --hookTimeout=60000 --testTimeout=60000 --passWithNoTests integration.test"
   },
   "dependencies": {
+    "@better-auth/cimd": "catalog:",
     "@better-auth/mcp": "catalog:",
+    "@better-auth/oauth-provider": "catalog:",
     "@fastify/busboy": "catalog:",
-    "@hono/node-server": "^2.1.5",
+    "@hono/node-server": "^2.1.6",
     "@modelcontextprotocol/server": "catalog:",
     "@orpc/openapi": "catalog:",
     "@orpc/server": "catalog:",

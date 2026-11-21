@@ -137,7 +137,11 @@ it("keeps pending feedback through unrelated page and portal gestures until sett
     pull(target);
     cancel(target);
     expect(view.indicator.style.height).toBe("40px");
-    expect(view.indicator.querySelector("svg")?.style.animation).toBe("spin 0.8s linear infinite");
+    // Compare longhands: the shorthand's serialized token order is engine-specific.
+    const spinning = view.indicator.querySelector("svg")?.style;
+    expect(spinning?.animationName).toBe("spin");
+    expect(spinning?.animationDuration).toBe("0.8s");
+    expect(spinning?.animationIterationCount).toBe("infinite");
     expect(view.refresh).toHaveBeenCalledTimes(1);
   }
   await act(async () => pending.resolve());

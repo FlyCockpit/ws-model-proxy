@@ -58,14 +58,6 @@ where
     }
 }
 
-fn ignore_legacy_field<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    serde::de::IgnoredAny::deserialize(deserializer)?;
-    Ok(None)
-}
-
 pub const MAX_FILE_ROOTS: usize = 32;
 /// Aggregate JSON-serialized size of the whole roots set (control characters
 /// and quotes count as their escapes). A larger set is refused where it is
@@ -204,7 +196,12 @@ pub struct ConfigLock {
     _guard: Flock<std::fs::File>,
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub struct ConfigLock {
+    _file: std::fs::File,
+}
+
+#[cfg(not(any(unix, windows)))]
 pub struct ConfigLock;
 
 impl ConfigLock {
@@ -233,20 +230,93 @@ impl ConfigLock {
                 .with_context(|| format!("locking config `{}`", config.display()))?;
             Ok(Self { _guard: lock })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            // Windows does not expose the Unix control plane. Atomic writes
-            // still protect file integrity there; daemon-owned mutations are
-            // required before concurrent Windows writers are supported.
+            Self::exclusive_at(
+                &config.with_extension("json.lock"),
+                std::time::Duration::from_secs(10),
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
             Ok(Self)
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase", from = "ConfigWire")]
+#[cfg(windows)]
+impl ConfigLock {
+    fn try_exclusive_at(path: &std::path::Path) -> Result<Option<Self>> {
+        use std::os::windows::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(path)
+        {
+            Ok(file) => Ok(Some(Self { _file: file })),
+            // ERROR_SHARING_VIOLATION: another process owns this lock.
+            Err(error) if error.raw_os_error() == Some(32) => Ok(None),
+            Err(error) => Err(error).context("opening config lock"),
+        }
+    }
+
+    fn exclusive_at(path: &std::path::Path, wait: std::time::Duration) -> Result<Self> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            if let Some(lock) = Self::try_exclusive_at(path)? {
+                return Ok(lock);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            anyhow::ensure!(!remaining.is_zero(), "config is busy; try again shortly");
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
+        }
+    }
+}
+
+#[cfg(all(windows, test))]
+mod windows_config_lock_tests {
+    use super::ConfigLock;
+
+    #[test]
+    fn windows_config_lock_excludes_other_handles_and_releases_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json.lock");
+        let lock = ConfigLock::try_exclusive_at(&path)
+            .expect("open")
+            .expect("lock");
+        let other = path.clone();
+        std::thread::spawn(move || {
+            assert!(
+                ConfigLock::try_exclusive_at(&other)
+                    .expect("try lock")
+                    .is_none()
+            );
+            assert!(
+                ConfigLock::exclusive_at(&other, std::time::Duration::from_millis(10)).is_err()
+            );
+        })
+        .join()
+        .expect("thread");
+        drop(lock);
+        assert!(
+            ConfigLock::try_exclusive_at(&path)
+                .expect("retry")
+                .is_some()
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Config {
     pub version: u8,
+    /// A diagnostic about a retired key in the loaded file, never a setting.
+    /// Skipped on every save; it has no effect on the node's permissions.
+    #[serde(skip)]
+    pub retired_command_policy_warning: Option<&'static str>,
     pub server_url: Option<String>,
     /// The server's public origin, pinned by a person on this machine
     /// (`wsmp config set-server <URL> --public-origin <origin>`). The relay
@@ -460,18 +530,19 @@ pub const DEFAULT_MAX_TERMINALS: u32 = 4;
 /// Accepted `maxTerminals` values (`wsmp config set-max-terminals`).
 pub const MAX_TERMINALS_RANGE: std::ops::RangeInclusive<u32> = 1..=32;
 
-/// The on-disk shape. Keys of older releases (`cliTokenEnv`,
-/// `mcpCommandMode`, `allowMcpCommands`, `mcpFileRead`, and the 0.3
-/// `endpoints` list) are ignored and never written back: trust is the one
-/// switch now, and runtimes are defined on the server.
+/// The current on-disk shape; unknown keys are rejected.
 #[derive(Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct ConfigWire {
-    version: u8,
+    version: u64,
     server_url: Option<String>,
     public_origin: Option<String>,
     cli_slug: Option<String>,
     trust: Option<TrustValue>,
+    // Accept and discard a setting written by unreleased 1.0 builds,
+    // retaining only a diagnostic for startup and `config show`.
+    #[serde(rename = "agentCommands")]
+    retired_command_policy_warning: RetiredCommandPolicyWarning,
     runtime_hosts: Vec<String>,
     media_trusted_origins: Vec<String>,
     allow_human_terminal: bool,
@@ -489,11 +560,12 @@ impl Default for ConfigWire {
     fn default() -> Self {
         let config = Config::default();
         Self {
-            version: config.version,
+            version: u64::from(config.version),
             server_url: None,
             public_origin: None,
             cli_slug: None,
             trust: None,
+            retired_command_policy_warning: RetiredCommandPolicyWarning::default(),
             runtime_hosts: Vec::new(),
             media_trusted_origins: Vec::new(),
             allow_human_terminal: false,
@@ -508,10 +580,60 @@ impl Default for ConfigWire {
     }
 }
 
+#[derive(Default)]
+struct RetiredCommandPolicyWarning(Option<&'static str>);
+
+impl<'de> Deserialize<'de> for RetiredCommandPolicyWarning {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Keep accepting any JSON value, just as the accept-and-drop reader did.
+        // Never echo an arbitrary config value into a diagnostic.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(Self(Some(if value.as_str() == Some("isolated") {
+            "The agentCommands setting was removed in wsmp 1.0 and is ignored. Agent commands now follow this node's trust level: at Full control they run as this user. Lower trust with `wsmp trust relay` if you relied on isolated."
+        } else {
+            "The agentCommands setting was removed in wsmp 1.0 and is ignored."
+        })))
+    }
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ConfigWire::deserialize(deserializer).map_err(|error| {
+            if error.to_string().contains("unknown field") {
+                serde::de::Error::custom(format!(
+                    "{error}; delete that key from the config file before retrying; `wsmp login` also requires a valid config"
+                ))
+            } else {
+                error
+            }
+        })?;
+        if wire.version > u64::from(CONFIG_VERSION) {
+            return Err(serde::de::Error::custom(format!(
+                "config version {} was written by a newer wsmp; upgrade wsmp to read it",
+                wire.version
+            )));
+        }
+        if wire.version == 0 {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported config version 0; expected 1..={CONFIG_VERSION}"
+            )));
+        }
+        Ok(wire.into())
+    }
+}
+
 impl From<ConfigWire> for Config {
     fn from(wire: ConfigWire) -> Self {
         Self {
-            version: wire.version,
+            // 0.4.x preserved earlier version stamps even after saving current keys.
+            version: CONFIG_VERSION,
+            retired_command_policy_warning: wire.retired_command_policy_warning.0,
             server_url: wire.server_url,
             public_origin: wire.public_origin,
             cli_slug: wire.cli_slug,
@@ -534,6 +656,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
+            retired_command_policy_warning: None,
             server_url: None,
             public_origin: None,
             cli_slug: None,
@@ -833,13 +956,6 @@ struct RawCapabilities {
     confidence: Option<CapabilityConfidence>,
     models: Option<ModelListCapabilities>,
     chat_completions: Option<ChatCompletionsCapabilities>,
-    #[allow(dead_code)]
-    #[serde(
-        default,
-        rename = "completions",
-        deserialize_with = "ignore_legacy_field"
-    )]
-    _completions: Option<bool>,
     embeddings: Option<EmbeddingsCapabilities>,
     responses: Option<ResponsesCapabilities>,
     audio: Option<AudioCapabilities>,
@@ -857,7 +973,6 @@ impl Default for RawCapabilities {
             confidence: None,
             models: None,
             chat_completions: None,
-            _completions: None,
             embeddings: None,
             responses: None,
             audio: None,
@@ -1139,14 +1254,6 @@ pub struct SurfaceInventory {
     pub openai_responses: Option<ResponsesSurfaceCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anthropic_messages: Option<AnthropicSurfaceCapabilities>,
-    #[allow(dead_code)]
-    #[serde(
-        default,
-        rename = "openaiCompletions",
-        skip_serializing,
-        deserialize_with = "ignore_legacy_field"
-    )]
-    pub(crate) _openai_completions: Option<bool>,
 }
 
 impl SurfaceInventory {
@@ -1975,7 +2082,7 @@ mod tests {
             ..Config::default()
         };
         let reordered: Config = serde_json::from_str(&format!(
-            r#"{{"fileRoots":{},"mcpFileRead":true}}"#,
+            r#"{{"fileRoots":{},"version":3}}"#,
             serde_json::to_string(&enabled.file_roots).expect("roots")
         ))
         .expect("field order");
@@ -2140,55 +2247,21 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_legacy_completions_fields_without_writing_them_back() {
-        let v1: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
-            "version": 1,
-            "protocol": "openai-compatible",
-            "chatCompletions": { "supported": true, "streaming": true },
-            "completions": { "supported": true, "streaming": true }
-        }))
-        .expect("v1 inventory with legacy completions");
-        let v1_serialized = serde_json::to_value(&v1).expect("serialize v1");
-        assert!(v1_serialized.get("completions").is_none());
-        assert_eq!(v1_serialized["chatCompletions"]["supported"], true);
-
-        let v3: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
-            "version": 3,
-            "protocol": "openai-compatible",
-            "surfaces": {
-                "openaiChatCompletions": {
-                    "source": "declared",
-                    "confidence": "exact",
-                    "supported": true,
-                    "streaming": true
-                },
-                "openaiCompletions": {
-                    "source": "declared",
-                    "confidence": "exact",
-                    "supported": true,
-                    "streaming": true
-                }
-            }
-        }))
-        .expect("v3 inventory with legacy completions");
-        let v3_serialized = serde_json::to_value(&v3).expect("serialize v3");
-        assert!(v3_serialized["surfaces"].get("openaiCompletions").is_none());
-        assert_eq!(
-            v3_serialized["surfaces"]["openaiChatCompletions"]["supported"],
-            true
-        );
-    }
-
-    #[test]
-    fn a_0_3_endpoints_list_is_ignored_and_not_written_back() {
-        let config: Config = serde_json::from_value(serde_json::json!({
-            "version": 1,
-            "endpoints": [{ "slug": "local", "baseUrl": "http://127.0.0.1:11434/v1" }]
-        }))
-        .expect("0.3 config loads");
-        config.validate().expect("valid");
-        let written = serde_json::to_value(&config).expect("serialize config");
-        assert!(written.get("endpoints").is_none());
+    fn removed_completions_capability_keys_are_rejected_by_name() {
+        for (key, value) in [
+            (
+                "completions",
+                serde_json::json!({ "version": 1, "protocol": "openai-compatible", "completions": { "supported": true } }),
+            ),
+            (
+                "openaiCompletions",
+                serde_json::json!({ "version": 3, "protocol": "openai-compatible", "surfaces": { "openaiCompletions": { "supported": true } } }),
+            ),
+        ] {
+            let error = serde_json::from_value::<OpenAiCompatibleCapabilities>(value)
+                .expect_err("removed capability");
+            assert!(error.to_string().contains(key), "{error}");
+        }
     }
 
     #[test]
@@ -2283,22 +2356,49 @@ mod tests {
     }
 
     #[test]
-    fn trust_is_read_and_legacy_switches_are_dropped() {
-        let legacy: Config = serde_json::from_value(serde_json::json!({
-            "version": 1, "allowMcpCommands": true, "mcpCommandMode": "unsupervised",
-            "cliTokenEnv": "WSMP_TOKEN", "mcpFileRead": true
-        }))
-        .expect("legacy keys load");
-        assert_eq!(legacy.trust, None);
-        let written = serde_json::to_value(&legacy).expect("serialize");
+    fn current_config_accepts_existing_version_stamps_and_rejects_unknown_keys() {
+        for version in 1..=CONFIG_VERSION {
+            let config =
+                serde_json::from_value::<Config>(serde_json::json!({ "version": version }))
+                    .expect("current keys with an earlier stamp");
+            assert_eq!(config.version, CONFIG_VERSION);
+        }
+        for (version, message) in [
+            (0, "unsupported config version 0"),
+            (u64::from(CONFIG_VERSION) + 1, "written by a newer wsmp"),
+            (256, "written by a newer wsmp"),
+            (u64::MAX, "written by a newer wsmp"),
+        ] {
+            let error = serde_json::from_value::<Config>(serde_json::json!({ "version": version }))
+                .expect_err("unsupported version");
+            assert!(error.to_string().contains(message), "{error}");
+        }
         for key in [
             "allowMcpCommands",
             "mcpCommandMode",
             "cliTokenEnv",
             "mcpFileRead",
-            "trust",
+            "endpoints",
+            "unknown",
         ] {
-            assert!(written.get(key).is_none(), "{key}");
+            for version in 1..=CONFIG_VERSION {
+                let dir = tempfile::tempdir().expect("dir");
+                let path = dir.path().join("config.json");
+                std::fs::write(
+                    &path,
+                    serde_json::json!({ "version": version, key: true }).to_string(),
+                )
+                .expect("write");
+                let error = Config::load_from_path(&path).expect_err("unknown key");
+                let message = format!("{error:#}");
+                assert!(message.contains(key), "{message}");
+                assert!(message.contains(path.to_str().expect("path")), "{message}");
+                assert!(message.contains("delete that key"), "{message}");
+                assert!(
+                    message.contains("`wsmp login` also requires a valid config"),
+                    "{message}"
+                );
+            }
         }
         let relay: Config =
             serde_json::from_value(serde_json::json!({ "trust": "relay" })).expect("trust relay");
@@ -2308,6 +2408,109 @@ mod tests {
             "relay"
         );
         assert!(serde_json::from_value::<Config>(serde_json::json!({ "trust": "root" })).is_err());
+    }
+
+    #[test]
+    fn retired_command_policy_is_ignored_on_load_and_dropped_on_save() {
+        for mode in ["standard", "isolated"] {
+            let dir = tempfile::tempdir().expect("dir");
+            let path = dir.path().join("config.json");
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "agentCommands": mode,
+                    "trust": "relay",
+                    "requireTerminalApproval": true,
+                })
+                .to_string(),
+            )
+            .expect("write");
+            let mut config = Config::load_from_path(&path).expect("load prerelease config");
+            let warning = config.retired_command_policy_warning.expect("load warning");
+            assert!(
+                warning.starts_with(
+                    "The agentCommands setting was removed in wsmp 1.0 and is ignored."
+                )
+            );
+            assert_eq!(warning.contains("wsmp trust relay"), mode == "isolated");
+            // The diagnostic is the only in-memory difference.
+            config.retired_command_policy_warning = None;
+            assert_eq!(
+                config,
+                Config {
+                    trust: Some(TrustValue::Relay),
+                    require_terminal_approval: true,
+                    ..Config::default()
+                }
+            );
+            config.retired_command_policy_warning = Some(warning);
+            config.save_to_path(path.clone()).expect("save");
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+                    .expect("saved json");
+            assert!(saved.get("agentCommands").is_none());
+            assert!(saved.get("retiredCommandPolicyWarning").is_none());
+            config.retired_command_policy_warning = None;
+            assert_eq!(Config::load_from_path(&path).expect("reload"), config);
+        }
+    }
+
+    #[test]
+    fn retired_command_policy_accepts_other_json_values_without_echoing_them() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(42),
+            serde_json::json!(["unrecognized"]),
+            serde_json::json!({ "unrecognized": true }),
+            serde_json::json!("unrecognized\nvalue"),
+        ] {
+            let config: Config =
+                serde_json::from_value(serde_json::json!({ "agentCommands": value }))
+                    .expect("accept and drop any retired value");
+            assert_eq!(
+                config.retired_command_policy_warning,
+                Some("The agentCommands setting was removed in wsmp 1.0 and is ignored.")
+            );
+            assert_eq!(
+                serde_json::to_value(config).expect("serialize"),
+                serde_json::to_value(Config::default()).expect("default")
+            );
+        }
+        assert!(Config::default().retired_command_policy_warning.is_none());
+        assert!(
+            serde_json::from_str::<Config>("{}")
+                .expect("no retired key")
+                .retired_command_policy_warning
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_0_4_3_config_with_version_1_preserves_settings_and_saves_version_3() {
+        let text = include_str!("../tests/fixtures/upgrade-0.4.3/config-version-1.json");
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, text).expect("write");
+        let config = Config::load_from_path(&path).expect("load");
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(config.trust, Some(TrustValue::Relay));
+        assert!(config.require_terminal_approval);
+        assert_eq!(config.max_terminals, Some(2));
+        assert_eq!(config.remote_updates, RemoteUpdates::Off);
+        config.save_to_path(path.clone()).expect("save");
+        let mut expected: serde_json::Value = serde_json::from_str(text).expect("fixture");
+        expected["version"] = serde_json::json!(CONFIG_VERSION);
+        let actual: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+                .expect("saved json");
+        // Serialization omits false switches; compare the complete typed settings.
+        assert_eq!(Config::load_from_path(&path).expect("reload"), config);
+        assert_eq!(
+            serde_json::from_value::<Config>(expected).expect("expected"),
+            config
+        );
+        assert_eq!(actual["version"], CONFIG_VERSION);
     }
 
     #[test]

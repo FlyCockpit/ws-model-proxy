@@ -1,7 +1,9 @@
+import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link, Outlet } from "@tanstack/react-router";
+import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { useTranslation } from "react-i18next";
-
 import { type SectionTab, SectionTabs } from "@/components/page-stub";
+import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/runtimes/$runtimeId")({
   component: RuntimeLayout,
@@ -10,6 +12,7 @@ export const Route = createFileRoute("/$lang/_auth/_app/runtimes/$runtimeId")({
 function RuntimeLayout() {
   const { lang, runtimeId } = Route.useParams();
   const { t } = useTranslation(["dashboard", "nav"]);
+  const runtime = useQuery(orpc.runtimes.get.queryOptions({ input: { runtimeId } }));
   const tabs: SectionTab[] = [
     {
       key: "overview",
@@ -59,6 +62,13 @@ function RuntimeLayout() {
   ];
   return (
     <div className="flex min-w-0 flex-col gap-4">
+      <h1 className="min-w-0 break-all text-2xl font-semibold">
+        {runtime.isPending ? (
+          <Skeleton className="h-8 w-56 max-w-full" />
+        ) : (
+          (runtime.data?.name ?? t("dashboard:pages.runtimeOverview.title"))
+        )}
+      </h1>
       <SectionTabs tabs={tabs} ariaLabel={t("dashboard:pages.runtimeOverview.title")} />
       <Outlet />
     </div>

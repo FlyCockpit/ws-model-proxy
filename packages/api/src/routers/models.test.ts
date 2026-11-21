@@ -39,9 +39,12 @@ const FULL_AGENT: CallerAuth = {
   kind: "agent_token",
   userId: "me",
   agentTokenId: "tok1",
-  level: "FULL",
+  access: {
+    scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+    nodeIds: null,
+  },
 };
-const READ_AGENT: CallerAuth = { ...FULL_AGENT, level: "READ" };
+const READ_AGENT: CallerAuth = { ...FULL_AGENT, access: { scopes: ["read"], nodeIds: null } };
 
 const OUTPUT: ModelTestServiceOutput = {
   result: {
@@ -77,6 +80,7 @@ const pool = (overrides: Partial<{ userId: string; modelType: string }> = {}) =>
 
 beforeEach(() => {
   mockReset(db);
+  db.runtime.findMany.mockResolvedValue([]);
   db.modelAlias.findMany.mockResolvedValue([]);
 });
 

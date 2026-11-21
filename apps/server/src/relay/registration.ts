@@ -1,5 +1,5 @@
 /**
- * Durable node connection state for relay 3.0 (spec §3.1, §4.2): the hello registration, the
+ * Durable node connection state for relay 4.0 (spec §3.1, §4.2): the hello registration, the
  * heartbeat, `node.state`, and the disconnect. Every write is fenced by the node's
  * `connectionGeneration` (+1 per accepted hello), so a stale session's heartbeat or
  * disconnect can never overwrite a successor, in this process or another replica.
@@ -102,8 +102,8 @@ export type NodeHelloFacts = {
   identityPublicKey: string;
   trust: NodeTrustWire;
   features: NodeFeatures;
-  /** Self-update: the build and environment the node reports (absent on older CLIs). */
-  build?: NodeBuild;
+  /** The build and optional environment the node reports. */
+  build: NodeBuild;
   environment?: NodeEnvironment;
   definitions: HeldDefinition[];
   heldMetricCommandsHash: string | null;
@@ -197,8 +197,8 @@ export async function registerNodeHello(input: {
       ...trustLowerColumns(trust.trust, reportedTrust, trust.trustLowerRequestedAt !== null),
       features: hello.features as Prisma.InputJsonValue,
       featuresAt: now,
-      // Each hello says it again: a node that no longer reports them (a downgrade) clears them.
-      cliBuild: hello.build ? (hello.build as Prisma.InputJsonValue) : DbNull,
+      // Each hello replaces the build and any optional environment facts.
+      cliBuild: hello.build as Prisma.InputJsonValue,
       environment:
         hello.environment && Object.keys(hello.environment).length > 0
           ? (hello.environment as Prisma.InputJsonValue)
@@ -346,14 +346,18 @@ export async function recordNodeIdentityRefusal(
   });
 }
 
-/** Remembers why a node's hello was refused for its protocol ("upgrade wsmp"). */
+/** Remembers a protocol refusal at most once a minute, including repeated upgrade attempts. */
 export async function recordRejectedNodeHello(
   identity: NodeIdentity,
   rejected: { protocolVersion: string | null; cliVersion: string | null },
   now: Date,
 ): Promise<void> {
   await prisma.node.updateMany({
-    where: { id: identity.nodeId, userId: identity.userId },
+    where: {
+      id: identity.nodeId,
+      userId: identity.userId,
+      OR: [{ rejectedAt: null }, { rejectedAt: { lt: new Date(now.getTime() - 60_000) } }],
+    },
     data: {
       rejectedProtocolVersion: rejected.protocolVersion,
       rejectedCliVersion: rejected.cliVersion,

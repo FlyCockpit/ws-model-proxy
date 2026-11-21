@@ -6,8 +6,12 @@ import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
 import type { z } from "zod";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import type { poolAdvancedPatchSchema } from "../contracts/advanced";
+import type { AnonymousAuth, CallerAuth } from "../contracts/auth-context";
 import { poolsContract as c, type routingRulesSchema } from "../contracts/pools";
 import { callableIdOf } from "../lib/access-views";
+import { hiddenNodeIds, instanceVisible } from "../lib/agent-hidden-nodes";
+import { type HiddenServing, hiddenServing } from "../lib/agent-hidden-serving";
+import { assertAgentRuntimeNodes } from "../lib/agent-node-access";
 import { type CallerActor, callerActor } from "../lib/caller-actor";
 import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { graphDelete, graphWrite, modelTargetFences, poolTargetFences } from "../lib/graph-write";
@@ -24,6 +28,7 @@ import {
   type PoolRow,
   poolView,
   type Traffic,
+  visibleMember,
 } from "../lib/pool-views";
 import {
   isUniqueViolation,
@@ -59,8 +64,12 @@ function userIdOf(context: SignedInContext): string {
 }
 
 /** Hourly request counts of the last 24 h (agent tests excluded), from the usage rollup. */
-function trafficOf(ownerId: string, poolIds: string[]): Promise<Map<string, Traffic>> {
-  return poolTraffic(ownerId, poolIds, "24h");
+function trafficOf(
+  ownerId: string,
+  poolIds: string[],
+  served: HiddenServing,
+): Promise<Map<string, Traffic>> {
+  return poolTraffic(ownerId, poolIds, "24h", new Date(), served);
 }
 
 async function ownedPoolRow(userId: string, poolId: string): Promise<PoolRow> {
@@ -77,21 +86,28 @@ async function membersLive(
   context: SignedInContext,
   ownerId: string,
   pools: readonly PoolRow[],
+  served: HiddenServing,
 ): Promise<MembersLive> {
+  const excluded = new Set(served.nodeIds);
   // Only the owner's own runtimes: a contributed member's queue is the contributor's engine
   // (their other traffic included), so it stays unknown here.
   const instanceIds = pools.flatMap((pool) =>
-    pool.Members.flatMap((member) =>
-      member.shareId === null
-        ? (member.RuntimeModel?.Runtime.Instances.map((instance) => instance.id) ?? [])
-        : [],
-    ),
+    pool.Members.flatMap((member) => {
+      const runtime = member.RuntimeModel?.Runtime;
+      return member.shareId === null && runtime
+        ? runtime.Instances.filter((instance) =>
+            instanceVisible(instance, excluded, runtime.nodeId),
+          ).map((instance) => instance.id)
+        : [];
+    }),
   );
   return {
     load: readLiveLoad(context.services?.liveLoad, instanceIds),
     ...(await memberRecentTraffic(
       ownerId,
       pools.map((pool) => pool.id),
+      new Date(),
+      served,
     )),
   };
 }
@@ -99,11 +115,21 @@ async function membersLive(
 async function ownedPoolView(context: SignedInContext, poolId: string) {
   const userId = userIdOf(context);
   const pool = await ownedPoolRow(userId, poolId);
+  const hidden = await hiddenNodeIds(prisma, context.auth);
+  const served = await hiddenServing(prisma, hidden);
   const [traffic, live] = await Promise.all([
-    trafficOf(userId, [pool.id]),
-    membersLive(context, userId, [pool]),
+    trafficOf(userId, [pool.id], served),
+    membersLive(context, userId, [pool], served),
   ]);
-  return poolView(pool, userId, traffic.get(pool.id), cloudEgressEnabled(), live);
+  return poolView(
+    pool,
+    userId,
+    traffic.get(pool.id),
+    cloudEgressEnabled(),
+    live,
+    context.auth,
+    hidden,
+  );
 }
 
 async function audit(
@@ -138,7 +164,7 @@ async function resolveOwnModel(db: Tx, userId: string, ref: MemberRef) {
       "runtimeModelId" in ref
         ? { id: ref.runtimeModelId, userId }
         : { runtimeId: ref.runtimeId, upstreamModelId: ref.model, userId },
-    select: { id: true, type: true, retired: true },
+    select: { id: true, runtimeId: true, type: true, retired: true },
   });
   if (!model)
     throw refuse(
@@ -191,13 +217,39 @@ async function ownProviderModelIds(db: Tx, userId: string, ids: readonly string[
   return models.map((model) => model.id);
 }
 
+/** Removing a member reaches its runtime just as adding or tuning it does. */
+async function assertMembersRemovable(
+  db: Tx,
+  auth: CallerAuth | AnonymousAuth,
+  userId: string,
+  where: Prisma.PoolMemberWhereInput,
+) {
+  if (
+    (auth.kind !== "agent_token" && auth.kind !== "oauth_access_token") ||
+    auth.access.nodeIds === null
+  )
+    return;
+  const members = await db.poolMember.findMany({
+    where: { AND: [where, { RuntimeModel: { userId } }] },
+    select: { RuntimeModel: { select: { userId: true, runtimeId: true } } },
+  });
+  const runtimeIds = new Set(
+    members.flatMap((member) =>
+      member.RuntimeModel?.userId === userId ? [member.RuntimeModel.runtimeId] : [],
+    ),
+  );
+  for (const runtimeId of runtimeIds) await assertAgentRuntimeNodes(db, auth, userId, runtimeId);
+}
+
 async function addOwnMembers(
   db: Tx,
   pool: { id: string; userId: string; modelType: ModelType },
   refs: MemberRef[],
+  auth: CallerAuth | AnonymousAuth,
 ) {
   for (const ref of refs) {
     const model = await resolveOwnModel(db, pool.userId, ref);
+    await assertAgentRuntimeNodes(db, auth, pool.userId, model.runtimeId);
     assertType(pool.modelType, model.type, model.id);
     if (model.retired)
       throw new ORPCError("BAD_REQUEST", {
@@ -622,16 +674,27 @@ export const poolsRouter = {
       }),
       sessionNames(prisma, userId),
     ]);
+    const hidden = await hiddenNodeIds(prisma, context.auth);
+    const served = await hiddenServing(prisma, hidden);
     const [traffic, live] = await Promise.all([
       trafficOf(
         userId,
         pools.map((pool) => pool.id),
+        served,
       ),
-      membersLive(context, userId, pools),
+      membersLive(context, userId, pools, served),
     ]);
     return {
       pools: pools.map((pool) =>
-        poolView(pool, userId, traffic.get(pool.id), cloudEgressEnabled(), live),
+        poolView(
+          pool,
+          userId,
+          traffic.get(pool.id),
+          cloudEgressEnabled(),
+          live,
+          context.auth,
+          hidden,
+        ),
       ),
       sharedWithMe: shares.map((share) => ({
         poolId: share.poolId,
@@ -715,7 +778,7 @@ export const poolsRouter = {
             },
             select: { id: true, userId: true, modelType: true },
           });
-          await addOwnMembers(tx, pool, input.members ?? []);
+          await addOwnMembers(tx, pool, input.members ?? [], context.auth);
           await applyRouting(tx, pool.id, input.routing);
           await applyAdvanced(tx, pool.id, input.advanced);
           await applySidecars(tx, pool, input.sidecars ?? [], owners);
@@ -772,6 +835,11 @@ export const poolsRouter = {
         // fences (a delete or a rename may have landed since).
         async (tx) => {
           await assertPoolLive(tx, userId, pool.id);
+          if (input.members?.remove?.length)
+            await assertMembersRemovable(tx, context.auth, userId, {
+              id: { in: input.members.remove },
+              poolId: pool.id,
+            });
           const current =
             input.slug === undefined
               ? null
@@ -789,12 +857,25 @@ export const poolsRouter = {
           };
           if (Object.keys(fields).length > 0)
             await tx.pool.update({ where: { id: pool.id }, data: fields });
-          if (input.members?.remove?.length)
-            await tx.poolMember.deleteMany({
-              where: { id: { in: input.members.remove }, poolId: pool.id },
-            });
-          await addOwnMembers(tx, pool, input.members?.add ?? []);
+          if (input.members?.remove?.length) {
+            const where = { id: { in: input.members.remove }, poolId: pool.id };
+            await tx.poolMember.deleteMany({ where });
+          }
+          await addOwnMembers(tx, pool, input.members?.add ?? [], context.auth);
           for (const set of input.members?.set ?? []) {
+            if (context.auth.kind === "agent_token" || context.auth.kind === "oauth_access_token") {
+              const member = await tx.poolMember.findFirst({
+                where: { id: set.memberId, poolId: pool.id },
+                select: { RuntimeModel: { select: { userId: true, runtimeId: true } } },
+              });
+              if (member?.RuntimeModel?.userId === userId)
+                await assertAgentRuntimeNodes(
+                  tx,
+                  context.auth,
+                  userId,
+                  member.RuntimeModel.runtimeId,
+                );
+            }
             const updated = await tx.poolMember.updateMany({
               where: { id: set.memberId, poolId: pool.id },
               data: {
@@ -871,6 +952,7 @@ export const poolsRouter = {
         select: { slug: true },
       });
       if (!live) return;
+      await assertMembersRemovable(tx, context.auth, userId, { poolId: pool.id });
       await tx.pool.deleteMany({ where: { id: pool.id, userId } });
       await audit(tx, {
         ownerId: userId,
@@ -979,7 +1061,7 @@ export const poolsRouter = {
             );
           const model = await db.runtimeModel.findFirst({
             where: { id: input.runtimeModelId, userId },
-            select: { id: true, type: true, retired: true },
+            select: { id: true, runtimeId: true, type: true, retired: true },
           });
           if (!model)
             throw refuseAbout(
@@ -987,6 +1069,7 @@ export const poolsRouter = {
               input.runtimeModelId,
               "You can contribute only your own served models.",
             );
+          await assertAgentRuntimeNodes(db, context.auth, userId, model.runtimeId);
           assertType(share.Pool.modelType, model.type, model.id);
           if (model.retired)
             throw new ORPCError("BAD_REQUEST", {
@@ -1034,7 +1117,8 @@ export const poolsRouter = {
           where: { id: memberId },
           include: MEMBER_INCLUDE,
         });
-        return memberView(member);
+        const hidden = new Set(await hiddenNodeIds(prisma, context.auth));
+        return memberView(visibleMember(member, hidden));
       },
     ),
 
@@ -1048,14 +1132,26 @@ export const poolsRouter = {
             shareId: { not: null },
             OR: [{ Share: { granteeUserId: userId } }, { Pool: { userId } }],
           },
-          select: { id: true, poolId: true, Pool: { select: { userId: true } } },
+          select: {
+            id: true,
+            poolId: true,
+            Pool: { select: { userId: true } },
+            RuntimeModel: { select: { userId: true } },
+          },
         });
         if (!member) throw notFound("That contributed member does not exist.");
         const actor = callerActor(context.auth, userId);
-        await graphDelete(
-          { userId: member.Pool.userId, poolMemberIds: [member.id] },
+        await graphWrite(
+          // Placement changes take the runtime owner's fence too. Hold every owner before
+          // the removal check, then policy fences, just as for pools.update.
+          [
+            member.Pool.userId,
+            userId,
+            ...(member.RuntimeModel ? [member.RuntimeModel.userId] : []),
+          ],
           async (tx) => {
             // Withdrawn or removed by another request meanwhile: that one audited it.
+            await assertMembersRemovable(tx, context.auth, userId, { id: member.id });
             const withdrawn = await tx.poolMember.deleteMany({ where: { id: member.id } });
             if (withdrawn.count === 0) return;
             await audit(tx, {
@@ -1066,6 +1162,7 @@ export const poolsRouter = {
               after: { memberId: member.id, note: input.note ?? null },
             });
           },
+          (tx) => poolTargetFences(tx, member.poolId),
         );
         // Rules naming the member went with it.
         await invalidatePoolRouting(context.services, [member.poolId]);

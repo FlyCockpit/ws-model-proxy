@@ -5,11 +5,16 @@ export type CredentialDates = {
   revokedAt: string | null;
 };
 
-export type CredentialStatus = "active" | "expired" | "revoked";
+export type CredentialStatus = "active" | "expired" | "revoked" | "blocked";
 
-export function credentialStatus(row: CredentialDates, now: number): CredentialStatus {
+/** `blocked`: a no-expiry agent token the server refuses while no-expiry tokens are off. */
+export function credentialStatus(
+  row: CredentialDates & { blockedByPolicy?: boolean },
+  now: number,
+): CredentialStatus {
   if (row.revokedAt) return "revoked";
   if (row.expiresAt && new Date(row.expiresAt).getTime() <= now) return "expired";
+  if (row.blockedByPolicy === true) return "blocked";
   return "active";
 }
 

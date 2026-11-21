@@ -19,10 +19,6 @@
     "apps/server/src/model-api/protocols/streams.ts": ["exports"],
     "apps/server/src/model-api/transcription-request.ts": ["exports"],
     "apps/web/src/lib/nav-items.ts": ["exports"],
-    // 0.3 pool-transformer helpers. routes.ts still uses the transform-envelope
-    // policy guard and diagnostics.ts the chat-response readers; the other
-    // exports are unused and go when that guard is retired.
-    "apps/server/src/model-api/media-transform.ts": ["exports"],
     // resolveRouteSession is @deprecated (prefer resolveRouteSessionFromAuth);
     // kept only for the projection-assertion tests documented on it.
     "apps/web/src/server/auth-session.ts": ["exports"],
@@ -33,7 +29,19 @@
   },
   "workspaces": {
     ".": {
+      // Shell/image entry points are not visible through static imports.
+      "entry": ["scripts/backup/*.mjs!", "scripts/db/*.mjs!", "scripts/db/lib/local-db-name.mjs!"],
+      "ignoreDependencies": [
+        // The migration scripts load pg from packages/db's dependency closure
+        // (scripts/db/lib/prisma.mjs loadPg). Do not add pg to the root
+        // package.json: a hoisted root pg makes the web SSR build leave `pg`
+        // external, and the image's apps/web/node_modules has no pg.
+        "pg"
+      ],
       "ignoreBinaries": [
+        // PostgreSQL client tools supplied by the runtime image, not npm.
+        "psql",
+        "pg_restore",
         // Global local-dev CLI. Intentionally not listed in package.json.
         "portless"
       ]

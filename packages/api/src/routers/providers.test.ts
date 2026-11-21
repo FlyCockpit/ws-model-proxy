@@ -118,7 +118,7 @@ const READ_AGENT: CallerAuth = {
   kind: "agent_token",
   userId: OWNER,
   agentTokenId: "tok-r",
-  level: "READ",
+  access: { scopes: ["read"], nodeIds: null },
 };
 const API_KEY: CallerAuth = { kind: "api_key", userId: OWNER, apiKeyId: "key-1" };
 

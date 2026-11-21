@@ -1,5 +1,6 @@
 {
   "name": "@ws-model-proxy/api",
+  "private": true,
   "type": "module",
   "exports": {
     "./lib/runtime-spec": {

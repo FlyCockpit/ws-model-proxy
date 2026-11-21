@@ -20,6 +20,10 @@ import { type NodeEventHub, nodeEventHub } from "./hub.js";
  *
  * The browser's own client treats 401 and 403 as final and backs off on everything else.
  *
+ * The request's abort signal ends the stream: a client that left during those checks gets no
+ * stream (its slot is given back), and one that leaves later is dropped from the hub even if
+ * node-server never cancels the response body.
+ *
  * Origin: a browser sends `Origin` on a cross-origin request, and usually leaves it out of a
  * same-origin GET, so a missing one is allowed and a present one must be the dashboard's.
  * `Sec-Fetch-Site`, when sent, must not be `cross-site`. CORS already keeps another site from
@@ -124,9 +128,21 @@ export function createNodeEventsHandler(options: NodeEventsRouteOptions): Handle
       return refuse(c, 403, verdict === "blocked" ? "access_blocked" : "two_factor_required");
     }
 
+    // The client left while the session was read. node-server only cancels a response stream
+    // whose connection closes after the response started, so a stream opened now would never
+    // be cancelled and would hold its slot. Nobody reads this answer.
+    const signal = c.req.raw.signal;
+    if (signal.aborted) {
+      hub.release(reserved.subscriber);
+      return refuse(c, 503, "client_gone");
+    }
     const stream = hub.activate(reserved.subscriber);
     // Ended while the row was read: a sign-out (401) or the shutdown (503).
     if (!stream) return refuse(c, options.isDraining() ? 503 : 401, "session_ended");
+    // A backstop for the same gap: a close from here on ends the stream even when node-server
+    // never cancels it. A no-op after the stream's own cancel or any other end.
+    const subscriber = reserved.subscriber;
+    signal.addEventListener("abort", () => hub.drop(subscriber), { once: true });
     return new Response(stream, {
       status: 200,
       headers: {

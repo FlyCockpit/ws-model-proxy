@@ -3587,6 +3587,7 @@ export async function dispatchPublicOverflow(
       };
       const auth = providerAuth(target, claim.secret);
       await request.beforeProviderSend?.(target);
+      options.signal.throwIfAborted();
       providerIoStarted = true;
       anyProviderIoStarted = true;
       providerFailure = { target };

@@ -1,8 +1,9 @@
 import defaultPrisma from "@ws-model-proxy/db";
 import { getMediaConfig } from "./config.js";
+import { deleteExpiredMedia } from "./deletion.js";
 import { LocalMediaStore, type MediaStore } from "./store.js";
 
-type MediaPrisma = Pick<typeof defaultPrisma, "mediaAsset">;
+type MediaPrisma = Pick<typeof defaultPrisma, "mediaAsset" | "$transaction">;
 
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000; // hourly
 const SWEEP_BATCH = 500;
@@ -24,20 +25,24 @@ export async function sweepExpiredMedia({
   now?: Date;
 }): Promise<number> {
   let removed = 0;
+  const skippedIds: string[] = [];
   // Batch to avoid loading an unbounded set of ids into memory.
   for (;;) {
     const expired = await prisma.mediaAsset.findMany({
-      where: { expiresAt: { lte: now } },
+      where: { expiresAt: { lte: now }, id: { notIn: skippedIds } },
       select: { id: true },
       take: SWEEP_BATCH,
     });
     if (expired.length === 0) break;
 
     for (const { id } of expired) {
-      await store.delete(id);
+      try {
+        removed += await deleteExpiredMedia({ id, now, prisma, store });
+      } catch {
+        console.warn("[media] expired asset deletion failed; retained for retry.");
+        skippedIds.push(id);
+      }
     }
-    await prisma.mediaAsset.deleteMany({ where: { id: { in: expired.map((a) => a.id) } } });
-    removed += expired.length;
 
     if (expired.length < SWEEP_BATCH) break;
   }
@@ -60,11 +65,8 @@ export function startMediaCleanup(): (() => void) | null {
           console.log(`[media] cleanup swept ${removed} expired asset(s).`);
         }
       })
-      .catch((err) => {
-        console.warn(
-          "[media] cleanup sweep failed:",
-          err instanceof Error ? err.message : String(err),
-        );
+      .catch(() => {
+        console.warn("[media] cleanup sweep failed.");
       });
 
     void store
@@ -74,11 +76,8 @@ export function startMediaCleanup(): (() => void) | null {
           console.log(`[media] cleanup removed ${removed} stale staging file(s).`);
         }
       })
-      .catch((err) => {
-        console.warn(
-          "[media] cleanup stale-tmp sweep failed:",
-          err instanceof Error ? err.message : String(err),
-        );
+      .catch(() => {
+        console.warn("[media] cleanup stale-tmp sweep failed.");
       });
   };
 

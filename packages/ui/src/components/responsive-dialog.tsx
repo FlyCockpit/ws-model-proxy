@@ -91,7 +91,7 @@ export function ResponsiveDialog({
           <DrawerTitle>{title}</DrawerTitle>
           {description ? <DrawerDescription>{description}</DrawerDescription> : null}
         </DrawerHeader>
-        <div className="overflow-y-auto overscroll-contain px-4">{children}</div>
+        <div className="overflow-x-hidden overflow-y-auto overscroll-contain px-4">{children}</div>
         {footer ? <DrawerFooter>{footer}</DrawerFooter> : null}
       </DrawerContent>
     </Drawer>

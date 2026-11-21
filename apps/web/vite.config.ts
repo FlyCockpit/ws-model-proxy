@@ -129,7 +129,18 @@ export default defineConfig(({ mode }) => {
     manifest: {
       name: appName,
       short_name: appName,
-      description: `${appName} - PWA Application`,
+      description: "Self-hosted OpenAI-compatible model routing through outbound websockets.",
+      // Outputs of pwa-assets.config.ts; purpose defaults to "any".
+      icons: [
+        { src: "pwa-192x192.png", sizes: "192x192", type: "image/png" },
+        { src: "pwa-512x512.png", sizes: "512x512", type: "image/png" },
+        {
+          src: "maskable-icon-512x512.png",
+          sizes: "512x512",
+          type: "image/png",
+          purpose: "maskable",
+        },
+      ],
       theme_color: "#101113",
       background_color: "#101113",
     },

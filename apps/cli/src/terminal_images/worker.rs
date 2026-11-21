@@ -78,7 +78,7 @@ impl RequestCell {
     /// files.
     fn cancel(&self) {
         // CAS loop rather than fetch_update, which newer toolchains deprecate in favour of
-        // try_update (Rust 1.95) while the MSRV is 1.88.
+        // try_update (Rust 1.95) while the MSRV is 1.89.
         let mut current = self.load();
         while matches!(current, RequestState::Pending | RequestState::Offered) {
             if self.try_move(current, RequestState::Cancelled) {

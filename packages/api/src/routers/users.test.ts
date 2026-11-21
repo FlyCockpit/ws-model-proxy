@@ -167,6 +167,20 @@ async function captureConsoleDuring(fn: () => Promise<unknown>): Promise<string>
 describe("usersRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    for (const mock of [
+      db.user.findUnique,
+      db.user.findMany,
+      db.user.count,
+      db.user.update,
+      db.user.updateMany,
+      db.user.delete,
+      db.$transaction,
+      db.session.deleteMany,
+      db.cliDeviceCredential.findMany,
+      db.cliToken.findMany,
+      db.appSetting.findUnique,
+    ])
+      mock.mockClear();
     invalidateForceTwoFactorPolicyCache();
     // Current users.ts reads the signup-access gate via appSetting.
     db.appSetting.findUnique.mockResolvedValue(null);

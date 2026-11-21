@@ -39,7 +39,7 @@ import { registerMcpTools } from "./tools";
 
 /**
  * A short, deterministic hash of the tool manifest: every tool's name and advertised input
- * schema (whatever the caller's level may list), so a changed tool list shows in the version.
+ * schema (whatever the caller's scopes may list), so a changed tool list shows in the version.
  */
 export function mcpToolManifestHash(
   tools: ReadonlyArray<{ name: string; inputSchema: unknown }> = MCP_TOOLS.map((contract) => ({

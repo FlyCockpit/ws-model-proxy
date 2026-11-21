@@ -3,7 +3,7 @@
  * `is_fabric_ip`) and the database (`wsmp_is_fabric_ip` in schema-hardening.sql). All three
  * accept exactly the canonical text form, so the same string means the same address
  * everywhere and nothing else (brackets, zone ids, prefixes, shell text) gets through. The
- * shared vectors live in `apps/cli/tests/fixtures/relay-3.0/rules/fabric-ip.json`.
+ * shared vectors live in `apps/cli/tests/fixtures/relay-4.0/rules/fabric-ip.json`.
  *
  * Pure (no `node:net`): contracts are also bundled for the browser.
  */

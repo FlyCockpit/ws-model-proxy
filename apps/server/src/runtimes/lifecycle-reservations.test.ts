@@ -1,5 +1,6 @@
 import type { RuntimeLaunch } from "@ws-model-proxy/api/lib/runtime-spec";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TEST_NODE_FEATURES } from "../../../../packages/api/src/lib/node-features-test-fixture";
 
 // A single-node instance with a reservation (`launch.reservations`) on another node, through
 // the production engine (`runOnce`, dispatch, job results) on in-memory tables. Every fenced
@@ -166,6 +167,7 @@ const db = vi.hoisted(() => {
     fabricsHash: null,
     heldFabricsHash: null,
     declaredResources: { kind: "unified", memoryGb: node.memoryGb },
+    features: TEST_NODE_FEATURES,
     nodeInfo: null,
     nodeMetrics: null,
     nodeMetricsAt: null,
@@ -367,7 +369,7 @@ let clock = new Date(Date.now() + 3_600_000);
 const sent: Array<{ nodeId: string; frame: Row; stopsStartsThrough?: number }> = [];
 let errors: unknown[][] = [];
 
-function engine(session: { jobReservations?: boolean } = { jobReservations: true }) {
+function engine() {
   return new RuntimeLifecycle(
     {
       onlineNodeIds: () => store.nodes.filter((node) => node.online).map((node) => node.id),
@@ -375,8 +377,6 @@ function engine(session: { jobReservations?: boolean } = { jobReservations: true
         userId: "u1",
         connectionGeneration: 1,
         trust: "full",
-        rankIdle: true,
-        ...session,
       }),
       sendToNode: (nodeId: string, frame: unknown, guard?: { stopsStartsThrough?: number }) => {
         sent.push({ nodeId, frame: frame as Row, stopsStartsThrough: guard?.stopsStartsThrough });
@@ -419,7 +419,7 @@ function instance(id: string, overrides: Partial<Instance> = {}): Instance {
     nextRestartAt: null,
     needsOperator: null,
     // A row from before runs existed (the column's default): bootstrapped from its steps.
-    runGeneration: 0,
+    runGeneration: 1,
     restartsInWindow: 0,
     restartWindowStartedAt: null,
     healthFailures: 0,
@@ -1137,6 +1137,7 @@ describe("a restart's superseded reservation holds until the new run's leading s
       phase: "STARTING",
       phaseReason: "restart_requested",
       operationId: "op-restart",
+      runGeneration: 2,
     });
     const [old] = item.Reservations;
     if (!old) throw new Error("no reservation");
@@ -1498,19 +1499,6 @@ describe("a run's jobs name the nodes its reservations got", () => {
     });
   });
 
-  it("a node whose CLI cannot read them fails the start, saying to upgrade it", async () => {
-    store.instances = [instance("inst", { phase: "STARTING" })];
-    const lc = engine({});
-    await lc.runOnce();
-    await lc.stop();
-    expect(framesTo("start")).toEqual([]);
-    expect(store.steps.find((step) => step.phase === "START")).toMatchObject({
-      state: "FAILED",
-      errorCode: "cli_upgrade_required",
-    });
-    expect(main().phaseReason).toBe("cli_upgrade_required");
-  });
-
   it("an agent's start fails trust_relay when its reservation node was lowered to Relay only", async () => {
     for (const worker of [
       { trust: "RELAY" as const },
@@ -1547,6 +1535,7 @@ describe("a run's jobs name the nodes its reservations got", () => {
       phase: "STARTING",
       phaseReason: "restart_requested",
       operationId: "op-restart",
+      runGeneration: 2,
     });
     const [old] = item.Reservations;
     if (!old) throw new Error("no reservation");
@@ -1575,18 +1564,5 @@ describe("a run's jobs name the nodes its reservations got", () => {
     await lc.stop();
     const [start] = framesTo("start");
     expect(start?.frame.reservations).toEqual([{ index: 0, nodeId: "w2", node: "w2" }]);
-  });
-
-  it("a stop to a CLI that cannot read them goes without them", async () => {
-    store.instances = [
-      instance("inst", { phase: "STOPPING", desiredState: "STOPPED", runGeneration: 1 }),
-    ];
-    launchedOn("inst", "w1");
-    const lc = engine({});
-    await lc.runOnce();
-    await lc.stop();
-    const [stop] = framesTo("stop");
-    expect(stop).toBeDefined();
-    expect(stop?.frame.reservations).toBeUndefined();
   });
 });

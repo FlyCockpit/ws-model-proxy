@@ -33,6 +33,7 @@ import {
   untouchedNodeIds,
 } from "./agent-updates";
 import { type NodeEvent, onNodeEvent } from "./node-events";
+import { TEST_NODE_FEATURES } from "./node-features-test-fixture";
 
 const OWNER = "owner-1";
 const ORIGIN = "https://proxy.example.com";
@@ -162,6 +163,15 @@ describe("eligibility", () => {
     });
     expect(result.manualCommand).toBeNull();
   });
+
+  it.each(["standard", "isolated"])(
+    "retains stored self-update evidence with legacy policy %s while offline",
+    (agentCommands) => {
+      const result = check({ features: { ...TEST_NODE_FEATURES, agentCommands } }, { live: null });
+      expect(result.selfUpdate).toEqual(TEST_NODE_FEATURES.selfUpdate);
+      expect(result.blockedReason).toBe("node_offline");
+    },
+  );
 
   it("says why not, with the command to run on the node", () => {
     expect(check({}, { live: null })).toMatchObject({
@@ -491,7 +501,7 @@ describe("Homebrew: Install anyway and forced resends", () => {
   const macNode = (overrides: Record<string, unknown> = {}) =>
     addNodes({
       cliBuild: { commit: null, installMethod: "homebrew", target: MAC },
-      features: { selfUpdate: HOMEBREW },
+      features: { ...(nodeRow().features as Record<string, unknown>), selfUpdate: HOMEBREW },
       ...overrides,
     });
   const start = (p: AgentUpdatePort, extra: Partial<Parameters<typeof startAgentUpdate>[1]> = {}) =>

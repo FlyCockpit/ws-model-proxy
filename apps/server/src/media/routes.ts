@@ -8,9 +8,11 @@ import type { Session } from "@ws-model-proxy/auth";
 import defaultPrisma from "@ws-model-proxy/db";
 import type { Context } from "hono";
 import { z } from "zod";
+import { forcedTwoFactorResponse } from "../force-2fa-gate.js";
 import { deleteAllMedia, getMediaStats } from "./admin.js";
 import { sweepExpiredMedia } from "./cleanup.js";
 import { getMediaConfig, MEDIA_NOT_CONFIGURED_MESSAGE, type MediaConfig } from "./config.js";
+import { deleteExpiredMedia } from "./deletion.js";
 import { MediaQuotaExceededError, uploadMedia } from "./service.js";
 import { buildSignedMediaUrl, verifyMediaSignature } from "./signing.js";
 import { MediaTypeNotAllowedError } from "./sniff.js";
@@ -22,10 +24,11 @@ import {
   MEDIA_ASSET_TTL_MIN_HOURS,
 } from "./ttl.js";
 
-type MediaPrisma = Pick<typeof defaultPrisma, "appSetting" | "mediaAsset">;
+type MediaPrisma = Pick<typeof defaultPrisma, "appSetting" | "mediaAsset" | "$transaction">;
 
 /** Dependency seam so tests can inject a temp-dir store, mock prisma, and clock. */
 export interface MediaHandlerDeps {
+  twoFactorRequired?: () => Promise<boolean>;
   getConfig?: () => MediaConfig | null;
   makeStore?: (config: MediaConfig) => MediaStore;
   prisma?: MediaPrisma;
@@ -38,6 +41,7 @@ export interface MediaHandlerDeps {
 function resolveDeps(deps: MediaHandlerDeps) {
   const prisma = deps.prisma ?? (defaultPrisma as unknown as MediaPrisma);
   return {
+    twoFactorRequired: deps.twoFactorRequired,
     getConfig: deps.getConfig ?? getMediaConfig,
     makeStore: deps.makeStore ?? ((config: MediaConfig) => new LocalMediaStore(config.root)),
     prisma,
@@ -92,11 +96,14 @@ export function createMediaConfigHandler(deps: MediaHandlerDeps = {}) {
 // POST /api/internal/media — multipart upload (session-authenticated)
 // ---------------------------------------------------------------------------
 export function createMediaUploadHandler(deps: MediaHandlerDeps = {}) {
-  const { getAttachmentLimit, getConfig, makeStore, prisma, getTtlHours, now } = resolveDeps(deps);
+  const { getAttachmentLimit, getConfig, makeStore, prisma, getTtlHours, now, twoFactorRequired } =
+    resolveDeps(deps);
 
   return async (c: Context): Promise<Response> => {
     const user = sessionUser(c);
     if (!user) return c.json({ error: "Authentication is required." }, 401);
+    const denied = await forcedTwoFactorResponse(c.get("session"), twoFactorRequired);
+    if (denied) return denied;
 
     const config = getConfig();
     if (!config) return c.json({ error: MEDIA_NOT_CONFIGURED_MESSAGE }, 501);
@@ -124,7 +131,7 @@ export function createMediaUploadHandler(deps: MediaHandlerDeps = {}) {
         maxUploadBytes: await getAttachmentLimit(config),
         maxBytesPerUser: config.maxBytesPerUser,
         prisma,
-        now: new Date(now()),
+        now: () => new Date(now()),
       });
       return c.json({ id: result.id, expiresAt: result.expiresAt.toISOString() }, 201);
     } catch (err) {
@@ -157,11 +164,13 @@ const signBodySchema = z.object({
 });
 
 export function createMediaSignHandler(deps: MediaHandlerDeps = {}) {
-  const { getConfig, prisma, now } = resolveDeps(deps);
+  const { getConfig, prisma, now, twoFactorRequired } = resolveDeps(deps);
 
   return async (c: Context): Promise<Response> => {
     const user = sessionUser(c);
     if (!user) return c.json({ error: "Authentication is required." }, 401);
+    const denied = await forcedTwoFactorResponse(c.get("session"), twoFactorRequired);
+    if (denied) return denied;
 
     const config = getConfig();
     if (!config) return c.json({ error: MEDIA_NOT_CONFIGURED_MESSAGE }, 501);
@@ -236,9 +245,16 @@ export function createMediaGetHandler(deps: MediaHandlerDeps = {}) {
     if (!asset) return c.text("Not found", 404);
 
     // Lazy expiry: an expired asset is deleted on access, then 404s.
-    if (asset.expiresAt.getTime() <= now()) {
-      await makeStore(config).delete(id);
-      await prisma.mediaAsset.delete({ where: { id } }).catch(() => {});
+    const expiryCheckTime = new Date(now());
+    if (asset.expiresAt <= expiryCheckTime) {
+      await deleteExpiredMedia({
+        id,
+        now: expiryCheckTime,
+        prisma,
+        store: makeStore(config),
+      }).catch(() => {
+        console.warn("[media] lazy expiry deletion failed; retained for retry.");
+      });
       return c.text("Not found", 404);
     }
 

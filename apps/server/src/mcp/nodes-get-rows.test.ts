@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TEST_NODE_FEATURES } from "../../../../packages/api/src/lib/node-features-test-fixture";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
@@ -53,10 +54,9 @@ function nodeRow() {
     _count: { Runtimes: 1, QueuedCommands: 0 },
     hostname: "spark-01",
     features: {
-      terminals: { supported: true, max: 4, approvalRequired: false },
+      ...TEST_NODE_FEATURES,
       operatorTerminals: true,
       files: { roots: ["/home/me"], asRoot: false, source: "default" },
-      runtimeHosts: [],
       mediaExpand: true,
       liveStt: true,
       secrets: [
@@ -71,10 +71,16 @@ function nodeRow() {
 const nodesGet = MCP_TOOLS.find((tool) => tool.name === "nodes_get");
 
 describe("nodes_get list rows", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-07T10:00:00.000Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
   it("carry hostname, fabrics, GPUs and secret names, without nulls or empty lists", async () => {
     if (!nodesGet) throw new Error("no nodes_get");
     db.node.findMany.mockResolvedValue([nodeRow()] as never);
-    const result = await runMcpTool(nodesGet, { dispatch: testDispatch("READ"), args: {} });
+    const result = await runMcpTool(nodesGet, { dispatch: testDispatch(["read"]), args: {} });
     const text = result.content[0]?.type === "text" ? result.content[0].text : "";
     console.info(`[budget] nodes_get list row: ${text.length} bytes`);
     expect(JSON.parse(text)).toEqual({

@@ -1,5 +1,5 @@
 /**
- * The wire vocabulary of `wsmp` self-update (relay 3.0, extended in place): the hello `build`
+ * The wire vocabulary of `wsmp` self-update (relay 4.0, extended in place): the hello `build`
  * and `environment` the node reports, the `agent.update` frame the server sends and the
  * `agent.update.progress` phases and reasons the node answers with. The relay schemas
  * (`apps/server/src/relay/frames.ts`) and the procedures (`nodes/agent-update.ts`) share these;
@@ -83,9 +83,9 @@ export const AGENT_UPDATE_REASONS = [
 export type AgentUpdateReason = (typeof AGENT_UPDATE_REASONS)[number];
 
 /**
- * A release version (`0.4.3`, `0.4.4-rc.1`), as `agent.update`'s `version` and a refusal's
+ * A release version (`1.0.0`, `1.0.1-rc.1`), as `agent.update`'s `version` and a refusal's
  * `availableVersion`: exactly what the node reads as one (`is_release_version` in the CLI's
- * `frames.rs`, the same since relay 3.0's first wsmp), so the server never offers or sends a
+ * `frames.rs`), so the server never offers or sends a
  * version the node cannot install. At most 64 characters; `MAJOR.MINOR.PATCH` without leading
  * zeros; then nothing, or `-` or `+` followed by at least one of `[0-9A-Za-z.+-]`. Both sides
  * check `agent-release-version-vectors.json`.

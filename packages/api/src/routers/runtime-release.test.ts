@@ -52,7 +52,7 @@ const READ_AGENT: CallerAuth = {
   kind: "agent_token",
   userId: OWNER,
   agentTokenId: "tok-1",
-  level: "READ",
+  access: { scopes: ["read"], nodeIds: null },
 };
 
 function client(auth: CallerAuth = CALLERS.person()) {
@@ -89,6 +89,7 @@ function instanceWith(
         claim,
         markedStoppedAt: new Date(NOW - 1_800_000),
         Node: {
+          userId: OWNER,
           id: "node-1",
           trust: "FULL",
           trustLowerRequestedAt: null,
@@ -104,6 +105,7 @@ function instanceWith(
       nodeId: string | null;
       supersededGeneration: number | null;
       Node: {
+        userId: string;
         id: string;
         slug: string;
         trust: "FULL" | "RELAY";
@@ -492,7 +494,7 @@ describe("runtimes.releaseRequests: what an agent's text and node may be", () =>
           nodeId: "worker",
           // A replaced run's row still holds while the rank does.
           supersededGeneration: 1,
-          Node: { id: "worker", slug: "worker", ...node },
+          Node: { userId: OWNER, id: "worker", slug: "worker", ...node },
         },
       ];
       db.runtimeInstance.findFirst.mockResolvedValueOnce(held as never);
@@ -606,7 +608,7 @@ describe("runtimes.releaseRequests.approve / decline (people)", () => {
       Rank: {
         rank: 0,
         nodeId: "node-1",
-        Node: { slug: "box" },
+        Node: { userId: OWNER, slug: "box" },
         Instance: { id: "inst-1", runtimeId: "rt-1", Runtime: { name: "Qwen" } },
       },
     } as never);

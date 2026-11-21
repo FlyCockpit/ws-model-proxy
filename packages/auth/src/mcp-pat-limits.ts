@@ -32,6 +32,38 @@ export const MCP_PAT_EXPIRY_CLIENT_SKEW_MS = 60_000;
 
 export const MCP_PAT_NO_EXPIRY_DISABLED_REASON = "mcp_pat_no_expiry_disabled" as const;
 
+/**
+ * An existing agent token without expiry, refused while `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY` is
+ * off. The token is kept (not revoked) and works again once the flag is back on.
+ */
+export const MCP_PAT_NO_EXPIRY_BLOCKED_REASON = "mcp_pat_no_expiry_blocked" as const;
+
+/**
+ * True for a no-expiry agent token while the deployment disallows them. Fails closed: only an
+ * explicit `allowNoExpiry === true` lets a no-expiry token through.
+ */
+export function mcpPatBlockedByPolicy(
+  expiresAt: Date | string | null,
+  allowNoExpiry: boolean | undefined,
+): boolean {
+  return expiresAt === null && allowNoExpiry !== true;
+}
+
+/**
+ * Prisma `where` fragment for a live agent token: unrevoked, unexpired, and (while no-expiry
+ * tokens are disallowed) dated. The policy is part of the same statement as the row read, so no
+ * decision ever pairs a fresh row with an older policy read.
+ */
+export function liveAgentTokenWhere(now: Date, allowNoExpiry: boolean | undefined) {
+  return {
+    revokedAt: null,
+    OR:
+      allowNoExpiry === true
+        ? [{ expiresAt: null }, { expiresAt: { gt: now } }]
+        : [{ expiresAt: { gt: now } }],
+  };
+}
+
 export function mcpPatMaxExpiryMs(nowMs: number): number {
   return nowMs + MCP_PAT_MAX_TTL_MS;
 }

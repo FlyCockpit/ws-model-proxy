@@ -55,6 +55,7 @@ describe("resolveMcpPlugins (WMP_MCP_ENABLED decision)", () => {
     expect(plugins.map((plugin) => plugin.id)).toEqual([
       "jwt",
       "oauth-provider",
+      "wsmp-mcp-scope-policy",
       "wsmp-mcp-consent-level",
       "cimd",
     ]);
@@ -95,7 +96,7 @@ describe("resolveMcpPlugins (WMP_MCP_ENABLED decision)", () => {
       enabled: true,
       baseUrl: "http://localhost:3000",
     });
-    expect(plugins).toHaveLength(4);
+    expect(plugins).toHaveLength(5);
     const mcpPlugin = plugins.find((plugin) => plugin.id === "oauth-provider");
     expect(mcpPlugin && "options" in mcpPlugin ? mcpPlugin.options.resources : undefined).toContain(
       canonicalMcpResource("http://localhost:3000"),

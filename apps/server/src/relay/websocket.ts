@@ -8,14 +8,17 @@ import {
   relayUpgradeFailureBudget,
   relayUpgradeNodeLimiter,
 } from "../rate-limit.js";
+import { SERVER_VERSION } from "../version.js";
 import { authenticateNodeCredential, type NodeIdentity } from "./node-credential-auth.js";
 import {
   parseRelaySubprotocolHeader,
   protocolErrorMessage,
   RELAY_SUBPROTOCOL,
 } from "./protocol.js";
+import { recordRejectedNodeHello } from "./registration.js";
 import { type RelaySocket, relaySessionManager } from "./session-manager.js";
 import { settleSocketHandler } from "./socket-handler.js";
+import { retainUpgradeRefusalBody } from "./upgrade-refusal-body.js";
 
 type RelayVariables = {
   relayIdentity: NodeIdentity;
@@ -38,51 +41,77 @@ const relayIpKey = (c: Context) => `ip:${resolveClientIp(c)}`;
  */
 export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables: RelayVariables }> {
   return async (c, next) => {
+    const refuse = (response: Response) => retainUpgradeRefusalBody(c.env, response);
     if (c.req.header("upgrade")?.toLowerCase() !== "websocket") {
-      return c.json({ error: "WebSocket upgrade required." }, 426);
+      return refuse(c.json({ error: "WebSocket upgrade required." }, 426));
     }
     if (relaySessionManager.isDraining()) {
-      return c.json({ error: "Server is shutting down." }, 503);
+      return refuse(c.json({ error: "Server is shutting down." }, 503));
     }
 
     const ipKey = relayIpKey(c);
     const budget = await relayUpgradeFailureBudget(ipKey);
     if (!budget.allowed) {
       c.header("Retry-After", String(Math.max(1, Math.ceil(budget.retryAfterMs / 1000))));
-      return c.json({ error: "Too many attempts. Please wait a moment and try again." }, 429);
+      return refuse(
+        c.json({ error: "Too many attempts. Please wait a moment and try again." }, 429),
+      );
     }
 
     const requestedProtocol = parseRelaySubprotocolHeader(c.req.header("sec-websocket-protocol"));
     if (!requestedProtocol.supported) {
-      await chargeRelayUpgradeFailure(ipKey);
-      return c.json(
-        {
-          ...protocolErrorMessage({
-            code: "upgrade_cli",
-            message: "Unsupported relay websocket subprotocol.",
-          }),
-          supportedSubprotocol: RELAY_SUBPROTOCOL,
-        },
-        426,
+      const oldToken = (c.req.header("sec-websocket-protocol") ?? "")
+        .split(",")
+        .map((token) => token.trim())
+        .find((token) => /^ws-model-proxy\.relay\.v3$/.test(token));
+      const secret = oldToken ? bearerSecret(c.req.header("authorization")) : null;
+      const identity = secret ? await authenticateNodeCredential(secret) : null;
+      if (identity && oldToken) {
+        const nodeLimited = await createRateLimiterMiddleware(relayUpgradeNodeLimiter, {
+          resolveKey: () => `node:${identity.nodeId}`,
+        })(c, async () => undefined);
+        if (nodeLimited instanceof Response) return refuse(nodeLimited);
+        await recordRejectedNodeHello(
+          identity,
+          { protocolVersion: "3.0", cliVersion: null },
+          new Date(),
+        ).catch(() => console.error("[relay] recording a protocol refusal failed"));
+      } else {
+        await chargeRelayUpgradeFailure(ipKey);
+      }
+      return refuse(
+        c.json(
+          {
+            ...protocolErrorMessage({
+              code: "upgrade_cli",
+              message:
+                "This server runs WS Model Proxy 1.0 and needs wsmp 1.0 or later. Upgrade wsmp (re-run the server's install.sh, or brew upgrade wsmp), then restart it.",
+            }),
+            supportedSubprotocol: RELAY_SUBPROTOCOL,
+            serverVersion: SERVER_VERSION,
+            minimumCliVersion: "1.0.0",
+          },
+          426,
+        ),
       );
     }
 
     const secret = bearerSecret(c.req.header("authorization"));
     if (!secret) {
       await chargeRelayUpgradeFailure(ipKey);
-      return c.json({ error: "Node credential required." }, 401);
+      return refuse(c.json({ error: "Node credential required." }, 401));
     }
 
     const identity = await authenticateNodeCredential(secret);
     if (!identity) {
       await chargeRelayUpgradeFailure(ipKey);
-      return c.json({ error: "Invalid or revoked node credential." }, 401);
+      return refuse(c.json({ error: "Invalid or revoked node credential." }, 401));
     }
     const nodeRateLimit = createRateLimiterMiddleware(relayUpgradeNodeLimiter, {
       resolveKey: () => `node:${identity.nodeId}`,
     });
     const nodeLimited = await nodeRateLimit(c, async () => undefined);
-    if (nodeLimited instanceof Response) return nodeLimited;
+    if (nodeLimited instanceof Response) return refuse(nodeLimited);
     c.set("relayIdentity", identity);
     await next();
   };

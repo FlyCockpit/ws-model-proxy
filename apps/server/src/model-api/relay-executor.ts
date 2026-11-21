@@ -1,7 +1,7 @@
 import {
   RELAY_BINARY_CHUNK_MAX_BYTES,
   type RelayFailure,
-  type RelayServerControlMessage,
+  type ServerToNodeControlFrame,
 } from "../relay/protocol.js";
 import type {
   ActiveRelayResponseHandlers,
@@ -252,7 +252,7 @@ export function startRelayAttempt({
   nodeId: string;
   /** The instance handle the node routes by. */
   handle: string;
-  family: Extract<RelayServerControlMessage, { type: "relay.request" }>["family"];
+  family: Extract<ServerToNodeControlFrame, { type: "relay.request" }>["family"];
   method: "GET" | "POST" | "DELETE";
   path: string;
   headers: Headers;

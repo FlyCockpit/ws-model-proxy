@@ -1,3 +1,4 @@
+import { createInstance } from "i18next";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/ui/lib/toast", () => ({ toast: { error: vi.fn() } }));
@@ -6,6 +7,8 @@ vi.mock("@/utils/friendly-error", () => ({
 }));
 
 import { refusalReservationOf } from "@/lib/refusal-text";
+import enDashboard from "@/locales/en-US/dashboard.json";
+import esDashboard from "@/locales/es-MX/dashboard.json";
 import { refusalMessage, refusalReasonOf } from "./refusal";
 
 const copy: Record<string, string> = {
@@ -37,6 +40,17 @@ describe("refusal copy", () => {
     expect(refusalMessage(t, { data: { reason: "port_range_in_use" } })).toBe("port range copy");
     expect(refusalMessage(t, { data: { reason: "unknown_reason" } }, "fallback.key")).toBe(
       "fallback.key",
+    );
+  });
+
+  it.each([
+    ["en-US", enDashboard],
+    ["es-MX", esDashboard],
+  ])("localizes bad_cwd for command-start refusals in %s", async (lng, dashboard) => {
+    const i18n = createInstance();
+    await i18n.init({ lng, resources: { [lng]: { dashboard } } });
+    expect(refusalMessage(i18n.t, { data: { reason: "bad_cwd" } })).toBe(
+      dashboard.refusals.bad_cwd,
     );
   });
 

@@ -347,7 +347,7 @@ fn substitution_and_decimals() {
 #[test]
 fn shared_render_vectors() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/relay-3.0/rules/command-render.json");
+        .join("tests/fixtures/relay-4.0/rules/command-render.json");
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("shared vectors"))
         .expect("json");
     let values_of = |object: &Value| -> BTreeMap<&'static str, String> {

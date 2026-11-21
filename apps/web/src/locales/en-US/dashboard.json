@@ -340,7 +340,7 @@
     },
     "trustCard": {
       "title": "Trust",
-      "fullDescription": "The server may run commands, edit files, open terminals and change definitions on this node (people, and agents with Full access).",
+      "fullDescription": "The server may run commands, edit files, open terminals and change definitions on this node (people, and agents whose access allows it).",
       "relayDescription": "The server only relays requests to what this node already holds. People can still start and stop those definitions; nothing else changes remotely.",
       "changed": "Changed",
       "lower": "Lower to Relay only",
@@ -861,7 +861,8 @@
     "agent_update_opted_out": "The machine's operator turned off remote updates in wsmp's config on that machine.",
     "agent_update_unsupported": "This wsmp install cannot update itself. Run the command shown on the node.",
     "agent_update_platform": "Updates from the browser aren't offered on this node's platform yet. Run the command shown on the node.",
-    "agent_update_current": "The node already runs this server's wsmp."
+    "agent_update_current": "The node already runs this server's wsmp.",
+    "bad_cwd": "That working directory cannot be used on the node. Use an absolute path or ~ for an existing, accessible directory, and make sure the node account has a home directory."
   },
   "models": {
     "loadFailed": "Couldn't load your models.",
@@ -1610,8 +1611,8 @@
       "command_failed": "the health command failed",
       "status_not_running": "the status command did not say running"
     },
+    "cliUpgradeRequired": "This node needs a newer wsmp. Upgrade wsmp on the node, then start the instance again.",
     "processDetached": "The start command handed its server off (for example `docker compose up -d`), so the node cannot watch or stop it. Use management \"service\" with stop and status commands, and stop what is still running by hand.",
-    "cliUpgradeRequired": "wsmp on this runtime's node is too old to run it. Upgrade wsmp on the node and restart it, then start the runtime again.",
     "needsOperator": {
       "STEP": "A step waits for you",
       "RESTART": "Restart needed",

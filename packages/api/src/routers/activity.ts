@@ -12,7 +12,13 @@ import { deleteTerminalRelayRequestsWithoutWaiting } from "@ws-model-proxy/db/ca
 import type { z } from "zod";
 import { contractProcedure } from "../contract-procedure";
 import { activityContract as c, type requestRowSchema } from "../contracts/activity";
+import { agentNodeAllowed } from "../contracts/agent-scopes";
 import { callableIdOf } from "../lib/access-views";
+import {
+  hiddenServing,
+  NOTHING_HIDDEN,
+  servedVisiblyRequestWhere,
+} from "../lib/agent-hidden-serving";
 import { loadAgentNames } from "../lib/agent-names";
 import { programOfSubject } from "../lib/command-audit";
 import { runMetricsQuery } from "../lib/metrics-query";
@@ -109,6 +115,24 @@ const requests = {
   list: contractProcedure(c.requests.list).handler(async ({ context, input }) => {
     const userId = context.session.user.id;
     const cursor = decodeCursor(input.cursor);
+    const access =
+      context.auth.kind === "agent_token" || context.auth.kind === "oauth_access_token"
+        ? context.auth.access
+        : undefined;
+    let hiddenNodeIds: string[] = [];
+    if (access !== undefined && access.nodeIds !== null) {
+      const owned = await prisma.node.findMany({ where: { userId }, select: { id: true } });
+      if (
+        input.nodeId !== undefined &&
+        (!agentNodeAllowed(access, input.nodeId) || !owned.some((node) => node.id === input.nodeId))
+      )
+        throw new ORPCError("NOT_FOUND", {
+          message: "No such pool, runtime, version, node or instance.",
+        });
+      hiddenNodeIds = owned
+        .filter((node) => !agentNodeAllowed(access, node.id))
+        .map((node) => node.id);
+    }
     const versionIds = input.runtimeId
       ? (
           await prisma.runtimeVersion.findMany({
@@ -123,22 +147,38 @@ const requests = {
     // caller's own resources, so they cannot probe another owner's ids.
     const placementFilter =
       input.runtimeId !== undefined || input.versionId !== undefined || input.nodeId !== undefined;
+    const filters: Prisma.RelayRequestWhereInput[] = [
+      placementFilter
+        ? { resourceOwnerUserId: userId }
+        : { OR: [{ userId }, { resourceOwnerUserId: userId }] },
+      afterCursor(cursor),
+      input.versionId ? { selectedVersionId: input.versionId } : {},
+      versionIds ? { selectedVersionId: { in: versionIds } } : {},
+      {
+        ...(input.poolId ? { poolId: input.poolId } : {}),
+        ...(input.nodeId ? { selectedNodeId: input.nodeId } : {}),
+        ...(input.status ? { status: input.status } : {}),
+        ...(input.source ? { source: input.source } : {}),
+        ...(input.since ? { createdAt: { gte: new Date(input.since) } } : {}),
+      },
+    ];
+    // Left out, before pagination and every placement filter (runtime/version included):
+    // requests served on a hidden node or by a hidden instance (one with a binding, rank or
+    // reservation on a hidden node, whichever node served it). Other owners' nodes and
+    // requests without a selected node or instance remain visible. Only instances that may
+    // have served the oldest row this filter could return are looked up.
+    let served = NOTHING_HIDDEN;
+    if (hiddenNodeIds.length > 0) {
+      const oldest = await prisma.relayRequest.findFirst({
+        where: { AND: filters },
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+        select: { createdAt: true },
+      });
+      if (oldest) served = await hiddenServing(prisma, hiddenNodeIds, oldest.createdAt);
+      else served = { nodeIds: hiddenNodeIds, instanceIds: [] };
+    }
     const where: Prisma.RelayRequestWhereInput = {
-      AND: [
-        placementFilter
-          ? { resourceOwnerUserId: userId }
-          : { OR: [{ userId }, { resourceOwnerUserId: userId }] },
-        afterCursor(cursor),
-        input.versionId ? { selectedVersionId: input.versionId } : {},
-        versionIds ? { selectedVersionId: { in: versionIds } } : {},
-        {
-          ...(input.poolId ? { poolId: input.poolId } : {}),
-          ...(input.nodeId ? { selectedNodeId: input.nodeId } : {}),
-          ...(input.status ? { status: input.status } : {}),
-          ...(input.source ? { source: input.source } : {}),
-          ...(input.since ? { createdAt: { gte: new Date(input.since) } } : {}),
-        },
-      ],
+      AND: [...filters, ...servedVisiblyRequestWhere(served)],
     };
     const rows = await prisma.relayRequest.findMany({
       where,
@@ -399,7 +439,14 @@ const needsYou = {
 export const activityRouter = {
   metrics: {
     query: contractProcedure(c.metrics.query).handler(({ context, input }) =>
-      runMetricsQuery(context.session.user.id, input),
+      runMetricsQuery(
+        context.session.user.id,
+        input,
+        new Date(),
+        context.auth.kind === "agent_token" || context.auth.kind === "oauth_access_token"
+          ? context.auth.access
+          : undefined,
+      ),
     ),
   },
   requests,

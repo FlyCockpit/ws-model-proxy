@@ -16,12 +16,28 @@ export function createProductionCapacityRuntime() {
   };
   const store = new PostgresCapacityAdmissionStore(prisma, crypto.randomUUID(), notifier);
   const runtime = new StoreCapacityAdmissionRuntime(store, 100, 5_000, wakeSource);
-  const maintenanceTimer = setInterval(() => {
-    void runtime.maintain();
-  }, 5_000);
+  let inFlight: Promise<void> | undefined;
+  const runMaintenance = () => {
+    if (inFlight) return;
+    inFlight = (async () => {
+      try {
+        await runtime.maintain();
+      } catch (error) {
+        // Prisma failures may contain SQL and parameters. Log only the class.
+        console.error(
+          "[capacity] maintenance sweep failed:",
+          error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+        );
+      }
+    })().finally(() => {
+      inFlight = undefined;
+    });
+  };
+  const maintenanceTimer = setInterval(runMaintenance, 5_000);
   maintenanceTimer.unref?.();
   const stopMaintenance = async () => {
     clearInterval(maintenanceTimer);
+    await inFlight;
     await wakeSource.close();
   };
   return {

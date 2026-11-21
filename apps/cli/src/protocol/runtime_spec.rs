@@ -439,7 +439,7 @@ impl Commands {
 /// compared after collapsing spaces, tabs and line breaks and dropping
 /// trailing semicolons. Nothing else is parsed. Twin of the server's
 /// `statusCanReportStopped` (`packages/api/src/lib/runtime-spec.ts`); shared
-/// vectors in `tests/fixtures/relay-3.0/rules/status-command.json`.
+/// vectors in `tests/fixtures/relay-4.0/rules/status-command.json`.
 pub fn status_can_report_stopped(command: &str) -> bool {
     let mut text = command
         .split([' ', '\t', '\n', '\r'])
@@ -662,7 +662,7 @@ pub struct NodeFeatures {
     pub media_expand: bool,
     pub live_stt: bool,
     /// The node reads `runtime.job` `reservations` and exports them to the
-    /// commands. Absent means an older CLI that ignores them.
+    /// commands.
     #[serde(default, skip_serializing_if = "is_false")]
     pub job_reservations: bool,
     /// One runtime step runner outlives the node's relay connections, and
@@ -671,8 +671,7 @@ pub struct NodeFeatures {
     /// sends runtime jobs only to a node with it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub rank_idle: bool,
-    /// What runtime launches this node can run. Absent on older CLIs: the
-    /// server then reads the node's `executionMechanism`.
+    /// What runtime launches this node can run; absent means it cannot launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchFeatures>,
     /// The node's secrets: names and when they were last set (never values).
@@ -810,7 +809,7 @@ mod tests {
     #[test]
     fn status_commands_match_the_shared_vectors() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/relay-3.0/rules/status-command.json");
+            .join("tests/fixtures/relay-4.0/rules/status-command.json");
         let text = std::fs::read_to_string(path).expect("status-command vectors");
         let vectors: serde_json::Value = serde_json::from_str(&text).expect("vectors are JSON");
         let list = |key: &str| -> Vec<String> {

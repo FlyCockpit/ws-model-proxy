@@ -7,7 +7,10 @@ import type { PrismaClient } from "../../../db/prisma/generated/client";
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: { BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret-0123" },
 }));
-vi.mock("@ws-model-proxy/db", () => ({ default: mockDeep<PrismaClient>() }));
+vi.mock("@ws-model-proxy/db", async () => ({
+  default: mockDeep<PrismaClient>(),
+  Prisma: await import("../../../db/prisma/generated/internal/prismaNamespace"),
+}));
 vi.mock("@ws-model-proxy/auth", () => ({ auth: { api: {} } }));
 vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
   isForceTwoFactorRequired: vi.fn(async () => false),
@@ -16,6 +19,8 @@ vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
 import prisma from "@ws-model-proxy/db";
 import type { Context } from "../context";
 import type { CallerAuth } from "../contracts/auth-context";
+import { hiddenInstancesWhere } from "../lib/agent-hidden-nodes";
+import { servedSinceWhere } from "../lib/agent-hidden-serving";
 import { activityRouter } from "./activity";
 
 const db = prisma as unknown as ReturnType<typeof mockDeep<PrismaClient>>;
@@ -33,7 +38,10 @@ const AGENT: CallerAuth = {
   kind: "agent_token",
   userId: "owner",
   agentTokenId: "t",
-  level: "FULL",
+  access: {
+    scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+    nodeIds: null,
+  },
 };
 
 function client(auth: CallerAuth = PERSON) {
@@ -72,7 +80,129 @@ const request = {
   resourceOwnerUserId: "owner",
 };
 
-beforeEach(() => mockReset(db));
+beforeEach(() => {
+  mockReset(db);
+  db.runtimeInstance.findMany.mockResolvedValue([]);
+});
+
+describe("agent request row projections", () => {
+  for (const kind of ["agent_token", "oauth_access_token"] as const) {
+    for (const nodeIds of [["allowed"], [], null])
+      it(`${kind}: preserves other-node and unplaced rows with ${JSON.stringify(nodeIds)}`, async () => {
+        const access = { scopes: ["read"] as const, nodeIds };
+        const auth: CallerAuth =
+          kind === "agent_token"
+            ? { kind, userId: "owner", agentTokenId: "t", access }
+            : { kind, userId: "owner", grantId: "g", access };
+        db.node.findMany.mockResolvedValue([{ id: "allowed" }, { id: "hidden" }] as never);
+        // These are rows the database keeps under the node exclusion predicate: an own
+        // resource on another user's node, another owner's pool, and an unplaced request.
+        db.relayRequest.findMany.mockResolvedValue([
+          { ...request, id: "own-shared", selectedNodeId: "foreign", selectedInstanceId: "i1" },
+          { ...request, id: "other-pool", resourceOwnerUserId: "other", selectedNodeId: "foreign" },
+          { ...request, id: "unplaced", selectedNodeId: null },
+        ] as never);
+        db.pool.findMany.mockResolvedValue([]);
+        const page = await client(auth).requests.list({ limit: 10 });
+        expect(page.items.map((row) => row.id)).toEqual(["own-shared", "other-pool", "unplaced"]);
+        expect(page.items[0]).toMatchObject({
+          nodeId: "foreign",
+          instanceId: "i1",
+          upstreamError: request.upstreamErrorExcerpt,
+        });
+        expect(page.items[1]).toMatchObject({
+          nodeId: null,
+          instanceId: null,
+          route: null,
+          upstreamError: null,
+        });
+        expect(page.items[2]?.nodeId).toBeNull();
+        expect(page.nextCursor).toBeNull();
+      });
+    for (const [nodeIds, filtered] of [
+      [["allowed"], true],
+      [null, false],
+    ] as const)
+      it(`${kind}: ${JSON.stringify(nodeIds)} leaves out requests a mixed instance served on an allowed node`, async () => {
+        const access = { scopes: ["read"] as const, nodeIds };
+        const auth: CallerAuth =
+          kind === "agent_token"
+            ? { kind, userId: "owner", agentTokenId: "t", access }
+            : { kind, userId: "owner", grantId: "g", access };
+        db.node.findMany.mockResolvedValue([{ id: "allowed" }, { id: "hidden" }] as never);
+        // inst-mixed's head is on the allowed node; another rank is on the hidden one.
+        db.runtimeInstance.findMany.mockResolvedValue([{ id: "inst-mixed" }] as never);
+        const oldest = new Date("2026-11-01T00:00:00.000Z");
+        db.relayRequest.findFirst.mockResolvedValue({ createdAt: oldest } as never);
+        db.relayRequest.findMany.mockResolvedValue([]);
+        db.pool.findMany.mockResolvedValue([]);
+        await client(auth).requests.list({ limit: 10 });
+        const where = db.relayRequest.findMany.mock.calls[0]?.[0]?.where as {
+          AND: unknown[];
+        };
+        const mixed = {
+          OR: [{ selectedInstanceId: null }, { selectedInstanceId: { notIn: ["inst-mixed"] } }],
+        };
+        const node = { OR: [{ selectedNodeId: null }, { selectedNodeId: { notIn: ["hidden"] } }] };
+        if (filtered) {
+          expect(where.AND).toContainEqual(mixed);
+          expect(where.AND).toContainEqual(node);
+          // Only instances that may have served the oldest row the same filters can return.
+          expect(db.relayRequest.findFirst.mock.calls[0]?.[0]).toMatchObject({
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+          });
+          expect(db.runtimeInstance.findMany).toHaveBeenCalledExactlyOnceWith({
+            where: { AND: [hiddenInstancesWhere(["hidden"]), servedSinceWhere(oldest)] },
+            select: { id: true },
+          });
+        } else {
+          expect(JSON.stringify(where)).not.toContain("inst-mixed");
+          expect(db.relayRequest.findFirst).not.toHaveBeenCalled();
+          expect(db.runtimeInstance.findMany).not.toHaveBeenCalled();
+        }
+      });
+    it(`${kind}: with no candidate row, looks up no instance and still filters hidden nodes`, async () => {
+      const access = { scopes: ["read"] as const, nodeIds: ["allowed"] };
+      const auth: CallerAuth =
+        kind === "agent_token"
+          ? { kind, userId: "owner", agentTokenId: "t", access }
+          : { kind, userId: "owner", grantId: "g", access };
+      db.node.findMany.mockResolvedValue([{ id: "allowed" }, { id: "hidden" }] as never);
+      db.relayRequest.findFirst.mockResolvedValue(null);
+      db.relayRequest.findMany.mockResolvedValue([]);
+      await client(auth).requests.list({ limit: 10 });
+      expect(db.runtimeInstance.findMany).not.toHaveBeenCalled();
+      const where = db.relayRequest.findMany.mock.calls[0]?.[0]?.where as { AND: unknown[] };
+      expect(where.AND).toContainEqual({
+        OR: [{ selectedNodeId: null }, { selectedNodeId: { notIn: ["hidden"] } }],
+      });
+    });
+    it(`${kind}: preserves placement fields for an allowed own-node filter`, async () => {
+      const access = { scopes: ["read"] as const, nodeIds: ["allowed"] };
+      const auth: CallerAuth =
+        kind === "agent_token"
+          ? { kind, userId: "owner", agentTokenId: "t", access }
+          : { kind, userId: "owner", grantId: "g", access };
+      db.node.findMany.mockResolvedValue([{ id: "allowed" }] as never);
+      db.relayRequest.findMany.mockResolvedValue([
+        {
+          ...request,
+          selectedNodeId: "allowed",
+          selectedInstanceId: "i1",
+          selectedVersionId: "v1",
+        },
+      ] as never);
+      db.pool.findMany.mockResolvedValue([]);
+      const page = await client(auth).requests.list({ nodeId: "allowed" });
+      expect(page.items[0]).toMatchObject({
+        nodeId: "allowed",
+        instanceId: "i1",
+        versionId: "v1",
+        route: "cloud",
+      });
+    });
+  }
+});
 
 describe("request log", () => {
   it("lists the caller's requests and requests to the caller's resources, prompt-free", async () => {

@@ -1,3 +1,4 @@
+import type { CallerAuth } from "@ws-model-proxy/api/contracts";
 /**
  * `models.test` (MCP `model_test`): one test request, or a bench of them, as the caller through
  * the production admission and routing path (`modelTestHandler` in routes.ts, the Test page's
@@ -120,6 +121,7 @@ export type ModelTestSend = (input: {
   request: Request;
   userId: string;
   kind: ModelTestKind;
+  auth: CallerAuth;
 }) => Promise<Response>;
 
 export type RelayRequestReadback = {
@@ -149,11 +151,18 @@ export type ModelTestDependencies = {
   sleep?: (ms: number) => Promise<void>;
 };
 
-function defaultSend({ request, userId, kind }: Parameters<ModelTestSend>[0]): Promise<Response> {
+function defaultSend({
+  request,
+  userId,
+  kind,
+  auth,
+}: Parameters<ModelTestSend>[0]): Promise<Response> {
   return modelTestHandler({
     request,
     userId,
     kind,
+    agentAccess:
+      auth.kind === "agent_token" || auth.kind === "oauth_access_token" ? auth.access : undefined,
     manager: relaySessionManager,
     limiter: modelApiConcurrencyLimiter,
     capacityRuntime: diagnosticsCapacityRuntime(),
@@ -485,6 +494,7 @@ async function runOne(
             request: buildRequest(input, input.signal),
             userId: input.userId,
             kind: input.kind,
+            auth: input.auth,
           });
           // The whole body is read (or cancelled) inside the scope, so no capacity lease outlives it.
           const read = await readAnswer(input.kind, response, deps.now);

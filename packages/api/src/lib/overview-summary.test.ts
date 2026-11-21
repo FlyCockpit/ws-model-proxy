@@ -9,7 +9,9 @@ vi.mock("@ws-model-proxy/db", async () => ({
 
 import { emptyLatencyHistogram, latencyBucketIndex } from "@ws-model-proxy/config/usage-metrics";
 import prisma, { Prisma } from "@ws-model-proxy/db";
-import { overviewSummary } from "./overview-summary";
+import { NOTHING_HIDDEN } from "./agent-hidden-serving";
+import { memberRecentTraffic, overviewSummary, poolTraffic } from "./overview-summary";
+import { memberLatencyKey } from "./pool-views";
 
 const db = prisma as unknown as ReturnType<typeof mockDeep<PrismaClient>>;
 const NOW = new Date("2026-10-07T12:20:00.000Z");
@@ -121,5 +123,91 @@ describe("overview summary", () => {
     });
     expect(summary.pools).toEqual([]);
     expect(db.$queryRaw).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("shared pool rollups", () => {
+  it("keeps the default SQL identical with an explicit empty hidden-node list", async () => {
+    db.$queryRaw.mockImplementation((async (strings: TemplateStringsArray, ...parts: unknown[]) => {
+      queries.push(Prisma.sql(strings, ...parts));
+      return [];
+    }) as never);
+    await poolTraffic("u1", ["p1"], "24h", NOW);
+    await memberRecentTraffic("u1", ["p1"], NOW);
+    await poolTraffic("u1", ["p1"], "24h", NOW, NOTHING_HIDDEN);
+    await memberRecentTraffic("u1", ["p1"], NOW, { nodeIds: [], instanceIds: [] });
+    expect(queries[2]?.sql).toEqual(queries[0]?.sql);
+    expect(queries[2]?.values).toEqual(queries[0]?.values);
+    expect(queries[3]?.sql).toEqual(queries[1]?.sql);
+    expect(queries[3]?.values).toEqual(queries[1]?.values);
+    for (const query of queries) {
+      expect(query.sql).not.toContain('COALESCE("nodeId"');
+      expect(query.sql).not.toContain('COALESCE("instanceId"');
+    }
+  });
+
+  it.each(["24h", "7d"] as const)(
+    "%s: excludes hidden serving nodes with parameters in both rollups",
+    async (range) => {
+      const hiddenNodeIds = ["hidden", "hidden' OR TRUE --"];
+      const hiddenInstanceIds = ["inst-mixed", "inst' OR TRUE --"];
+      const hidden = { nodeIds: hiddenNodeIds, instanceIds: hiddenInstanceIds };
+      db.$queryRaw.mockImplementation((async (
+        strings: TemplateStringsArray,
+        ...parts: unknown[]
+      ) => {
+        const query = Prisma.sql(strings, ...parts);
+        queries.push(query);
+        return query.sql.includes("AS provider_model")
+          ? [
+              { pool: "p1", runtime: "rt1", provider_model: "", requests: 4, ...histogram("l", 1) },
+              {
+                pool: "p1",
+                runtime: "",
+                provider_model: "cloud",
+                requests: 6,
+                ...histogram("l", 2),
+              },
+            ]
+          : [{ pool: "p1", t: new Date("2026-10-07T12:00:00.000Z"), requests: 10, errors: 1 }];
+      }) as never);
+      const traffic = await poolTraffic("u1", ["p1"], range, NOW, hidden);
+      expect(traffic.get("p1")).toMatchObject({ requests: 10, errors: 1 });
+      expect(traffic.get("p1")?.sparkline).toHaveLength(range === "24h" ? 24 : 28);
+      expect(traffic.get("p1")?.sparkline.reduce((a, b) => a + b, 0)).toBe(10);
+      const members = await memberRecentTraffic("u1", ["p1"], NOW, hidden);
+      const localKey = memberLatencyKey("p1", { runtimeId: "rt1", providerModelId: null });
+      const cloudKey = memberLatencyKey("p1", { runtimeId: null, providerModelId: "cloud" });
+      expect(members.requests.get(localKey)).toBe(4);
+      expect(members.requests.get(cloudKey)).toBe(6);
+      expect(members.poolRequests.get("p1")).toBe(10);
+      expect(members.p95.get(localKey)).toBeGreaterThan(0);
+      expect(members.p95.get(cloudKey)).toBeGreaterThan(0);
+      expect(queries).toHaveLength(2);
+      for (const query of queries) {
+        expect(query.sql).toContain("AND NOT (COALESCE(\"nodeId\", '') = ANY(");
+        expect(query.sql).toContain("AND NOT (COALESCE(\"instanceId\", '') = ANY(");
+        expect(query.values).toContainEqual(hiddenNodeIds);
+        expect(query.values).toContainEqual(hiddenInstanceIds);
+        for (const id of hiddenInstanceIds) expect(query.sql).not.toContain(id);
+        expect(query.values).toContain("u1");
+        expect(query.values).toContainEqual(["p1"]);
+        for (const id of hiddenNodeIds) expect(query.sql).not.toContain(id);
+        expect(query.sql).toContain(
+          `source NOT IN ('TEST'::"RequestSource", 'AGENT_TEST'::"RequestSource")`,
+        );
+      }
+    },
+  );
+
+  it("does not query either rollup for an empty pool list, even with hidden nodes", async () => {
+    const hidden = { nodeIds: ["hidden"], instanceIds: ["inst-mixed"] };
+    expect(await poolTraffic("u1", [], "24h", NOW, hidden)).toEqual(new Map());
+    expect(await memberRecentTraffic("u1", [], NOW, hidden)).toEqual({
+      p95: new Map(),
+      requests: new Map(),
+      poolRequests: new Map(),
+    });
+    expect(db.$queryRaw).not.toHaveBeenCalled();
   });
 });

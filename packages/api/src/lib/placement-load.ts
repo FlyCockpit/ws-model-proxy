@@ -4,7 +4,7 @@
  * is), and their fabrics. Plain reads; callers run it inside their transaction.
  */
 
-import { effectiveHardware, liveMetrics } from "../nodes/hardware";
+import { effectiveHardware, liveMetrics, ramOnlyMemoryBudgetGb } from "../nodes/hardware";
 import { effectiveTrust } from "../nodes/trust";
 import { parseHeldDefinitions } from "../nodes/views";
 import { occupiesNodesWhere } from "./instance-occupancy";
@@ -131,7 +131,17 @@ export function placementNodeOf(
     requiredVersionIds,
     frozenFabrics: frozenFabricsOf(row),
     memoryGb: hardware.usableMemoryGb,
-    // A unified GPU's VRAM is the node's usable memory (system memory minus reserved).
+    ramOnlyGb: ramOnlyMemoryBudgetGb(hardware, row.nodeInfo),
+    // The GPU-addressable pool is separate from physical RAM. Reserve GPU VRAM on both,
+    // but keep OS headroom on RAM only: it is not a GPU allocation.
+    unifiedAcceleratorGb:
+      hardware.kind.value === "unified" && hardware.acceleratorMemoryGb.value !== null
+        ? Math.max(
+            0,
+            hardware.acceleratorMemoryGb.value -
+              hardware.gpus.reduce((sum, gpu) => sum + (gpu.unified ? gpu.reservedVramGb : 0), 0),
+          )
+        : null,
     gpus: hardware.gpus.map((gpu) => ({
       key: gpu.key,
       vendor: gpu.vendor,
@@ -139,7 +149,7 @@ export function placementNodeOf(
       unified: gpu.unified,
     })),
     liveFreeMemoryGb: liveMetrics(row.nodeMetrics, row.nodeMetricsAt, now).freeMemoryGb,
-    launch: launchCapabilities(row.features, row.nodeInfo),
+    launch: launchCapabilities(row.features),
   };
 }
 
@@ -335,11 +345,16 @@ export async function loadPlacementFabrics(db: Tx, userId: string): Promise<Plac
 /** Everything the planner needs for a start by `userId` on any of their nodes. */
 export async function loadPlacementContext(
   db: Tx,
-  input: { userId: string; agent: boolean; now?: Date },
+  input: { userId: string; agent: boolean; nodeIds?: readonly string[] | null; now?: Date },
 ): Promise<PlacementContext> {
   const now = input.now ?? new Date();
   const nodes = await db.node.findMany({
-    where: { userId: input.userId },
+    where: {
+      userId: input.userId,
+      ...(input.nodeIds !== undefined && input.nodeIds !== null
+        ? { id: { in: [...input.nodeIds] } }
+        : {}),
+    },
     select: PLACEMENT_NODE_SELECT,
     orderBy: { slug: "asc" },
   });

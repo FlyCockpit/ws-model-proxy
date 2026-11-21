@@ -1,9 +1,9 @@
 /**
  * Node file tools (`nodes.files.read/write/edit`, MCP `node_file_read/_write/_edit`): agents
- * configure a node without SSH, over relay 3.0 `file.op`.
+ * configure a node without SSH, over relay 4.0 `file.op`.
  *
  * Layers, each checked on its own:
- * - here: a FULL agent credential (people use a browser terminal), the caller's own node, and
+ * - here: an agent credential with files scope (people use a browser terminal), the caller's own node, and
  *   the node at Full control as stored (a pending lowering counts as Relay); the tool input is
  *   mapped to the relay args of one op;
  * - the server (`apps/server/src/relay/node-file-ops.ts`): the live credential and owner, the
@@ -37,6 +37,7 @@ import {
   type nodeFileReadOutputSchema,
   type nodeFileWriteInputSchema,
 } from "../contracts/nodes";
+import { assertAgentNode, assertAgentScope } from "../lib/caller-actor";
 import { notFound, refuseAbout } from "../lib/refuse";
 
 /** A write's content, decoded (the relay carries at most one 1 MiB `file.body`). */
@@ -63,21 +64,19 @@ function services(context: Context): NodeFileServices {
 }
 
 /**
- * The agent credential behind the call. File tools need a FULL agent token or OAuth grant: a
+ * The agent credential behind the call. File tools need an agent token or OAuth grant with files scope: a
  * person (cookie session) uses a browser terminal instead, so no cookie ever reaches a node's
  * files through these procedures.
  */
 function fileCredential(auth: CallerAuth | { kind: "anonymous" }): NodeFileCredential {
   if (auth.kind === "agent_token" || auth.kind === "oauth_access_token") {
-    if (auth.level !== "FULL") {
-      throw new ORPCError("FORBIDDEN", { message: "Node file tools need a Full agent token." });
-    }
+    assertAgentScope(auth, "files");
     return auth.kind === "agent_token"
       ? { kind: "agent_token", id: auth.agentTokenId }
       : { kind: "oauth_grant", id: auth.grantId };
   }
   throw new ORPCError("FORBIDDEN", {
-    message: "Node file tools are for agents with a Full token; people use a browser terminal.",
+    message: "Node file tools are for agents with files scope; people use a browser terminal.",
   });
 }
 
@@ -427,6 +426,7 @@ async function runOne(
 ): Promise<Record<string, unknown>> {
   const credential = fileCredential(context.auth);
   const userId = context.session.user.id;
+  assertAgentNode(context.auth, nodeId);
   const node = await ownedNode(userId, nodeId);
   const files = services(context);
   let mapped: Mapped;

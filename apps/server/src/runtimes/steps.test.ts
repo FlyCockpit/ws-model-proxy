@@ -177,7 +177,7 @@ describe("reservation nodes in a run's steps", () => {
     { index: 1, nodeId: "nd-b", node: "worker-b" },
     { index: 0, nodeId: "nd-a", node: "worker-a" },
   ];
-  const frameOf = (step: ReturnType<typeof generationSteps>[number], jobReservations: boolean) =>
+  const frameOf = (step: ReturnType<typeof generationSteps>[number]) =>
     jobFrame({
       stepId: "st1",
       instanceId: solo.id,
@@ -187,10 +187,9 @@ describe("reservation nodes in a run's steps", () => {
       intentHash: step.intentHash,
       ownerEpoch: "e:1",
       headAddr: null,
-      jobReservations,
     });
 
-  it("every step of a single-node run carries them (index order); the job only to a CLI that reads them", () => {
+  it("every step and job of a single-node run carries reservations in index order", () => {
     const steps = generationSteps({
       instance: solo,
       ranks: [head],
@@ -206,10 +205,9 @@ describe("reservation nodes in a run's steps", () => {
       ]);
     const start = steps.find((step) => step.phase === "START");
     if (!start) throw new Error("no start");
-    const frame = frameOf(start, true);
+    const frame = frameOf(start);
     expect(runtimeJobFrameSchema.parse(frame)).toEqual(frame);
     expect(frame.reservations).toHaveLength(2);
-    expect(frameOf(start, false).reservations).toBeUndefined();
     // Without reservations nothing changes: no key, the intent hash as before.
     const plain = generationSteps({
       instance: solo,
@@ -219,7 +217,7 @@ describe("reservation nodes in a run's steps", () => {
       operationId: null,
     }).find((step) => step.phase === "START");
     expect(plain?.intent).not.toHaveProperty("reservations");
-    expect(frameOf(plain ?? start, true)).not.toHaveProperty("reservations");
+    expect(frameOf(plain ?? start)).not.toHaveProperty("reservations");
   });
 
   it("a stop of a recorded launch names that launch's nodes, not the run's", () => {

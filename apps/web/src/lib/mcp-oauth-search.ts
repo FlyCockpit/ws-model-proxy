@@ -13,7 +13,7 @@
  */
 
 /** MCP scopes the consent page knows how to explain. */
-export type ExplainableMcpScope = "read" | "write" | "offline_access";
+export type ExplainableMcpScope = "read" | "offline_access";
 
 export interface McpOAuthSearchInfo {
   /** `client_id` query parameter when present and nonempty. */
@@ -66,9 +66,8 @@ export function resolveOauthRedirectUrl(data: unknown): string | null {
 }
 
 /**
- * Map raw scope tokens to consent-page explanation keys. `mcp:read` and
- * `mcp:write` map to their explanations (write explains read too — invariant
- * 9); unknown tokens map to null and are still COUNTED so the page can show
+ * Map raw scope tokens to consent-page explanation keys. Unknown tokens
+ * map to null and are still COUNTED so the page can show
  * a generic "additional access" row rather than silently hiding a scope.
  */
 export function explainableMcpScopes(
@@ -76,7 +75,6 @@ export function explainableMcpScopes(
 ): Array<{ raw: string; key: ExplainableMcpScope | null }> {
   return scopes.map((raw) => {
     if (raw === "mcp:read") return { raw, key: "read" };
-    if (raw === "mcp:write") return { raw, key: "write" };
     if (raw === "offline_access") return { raw, key: "offline_access" };
     return { raw, key: null };
   });

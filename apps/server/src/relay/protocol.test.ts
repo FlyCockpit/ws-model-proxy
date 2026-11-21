@@ -22,7 +22,7 @@ import {
   type ServerToNodeControlFrame,
 } from "./protocol.js";
 
-const FIXTURES = fileURLToPath(new URL("../../../cli/tests/fixtures/relay-3.0/", import.meta.url));
+const FIXTURES = fileURLToPath(new URL("../../../cli/tests/fixtures/relay-4.0/", import.meta.url));
 
 function load(dir: string): Array<[string, Record<string, unknown>]> {
   const path = join(FIXTURES, dir);
@@ -50,11 +50,11 @@ function nodeBinaryFrame(metadata: Record<string, unknown>, body: Uint8Array): A
   return frame.buffer;
 }
 
-describe("relay 3.0 codec", () => {
-  it("speaks exactly 3.0 on the v3 subprotocol", () => {
-    expect(RELAY_PROTOCOL_VERSION).toBe("3.0");
-    expect(RELAY_SUBPROTOCOL).toBe("ws-model-proxy.relay.v3");
-    expect(parseRelaySubprotocolHeader("ws-model-proxy.relay.v3").supported).toBe(true);
+describe("relay 4.0 codec", () => {
+  it("speaks exactly 4.0 on the v4 subprotocol", () => {
+    expect(RELAY_PROTOCOL_VERSION).toBe("4.0");
+    expect(RELAY_SUBPROTOCOL).toBe("ws-model-proxy.relay.v4");
+    expect(parseRelaySubprotocolHeader("ws-model-proxy.relay.v4").supported).toBe(true);
     expect(parseRelaySubprotocolHeader("ws-model-proxy.relay.v2").supported).toBe(false);
     expect(parseRelaySubprotocolHeader(undefined).ok).toBe(false);
   });
@@ -121,15 +121,15 @@ describe("relay 3.0 codec", () => {
     expect(describeRelayControlParseError(new SyntaxError("x"))).toEqual({ kind: "json" });
   });
 
-  it("tells a non-3.0 hello apart and keeps only version-shaped facts", () => {
+  it("tells a different-protocol hello apart and keeps only version-shaped facts", () => {
     const old = JSON.stringify({
       type: "hello",
       id: "h1",
-      protocolVersion: "2.9",
-      cli: { slug: "box", version: "0.3.9" },
+      protocolVersion: "5.0",
+      node: { slug: "box", version: "2.0.0" },
     });
     expect(helloNeedsUpgrade(old)).toBe(true);
-    expect(rejectedHelloFacts(old)).toEqual({ protocolVersion: "2.9", cliVersion: "0.3.9" });
+    expect(rejectedHelloFacts(old)).toEqual({ protocolVersion: "5.0", cliVersion: "2.0.0" });
     const [, hello] = load("frames/node-to-server").find(([name]) => name === "hello.json") ?? [];
     expect(helloNeedsUpgrade(JSON.stringify(hello))).toBe(false);
     expect(
@@ -138,8 +138,8 @@ describe("relay 3.0 codec", () => {
       ),
     ).toEqual({ protocolVersion: null, cliVersion: null });
     expect(refusedRelayProtocolReason("2.9")).toBe("cli_too_old");
-    expect(refusedRelayProtocolReason("3.1")).toBe("cli_too_new");
-    expect(refusedRelayProtocolReason("4.0")).toBe("cli_too_new");
+    expect(refusedRelayProtocolReason("3.1")).toBe("cli_too_old");
+    expect(refusedRelayProtocolReason("5.0")).toBe("cli_too_new");
     expect(refusedRelayProtocolReason(null)).toBe("cli_too_old");
   });
 

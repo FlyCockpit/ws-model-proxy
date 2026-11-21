@@ -12,7 +12,7 @@ import {
 const repoRoot = join(import.meta.dirname, "../../../..");
 const vectors = JSON.parse(
   readFileSync(
-    join(repoRoot, "apps/cli/tests/fixtures/relay-3.0/rules/status-command.json"),
+    join(repoRoot, "apps/cli/tests/fixtures/relay-4.0/rules/status-command.json"),
     "utf8",
   ),
 ) as { refused: string[]; accepted: string[] };

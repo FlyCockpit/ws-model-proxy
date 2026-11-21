@@ -60,6 +60,7 @@ const row = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  for (const mock of [db.user.findUnique, db.user.update, db.user.updateMany]) mock.mockClear();
   forceTwoFactorPolicy.isForceTwoFactorRequired.mockResolvedValue(false);
 });
 

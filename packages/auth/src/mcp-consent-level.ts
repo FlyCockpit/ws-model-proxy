@@ -1,34 +1,12 @@
-/**
- * The access level a person chooses on the MCP consent page (Read-only or Full), carried from
- * the approval into the grant.
- *
- * The consent page posts `{ accept, level, oauth_query }` to Better Auth's `/oauth2/consent`.
- * That endpoint is the person's: a cookie session (`sessionMiddleware`) behind Better Auth's
- * origin check (CSRF), with the transaction pinned by the signed `oauth_query`. `level` is a
- * field of that body only; nothing the client controls (authorize parameters, scope, the
- * signed query) is ever read as a level. Absent means Read-only, the same default as the agent
- * token dialog, so a forged or replayed approval can never come out Full.
- *
- * - before: refuse an unknown `level`, and Full when the approved scopes lack `mcp:write`
- *   (a token without it can never act at Full, so the page never offers it).
- * - after: when the approval issued a code, record the level on the exact grant generation
- *   the code exchanges into (`recordConsentedMcpGrantLevel`) BEFORE the response, and so the
- *   code, reaches the browser. A storage failure withholds the code (500).
- *
- * Remembered consent (no page shown) never writes a level: re-authorization keeps the level
- * the person last chose. A scope step-up (or `prompt=consent`) shows the page again, and the
- * person's new choice replaces the level.
- */
+/** The person chooses scopes and node restrictions in the signed consent transaction. */
 import { getOAuthProviderState } from "@better-auth/oauth-provider";
+import prisma from "@ws-model-proxy/db";
 import type { BetterAuthPlugin } from "better-auth";
 import { APIError, createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
-import { mcpScopesAllow, parseMcpScopes } from "./mcp-config";
+import { type AgentAccess, isAgentScope, oauthScopeCeiling } from "./agent-scopes";
+import { parseMcpScopes } from "./mcp-config";
 import { deriveMcpConsentReferenceId } from "./mcp-grant";
-import {
-  isMcpGrantLevel,
-  type McpGrantLevel,
-  recordConsentedMcpGrantLevel,
-} from "./mcp-grant-level";
+import { recordConsentedMcpGrantAccess } from "./mcp-grant-access";
 
 /** Better Auth's consent endpoint path (router-relative). */
 export const MCP_CONSENT_ENDPOINT_PATH = "/oauth2/consent";
@@ -39,11 +17,29 @@ function bodyRecord(body: unknown): Record<string, unknown> {
     : {};
 }
 
-/** The approval's level: absent → READ (the default); anything but READ/FULL → null. */
-export function consentLevelOf(body: unknown): McpGrantLevel | null {
-  const level = bodyRecord(body).level;
-  if (level === undefined) return "READ";
-  return isMcpGrantLevel(level) ? level : null;
+/** Missing fields default to read and all owned nodes; malformed values fail closed. */
+export function consentAccessOf(body: unknown): AgentAccess | null {
+  const record = bodyRecord(body);
+  const scopes = record.scopes === undefined ? ["read"] : record.scopes;
+  const nodeIds = record.nodeIds === undefined ? null : record.nodeIds;
+  if (
+    !Array.isArray(scopes) ||
+    !scopes.every(isAgentScope) ||
+    !scopes.includes("read") ||
+    scopes.length > 7
+  )
+    return null;
+  if (
+    nodeIds !== null &&
+    (!Array.isArray(nodeIds) ||
+      nodeIds.length > 10000 ||
+      !nodeIds.every((id) => typeof id === "string" && id.length > 0))
+  )
+    return null;
+  return {
+    scopes: [...new Set(scopes)],
+    nodeIds: nodeIds === null ? null : [...new Set<string>(nodeIds)],
+  };
 }
 
 /** Whether the body approves (Better Auth treats anything but `true` as a denial). */
@@ -85,12 +81,12 @@ async function signedQueryOf(): Promise<string | null> {
   }
 }
 
-function invalidLevel(description: string): APIError {
+function invalidAccess(description: string): APIError {
   return new APIError("BAD_REQUEST", { error: "invalid_request", error_description: description });
 }
 
 /**
- * The Better Auth plugin carrying the consent page's level into the grant. Composed right
+ * The Better Auth plugin carrying the consent page's access into the grant. Composed right
  * after `mcp()`, so the provider's own before hook has verified the signed query first.
  */
 export function mcpConsentLevel({ secret }: { secret: string }) {
@@ -102,13 +98,21 @@ export function mcpConsentLevel({ secret }: { secret: string }) {
           matcher: (ctx) => ctx.path === MCP_CONSENT_ENDPOINT_PATH,
           handler: createAuthMiddleware(async (ctx) => {
             if (!consentAccepts(ctx.body)) return;
-            const level = consentLevelOf(ctx.body);
-            if (level === null) throw invalidLevel("level must be READ or FULL");
-            if (
-              level === "FULL" &&
-              !mcpScopesAllow(approvedScopes(ctx.body, await signedQueryOf()), "write")
-            ) {
-              throw invalidLevel("Full access needs the mcp:write scope");
+            const access = consentAccessOf(ctx.body);
+            if (access === null)
+              throw invalidAccess("Invalid agent scopes or nodes; read is required.");
+            const ceiling = oauthScopeCeiling(approvedScopes(ctx.body, await signedQueryOf()));
+            if (access.scopes.some((scope) => !ceiling.includes(scope)))
+              throw invalidAccess("Agent scopes exceed the approved OAuth scopes.");
+            if (access.nodeIds?.length) {
+              const session = await getSessionFromCtx(ctx);
+              if (!session) throw invalidAccess("A session is required.");
+              const nodes = await prisma.node.findMany({
+                where: { userId: session.user.id, id: { in: [...access.nodeIds] } },
+                select: { id: true },
+              });
+              if (nodes.length !== access.nodeIds.length)
+                throw invalidAccess("One or more selected nodes do not exist.");
             }
           }),
         },
@@ -118,8 +122,9 @@ export function mcpConsentLevel({ secret }: { secret: string }) {
           matcher: (ctx) => ctx.path === MCP_CONSENT_ENDPOINT_PATH,
           handler: createAuthMiddleware(async (ctx) => {
             if (!consentAccepts(ctx.body) || !consentIssuedCode(ctx.context.returned)) return;
-            const level = consentLevelOf(ctx.body);
-            if (level === null) throw invalidLevel("level must be READ or FULL");
+            const access = consentAccessOf(ctx.body);
+            if (access === null)
+              throw invalidAccess("Invalid agent scopes or nodes; read is required.");
             const session = await getSessionFromCtx(ctx);
             const query = await signedQueryOf();
             const clientId = query === null ? null : new URLSearchParams(query).get("client_id");
@@ -133,19 +138,20 @@ export function mcpConsentLevel({ secret }: { secret: string }) {
               clientId,
             });
             try {
-              await recordConsentedMcpGrantLevel({
+              await recordConsentedMcpGrantAccess({
                 userId: session.user.id,
                 clientId,
                 referenceId,
-                level,
+                scopes: access.scopes,
+                nodeIds: access.nodeIds,
               });
             } catch (error) {
               console.error(
-                "[mcp-consent] recording the grant level failed",
+                "[mcp-consent] recording the grant access failed",
                 error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
               );
               // Better Auth already remembered this approval. Forget it, so the next authorize
-              // shows the page again instead of issuing a code at the level the person just
+              // shows the page again instead of issuing a code with the access the person just
               // tried to change (e.g. a lowering that did not land).
               try {
                 await ctx.context.adapter.deleteMany({

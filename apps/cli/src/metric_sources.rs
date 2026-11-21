@@ -1,4 +1,4 @@
-//! Node metric commands (relay 3.0 `node.metrics.custom`).
+//! Node metric commands (relay 4.0 `node.metrics.custom`).
 //!
 //! The server defines them in the node part of `runtime.define`
 //! (`node.metricCommands`, at most 16, frozen with the rest at Relay only).

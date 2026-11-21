@@ -136,11 +136,76 @@ pub(crate) fn list(ops: &FileOps, args: &ListArgs, cancel: &Cancel) -> FileResul
         last_rel = entry.rel.to_string();
         Ok(Flow::Continue)
     };
-    walk(&ops.policy, &root, &root_path, depth, &mut visit)?;
+    let stats = walk(
+        &ops.policy,
+        &root,
+        &root_path,
+        depth,
+        &mut || cancel.check(),
+        &mut visit,
+    )?;
+    if stats.truncated_dirs > 0 && more.is_none() {
+        more = Some(ListMore {
+            cursor: URL_SAFE_NO_PAD.encode(&last_rel),
+        });
+    }
     Ok(ListResult {
         count: lines.len(),
         entries: lines.join("\n"),
         more,
         resolved_path: resolved.echo(&args.path),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_ops::walk::test_support::{truncated_tree, with_directory_limit};
+
+    #[test]
+    fn list_reports_nested_directory_truncation_through_more() {
+        let (_dir, ops, root) = truncated_tree();
+        let args = ListArgs {
+            path: crate::file_ops::display_path(&root).expect("display path"),
+            depth: Some(2),
+            glob: Some("*.txt".into()),
+            ..ListArgs::default()
+        };
+        let result = with_directory_limit(2, || ops.dir_list(&args, &Cancel::new()))
+            .expect("partial listing");
+        assert_eq!(result.count, 2); // directory plus the untruncated sibling
+        assert!(result.entries.ends_with("z-sibling.txt"));
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(result.more.expect("incomplete").cursor)
+                .expect("cursor"),
+            b"z-sibling.txt"
+        );
+        assert!(
+            ops.dir_list(&args, &Cancel::new())
+                .expect("complete listing")
+                .more
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn list_truncation_preserves_the_pagination_cursor() {
+        let (_dir, ops, root) = truncated_tree();
+        let args = ListArgs {
+            path: crate::file_ops::display_path(&root).expect("display path"),
+            depth: Some(2),
+            max_entries: Some(1),
+            ..ListArgs::default()
+        };
+        let result =
+            with_directory_limit(2, || ops.dir_list(&args, &Cancel::new())).expect("first page");
+        assert_eq!(result.count, 1);
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(result.more.expect("next page").cursor)
+                .expect("cursor"),
+            b"a-large"
+        );
+    }
 }

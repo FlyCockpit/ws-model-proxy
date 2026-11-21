@@ -126,6 +126,8 @@ const STATE_FEATURES = {
   mediaExpand: false,
   liveStt: false,
   secrets: [],
+  jobReservations: true,
+  rankIdle: true,
   selfUpdate: SELF_UPDATE,
 };
 const identity: NodeIdentity = {
@@ -180,22 +182,20 @@ function hello(
     signature?: string;
     operatorTerminals?: boolean;
     shells?: string[];
-    jobReservations?: boolean;
-    /** `false`: a wsmp older than self-update (no `features.selfUpdate`). */
-    selfUpdate?: boolean;
   } = {},
 ) {
   const trust = overrides.trust ?? "full";
   return JSON.stringify({
     type: "hello",
     id: "hello-1",
-    protocolVersion: "3.0",
+    protocolVersion: "4.0",
     node: {
       slug: "box",
       version: "0.4.0",
       identityPublicKey: testIdentity.publicKey,
       identitySignature: overrides.signature ?? testIdentity.sign(challenge(socket), "box", ORIGIN),
       terminalPublicKey: TERMINAL_KEY,
+      build: { commit: null, target: "x86_64-unknown-linux-gnu", installMethod: "script" },
     },
     trust: { value: trust, frozen: trust === "relay" },
     features: {
@@ -210,11 +210,10 @@ function hello(
       runtimeHosts: [],
       mediaExpand: false,
       liveStt: false,
-      ...(overrides.jobReservations === undefined
-        ? {}
-        : { jobReservations: overrides.jobReservations }),
+      jobReservations: true,
+      rankIdle: true,
       secrets: [],
-      ...(overrides.selfUpdate === false ? {} : { selfUpdate: SELF_UPDATE }),
+      selfUpdate: SELF_UPDATE,
     },
     definitions: [],
     heldMetricCommandsHash: null,
@@ -239,7 +238,7 @@ function credentialRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
-describe("RelaySessionManager (relay 3.0)", () => {
+describe("RelaySessionManager (relay 4.0)", () => {
   let manager: InstanceType<typeof RelaySessionManager>;
   let stored: ReturnType<typeof storedNodes>;
   /** A person's lowering as the API writes it (`nodes.lowerTrust`), then tells the manager. */
@@ -270,6 +269,7 @@ describe("RelaySessionManager (relay 3.0)", () => {
       generation = Number(written.connectionGeneration);
       return written;
     });
+    db.node.update.mockClear();
     db.node.updateMany.mockImplementation(stored.updateMany);
     db.node.findUnique.mockImplementation(stored.findUnique);
     db.runtimeInstance.findMany.mockResolvedValue([]);
@@ -418,16 +418,14 @@ describe("RelaySessionManager (relay 3.0)", () => {
     });
   });
 
-  it("registers a signed 3.0 hello and answers hello.ok with the node id", async () => {
+  it("registers a signed 4.0 hello and answers hello.ok with the node id", async () => {
     const socket = await connect();
     expect(socket.last("hello.ok")).toEqual({
       type: "hello.ok",
       id: "hello-1",
-      protocolVersion: "3.0",
+      protocolVersion: "4.0",
       nodeId: "node-1",
       definitionSync: "none",
-      // The optional node frame fields this server accepts (released wsmp ignores it).
-      features: { execRanWith: true, agentUpdateAvailableVersion: true },
     });
     expect(manager.getOnlineNodeIds()).toEqual(["node-1"]);
     expect(manager.getLiveNodeState("node-1")).toMatchObject({ trust: "full", slug: "box" });
@@ -486,28 +484,72 @@ describe("RelaySessionManager (relay 3.0)", () => {
     expect(db.node.update).not.toHaveBeenCalled();
   });
 
-  it("refuses a 2.x hello with an upgrade message and remembers it", async () => {
+  it("answers heartbeat before starting a blocked database write", async () => {
+    const socket = await connect();
+    let finish: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    db.node.updateMany.mockImplementationOnce(async () => {
+      expect(socket.last("heartbeat.pong")).toMatchObject({ id: "hb-1" });
+      await blocked;
+      return { count: 1 };
+    });
+    const pending = manager.handleTextFrame(socket, heartbeat());
+    try {
+      expect(socket.last("heartbeat.pong")).toMatchObject({ id: "hb-1" });
+    } finally {
+      finish();
+      await pending;
+    }
+  });
+
+  it("keeps a sent heartbeat pong when the database write fails and logs the failure", async () => {
+    const socket = await connect();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    db.node.updateMany.mockRejectedValueOnce(new Error("database unavailable"));
+    try {
+      await manager.handleTextFrame(socket, heartbeat());
+      expect(socket.last("heartbeat.pong")).toMatchObject({ id: "hb-1" });
+      expect(errors).toHaveBeenCalledWith("[relay] heartbeat write failed", "Error");
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it.each([
+    ["5.0", "upgrade_server"],
+    ["3.0", "upgrade_cli"],
+  ])("refuses protocol %s with %s and remembers it", async (protocolVersion, code) => {
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity });
     await manager.handleTextFrame(
       socket,
-      JSON.stringify({ type: "hello", id: "h", protocolVersion: "2.9", cli: { version: "0.3.9" } }),
+      JSON.stringify({
+        type: "hello",
+        id: "h",
+        protocolVersion,
+        node: { version: "2.0.0" },
+      }),
     );
     expect(socket.last("protocol.error")).toMatchObject({
-      code: "upgrade_cli",
-      supportedVersions: ["3.0"],
+      code,
+      supportedVersions: ["4.0"],
+      message: expect.stringContaining(
+        code === "upgrade_server" ? "Upgrade the WS Model Proxy server" : "Upgrade wsmp",
+      ),
     });
     expect(db.node.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          rejectedProtocolVersion: "2.9",
-          rejectedCliVersion: "0.3.9",
+          rejectedProtocolVersion: protocolVersion,
+          rejectedCliVersion: "2.0.0",
         }),
       }),
     );
   });
 
-  it("refuses a 3.0 hello from an older wsmp build with an upgrade message and remembers it", async () => {
+  it("refuses a 4.0 hello from an older wsmp build with an upgrade message and remembers it", async () => {
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity });
     // Same protocol, but missing fields this server requires (e.g. features.files.source).
@@ -516,7 +558,7 @@ describe("RelaySessionManager (relay 3.0)", () => {
       JSON.stringify({
         type: "hello",
         id: "h",
-        protocolVersion: "3.0",
+        protocolVersion: "4.0",
         node: { version: "0.4.0" },
       }),
     );
@@ -526,23 +568,7 @@ describe("RelaySessionManager (relay 3.0)", () => {
     expect(db.node.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          rejectedProtocolVersion: "3.0",
-          rejectedCliVersion: "0.4.0",
-        }),
-      }),
-    );
-  });
-
-  it("refuses a wsmp that cannot update itself, by capability, and remembers it", async () => {
-    const socket = await connect({ selfUpdate: false });
-    expect(socket.last("protocol.error")).toMatchObject({ code: "upgrade_cli" });
-    expect(socket.last("hello.ok")).toBeUndefined();
-    expect(socket.closes).toHaveLength(1);
-    expect(manager.getOnlineNodeIds()).toEqual([]);
-    expect(db.node.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({
-          rejectedProtocolVersion: "3.0",
+          rejectedProtocolVersion: "4.0",
           rejectedCliVersion: "0.4.0",
         }),
       }),
@@ -826,6 +852,7 @@ describe("RelaySessionManager (relay 3.0)", () => {
                   launchHash: "b".repeat(64),
                   rank: 0,
                   intentHash: "c".repeat(64),
+                  stepId: "current-readiness",
                   phase: "ready",
                   unitName: "wsmp-i-0123456789ab-r0",
                   port: 8000,
@@ -898,11 +925,6 @@ describe("RelaySessionManager (relay 3.0)", () => {
       trust: "full",
       operatorTerminals: false,
       terminalShells: [],
-      // A hello without the flag (a CLI from before it): job reservations are not sent.
-      jobReservations: false,
-      // Nor runtime jobs at all (it cannot prove what it runs).
-      rankIdle: false,
-      // It reports self-update (a node without it is refused at hello).
       selfUpdate: SELF_UPDATE,
     });
     const frame = { type: "runtime.detect" as const, id: "d2" };
@@ -918,11 +940,6 @@ describe("RelaySessionManager (relay 3.0)", () => {
     void manager.requestTrustLower("node-1");
     expect(manager.sendToNode("node-1", frame, { requireFullTrust: true })).toBe(false);
     expect(manager.nodeSession("node-1")?.trust).toBe("relay");
-  });
-
-  it("says when the node's CLI reads job reservations", async () => {
-    await connect({ jobReservations: true });
-    expect(manager.nodeSession("node-1")?.jobReservations).toBe(true);
   });
 
   it("never delivers a stop, status or health job of a run older than a start it sent", async () => {
@@ -1301,6 +1318,7 @@ describe("RelaySessionManager (relay 3.0)", () => {
       manager = new RelaySessionManager();
       stored = storedNodes("user-1");
       db.node.findUnique.mockImplementation(stored.findUnique);
+      db.node.update.mockClear();
       db.node.updateMany.mockImplementation(stored.updateMany);
     }
   });
@@ -1599,6 +1617,160 @@ describe("RelaySessionManager (relay 3.0)", () => {
         failureClass: "WEBSOCKET_DISCONNECTED",
       }),
     );
+  });
+
+  it("runs the disconnect hook even when the socket-close write rejects", async () => {
+    const disconnected = vi.fn();
+    manager.setNodeFrameHandlers({ nodeDisconnected: disconnected });
+    const socket = await connect();
+    const failure = new Error("disconnect unavailable");
+    routing.disconnectNodeAtGeneration.mockRejectedValueOnce(failure);
+    await expect(manager.removeSession(socket)).rejects.toBe(failure);
+    expect(disconnected).toHaveBeenCalledWith(
+      expect.objectContaining({ connectionGeneration: generation }),
+    );
+    expect(manager.getOnlineNodeIds()).toEqual([]);
+  });
+
+  it("detaches every stale session before independently settling failed disconnect writes", async () => {
+    const disconnected = vi.fn();
+    manager.setNodeFrameHandlers({ nodeDisconnected: disconnected });
+    const first = await connect();
+    const second = new FakeSocket();
+    db.nodeCredential.findUnique.mockResolvedValue(
+      credentialRow({
+        Node: { ...credentialRow().Node, id: "node-2" },
+      }),
+    );
+    expect(
+      manager.acceptAuthenticatedSocket({
+        socket: second,
+        identity: { ...identity, credentialId: "cred-2", nodeId: "node-2" },
+      }),
+    ).toBe(true);
+    await manager.handleTextFrame(second, hello(second));
+    let release: () => void = () => undefined;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    routing.disconnectNodeAtGeneration.mockImplementationOnce(async () => {
+      await blocked;
+      throw new Error("disconnect unavailable");
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const sweep = manager.checkStaleSessions(new Date(Date.now() + 120_000));
+      expect(first.closes).toEqual([{ code: 1001, reason: "stale" }]);
+      expect(second.closes).toEqual([{ code: 1001, reason: "stale" }]);
+      expect(manager.getOnlineNodeIds()).toEqual([]);
+      expect(routing.disconnectNodeAtGeneration).toHaveBeenCalledTimes(2);
+      release();
+      await expect(sweep).resolves.toBeUndefined();
+      expect(disconnected.mock.calls.map(([node]) => node.nodeId).sort()).toEqual([
+        "node-1",
+        "node-2",
+      ]);
+      expect(error).toHaveBeenCalledWith("[relay] stale session disconnect failed", "Error");
+    } finally {
+      release();
+      error.mockRestore();
+    }
+  });
+
+  it("retires an older owner after a detached hello commits a newer generation", async () => {
+    const disconnected = vi.fn();
+    manager.setNodeFrameHandlers({ nodeDisconnected: disconnected });
+    const owner = await connect();
+    const oldGeneration = generation;
+    let resume: () => void = () => undefined;
+    db.$transaction.mockImplementationOnce(
+      (callback: (tx: typeof db) => unknown) =>
+        new Promise((resolve) => {
+          resume = () => resolve(callback(db));
+        }),
+    );
+    const socket = new FakeSocket();
+    expect(manager.acceptAuthenticatedSocket({ socket, identity })).toBe(true);
+    const registering = manager.handleTextFrame(socket, hello(socket));
+    await new Promise((resolve) => setImmediate(resolve));
+    await manager.removeSession(socket);
+    resume();
+    await registering;
+    expect(generation).toBe(oldGeneration + 1);
+    expect(owner.closes).toEqual([{ code: 1000, reason: "replaced" }]);
+    expect(manager.getOnlineNodeIds()).toEqual([]);
+    expect(routing.disconnectNodeAtGeneration).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nodeId: "node-1",
+        generation: oldGeneration + 1,
+      }),
+    );
+    expect(disconnected).toHaveBeenCalledWith(
+      expect.objectContaining({ connectionGeneration: oldGeneration + 1 }),
+    );
+    const replacement = await connect();
+    expect(replacement.last("hello.ok")).toBeDefined();
+    expect(manager.nodeSession("node-1")?.connectionGeneration).toBe(oldGeneration + 2);
+  });
+
+  it("keeps a newer owner when an older detached hello finishes late", async () => {
+    await connect();
+    let release: () => void = () => undefined;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    db.node.update.mockImplementationOnce(async (args: Parameters<typeof stored.update>[0]) => {
+      const written = await stored.update(args);
+      generation = Number(written.connectionGeneration);
+      await blocked;
+      return written;
+    });
+    const socket = new FakeSocket();
+    expect(manager.acceptAuthenticatedSocket({ socket, identity })).toBe(true);
+    const registering = manager.handleTextFrame(socket, hello(socket));
+    await new Promise((resolve) => setImmediate(resolve));
+    await manager.removeSession(socket);
+    const newer = await connect();
+    const newerGeneration = generation;
+    release();
+    await registering;
+    expect(newer.closes).toEqual([]);
+    expect(manager.nodeSession("node-1")?.connectionGeneration).toBe(newerGeneration);
+    expect(routing.disconnectNodeAtGeneration).not.toHaveBeenCalled();
+  });
+
+  it("fences a delayed node.info write against the replacement generation", async () => {
+    const old = await connect();
+    const oldGeneration = generation;
+    let release: () => void = () => undefined;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    db.node.updateMany.mockImplementationOnce(
+      async (args: Parameters<typeof stored.updateMany>[0]) => {
+        await blocked;
+        return stored.updateMany(args);
+      },
+    );
+    const write = manager.handleTextFrame(
+      old,
+      JSON.stringify({ type: "node.info", memoryTotalMiB: 100 }),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(db.node.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "node-1", connectionGeneration: oldGeneration },
+        data: expect.objectContaining({ nodeInfo: { memoryTotalMiB: 100 } }),
+      }),
+    );
+    const replacement = await connect();
+    await manager.handleTextFrame(
+      replacement,
+      JSON.stringify({ type: "node.info", memoryTotalMiB: 200 }),
+    );
+    release();
+    await write;
+    expect(stored.rows.get("node-1")?.nodeInfo).toEqual({ memoryTotalMiB: 200 });
   });
 
   describe("node events for the browser (#255)", () => {

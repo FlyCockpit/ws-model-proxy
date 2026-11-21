@@ -24,6 +24,15 @@ describe("auth locale key parity (en-US / es-MX)", () => {
     expect(keyTree(esAuth.mcpConsent)).toEqual(keyTree(enAuth.mcpConsent));
   });
 
+  it("ties the narrowing warning to authorization in every locale", () => {
+    expect(enAuth.mcpConsent.narrowWarning).toMatch(/^Authorizing removes access immediately/);
+    expect(esAuth.mcpConsent.narrowWarning).toMatch(
+      /^Al autorizar, el acceso se quita de inmediato/,
+    );
+    expect(enAuth.mcpConsent.narrowWarning).not.toContain("Saving");
+    expect(esAuth.mcpConsent.narrowWarning).not.toContain("Al guardar");
+  });
+
   it("contains the full MCP login/consent key sets in both bundles", () => {
     for (const bundle of [enAuth, esAuth]) {
       expect(keyTree(bundle.mcpLogin).sort()).toEqual(
@@ -48,6 +57,7 @@ describe("auth locale key parity (en-US / es-MX)", () => {
           "scopesTitle",
           "noScopes",
           "readOnlyRequested",
+          "narrowWarning",
           "accept",
           "deny",
           "submitting",
@@ -57,10 +67,13 @@ describe("auth locale key parity (en-US / es-MX)", () => {
           "invalidDescription",
           "manageNote",
           "returnsTo",
+          "failedTitle",
+          "failedDescription",
+          "connectionsFailed",
+          "requestedCeiling",
+          "widenNotice",
           "scopes.read.name",
           "scopes.read.description",
-          "scopes.write.name",
-          "scopes.write.description",
           "scopes.offline_access.name",
           "scopes.offline_access.description",
           "scopes.additionalName",

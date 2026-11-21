@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "serverUrl": "https://server.example.test",
+  "publicOrigin": "https://server.example.test",
+  "cliSlug": "desk-01",
+  "trust": "relay",
+  "runtimeHosts": ["10.0.0.5:8000"],
+  "mediaTrustedOrigins": ["https://media.example.test"],
+  "allowHumanTerminal": true,
+  "requireTerminalApproval": true,
+  "maxTerminals": 2,
+  "terminalShell": "pwsh",
+  "allowFileToolsAsRoot": false,
+  "fileRoots": ["/workspace/models"],
+  "disableFileTools": false,
+  "remoteUpdates": "off"
+}

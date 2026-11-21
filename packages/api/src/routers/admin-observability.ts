@@ -7,6 +7,7 @@ import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { contractProcedure } from "../contract-procedure";
 import { adminObservabilityContract as c } from "../contracts/account";
 import { callableIdOf } from "../lib/access-views";
+import { liveConnection } from "../lib/node-liveness";
 import { effectiveTrust } from "../nodes/trust";
 
 type PageInput = { page: number; pageSize: number; ownerQuery?: string | undefined };
@@ -46,6 +47,7 @@ function pageOf<T>(items: T[], total: number, input: PageInput, partial = false)
 
 export const adminObservabilityRouter = {
   nodes: contractProcedure(c.nodes).handler(async ({ input }) => {
+    const now = new Date();
     const owner = ownerWhere(input.ownerQuery);
     const where: Prisma.NodeWhereInput = owner ? { User: owner } : {};
     const [rows, total] = await Promise.all([
@@ -75,7 +77,7 @@ export const adminObservabilityRouter = {
         id: row.id,
         slug: row.slug,
         owner: row.User,
-        connection: row.connection,
+        connection: liveConnection(row, now),
         trust: effectiveTrust(row),
         version: row.cliVersion,
         lastHeartbeatAt: row.lastHeartbeatAt?.toISOString() ?? null,

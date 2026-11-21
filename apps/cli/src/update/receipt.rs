@@ -1,6 +1,5 @@
 //! The install receipt, `<state>/install.json`: how wsmp was installed. The
-//! installers write it; the first successful update writes it for installs
-//! older than self-update.
+//! installers and successful self-updates record the installation method here.
 
 use std::path::{Path, PathBuf};
 

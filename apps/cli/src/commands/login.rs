@@ -1,6 +1,6 @@
 //! `wsmp login <url> --code CODE`: enroll this machine as a node.
 //!
-//! 1. Check `/.well-known/wsmp` (relay protocol 3.0, the server's public
+//! 1. Check `/.well-known/wsmp` (relay protocol 4.0, the server's public
 //!    origin, pinned when it differs from the URL's).
 //! 2. Exchange the enrollment code, this machine's identity public key and a
 //!    slug for the node credential. A Replace code needs `--replace` or a
@@ -109,6 +109,18 @@ pub fn run(args: &Args) -> Result<()> {
     // `wsmp service install` refuse from a process wsmp started, login skips there too.
     let started_by_wsmp = crate::trust::self_started_by_wsmp();
     let server_url = normalize_server_url(&args.url)?;
+    // As root the service step would refuse ([`service::root_install_refusal`]): say so
+    // before enrolling, so no node is left behind under an account that cannot keep it.
+    if root_service_refused(
+        cfg!(target_os = "linux") && running_as_root(),
+        wants_service(args, interactive()),
+        started_by_wsmp.is_some(),
+    ) {
+        anyhow::bail!(
+            "{}\n  to enroll as root anyway, for a foreground `wsmp run` only, pass `--no-service`",
+            crate::commands::service::root_install_refusal(Some(&server_url))
+        );
+    }
     if let Some(warning) = server_url_http_warning(&server_url) {
         output::diagnostic(warning)?;
     }
@@ -120,11 +132,10 @@ pub fn run(args: &Args) -> Result<()> {
     let prior = prior_enrollment(
         saved.server_url.as_deref(),
         saved.public_origin.as_deref(),
-        saved.trust,
         crate::state::load_node_credential(),
         &[server_url.as_str(), public_origin.as_str()],
     );
-    // An earlier enrollment elsewhere (another server, or a 0.3 credential)
+    // An earlier enrollment with another server
     // does not hand its node name to this one: that would leave its node
     // behind as a ghost under a reused name.
     let saved_slug = match prior {
@@ -286,14 +297,14 @@ pub fn run(args: &Args) -> Result<()> {
                 }
             };
         }
+        save_node_credential(&NodeCredential {
+            node_id: enrolled.node_id.clone(),
+            slug: enrolled.slug.clone(),
+            server: server_url.clone(),
+            credential: enrolled.credential.clone(),
+        })?;
         resolution = decided;
     }
-    save_node_credential(&NodeCredential {
-        node_id: enrolled.node_id.clone(),
-        slug: enrolled.slug.clone(),
-        server: server_url.clone(),
-        credential: enrolled.credential.clone(),
-    })?;
     if let Some(line) = resolution.message(trust) {
         output::diagnostic(line)?;
     }
@@ -535,11 +546,10 @@ fn choose_trust(
 enum Prior {
     /// Never enrolled.
     None,
-    /// A 0.4 credential for this same server: a re-login.
+    /// A credential for this same server: a re-login.
     SameServer,
-    /// Leftovers of another enrollment: a credential for another server, a
-    /// 0.3 credential this version cannot read, or a 0.3 config (no `trust`)
-    /// without one. This login is a fresh enrollment.
+    /// A credential for another server or an unreadable credential.
+    /// This login is a fresh enrollment.
     Stale,
 }
 
@@ -562,7 +572,6 @@ fn origin_of(url: &str) -> Option<String> {
 fn prior_enrollment(
     saved_server: Option<&str>,
     saved_public: Option<&str>,
-    saved_trust: Option<TrustValue>,
     credential: Result<Option<crate::state::NodeCredential>>,
     this_server: &[&str],
 ) -> Prior {
@@ -580,11 +589,11 @@ fn prior_enrollment(
     match credential {
         Ok(Some(credential)) if here(&credential.server) || saved_here => Prior::SameServer,
         Ok(Some(_)) | Err(_) => Prior::Stale,
-        // `wsmp logout` keeps the 0.4 config (it has `trust`): logging back
+        // `wsmp logout` keeps the config: logging back
         // in to the same server is a re-login, not a fresh enrollment.
         Ok(None) => match saved_server {
             None => Prior::None,
-            Some(_) if saved_trust.is_some() && saved_here => Prior::SameServer,
+            Some(_) if saved_here => Prior::SameServer,
             Some(_) => Prior::Stale,
         },
     }
@@ -611,7 +620,7 @@ enum Lowering {
 /// A same-server re-login keeps a person's lowering: a frozen copy, or this
 /// server's node saved as `relay`. A fresh enrollment keeps a frozen copy
 /// unless `may_clear` (an explicit Full choice, no relay running). An
-/// absent trust (a 0.3 config) is not a lowering.
+/// absent trust is not a lowering.
 fn lowering(config: &Config, prior: Prior, may_clear: bool) -> Lowering {
     lowering_with(frozen_exists(), prior, config.trust, may_clear)
 }
@@ -836,21 +845,41 @@ fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
+/// Whether login would install the service, or ask to: not with `--no-service`; with
+/// `--service`, `--yes` (where a per-user service exists), or on a terminal.
+/// `interactive` is [`interactive`], given so tests do not depend on the terminal.
+fn wants_service(args: &Args, interactive: bool) -> bool {
+    // `--yes` takes the default only where a per-user service exists.
+    let yes_installs = args.yes && cfg!(any(target_os = "linux", target_os = "macos"));
+    !args.no_service && (args.service || yes_installs || interactive)
+}
+
+/// Whether login refuses up front: as root on Linux, when it would install the service
+/// (or ask to). A process wsmp started skips the service anyway ([`service_skip`]).
+fn root_service_refused(root_on_linux: bool, wants_service: bool, started_by_wsmp: bool) -> bool {
+    root_on_linux && wants_service && !started_by_wsmp
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    nix::unistd::Uid::effective().is_root()
+}
+
+#[cfg(not(unix))]
+fn running_as_root() -> bool {
+    false
+}
+
 fn offer_service(args: &Args, started_by_wsmp: Option<&str>) -> Result<bool> {
     if args.no_service {
         return Ok(false);
     }
-    // `--yes` takes the default only where a per-user service exists.
-    let yes_installs = args.yes && cfg!(any(target_os = "linux", target_os = "macos"));
-    if let Some(line) = service_skip(
-        args.service || yes_installs || interactive(),
-        started_by_wsmp,
-    ) {
+    if let Some(line) = service_skip(wants_service(args, interactive()), started_by_wsmp) {
         output::diagnostic(line)?;
         return Ok(false);
     }
     let install = args.service
-        || yes_installs
+        || (args.yes && cfg!(any(target_os = "linux", target_os = "macos")))
         || (interactive()
             && matches!(
                 ask("Install as a service so it starts at boot? [Y/n]: ")?
@@ -934,6 +963,34 @@ mod tests {
     }
 
     #[test]
+    fn root_on_linux_is_refused_before_enrolling_only_when_the_service_would_be_installed() {
+        // As root on Linux, a login that would install (or offer) the service stops first.
+        assert!(root_service_refused(true, true, false));
+        // `--no-service` (or nothing to offer): root may enroll for a foreground `wsmp run`.
+        assert!(!root_service_refused(true, false, false));
+        // A process wsmp started skips the service step anyway.
+        assert!(!root_service_refused(true, true, true));
+        // Not root, or not Linux: unchanged.
+        assert!(!root_service_refused(false, true, false));
+        // What login wants, from the flags and whether a terminal can be asked.
+        for terminal in [false, true] {
+            assert!(wants_service(&login_args(&["--service"]), terminal));
+            assert!(!wants_service(&login_args(&["--no-service"]), terminal));
+            assert!(!wants_service(
+                &login_args(&["--yes", "--trust", "full", "--no-service"]),
+                terminal
+            ));
+        }
+        assert_eq!(
+            wants_service(&login_args(&["--yes", "--trust", "full"]), false),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+        // No flags: only a terminal is asked (as root, that is refused up front).
+        assert!(wants_service(&login_args(&[]), true));
+        assert!(!wants_service(&login_args(&[]), false));
+    }
+
+    #[test]
     fn yes_needs_an_explicit_trust_and_never_turns_terminals_on() {
         use clap::Parser;
         #[derive(clap::Parser)]
@@ -984,13 +1041,9 @@ mod tests {
     fn leftovers_of_another_enrollment_make_a_fresh_one() {
         let here = "https://models.example.com";
         let names = [here, "https://public.example.com"];
-        let full = Some(TrustValue::Full);
+        assert_eq!(prior_enrollment(None, None, Ok(None), &names), Prior::None);
         assert_eq!(
-            prior_enrollment(None, None, None, Ok(None), &names),
-            Prior::None
-        );
-        assert_eq!(
-            prior_enrollment(Some(here), None, full, Ok(Some(credential(here))), &names),
+            prior_enrollment(Some(here), None, Ok(Some(credential(here))), &names),
             Prior::SameServer
         );
         // Another spelling of this server (as typed, or its public origin).
@@ -998,24 +1051,21 @@ mod tests {
             prior_enrollment(
                 Some(here),
                 None,
-                full,
                 Ok(Some(credential("https://public.example.com/"))),
                 &names
             ),
             Prior::SameServer
         );
-        // After `wsmp logout`: the 0.4 config (with trust) stays, the credential goes.
+        // After `wsmp logout`: the config stays, the credential goes.
         assert_eq!(
-            prior_enrollment(Some(here), None, full, Ok(None), &names),
+            prior_enrollment(Some(here), None, Ok(None), &names),
             Prior::SameServer
         );
-        // Another server, a 0.3 credential (unreadable here), a 0.3 config
-        // without a 0.4 credential, or a 0.4 config for another server.
+        // Another server or an unreadable credential starts a fresh enrollment.
         assert_eq!(
             prior_enrollment(
                 Some("https://old.example"),
                 None,
-                full,
                 Ok(Some(credential("https://old.example"))),
                 &names
             ),
@@ -1025,18 +1075,13 @@ mod tests {
             prior_enrollment(
                 Some(here),
                 None,
-                None,
-                Err(anyhow::anyhow!("0.3 format")),
+                Err(anyhow::anyhow!("corrupt credential")),
                 &names
             ),
             Prior::Stale
         );
         assert_eq!(
-            prior_enrollment(Some(here), None, None, Ok(None), &names),
-            Prior::Stale
-        );
-        assert_eq!(
-            prior_enrollment(Some("https://old.example"), None, full, Ok(None), &names),
+            prior_enrollment(Some("https://old.example"), None, Ok(None), &names),
             Prior::Stale
         );
         // This server reached through another address: the saved enrollment
@@ -1044,11 +1089,11 @@ mod tests {
         let lan = "http://10.0.0.5:3000";
         let public = Some("https://public.example.com");
         assert_eq!(
-            prior_enrollment(Some(lan), public, full, Ok(Some(credential(lan))), &names),
+            prior_enrollment(Some(lan), public, Ok(Some(credential(lan))), &names),
             Prior::SameServer
         );
         assert_eq!(
-            prior_enrollment(Some(lan), public, full, Ok(None), &names),
+            prior_enrollment(Some(lan), public, Ok(None), &names),
             Prior::SameServer
         );
         // A pinned origin of another server is not this one.
@@ -1056,7 +1101,6 @@ mod tests {
             prior_enrollment(
                 Some(lan),
                 Some("https://old.example"),
-                full,
                 Ok(Some(credential(lan))),
                 &names
             ),
@@ -1067,7 +1111,6 @@ mod tests {
             prior_enrollment(
                 Some(lan),
                 public,
-                full,
                 Ok(Some(credential("http://10.0.0.9:3000"))),
                 &names
             ),
@@ -1077,7 +1120,6 @@ mod tests {
             prior_enrollment(
                 Some(here),
                 None,
-                full,
                 Ok(Some(credential("http://10.0.0.9:3000"))),
                 &names
             ),
@@ -1089,7 +1131,7 @@ mod tests {
     fn only_an_explicit_lowering_keeps_a_login_relay_only() {
         let relay = Some(TrustValue::Relay);
         for may_clear in [false, true] {
-            // A 0.3 config has no trust: not a lowering.
+            // An unset trust value is not a lowering.
             assert_eq!(
                 lowering_with(false, Prior::SameServer, None, may_clear),
                 Lowering::None
@@ -1191,7 +1233,7 @@ mod tests {
         let here = "https://models.example.com";
         assert!(!credential_is_for_another_server(Ok(None), here));
         assert!(!credential_is_for_another_server(
-            Err(anyhow::anyhow!("0.3 format")),
+            Err(anyhow::anyhow!("corrupt credential")),
             here
         ));
         assert!(!credential_is_for_another_server(

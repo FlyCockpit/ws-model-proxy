@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  liveConnection,
   liveNodeWhere,
   NODE_HEARTBEAT_STALE_MS,
   type NodeLivenessRow,
@@ -71,6 +72,19 @@ describe("nodeLiveness", () => {
   });
 });
 
+describe("liveConnection", () => {
+  it.each([
+    ["ONLINE", at(10_000), "ONLINE"],
+    ["ONLINE", null, "ONLINE"],
+    ["ONLINE", at(NODE_HEARTBEAT_STALE_MS), "ONLINE"],
+    ["ONLINE", at(NODE_HEARTBEAT_STALE_MS + 1), "OFFLINE"],
+    ["OFFLINE", at(0), "OFFLINE"],
+    ["OFFLINE", null, "OFFLINE"],
+  ] as const)("%s with heartbeat %s reads %s", (connection, lastHeartbeatAt, expected) => {
+    expect(liveConnection({ connection, lastHeartbeatAt }, NOW)).toBe(expected);
+  });
+});
+
 describe("the readers' forms agree", () => {
   const rows: NodeLivenessRow[] = [];
   for (const connection of ["ONLINE", "OFFLINE"] as const)
@@ -89,6 +103,7 @@ describe("the readers' forms agree", () => {
     for (const row of rows) {
       const live = nodeLiveness(row, NOW).state === "online";
       expect(nodeIsLive(row, NOW), JSON.stringify(row)).toBe(live);
+      expect(liveConnection(row, NOW), JSON.stringify(row)).toBe(live ? "ONLINE" : "OFFLINE");
       expect(matchesLiveWhere(row), JSON.stringify(row)).toBe(live);
       expect(nodeUnreachableSince(row, NOW) === null, JSON.stringify(row)).toBe(live);
     }

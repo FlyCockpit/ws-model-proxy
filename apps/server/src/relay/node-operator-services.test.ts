@@ -16,18 +16,27 @@ const db = vi.hoisted(() => {
         updateMany: vi.fn(async (): Promise<{ count: number }> => ({ count: 1 })),
       },
       agentToken: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
+      node: { findFirst: vi.fn(async (): Promise<unknown> => null) },
       mcpGrant: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
       user: { findMany: vi.fn(async (): Promise<unknown[]> => []) },
     },
   };
 });
 vi.mock("@ws-model-proxy/db", () => ({ default: db.client }));
-vi.mock("@ws-model-proxy/env/server", () => ({ env: { BETTER_AUTH_SECRET: "x".repeat(32) } }));
+const policy = vi.hoisted(() => ({
+  env: { BETTER_AUTH_SECRET: "x".repeat(32), WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: true as boolean },
+}));
+vi.mock("@ws-model-proxy/env/server", () => ({ env: policy.env }));
 
 const { createNodeOperatorServices, NodeCommandStartError } = await import(
   "./node-operator-services.js"
 );
-const { NodeCommandTracker, NODE_COMMAND_SWEEP_PAGE } = await import("./node-command-tracker.js");
+const {
+  NodeCommandTracker,
+  NODE_COMMAND_SWEEP_PAGE,
+  NODE_COMMAND_RECOVERY_PAGE,
+  NODE_COMMAND_TRACK_GRACE_MS,
+} = await import("./node-command-tracker.js");
 const { TerminalTicketStore } = await import("./terminal-tickets.js");
 const { PRODUCT_CREDENTIAL_PREFIXES, generateProductCredentialSecret } = await import(
   "@ws-model-proxy/db/node-security"
@@ -199,7 +208,7 @@ describe("node operator services: commands", () => {
     });
   });
 
-  it("throws a fixed message on exec.rejected and when the node is offline or at Relay", async () => {
+  it("preserves the exec.rejected reason with a fixed message, including offline or Relay nodes", async () => {
     const s = setup();
     const started = s.services.startCommand(startArgs);
     await s.handlers["exec.rejected"]?.(ref(), {
@@ -207,7 +216,11 @@ describe("node operator services: commands", () => {
       commandId: COMMAND,
       reason: "bad_cwd",
     });
-    await expect(started).rejects.toThrow("The node did not start the command (rejected).");
+    await expect(started).rejects.toMatchObject({
+      code: "rejected",
+      nodeReason: "bad_cwd",
+      message: "The node did not start the command (rejected).",
+    });
     expect(s.tracker.size).toBe(0);
 
     s.session.trust = "relay";
@@ -316,8 +329,13 @@ describe("node operator services: commands", () => {
       // When the end reached the server, not the node's own clock.
       finishedAt: new Date("2026-03-01T12:00:10.000Z"),
     });
-    // A poll answered the end: the procedure records it, not the handler.
-    expect(db.client.nodeCommand.findFirst).not.toHaveBeenCalled();
+    // The handler records the end too, outside the poll's request: that request may already
+    // be aborted (a narrowed or revoked credential), and its fenced write would be refused.
+    expect(db.client.nodeCommand.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: expect.any(String), state: "RUNNING" }),
+      }),
+    );
   });
 
   it("polls again at waitMs for a command still running and answers its latest output", async () => {
@@ -470,6 +488,176 @@ describe("node operator services: commands", () => {
   });
 });
 
+describe("node operator services: overdue command recovery", () => {
+  const now = Date.parse("2026-01-01T01:00:00.000Z");
+  const row = (id = COMMAND) => ({
+    id,
+    nodeId: "node-1",
+    userId: "user-1",
+    actor: "AGENT" as const,
+    agentTokenId: "token-1",
+    mcpGrantId: null,
+    subject: "hmac-sha256:00 command",
+    state: "RUNNING" as const,
+    exitCode: null,
+    startedAt: new Date(now - NODE_COMMAND_TRACK_GRACE_MS - 60_000),
+    endsBy: new Date(now - NODE_COMMAND_TRACK_GRACE_MS),
+    finishedAt: null,
+    ranMode: null,
+    ranShell: null,
+  });
+  const overduePage = (rows = [row()]) => {
+    db.client.nodeCommand.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+  };
+
+  it("recovers a failed unsolicited final write by polling the overdue RUNNING row", async () => {
+    const s = setup();
+    const command = row();
+    s.tracker.track({
+      commandId: COMMAND,
+      nodeId: command.nodeId,
+      userId: command.userId,
+      endsBy: command.endsBy.getTime(),
+    });
+    db.client.nodeCommand.findFirst.mockResolvedValueOnce(command);
+    db.tx.nodeCommand.updateMany.mockRejectedValueOnce(new Error("write unavailable"));
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await s.handlers["exec.status"]?.(ref(), status("succeeded"));
+      expect(s.tracker.size).toBe(0);
+      expect(db.tx.nodeAuditEvent.create).not.toHaveBeenCalled();
+      overduePage();
+      const recovery = s.tracker.sweep(now);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(s.types()).toEqual(["exec.poll"]);
+      await s.handlers["exec.status"]?.(ref(), status("succeeded"));
+      await expect(recovery).resolves.toBe(0);
+      expect(db.tx.nodeCommand.updateMany).toHaveBeenCalledTimes(2);
+      expect(db.tx.nodeAuditEvent.create).toHaveBeenCalledOnce();
+      expect(db.tx.nodeCommand.updateMany).toHaveBeenLastCalledWith({
+        where: { id: COMMAND, state: "RUNNING" },
+        data: expect.objectContaining({ state: "SUCCEEDED", exitCode: 0 }),
+      });
+      expect(db.client.nodeCommand.findMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          where: { state: "RUNNING", endsBy: { lte: command.endsBy } },
+          take: NODE_COMMAND_RECOVERY_PAGE,
+        }),
+      );
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it.each(["running", "unknown"] as const)(
+    "handles an overdue poll answered %s without guessing its outcome",
+    async (state) => {
+      const s = setup();
+      overduePage();
+      const recovery = s.tracker.sweep(now);
+      await new Promise((resolve) => setImmediate(resolve));
+      await s.handlers["exec.status"]?.(ref(), { type: "exec.status", commandId: COMMAND, state });
+      await recovery;
+      if (state === "running") {
+        expect(db.tx.nodeCommand.updateMany).not.toHaveBeenCalled();
+      } else {
+        expect(db.tx.nodeCommand.updateMany).toHaveBeenCalledWith({
+          where: { id: COMMAND, state: "RUNNING" },
+          data: expect.objectContaining({ state: "UNKNOWN" }),
+        });
+      }
+    },
+  );
+
+  it("settles an overdue command as UNKNOWN when its node is gone", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const s = setup();
+    s.session.online = false;
+    overduePage();
+    await s.tracker.sweep(now);
+    expect(db.client.node.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: "node-1",
+        userId: "user-1",
+        connection: "ONLINE",
+        OR: [{ lastHeartbeatAt: null }, { lastHeartbeatAt: { gte: new Date(now - 3 * 60_000) } }],
+      },
+      select: { id: true },
+    });
+    expect(s.types()).toEqual([]);
+    expect(db.tx.nodeCommand.updateMany).toHaveBeenCalledWith({
+      where: { id: COMMAND, state: "RUNNING" },
+      data: expect.objectContaining({ state: "UNKNOWN" }),
+    });
+  });
+
+  it.each([false, true])(
+    "keeps an overdue command retryable when its node is live on another replica (local session: %s)",
+    async (localSession) => {
+      const s = setup();
+      s.session.online = localSession;
+      if (localSession) s.session.userId = "another-user";
+      db.client.node.findFirst.mockResolvedValueOnce({ id: "node-1" });
+      overduePage();
+      await s.tracker.sweep(now);
+      expect(db.client.node.findFirst).toHaveBeenCalledOnce();
+      expect(s.types()).toEqual([]);
+      expect(db.tx.nodeCommand.updateMany).not.toHaveBeenCalled();
+      expect(db.tx.nodeAuditEvent.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps an overdue row retryable when a connected node does not answer", async () => {
+    vi.useFakeTimers();
+    const s = setup({ pollAnswerTimeoutMs: 10 });
+    overduePage();
+    const recovery = s.tracker.sweep(now);
+    await vi.advanceTimersByTimeAsync(20);
+    await recovery;
+    expect(s.types()).toEqual(["exec.poll"]);
+    expect(db.tx.nodeCommand.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("bounds each recovery pass, skips failed rows independently and advances beyond unresponsive rows", async () => {
+    const s = setup();
+    const rows = Array.from({ length: NODE_COMMAND_RECOVERY_PAGE }, (_, index) =>
+      row(`cmd-${String(index).padStart(3, "0")}`),
+    );
+    const reconcile = vi
+      .fn(async () => undefined)
+      .mockRejectedValueOnce(new Error("transient failure"));
+    s.tracker.setCommandReconciler(reconcile);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      overduePage(rows);
+      await s.tracker.sweep(now);
+      expect(reconcile).toHaveBeenCalledTimes(NODE_COMMAND_RECOVERY_PAGE);
+      overduePage([]);
+      await s.tracker.sweep(now);
+      expect(db.client.nodeCommand.findMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: { gt: rows.at(-1)?.id } }),
+          take: NODE_COMMAND_RECOVERY_PAGE,
+        }),
+      );
+      overduePage([]);
+      await s.tracker.sweep(now);
+      expect(db.client.nodeCommand.findMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          where: { state: "RUNNING", endsBy: { lte: row().endsBy } },
+        }),
+      );
+      expect(error).toHaveBeenCalledWith(
+        "[relay] overdue node command reconciliation failed",
+        "Error",
+      );
+    } finally {
+      error.mockRestore();
+    }
+  });
+});
+
 describe("node operator services: command tracking", () => {
   it("ends a banned user's commands at once and resends to an offline node when it is back", async () => {
     const s = setup();
@@ -511,6 +699,143 @@ describe("node operator services: command tracking", () => {
     ]);
   });
 
+  it("does not cancel commands when an unrelated scope was removed", async () => {
+    const s = setup();
+    await expect(
+      s.tracker.cancelForNarrowedCredential({
+        userId: "user-1",
+        credentialIds: ["token-1"],
+        access: { scopes: ["read", "commands"], nodeIds: null },
+      }),
+    ).resolves.toBe(0);
+    expect(db.client.nodeCommand.findMany).not.toHaveBeenCalled();
+    expect(s.types()).toEqual([]);
+  });
+
+  it.each([false, true])(
+    "cancels commands only outside the new access (commands removed: %s)",
+    async (removedScope) => {
+      const s = setup();
+      db.client.nodeCommand.findMany.mockResolvedValueOnce([
+        { id: COMMAND, nodeId: "node-1", userId: "user-1", endsBy: new Date(Date.now() + 60_000) },
+      ]);
+      await expect(
+        s.tracker.cancelForNarrowedCredential({
+          userId: "user-1",
+          credentialIds: ["token-1"],
+          access: {
+            scopes: removedScope ? ["read"] : ["read", "commands"],
+            nodeIds: ["keep-node"],
+          },
+        }),
+      ).resolves.toBe(1);
+      expect(db.client.nodeCommand.findMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          where: {
+            userId: "user-1",
+            state: "RUNNING",
+            OR: [{ agentTokenId: { in: ["token-1"] } }, { mcpGrantId: { in: ["token-1"] } }],
+            ...(removedScope ? {} : { nodeId: { notIn: ["keep-node"] } }),
+          },
+        }),
+      );
+      expect(s.types()).toEqual(["exec.cancel"]);
+    },
+  );
+
+  it("the sweep cancels only commands on nodes removed from each live grant", async () => {
+    const s = setup();
+    const now = Date.now();
+    const rows = [
+      { id: "keep", nodeId: "keep-node", agentTokenId: "token-1", mcpGrantId: null },
+      { id: "removed", nodeId: "node-1", agentTokenId: "token-1", mcpGrantId: null },
+      { id: "oauth", nodeId: "node-1", agentTokenId: null, mcpGrantId: "grant-1" },
+    ].map((row) => ({ ...row, userId: "user-1", endsBy: new Date(now + 60_000) }));
+    db.client.nodeCommand.findMany.mockResolvedValueOnce(rows);
+    db.client.agentToken.findMany.mockResolvedValueOnce([
+      {
+        id: "token-1",
+        userId: "user-1",
+        grant: { allNodes: false, Nodes: [{ nodeId: "keep-node" }] },
+      },
+    ]);
+    db.client.mcpGrant.findMany.mockResolvedValueOnce([
+      { id: "grant-1", userId: "user-1", allNodes: true, Nodes: [] },
+    ]);
+    db.client.user.findMany.mockResolvedValueOnce([
+      { id: "user-1", banned: false, banExpires: null, deletionRequestedAt: null },
+    ]);
+    await expect(s.tracker.sweep(now)).resolves.toBe(1);
+    expect(s.sent.map((entry) => entry.frame)).toEqual([
+      { type: "exec.cancel", commandId: "removed" },
+    ]);
+    expect(db.client.agentToken.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ grant: { revokedAt: null, scopes: { has: "COMMANDS" } } }),
+      }),
+    );
+    expect(db.client.mcpGrant.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ scopes: { has: "COMMANDS" } }) }),
+    );
+  });
+
+  it("the sweep ends a no-expiry token's running command only while no-expiry tokens are off", async () => {
+    const now = Date.now();
+    const sweepWith = async (allow: boolean, tokenExpiresAt: Date | null) => {
+      const s = setup();
+      db.client.nodeCommand.findMany.mockResolvedValueOnce([
+        {
+          id: "cmd",
+          nodeId: "node-1",
+          agentTokenId: "token-1",
+          mcpGrantId: null,
+          userId: "user-1",
+          endsBy: new Date(now + 60_000),
+        },
+      ]);
+      // Returned even while off: the verdict must not trust the SQL filter alone.
+      db.client.agentToken.findMany.mockImplementationOnce((async () => {
+        policy.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = allow;
+        return [
+          {
+            id: "token-1",
+            userId: "user-1",
+            expiresAt: tokenExpiresAt,
+            grant: { allNodes: true, Nodes: [] },
+          },
+        ];
+      }) as never);
+      db.client.user.findMany.mockResolvedValueOnce([
+        { id: "user-1", banned: false, banExpires: null, deletionRequestedAt: null },
+      ]);
+      const cancelled = await s.tracker.sweep(now);
+      const calls = db.client.agentToken.findMany.mock.calls as unknown as Array<
+        [{ where?: { OR?: unknown } }]
+      >;
+      return {
+        cancelled,
+        sent: s.sent.map((entry) => entry.frame),
+        or: calls.at(-1)?.[0]?.where?.OR,
+      };
+    };
+    try {
+      const on = await sweepWith(true, null);
+      expect(on.cancelled).toBe(0);
+      expect(on.or).toEqual([{ expiresAt: null }, { expiresAt: { gt: expect.any(Date) } }]);
+      // The flag turns off while the token read is pending: the command is still ended.
+      const off = await sweepWith(false, null);
+      expect(off.cancelled).toBe(1);
+      expect(off.sent).toEqual([{ type: "exec.cancel", commandId: "cmd" }]);
+      policy.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = false;
+      const offQuery = await sweepWith(false, null);
+      expect(offQuery.or).toEqual([{ expiresAt: { gt: expect.any(Date) } }]);
+      // A dated token keeps running with the flag off.
+      expect((await sweepWith(false, new Date(now + 86_400_000))).cancelled).toBe(0);
+    } finally {
+      policy.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = true;
+    }
+  });
+
   it("sweeps commands whose token expired or whose owner is banned, and keeps live ones", async () => {
     const s = setup();
     const now = Date.parse("2026-01-01T00:00:00.000Z");
@@ -530,7 +855,9 @@ describe("node operator services: command tracking", () => {
       row("person", {}),
       row("banned", { userId: "user-banned", nodeId: "node-banned" }),
     ]);
-    db.client.agentToken.findMany.mockResolvedValueOnce([{ id: "token-live" }]);
+    db.client.agentToken.findMany.mockResolvedValueOnce([
+      { id: "token-live", userId: "user-1", grant: { allNodes: true, Nodes: [] } },
+    ]);
     db.client.mcpGrant.findMany.mockResolvedValueOnce([]);
     db.client.user.findMany.mockResolvedValueOnce([
       { id: "user-1", banned: false, banExpires: null, deletionRequestedAt: null },
@@ -565,7 +892,7 @@ describe("node operator services: command tracking", () => {
     const calls = db.client.nodeCommand.findMany.mock.calls as unknown as Array<
       [{ take: number; orderBy: unknown; cursor?: unknown; skip?: number }]
     >;
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(3);
     expect(calls[0]?.[0]).toMatchObject({ take: NODE_COMMAND_SWEEP_PAGE, orderBy: { id: "asc" } });
     expect(calls[0]?.[0].cursor).toBeUndefined();
     expect(calls[1]?.[0]).toMatchObject({

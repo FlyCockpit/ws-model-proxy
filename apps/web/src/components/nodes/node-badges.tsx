@@ -76,7 +76,15 @@ export function NodeFlags({
 }
 
 /** A shell command with a copy button (44px target). */
-export function CommandBlock({ command, label }: { command: string; label?: string }) {
+export function CommandBlock({
+  command,
+  label,
+  wrapAtSpaces = false,
+}: {
+  command: string;
+  label?: string;
+  wrapAtSpaces?: boolean;
+}) {
   const { t } = useTranslation(["dashboard", "errors"]);
   const { feedback, copy: copyText } = useCopyFeedback(2_000);
   const copy = async () => {
@@ -87,7 +95,10 @@ export function CommandBlock({ command, label }: { command: string; label?: stri
     <div className="flex min-w-0 items-start gap-2 rounded-md border bg-muted/40 p-2">
       <code
         aria-label={label}
-        className="min-w-0 flex-1 font-mono text-xs leading-relaxed break-all select-all"
+        className={cn(
+          "min-w-0 flex-1 font-mono text-xs leading-relaxed select-all",
+          wrapAtSpaces ? "whitespace-normal break-normal" : "break-all",
+        )}
       >
         {command}
       </code>

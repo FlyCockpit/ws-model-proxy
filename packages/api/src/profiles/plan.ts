@@ -57,6 +57,8 @@ export type PlanNode = {
   frozenFabrics?: readonly PlacementFrozenFabric[] | "current" | null;
   /** Node memory budget for wsmp (usable, before any claim). */
   memoryGb: number;
+  unifiedAcceleratorGb: number | null;
+  ramOnlyGb: number | null;
   /** Usable VRAM per GPU (reserved taken off), before any claim. */
   gpus: readonly PlacementGpu[];
   liveFreeMemoryGb: number | null;
@@ -307,6 +309,8 @@ export function profilePlan(input: PlanInput): ProfilePlan {
       requiredVersionIds: node.requiredVersionIds,
       frozenFabrics: node.frozenFabrics ?? null,
       memoryGb: node.memoryGb,
+      unifiedAcceleratorGb: node.unifiedAcceleratorGb,
+      ramOnlyGb: node.ramOnlyGb,
       gpus: node.gpus,
       liveFreeMemoryGb: node.liveFreeMemoryGb,
       launch: node.launch,

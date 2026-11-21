@@ -36,14 +36,20 @@ const TOKEN: CallerAuth = {
   kind: "agent_token",
   userId: USER,
   agentTokenId: `${RUN}-tok`,
-  level: "FULL",
+  access: {
+    scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+    nodeIds: null,
+  },
 };
 const OTHER_TOKEN: CallerAuth = { ...TOKEN, agentTokenId: `${RUN}-tok2` };
 const GRANT: CallerAuth = {
   kind: "oauth_access_token",
   userId: USER,
   grantId: `${RUN}-grant`,
-  level: "FULL",
+  access: {
+    scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+    nodeIds: null,
+  },
 };
 const PERSON: CallerAuth = {
   kind: "cookie_session",
@@ -78,6 +84,46 @@ integration("withdrawing a queued command (PostgreSQL)", () => {
         slug: USER,
       },
     });
+    // Live credentials: enqueue re-reads them (commands scope, node allowlist) after its insert.
+    const everyScope = [
+      "READ",
+      "POOLS",
+      "RUNTIMES",
+      "NODES_MANAGE",
+      "COMMANDS",
+      "FILES",
+      "MODELS_TEST",
+    ] as const;
+    await fixtures.mcpGrant.create({
+      data: {
+        id: `${RUN}-grant`,
+        userId: USER,
+        clientId: `${RUN}-client`,
+        referenceId: "ref",
+        scopes: [...everyScope],
+      },
+    });
+    for (const [index, tokenId] of [`${RUN}-tok`, `${RUN}-tok2`].entries()) {
+      const grant = await fixtures.mcpGrant.create({
+        data: {
+          userId: USER,
+          clientId: `pat:${tokenId}`,
+          referenceId: "pat",
+          scopes: [...everyScope],
+        },
+        select: { id: true },
+      });
+      await fixtures.agentToken.create({
+        data: {
+          id: tokenId,
+          userId: USER,
+          name: `token ${index}`,
+          lookupPrefix: `${RUN}-p${index}`.padEnd(8, "x").slice(0, 64),
+          secretDigest: String(index).repeat(64),
+          grantId: grant.id,
+        },
+      });
+    }
     nodeId = (
       await fixtures.node.create({
         data: { userId: USER, slug: `${RUN}-n`, connection: "OFFLINE", trust: "FULL" },
@@ -92,6 +138,8 @@ integration("withdrawing a queued command (PostgreSQL)", () => {
       await fixtures.queuedNodeCommand.deleteMany({ where: { userId: USER } });
       await fixtures.node.deleteMany({ where: { userId: USER } });
       await fixtures.nodeAuditEvent.deleteMany({ where: { userId: USER } });
+      await fixtures.agentToken.deleteMany({ where: { userId: USER } });
+      await fixtures.mcpGrant.deleteMany({ where: { userId: USER } });
       await fixtures.user.deleteMany({ where: { id: USER } });
     } finally {
       await fixtures.$disconnect();

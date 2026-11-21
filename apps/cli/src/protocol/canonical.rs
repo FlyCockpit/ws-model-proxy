@@ -1,7 +1,7 @@
-//! Canonical JSON and the relay 3.0 `launchHash`.
+//! Canonical JSON and the relay 4.0 `launchHash`.
 //!
 //! Mirrors `packages/api/src/lib/canonical-json.ts`; the shared vectors are
-//! `tests/fixtures/relay-3.0/canonical/vectors.json`. Rules: object keys sorted by
+//! `tests/fixtures/relay-4.0/canonical/vectors.json`. Rules: object keys sorted by
 //! Unicode code point (UTF-8 byte order), no whitespace, strings escaped like
 //! `JSON.stringify`, integers within ±(2^53 − 1) as integers (`2.0` → `2`,
 //! `-0` → `0`), other numbers finite with 1e-6 ≤ |x| < 1e15 in their shortest
@@ -130,7 +130,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixtures() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/relay-3.0")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/relay-4.0")
     }
 
     #[test]

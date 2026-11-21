@@ -1,4 +1,4 @@
-//! Node file tools: the CLI-side library (plan `mcp-node-file-tools-plan.md`).
+//! Node file tools: the CLI-side library.
 //!
 //! Pure functions over the local filesystem; there is no wire, admission, or
 //! mode logic here (later phases). Every operation is fd-based and

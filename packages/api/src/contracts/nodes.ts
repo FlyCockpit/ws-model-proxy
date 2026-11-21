@@ -702,14 +702,14 @@ export const nodesContract = {
     z.object({ deleted: z.literal(true), stoppedInstances: z.array(idSchema) }).strict(),
     "Delete a node: its always-on runtimes go, every reservation there is released and instances with a part there stop.",
   ),
-  /** An agent's delete: offline nodes only (owner decision), audited with the slug and id. */
+  /** An agent's delete: nodes that are not live (offline, or a stale heartbeat), audited with the slug and id. */
   deleteOffline: mutation(
     "agent",
     z
       .object({ nodeId: idSchema, confirm: confirmDeleteSchema, note: noteSchema.optional() })
       .strict(),
     z.object({ deleted: z.literal(true), stoppedInstances: z.array(idSchema) }).strict(),
-    "Delete an offline node as nodes.delete does; refused while it is online (node_online), with no override.",
+    "Delete a node that is not live (offline, or ONLINE with a stale heartbeat) as nodes.delete does; refused while it is live (node_online), with no override.",
     ["node_delete"],
   ),
   lowerTrustPreview: query(
@@ -1007,6 +1007,7 @@ export const nodesContract = {
            * (`pwsh` or `powershell`, never `cmd`).
            */
           shell: z.enum(RUNTIME_SHELLS).optional(),
+          /** Absolute path or ~ path to an existing, accessible directory on the node; otherwise bad_cwd. */
           cwd: z.string().min(1).max(4_096).optional(),
           /** Default 1 h; capped by the node's commandMaxMs (at most 24 h). */
           timeoutMs: z

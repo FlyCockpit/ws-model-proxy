@@ -67,7 +67,7 @@ async function buildRealSignedQuery(): Promise<string> {
   const signed = await loadInstalledSignedQueryModule();
   const params = new URLSearchParams();
   params.set("client_id", "mcp-client-1");
-  params.set("scope", "mcp:read mcp:write offline_access");
+  params.set("scope", "mcp:read mcp:pools offline_access");
   params.set("state", "st-8f3a");
   params.set("code_challenge", "cc-S0meL0ngCh4llenge");
   params.set("ba_iat", "1758100000000");
@@ -115,7 +115,7 @@ describe("raw-query MCP page transitions (R83/R84 F1)", () => {
     expect(oauthQuery).toBeDefined();
     const params = new URLSearchParams(oauthQuery ?? "");
     expect(params.get("client_id")).toBe("mcp-client-1");
-    expect(params.get("scope")).toBe("mcp:read mcp:write offline_access");
+    expect(params.get("scope")).toBe("mcp:read mcp:pools offline_access");
     expect(params.get("sig")).toBe("sig-SECRET-value");
     expect(params.getAll("ba_param")).toContain("client_id");
     expect(params.getAll("ba_param")).toContain("scope");

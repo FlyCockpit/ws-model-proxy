@@ -76,7 +76,7 @@ impl Resampler24To16 {
             self.push_sample(i16::from_le_bytes([low, high]), out);
             bytes = rest;
         }
-        // `as_chunks` is stable since 1.88, the crate's MSRV.
+        // `as_chunks` is stable since 1.88, below the crate's MSRV.
         let (pairs, rest) = bytes.as_chunks::<2>();
         for &pair in pairs {
             self.push_sample(i16::from_le_bytes(pair), out);

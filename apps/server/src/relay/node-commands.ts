@@ -1,3 +1,4 @@
+import type { AgentAccess } from "@ws-model-proxy/auth/agent-scopes";
 /**
  * The process's node command tracker and the entry points that end commands from outside the
  * procedures: a ban (`user-ban.ts`), a revoked agent credential (`access-revocation.ts`
@@ -27,6 +28,14 @@ export function cancelNodeCommandsForCredentials(input: {
   credentialIds: readonly string[];
 }): Promise<number> {
   return nodeCommandTracker.cancelForCredentials(input);
+}
+
+export function cancelNodeCommandsForNarrowedCredential(input: {
+  userId: string;
+  credentialIds: readonly string[];
+  access: AgentAccess;
+}): Promise<number> {
+  return nodeCommandTracker.cancelForNarrowedCredential(input);
 }
 
 /**

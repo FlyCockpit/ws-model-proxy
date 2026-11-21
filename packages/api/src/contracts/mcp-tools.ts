@@ -1,7 +1,7 @@
 /**
  * The 0.4.0 MCP tool manifest (spec §6): 28 tools, user nouns, no implementations.
  * `apps/server/src/mcp/tools.ts` registers these; handlers call the procedures named in
- * `procedures`. READ tokens see the read tools; FULL tokens see all. Most writes take an
+ * `procedures`. Credentials see only tools permitted by their scopes. Most writes take an
  * optional `note`. Refusals carry `data.reason` with a message that says what to do next.
  *
  * Token budget (owner guidance): descriptions are 1–3 short sentences (what it does plus the
@@ -14,6 +14,7 @@
 import { z } from "zod";
 import { nodeSecretNameSchema } from "../lib/runtime-spec";
 import { activityContract } from "./activity";
+import { AGENT_SCOPE_OF_TOOL, type AgentScope } from "./agent-scopes";
 import { confirmDeleteSchema, idSchema, MODEL_CAPABILITY, noteSchema, okSchema } from "./common";
 import { modelsContract } from "./models";
 import {
@@ -41,11 +42,11 @@ import {
   runtimeVersionSummarySchema,
   SERVED_MODEL_CAPABILITIES_REQUIRED,
 } from "./runtimes";
-import { MCP_READ_TOOLS, type McpToolName } from "./tool-names";
+import { type McpToolName } from "./tool-names";
 
 export type McpToolContract = {
   name: McpToolName;
-  level: "READ" | "FULL";
+  scope: AgentScope;
   /** Shown to the agent: 1–3 short sentences, the user's nouns. */
   description: string;
   input: z.ZodType;
@@ -72,10 +73,10 @@ export type McpToolContract = {
   };
 };
 
-function tool(contract: Omit<McpToolContract, "level">): McpToolContract {
+function tool(contract: Omit<McpToolContract, "scope">): McpToolContract {
   return {
     ...contract,
-    level: (MCP_READ_TOOLS as readonly string[]).includes(contract.name) ? "READ" : "FULL",
+    scope: AGENT_SCOPE_OF_TOOL[contract.name],
   };
 }
 
@@ -518,7 +519,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "node_delete",
     description:
-      'Delete an offline node (refused while online: node_online): its always-on runtimes go, instances with a part there stop. confirm: "DELETE".',
+      'Delete a node that is offline or whose heartbeat went stale (refused while it is live: node_online): its always-on runtimes go, instances with a part there stop. confirm: "DELETE".',
     input: nodesContract.deleteOffline.input,
     output: nodesContract.deleteOffline.output,
     procedures: ["nodes.deleteOffline"],
@@ -543,7 +544,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "node_command_run",
     description:
-      'Run a one-off command (downloads, builds, diagnostics) on a Full-control node; answers within ~15 s, then poll node_command_get. command: text in shell (default: first of features.launch.shells; on Windows PowerShell 7 or 5.1) or an argv no shell parses. Anything serving traffic must be a runtime: a server started here is invisible to the proxy and dies with the command. confirm: "RUN".',
+      'Run a one-off command (downloads, builds, diagnostics) on a Full-control node; answers within ~15 s, then poll node_command_get. command: text in shell (default: first of features.launch.shells; on Windows PowerShell 7 or 5.1) or an argv no shell parses. Anything serving traffic must be a runtime: a server started here is invisible to the proxy and is stopped with the command. confirm: "RUN".',
     input: nodesContract.commands.run.input,
     output: nodesContract.commands.run.output,
     procedures: ["nodes.commands.run"],
@@ -552,7 +553,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "node_command_get",
     description:
-      "State and output tail of a command from node_command_run (or the state of one from node_command_queue_for_user); waitMs waits for it, cancel stops it and everything it started (a queued one: withdraws it, if you queued it).",
+      "State and output tail of a command from node_command_run (or the state of one from node_command_queue_for_user); waitMs waits for it, cancel stops it and its process group (a queued one: withdraws it, if you queued it).",
     input: nodesContract.commands.get.input,
     output: nodesContract.commands.get.output,
     procedures: ["nodes.commands.get"],

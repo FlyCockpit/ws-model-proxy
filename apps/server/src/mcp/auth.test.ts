@@ -1,3 +1,5 @@
+import { generateKeyPairSync, sign } from "node:crypto";
+import { requireMcpAuth } from "@better-auth/mcp";
 import type { AuthInfo } from "@modelcontextprotocol/server";
 import {
   CLIENT_CAPABILITIES_META_KEY,
@@ -5,6 +7,12 @@ import {
   McpServer,
   PROTOCOL_VERSION_META_KEY,
 } from "@modelcontextprotocol/server";
+import {
+  ALL_AGENT_SCOPES,
+  agentScopeToDb,
+  MCP_FINE_SCOPES,
+} from "@ws-model-proxy/auth/agent-scopes";
+import { betterAuth } from "better-auth";
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -17,13 +25,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * DOWNSTREAM of verification (the application-owned admission sequence) is
  * real code under test.
  *
- * Upstream-owned behaviors (JWKS fetch, signature, DPoP, the upstream
+ * The signed-JWT transition tests below use the REAL upstream verifier
+ * with an in-process JWKS response to pin legacy-scope rejection ordering.
+ * Otherwise, upstream-owned behaviors (JWKS fetch, signature, DPoP, the upstream
  * 401/insufficient-scope challenges) are NOT re-tested here — they are the
  * installed package's own contract, exercised live in the chain tests via
  * the memory-adapter parity instance (no-token 401 challenge).
  */
 
-vi.mock("@ws-model-proxy/env/server", () => ({
+const envState = vi.hoisted(() => ({
   env: {
     WMP_MCP_ENABLED: true,
     BETTER_AUTH_URL: "https://proxy.example.com",
@@ -31,8 +41,10 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     CORS_ORIGIN: "https://app.example.com",
     WMP_RATE_LIMIT_SCALE: 1,
     TRUST_PROXY_HOPS: 0,
+    WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: true as boolean,
   },
 }));
+vi.mock("@ws-model-proxy/env/server", () => envState);
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -135,7 +147,9 @@ type GrantRow = {
   userId: string;
   clientId: string;
   revokedAt: Date | null;
-  level?: "READ" | "FULL";
+  scopes?: ReturnType<typeof agentScopeToDb>[];
+  allNodes?: boolean;
+  Nodes?: { nodeId: string }[];
 };
 
 function buildPrisma({
@@ -146,7 +160,12 @@ function buildPrisma({
   user?: McpSessionUser | null;
 } = {}): McpAuthPrisma {
   return {
-    mcpGrant: { findUnique: vi.fn(async () => grant) },
+    mcpGrant: {
+      findUnique: vi.fn(async () => grant),
+      findFirst: vi.fn(async () =>
+        grant ? { scopes: ["READ"], allNodes: true, Nodes: [], ...grant } : null,
+      ),
+    },
     user: { findUnique: vi.fn(async () => user) },
   } as unknown as McpAuthPrisma;
 }
@@ -246,7 +265,7 @@ afterEach(() => {
 });
 
 describe("createMcpRequestHandler — upstream wrapper wiring", () => {
-  it("passes the canonical issuer, resource, read baseline, and write-satisfies-read matcher upstream", async () => {
+  it("passes the canonical issuer, resource, read baseline, and legacy-rejection handoff upstream", async () => {
     const { handler } = buildHandler();
     // The upstream wrapper is constructed per request (so the request ID
     // threads through); fire one request to capture its options.
@@ -255,27 +274,145 @@ describe("createMcpRequestHandler — upstream wrapper wiring", () => {
       issuer: `${BASE}/api/auth`,
       resource: RESOURCE,
       requiredScopes: ["mcp:read"],
-      // An unauthenticated client learns it may ask for mcp:write (consent can offer Full).
-      challengeScopes: ["mcp:read", "mcp:write"],
+      // An unauthenticated client learns every fine scope it may request.
+      challengeScopes: ["mcp:read", ...MCP_FINE_SCOPES],
     });
+    const matcher = upstreamState.capturedOpts?.isScopeSatisfied;
+    expect(matcher).toBeTypeOf("function");
+    if (typeof matcher !== "function") throw new Error("scope matcher not captured");
+    // Only legacy tokens bypass the upstream baseline check, so the handler
+    // can reject them as invalid_token; other missing-read tokens still fail.
+    expect(matcher("mcp:read", new Set(["mcp:write"]))).toBe(true);
+    expect(matcher("mcp:read", new Set(["mcp:read", "mcp:write"]))).toBe(true);
+    expect(matcher("mcp:read", new Set(MCP_FINE_SCOPES))).toBe(false);
+    expect(matcher("mcp:read", new Set(["mcp:read", ...MCP_FINE_SCOPES]))).toBe(true);
   });
 
-  it("scope predicate: mcp:write satisfies the read baseline; mcp:read alone never satisfies write", () => {
-    const read = new Set(["mcp:read"]);
-    const write = new Set(["mcp:write"]);
-    const both = new Set(["mcp:read", "mcp:write"]);
-    const neither = new Set(["offline_access"]);
-    expect(mcpReadBaselineMatcher("mcp:read", read)).toBe(true);
-    expect(mcpReadBaselineMatcher("mcp:read", write)).toBe(true);
-    expect(mcpReadBaselineMatcher("mcp:read", both)).toBe(true);
-    expect(mcpReadBaselineMatcher("mcp:read", neither)).toBe(false);
-    expect(mcpReadBaselineMatcher("mcp:write", write)).toBe(true);
-    expect(mcpReadBaselineMatcher("mcp:write", read)).toBe(false);
-    expect(mcpReadBaselineMatcher("mcp:write", both)).toBe(true);
+  it("scope predicate: only mcp:read satisfies admission", () => {
+    expect(mcpReadBaselineMatcher("mcp:read", new Set(["mcp:read"]))).toBe(true);
+    expect(mcpReadBaselineMatcher("mcp:read", new Set(["mcp:write"]))).toBe(false);
+    expect(mcpReadBaselineMatcher("mcp:read", new Set(MCP_FINE_SCOPES))).toBe(false);
+    expect(mcpReadBaselineMatcher("mcp:pools", new Set(["mcp:pools"]))).toBe(true);
+    expect(mcpReadBaselineMatcher("mcp:pools", new Set(["mcp:read"]))).toBe(false);
+  });
+});
+
+describe("createMcpRequestHandler — signed JWT scope transition (real verifier)", () => {
+  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const jwk = publicKey.export({ format: "jwk" });
+  const authInstance = betterAuth({
+    baseURL: BASE,
+    secret: "scope-transition-test-secret-at-least-thirty-two-characters",
+    logger: { disabled: true },
+  });
+
+  it.each([
+    { scope: "mcp:read mcp:write", status: 401, legacy: true },
+    { scope: "mcp:write", status: 401, legacy: true },
+    { scope: `mcp:read ${MCP_FINE_SCOPES.join(" ")}`, status: 200, legacy: false },
+    { scope: "mcp:files", status: 403, legacy: false },
+  ])("signed $scope → $status", async ({ scope, status, legacy }) => {
+    const actual = await vi.importActual<typeof import("@better-auth/mcp")>("@better-auth/mcp");
+    vi.mocked(requireMcpAuth).mockImplementationOnce(actual.requireMcpAuth);
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () =>
+        Response.json({ keys: [{ ...jwk, kid: "scope-transition", alg: "ES256", use: "sig" }] }),
+      );
+    try {
+      const message = [
+        { alg: "ES256", kid: "scope-transition" },
+        {
+          ...validClaims(),
+          azp: CLIENT_ID,
+          scope,
+          exp: Math.floor(Date.now() / 1000) + 300,
+        },
+      ]
+        .map((part) => Buffer.from(JSON.stringify(part)).toString("base64url"))
+        .join(".");
+      const signature = sign("sha256", Buffer.from(message), {
+        key: privateKey,
+        dsaEncoding: "ieee-p1363",
+      }).toString("base64url");
+      const { handler, transport } = buildHandler({ authInstance });
+      const res = await callHandler(
+        handler,
+        mcpRequest({ authorization: `Bearer ${message}.${signature}` }),
+      );
+      expect(res.status).toBe(status);
+      expect(transport.calls).toHaveLength(status === 200 ? 1 : 0);
+      if (legacy) {
+        expect(res.headers.get("www-authenticate")).toContain('error="invalid_token"');
+        expect(res.headers.get("www-authenticate")).toContain(
+          'error_description="This token predates wsmp 1.0 scopes; refresh it or sign in again."',
+        );
+      } else if (status === 403) {
+        expect(res.headers.get("www-authenticate")).toContain('error="insufficient_scope"');
+      }
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
 
 describe("createMcpRequestHandler — admission decisions", () => {
+  it.each(
+    [
+      "mcp:read mcp:write",
+      "mcp:write",
+      "mcp:read mcp:write mcp:files",
+      " mcp:write ",
+      ["mcp:read", "mcp:write"],
+      ["mcp:write"],
+    ].map((scope) => ({ scope })),
+  )("legacy JWT scope $scope → 401 invalid_token before grant access", async ({ scope }) => {
+    upstreamState.claims.scope = scope;
+    const prisma = buildPrisma();
+    const { handler, transport, quota, verified } = buildHandler({ prisma });
+    const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${TOKEN}` }));
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toBe(
+      'Bearer error="invalid_token", ' +
+        'resource_metadata="https://proxy.example.com/.well-known/oauth-protected-resource/mcp", ' +
+        'error_description="This token predates wsmp 1.0 scopes; refresh it or sign in again."',
+    );
+    expect(prisma.mcpGrant.findUnique).not.toHaveBeenCalled();
+    expect(prisma.mcpGrant.findFirst).not.toHaveBeenCalled();
+    expect(prisma.user.findUnique).not.toHaveBeenCalled();
+    expect(quota).not.toHaveBeenCalled();
+    expect(verified).toHaveLength(0);
+    expect(transport.calls).toHaveLength(0);
+  });
+
+  it("read plus all fine scopes JWT → admitted with the full grant", async () => {
+    upstreamState.claims.scope = ["mcp:read", ...MCP_FINE_SCOPES].join(" ");
+    const { handler, verified } = buildHandler({
+      prisma: buildPrisma({
+        grant: {
+          id: GRANT_ID,
+          userId: SUB,
+          clientId: CLIENT_ID,
+          revokedAt: null,
+          scopes: ALL_AGENT_SCOPES.map(agentScopeToDb),
+        },
+      }),
+    });
+    const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${TOKEN}` }));
+    expect(res.status).toBe(200);
+    expect(verified[0]?.credential.access.scopes).toEqual(ALL_AGENT_SCOPES);
+  });
+
+  it.each(["MCP:WRITE", "mcp:write:extra", "mcp:write\t", "prefix:mcp:write"])(
+    "scope token %j is not the exact legacy scope",
+    async (otherScope) => {
+      upstreamState.claims.scope = `mcp:read ${otherScope} offline_access`;
+      const { handler } = buildHandler();
+      const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${TOKEN}` }));
+      expect(res.status).toBe(200);
+    },
+  );
+
   it("valid token + active grant + healthy user → transport reached with the pinned AuthInfo shape", async () => {
     const { handler, transport, quota, verified } = buildHandler();
     const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${TOKEN}` }));
@@ -298,18 +435,46 @@ describe("createMcpRequestHandler — admission decisions", () => {
     expect(verified[0]?.orpcContext.session.user.id).toBe(SUB);
     expect(verified[0]?.orpcContext.session.session.token).toBe(MCP_SYNTHETIC_SESSION_TOKEN);
     expect(JSON.stringify(verified[0]?.orpcContext)).not.toContain(TOKEN);
-    // The grant fixture has no FULL level, so the request is READ.
+    // The grant fixture has only the baseline read scope.
     expect(verified[0]?.credential).toEqual({
       kind: "oauth",
       grantId: GRANT_ID,
-      level: "READ",
-      levelReadAt: expect.any(Number),
+      access: { scopes: ["read"], nodeIds: null },
+      accessReadAt: expect.any(Number),
     });
     expect(verified[0]?.orpcContext.auth).toEqual({
       kind: "oauth_access_token",
       userId: SUB,
       grantId: GRANT_ID,
-      level: "READ",
+      access: { scopes: ["read"], nodeIds: null },
+    });
+  });
+
+  it.each([
+    ["mcp:read", ["read"]],
+    ["mcp:read mcp:pools", ["read", "pools"]],
+    [`mcp:read ${MCP_FINE_SCOPES.join(" ")}`, ["read", "pools", "files"]],
+    ["mcp:read mcp:commands", ["read"]],
+  ])("intersects grant access with the OAuth ceiling %s", async (scope, effective) => {
+    upstreamState.claims.scope = scope;
+    const { handler, verified } = buildHandler({
+      prisma: buildPrisma({
+        grant: {
+          id: GRANT_ID,
+          userId: SUB,
+          clientId: CLIENT_ID,
+          revokedAt: null,
+          scopes: ["READ", "POOLS", "FILES"],
+          allNodes: false,
+          Nodes: [{ nodeId: "allowed-node" }],
+        },
+      }),
+    });
+    const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${TOKEN}` }));
+    expect(res.status).toBe(200);
+    expect(verified[0]?.credential.access).toEqual({
+      scopes: effective,
+      nodeIds: ["allowed-node"],
     });
   });
 
@@ -1637,7 +1802,8 @@ describe("createMcpRequestHandler — agent token admission", () => {
       id: PAT_ID,
       userId: SUB,
       grantId: GRANT_ID,
-      level: "READ",
+      access: { scopes: ["read"], nodeIds: null },
+      accessReadAt: performance.now(),
       expiresAt: null,
       ...overrides,
     };
@@ -1665,27 +1831,104 @@ describe("createMcpRequestHandler — agent token admission", () => {
     expect(verified[0]?.credential).toEqual({
       kind: "agent_token",
       tokenId: PAT_ID,
-      level: "READ",
+      grantId: GRANT_ID,
+      accessReadAt: expect.any(Number),
+      access: { scopes: ["read"], nodeIds: null },
       expiresAt: null,
     });
     expect(verified[0]?.orpcContext.auth).toEqual({
       kind: "agent_token",
       userId: SUB,
       agentTokenId: PAT_ID,
-      level: "READ",
+      access: { scopes: ["read"], nodeIds: null },
     });
     expect(JSON.stringify(verified[0]?.orpcContext)).not.toContain(PAT);
   });
 
-  it("a FULL agent token carries its level and the write scope", async () => {
+  it("an agent token carries its grant scopes as fine OAuth scopes", async () => {
     const { handler, transport, verified } = buildHandler({
-      authenticateAgentToken: async () => patIdentity({ level: "FULL" }),
-      prisma: buildPrisma({ grant: patGrant() }),
+      authenticateAgentToken: async () =>
+        patIdentity({ access: { scopes: ALL_AGENT_SCOPES, nodeIds: null } }),
+      prisma: buildPrisma({ grant: patGrant({ scopes: ALL_AGENT_SCOPES.map(agentScopeToDb) }) }),
     });
     const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
     expect(res.status).toBe(200);
-    expect(transport.calls[0]?.authInfo?.scopes).toEqual(["mcp:read", "mcp:write"]);
-    expect(verified[0]?.credential).toMatchObject({ kind: "agent_token", level: "FULL" });
+    expect(transport.calls[0]?.authInfo?.scopes).toEqual(
+      ALL_AGENT_SCOPES.map((scope) => `mcp:${scope}`),
+    );
+    expect(verified[0]?.credential).toMatchObject({
+      kind: "agent_token",
+      access: { scopes: ALL_AGENT_SCOPES, nodeIds: null },
+    });
+  });
+
+  it("a no-expiry agent token blocked by policy is a typed 401 and never reaches the transport", async () => {
+    try {
+      envState.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = false;
+      const { handler, transport } = buildHandler({
+        authenticateAgentToken: async () => patIdentity(),
+        prisma: buildPrisma({ grant: patGrant() }),
+      });
+      const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
+      expect(res.status).toBe(401);
+      const challenge = res.headers.get("www-authenticate") ?? "";
+      expect(challenge).toContain('error="invalid_token"');
+      expect(challenge).toContain('error_description="mcp_pat_no_expiry_blocked"');
+      const body = (await res.json()) as { error: { data?: { reason?: string } } };
+      expect(body.error.data?.reason).toBe("mcp_pat_no_expiry_blocked");
+      expect(transport.calls).toHaveLength(0);
+      expect(upstreamState.receivedRequest).toBeNull();
+
+      // A dated token is admitted with the flag off.
+      const dated = buildHandler({
+        authenticateAgentToken: async () =>
+          patIdentity({ expiresAt: new Date("2026-06-30T00:00:00Z") }),
+        prisma: buildPrisma({ grant: patGrant() }),
+      });
+      expect(
+        (await callHandler(dated.handler, mcpRequest({ authorization: `Bearer ${PAT}` }))).status,
+      ).toBe(200);
+
+      // Back on: the same no-expiry token is admitted again.
+      envState.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = true;
+      const again = buildHandler({
+        authenticateAgentToken: async () => patIdentity(),
+        prisma: buildPrisma({ grant: patGrant() }),
+      });
+      expect(
+        (await callHandler(again.handler, mcpRequest({ authorization: `Bearer ${PAT}` }))).status,
+      ).toBe(200);
+    } finally {
+      envState.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = true;
+    }
+  });
+
+  it("a blocked no-expiry token whose grant was revoked or whose owner is banned gets the ordinary refusal", async () => {
+    try {
+      envState.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = false;
+      const revoked = buildHandler({
+        authenticateAgentToken: async () => patIdentity(),
+        prisma: buildPrisma({ grant: patGrant({ revokedAt: new Date("2026-05-01T00:00:00Z") }) }),
+      });
+      const revokedRes = await callHandler(
+        revoked.handler,
+        mcpRequest({ authorization: `Bearer ${PAT}` }),
+      );
+      expect(revokedRes.status).toBe(403);
+      expect(revokedRes.headers.get("www-authenticate")).toBeNull();
+      const banned = buildHandler({
+        authenticateAgentToken: async () => patIdentity(),
+        prisma: buildPrisma({
+          grant: patGrant(),
+          user: { ...healthyUser, banned: true, banExpires: null },
+        }),
+      });
+      expect(
+        (await callHandler(banned.handler, mcpRequest({ authorization: `Bearer ${PAT}` }))).status,
+      ).toBe(403);
+    } finally {
+      envState.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = true;
+    }
   });
 
   it("an invalid agent token is 401 and never reaches the transport", async () => {
@@ -1814,8 +2057,9 @@ describe("createMcpRequestHandler — agent token admission", () => {
     const expiresAt = new Date("2026-12-01T00:00:00Z");
     const exp = Math.floor(expiresAt.getTime() / 1000);
     const { handler, transport, verified } = buildHandler({
-      authenticateAgentToken: async () => patIdentity({ expiresAt, level: "FULL" }),
-      prisma: buildPrisma({ grant: patGrant() }),
+      authenticateAgentToken: async () =>
+        patIdentity({ expiresAt, access: { scopes: ALL_AGENT_SCOPES, nodeIds: null } }),
+      prisma: buildPrisma({ grant: patGrant({ scopes: ALL_AGENT_SCOPES.map(agentScopeToDb) }) }),
     });
     const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
     expect(res.status).toBe(200);
@@ -1825,7 +2069,9 @@ describe("createMcpRequestHandler — agent token admission", () => {
     expect(verified[0]?.credential).toEqual({
       kind: "agent_token",
       tokenId: PAT_ID,
-      level: "FULL",
+      grantId: GRANT_ID,
+      accessReadAt: expect.any(Number),
+      access: { scopes: ALL_AGENT_SCOPES, nodeIds: null },
       expiresAt,
     });
   });

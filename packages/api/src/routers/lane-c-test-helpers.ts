@@ -36,13 +36,19 @@ export const CALLERS = {
     kind: "agent_token",
     userId,
     agentTokenId: "tok-1",
-    level: "FULL",
+    access: {
+      scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+      nodeIds: null,
+    },
   }),
   oauthAgent: (userId = OWNER): CallerAuth => ({
     kind: "oauth_access_token",
     userId,
     grantId: "grant-1",
-    level: "FULL",
+    access: {
+      scopes: ["read", "pools", "runtimes", "nodes:manage", "commands", "files", "models:test"],
+      nodeIds: null,
+    },
   }),
 };
 

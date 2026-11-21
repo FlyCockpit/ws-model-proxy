@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { nodesContract } from "../contracts/nodes";
 import { declaredHardwareSchema } from "../lib/runtime-spec";
-import { effectiveHardware, fabricSuggestions } from "./hardware";
+import { effectiveHardware, fabricSuggestions, ramOnlyMemoryBudgetGb } from "./hardware";
 
 const NOW = new Date("2026-10-08T00:00:00Z");
 
@@ -324,5 +324,107 @@ describe("fabricSuggestions", () => {
     const result = fabricSuggestions(local, [tcp, rdma]);
     expect(result.map((suggestion) => suggestion.ip)).toEqual(["10.2.0.1", "10.1.0.1", "10.3.0.1"]);
     expect(result[0]?.peerNodeIds).toEqual(["rdma", "tcp"]);
+  });
+});
+
+describe("physical RAM versus accelerator-addressable memory", () => {
+  it.each([
+    // Default 128 GB Strix Halo: 512 MiB carve-out plus 62812 MiB GTT/TTM.
+    ["Strix Halo", 126136, 63324, 123.18, 61.84, 121.18],
+    // Default 16 GB Phoenix: 2 GiB carve-out plus 6963 MiB GTT/TTM.
+    ["Phoenix", 15974, 9011, 15.6, 8.8, 13.6],
+    // Apple keeps its wired GPU limit separate from hw.memsize.
+    ["Apple", 131072, 98304, 128, 96, 126],
+    ["GB10", 122357, 122357, 119.49, 119.49, 117.49],
+  ])(
+    "uses OS total for %s, keeping its GPU pool separate",
+    (_name, total, pool, memory, accelerator, usable) => {
+      const hardware = hardwareOf({
+        nodeKind: "unified",
+        memoryTotalMiB: total,
+        unifiedMemoryMiB: pool,
+        acceleratorMemoryMiB: pool,
+      });
+      expect(hardware.memoryGb).toEqual({ value: memory, source: "detected" });
+      expect(hardware.acceleratorMemoryGb.value).toBe(accelerator);
+      expect(hardware.usableMemoryGb).toBe(usable);
+    },
+  );
+
+  it("uses the legacy pool only without an OS total and preserves a reported zero total", () => {
+    expect(hardwareOf({ nodeKind: "unified", unifiedMemoryMiB: 63324 }).memoryGb.value).toBe(61.84);
+    expect(hardwareOf({ memoryTotalMiB: 0, unifiedMemoryMiB: 63324 }).memoryGb.value).toBe(0);
+  });
+
+  it("keeps browser/agent declarations above node config and both above detection", () => {
+    const info = {
+      nodeKind: "unified",
+      memoryTotalMiB: 126136,
+      unifiedMemoryMiB: 63324,
+      acceleratorMemoryMiB: 63324,
+      declared: { memoryGb: 110, acceleratorMemoryGb: 55 },
+    };
+    expect(hardwareOf(info).memoryGb).toEqual({ value: 110, source: "node" });
+    expect(hardwareOf(info).acceleratorMemoryGb).toEqual({ value: 55, source: "node" });
+    const hardware = hardwareOf(info, { memoryGb: 120, acceleratorMemoryGb: 60 });
+    expect(hardware.memoryGb).toEqual({ value: 120, source: "browser" });
+    expect(hardware.acceleratorMemoryGb).toEqual({ value: 60, source: "browser" });
+  });
+
+  it("shows the real Strix Halo live free memory independently of its accelerator cap", () => {
+    const hardware = effectiveHardware({
+      declaredResources: null,
+      nodeInfo: {
+        nodeKind: "unified",
+        memoryTotalMiB: 126136,
+        unifiedMemoryMiB: 63324,
+        acceleratorMemoryMiB: 63324,
+      },
+      nodeMetrics: { memory: { availableMiB: 123392 } },
+      nodeMetricsAt: NOW,
+      heldClaims: [],
+      now: NOW,
+    });
+    expect(hardware.memoryGb.value).toBe(123.18);
+    expect(hardware.acceleratorMemoryGb.value).toBe(61.84);
+    expect(hardware.usableMemoryGb).toBe(121.18);
+    expect(hardware.liveFreeMemoryGb).toBe(120.5);
+  });
+});
+
+describe("detected APU host RAM budget", () => {
+  const info = {
+    nodeKind: "unified",
+    memoryTotalMiB: 129922,
+    acceleratorMemoryMiB: 114113,
+    gpus: [{ vendor: "amd", index: 0, apu: true, vramTotalMiB: 98304 }],
+  };
+  it("subtracts AMD carve-outs and RAM reserves, but not shared GPU reserves", () => {
+    expect(ramOnlyMemoryBudgetGb(hardwareOf(info), info)).toBe(28.88);
+    expect(
+      ramOnlyMemoryBudgetGb(
+        hardwareOf(info, { reservedMemoryGb: 3, reservedVramGb: { "amd:0": 8 } }),
+        info,
+      ),
+    ).toBe(25.88);
+    const two = {
+      ...info,
+      gpus: [...info.gpus, { vendor: "amd", index: 1, apu: true, vramTotalMiB: 1024 }],
+    };
+    // The CLI adds only the first APU's carve-out to the total, so only that one comes off.
+    expect(ramOnlyMemoryBudgetGb(hardwareOf(two), two)).toBe(28.88);
+  });
+  it("does not infer carve-outs for declared totals, legacy totals or other GPU vendors", () => {
+    expect(ramOnlyMemoryBudgetGb(hardwareOf(info, { memoryGb: 120 }), info)).toBeNull();
+    const declared = { ...info, declared: { memoryGb: 120 } };
+    expect(ramOnlyMemoryBudgetGb(hardwareOf(declared), declared)).toBeNull();
+    const legacy = { nodeKind: "unified", unifiedMemoryMiB: 114113, gpus: info.gpus };
+    expect(ramOnlyMemoryBudgetGb(hardwareOf(legacy), legacy)).toBeNull();
+    for (const vendor of ["apple", "nvidia"]) {
+      const other = { ...info, gpus: [{ ...info.gpus[0], vendor }] };
+      expect(ramOnlyMemoryBudgetGb(hardwareOf(other), other)).toBeNull();
+    }
+    const zero = { ...info, memoryTotalMiB: 0 };
+    expect(ramOnlyMemoryBudgetGb(hardwareOf(zero), zero)).toBe(0);
   });
 });

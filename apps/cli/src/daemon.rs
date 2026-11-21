@@ -1,4 +1,4 @@
-//! Foreground websocket relay daemon (relay protocol 3.0).
+//! Foreground websocket relay daemon (relay protocol 4.0).
 //!
 //! Request bodies are streamed to the upstream endpoint as they arrive over the
 //! websocket instead of being fully buffered first. Each relayed request runs on
@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::{self};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
@@ -28,12 +29,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use futures_core::Stream;
 use tokio::sync::{mpsc as tokio_mpsc, watch};
+use tungstenite::Message;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::HeaderValue;
-use tungstenite::{Message, connect};
 use url::Url;
 
-use crate::auth::{join, resolve_credential};
+use crate::auth::{CredentialPairing, join};
 use crate::config::{Config, ConfigLock, EndpointAuthMode};
 use crate::control::ControlServer;
 use crate::control::{self, ControlCommand, ControlResponse};
@@ -74,8 +75,13 @@ const RELAY_FATAL_INITIAL_DELAY: Duration = Duration::from_secs(5);
 /// output and send heartbeats. Bounds worker-frame latency (response streaming)
 /// without busy-spinning.
 const RELAY_SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
-/// Bound on waiting for `hello.challenge`. An old server never sends it.
+const RELAY_SOCKET_BUSY_POLL: Duration = Duration::from_millis(1);
+const DRAIN_MAX_MESSAGES: usize = 256;
+const DRAIN_MAX_TIME: Duration = Duration::from_millis(20);
+/// Bound on waiting for `hello.challenge`.
 const HELLO_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound on registration after this node sends `hello`.
+const HELLO_OK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bounded capacity for the worker -> main-loop outbound frame channel. Provides
 /// backpressure toward workers (and therefore upstream response reads) so a fast
 /// upstream cannot grow unbounded memory ahead of the websocket writer.
@@ -589,6 +595,40 @@ enum AttemptEnd {
     Fatal,
 }
 
+/// Dead-peer detection starts at the first heartbeat sent after the last inbound
+/// frame, so a stall of this loop without a sent heartbeat never reads as silence.
+const RELAY_HEARTBEAT_ANSWER_TIMEOUT: Duration =
+    Duration::from_secs(2 * RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS);
+
+#[derive(Default)]
+struct PeerWatch {
+    unanswered_since: Option<Instant>,
+}
+
+impl PeerWatch {
+    fn on_inbound(&mut self) {
+        self.unanswered_since = None;
+    }
+
+    fn on_heartbeat_sent(&mut self, now: Instant) {
+        self.unanswered_since.get_or_insert(now);
+    }
+
+    fn is_dead(&self, now: Instant) -> bool {
+        self.unanswered_since.is_some_and(|since| {
+            now.saturating_duration_since(since) >= RELAY_HEARTBEAT_ANSWER_TIMEOUT
+        })
+    }
+}
+
+struct HelloOkDeadline(Instant);
+
+impl HelloOkDeadline {
+    fn expired(&self, registered: bool, now: Instant) -> bool {
+        !registered && now.saturating_duration_since(self.0) >= HELLO_OK_TIMEOUT
+    }
+}
+
 /// The relay's reconnect backoff: one place decides every wait.
 ///
 /// Reconnects wait 1 s, then twice as long each time, up to 5 minutes; a
@@ -693,11 +733,15 @@ pub fn connect_foreground() -> Result<()> {
         startup.trust_snapshot().lowerings,
     )?;
     let mut backoff = ReconnectBackoff::new();
+    let mut credential_pairing = CredentialPairing::default();
     loop {
         check_shutdown()?;
         let node_slug = ensure_cli_slug(&mut config)?;
         let mut progress = ConnectProgress::Connecting;
-        let wait = match resolve_credential() {
+        let wait = match credential_pairing.resolve_credential(
+            config.server_url.as_deref(),
+            config.public_origin.as_deref(),
+        ) {
             // Definitely no credential: stop only where nothing restarts us in
             // a loop (see `stop_on_unusable_credential`).
             Err(error)
@@ -1483,6 +1527,155 @@ fn node_features(startup: &TerminalStartup) -> crate::protocol::runtime_spec::No
     features
 }
 
+const RELAY_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
+const RELAY_MAX_REDIRECTS: usize = 3;
+
+type RelaySocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
+
+/// Default ports remain equivalent across a TLS upgrade; custom ports must match.
+fn relay_redirect_allowed(from: &Url, to: &Url, followed: usize) -> bool {
+    let scheme = |url: &Url| match url.scheme() {
+        "http" | "ws" => Some(false),
+        "https" | "wss" => Some(true),
+        _ => None,
+    };
+    let schemes_allowed = match (scheme(from), scheme(to)) {
+        (Some(secure), Some(next_secure)) => !secure || next_secure,
+        _ => false,
+    };
+    followed < RELAY_MAX_REDIRECTS
+        && schemes_allowed
+        && from.host_str().is_some()
+        && from.host_str() == to.host_str()
+        && to.username().is_empty()
+        && to.password().is_none()
+        && (from.port_or_known_default() == to.port_or_known_default()
+            || (from.port().is_none() && to.port().is_none()))
+}
+
+fn relay_connect_timeout() -> tungstenite::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "relay connection deadline elapsed").into()
+}
+
+fn connect_relay(
+    request: tungstenite::handshake::client::Request,
+) -> tungstenite::Result<(RelaySocket, tungstenite::handshake::client::Response)> {
+    connect_relay_with_deadline(request, RELAY_CONNECT_DEADLINE)
+}
+
+fn connect_relay_with_deadline(
+    mut request: tungstenite::handshake::client::Request,
+    timeout: Duration,
+) -> tungstenite::Result<(RelaySocket, tungstenite::handshake::client::Response)> {
+    let deadline = Instant::now() + timeout;
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(relay_connect_timeout)
+    };
+    for followed in 0..=RELAY_MAX_REDIRECTS {
+        let url = Url::parse(&request.uri().to_string())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let host = match url.host() {
+            Some(url::Host::Domain(host)) => host.to_string(),
+            Some(url::Host::Ipv4(host)) => host.to_string(),
+            Some(url::Host::Ipv6(host)) => host.to_string(),
+            None => {
+                return Err(tungstenite::Error::Url(
+                    tungstenite::error::UrlError::NoHostName,
+                ));
+            }
+        };
+        let port = url.port_or_known_default().ok_or(tungstenite::Error::Url(
+            tungstenite::error::UrlError::UnsupportedUrlScheme,
+        ))?;
+        // The system resolver has no timeout API. Keep its wait within the same
+        // deadline as dialing and redirects, without blocking the relay forever.
+        let (tx, rx) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("wsmp-relay-dns".into())
+            .spawn(move || {
+                let _ = tx.send(
+                    (host.as_str(), port)
+                        .to_socket_addrs()
+                        .map(|addrs| addrs.collect::<Vec<_>>()),
+                );
+            })?;
+        let addrs = rx
+            .recv_timeout(remaining()?)
+            .map_err(|_| relay_connect_timeout())??;
+        let mut last_error = io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no relay addresses resolved",
+        );
+        let mut connected = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, remaining()?.min(Duration::from_secs(10))) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(error) => last_error = error,
+            }
+        }
+        let stream = connected.ok_or(tungstenite::Error::Io(last_error))?;
+        stream.set_nodelay(true)?;
+        let handshake_timeout = remaining()?.min(Duration::from_secs(15));
+        stream.set_read_timeout(Some(handshake_timeout))?;
+        stream.set_write_timeout(Some(handshake_timeout))?;
+        // Exactly connect()'s TLS defaults: rustls, the installed ring provider,
+        // native root certificates, and no custom WebSocket config or connector.
+        let result = tungstenite::client_tls_with_config(request.clone(), stream, None, None)
+            .map_err(|error| match error {
+                tungstenite::HandshakeError::Failure(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    relay_connect_timeout()
+                }
+                tungstenite::HandshakeError::Failure(error) => error,
+                tungstenite::HandshakeError::Interrupted(_) => relay_connect_timeout(),
+            });
+        match result {
+            Err(tungstenite::Error::Http(response)) if response.status().is_redirection() => {
+                let target = response
+                    .headers()
+                    .get("Location")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|location| url.join(location).ok());
+                let Some(mut target) =
+                    target.filter(|to| relay_redirect_allowed(&url, to, followed))
+                else {
+                    return Err(tungstenite::Error::Http(response));
+                };
+                let scheme = match target.scheme() {
+                    "http" => "ws",
+                    "https" => "wss",
+                    other => other,
+                }
+                .to_string();
+                target.set_scheme(&scheme).map_err(|()| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid relay redirect scheme")
+                })?;
+                let mut next = target.as_str().into_client_request()?;
+                // Preserve the bearer only after the destination passed policy.
+                // Host and the handshake key come from the new destination.
+                for name in ["Authorization", "Sec-WebSocket-Protocol"] {
+                    if let Some(value) = request.headers().get(name) {
+                        next.headers_mut().insert(name, value.clone());
+                    }
+                }
+                request = next;
+            }
+            other => return other,
+        }
+    }
+    Err(relay_connect_timeout())
+}
+
 /// One relay connection. `progress` says how far it got (the reconnect
 /// backoff reads it), whatever it returns.
 #[allow(clippy::too_many_arguments)]
@@ -1505,8 +1698,13 @@ fn run_relay_session(
         HeaderValue::from_static(RELAY_SUBPROTOCOL),
     );
     request.headers_mut().insert("Authorization", auth_value);
-    let (mut socket, response) =
-        connect(request).map_err(|error| relay_connect_error(error, StopOn::here()))?;
+    let (mut socket, response) = connect_relay(request).map_err(|error| {
+        relay_connect_error_with_discovery(error, StopOn::here(), || {
+            crate::auth::fetch_well_known_document(config.server_url.as_deref().unwrap_or_default())
+                .ok()
+                .map(|known| known.protocol_version)
+        })
+    })?;
     if response
         .headers()
         .get("Sec-WebSocket-Protocol")
@@ -1533,8 +1731,6 @@ fn run_relay_session(
     let worker_rx = &link.worker_rx;
     // The watch starts before the pre-hello reload: no edit falls between.
     let mut config_watch = ConfigWatch::new();
-    // This connection's server says at `hello.ok` what it accepts; until then, nothing new.
-    link.execs.set_report_ran_with(false);
     let mut session = Session {
         worker_tx: worker_tx.clone(),
         requests: RelayRequests::new(),
@@ -1604,15 +1800,26 @@ fn run_relay_session(
         held_fabrics_hash: session.runtimes.store.fabrics_hash(),
     };
     send_control(&mut socket, &hello, "sending relay hello")?;
+    let hello_ok_deadline = HelloOkDeadline(Instant::now());
     session.phase = SessionPhase::AwaitingHelloOk;
     *progress = ConnectProgress::HelloSent;
 
     let mut next_telemetry_sync = Instant::now();
     let mut next_heartbeat =
         Instant::now() + Duration::from_secs(RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS);
+    let mut peer = PeerWatch::default();
+    let mut busy_poll = false;
     let result = 'session: loop {
         if let Some(signal) = crate::shutdown::requested() {
             break 'session Err(RelaySessionError::Shutdown(signal));
+        }
+        if hello_ok_deadline.expired(session.phase.is_registered(), Instant::now()) {
+            break Err(RelaySessionError::Reconnectable {
+                error: anyhow::anyhow!(
+                    "the server sent no hello.ok within {} s after hello; reconnecting",
+                    HELLO_OK_TIMEOUT.as_secs()
+                ),
+            });
         }
         if session.phase.is_registered() {
             // Commands that ended (or were interrupted) while disconnected,
@@ -1625,8 +1832,21 @@ fn run_relay_session(
                 break Err(error);
             }
         }
-        if let Err(error) = drain_worker_output(&mut socket, worker_rx, &mut session) {
-            break Err(error);
+        let drain = match drain_worker_output(&mut socket, worker_rx, &mut session) {
+            Ok(drain) => drain,
+            Err(error) => break Err(error),
+        };
+        let more_output = drain == Drain::More;
+        if more_output != busy_poll {
+            let interval = if more_output {
+                RELAY_SOCKET_BUSY_POLL
+            } else {
+                RELAY_SOCKET_POLL_INTERVAL
+            };
+            if let Err(error) = set_read_poll(socket.get_mut(), interval) {
+                break Err(RelaySessionError::Reconnectable { error });
+            }
+            busy_poll = more_output;
         }
         if let Err(error) = drain_runner(&mut socket, &mut session) {
             break Err(error);
@@ -1693,11 +1913,16 @@ fn run_relay_session(
             if let Err(error) = send_control(&mut socket, &heartbeat, "sending relay heartbeat") {
                 break Err(error);
             }
+            peer.on_heartbeat_sent(Instant::now());
             next_heartbeat =
                 Instant::now() + Duration::from_secs(RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS);
         }
 
-        let outcome = match socket.read() {
+        let incoming = socket.read();
+        if incoming.is_ok() {
+            peer.on_inbound();
+        }
+        let outcome = match incoming {
             Ok(Message::Text(text)) => {
                 handle_text(&mut socket, config, startup, &mut session, &text)
             }
@@ -1713,7 +1938,18 @@ fn run_relay_session(
                 .map_err(|error| websocket_session_error(error, "sending relay pong")),
             Ok(Message::Pong(_)) => Ok(()),
             Ok(Message::Frame(_)) => Ok(()),
-            Err(tungstenite::Error::Io(err)) if read_poll_woke(&err) => Ok(()),
+            Err(tungstenite::Error::Io(err)) if read_poll_woke(&err) => {
+                if peer.is_dead(Instant::now()) {
+                    Err(RelaySessionError::Reconnectable {
+                        error: anyhow::anyhow!(
+                            "no answer from the server for {} s after a heartbeat; reconnecting",
+                            RELAY_HEARTBEAT_ANSWER_TIMEOUT.as_secs()
+                        ),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
             Err(err) => Err(websocket_session_error(err, "reading relay websocket")),
         };
         if let Err(error) = outcome {
@@ -1806,22 +2042,53 @@ fn abort_all_workers(workers: BTreeMap<String, WorkerHandle>) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    Empty,
+    More,
+}
+
+/// Bound each drain so socket reads and control work run even under output floods.
+fn drain_bounded<T>(
+    rx: &Receiver<T>,
+    max: usize,
+    budget: Duration,
+    mut send: impl FnMut(T) -> RelaySessionResult<()>,
+) -> RelaySessionResult<Drain> {
+    let started = Instant::now();
+    let mut count = 0;
+    loop {
+        if count >= max || started.elapsed() >= budget {
+            return Ok(Drain::More);
+        }
+        match rx.try_recv() {
+            Ok(message) => {
+                send(message)?;
+                count += 1;
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                return Ok(Drain::Empty);
+            }
+        }
+    }
+}
+
 fn drain_worker_output<S>(
     socket: &mut tungstenite::WebSocket<S>,
     worker_rx: &Receiver<FromWorker>,
     session: &mut Session,
-) -> RelaySessionResult<()>
+) -> RelaySessionResult<Drain>
 where
     S: std::io::Read + std::io::Write,
 {
-    loop {
-        match worker_rx.try_recv() {
-            Ok(FromWorker::Send { request_id, frame }) => {
+    drain_bounded(worker_rx, DRAIN_MAX_MESSAGES, DRAIN_MAX_TIME, |message| {
+        match message {
+            FromWorker::Send { request_id, frame } => {
                 // A cancellation removes the live handle before acknowledging
                 // it. Suppress any racing worker frame already queued behind
                 // that cancellation so cancelled requests never complete late.
                 if !session.requests.is_live(&request_id) {
-                    continue;
+                    return Ok(());
                 }
                 match frame {
                     WsFrame::Text(text) => socket.send(Message::Text(text.into())),
@@ -1829,57 +2096,56 @@ where
                 }
                 .map_err(|error| websocket_session_error(error, "sending relay frame"))?;
             }
-            Ok(FromWorker::Finished(request_id)) => {
+            FromWorker::Finished(request_id) => {
                 session.requests.retire(&request_id, Retire::Finished);
             }
-            Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
+            FromWorker::TerminalBytes { terminal_id, bytes } => {
                 send_outbound_frames(socket, session.terminals.on_bytes(&terminal_id, &bytes))?;
             }
-            Ok(FromWorker::TerminalEof { terminal_id }) => {
+            FromWorker::TerminalEof { terminal_id } => {
                 send_outbound_frames(socket, session.terminals.on_eof(&terminal_id))?;
             }
-            Ok(FromWorker::TerminalWriteFailed { terminal_id }) => {
+            FromWorker::TerminalWriteFailed { terminal_id } => {
                 tracing::warn!(
                     terminal_id,
                     "writing terminal input failed; closing the terminal"
                 );
                 send_outbound_frames(socket, session.terminals.close(&terminal_id))?;
             }
-            Ok(FromWorker::ExecBytes {
+            FromWorker::ExecBytes {
                 command_id,
                 stderr,
                 bytes,
-            }) => session.execs.on_bytes(&command_id, stderr, &bytes),
-            Ok(FromWorker::ExecEof { command_id, stderr }) => {
+            } => session.execs.on_bytes(&command_id, stderr, &bytes),
+            FromWorker::ExecEof { command_id, stderr } => {
                 session.execs.on_eof(&command_id, stderr);
             }
-            Ok(FromWorker::Stt {
+            FromWorker::Stt {
                 session_id,
                 message,
-            }) => {
+            } => {
                 if let Some(message) = session.stt.outbound(&session_id, *message) {
                     send_stt(socket, &mut session.stt, message)?;
                 }
             }
             // A frame queued by a closed session's worker never precedes
             // this session's hello.
-            Ok(FromWorker::Telemetry(text)) => {
+            FromWorker::Telemetry(text) => {
                 if gate(session.phase, FrameClass::Periodic) == Gate::Send {
                     socket
                         .send(Message::Text(text.into()))
                         .map_err(|error| websocket_session_error(error, "sending telemetry"))?;
                 }
             }
-            Ok(FromWorker::FileFrames { op_id, frames }) => {
+            FromWorker::FileFrames { op_id, frames } => {
                 // Cancelled or torn-down ops are no longer pending: drop them.
                 if session.files.complete(&op_id) {
                     send_file_frames(socket, frames)?;
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
         }
-    }
+        Ok(())
+    })
 }
 
 /// A control frame that does not parse: what it concerns (one request, one
@@ -1971,7 +2237,6 @@ where
             id,
             node_id,
             definition_sync,
-            features,
             ..
         } => {
             if session.phase.is_registered() {
@@ -1982,15 +2247,8 @@ where
             session.phase = SessionPhase::Registered {
                 since: Instant::now(),
             };
-            // Optional node frame fields go only to a server that said it accepts them.
-            session
-                .execs
-                .set_report_ran_with(features.unwrap_or_default().exec_ran_with);
             tracing::info!(id, node_id, ?definition_sync, "relay registration accepted");
-            session.update.on_hello_ok(
-                definition_sync,
-                features.unwrap_or_default().agent_update_available_version,
-            );
+            session.update.on_hello_ok(definition_sync);
             send_inventory(session);
         }
         ServerFrame::HelloChallenge { .. } => {
@@ -2009,7 +2267,7 @@ where
                     "relay protocol error: {message}"
                 )));
             }
-            return Err(hello_rejection(&message, Some(&code), StopOn::here()));
+            return Err(hello_rejection(&message, &code, StopOn::here()));
         }
         ServerFrame::HeartbeatPong { id, .. } => {
             tracing::debug!(id, "relay heartbeat acknowledged");
@@ -4362,7 +4620,7 @@ where
     Ok(())
 }
 
-fn old_server_upgrade_error(stop: StopOn) -> RelaySessionError {
+fn unexpected_hello_error(stop: StopOn) -> RelaySessionError {
     protocol_mismatch(
         anyhow::anyhow!(
             "the server did not complete the relay handshake for protocol {RELAY_PROTOCOL_VERSION}; upgrade the WS Model Proxy server"
@@ -4381,45 +4639,31 @@ fn old_server_upgrade_error(stop: StopOn) -> RelaySessionError {
 /// `access_denied` (revoked credential, an owner who is not active, a
 /// rebound credential) may clear up by itself (an owner reactivated): it is
 /// always retried slowly.
-fn hello_rejection(
-    message: &str,
-    code: Option<&ProtocolErrorCode>,
-    stop: StopOn,
-) -> RelaySessionError {
+fn hello_rejection(message: &str, code: &ProtocolErrorCode, stop: StopOn) -> RelaySessionError {
     let text = hello_rejection_message(message, code);
     match code {
-        None | Some(ProtocolErrorCode::UpgradeCli | ProtocolErrorCode::UpgradeServer) => {
+        ProtocolErrorCode::UpgradeCli | ProtocolErrorCode::UpgradeServer => {
             protocol_mismatch(anyhow::anyhow!(text), stop)
         }
-        Some(ProtocolErrorCode::AccessDenied) => unrecoverable(
+        ProtocolErrorCode::AccessDenied => unrecoverable(
             anyhow::anyhow!(
                 "{text}; if this machine's credential was revoked, run `wsmp login` to enroll it again"
             ),
             crate::exit::ExitCode::CredentialRejected,
             false,
         ),
-        Some(ProtocolErrorCode::IdentityMismatch) => unrecoverable(
+        ProtocolErrorCode::IdentityMismatch => unrecoverable(
             anyhow::anyhow!("{text}; run `wsmp login` to enroll this machine again"),
             crate::exit::ExitCode::CredentialRejected,
             stop.credential,
         ),
-        Some(
-            ProtocolErrorCode::Malformed | ProtocolErrorCode::Internal | ProtocolErrorCode::Unknown,
-        ) => RelaySessionError::Fatal(anyhow::anyhow!(text)),
+        ProtocolErrorCode::Malformed | ProtocolErrorCode::Internal | ProtocolErrorCode::Unknown => {
+            RelaySessionError::Fatal(anyhow::anyhow!(text))
+        }
     }
 }
 
 fn protocol_mismatch(error: anyhow::Error, stop: StopOn) -> RelaySessionError {
-    // A unit written before exit 5 existed restarts on it: retry slowly there,
-    // and say how to get the unit that stops instead.
-    let error = if !stop.protocol && stop.credential {
-        error.context(
-            "this wsmp.service predates the protocol-mismatch exit code; after installing the matching wsmp, \
-             run `wsmp service install` to update it",
-        )
-    } else {
-        error
-    };
     unrecoverable(
         error,
         crate::exit::ExitCode::RelayProtocolMismatch,
@@ -4482,24 +4726,6 @@ fn check_hello_origin(
     )))
 }
 
-/// A reply to the hello wait that 3.0 parsing refused, read loosely:
-/// an older server sends `protocol.error` without a code, or a challenge
-/// without an origin. Both mean "upgrade the server".
-fn older_server_reply(text: &str, stop: StopOn) -> Option<RelaySessionError> {
-    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
-    match value.get("type").and_then(serde_json::Value::as_str)? {
-        "protocol.error" => {
-            let message = value
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("protocol error");
-            Some(hello_rejection(message, None, stop))
-        }
-        "hello.challenge" => Some(old_server_upgrade_error(stop)),
-        _ => None,
-    }
-}
-
 fn wait_for_hello_challenge<S>(
     socket: &mut tungstenite::WebSocket<S>,
     stop: StopOn,
@@ -4512,7 +4738,7 @@ where
         if Instant::now() >= deadline {
             return Err(RelaySessionError::Reconnectable {
                 error: anyhow::anyhow!(
-                    "the server sent no hello.challenge within {} s (a server older than relay protocol {RELAY_PROTOCOL_VERSION} never does; upgrade it if this repeats)",
+                    "the server sent no hello.challenge within {} s (upgrade the server if this repeats)",
                     HELLO_CHALLENGE_TIMEOUT.as_secs()
                 ),
             });
@@ -4524,7 +4750,7 @@ where
             Ok(Message::Text(text)) => match parse_server_control(&text) {
                 Ok(ServerFrame::HelloChallenge { nonce, origin }) => {
                     if origin.is_empty() {
-                        return Err(old_server_upgrade_error(stop));
+                        return Err(unexpected_hello_error(stop));
                     }
                     return Ok((nonce, origin));
                 }
@@ -4534,19 +4760,18 @@ where
                             error: anyhow::anyhow!("relay protocol error: {message}"),
                         });
                     }
-                    return Err(hello_rejection(&message, Some(&code), stop));
+                    return Err(hello_rejection(&message, &code, stop));
                 }
                 Ok(_) => {
                     return Err(RelaySessionError::Fatal(anyhow::anyhow!(
-                        "expected hello.challenge, received another control frame"
+                        "expected hello.challenge, received another control frame; upgrade the WS Model Proxy server"
                     )));
                 }
                 Err(error) => {
-                    if let Some(refusal) = older_server_reply(&text, stop) {
-                        return Err(refusal);
-                    }
                     return Err(RelaySessionError::Reconnectable {
-                        error: anyhow::anyhow!("invalid hello.challenge frame: {error}"),
+                        error: anyhow::anyhow!(
+                            "could not parse the relay handshake reply before hello.challenge: {error}; reconnecting"
+                        ),
                     });
                 }
             },
@@ -4637,8 +4862,7 @@ fn person_watching() -> bool {
 }
 
 /// Set by a systemd unit that also lists exit 5 in `RestartPreventExitStatus=`
-/// (units written before exit 5 existed do not set it, and would restart on
-/// it every 5 seconds).
+/// so a protocol mismatch stops the service.
 pub const STOP_ON_PROTOCOL_MISMATCH_ENV: &str = "WSMP_STOP_ON_PROTOCOL_MISMATCH";
 
 /// Where an unrecoverable refusal may stop the relay instead of retrying it
@@ -4672,15 +4896,54 @@ impl StopOn {
     };
 }
 
-/// Whether a 426 body is the server's relay protocol refusal (`upgrade_cli`,
-/// with the subprotocol it speaks), not a proxy's or the server's plain
-/// "WebSocket upgrade required" (an `Upgrade` header lost on the way).
-fn refuses_relay_protocol(body: Option<&[u8]>) -> bool {
-    body.and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-        .is_some_and(|value| {
-            value.get("code").and_then(serde_json::Value::as_str) == Some("upgrade_cli")
-                || value.get("supportedSubprotocol").is_some()
-        })
+/// The upgrade action in a relay protocol refusal. A plain or unreadable
+/// 426 body leaves discovery to the caller.
+fn refuses_relay_protocol(body: Option<&[u8]>) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_slice(body?).ok()?;
+    let subprotocol = value
+        .get("supportedSubprotocol")
+        .and_then(serde_json::Value::as_str);
+    let versions = value
+        .get("supportedVersions")
+        .and_then(serde_json::Value::as_array);
+    if !matches!(
+        value.get("code").and_then(serde_json::Value::as_str),
+        Some("upgrade_cli" | "upgrade_server")
+    ) && subprotocol.is_none()
+        && versions.is_none()
+    {
+        return None;
+    }
+    let current = crate::protocol::relay_protocol_major(RELAY_PROTOCOL_VERSION)?;
+    let subprotocol_major = subprotocol
+        .and_then(|token| token.strip_prefix("ws-model-proxy.relay.v"))
+        .and_then(|major| major.parse::<u64>().ok());
+    let version_majors: Vec<_> = versions
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(crate::protocol::relay_protocol_major)
+        .collect();
+    let server_is_older = subprotocol_major.map_or_else(
+        || !version_majors.is_empty() && version_majors.iter().all(|major| *major < current),
+        |major| major < current,
+    );
+    Some(relay_upgrade_action(server_is_older))
+}
+
+fn relay_upgrade_action(server_is_older: bool) -> &'static str {
+    if server_is_older {
+        "the server runs WS Model Proxy 0.4 or older; upgrade the server to 1.0 or later (or install the wsmp that server serves)"
+    } else {
+        "upgrade wsmp by re-running the server's install.sh (`curl -fsSL https://<your server>/install.sh | sh`), then restart wsmp"
+    }
+}
+
+/// A discovery reply with the current protocol cannot explain a 426; keep the proxy hint.
+fn discovered_protocol_action(version: &str) -> Option<&'static str> {
+    let server = crate::protocol::relay_protocol_major(version)?;
+    let cli = crate::protocol::relay_protocol_major(RELAY_PROTOCOL_VERSION)?;
+    (version != RELAY_PROTOCOL_VERSION).then(|| relay_upgrade_action(server < cli))
 }
 
 /// The longest `Retry-After` the relay honours; a longer one waits this long.
@@ -4767,7 +5030,16 @@ fn retry_after_header(response: &tungstenite::http::Response<Option<Vec<u8>>>) -
 /// wsmp's relay protocol (exit 5 with `stop`). Everything else, including a
 /// 403 from a proxy or firewall in front of the server, 429 and 5xx,
 /// reconnects, no sooner than a `Retry-After` the server sent.
+#[cfg(test)]
 fn relay_connect_error(error: tungstenite::Error, stop: StopOn) -> RelaySessionError {
+    relay_connect_error_with_discovery(error, stop, || None)
+}
+
+fn relay_connect_error_with_discovery(
+    error: tungstenite::Error,
+    stop: StopOn,
+    discover: impl FnOnce() -> Option<String>,
+) -> RelaySessionError {
     if let tungstenite::Error::Http(response) = &error
         && response.status().as_u16() == 401
     {
@@ -4784,16 +5056,44 @@ fn relay_connect_error(error: tungstenite::Error, stop: StopOn) -> RelaySessionE
     }
     if let tungstenite::Error::Http(response) = &error
         && response.status().as_u16() == 426
-        && refuses_relay_protocol(response.body().as_deref())
+        && let Some(action) = refuses_relay_protocol(response.body().as_deref())
+            .or_else(|| discover().as_deref().and_then(discovered_protocol_action))
     {
         return protocol_mismatch(
             anyhow::Error::new(error).context(format!(
                 "the server refused relay protocol {RELAY_PROTOCOL_VERSION} (HTTP 426); \
-                 install the server's build by re-running its install.sh \
-                 (`curl -fsSL https://<your server>/install.sh | sh`), then restart wsmp"
+                 {action}"
             )),
             stop,
         );
+    }
+    if let tungstenite::Error::Http(response) = &error
+        && response.status().is_redirection()
+    {
+        let location = response
+            .headers()
+            .get("Location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("the server's canonical URL (Location missing or invalid)");
+        let canonical = Url::parse(location).ok().map(|mut url| {
+            // Login accepts HTTP origins, while a relay Location may use WS.
+            let scheme = match url.scheme() {
+                "ws" => Some("http"),
+                "wss" => Some("https"),
+                _ => None,
+            };
+            if let Some(scheme) = scheme {
+                let _ = url.set_scheme(scheme);
+            }
+            url.to_string()
+        });
+        let canonical =
+            crate::display_escape::escape_single_line(canonical.as_deref().unwrap_or(location));
+        return RelaySessionError::Reconnectable {
+            error: anyhow::anyhow!(
+                "relay redirect refused (cross-host, changed port, TLS downgrade, invalid target, or more than {RELAY_MAX_REDIRECTS} redirects); configure the canonical server URL `{canonical}` with `wsmp login <url> --code <code>`"
+            ),
+        };
     }
     let retry_after = match &error {
         tungstenite::Error::Http(response) => retry_after_header(response),
@@ -4853,19 +5153,32 @@ fn read_poll_woke(error: &std::io::Error) -> bool {
     )
 }
 
-fn set_socket_timeouts(
+fn set_read_poll(
     stream: &mut tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
-    read_timeout: Duration,
-    write_timeout: Duration,
+    interval: Duration,
 ) -> Result<()> {
     let tcp = match stream {
         tungstenite::stream::MaybeTlsStream::Plain(stream) => Some(stream),
         tungstenite::stream::MaybeTlsStream::Rustls(stream) => Some(&mut stream.sock),
         _ => None,
     };
+    tcp.context("unsupported websocket transport timeout configuration")?
+        .set_read_timeout(Some(interval))
+        .context("setting websocket read timeout")
+}
+
+fn set_socket_timeouts(
+    stream: &mut tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<()> {
+    set_read_poll(stream, read_timeout)?;
+    let tcp = match stream {
+        tungstenite::stream::MaybeTlsStream::Plain(stream) => Some(stream),
+        tungstenite::stream::MaybeTlsStream::Rustls(stream) => Some(&mut stream.sock),
+        _ => None,
+    };
     let tcp = tcp.context("unsupported websocket transport timeout configuration")?;
-    tcp.set_read_timeout(Some(read_timeout))
-        .context("setting websocket read timeout")?;
     tcp.set_write_timeout(Some(write_timeout))
         .context("setting websocket write timeout")?;
     Ok(())
@@ -4929,6 +5242,317 @@ fn next_id(prefix: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn relay_redirect_policy_allows_only_same_host_equivalent_ports_and_no_downgrade() {
+        let allowed = [
+            ("ws://example.invalid/a", "ws://example.invalid/b"),
+            ("ws://example.invalid/a", "wss://example.invalid/b"),
+            (
+                "http://example.invalid:80/a",
+                "https://example.invalid:443/b",
+            ),
+            ("wss://example.invalid:443/a", "https://example.invalid/b"),
+            (
+                "ws://example.invalid:8443/a",
+                "wss://example.invalid:8443/b",
+            ),
+        ];
+        for (from, to) in allowed {
+            let from = Url::parse(from).expect("from");
+            let to = Url::parse(to).expect("to");
+            for followed in 0..3 {
+                assert!(
+                    relay_redirect_allowed(&from, &to, followed),
+                    "{from} -> {to}"
+                );
+            }
+            assert!(
+                !relay_redirect_allowed(&from, &to, 3),
+                "fourth redirect refused"
+            );
+        }
+        for (from, to) in [
+            ("ws://example.invalid", "ws://other.invalid"),
+            ("wss://example.invalid", "ws://example.invalid"),
+            ("https://example.invalid", "http://example.invalid"),
+            ("ws://example.invalid:8080", "wss://example.invalid:8443"),
+            ("ws://example.invalid", "wss://example.invalid:8443"),
+            ("ws://example.invalid", "ftp://example.invalid"),
+            ("ws://example.invalid", "ws://user@example.invalid"),
+        ] {
+            assert!(
+                !relay_redirect_allowed(
+                    &Url::parse(from).expect("from"),
+                    &Url::parse(to).expect("to"),
+                    0
+                ),
+                "{from} -> {to}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_relay_times_out_a_silent_http_or_tls_peer() {
+        for scheme in ["ws", "wss"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let request = format!(
+                "{scheme}://{}/relay",
+                listener.local_addr().expect("address")
+            )
+            .into_client_request()
+            .expect("request");
+            let (stop, stopped) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (_socket, _) = listener.accept().expect("accept");
+                let _ = stopped.recv_timeout(Duration::from_secs(3));
+            });
+            let start = Instant::now();
+            let error = connect_relay_with_deadline(request, Duration::from_millis(150))
+                .expect_err("timeout");
+            let elapsed = start.elapsed();
+            let _ = stop.send(());
+            server.join().expect("server");
+            assert!(
+                matches!(&error, tungstenite::Error::Io(io) if io.kind() == io::ErrorKind::TimedOut),
+                "{scheme}: {error}"
+            );
+            assert!(elapsed < Duration::from_secs(1), "{scheme}: {elapsed:?}");
+            assert!(matches!(
+                relay_connect_error(
+                    error,
+                    StopOn {
+                        credential: true,
+                        protocol: true
+                    }
+                ),
+                RelaySessionError::Reconnectable { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn connect_relay_refuses_redirect_before_contacting_another_port() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let other = std::net::TcpListener::bind("127.0.0.1:0").expect("other bind");
+        other.set_nonblocking(true).expect("nonblocking");
+        let canonical = format!("ws://{}/relay", other.local_addr().expect("address"));
+        let location = canonical.clone();
+        let mut request = format!("ws://{}/relay", listener.local_addr().expect("address"))
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer test-only-token"),
+        );
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            let mut buf = [0; 4096];
+            assert!(socket.read(&mut buf).expect("request") > 0);
+            write!(
+                socket,
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .expect("redirect");
+        });
+        let error = connect_relay_with_deadline(request, Duration::from_secs(2))
+            .expect_err("redirect refused");
+        server.join().expect("server");
+        assert!(matches!(other.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        let RelaySessionError::Reconnectable { error } = relay_connect_error(
+            error,
+            StopOn {
+                credential: true,
+                protocol: true,
+            },
+        ) else {
+            panic!("reconnectable");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains(&canonical.replacen("ws://", "http://", 1)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("wsmp login"));
+    }
+
+    #[test]
+    fn connect_relay_follows_a_same_origin_relative_redirect() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let mut request = format!("ws://{}/old", listener.local_addr().expect("address"))
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer test-only-token"),
+        );
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("first");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            let mut buf = [0; 4096];
+            assert!(socket.read(&mut buf).expect("request") > 0);
+            socket.write_all(b"HTTP/1.1 301 Moved Permanently\r\nLocation: /canonical\r\nContent-Length: 0\r\n\r\n").expect("redirect");
+            drop(socket);
+            let (mut socket, _) = listener.accept().expect("second");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).expect("request byte");
+                request.push(byte[0]);
+            }
+            let text = String::from_utf8(request).expect("text");
+            assert!(text.starts_with("GET /canonical "), "{text}");
+            assert!(
+                text.to_ascii_lowercase()
+                    .contains("authorization: bearer test-only-token")
+            );
+            socket
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                .expect("answer");
+        });
+        let error =
+            connect_relay_with_deadline(request, Duration::from_secs(2)).expect_err("final 503");
+        server.join().expect("server");
+        assert!(
+            matches!(error, tungstenite::Error::Http(response) if response.status().as_u16() == 503)
+        );
+    }
+
+    #[test]
+    fn hello_ok_deadline_expires_after_hello_and_is_disabled_when_registered() {
+        let sent = Instant::now();
+        let deadline = HelloOkDeadline(sent);
+        assert!(!deadline.expired(false, sent));
+        assert!(!deadline.expired(false, sent + HELLO_OK_TIMEOUT - Duration::from_nanos(1)));
+        assert!(deadline.expired(false, sent + HELLO_OK_TIMEOUT));
+        assert!(deadline.expired(false, sent + HELLO_OK_TIMEOUT * 2));
+        assert!(!deadline.expired(true, sent + HELLO_OK_TIMEOUT * 2));
+    }
+
+    #[test]
+    fn peer_watch_unarmed_stays_alive_through_a_loop_stall() {
+        let peer = PeerWatch::default();
+        let now = Instant::now();
+        assert!(!peer.is_dead(now));
+        assert!(!peer.is_dead(now + Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn peer_watch_expires_forty_seconds_after_the_first_unanswered_heartbeat() {
+        let now = Instant::now();
+        let mut peer = PeerWatch::default();
+        peer.on_heartbeat_sent(now);
+        assert!(!peer.is_dead(now + Duration::from_secs(39)));
+        assert!(peer.is_dead(now + Duration::from_secs(40)));
+    }
+
+    #[test]
+    fn peer_watch_later_heartbeats_do_not_extend_the_deadline() {
+        let now = Instant::now();
+        let mut peer = PeerWatch::default();
+        peer.on_heartbeat_sent(now);
+        peer.on_heartbeat_sent(now + Duration::from_secs(20));
+        assert!(peer.is_dead(now + Duration::from_secs(40)));
+    }
+
+    #[test]
+    fn peer_watch_any_inbound_frame_resets_the_window() {
+        let now = Instant::now();
+        let mut peer = PeerWatch::default();
+        peer.on_heartbeat_sent(now);
+        peer.on_inbound();
+        assert!(!peer.is_dead(now + Duration::from_secs(300)));
+        peer.on_heartbeat_sent(now + Duration::from_secs(300));
+        assert!(!peer.is_dead(now + Duration::from_secs(339)));
+        assert!(peer.is_dead(now + Duration::from_secs(340)));
+    }
+
+    #[test]
+    fn drain_bounded_caps_message_count_and_leaves_the_rest_queued() {
+        let (tx, rx) = mpsc::sync_channel(300);
+        for message in 0..300 {
+            tx.send(message).expect("queue message");
+        }
+        let mut sent = Vec::new();
+        let drained = drain_bounded(&rx, 256, Duration::from_secs(10), |message| {
+            sent.push(message);
+            Ok(())
+        });
+        assert!(matches!(drained, Ok(Drain::More)));
+        assert_eq!(sent, (0..256).collect::<Vec<_>>());
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            (256..300).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn drain_bounded_returns_empty_after_a_short_queue_or_disconnection() {
+        let (tx, rx) = mpsc::sync_channel(10);
+        for message in 0..10 {
+            tx.send(message).expect("queue message");
+        }
+        let mut sent = 0;
+        assert!(matches!(
+            drain_bounded(&rx, 256, Duration::from_secs(10), |_| {
+                sent += 1;
+                Ok(())
+            }),
+            Ok(Drain::Empty)
+        ));
+        assert_eq!(sent, 10);
+        drop(tx);
+        assert!(matches!(
+            drain_bounded(&rx, 256, Duration::from_secs(10), |_| Ok(())),
+            Ok(Drain::Empty)
+        ));
+    }
+
+    #[test]
+    fn drain_bounded_yields_when_the_time_budget_expires() {
+        let (tx, rx) = mpsc::sync_channel(10);
+        for message in 0..10 {
+            tx.send(message).expect("queue message");
+        }
+        let mut sent = 0;
+        assert!(matches!(
+            drain_bounded(&rx, 256, Duration::from_millis(20), |_| {
+                sent += 1;
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(())
+            }),
+            Ok(Drain::More)
+        ));
+        assert!(sent <= 5);
+        assert_eq!(rx.try_iter().count(), 10 - sent);
+    }
+
+    #[test]
+    fn drain_bounded_propagates_sender_errors() {
+        let (tx, rx) = mpsc::sync_channel(2);
+        tx.send(1).expect("first message");
+        tx.send(2).expect("second message");
+        let result = drain_bounded(&rx, 256, Duration::from_secs(10), |_| {
+            Err(RelaySessionError::Reconnectable {
+                error: anyhow::anyhow!("send failed"),
+            })
+        });
+        assert!(
+            matches!(result, Err(RelaySessionError::Reconnectable { error }) if error.to_string() == "send failed")
+        );
+        assert_eq!(rx.try_recv().expect("remaining message"), 2);
+    }
 
     // Unix only: Windows `shutdown` does not interrupt a blocked send (see
     // `PublicationWatchdog`).
@@ -5386,20 +6010,18 @@ mod tests {
     }
 
     #[test]
-    fn hello_challenge_transient_close_and_parse_failure_reconnect() {
-        for message in [Message::Close(None), Message::Text("{garbled".into())] {
-            let mut socket = challenge_socket(message);
-            assert!(matches!(
-                wait_for_hello_challenge(&mut socket, StopOn::ALL),
-                Err(RelaySessionError::Reconnectable { .. })
-            ));
-        }
+    fn hello_challenge_transient_close_reconnects() {
+        let mut socket = challenge_socket(Message::Close(None));
+        assert!(matches!(
+            wait_for_hello_challenge(&mut socket, StopOn::ALL),
+            Err(RelaySessionError::Reconnectable { .. })
+        ));
     }
 
     #[test]
-    fn hello_challenge_keeps_coded_internal_retryable_and_old_server_actionable() {
+    fn hello_challenge_keeps_internal_errors_and_unparseable_replies_retryable() {
         let mut socket = challenge_socket(Message::Text(
-            r#"{"type":"protocol.error","failure":"protocol_error","message":"database unavailable","code":"internal","supportedVersions":["3.0"]}"#
+            r#"{"type":"protocol.error","failure":"protocol_error","message":"database unavailable","code":"internal","supportedVersions":["4.0"]}"#
                 .into(),
         ));
         assert!(matches!(
@@ -5411,16 +6033,13 @@ mod tests {
                 .into(),
         ));
         match wait_for_hello_challenge(&mut socket, StopOn::ALL) {
-            Err(RelaySessionError::Fatal(error)) => {
-                assert!(
-                    crate::exit::message_for(&error).contains("upgrade the WS Model Proxy server")
-                );
-                assert_eq!(
-                    crate::exit::code_for(&error),
-                    crate::exit::ExitCode::RelayProtocolMismatch
-                );
+            Err(RelaySessionError::Reconnectable { error }) => {
+                let message = crate::exit::message_for(&error);
+                assert!(message.contains("could not parse the relay handshake reply"));
+                assert!(!message.contains("upgrade"));
+                assert_eq!(retry_floor(&error), None);
             }
-            _ => panic!("expected actionable old server refusal"),
+            _ => panic!("unparseable reply must reconnect"),
         }
     }
 
@@ -5431,7 +6050,7 @@ mod tests {
         ));
         assert!(matches!(
             wait_for_hello_challenge(&mut socket, StopOn::ALL),
-            Err(RelaySessionError::Fatal(_))
+            Err(RelaySessionError::Reconnectable { .. })
         ));
         let mut socket = challenge_socket(Message::Text(
             r#"{"type":"hello.challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAA","origin":"https://example.test"}"#.into()));
@@ -5959,16 +6578,11 @@ mod tests {
     fn a_refused_relay_protocol_stops_with_its_own_exit_code() {
         let refusals = [
             hello_rejection(
-                "This server requires relay protocol 3.0. Upgrade wsmp and restart it.",
-                Some(&ProtocolErrorCode::UpgradeCli),
+                "This server requires relay protocol 4.0. Upgrade wsmp and restart it.",
+                &ProtocolErrorCode::UpgradeCli,
                 StopOn::ALL,
             ),
-            hello_rejection(
-                "too new",
-                Some(&ProtocolErrorCode::UpgradeServer),
-                StopOn::ALL,
-            ),
-            hello_rejection("Malformed relay protocol message.", None, StopOn::ALL),
+            hello_rejection("too new", &ProtocolErrorCode::UpgradeServer, StopOn::ALL),
         ];
         for refusal in refusals {
             match refusal {
@@ -5986,11 +6600,7 @@ mod tests {
                 _ => panic!("a refused protocol must stop where stopping is safe"),
             }
         }
-        let cli = hello_rejection(
-            "Upgrade wsmp.",
-            Some(&ProtocolErrorCode::UpgradeCli),
-            StopOn::ALL,
-        );
+        let cli = hello_rejection("Upgrade wsmp.", &ProtocolErrorCode::UpgradeCli, StopOn::ALL);
         let RelaySessionError::Fatal(error) = cli else {
             panic!("upgrade_cli must stop");
         };
@@ -6001,7 +6611,7 @@ mod tests {
     fn a_refused_relay_protocol_retries_slowly_where_exiting_would_relaunch() {
         match hello_rejection(
             "Upgrade wsmp.",
-            Some(&ProtocolErrorCode::UpgradeCli),
+            &ProtocolErrorCode::UpgradeCli,
             StopOn::NONE,
         ) {
             RelaySessionError::Reconnectable { error, .. } => {
@@ -6016,7 +6626,7 @@ mod tests {
     fn a_hello_credential_refusal_asks_for_login_and_malformed_stays_generic() {
         let RelaySessionError::Fatal(error) = hello_rejection(
             "another identity key",
-            Some(&ProtocolErrorCode::IdentityMismatch),
+            &ProtocolErrorCode::IdentityMismatch,
             StopOn::ALL,
         ) else {
             panic!("an identity mismatch must stop where stopping is safe");
@@ -6029,7 +6639,7 @@ mod tests {
         // Access denied (revoked, owner not active) may clear up: retried slowly.
         match hello_rejection(
             "The node's owner is not active.",
-            Some(&ProtocolErrorCode::AccessDenied),
+            &ProtocolErrorCode::AccessDenied,
             StopOn::ALL,
         ) {
             RelaySessionError::Reconnectable { error, .. } => {
@@ -6039,7 +6649,7 @@ mod tests {
             _ => panic!("access_denied must be retried slowly"),
         }
         let RelaySessionError::Fatal(error) =
-            hello_rejection("bad", Some(&ProtocolErrorCode::Malformed), StopOn::ALL)
+            hello_rejection("bad", &ProtocolErrorCode::Malformed, StopOn::ALL)
         else {
             panic!("malformed must stay fatal");
         };
@@ -6050,21 +6660,108 @@ mod tests {
     }
 
     #[test]
-    fn an_old_unit_retries_a_refused_protocol_slowly_and_says_to_reinstall_it() {
-        let old_unit = StopOn {
-            credential: true,
-            protocol: false,
-        };
-        match hello_rejection(
-            "Upgrade wsmp.",
-            Some(&ProtocolErrorCode::UpgradeCli),
-            old_unit,
-        ) {
-            RelaySessionError::Reconnectable { error, .. } => {
-                assert_eq!(retry_floor(&error), Some(RELAY_RECONNECT_MAX_DELAY));
-                assert!(format!("{error:#}").contains("`wsmp service install`"));
+    fn relay_426_names_the_side_that_must_upgrade() {
+        for (subprotocol, versions, action) in [
+            (
+                Some("ws-model-proxy.relay.v3"),
+                vec!["3.0"],
+                "the server runs WS Model Proxy 0.4 or older; upgrade the server to 1.0 or later",
+            ),
+            (
+                Some("ws-model-proxy.relay.v1"),
+                vec!["1.0"],
+                "upgrade the server",
+            ),
+            (Some("ws-model-proxy.relay.v5"), vec!["5.0"], "upgrade wsmp"),
+            (None, vec!["3.0"], "upgrade the server"),
+            (None, vec!["10.0"], "upgrade wsmp"),
+        ] {
+            for stop in [StopOn::ALL, StopOn::NONE] {
+                let body = serde_json::json!({
+                    "type": "protocol.error", "failure": "protocol_error", "code": "upgrade_cli",
+                    "supportedSubprotocol": subprotocol, "supportedVersions": versions
+                });
+                let response = tungstenite::http::Response::builder()
+                    .status(426)
+                    .body(Some(serde_json::to_vec(&body).expect("json")))
+                    .expect("response");
+                match relay_connect_error(tungstenite::Error::Http(Box::new(response)), stop) {
+                    RelaySessionError::Fatal(error) => {
+                        assert!(stop.protocol);
+                        assert_eq!(
+                            crate::exit::code_for(&error),
+                            crate::exit::ExitCode::RelayProtocolMismatch
+                        );
+                        assert!(format!("{error:#}").contains(action), "{error:#}");
+                    }
+                    RelaySessionError::Reconnectable { error } => {
+                        assert!(!stop.protocol);
+                        assert_eq!(retry_floor(&error), Some(RELAY_RECONNECT_MAX_DELAY));
+                        assert!(format!("{error:#}").contains(action), "{error:#}");
+                    }
+                    _ => panic!("unexpected result"),
+                }
             }
-            _ => panic!("an old unit restarts on exit 5: retry instead"),
+        }
+    }
+
+    #[test]
+    fn discovered_protocol_names_the_side_that_must_upgrade() {
+        for (version, expected) in [
+            ("3.0", Some("upgrade the server")),
+            ("1.0", Some("upgrade the server")),
+            ("5.0", Some("upgrade wsmp")),
+            ("10.0", Some("upgrade wsmp")),
+            ("4.1", Some("upgrade wsmp")),
+            (RELAY_PROTOCOL_VERSION, None),
+            ("not a version", None),
+        ] {
+            let action = discovered_protocol_action(version);
+            match expected {
+                Some(expected) => assert!(action.expect("upgrade action").contains(expected)),
+                None => assert_eq!(action, None),
+            }
+        }
+    }
+
+    #[test]
+    fn relay_426_with_an_unreadable_body_uses_discovery() {
+        for stop in [StopOn::ALL, StopOn::NONE] {
+            for version in ["3.0", "5.0"] {
+                for body in [None, Some(b"{".to_vec())] {
+                    let response = tungstenite::http::Response::builder()
+                        .status(426)
+                        .body(body)
+                        .expect("response");
+                    let result = relay_connect_error_with_discovery(
+                        tungstenite::Error::Http(Box::new(response)),
+                        stop,
+                        || Some(version.to_string()),
+                    );
+                    let error = match result {
+                        RelaySessionError::Fatal(error) => {
+                            assert!(stop.protocol);
+                            assert_eq!(
+                                crate::exit::code_for(&error),
+                                crate::exit::ExitCode::RelayProtocolMismatch
+                            );
+                            error
+                        }
+                        RelaySessionError::Reconnectable { error } => {
+                            assert!(!stop.protocol);
+                            assert_eq!(retry_floor(&error), Some(RELAY_RECONNECT_MAX_DELAY));
+                            error
+                        }
+                        _ => panic!("unexpected result"),
+                    };
+                    let expected = if version == "3.0" {
+                        "upgrade the server"
+                    } else {
+                        "upgrade wsmp"
+                    };
+                    assert!(format!("{error:#}").contains(expected));
+                }
+            }
         }
     }
 
@@ -6088,7 +6785,7 @@ mod tests {
         }
         let RelaySessionError::Fatal(error) = relay_connect_error(
             refusal(
-                r#"{"type":"protocol.error","code":"upgrade_cli","supportedSubprotocol":"ws-model-proxy.relay.v3"}"#,
+                r#"{"type":"protocol.error","code":"upgrade_cli","supportedSubprotocol":"ws-model-proxy.relay.v4"}"#,
             ),
             StopOn::ALL,
         ) else {

@@ -1,7 +1,18 @@
 import { defineConfig, minimal2023Preset } from "@vite-pwa/assets-generator/config";
 
-// public/logo.png is a full-bleed square whose edges are this colour.
-const logoEdgeColor = "#0e1230";
+// `assets/logo.png` is the bare artwork on a transparent canvas. The transparent
+// icons (favicon and pwa-*) use it as is, so they sit on any page background.
+// The maskable icon must be opaque, so its padding uses the FlyCockpit suite
+// blue (#4a97fa) instead of the generator's default white. Padding 0.33 is
+// tuned for this logo so its farthest opaque pixel stays inside the center
+// 80% maskable safe-zone circle (messages-mcp's artwork uses 0.27).
+//
+// The apple touch icon is NOT generated here (`sizes: []`): it is the Icon
+// Composer tile `assets/app-icon.png` with its transparent corners filled by
+// the tile's own background, sampled row by row (a dark vertical gradient),
+// and resized to `public/apple-touch-icon-180x180.png` (iOS rounds the corners
+// itself, shows transparency as black, and has no dark variant for web clips).
+const background = "#4a97fa";
 
 export default defineConfig({
   headLinkOptions: {
@@ -9,19 +20,8 @@ export default defineConfig({
   },
   preset: {
     ...minimal2023Preset,
-    // iOS masks the corners itself. Any padding here is baked into the PNG
-    // (white by default) and shows up as a frame on the home screen.
-    apple: {
-      ...minimal2023Preset.apple,
-      padding: 0,
-      resizeOptions: { background: logoEdgeColor },
-    },
-    // Keep the default padding so the artwork stays inside Android's circular
-    // safe zone, but pad with the logo's edge colour instead of white.
-    maskable: {
-      ...minimal2023Preset.maskable,
-      resizeOptions: { background: logoEdgeColor },
-    },
+    maskable: { ...minimal2023Preset.maskable, padding: 0.33, resizeOptions: { background } },
+    apple: { ...minimal2023Preset.apple, sizes: [] },
   },
-  images: ["public/logo.png"],
+  images: ["assets/logo.png"],
 });

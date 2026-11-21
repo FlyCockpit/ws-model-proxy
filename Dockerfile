@@ -1,18 +1,22 @@
-FROM node:26-slim AS base
+FROM node:26.13.1-trixie-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS base
 
 ARG APT_CACHE_DATE=static
 
 # Runtime base:
 #   - openssl: required by Prisma query engine
-#   - postgresql-client: provides psql, used by docker-entrypoint.sh to hold a
-#     Postgres advisory lock around `prisma db push` (multi-replica safety).
+#   - postgresql-client: psql, pg_dump and pg_restore for the optional
+#     pre-migration backup and the `backup` / `restore` image commands
+#     (scripts/backup/). Debian 13's client is PostgreSQL 17, the supported
+#     server major; a client older than the server cannot dump it, so a newer
+#     Postgres server needs a newer client here.
 # `apt-get upgrade` pulls the latest Debian 13 security patches for packages
-# already in node:26-slim (glibc, libcap2, systemd libs, etc.) — the base image
+# already in node:26.13.1-trixie-slim (glibc, libcap2, systemd libs, etc.) — the base image
 # lags the Debian point release, so Trivy fails on fixable HIGH CVEs without it.
 RUN echo "APT cache date: ${APT_CACHE_DATE}" && apt-get update -y && apt-get upgrade -y && apt-get install -y \
   openssl \
   postgresql-client \
   util-linux \
+  tini \
   && rm -rf /var/lib/apt/lists/*
 
 # --- Build-time base ---
@@ -28,7 +32,7 @@ ENV PATH="$PNPM_HOME:$PATH"
 ENV NODE_OPTIONS="--max-old-space-size=4096"
 # Node 25+ no longer bundles corepack, so pnpm comes from npm (build stages only).
 # Keep the version equal to package.json's packageManager.
-RUN npm install -g pnpm@12.16.0
+RUN npm install -g pnpm@12.18.0
 
 # --- Builder stage ---
 # pnpm install runs here with source files present so workspace symlinks resolve correctly
@@ -133,13 +137,16 @@ COPY packages/ui/package.json packages/ui/
 COPY packages/db/prisma.config.ts packages/db/
 COPY packages/db/prisma packages/db/prisma
 # prisma.config.ts imports @ws-model-proxy/env/root-dotenv (also needed at
-# runtime by `prisma db push`, which loads the same config).
+# runtime by `prisma migrate deploy`, which loads the same config).
 COPY packages/env/src packages/env/src
 
 # Install prod deps for BOTH the server and the web app. The server bundle
 # imports the built web SSR handler (apps/web/dist/server), which leaves `react`
 # external — so web's runtime deps must be present in the image for SSR to load.
-RUN pnpm install --frozen-lockfile --prod --ignore-scripts --filter=server... --filter=web...
+# --include-workspace-root adds the root package's prod dependencies: only
+# @aws-sdk/client-s3, which scripts/backup/s3.mjs loads for BACKUP_S3_* uploads
+# and s3:// restores (resolved from /app/node_modules).
+RUN pnpm install --frozen-lockfile --prod --ignore-scripts --filter=server... --filter=web... --include-workspace-root
 
 # TypeScript is only needed while building and type-checking. It can appear in
 # prod node_modules as an optional/types peer of runtime packages; remove it
@@ -152,9 +159,11 @@ RUN rm -rf node_modules/.pnpm/typescript@* \
   apps/web/node_modules/typescript
 
 # --- Runner stage ---
-# Server image: Hono API + SSR bundle + static web SPA. Ships the Prisma CLI
-# and postgresql-client so `prisma db push` can run on boot when
-# APPLY_SCHEMA=safe|dangerous.
+# Server image: Hono API + SSR bundle + static web SPA. Ships the Prisma CLI,
+# the committed migrations, and postgresql-client: the entrypoint migrates on
+# boot (MIGRATE_ON_START, default true for the server), the `migrate` command
+# runs the same runner as a one-shot job, and `backup` / `restore` run
+# scripts/backup/. See docs/schema-migrations.md.
 # No .env files are COPYed into the image — production env values are injected
 # at runtime by the container platform.
 FROM base AS runner
@@ -173,12 +182,12 @@ COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
 COPY apps/server/package.json apps/server/
 COPY packages/db/package.json packages/db/
 # packages/db/prisma.config.ts imports @ws-model-proxy/env/root-dotenv, and the
-# entrypoint loads that config when running `prisma db push`.
+# migration runner loads that config when running `prisma migrate deploy`.
 COPY packages/env/package.json packages/env/
 COPY packages/env/src ./packages/env/src
 
 # Copy production node_modules. The two Prisma-bearing trees are
-# --chown=node:node: `prisma db push` runs at runtime as USER node and
+# --chown=node:node: `prisma migrate deploy` runs at runtime as USER node and
 # materializes its schema engine into node_modules, so uid 1000 must own
 # them. Done at COPY time (not a RUN chown) to avoid duplicating the layer.
 COPY --chown=node:node --from=prod-deps /app/node_modules ./node_modules
@@ -190,18 +199,13 @@ COPY --from=prod-deps /app/packages/env/node_modules ./packages/env/node_modules
 # whose SSR chunks resolve `react` (left external by the web build) from here.
 COPY --from=prod-deps /app/apps/web/node_modules ./apps/web/node_modules
 
-# Copy Prisma schema + config for runtime `prisma db push` (gated on APPLY_SCHEMA)
+# Copy Prisma schema, committed migrations (prisma/migrations) + config for the
+# runtime `prisma migrate deploy`
 COPY --from=builder /app/packages/db/prisma ./packages/db/prisma
 COPY --from=builder /app/packages/db/prisma.config.ts ./packages/db/prisma.config.ts
-COPY --from=builder /app/packages/db/scripts/apply-schema-hardening.mjs ./packages/db/scripts/apply-schema-hardening.mjs
-COPY --from=builder /app/packages/db/scripts/push-schema.mjs ./packages/db/scripts/push-schema.mjs
-# Modules the two scripts import (pnpm docker:check-copy follows their
-# relative imports and fails when one is not copied here).
-COPY --from=builder /app/packages/db/scripts/pre-push-null-cleanup.mjs ./packages/db/scripts/pre-push-null-cleanup.mjs
-COPY --from=builder /app/packages/db/scripts/hardening-sql.mjs ./packages/db/scripts/hardening-sql.mjs
 # Copy generated Prisma client (built during deps stage)
 COPY --from=builder /app/packages/db/prisma/generated ./packages/db/prisma/generated
-# Copy prisma CLI (devDependency, not in prod node_modules) so the entrypoint can run `prisma db push`
+# Copy prisma CLI (devDependency, not in prod node_modules) so the migration runner can run `prisma migrate deploy`
 COPY --chown=node:node --from=builder /app/packages/db/node_modules/.bin/prisma ./packages/db/node_modules/.bin/prisma
 COPY --chown=node:node --from=builder /app/packages/db/node_modules/prisma ./packages/db/node_modules/prisma
 
@@ -209,11 +213,28 @@ COPY --chown=node:node --from=builder /app/packages/db/node_modules/prisma ./pac
 COPY --from=builder /app/apps/server/dist ./apps/server/dist
 COPY --from=builder /app/apps/web/dist ./apps/web/dist
 
-# Copy runtime scripts (entrypoint validates required env vars; backup.sh is
-# used by optional cron jobs).
+# Copy runtime scripts: the entrypoint, the migration runner
+# (scripts/db/migrate-runtime.mjs + its libs; the SQL in
+# packages/db/prisma/migrations is copied with packages/db/prisma above), and
+# the backup/restore commands (scripts/backup/). pnpm docker:check-copy follows
+# their relative imports and fails when one is not copied here.
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-COPY scripts/backup.sh ./scripts/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh ./scripts/backup.sh
+COPY scripts/db/migrate-runtime.mjs ./scripts/db/
+COPY scripts/db/lib/baseline.mjs scripts/db/lib/contracts.mjs scripts/db/lib/migration-state.mjs scripts/db/lib/prisma.mjs scripts/db/lib/sql.mjs ./scripts/db/lib/
+COPY scripts/backup/pre-migrate.sh \
+     scripts/backup/restore.sh \
+     scripts/backup/restore.mjs \
+     scripts/backup/lib.mjs \
+     scripts/backup/s3.mjs \
+     scripts/backup/schedule.mjs \
+     scripts/backup/drill.mjs \
+     scripts/backup/host.sh \
+     ./scripts/backup/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+  ./scripts/backup/pre-migrate.sh \
+  ./scripts/backup/restore.sh
+# Fail the build, not a deploy, when the S3 backup path cannot load its SDK.
+RUN su node -s /bin/sh -c 'node scripts/backup/s3.mjs check'
 
 # Strip the global npm CLI from the runtime image. The server runs `node`
 # directly (CMD) and the entrypoint invokes the COPY'd prisma binary by path
@@ -224,20 +245,30 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh ./scripts/backup.sh
 # Build stages keep npm; this only affects the final runner image.
 RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
-# Drop privileges. The `node` user (uid 1000) ships in node:26-slim. The
+# /backups is the optional pre-migration backup destination. Create it owned
+# by the runtime user so a fresh named volume mounted there inherits writable
+# ownership (Docker seeds a new volume from the image directory). The empty
+# directory alone is NOT treated as configured: scripts/backup/pre-migrate.sh
+# only writes there when it is a real mount (docs/backup-and-restore.md).
+RUN mkdir -p /backups && chown node:node /backups
+
+# Drop privileges. The `node` user (uid 1000) ships in node:26.13.1-trixie-slim. The
 # server only reads /app at runtime; the entrypoint's writes go to /tmp
-# (mktemp) and to Postgres over the network, so no chown of /app is needed.
+# (mktemp), to /backups (above) and to Postgres over the network, so no chown
+# of /app is needed.
 USER node
 
+# The shell stays PID 1 through startup, drops BACKUP_S3_*, then execs tini
+# with the CMD so both tini and the server inherit the cleaned environment.
 ENTRYPOINT ["docker-entrypoint.sh"]
 
 EXPOSE 3000
 
 # Container platforms can use this healthcheck for rolling updates.
 # Use Node's built-in fetch; node:slim does not ship curl or wget.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=480s \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=540s \
   CMD node -e "const port=process.env.SERVER_PORT||process.env.PORT||3000;fetch('http://localhost:'+port+'/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-# Start the server. Schema sync (gated on APPLY_SCHEMA) runs inside the
-# ENTRYPOINT before this CMD executes. See scripts/docker-entrypoint.sh.
+# Start the server. Migrations (MIGRATE_ON_START) run inside the ENTRYPOINT
+# before this CMD executes. See scripts/docker-entrypoint.sh.
 CMD ["node", "apps/server/dist/index.mjs"]

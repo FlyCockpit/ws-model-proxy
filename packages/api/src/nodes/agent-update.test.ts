@@ -1,6 +1,6 @@
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAgentUpdateDb, nodeRow } from "../lib/agent-update-test-fake";
 
 const fake = vi.hoisted(() => ({ db: null as unknown }));
@@ -531,6 +531,27 @@ describe("nodes.agentUpdate Install anyway (Homebrew tap)", () => {
 });
 
 describe("nodes.agentUpdate.overview", () => {
+  const now = new Date("2026-11-03T12:00:00.000Z");
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.each([
+    [new Date(now.getTime() - 4 * 60_000), "OFFLINE"],
+    [new Date(now.getTime() - 10_000), "ONLINE"],
+    [null, "ONLINE"],
+  ] as const)("shows heartbeat %s as %s", async (lastHeartbeatAt, connection) => {
+    Object.assign(store.tables.node[0] ?? {}, { lastHeartbeatAt });
+    const overview = await client().overview();
+    expect(overview.nodes[0]?.connection).toBe(connection);
+  });
+
   it("explains a node that cannot update itself, with its command", async () => {
     Object.assign(store.tables.node[0] ?? {}, {
       cliBuild: { commit: "b".repeat(40), installMethod: "source", target: TARGET },
@@ -810,7 +831,10 @@ describe("nodes.agentUpdate sends only under the update-authority lock (F-FA-1)"
   // changes a turn later.
   const optOutStored = async () => {
     Object.assign(store.tables.node[0] ?? {}, {
-      features: { selfUpdate: { ...SELF_UPDATE, remote: "off" } },
+      features: {
+        ...(nodeRow().features as Record<string, unknown>),
+        selfUpdate: { ...SELF_UPDATE, remote: "off" },
+      },
     });
   };
   const lowerTrust = async () => {

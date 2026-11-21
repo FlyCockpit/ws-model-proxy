@@ -344,7 +344,7 @@ function TwoFactorCard({
               inputMode="numeric"
               autoComplete="one-time-code"
               maxLength={6}
-              className="text-center text-lg tracking-widest"
+              className="h-11 text-base md:h-8 md:text-xs text-center tracking-widest"
               onKeyDown={(e) => {
                 if (e.key === "Enter") handle2FAVerify();
               }}
@@ -468,6 +468,7 @@ function SignInForm({
           <div className="space-y-2">
             <Label htmlFor={field.name}>{t("auth:fields.email")}</Label>
             <Input
+              className="h-11 text-base md:h-8 md:text-xs"
               id={field.name}
               name={field.name}
               type="email"
@@ -491,6 +492,7 @@ function SignInForm({
           <div className="space-y-2">
             <Label htmlFor={field.name}>{t("auth:fields.password")}</Label>
             <Input
+              className="h-11 text-base md:h-8 md:text-xs"
               id={field.name}
               name={field.name}
               type="password"

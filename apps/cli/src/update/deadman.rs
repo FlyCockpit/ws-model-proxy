@@ -37,14 +37,10 @@ use anyhow::{Context, Result};
 
 pub const LINUX_UNIT: &str = "wsmp-update-deadman";
 pub const MACOS_LABEL: &str = "com.flycockpit.wsmp.update-deadman";
-/// Windows task names are machine-wide: one per user, like the relay task.
-pub fn windows_task_name(user: &str) -> String {
-    crate::commands::service::windows_task::task_name(user).replacen(
-        "wsmp-relay-",
-        "wsmp-update-deadman-",
-        1,
-    )
-}
+/// Windows task names are machine-wide: one per account, like the relay
+/// task, named after the account SID (0.4.x used `USERNAME`; see
+/// [`crate::commands::service::task_names`]).
+pub use crate::commands::service::task_names::DEADMAN_PREFIX as WINDOWS_TASK_PREFIX;
 /// The Windows dead-man's early run: start the relay task again after the exit 75.
 pub const WINDOWS_KICK_AFTER: Duration = Duration::from_secs(5);
 
@@ -366,14 +362,7 @@ pub struct SystemdTimer;
 #[cfg(target_os = "linux")]
 impl SystemdTimer {
     fn env() -> Vec<(&'static str, String)> {
-        if std::env::var_os("XDG_RUNTIME_DIR").is_some() {
-            Vec::new()
-        } else {
-            vec![(
-                "XDG_RUNTIME_DIR",
-                format!("/run/user/{}", nix::unistd::Uid::effective().as_raw()),
-            )]
-        }
+        crate::commands::service::user_bus_env()
     }
 
     fn systemctl(args: &[&str]) -> Result<(bool, String)> {
@@ -700,10 +689,48 @@ pub struct ScheduledTask;
 
 #[cfg(windows)]
 impl ScheduledTask {
-    fn name() -> Result<String> {
-        Ok(windows_task_name(
-            &std::env::var("USERNAME").context("`USERNAME` is not set")?,
+    fn names() -> Result<(
+        crate::commands::service::task_names::TaskNames,
+        crate::commands::service::task_names::Account,
+    )> {
+        let account = crate::commands::service::windows_account()?;
+        Ok((
+            crate::commands::service::task_names::TaskNames::new(WINDOWS_TASK_PREFIX, &account),
+            account,
         ))
+    }
+    fn name() -> Result<String> {
+        Ok(Self::names()?.0.current)
+    }
+    /// The registered dead-man tasks: the SID-named one, and this account's
+    /// 0.4.x one (armed by a 0.4.x `wsmp update` into this build).
+    fn registered() -> Result<Vec<String>> {
+        use crate::commands::service::task_names::{Legacy, Presence, Tasks, legacy};
+        let tasks = crate::commands::service::SystemTasks;
+        let (names, account) = Self::names()?;
+        let mut found = Vec::new();
+        match tasks.exists(&names.current)? {
+            Presence::Absent => {}
+            Presence::Present => found.push(names.current.clone()),
+            Presence::Unreadable => anyhow::bail!(
+                "the update dead-man task `{}` exists but this account may not read it",
+                names.current
+            ),
+        }
+        match legacy(&tasks, &names, &account)? {
+            Legacy::Ours(old) => found.push(old),
+            Legacy::NotOurs { name, owner: None } => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        task = %name,
+                        "a wsmp 0.4 update dead-man task could not be confirmed as this account's and is left alone; if it is yours, remove it with `schtasks /Delete /TN {name} /F`"
+                    );
+                });
+            }
+            _ => {}
+        }
+        Ok(found)
     }
     fn schtasks(args: &[&str]) -> Result<(bool, String)> {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
@@ -714,25 +741,30 @@ impl ScheduledTask {
 #[cfg(windows)]
 impl Scheduler for ScheduledTask {
     fn present(&self) -> Result<bool> {
-        Ok(Self::schtasks(&["/Query", "/TN", &Self::name()?])?.0)
+        Ok(!Self::registered()?.is_empty())
     }
     fn running(&self) -> Result<bool> {
-        let script = format!(
-            "(Get-ScheduledTask -TaskName {} -ErrorAction Stop).State",
-            powershell_quote(&Self::name()?)
-        );
-        let (_, output) = run_bounded(
-            "powershell",
-            &[
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-Command".into(),
-                script,
-            ],
-            &[],
-            Duration::from_secs(30),
-        )?;
-        Ok(output.trim() == "Running")
+        for name in Self::registered()? {
+            let script = format!(
+                "(Get-ScheduledTask -TaskName {} -ErrorAction Stop).State",
+                powershell_quote(&name)
+            );
+            let (_, output) = run_bounded(
+                "powershell",
+                &[
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    script,
+                ],
+                &[],
+                Duration::from_secs(30),
+            )?;
+            if output.trim() == "Running" {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     fn register(&self, spec: &DeadmanSpec) -> Result<()> {
         let now = super::unix_now();
@@ -766,7 +798,9 @@ impl Scheduler for ScheduledTask {
         Ok(())
     }
     fn remove(&self) -> Result<()> {
-        let _ = Self::schtasks(&["/Delete", "/TN", &Self::name()?, "/F"]);
+        for name in Self::registered()? {
+            let _ = Self::schtasks(&["/Delete", "/TN", &name, "/F"]);
+        }
         Ok(())
     }
 }
@@ -1400,6 +1434,9 @@ mod tests {
         assert!(!deadline.contains("<Duration>"));
         assert_eq!(xml.matches("<Repetition>").count(), 1);
         assert!(xml.contains("&quot;C:\\Users\\A B"));
-        assert_eq!(windows_task_name("me"), "wsmp-update-deadman-me");
+        assert_eq!(
+            crate::commands::service::task_names::task_name(WINDOWS_TASK_PREFIX, "S-1-5-18"),
+            "wsmp-update-deadman-S-1-5-18"
+        );
     }
 }

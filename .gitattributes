@@ -1,2 +1,14 @@
 * text=auto eol=lf
 *.sh text eol=lf
+
+# Generated files remain tracked, but are collapsed in GitHub reviews.
+pnpm-lock.yaml linguist-generated=true
+apps/cli/Cargo.lock linguist-generated=true
+apps/web/src/routeTree.gen.ts linguist-generated=true
+docs/mcp-tool-coverage.md linguist-generated=true
+.env.example linguist-generated=true
+apps/web/.env.example linguist-generated=true
+CLAUDE.md linguist-generated=true
+.cursorrules linguist-generated=true
+apps/cli/CLAUDE.md linguist-generated=true
+apps/cli/.cursorrules linguist-generated=true

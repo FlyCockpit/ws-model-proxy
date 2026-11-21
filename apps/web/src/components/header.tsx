@@ -16,14 +16,14 @@ export default function Header() {
   const lang = isSupportedLocale(params.lang) ? params.lang : DEFAULT_LOCALE;
 
   return (
-    <div style={{ viewTransitionName: "site-header" }}>
+    <div className="min-w-0">
       <div className="flex min-w-0 flex-row items-center gap-4 px-4 py-2">
         <Link
           to="/$lang"
           params={{ lang }}
-          className="min-w-0 max-w-40 shrink-0 truncate font-semibold text-lg sm:max-w-56 lg:max-w-none"
+          className="inline-flex min-h-11 min-w-0 max-w-40 items-center font-semibold text-lg sm:max-w-56 lg:max-w-none"
         >
-          {appName}
+          <span className="truncate">{appName}</span>
         </Link>
         <MainNav />
         <div className="ml-auto flex shrink-0 items-center gap-2">

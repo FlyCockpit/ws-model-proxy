@@ -4,19 +4,24 @@
  * once on the same member, a semantic field gets a clear 400, and native answers are
  * normalized. The relay is a double: each send returns the next scripted answer.
  */
+
+import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDeep, mockReset } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../../packages/db/prisma/generated/client";
+import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
 import type { PoolRoute } from "./resolve.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: new Proxy({} as Record<string, unknown>, {
     get: (_target, key) =>
-      key === "BETTER_AUTH_SECRET"
-        ? "test-better-auth-secret-value-32chars!"
-        : key === "NODE_ENV"
-          ? "test"
-          : undefined,
+      key === "MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS"
+        ? 5_000
+        : key === "BETTER_AUTH_SECRET"
+          ? "test-better-auth-secret-value-32chars!"
+          : key === "NODE_ENV"
+            ? "test"
+            : undefined,
   }),
 }));
 vi.mock("@ws-model-proxy/db", async () => {
@@ -33,16 +38,31 @@ const resolve = vi.hoisted(() => ({
   testRoutes: vi.fn(async (): Promise<unknown[]> => []),
 }));
 vi.mock("./resolve.js", () => resolve);
-type Sent = { headers: Headers; body: string };
+const capabilities = vi.hoisted(() => ({ override: null as OpenAiCompatibleCapabilities | null }));
+vi.mock("./served-model-capabilities.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./served-model-capabilities.js")>();
+  return {
+    ...actual,
+    servedModelCapabilities: (model: Parameters<typeof actual.servedModelCapabilities>[0]) =>
+      capabilities.override ?? actual.servedModelCapabilities(model),
+  };
+});
+type Sent = { headers: Headers; body: string; path: string };
 const relay = vi.hoisted(() => ({
   sent: [] as Sent[],
-  answers: [] as Array<{ status: number; body: string; contentType?: string }>,
+  answers: [] as Array<{
+    status: number;
+    body: string;
+    contentType?: string;
+    stream?: ReadableStream<Uint8Array>;
+  }>,
 }));
 vi.mock("./local-send.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./local-send.js")>()),
   startAuthorizedLocalRelayAttempt: vi.fn(
-    async (_binding: unknown, args: { headers: Headers; body?: Uint8Array }) => {
+    async (_binding: unknown, args: { headers: Headers; body?: Uint8Array; path: string }) => {
       relay.sent.push({
+        path: args.path,
         headers: new Headers(args.headers),
         body: new TextDecoder().decode(args.body ?? new Uint8Array()),
       });
@@ -53,12 +73,14 @@ vi.mock("./local-send.js", async (importOriginal) => ({
         started: Promise.resolve({
           status: answer.status,
           headers: new Headers({ "content-type": answer.contentType ?? "application/json" }),
-          body: new ReadableStream<Uint8Array>({
-            start(controller) {
-              controller.enqueue(bytes);
-              controller.close();
-            },
-          }),
+          body:
+            answer.stream ??
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(bytes);
+                controller.close();
+              },
+            }),
         }),
         terminal: Promise.resolve({
           ok: answer.status < 400,
@@ -78,7 +100,8 @@ vi.mock("./local-send.js", async (importOriginal) => ({
 
 const prisma = (await import("@ws-model-proxy/db")).default;
 const db = prisma as unknown as ReturnType<typeof mockDeep<PrismaClient>>;
-const { createModelApiRoutes, chatTestCompletionsHandler } = await import("./routes.js");
+const { createModelApiRoutes, chatTestCompletionsHandler, captureProviderResponseBinding } =
+  await import("./routes.js");
 const { ModelApiConcurrencyLimiter } = await import("./limits.js");
 const { clearRequestProfileCache } = await import("./compat/profile-store.js");
 
@@ -186,9 +209,9 @@ function route(requestCompat: PoolRoute["instance"]["requestCompat"] = {}): Pool
   };
 }
 
-function app() {
+function app(capacityRuntime?: CapacityAdmissionRuntime) {
   return createModelApiRoutes({
-    capacityRuntime: undefined,
+    capacityRuntime,
     concurrencyLimiter: new ModelApiConcurrencyLimiter(),
     manager: {
       getOnlineNodeIds: () => ["node-1"],
@@ -227,6 +250,7 @@ beforeEach(() => {
   mockReset(db);
   vi.clearAllMocks();
   clearRequestProfileCache();
+  capabilities.override = null;
   relay.sent = [];
   relay.answers = [];
   db.relayRequest.create.mockResolvedValue({ id: "relay-1" } as never);
@@ -362,6 +386,7 @@ describe("request compatibility on a local pool member", () => {
     expect(relay.sent).toHaveLength(1);
 
     // Automatic: sent once more without the header, which is not remembered.
+    capabilities.override = null;
     relay.sent = [];
     relay.answers = [
       {
@@ -378,6 +403,7 @@ describe("request compatibility on a local pool member", () => {
     expect(relay.sent.map((sent) => sent.headers.has("openai-beta"))).toEqual([true, false]);
     expect(db.runtimeRequestProfile.create).not.toHaveBeenCalled();
 
+    capabilities.override = null;
     relay.sent = [];
     relay.answers = [
       {
@@ -626,4 +652,220 @@ describe("request compatibility on a direct runtime test", () => {
     expect(JSON.parse(relay.sent[1]!.body)).not.toHaveProperty("store");
     expect(await response.json()).toMatchObject({ choices: [{ finish_reason: "stop" }] });
   });
+});
+
+describe("modeled route admission", () => {
+  it.each(["/audio/translations", "/audio/speech", "/responses/count_tokens"])(
+    "%s refuses exhausted capacity before dispatch",
+    async (path) => {
+      // Model inventories can advertise these native surfaces independently.
+      capabilities.override = {
+        version: 4,
+        protocol: "openai-compatible",
+        audio: { translations: { supported: true }, speech: true },
+        surfaces: {
+          openaiResponses: {
+            source: "declared",
+            confidence: "exact",
+            operations: ["create", "countTokens"],
+          },
+        },
+      };
+      const runtime = mockDeep<CapacityAdmissionRuntime>();
+      runtime.acquire.mockResolvedValue({ state: "EXPIRED" });
+      const multipart = new FormData();
+      multipart.set("model", "owner/chat");
+      multipart.set("file", new File(["audio"], "clip.wav", { type: "audio/wav" }));
+      const response = await app(runtime).request(path, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_key_test",
+          ...(path === "/audio/translations" ? {} : { "content-type": "application/json" }),
+        },
+        body:
+          path === "/audio/translations"
+            ? multipart
+            : JSON.stringify({
+                model: "owner/chat",
+                input: "hello",
+                voice: "alloy",
+              }),
+      });
+      expect(runtime.acquire).toHaveBeenCalled();
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(relay.sent).toEqual([]);
+    },
+  );
+
+  it.each(["CONSERVATIVE_ESTIMATE", "ENGINE_REPORTED"] as const)(
+    "uses the complete instance's %s count strategy",
+    async (countStrategy) => {
+      capabilities.override = {
+        version: 1,
+        protocol: "openai-compatible",
+        responses: { supported: true, countTokens: true },
+      };
+      const member = route();
+      member.instance.countStrategy = countStrategy;
+      resolve.poolRoutes.mockResolvedValue([member]);
+      const runtime = mockDeep<CapacityAdmissionRuntime>();
+      runtime.acquire.mockImplementation(async (attempt) => ({
+        state: "ADMITTED",
+        lease: {
+          leaseId: "lease",
+          attemptId: attempt.attemptId,
+          capacityId: "instance-1",
+          executionTargetId: "target-1",
+          poolMemberId: "member-1",
+          fencingToken: 1n,
+          expiresAt: new Date(Date.now() + 30_000),
+        },
+      }));
+      runtime.hold.mockImplementation((response) => response);
+      runtime.release.mockResolvedValue(true);
+      if (countStrategy === "ENGINE_REPORTED")
+        relay.answers.push({ status: 200, body: JSON.stringify({ input_tokens: 3 }) });
+      relay.answers.push({
+        status: 200,
+        body: JSON.stringify({ id: "resp_ok", object: "response", output: [] }),
+      });
+      const response = await app(runtime).request("/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_key_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: "owner/chat", input: "hello", store: false }),
+      });
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(relay.sent.map((sent) => sent.path)).toEqual(
+        countStrategy === "ENGINE_REPORTED"
+          ? ["/v1/responses/count_tokens", "/v1/responses"]
+          : ["/v1/responses"],
+      );
+    },
+  );
+});
+
+describe("bounded local error inspection", () => {
+  function speech() {
+    capabilities.override = { version: 1, protocol: "openai-compatible", audio: { speech: true } };
+    return app().request("/audio/speech", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_key_test", "content-type": "application/json" },
+      body: JSON.stringify({ model: "owner/chat", input: "hello", voice: "alloy" }),
+    });
+  }
+
+  it.each([128, 128 * 1024])("forwards all %i error bytes unchanged", async (size) => {
+    const body = "x".repeat(size);
+    relay.answers.push({ status: 400, body });
+    const response = await speech();
+    expect(response.status).toBe(400);
+    expect((await response.text()) === body).toBe(true);
+    expect(relay.sent).toHaveLength(1);
+  });
+
+  it("returns after a bounded prefix and forwards the unread remainder on demand", async () => {
+    let pulls = 0;
+    const chunk = new TextEncoder().encode("x".repeat(64 * 1024));
+    relay.answers.push({
+      status: 400,
+      body: "",
+      stream: new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (pulls === 32) {
+            controller.close();
+            return;
+          }
+          pulls++;
+          controller.enqueue(chunk);
+        },
+      }),
+    });
+    const response = await speech();
+    expect(response.status).toBe(400);
+    expect(pulls).toBeLessThan(32);
+    expect((await response.text()).length).toBe(32 * chunk.length);
+  });
+
+  it("does not classify context errors beyond the inspected prefix", async () => {
+    const body = "x".repeat(64 * 1024) + " maximum context length exceeded";
+    relay.answers.push({ status: 400, body });
+    const response = await speech();
+    expect(response.status).toBe(400);
+    expect((await response.text()) === body).toBe(true);
+  });
+});
+
+describe("Responses ID capture budget", () => {
+  function capture(text: string, streaming: boolean) {
+    const bytes = new TextEncoder().encode(text);
+    let offset = 0;
+    return captureProviderResponseBinding({
+      response: new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (offset === bytes.length) {
+              controller.close();
+              return;
+            }
+            const end = Math.min(offset + 64 * 1024, bytes.length);
+            controller.enqueue(bytes.subarray(offset, end));
+            offset = end;
+          },
+        }),
+      ),
+      streaming,
+      requester: {
+        userId: "owner",
+        source: "API_KEY",
+        limitKey: "key-1",
+        apiKeyId: "key-1",
+        apiKeyPrefix: "test",
+      },
+      targetPoolId: "pool-1",
+      shareId: null,
+      target: {
+        executionTargetId: "target",
+        providerAccountId: "account",
+        providerModelId: "model",
+        endpointIdentity: "endpoint",
+        endpointVersion: 1,
+        upstreamModelId: "upstream",
+      },
+      terminal: Promise.resolve({ ok: true }),
+    });
+  }
+
+  it.each([true, false])(
+    "fails capture after the character budget in streaming=%s mode",
+    async (streaming) => {
+      // A long first line without a newline must stop capture. Even a valid
+      // ID later in the stream must not revive it.
+      const oversized = streaming
+        ? `data: ${"x".repeat(2 * 1024 * 1024)}`
+        : " ".repeat(2 * 1024 * 1024);
+      const tail = streaming
+        ? '\ndata: {"response":{"id":"resp_late"}}\n'
+        : '{"id":"resp_late","object":"response"}';
+      await expect(capture(oversized + tail, streaming).text()).rejects.toThrow(
+        "Provider response did not include a response id",
+      );
+      expect(db.responseStickinessRecord.upsert).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([true, false])(
+    "captures an ID exactly at the character budget in streaming=%s mode",
+    async (streaming) => {
+      const payload = streaming
+        ? 'data: {"response":{"id":"resp_ok"}}\n'
+        : '{"id":"resp_ok","object":"response"}';
+      const padding = streaming
+        ? `:${"x".repeat(1024 * 1024 - payload.length - 2)}\n`
+        : " ".repeat(1024 * 1024 - payload.length);
+      const text = padding + payload;
+      expect((await capture(text, streaming).text()) === text).toBe(true);
+      expect(db.responseStickinessRecord.upsert).toHaveBeenCalledOnce();
+    },
+  );
 });

@@ -2,20 +2,15 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef, useState } from "react";
 import { authClient } from "@/lib/auth-client";
 import { MCP_REAUTH_STATUS_QUERY_KEY } from "@/lib/mcp-oauth-search";
+import { markExplicitSignOut } from "./use-reload-on-identity-change";
 
 /**
  * Sign-out for the MCP login page's tombstone-reauthorization branch
  * (Phase 6).
  *
- * `disableRedirect: true` and NO navigation: the signed `oauth_query` lives
- * in the CURRENT page URL, and keeping it there is what lets Better Auth's
- * `oauthProviderClient()` fetch plugin carry it through the new sign-in and
- * the session-cookie hook resume authorization with a new session-derived
- * grant generation. Navigating anywhere (including a "clean" reload with
- * rebuilt parameters) would either drop the signed query or require
- * reconstructing authorize parameters — both prohibited. After the cookie is
- * cleared, `useAuthSession` flips to anonymous and the route re-renders the
- * shared sign-in flow in place.
+ * `disableRedirect: true` preserves the signed `oauth_query` in the current
+ * URL. Success reloads that exact URL to drop all previous-identity client
+ * state before the shared sign-in flow resumes authorization.
  *
  * Part H pass 2 (R83/R84 F4/F5/F8):
  * - Failures are SURFACED (`signOutFailed`) so the login page renders a
@@ -44,18 +39,22 @@ export function useMcpReauthSignOut() {
   const signOutForReauth = useCallback(async () => {
     if (statusRef.current === "signing") return;
     setStatus("signing");
+    const undoSignOutMark = markExplicitSignOut();
     try {
       const result = await authClient.signOut({ disableRedirect: true });
       if (result.error) {
         // A failed sign-out leaves the session (and this card) in place; the
         // user can retry. Resolved { error } responses are surfaced to the UI
         // as a localized failure state (R83/R84 F4).
+        undoSignOutMark();
         setStatus("failed");
         return;
       }
       await queryClient.invalidateQueries({ queryKey: [MCP_REAUTH_STATUS_QUERY_KEY] });
       setStatus("done");
+      window.location.reload();
     } catch {
+      undoSignOutMark();
       setStatus("failed");
     }
   }, [queryClient, setStatus]);

@@ -55,6 +55,26 @@ beforeEach(() => {
 });
 
 describe("Test page routes", () => {
+  it("keeps the shared forced 2FA refusal ahead of Chat Test dispatch", async () => {
+    const root = new Hono<{ Variables: { session: Session | null } }>();
+    root.use("*", async (c, next) => {
+      c.set("session", { user: { id: "me", twoFactorEnabled: false } } as Session);
+      await next();
+    });
+    root.route("/chat-test", createChatTestRoutes({ twoFactorRequired: async () => true }));
+    const response = await root.request("/chat-test/embeddings", { method: "POST" });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: {
+        message: "Two-factor authentication setup is required.",
+        type: "invalid_request_error",
+        param: null,
+        code: "two_factor_required",
+      },
+    });
+    expect(modelTestHandler).not.toHaveBeenCalled();
+  });
+
   it("sends embeddings and file transcription as the person's Test traffic", async () => {
     vi.mocked(modelTestHandler).mockResolvedValue(json({ data: [] }, 200));
     const { root } = app();
