@@ -643,6 +643,89 @@ describe("spend settlement", () => {
     expect(state.ledger[0]).toMatchObject({ settledCost: D("1.00"), costKnown: false });
   });
 
+  it("settles OpenRouter's cost with no calculated cost beside it (a reasoning reply)", async () => {
+    // What the OpenRouter dialect returns for a complete reasoning reply whose schedule
+    // cannot price every category: the provider's cost, tagged with the attempt's price.
+    const input = await admitted();
+    await reconcileProviderBudget({
+      ...terminalFor(input),
+      reason: "COMPLETED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+      usage: {
+        inputTokens: 36n,
+        outputTokens: 4n,
+        reasoningTokens: 18n,
+        categoriesComplete: true,
+        reportedCost: "0.000013564",
+        reportedCostCurrency: "USD",
+        reportedCostPricingVersion: "v1",
+        reportedCostSource: "provider-runtime",
+        observationComplete: true,
+        accountingVersion: "provider-billable-v1",
+        confidence: "REPORTED",
+      },
+    });
+    expect(state.ledger[0]).toMatchObject({
+      settledCost: D("0.000013564"),
+      costKnown: true,
+      confidence: "REPORTED",
+    });
+  });
+
+  it("settles an OpenRouter refusal at zero for an attempt priced in another currency", async () => {
+    const input = attempt({
+      liability: {
+        tokens: 1000n,
+        spend: "1.00",
+        currency: "EUR",
+        pricingVersion: "v1",
+        accountingVersion: "provider-billable-v1",
+      },
+    });
+    await admitProviderBudget(input);
+    await reconcileProviderBudget({
+      ...terminalFor(input),
+      reason: "FAILED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+      observationComplete: true,
+      usage: {
+        inputTokens: 0n,
+        outputTokens: 0n,
+        categoriesComplete: true,
+        reportedCost: "0",
+        reportedCostCurrency: "USD",
+        reportedCostPricingVersion: "v1",
+        calculatedCost: "0",
+        calculatedCostCurrency: "EUR",
+        calculatedCostPricingVersion: "v1",
+        calculatedCostConfidence: "REPORTED",
+        accountingVersion: "provider-billable-v1",
+        confidence: "REPORTED",
+        observationComplete: true,
+      },
+    });
+    expect(state.ledger.at(-1)).toMatchObject({ settledCost: D("0"), costKnown: true });
+  });
+
+  it("records the provider's status and failure class on the finished attempt", async () => {
+    const input = await admitted();
+    await reconcileProviderBudget({
+      ...terminalFor(input),
+      reason: "FAILED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+      httpStatusCode: 400,
+      errorClass: "PROTOCOL",
+    });
+    expect(state.attempts.get(input.attemptId)).toMatchObject({
+      state: "FAILED",
+      httpStatusCode: 400,
+      errorClass: "PROTOCOL",
+    });
+  });
+
   it("appends corrections: a DELTA adds, an unknown DELTA tops up to the liability", async () => {
     const input = await admitted();
     const known = (cost: string) => ({

@@ -64,14 +64,23 @@ describe("strict cross-surface rendering", () => {
     expect(renderOpenAiChatRequest(canonical(false), "upstream")).not.toHaveProperty(
       "stream_options",
     );
-    expect(() =>
+    // A Chat client's own `stream_options.include_usage` (what OpenAI SDKs send) is
+    // honoured; any other stream option is not adaptable.
+    const chat = (stream_options: unknown) =>
       parseOpenAiChatRequest({
         model: "m",
         stream: true,
-        stream_options: { include_usage: false },
+        stream_options,
         messages: [{ role: "user", content: "hello" }],
-      }),
-    ).toThrow(/stream_options/u);
+      });
+    expect(chat({ include_usage: true })).toMatchObject({ streamUsage: true });
+    expect(chat({ include_usage: false })).toMatchObject({ streamUsage: false });
+    expect(chat({})).not.toHaveProperty("streamUsage");
+    expect(chat(undefined)).not.toHaveProperty("streamUsage");
+    expect(() => chat({ include_usage: true, include_obfuscation: true })).toThrow(
+      /stream_options/u,
+    );
+    expect(() => chat({ include_usage: "yes" })).toThrow(/include_usage/u);
   });
 
   it("rejects stop sequences when targeting Responses instead of silently dropping them", () => {
@@ -428,11 +437,11 @@ describe("upstream reply stream envelopes", () => {
             status: "in_progress",
             role: "assistant",
             content: [],
-            phase: "nope",
+            vendor_phase: "nope",
           },
         }),
       ),
-    ).toThrow(/phase/u);
+    ).toThrow(/vendor_phase/u);
 
     const anthropic = new CanonicalStreamParser("anthropic-messages");
     anthropic.push(

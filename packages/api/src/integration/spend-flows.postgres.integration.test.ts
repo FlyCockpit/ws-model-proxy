@@ -135,6 +135,8 @@ integration("cloud spend on PostgreSQL with the schema hardening", () => {
       accountId: account.id,
       upstreamModelId: "vendor/model-1",
       type: "LLM",
+      contextWindow: 32_768,
+      maxOutputTokens: 4_096,
     });
     await me.providers.models.update({ modelId: model.id, enabled: true });
     return { account, model };

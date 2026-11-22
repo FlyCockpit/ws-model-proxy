@@ -254,6 +254,35 @@ describe("request log", () => {
     );
   });
 
+  it("shows an own-key request's provider model to its requester only (BUG-8 placement)", async () => {
+    const ownKey = {
+      ...request,
+      route: "own_key",
+      selectedProviderModelId: "grantee-model",
+      selectedNodeId: null,
+      selectedInstanceId: null,
+      selectedVersionId: null,
+    };
+    db.pool.findMany.mockResolvedValue([] as never);
+    // The pool owner: the request went own-key, but which model is the share holder's.
+    db.relayRequest.findMany.mockResolvedValue([
+      { ...ownKey, userId: "grantee", resourceOwnerUserId: "owner" },
+    ] as never);
+    expect((await client().requests.list({ limit: 10 })).items[0]).toMatchObject({
+      route: "own_key",
+      providerModelId: null,
+    });
+    // The share holder (the requester) of someone else's pool: their own model, shown.
+    db.relayRequest.findMany.mockResolvedValue([
+      { ...ownKey, userId: "owner", resourceOwnerUserId: "pool-owner" },
+    ] as never);
+    expect((await client().requests.list({ limit: 10 })).items[0]).toMatchObject({
+      route: "own_key",
+      providerModelId: "grantee-model",
+      nodeId: null,
+    });
+  });
+
   it("refuses a forged cursor", async () => {
     await expect(client().requests.list({ limit: 10, cursor: "bm9wZQ" })).rejects.toMatchObject({
       code: "BAD_REQUEST",

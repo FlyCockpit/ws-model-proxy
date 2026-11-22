@@ -11,6 +11,8 @@ import {
   acceptChatChoiceExtras,
   acceptChatEnvelopeExtras,
   acceptChatMessageExtras,
+  acceptDirectToolCaller,
+  acceptMessagePhase,
   canonicalUsageFromCounts,
   ignoreUnknownEnvelopeFields,
   object,
@@ -60,6 +62,8 @@ export class CanonicalStreamParser {
   #observable = false;
   #lastSequence = -1;
   #nextResponseOutputIndex = 0;
+  /** Responses output indexes of reasoning items: their events are dropped. */
+  readonly #reasoningOutputs = new Map<number, { id: unknown; done: boolean }>();
   #aggregateBytes = 0;
   #pendingChatStop?: ReturnType<typeof stopReason>;
   #pendingChatFinishReason?: unknown;
@@ -490,6 +494,7 @@ export class CanonicalStreamParser {
       "response.incomplete",
       "response.failed",
       "error",
+      ...RESPONSES_REASONING_EVENTS,
     ]);
     if (!responseEvents.has(type))
       throw new AdapterError("unsupported_stream_event", `Unsupported Responses event: ${type}.`);
@@ -605,8 +610,16 @@ export class CanonicalStreamParser {
       throw new AdapterError("invalid_stream_event", `${type} requires output_index.`);
     const sourceIndex = typeof value.output_index === "number" ? value.output_index : 0;
     validIndex(sourceIndex);
-    const index = needsIndex ? this.#indexFor(`responses:${sourceIndex}`) : 0;
     const item = value.item && typeof value.item === "object" ? object(value.item) : {};
+    // Reasoning output items (and their summary/text events) are not answer content: they
+    // are dropped before they take a canonical item index, like Chat `reasoning` text.
+    if (
+      RESPONSES_REASONING_EVENTS.has(type) ||
+      (type === "response.output_item.added" && item.type === "reasoning") ||
+      (type === "response.output_item.done" && this.#reasoningOutputs.has(sourceIndex))
+    )
+      return [...events, ...this.#reasoningItem(type, value, item, sourceIndex)];
+    const index = needsIndex ? this.#indexFor(`responses:${sourceIndex}`) : 0;
     if (type === "response.output_item.added") {
       if (sourceIndex !== this.#nextResponseOutputIndex)
         throw new AdapterError(
@@ -616,11 +629,12 @@ export class CanonicalStreamParser {
       this.#nextResponseOutputIndex++;
       rejectUnknown(
         item,
-        ["id", "type", "status", "role", "content", "call_id", "name", "arguments"],
+        ["id", "type", "status", "role", "content", "call_id", "name", "arguments", "phase"],
         "stream.data.item",
       );
       if (item.type !== "message" && item.type !== "function_call")
         unsupported("stream.data.item.type");
+      acceptMessagePhase(item, "stream.data.item");
       if (item.status !== "in_progress")
         throw new AdapterError("invalid_item_status", "Responses added item must be in_progress.");
       if (
@@ -798,9 +812,10 @@ export class CanonicalStreamParser {
         item,
         this.#itemTypes.get(index) === "tool_call"
           ? ["id", "type", "call_id", "name", "arguments", "status"]
-          : ["id", "type", "role", "content", "status"],
+          : ["id", "type", "role", "content", "status", "phase"],
         "stream.data.item",
       );
+      if (this.#itemTypes.get(index) !== "tool_call") acceptMessagePhase(item, "stream.data.item");
       if (typeof item.id === "string" && this.#pendingResponseItems.get(index)?.id !== item.id)
         throw new AdapterError("item_id_mismatch", `Item ${index} changed IDs.`);
       if (this.#itemTypes.get(index) !== "tool_call" && !this.#completedResponseParts.has(index))
@@ -857,7 +872,30 @@ export class CanonicalStreamParser {
       const expected = [...this.#doneResponseItems.entries()]
         .sort(([left], [right]) => left - right)
         .map(([, done]) => done);
-      if (JSON.stringify(response.output) !== JSON.stringify(expected))
+      // The terminal output repeats the reasoning items dropped above, each completed and at
+      // its own index; only answer items are compared.
+      for (const [outputIndex, reasoning] of this.#reasoningOutputs) {
+        const repeated = response.output[outputIndex];
+        if (
+          !reasoning.done ||
+          !repeated ||
+          typeof repeated !== "object" ||
+          (repeated as Record<string, unknown>).type !== "reasoning" ||
+          (repeated as Record<string, unknown>).id !== reasoning.id ||
+          // A terminal that repeats it as anything but completed contradicts its done event.
+          ((repeated as Record<string, unknown>).status !== undefined &&
+            (repeated as Record<string, unknown>).status !== "completed")
+        )
+          throw new AdapterError(
+            "terminal_output_mismatch",
+            "Responses terminal output did not match completed reasoning items.",
+          );
+      }
+      const answerOutput = response.output.filter(
+        (_output, outputIndex) => !this.#reasoningOutputs.has(outputIndex),
+      );
+      // Same items, whatever order the provider serializes their keys in.
+      if (orderFreeJson(answerOutput) !== orderFreeJson(expected))
         throw new AdapterError(
           "terminal_output_mismatch",
           "Responses terminal output did not match completed items.",
@@ -891,6 +929,52 @@ export class CanonicalStreamParser {
       });
     }
     return events;
+  }
+
+  /** A dropped reasoning item's event: checked for its place in the stream, then dropped. */
+  #reasoningItem(
+    type: string,
+    value: Record<string, unknown>,
+    item: Record<string, unknown>,
+    sourceIndex: number,
+  ): CanonicalEvent[] {
+    if (!this.#started)
+      throw new AdapterError(
+        "event_before_start",
+        "Responses event arrived before response.created.",
+      );
+    if (this.#stopped)
+      throw new AdapterError("event_after_stop", "Responses event followed the stop barrier.");
+    if (typeof value.output_index !== "number")
+      throw new AdapterError("invalid_stream_event", `${type} requires output_index.`);
+    const known = this.#reasoningOutputs.get(sourceIndex);
+    if (type === "response.output_item.added") {
+      if (sourceIndex !== this.#nextResponseOutputIndex || known)
+        throw new AdapterError(
+          "invalid_stream_index",
+          "Responses output_index must be contiguous from zero.",
+        );
+      if (typeof item.id !== "string" || item.id === "")
+        throw new AdapterError("invalid_item_start", "Responses reasoning item requires an id.");
+      this.#nextResponseOutputIndex++;
+      this.#reasoningOutputs.set(sourceIndex, { id: item.id, done: false });
+      return [];
+    }
+    if (!known || known.done)
+      throw new AdapterError(
+        "reasoning_event_outside_item",
+        "Responses reasoning event arrived outside its reasoning item.",
+      );
+    // Every event of the item names it (`item_id`, or the done item's `id`).
+    if (type === "response.output_item.done") {
+      if (item.type !== "reasoning" || item.id !== known.id)
+        throw new AdapterError("item_id_mismatch", `Item ${sourceIndex} changed IDs.`);
+      if (item.status !== undefined && item.status !== "completed")
+        throw new AdapterError("invalid_done_status", "Responses done item must be completed.");
+      known.done = true;
+    } else if (value.item_id !== known.id)
+      throw new AdapterError("item_id_mismatch", `Item ${sourceIndex} changed IDs.`);
+    return [];
   }
 
   #anthropic(type: string, value: Record<string, unknown>): CanonicalEvent[] {
@@ -955,8 +1039,24 @@ export class CanonicalStreamParser {
     const index = blockEvent ? this.#indexFor(`anthropic:${sourceIndex}`) : 0;
     if (type === "content_block_start") {
       const block = object(value.content_block, "content_block");
-      rejectUnknown(block, ["type", "id", "name", "input", "text"], "content_block");
+      rejectUnknown(
+        block,
+        ["type", "id", "name", "input", "text", "citations", "caller"],
+        "content_block",
+      );
       if (block.type !== "text" && block.type !== "tool_use") unsupported("content_block.type");
+      // A text block opens with no citations (`[]`, as non-stream text may carry); citations
+      // themselves are not adaptable (and arrive as `citations_delta`, refused below).
+      if (block.citations !== undefined && block.citations !== null) {
+        if (block.type !== "text" || !Array.isArray(block.citations))
+          throw new AdapterError(
+            "invalid_block_start",
+            "Anthropic citations must be a text array.",
+          );
+        if (block.citations.length) unsupported("content_block.citations");
+      }
+      if (block.type === "tool_use") acceptDirectToolCaller(block.caller, "content_block.caller");
+      else if (block.caller !== undefined) unsupported("content_block.caller");
       if (block.type === "text" && block.text !== "")
         throw new AdapterError("invalid_block_start", "Anthropic text block must start empty.");
       if (
@@ -1017,7 +1117,11 @@ export class CanonicalStreamParser {
     } else if (type === "content_block_stop") events.push(...this.#completeItem(index));
     else if (type === "message_delta") {
       const delta = object(value.delta ?? {}, "delta");
-      rejectUnknown(delta, ["stop_reason", "stop_sequence"], "delta");
+      rejectUnknown(delta, ["stop_reason", "stop_sequence", "container", "stop_details"], "delta");
+      // A code-execution container or structured stop details have no other-surface form;
+      // null (what every plain reply carries) is their absence.
+      for (const key of ["container", "stop_details"] as const)
+        if (delta[key] !== undefined && delta[key] !== null) unsupported(`delta.${key}`);
       if (delta.stop_sequence !== null && delta.stop_sequence !== undefined)
         throw new AdapterError(
           "unsupported_stop_sequence",
@@ -1129,6 +1233,13 @@ function usageEvent(
   return usage ? { type: "usage", usage } : undefined;
 }
 
+/**
+ * The answer-bearing state of a Responses envelope: identity, status and its error,
+ * incomplete and usage fields. The rest of the envelope echoes the request's configuration
+ * (tools, tool choice, sampling, reasoning effort, service tier, ...) as the provider applied
+ * it, with its own defaults filled in: it carries no answer and is not compared. Reasoning
+ * output items are dropped by the parser; a structured (non-text) output format is refused.
+ */
 function validateResponseEnvelope(response: Record<string, unknown>) {
   if (!Number.isSafeInteger(response.created_at) || (response.created_at as number) < 0)
     throw new AdapterError("invalid_response_envelope", "Responses created_at is required.");
@@ -1136,66 +1247,16 @@ function validateResponseEnvelope(response: Record<string, unknown>) {
     throw new AdapterError("invalid_response_envelope", "Responses model is required.");
   if (!new Set(["in_progress", "completed", "incomplete", "failed"]).has(String(response.status)))
     throw new AdapterError("invalid_response_state", "Responses status is unsupported.");
-  for (const key of [
-    "error",
-    "incomplete_details",
-    "instructions",
-    "max_output_tokens",
-    "parallel_tool_calls",
-    "previous_response_id",
-    "reasoning",
-    "store",
-    "temperature",
-    "text",
-    "tool_choice",
-    "tools",
-    "top_p",
-    "truncation",
-    "metadata",
-    "usage",
-  ])
-    if (!(key in response))
-      throw new AdapterError("invalid_response_envelope", `Responses envelope is missing ${key}.`);
-  const emptyObject = (value: unknown) =>
-    value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value) &&
-    Object.keys(value).length === 0;
-  if (
-    response.instructions !== null ||
-    response.max_output_tokens !== null ||
-    response.parallel_tool_calls !== false ||
-    response.previous_response_id !== null ||
-    response.store !== false ||
-    response.temperature !== null ||
-    response.tool_choice !== "none" ||
-    !Array.isArray(response.tools) ||
-    response.tools.length !== 0 ||
-    response.top_p !== null ||
-    response.truncation !== "disabled" ||
-    !emptyObject(response.metadata)
-  )
-    throw new AdapterError(
-      "unsupported_response_configuration",
-      "Responses envelope contains unsupported mutable configuration.",
-    );
-  if (response.user !== undefined && response.user !== null)
-    unsupported("response.user", "is not safely adaptable");
-  if (
-    response.service_tier !== undefined &&
-    response.service_tier !== null &&
-    response.service_tier !== "default"
-  )
-    unsupported("response.service_tier", "is not safely adaptable");
-  const reasoning = object(response.reasoning, "response.reasoning");
-  rejectUnknown(reasoning, ["effort", "summary"], "response.reasoning");
-  if (reasoning.effort !== null || reasoning.summary !== null)
-    unsupported("response.reasoning", "is not safely adaptable");
-  const text = object(response.text, "response.text");
-  rejectUnknown(text, ["format"], "response.text");
-  const format = object(text.format, "response.text.format");
-  rejectUnknown(format, ["type"], "response.text.format");
-  if (format.type !== "text") unsupported("response.text.format.type");
+  // An absent state field is null (the documented empty value).
+  for (const key of ["error", "incomplete_details", "usage"] as const)
+    if (response[key] === undefined) response[key] = null;
+  if (response.text !== undefined && response.text !== null) {
+    const text = object(response.text, "response.text");
+    if (text.format !== undefined && text.format !== null) {
+      const format = object(text.format, "response.text.format");
+      if (format.type !== "text") unsupported("response.text.format.type");
+    }
+  }
   if (
     (response.status === "in_progress" &&
       (response.error !== null ||
@@ -1343,6 +1404,31 @@ function validateEmptyOptionalArray(value: unknown, parameter: string) {
   if (value.length) unsupported(parameter);
 }
 
+/** JSON with object keys sorted: equal documents compare equal in any key order. */
+function orderFreeJson(value: unknown): string {
+  const sorted = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(sorted);
+    if (item && typeof item === "object")
+      return Object.fromEntries(
+        Object.keys(item as Record<string, unknown>)
+          .sort()
+          .map((key) => [key, sorted((item as Record<string, unknown>)[key])]),
+      );
+    return item;
+  };
+  return JSON.stringify(sorted(value)) ?? "undefined";
+}
+
+/** Responses stream events of a reasoning item (its summary and text); never answer content. */
+const RESPONSES_REASONING_EVENTS = new Set([
+  "response.reasoning_summary_part.added",
+  "response.reasoning_summary_part.done",
+  "response.reasoning_summary_text.delta",
+  "response.reasoning_summary_text.done",
+  "response.reasoning_text.delta",
+  "response.reasoning_text.done",
+]);
+
 function responsesFields(type: string): readonly string[] {
   if (type === "error") return ["type", "code", "message", "param", "sequence_number"];
   if (type === "response.output_item.added" || type === "response.output_item.done")
@@ -1421,6 +1507,11 @@ export class CanonicalStreamRenderer {
   readonly #toolNames = new Map<number, string>();
   readonly #itemText = new Map<number, string>();
   readonly #chatToolIndexes = new Map<number, number>();
+  /** Chat tool calls whose first chunk (id, type, name) was sent. */
+  readonly #chatToolsOpened = new Set<number>();
+  /** Chat usage seen before the finish chunk: OpenAI sends it last, after the finish. */
+  #chatPendingUsage?: CanonicalEvent & { type: "usage" };
+  #chatFinished = false;
   readonly #wireIndexes = new Map<number, number>();
   readonly #responseOutput = new Map<number, Record<string, unknown>>();
   readonly #maxAggregateBytes: number;
@@ -1433,13 +1524,20 @@ export class CanonicalStreamRenderer {
   #terminal = false;
   #responseSequence = 0;
   #aggregateBytes = 0;
+  readonly #usageChunk: boolean;
 
   constructor(
     surface: ProtocolSurface,
-    options: { signal?: AbortSignal; maxAggregateBytes?: number } = {},
+    options: {
+      signal?: AbortSignal;
+      maxAggregateBytes?: number;
+      /** Chat only: false omits the usage chunk (no `stream_options.include_usage: true`). */
+      usageChunk?: boolean;
+    } = {},
   ) {
     this.#surface = surface;
     this.#signal = options.signal;
+    this.#usageChunk = options.usageChunk !== false;
     this.#maxAggregateBytes = options.maxAggregateBytes ?? 4 * 1024 * 1024;
   }
 
@@ -1622,7 +1720,11 @@ export class CanonicalStreamRenderer {
       return [
         { ...base, choices: [{ index: 0, delta: { refusal: event.delta }, finish_reason: null }] },
       ];
-    if (event.type === "tool_arguments_delta")
+    if (event.type === "tool_arguments_delta") {
+      // As OpenAI streams a call: id, type and name in its first chunk only (clients
+      // concatenate every string they receive), then the argument fragments.
+      const opening = !this.#chatToolsOpened.has(event.index);
+      this.#chatToolsOpened.add(event.index);
       return [
         {
           ...base,
@@ -1633,10 +1735,9 @@ export class CanonicalStreamRenderer {
                 tool_calls: [
                   {
                     index: this.#chatToolIndexes.get(event.index) ?? 0,
-                    id: event.id,
-                    type: "function",
+                    ...(opening ? { id: event.id, type: "function" } : {}),
                     function: {
-                      ...(event.name ? { name: event.name } : {}),
+                      ...(opening && event.name ? { name: event.name } : {}),
                       arguments: event.delta,
                     },
                   },
@@ -1647,19 +1748,26 @@ export class CanonicalStreamRenderer {
           ],
         },
       ];
-    if (event.type === "usage")
-      return [
-        {
-          ...base,
-          choices: [],
-          usage: {
-            prompt_tokens: event.usage.inputTokens,
-            completion_tokens: event.usage.outputTokens,
-            total_tokens: (event.usage.inputTokens ?? 0) + (event.usage.outputTokens ?? 0),
-          },
-        },
-      ];
-    if (event.type === "stop")
+    }
+    const usageChunk = (usage: CanonicalEvent & { type: "usage" }): WirePayload => ({
+      ...base,
+      choices: [],
+      usage: {
+        prompt_tokens: usage.usage.inputTokens,
+        completion_tokens: usage.usage.outputTokens,
+        total_tokens: (usage.usage.inputTokens ?? 0) + (usage.usage.outputTokens ?? 0),
+      },
+    });
+    if (event.type === "usage" && !this.#usageChunk) return [];
+    if (event.type === "usage") {
+      if (this.#chatFinished) return [usageChunk(event)];
+      this.#chatPendingUsage = event;
+      return [];
+    }
+    if (event.type === "stop") {
+      this.#chatFinished = true;
+      const pending = this.#chatPendingUsage;
+      this.#chatPendingUsage = undefined;
       return [
         {
           ...base,
@@ -1671,8 +1779,14 @@ export class CanonicalStreamRenderer {
             },
           ],
         },
+        ...(pending ? [usageChunk(pending)] : []),
       ];
-    if (event.type === "complete") return ["[DONE]"];
+    }
+    if (event.type === "complete") {
+      const pending = this.#chatPendingUsage;
+      this.#chatPendingUsage = undefined;
+      return [...(pending ? [usageChunk(pending)] : []), "[DONE]"];
+    }
     if (event.type === "reasoning_delta")
       throw new AdapterError(
         "unsupported_stream_event",

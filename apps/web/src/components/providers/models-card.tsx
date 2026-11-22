@@ -1,5 +1,10 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation } from "@tanstack/react-query";
+import {
+  defaultProviderModelSurfaces,
+  PROVIDER_MODEL_SURFACES,
+  type ProviderModelSurface,
+} from "@ws-model-proxy/api/lib/provider-model-capabilities";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -30,6 +35,15 @@ import {
   type ProviderModel,
   useProviderAction,
 } from "./provider-action";
+import { SurfacesChoice } from "./surfaces-choice";
+
+/** A token limit field: empty, or a whole number of tokens. */
+const TOKENS = /^[1-9][0-9]{0,9}$/;
+
+function tokensOrNull(value: string): number | null {
+  const trimmed = value.trim();
+  return trimmed === "" ? null : Number(trimmed);
+}
 
 /** The account's models: enable, prices, delete; add one by ID or from the catalog. */
 export function ModelsCard({ account }: { account: ProviderAccountDetail }) {
@@ -46,7 +60,7 @@ export function ModelsCard({ account }: { account: ProviderAccountDetail }) {
         ) : (
           <ul className="flex min-w-0 flex-col divide-y">
             {account.models.map((model) => (
-              <ModelRow key={model.id} model={model} />
+              <ModelRow key={model.id} model={model} providerType={account.providerType} />
             ))}
           </ul>
         )}
@@ -56,7 +70,7 @@ export function ModelsCard({ account }: { account: ProviderAccountDetail }) {
   );
 }
 
-function ModelRow({ model }: { model: ProviderModel }) {
+function ModelRow({ model, providerType }: { model: ProviderModel; providerType: string }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const action = useProviderAction();
   const [pricesOpen, setPricesOpen] = useState(false);
@@ -74,6 +88,11 @@ function ModelRow({ model }: { model: ProviderModel }) {
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         <span className="min-w-0 flex-1 break-all font-mono text-sm">{model.upstreamModelId}</span>
         <StatusPill tone="info">{t(`dashboard:models.type.${model.type}`)}</StatusPill>
+        {model.surfaces.map((surface) => (
+          <StatusPill key={surface} tone="muted">
+            {t(`dashboard:providers.surfaces.${surface}`)}
+          </StatusPill>
+        ))}
         {model.price ? (
           <span className="text-xs text-muted-foreground">
             {t("dashboard:providers.price", {
@@ -115,7 +134,15 @@ function ModelRow({ model }: { model: ProviderModel }) {
           <Trash aria-hidden="true" />
         </Button>
       </div>
-      {pricesOpen ? <ModelPricing model={model} /> : null}
+      {model.type === "LLM" && (model.contextWindow === null || model.maxOutputTokens === null) ? (
+        <p className="text-xs text-muted-foreground">{t("dashboard:providers.limitsMissing")}</p>
+      ) : null}
+      {pricesOpen ? (
+        <div className="flex min-w-0 flex-col gap-4">
+          <ModelSettings model={model} providerType={providerType} />
+          <ModelPricing model={model} />
+        </div>
+      ) : null}
       <ConfirmAction
         open={deleting}
         onOpenChange={setDeleting}
@@ -137,6 +164,128 @@ function ModelRow({ model }: { model: ProviderModel }) {
   );
 }
 
+/** A model's limits and native APIs. */
+function ModelSettings({ model, providerType }: { model: ProviderModel; providerType: string }) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  const action = useProviderAction();
+  const update = useMutation({
+    ...orpc.providers.models.update.mutationOptions(),
+    meta: { skipGlobalErrorToast: true },
+  });
+  const tokens = z
+    .string()
+    .trim()
+    .refine((value) => value === "" || TOKENS.test(value), t("dashboard:providers.tokensInvalid"));
+  const llm = model.type === "LLM";
+  const form = useForm({
+    defaultValues: {
+      contextWindow: model.contextWindow === null ? "" : String(model.contextWindow),
+      maxOutputTokens: model.maxOutputTokens === null ? "" : String(model.maxOutputTokens),
+      surfaces:
+        model.surfaces.length > 0 || !llm
+          ? model.surfaces
+          : defaultProviderModelSurfaces(providerType, model.upstreamModelId),
+    },
+    validators: {
+      onSubmit: z.object({
+        contextWindow: tokens,
+        maxOutputTokens: tokens,
+        surfaces: z
+          .array(z.enum(PROVIDER_MODEL_SURFACES))
+          .refine(
+            (surfaces) => !llm || surfaces.length > 0,
+            t("dashboard:providers.surfaces.required"),
+          ),
+      }),
+    },
+    onSubmit: async ({ value }) => {
+      const stored = new Set(model.surfaces);
+      const surfacesChanged =
+        llm &&
+        (value.surfaces.length !== stored.size ||
+          value.surfaces.some((surface) => !stored.has(surface)));
+      await action(() =>
+        update.mutateAsync({
+          modelId: model.id,
+          contextWindow: tokensOrNull(value.contextWindow),
+          maxOutputTokens: tokensOrNull(value.maxOutputTokens),
+          ...(surfacesChanged ? { surfaces: value.surfaces } : {}),
+        }),
+      );
+    },
+  });
+  return (
+    <form
+      className="flex min-w-0 flex-col gap-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        form.handleSubmit().catch(() => undefined);
+      }}
+    >
+      <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:flex-wrap">
+        <form.Field name="contextWindow">
+          {(field) => (
+            <div className="space-y-1.5 sm:w-40">
+              <Label htmlFor={`model-${model.id}-context`}>
+                {t("dashboard:providers.contextWindow")}
+              </Label>
+              <Input
+                id={`model-${model.id}-context`}
+                inputMode="numeric"
+                className="h-11"
+                value={field.state.value}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
+        <form.Field name="maxOutputTokens">
+          {(field) => (
+            <div className="space-y-1.5 sm:w-40">
+              <Label htmlFor={`model-${model.id}-output`}>
+                {t("dashboard:providers.maxOutputTokens")}
+              </Label>
+              <Input
+                id={`model-${model.id}-output`}
+                inputMode="numeric"
+                className="h-11"
+                value={field.state.value}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
+      </div>
+      {llm ? (
+        <form.Field name="surfaces">
+          {(field) => (
+            <div className="min-w-0">
+              <SurfacesChoice value={field.state.value} onChange={field.handleChange} />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
+      ) : null}
+      <form.Subscribe selector={(state) => state.isSubmitting}>
+        {(submitting) => (
+          <Button
+            type="submit"
+            size="touch"
+            variant="outline"
+            className="self-start"
+            disabled={submitting}
+          >
+            {t("dashboard:providers.saveModel")}
+          </Button>
+        )}
+      </form.Subscribe>
+    </form>
+  );
+}
+
 function AddModelForm({ account }: { account: ProviderAccountDetail }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const action = useProviderAction();
@@ -144,8 +293,19 @@ function AddModelForm({ account }: { account: ProviderAccountDetail }) {
     ...orpc.providers.models.create.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
   });
+  const tokens = z
+    .string()
+    .trim()
+    .refine((value) => value === "" || TOKENS.test(value), t("dashboard:providers.tokensInvalid"));
   const form = useForm({
-    defaultValues: { upstreamModelId: "", type: "LLM" as ModelType, contextWindow: "" },
+    defaultValues: {
+      upstreamModelId: "",
+      type: "LLM" as ModelType,
+      contextWindow: "",
+      maxOutputTokens: "",
+      // Null until the owner picks: the provider's defaults for the model id.
+      surfaces: null as ProviderModelSurface[] | null,
+    },
     validators: {
       onSubmit: z.object({
         upstreamModelId: z
@@ -154,24 +314,29 @@ function AddModelForm({ account }: { account: ProviderAccountDetail }) {
           .min(1, t("dashboard:providers.modelIdRequired"))
           .max(256),
         type: z.enum(MODEL_TYPES),
-        contextWindow: z
-          .string()
-          .trim()
+        contextWindow: tokens,
+        maxOutputTokens: tokens,
+        surfaces: z
+          .array(z.enum(PROVIDER_MODEL_SURFACES))
+          .nullable()
           .refine(
-            (value) => value === "" || /^[1-9][0-9]{0,9}$/.test(value),
-            t("dashboard:providers.contextWindowInvalid"),
+            (surfaces) => surfaces === null || surfaces.length > 0,
+            t("dashboard:providers.surfaces.required"),
           ),
       }),
     },
     onSubmit: async ({ value }) => {
-      const contextWindow = value.contextWindow.trim();
+      const contextWindow = tokensOrNull(value.contextWindow);
+      const maxOutputTokens = tokensOrNull(value.maxOutputTokens);
       const ok = await action(
         () =>
           create.mutateAsync({
             accountId: account.id,
             upstreamModelId: value.upstreamModelId.trim(),
             type: value.type,
-            ...(contextWindow ? { contextWindow: Number(contextWindow) } : {}),
+            ...(contextWindow !== null ? { contextWindow } : {}),
+            ...(maxOutputTokens !== null ? { maxOutputTokens } : {}),
+            ...(value.type === "LLM" && value.surfaces ? { surfaces: value.surfaces } : {}),
           }),
         t("dashboard:providers.modelAdded"),
       );
@@ -189,6 +354,10 @@ function AddModelForm({ account }: { account: ProviderAccountDetail }) {
             form.setFieldValue(
               "contextWindow",
               model.contextWindow === null ? "" : String(model.contextWindow),
+            );
+            form.setFieldValue(
+              "maxOutputTokens",
+              model.maxOutputTokens === null ? "" : String(model.maxOutputTokens),
             );
           }}
         />
@@ -252,6 +421,43 @@ function AddModelForm({ account }: { account: ProviderAccountDetail }) {
             </div>
           )}
         </form.Field>
+        <form.Field name="maxOutputTokens">
+          {(field) => (
+            <div className="space-y-1.5 sm:w-40">
+              <Label htmlFor="model-output">{t("dashboard:providers.maxOutputTokens")}</Label>
+              <Input
+                id="model-output"
+                inputMode="numeric"
+                className="h-11"
+                value={field.state.value}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
+        <form.Subscribe
+          selector={(state) => ({ type: state.values.type, id: state.values.upstreamModelId })}
+        >
+          {({ type, id }) =>
+            type === "LLM" ? (
+              <form.Field name="surfaces">
+                {(field) => (
+                  <div className="min-w-0 basis-full">
+                    <SurfacesChoice
+                      value={
+                        field.state.value ??
+                        defaultProviderModelSurfaces(account.providerType, id.trim())
+                      }
+                      onChange={field.handleChange}
+                    />
+                    <FieldErrors field={field} />
+                  </div>
+                )}
+              </form.Field>
+            ) : null
+          }
+        </form.Subscribe>
         <form.Subscribe selector={(state) => state.isSubmitting}>
           {(submitting) => (
             <Button type="submit" size="touch" disabled={submitting}>

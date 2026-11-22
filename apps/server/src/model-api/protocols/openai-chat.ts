@@ -67,7 +67,15 @@ export function parseOpenAiChatRequest(input: unknown): CanonicalRequest {
   if (body.seed !== undefined) unsupported("seed");
   if (body.user !== undefined)
     unsupported("user", "provider-side persisted identifiers are not adaptable");
-  if (body.stream_options !== undefined) unsupported("stream_options");
+  // `include_usage` is what OpenAI SDKs send: an adapted Chat stream ends with the usage
+  // chunk only when it is true, as OpenAI's do. Other stream options are not adaptable.
+  let includeUsage: boolean | undefined;
+  if (body.stream_options !== undefined && body.stream_options !== null) {
+    const streamOptions = object(body.stream_options, "stream_options");
+    rejectUnknown(streamOptions, ["include_usage"], "stream_options");
+    if (streamOptions.include_usage !== undefined)
+      includeUsage = boolean(streamOptions.include_usage, "stream_options.include_usage");
+  }
   const tools = parseTools(body.tools, "tools", "openai-chat");
   if (tools.length && body.parallel_tool_calls !== false)
     invalid("parallel_tool_calls", "must explicitly be false when tools are adapted");
@@ -174,6 +182,7 @@ export function parseOpenAiChatRequest(input: unknown): CanonicalRequest {
     toolChoice,
     parallelToolCalls: "single",
     stream: boolean(body.stream, "stream"),
+    ...(includeUsage !== undefined ? { streamUsage: includeUsage } : {}),
     sampling: chatSampling,
     limitations: instructions.some((item) => item.role === "developer")
       ? ["anthropic_instruction_authority_collapse"]

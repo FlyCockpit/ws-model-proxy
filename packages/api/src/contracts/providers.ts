@@ -1,5 +1,6 @@
 /** Providers and spend caps. Every write here is human-only (cloud spend and provider keys). */
 import { z } from "zod";
+import { PROVIDER_MODEL_SURFACES } from "../lib/provider-model-capabilities";
 import {
   ATTEMPT_STATE,
   currencySchema,
@@ -21,6 +22,15 @@ import {
 import { mutation, query } from "./procedure";
 
 export const PROVIDER_TYPES = ["openrouter", "generic"] as const;
+
+/** The generation APIs a provider serves natively for a model. */
+export const providerModelSurfacesSchema = z
+  .array(z.enum(PROVIDER_MODEL_SURFACES))
+  .min(1)
+  .max(PROVIDER_MODEL_SURFACES.length)
+  .refine((surfaces) => new Set(surfaces).size === surfaces.length, {
+    message: "Each API once.",
+  });
 
 export const spendViewSchema = z
   .object({
@@ -68,6 +78,8 @@ export const providerModelViewSchema = z
     health: z.enum(PROVIDER_HEALTH),
     contextWindow: z.number().int().nullable(),
     maxOutputTokens: z.number().int().nullable(),
+    /** The APIs the provider serves natively for it (others are adapted); empty: none. */
+    surfaces: z.array(z.enum(PROVIDER_MODEL_SURFACES)),
     /** Active price per million tokens (input/output), when known. */
     price: z
       .object({ input: moneySchema, output: moneySchema, currency: currencySchema })
@@ -211,10 +223,15 @@ export const providersContract = {
           type: z.enum(MODEL_TYPE),
           contextWindow: z.number().int().positive().optional(),
           maxOutputTokens: z.number().int().positive().optional(),
+          /**
+           * Native APIs; default by provider: OpenRouter Chat Completions, plus Responses for
+           * `openai/*` and Messages for `anthropic/*`; generic Chat Completions.
+           */
+          surfaces: providerModelSurfacesSchema.optional(),
         })
         .strict(),
       providerModelViewSchema,
-      "Add a provider model (disabled until enabled).",
+      "Add a provider model (disabled until enabled). An OpenRouter model takes its features, context, output limit and price from the OpenRouter catalog when listed there.",
     ),
     update: mutation(
       "human",
@@ -225,6 +242,7 @@ export const providersContract = {
           enabled: z.boolean().optional(),
           contextWindow: z.number().int().positive().nullable().optional(),
           maxOutputTokens: z.number().int().positive().nullable().optional(),
+          surfaces: providerModelSurfacesSchema.optional(),
         })
         .strict(),
       providerModelViewSchema,
@@ -284,6 +302,7 @@ export const providersContract = {
                 name: z.string(),
                 type: z.enum(MODEL_TYPE),
                 contextWindow: z.number().int().nullable(),
+                maxOutputTokens: z.number().int().nullable(),
               })
               .strict(),
           ),
@@ -303,7 +322,9 @@ export const providersContract = {
             createdAt: isoDateSchema,
             providerModelId: idSchema,
             poolId: idSchema.nullable(),
+            /** Prompt tokens, cached and cache-write tokens included. */
             inputTokens: z.number().int().nullable(),
+            /** Completion tokens, reasoning tokens included. */
             outputTokens: z.number().int().nullable(),
             cost: moneySchema.nullable(),
             currency: currencySchema.nullable(),
@@ -328,10 +349,12 @@ export const providersContract = {
             providerModelId: idSchema.nullable(),
             httpStatusCode: z.number().int().nullable(),
             errorClass: z.string().nullable(),
+            /** Why it ended or was not tried (e.g. PRICING_UNAVAILABLE, REQUEST_RENDER_FAILED). */
+            reason: z.string().nullable(),
           })
           .strict(),
       ),
-      "Cloud attempts.",
+      "Cloud attempts, including members skipped before sending and why.",
     ),
   },
   spendCaps: {

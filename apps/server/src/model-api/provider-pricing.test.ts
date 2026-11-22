@@ -60,7 +60,59 @@ describe("provider pricing and usage accounting", () => {
       pricingVersion: "2026-08-25",
       accountingVersion: "provider-billable-v2",
     });
-    expect(new Prisma.Decimal(liability.spend!).toString()).toBe("0.00775");
+    // 1000 input at the cache-write rate 2.5 (an input token may be a cache write), 500 output
+    // at 8, plus the allowances: (2500 + 4000 + 800 + 200 + 500 + 250) / 1e6.
+    expect(new Prisma.Decimal(liability.spend!).toString()).toBe("0.00825");
+  });
+
+  it("reserves at least what any reply within the bounds can cost, dearer categories included", () => {
+    // A catalog import: reasoning dearer than output, cache writes dearer than input, and no
+    // allowance for either (all within the input estimate and the output bound).
+    const dearer = parsePricingSchedule({
+      id: "dearer",
+      version: "v1",
+      currency: "USD",
+      accountingVersion: "provider-billable-v1",
+      confidence: "CALCULATED",
+      effectiveAt: new Date("2026-08-25T00:00:00Z"),
+      pricing: {
+        ratesPerMillion: { input: "1", output: "1", reasoning: "10", cacheWrite: "1.25" },
+      },
+      chargeRules: {
+        inputIncludesCacheRead: false,
+        inputIncludesCacheWrite: false,
+        outputIncludesReasoning: false,
+        outputIncludesTool: false,
+        reasoningAllowanceTokens: 0,
+        toolAllowanceTokens: 0,
+        cacheReadAllowanceTokens: 0,
+        cacheWriteAllowanceTokens: 0,
+        additionalAllowanceTokens: 0,
+        unknownCategories: "FAIL_CLOSED",
+      },
+    });
+    if (!dearer) throw new Error("expected a schedule");
+    const liability = liabilityFromPricing({
+      estimatedInputTokens: 1_000n,
+      requestedOutputTokens: 1_000n,
+      pricing: dearer,
+    });
+    // The dearest reply the bounds allow: every input token a cache write, every output token
+    // reasoning.
+    const worst = calculatedCostForUsage(
+      {
+        inputTokens: 0n,
+        cacheWriteTokens: 1_000n,
+        outputTokens: 0n,
+        reasoningTokens: 1_000n,
+        categoriesComplete: true,
+        accountingVersion: "provider-billable-v1",
+        confidence: "REPORTED",
+      },
+      dearer,
+    );
+    expect(worst?.toString()).toBe("0.01125");
+    expect(new Prisma.Decimal(liability.spend!).greaterThanOrEqualTo(worst!)).toBe(true);
   });
 
   it("de-duplicates OpenAI aggregate cached and reasoning token details", () => {

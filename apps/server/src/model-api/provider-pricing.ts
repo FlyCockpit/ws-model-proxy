@@ -83,6 +83,12 @@ export function parsePricingSchedule(row: {
     const parsed = decimalRate(ratesValue[key]);
     if (parsed) rates[key] = parsed;
   }
+  // Reasoning tokens are output tokens billed at the output rate (OpenAI and OpenRouter count
+  // them inside `completion_tokens`; the usage parser only splits them out). A schedule that
+  // names no reasoning rate prices them as output instead of leaving every reasoning reply
+  // without a calculable cost. The other categories have no such universal rate and stay
+  // fail-closed.
+  rates.reasoning ??= output;
   return {
     id: row.id,
     version: row.version,
@@ -183,9 +189,21 @@ export function liabilityFromPricing(input: {
       pricingVersion: input.pricing.version,
       accountingVersion: input.pricing.accountingVersion,
     };
-  const spend = input.pricing.rates.input
+  // The input estimate and the output bound may each turn out to be tokens of a dearer
+  // category (cache writes are input, reasoning and tool tokens are output, audio either):
+  // each bound is reserved at the highest rate of what it can contain, so a reply never
+  // settles above its reservation for the price of a category alone.
+  const rates = input.pricing.rates;
+  const highest = (...candidates: Array<Prisma.Decimal | undefined>) =>
+    candidates.reduce<Prisma.Decimal>(
+      (top, rate) => (rate?.greaterThan(top) ? rate : top),
+      new Prisma.Decimal(0),
+    );
+  const inputBoundRate = highest(rates.input, rates.cacheRead, rates.cacheWrite, rates.additional);
+  const outputBoundRate = highest(rates.output, rates.reasoning, rates.tool, rates.additional);
+  const spend = inputBoundRate
     .mul(input.estimatedInputTokens.toString())
-    .plus(input.pricing.rates.output.mul(input.requestedOutputTokens.toString()))
+    .plus(outputBoundRate.mul(input.requestedOutputTokens.toString()))
     .plus((input.pricing.rates.reasoning ?? input.pricing.rates.output).mul(reasoning.toString()))
     .plus((input.pricing.rates.tool ?? input.pricing.rates.output).mul(tool.toString()))
     .plus(

@@ -68,6 +68,8 @@ export type ExternalRouteErrorCode =
   | "external_required"
   | "external_unavailable"
   | "grantee_spend_cap"
+  /** A provider account cap applies and the model has no active price (owner configuration). */
+  | "provider_pricing_missing"
   | "local_members_required"
   /** D9: OpenRouter has no upstream provider that accepts `data_collection: "deny"`. */
   | "provider_data_policy_unavailable";
@@ -87,6 +89,7 @@ const errorStatus: Record<ExternalRouteErrorCode, number> = {
   external_required: 400,
   external_unavailable: 503,
   grantee_spend_cap: 429,
+  provider_pricing_missing: 400,
   local_members_required: 400,
   provider_data_policy_unavailable: 503,
 };

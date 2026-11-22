@@ -124,13 +124,14 @@ function AttemptList({
                 <TimeAgo value={row.createdAt} />
               </span>
             </div>
-            {row.httpStatusCode !== null || row.errorClass ? (
+            {row.httpStatusCode !== null || row.errorClass || row.reason ? (
               <p className="break-all text-xs text-muted-foreground">
                 {[
                   row.httpStatusCode !== null
                     ? t("dashboard:providers.activity.http", { status: row.httpStatusCode })
                     : null,
                   row.errorClass,
+                  row.reason,
                 ]
                   .filter(Boolean)
                   .join(" · ")}

@@ -5,7 +5,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { ORPCError } from "@orpc/server";
-import prisma, { type Prisma } from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { providerAccountSpendCurrencies } from "@ws-model-proxy/db/spend";
 import { env } from "@ws-model-proxy/env/server";
@@ -19,6 +19,7 @@ import {
   CATALOG_CHARGE_RULES,
   CATALOG_SEARCH_MAX_LIMIT,
   type CatalogModel,
+  catalogRatesPerMillion,
   searchCatalog,
 } from "../lib/provider-catalog-model";
 import {
@@ -28,6 +29,12 @@ import {
   providerCredentialNeedsRotation,
 } from "../lib/provider-credential-crypto";
 import { providerHttpsRequest, validateProviderBaseUrl } from "../lib/provider-egress";
+import {
+  defaultProviderModelSurfaces,
+  type ProviderModelSurface,
+  ProviderModelSurfacesError,
+  providerModelInventory,
+} from "../lib/provider-model-capabilities";
 import {
   classifyCredentialProbeStatus,
   providerCredentialProbe,
@@ -175,6 +182,13 @@ async function dropCloudMembers(tx: Tx, providerModelIds: string[]) {
   await tx.poolMember.deleteMany({ where: { providerModelId: { in: providerModelIds } } });
 }
 
+/** The sum of the known parts, or null when none is known. */
+function tokenSum(...parts: Array<bigint | null>): number | null {
+  const known = parts.filter((part): part is bigint => part !== null);
+  if (known.length === 0) return null;
+  return Number(known.reduce((sum, part) => sum + part, 0n));
+}
+
 let catalog: ReturnType<typeof createProviderCatalog> | null = null;
 function openRouterCatalog() {
   catalog ??= createProviderCatalog({
@@ -185,6 +199,49 @@ function openRouterCatalog() {
       }),
   });
   return catalog;
+}
+
+/** The OpenRouter catalog entry for this model id, or null when unlisted or unavailable. */
+async function openRouterCatalogModel(upstreamModelId: string): Promise<CatalogModel | null> {
+  const result = await openRouterCatalog().get();
+  if (result.status !== "ok") return null;
+  return result.models.find((model) => model.id === upstreamModelId) ?? null;
+}
+
+/**
+ * The capability inventory a language model is stored with: the declared surfaces (or the
+ * provider type's defaults) and, for OpenRouter, the catalog's features. Other model types
+ * declare no generation surfaces.
+ */
+function modelInventory(input: {
+  providerType: string;
+  type: string;
+  upstreamModelId: string;
+  surfaces: readonly ProviderModelSurface[] | undefined;
+  catalog: CatalogModel | null;
+}): Prisma.InputJsonValue | undefined {
+  if (input.type !== "LLM") {
+    if (input.surfaces)
+      throw new ORPCError("BAD_REQUEST", { message: "Only language models serve these APIs." });
+    return undefined;
+  }
+  try {
+    return providerModelInventory({
+      providerType: input.providerType,
+      surfaces:
+        input.surfaces ?? defaultProviderModelSurfaces(input.providerType, input.upstreamModelId),
+      catalog: input.catalog,
+      source: input.surfaces ? "declared" : "provider",
+    }) as Prisma.InputJsonValue;
+  } catch (error) {
+    if (error instanceof ProviderModelSurfacesError)
+      throw new ORPCError("BAD_REQUEST", { message: error.message });
+    throw error;
+  }
+}
+
+function isOpenRouterAccount(providerType: string): boolean {
+  return providerType.trim().toLowerCase() === "openrouter";
 }
 
 function catalogType(model: CatalogModel): "LLM" | "EMBEDDINGS" | "TRANSCRIPTION" {
@@ -623,7 +680,45 @@ export const providersRouter = {
     }),
     create: contractProcedure(c.models.create).handler(async ({ input, context }) => {
       const userId = userIdOf(context);
-      await ownedAccount(userId, input.accountId);
+      const account = await ownedAccount(userId, input.accountId);
+      // An OpenRouter model takes what the catalog knows: features, limits and its price.
+      const catalogModel =
+        input.type === "LLM" && isOpenRouterAccount(account.providerType)
+          ? await openRouterCatalogModel(input.upstreamModelId)
+          : null;
+      const nativeCapabilities = modelInventory({
+        providerType: account.providerType,
+        type: input.type,
+        upstreamModelId: input.upstreamModelId,
+        surfaces: input.surfaces,
+        catalog: catalogModel,
+      });
+      // Both limits bound every cloud request (and its reserved spend): a model serves only
+      // with both known, so the catalog fills what the owner left out.
+      const contextWindow = input.contextWindow ?? catalogModel?.contextLength ?? null;
+      const maxOutputTokens = input.maxOutputTokens ?? catalogModel?.maxCompletionTokens ?? null;
+      const catalogRates = catalogModel ? catalogRatesPerMillion(catalogModel) : null;
+      // The first price of a model with none: the catalog's, active at once.
+      const importCatalogPrice = async (tx: Tx, providerModelId: string) => {
+        if (!catalogRates) return;
+        if ((await tx.providerPricingVersion.count({ where: { providerModelId } })) > 0) return;
+        const now = new Date();
+        await tx.providerPricingVersion.create({
+          data: {
+            userId,
+            providerAccountId: input.accountId,
+            providerModelId,
+            version: "v1",
+            currency: "USD",
+            status: "ACTIVE",
+            activatedAt: now,
+            effectiveAt: now,
+            confidence: "CALCULATED",
+            pricing: { ratesPerMillion: catalogRates, source: "openrouter-catalog" },
+            chargeRules: CATALOG_CHARGE_RULES,
+          },
+        });
+      };
       let modelId: string;
       try {
         modelId = await graphWrite([userId], async (tx) => {
@@ -657,10 +752,12 @@ export const providersRouter = {
                 deletedAt: null,
                 enabled: false,
                 displayName: input.displayName ?? null,
-                contextWindow: input.contextWindow ?? null,
-                maxOutputTokens: input.maxOutputTokens ?? null,
+                contextWindow,
+                maxOutputTokens,
+                nativeCapabilities: nativeCapabilities ?? Prisma.DbNull,
               },
             });
+            await importCatalogPrice(tx, deleted.id);
             return withTarget(deleted.id);
           }
           const model = await tx.providerModel.create({
@@ -670,12 +767,14 @@ export const providersRouter = {
               upstreamModelId: input.upstreamModelId,
               displayName: input.displayName ?? null,
               type: input.type,
-              contextWindow: input.contextWindow ?? null,
-              maxOutputTokens: input.maxOutputTokens ?? null,
+              contextWindow,
+              maxOutputTokens,
+              ...(nativeCapabilities ? { nativeCapabilities } : {}),
               enabled: false,
             },
             select: { id: true },
           });
+          await importCatalogPrice(tx, model.id);
           await audit(tx, context, {
             accountId: input.accountId,
             action: "provider.model.create",
@@ -699,9 +798,44 @@ export const providersRouter = {
       const userId = userIdOf(context);
       const model = await prisma.providerModel.findFirst({
         where: { id: input.modelId, userId, deletedAt: null },
-        select: { id: true, providerAccountId: true },
+        select: {
+          id: true,
+          providerAccountId: true,
+          type: true,
+          upstreamModelId: true,
+          contextWindow: true,
+          maxOutputTokens: true,
+          Account: { select: { providerType: true } },
+        },
       });
       if (!model) throw notFound("That provider model does not exist.");
+      if (input.enabled === true && model.type === "LLM") {
+        const contextWindow =
+          input.contextWindow !== undefined ? input.contextWindow : model.contextWindow;
+        const maxOutputTokens =
+          input.maxOutputTokens !== undefined ? input.maxOutputTokens : model.maxOutputTokens;
+        // Cloud requests are bounded (and their spend reserved) by both limits: without them
+        // the model would be on and refuse every request.
+        if (contextWindow === null || maxOutputTokens === null)
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Set the model's context window and maximum output tokens before using it.",
+          });
+      }
+      const nativeCapabilities =
+        input.surfaces === undefined
+          ? undefined
+          : modelInventory({
+              providerType: model.Account.providerType,
+              type: model.type,
+              upstreamModelId: model.upstreamModelId,
+              surfaces: input.surfaces,
+              catalog:
+                model.type === "LLM" && isOpenRouterAccount(model.Account.providerType)
+                  ? await openRouterCatalogModel(model.upstreamModelId)
+                  : null,
+            });
+      // New APIs change where the model's requests go: they decide under its target fences.
+      const reroutes = input.enabled === false || nativeCapabilities !== undefined;
       await graphWrite(
         [userId],
         async (tx) => {
@@ -709,6 +843,7 @@ export const providersRouter = {
           await tx.providerModel.update({
             where: { id: model.id },
             data: {
+              ...(nativeCapabilities !== undefined ? { nativeCapabilities } : {}),
               ...(input.displayName !== undefined ? { displayName: input.displayName } : {}),
               ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
               ...(input.contextWindow !== undefined ? { contextWindow: input.contextWindow } : {}),
@@ -722,13 +857,15 @@ export const providersRouter = {
           await audit(tx, context, {
             accountId: model.providerAccountId,
             action: "provider.model.update",
-            after: { modelId: model.id, enabled: input.enabled ?? null },
+            after: {
+              modelId: model.id,
+              enabled: input.enabled ?? null,
+              ...(input.surfaces ? { surfaces: input.surfaces } : {}),
+            },
           });
         },
         (tx) =>
-          input.enabled === false
-            ? modelTargetFences(tx, { providerModelIds: [model.id] })
-            : Promise.resolve([]),
+          reroutes ? modelTargetFences(tx, { providerModelIds: [model.id] }) : Promise.resolve([]),
       );
       return modelView(
         await prisma.providerModel.findUniqueOrThrow({
@@ -903,6 +1040,7 @@ export const providersRouter = {
           name: model.name,
           type: catalogType(model),
           contextWindow: model.contextLength,
+          maxOutputTokens: model.maxCompletionTokens,
         })),
       };
     }),
@@ -925,6 +1063,9 @@ export const providersRouter = {
           poolId: true,
           inputTokens: true,
           outputTokens: true,
+          cacheReadTokens: true,
+          cacheWriteTokens: true,
+          reasoningTokens: true,
           settledCost: true,
           currency: true,
           confidence: true,
@@ -937,8 +1078,10 @@ export const providersRouter = {
           createdAt: row.createdAt.toISOString(),
           providerModelId: row.providerModelId,
           poolId: row.poolId,
-          inputTokens: row.inputTokens === null ? null : Number(row.inputTokens),
-          outputTokens: row.outputTokens === null ? null : Number(row.outputTokens),
+          // The ledger keeps cache and reasoning tokens apart from input and output; the
+          // view shows the provider's own prompt and completion counts.
+          inputTokens: tokenSum(row.inputTokens, row.cacheReadTokens, row.cacheWriteTokens),
+          outputTokens: tokenSum(row.outputTokens, row.reasoningTokens),
           cost: row.settledCost === null ? null : moneyString(row.settledCost),
           currency: row.currency,
           confidence: row.confidence,
@@ -967,11 +1110,20 @@ export const providersRouter = {
           providerModelId: true,
           httpStatusCode: true,
           errorClass: true,
+          terminalReason: true,
         },
       });
       const page = rows.slice(0, input.limit);
       return {
-        items: page.map((row) => ({ ...row, createdAt: row.createdAt.toISOString() })),
+        items: page.map(({ terminalReason, ...row }) => ({
+          ...row,
+          createdAt: row.createdAt.toISOString(),
+          // A plain outcome is the state itself; a skip or failure names its cause.
+          reason:
+            terminalReason && !["COMPLETED", "FAILED", "CANCELLED"].includes(terminalReason)
+              ? terminalReason
+              : null,
+        })),
         nextCursor: rows.length > input.limit ? (page.at(-1)?.id ?? null) : null,
       };
     }),

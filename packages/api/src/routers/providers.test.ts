@@ -31,6 +31,12 @@ const spend = vi.hoisted(() => ({
   providerAccountSpendCurrencies: vi.fn(),
 }));
 vi.mock("@ws-model-proxy/db/spend", () => spend);
+// The OpenRouter catalog (a keyless outbound fetch): disabled unless a test lists models.
+const catalog = vi.hoisted(() => ({ get: vi.fn() }));
+vi.mock("../lib/provider-catalog", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/provider-catalog")>()),
+  createProviderCatalog: () => ({ get: catalog.get, reset: () => undefined }),
+}));
 vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
   isForceTwoFactorRequired: vi.fn(async () => false),
 }));
@@ -100,6 +106,7 @@ beforeEach(() => {
   db.$transaction.mockImplementation(((work: (tx: PrismaClient) => unknown) => work(db)) as never);
   spend.providerAccountSpend.mockResolvedValue(usage("0", "0"));
   spend.providerAccountSpendCurrencies.mockResolvedValue([]);
+  catalog.get.mockResolvedValue({ status: "disabled", reason: "EXTERNAL_PROVIDERS_DISABLED" });
   db.providerAccount.findUniqueOrThrow.mockResolvedValue({
     currentCredentialId: "cred-1",
     baseUrl: "https://openrouter.ai/api/v1",
@@ -521,6 +528,8 @@ describe("provider review follow-ups", () => {
       health: "UNKNOWN",
       contextWindow: null,
       maxOutputTokens: null,
+      nativeCapabilities: null,
+      Account: { providerType: "openrouter" },
       PricingVersions: [],
     } as never);
     const view = await client().models.create({
@@ -552,6 +561,8 @@ describe("provider review follow-ups", () => {
       health: "UNKNOWN",
       contextWindow: null,
       maxOutputTokens: null,
+      nativeCapabilities: null,
+      Account: { providerType: "openrouter" },
       PricingVersions: [],
     } as never);
     let fencedWhenTargetCreated: string[] = [];
@@ -566,6 +577,260 @@ describe("provider review follow-ups", () => {
       skipDuplicates: true,
     });
     expect(fencedWhenTargetCreated).toEqual(["00:owner:owner-1"]);
+  });
+
+  function createdModel(overrides: Record<string, unknown> = {}) {
+    db.providerModel.findFirst.mockResolvedValue(null);
+    db.providerModel.create.mockResolvedValue({ id: "pm-new" } as never);
+    db.providerModel.findUniqueOrThrow.mockImplementation((() =>
+      Promise.resolve({
+        id: "pm-new",
+        providerAccountId: "acc-1",
+        upstreamModelId: "m",
+        displayName: null,
+        type: "LLM",
+        enabled: false,
+        health: "UNKNOWN",
+        contextWindow: null,
+        maxOutputTokens: null,
+        nativeCapabilities: db.providerModel.create.mock.calls[0]?.[0]?.data.nativeCapabilities,
+        Account: { providerType: "openrouter" },
+        PricingVersions: [],
+        ...overrides,
+      })) as never);
+  }
+
+  it("a model added through the product can serve: it is stored with its APIs (#BUG-1)", async () => {
+    db.providerAccount.findFirst.mockResolvedValue(accountRow() as never);
+    createdModel();
+    const view = await client().models.create({
+      accountId: "acc-1",
+      upstreamModelId: "anthropic/claude-haiku-5.5",
+      type: "LLM",
+    });
+    const data = db.providerModel.create.mock.calls[0]?.[0]?.data;
+    expect(data?.nativeCapabilities).toMatchObject({
+      version: 4,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: { streaming: true, operations: ["create"] },
+        anthropicMessages: { streaming: true, operations: ["create"] },
+      },
+    });
+    expect(view.surfaces).toEqual(["OPENAI_CHAT_COMPLETIONS", "ANTHROPIC_MESSAGES"]);
+    // Without the catalog nothing is priced or bounded on the owner's behalf.
+    expect(db.providerPricingVersion.create).not.toHaveBeenCalled();
+  });
+
+  it("an OpenRouter model takes the catalog's features, limits and price (#BUG-2)", async () => {
+    db.providerAccount.findFirst.mockResolvedValue(accountRow() as never);
+    db.providerPricingVersion.count.mockResolvedValue(0);
+    createdModel();
+    catalog.get.mockResolvedValue({
+      status: "ok",
+      stale: false,
+      fetchedAt: new Date(),
+      models: [
+        {
+          id: "deepseek/deepseek-v4.1-flash-1017",
+          name: "DeepSeek",
+          contextLength: 163_840,
+          maxCompletionTokens: null,
+          pricing: {
+            prompt: "0.0000003",
+            completion: "0.0000012",
+            cacheRead: null,
+            cacheWrite: null,
+            reasoning: null,
+            variable: false,
+            tiers: [],
+          },
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          supportsTools: true,
+          supportsReasoning: true,
+          supportsStructuredOutput: false,
+          expirationDate: null,
+          moderated: false,
+          free: false,
+        },
+      ],
+    });
+    await client().models.create({
+      accountId: "acc-1",
+      upstreamModelId: "deepseek/deepseek-v4.1-flash-1017",
+      type: "LLM",
+    });
+    const data = db.providerModel.create.mock.calls[0]?.[0]?.data;
+    // The catalog lists no output limit for it: that one stays for the owner to set.
+    expect(data).toMatchObject({ contextWindow: 163_840, maxOutputTokens: null });
+    expect(data?.nativeCapabilities).toMatchObject({
+      surfaces: {
+        openaiChatCompletions: {
+          tools: true,
+          reasoning: true,
+          structuredOutput: false,
+          maxContextTokens: 163_840,
+        },
+      },
+    });
+    expect(db.providerPricingVersion.create).toHaveBeenCalledTimes(1);
+    expect(db.providerPricingVersion.create.mock.calls[0]?.[0]?.data).toMatchObject({
+      providerModelId: "pm-new",
+      status: "ACTIVE",
+      currency: "USD",
+      pricing: {
+        ratesPerMillion: {
+          input: "0.3",
+          output: "1.2",
+          cacheRead: "0.3",
+          cacheWrite: "0.3",
+          reasoning: "1.2",
+        },
+      },
+    });
+  });
+
+  it("an owner declares a model's APIs; a generic account speaks one protocol", async () => {
+    db.providerAccount.findFirst.mockResolvedValue(
+      accountRow({ providerType: "generic", baseUrl: "https://llm.example.test/v1" }) as never,
+    );
+    createdModel({ Account: { providerType: "generic" } });
+    const view = await client().models.create({
+      accountId: "acc-1",
+      upstreamModelId: "claude",
+      type: "LLM",
+      surfaces: ["ANTHROPIC_MESSAGES"],
+    });
+    expect(db.providerModel.create.mock.calls[0]?.[0]?.data?.nativeCapabilities).toMatchObject({
+      protocol: "anthropic-compatible",
+      source: "declared",
+    });
+    expect(view.surfaces).toEqual(["ANTHROPIC_MESSAGES"]);
+    db.providerModel.create.mockClear();
+    expect(
+      await codeOf(
+        client().models.create({
+          accountId: "acc-1",
+          upstreamModelId: "mixed",
+          type: "LLM",
+          surfaces: ["ANTHROPIC_MESSAGES", "OPENAI_CHAT_COMPLETIONS"],
+        }),
+      ),
+    ).toBe("BAD_REQUEST");
+    expect(
+      await codeOf(
+        client().models.create({
+          accountId: "acc-1",
+          upstreamModelId: "embed",
+          type: "EMBEDDINGS",
+          surfaces: ["OPENAI_CHAT_COMPLETIONS"],
+        }),
+      ),
+    ).toBe("BAD_REQUEST");
+    expect(db.providerModel.create).not.toHaveBeenCalled();
+  });
+
+  it("changing a model's APIs rewrites its inventory", async () => {
+    createdModel();
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "pm-1",
+      providerAccountId: "acc-1",
+      type: "LLM",
+      upstreamModelId: "openai/gpt-6-luna",
+      Account: { providerType: "openrouter" },
+    } as never);
+    db.executionTarget.findMany.mockResolvedValue([] as never);
+    await client().models.update({ modelId: "pm-1", surfaces: ["OPENAI_RESPONSES"] });
+    const data = db.providerModel.update.mock.calls[0]?.[0]?.data as {
+      nativeCapabilities?: { surfaces?: Record<string, unknown> };
+    };
+    expect(Object.keys(data.nativeCapabilities?.surfaces ?? {})).toEqual(["openaiResponses"]);
+  });
+
+  it("a language model turns on only with both limits known (it would refuse every request)", async () => {
+    const model = (contextWindow: number | null, maxOutputTokens: number | null) =>
+      db.providerModel.findFirst.mockResolvedValue({
+        id: "pm-1",
+        providerAccountId: "acc-1",
+        type: "LLM",
+        upstreamModelId: "vendor/model",
+        contextWindow,
+        maxOutputTokens,
+        Account: { providerType: "generic" },
+      } as never);
+    model(32_768, null);
+    expect(await codeOf(client().models.update({ modelId: "pm-1", enabled: true }))).toBe(
+      "BAD_REQUEST",
+    );
+    model(null, 4_096);
+    expect(await codeOf(client().models.update({ modelId: "pm-1", enabled: true }))).toBe(
+      "BAD_REQUEST",
+    );
+    expect(db.providerModel.update).not.toHaveBeenCalled();
+    // Setting the missing limit in the same edit is enough.
+    createdModel({ Account: { providerType: "generic" } });
+    model(null, 4_096);
+    await client().models.update({ modelId: "pm-1", enabled: true, contextWindow: 32_768 });
+    expect(db.providerModel.update).toHaveBeenCalledTimes(1);
+  });
+
+  it("attempt rows name why a member was skipped or failed, not a plain outcome", async () => {
+    const row = (id: string, terminalReason: string | null) => ({
+      id,
+      requestId: "rq",
+      createdAt: new Date("2026-11-22T10:00:00Z"),
+      state: "FAILED",
+      providerModelId: "pm",
+      httpStatusCode: null,
+      errorClass: null,
+      terminalReason,
+    });
+    db.attempt.findMany.mockResolvedValue([
+      row("a1", "PRICING_UNAVAILABLE"),
+      row("a2", "FAILED"),
+      row("a3", null),
+    ] as never);
+    const page = await client().attempts.list({ limit: 10 });
+    expect(page.items.map((item) => item.reason)).toEqual(["PRICING_UNAVAILABLE", null, null]);
+    expect(page.items[0]).not.toHaveProperty("terminalReason");
+  });
+
+  it("usage rows show the provider's prompt and completion counts (cache and reasoning included)", async () => {
+    // deepseek-v4.1-flash on OpenRouter: 36 prompt / 22 completion tokens, 18 of them reasoning.
+    db.usageLedger.findMany.mockResolvedValue([
+      {
+        id: "use-1",
+        createdAt: new Date("2026-11-22T10:00:00Z"),
+        providerModelId: "model-1",
+        poolId: "pool-1",
+        inputTokens: 30n,
+        outputTokens: 4n,
+        cacheReadTokens: 6n,
+        cacheWriteTokens: 0n,
+        reasoningTokens: 18n,
+        settledCost: new Prisma.Decimal("0.000013564"),
+        currency: "USD",
+        confidence: "REPORTED",
+      },
+      {
+        id: "use-2",
+        createdAt: new Date("2026-11-22T10:00:00Z"),
+        providerModelId: "model-1",
+        poolId: "pool-1",
+        inputTokens: null,
+        outputTokens: null,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        reasoningTokens: null,
+        settledCost: null,
+        currency: null,
+        confidence: "ESTIMATED",
+      },
+    ] as never);
+    const page = await client().usage.list({ limit: 10 });
+    expect(page.items[0]).toMatchObject({ inputTokens: 36, outputTokens: 22 });
+    expect(page.items[1]).toMatchObject({ inputTokens: null, outputTokens: null });
   });
 
   it("another person's key, model and price are not found", async () => {

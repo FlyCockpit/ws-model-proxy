@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 const db = vi.hoisted(() => ({
   $transaction: vi.fn(),
   attemptEvent: { findFirst: vi.fn(), create: vi.fn() },
+  attempt: { createMany: vi.fn() },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 
@@ -462,6 +463,75 @@ describe("provider attempt failure policy", () => {
     ).resolves.toBe("COOLDOWN");
     expect(tx.providerAccount.update).not.toHaveBeenCalled();
     expect(tx.providerModel.update).not.toHaveBeenCalled();
+  });
+
+  it("records a skip before admission as a terminal attempt of its own (attempt_event FK)", async () => {
+    db.attempt.createMany.mockClear();
+    db.attemptEvent.create.mockClear();
+    db.attemptEvent.findFirst.mockResolvedValue(null);
+    const order: string[] = [];
+    db.attempt.createMany.mockImplementationOnce(async () => {
+      order.push("attempt");
+      return { count: 1 };
+    });
+    db.attemptEvent.create.mockImplementationOnce(async () => {
+      order.push("event");
+      return {};
+    });
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof db) => unknown) =>
+      callback(db),
+    );
+    await recordProviderAttemptEvent({
+      userId: "owner",
+      providerAccountId: "account",
+      providerModelId: "model",
+      requestId: "request",
+      attemptId: "attempt-skip",
+      fencingToken: 4n,
+      eventType: "TERMINAL",
+      reason: "REQUEST_RENDER_FAILED",
+      requestedSurface: "openai-chat",
+      nativeSurface: "anthropic-messages",
+      poolId: "pool",
+      terminalState: "SKIPPED",
+    });
+    expect(order).toEqual(["attempt", "event"]);
+    expect(db.attempt.createMany).toHaveBeenCalledWith({
+      data: [
+        expect.objectContaining({
+          id: "attempt-skip",
+          kind: "CLOUD",
+          state: "FAILED",
+          fencingToken: 4n,
+          terminalReason: "REQUEST_RENDER_FAILED",
+          requestedSurface: "openai-chat",
+          nativeSurface: "anthropic-messages",
+          providerModelId: "model",
+          poolId: "pool",
+        }),
+      ],
+      skipDuplicates: true,
+    });
+  });
+
+  it("reports an attempt event it could not store instead of swallowing it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    db.$transaction.mockRejectedValueOnce(new Error("foreign key violated"));
+    await expect(
+      recordProviderAttemptEvent({
+        userId: "owner",
+        providerAccountId: "account",
+        providerModelId: "model",
+        requestId: "request",
+        attemptId: "attempt",
+        eventType: "DISPATCH",
+      }),
+    ).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(
+      "[provider-attempt] attempt event not recorded",
+      expect.objectContaining({ eventType: "DISPATCH", error: "Error: foreign key violated" }),
+    );
+    warn.mockRestore();
   });
 
   it("persists a prompt-free, fully correlated append-only attempt event", async () => {

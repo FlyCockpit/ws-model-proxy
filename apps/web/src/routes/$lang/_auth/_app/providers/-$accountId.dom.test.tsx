@@ -35,6 +35,7 @@ const { ACCOUNT, VERSIONS } = vi.hoisted(() => {
         health: "HEALTHY",
         contextWindow: 32_768,
         maxOutputTokens: null,
+        surfaces: ["OPENAI_CHAT_COMPLETIONS"],
         price: { input: "0.1", output: "0.3", currency: "USD" },
       },
     ],
@@ -197,6 +198,7 @@ vi.mock("@/utils/orpc", () => {
                   name: "Llama 3.3 70B",
                   type: "LLM",
                   contextWindow: 131_072,
+                  maxOutputTokens: 8_192,
                 },
               ],
             };
@@ -212,6 +214,17 @@ vi.mock("@/utils/orpc", () => {
               providerModelId: "pm-1",
               httpStatusCode: 429,
               errorClass: "rate_limited",
+              reason: null,
+            },
+            {
+              id: "at-2",
+              requestId: "rq-2",
+              createdAt: "2026-10-07T10:00:00.000Z",
+              state: "FAILED",
+              providerModelId: "pm-1",
+              httpStatusCode: null,
+              errorClass: null,
+              reason: "PRICING_UNAVAILABLE",
             },
           ]),
         },
@@ -250,7 +263,7 @@ async function mount() {
       <Component />
     </QueryClientProvider>,
   );
-  await screen.findByText(
+  await screen.findAllByText(
     "dashboard:providers.activity.attemptState.FAILED",
     {},
     { timeout: 5_000 },
@@ -271,6 +284,8 @@ describe("provider page", () => {
     expect(
       screen.getByText(/dashboard:providers\.activity\.http\(\{"status":429\}\)/),
     ).toBeTruthy();
+    // A member skipped before sending says why.
+    expect(screen.getByText("PRICING_UNAVAILABLE")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "dashboard:providers.activity.usage" }));
     expect(
       await screen.findByText(/dashboard:providers\.activity\.confidence\.REPORTED/),
@@ -371,6 +386,60 @@ describe("provider page", () => {
       upstreamModelId: "meta-llama/llama-3.3-70b",
       type: "LLM",
       contextWindow: 131_072,
+      maxOutputTokens: 8_192,
+    });
+  });
+
+  it("adds a model with the APIs the owner picked", async () => {
+    await mount();
+    fireEvent.change(screen.getByLabelText("dashboard:providers.modelId"), {
+      target: { value: "anthropic/claude-haiku-5.5" },
+    });
+    // OpenRouter's defaults for an Anthropic model: Chat Completions and Messages.
+    const add = screen.getByRole("button", { name: "dashboard:pool.add" }).closest("form")!;
+    const messages = within(add as HTMLElement).getByRole("checkbox", {
+      name: "dashboard:providers.surfaces.ANTHROPIC_MESSAGES",
+    });
+    expect(messages.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(
+      within(add as HTMLElement).getByRole("checkbox", {
+        name: "dashboard:providers.surfaces.OPENAI_CHAT_COMPLETIONS",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pool.add" }));
+    await waitFor(() => expect(callsOf("models.create")).toHaveLength(1));
+    expect(callsOf("models.create")[0]?.input).toEqual({
+      accountId: "acc-1",
+      upstreamModelId: "anthropic/claude-haiku-5.5",
+      type: "LLM",
+      surfaces: ["ANTHROPIC_MESSAGES"],
+    });
+  });
+
+  it("sets a model's limits and APIs in its settings", async () => {
+    await mount();
+    expect(screen.getByText("dashboard:providers.limitsMissing")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:providers.pricing.toggle" }));
+    const settings = screen
+      .getByRole("button", { name: "dashboard:providers.saveModel" })
+      .closest("form") as HTMLElement;
+    fireEvent.change(within(settings).getByLabelText("dashboard:providers.maxOutputTokens"), {
+      target: { value: "4096" },
+    });
+    fireEvent.click(
+      within(settings).getByRole("checkbox", {
+        name: "dashboard:providers.surfaces.OPENAI_RESPONSES",
+      }),
+    );
+    fireEvent.click(
+      within(settings).getByRole("button", { name: "dashboard:providers.saveModel" }),
+    );
+    await waitFor(() => expect(callsOf("models.update")).toHaveLength(1));
+    expect(callsOf("models.update")[0]?.input).toEqual({
+      modelId: "pm-1",
+      contextWindow: 32_768,
+      maxOutputTokens: 4_096,
+      surfaces: ["OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES"],
     });
   });
 });

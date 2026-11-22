@@ -141,6 +141,9 @@ export interface ProviderBudgetTerminal {
   usage?: RawProviderUsage;
   /** Internal crash-sweeper cutoff, rechecked under the attempt fence. */
   crashExpiredAt?: Date;
+  /** The provider's HTTP status, and its failure class when it failed (the attempt list). */
+  httpStatusCode?: number;
+  errorClass?: string;
 }
 
 export class ProviderBudgetConfigurationError extends Error {}
@@ -705,6 +708,10 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
             state: terminalState(terminal.reason),
             terminalAt: now,
             terminalReason: terminal.reason,
+            ...(terminal.httpStatusCode !== undefined
+              ? { httpStatusCode: terminal.httpStatusCode }
+              : {}),
+            ...(terminal.errorClass !== undefined ? { errorClass: terminal.errorClass } : {}),
           },
         });
       };

@@ -10,6 +10,10 @@ import type {
   providerModelViewSchema,
   spendViewSchema,
 } from "../contracts/providers";
+import {
+  effectiveProviderModelCapabilities,
+  providerModelSurfacesOf,
+} from "./provider-model-capabilities";
 import { jsonObject } from "./registry-view";
 
 /** A Decimal(30,9) (or its string) as the contract's money string: no exponent, ≤ 9 decimals. */
@@ -97,6 +101,8 @@ export const MODEL_SELECT = {
   health: true,
   contextWindow: true,
   maxOutputTokens: true,
+  nativeCapabilities: true,
+  Account: { select: { providerType: true } },
   PricingVersions: {
     where: { status: "ACTIVE" },
     orderBy: { effectiveAt: "desc" },
@@ -127,6 +133,14 @@ export function modelView(row: ModelRow): z.infer<typeof providerModelViewSchema
     health: row.health,
     contextWindow: row.contextWindow,
     maxOutputTokens: row.maxOutputTokens,
+    surfaces: providerModelSurfacesOf(
+      effectiveProviderModelCapabilities({
+        type: row.type,
+        upstreamModelId: row.upstreamModelId,
+        providerType: row.Account.providerType,
+        nativeCapabilities: row.nativeCapabilities,
+      }),
+    ),
     price: priceOf(row),
   };
 }

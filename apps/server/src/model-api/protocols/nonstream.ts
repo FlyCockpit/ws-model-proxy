@@ -17,6 +17,8 @@ import {
   acceptChatChoiceExtras,
   acceptChatEnvelopeExtras,
   acceptChatMessageExtras,
+  acceptDirectToolCaller,
+  acceptMessagePhase,
   ignoreUnknownEnvelopeFields,
   object,
   parseProtocolUsage,
@@ -187,11 +189,14 @@ function parseChatSuccess(value: unknown): CanonicalResponse {
       if (index > 0)
         unsupported("response.choices[0].message.tool_calls", "must contain at most one call");
       const call = object(raw, `response.choices[0].message.tool_calls[${index}]`);
+      // OpenRouter numbers non-stream calls as streamed ones (`index`): only its position.
       rejectUnknown(
         call,
-        ["id", "type", "function"],
+        ["id", "type", "function", "index"],
         `response.choices[0].message.tool_calls[${index}]`,
       );
+      if (call.index !== undefined && call.index !== index)
+        invalid(`response.choices[0].message.tool_calls[${index}].index`, "must be its position");
       if (call.type !== "function")
         unsupported(`response.choices[0].message.tool_calls[${index}].type`);
       const fn = object(call.function, `response.choices[0].message.tool_calls[${index}].function`);
@@ -254,8 +259,15 @@ function parseResponsesSuccess(value: unknown): CanonicalResponse {
   const callIds = new Set<string>();
   for (const [index, raw] of body.output.entries()) {
     const item = object(raw, `response.output[${index}]`);
+    // Reasoning items (OpenAI and OpenRouter reasoning models) are not answer content.
+    if (item.type === "reasoning") continue;
     if (item.type === "message") {
-      rejectUnknown(item, ["id", "type", "status", "role", "content"], `response.output[${index}]`);
+      rejectUnknown(
+        item,
+        ["id", "type", "status", "role", "content", "phase"],
+        `response.output[${index}]`,
+      );
+      acceptMessagePhase(item, `response.output[${index}]`);
       if (item.role !== "assistant" || item.status !== "completed")
         invalid(`response.output[${index}]`, "must be a completed assistant message");
       if (!Array.isArray(item.content))
@@ -348,7 +360,8 @@ function parseAnthropicSuccess(value: unknown): CanonicalResponse {
     }
     if (block.type === "tool_use") {
       if (callIds.size > 0) unsupported("response.content", "must contain at most one tool use");
-      rejectUnknown(block, ["type", "id", "name", "input"], `response.content[${index}]`);
+      rejectUnknown(block, ["type", "id", "name", "input", "caller"], `response.content[${index}]`);
+      acceptDirectToolCaller(block.caller, `response.content[${index}].caller`);
       const id = string(block.id, `response.content[${index}].id`);
       if (callIds.has(id)) invalid(`response.content[${index}].id`, "must be unique");
       callIds.add(id);

@@ -200,6 +200,10 @@ const requests = {
     const items: RequestRow[] = page.map((row) => {
       // Requests to someone else's pool: where it ran is that owner's business.
       const own = row.resourceOwnerUserId === userId || row.resourceOwnerUserId === null;
+      // An own-key request ran on the requester's own provider model: which one is theirs to
+      // see (the pool owner sees only that it went own-key).
+      const ownKey = row.route === "own_key";
+      const placement = ownKey ? row.userId === userId : own;
       return {
         id: row.id,
         createdAt: row.createdAt.toISOString(),
@@ -212,11 +216,13 @@ const requests = {
         external: row.external,
         operation: row.operation,
         route:
-          own && row.route && ROUTES.has(row.route) ? (row.route as RequestRow["route"]) : null,
+          (own || placement) && row.route && ROUTES.has(row.route)
+            ? (row.route as RequestRow["route"])
+            : null,
         instanceId: own ? row.selectedInstanceId : null,
         versionId: own ? row.selectedVersionId : null,
         nodeId: own ? row.selectedNodeId : null,
-        providerModelId: own ? row.selectedProviderModelId : null,
+        providerModelId: placement ? row.selectedProviderModelId : null,
         queueWaitMs: row.queueWaitMs,
         ttftMs: row.firstClientByteAt
           ? Math.max(0, row.firstClientByteAt.getTime() - row.startedAt.getTime())

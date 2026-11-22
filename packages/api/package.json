@@ -162,6 +162,9 @@
     "./lib/provider-protocol": {
       "default": "./src/lib/provider-protocol.ts"
     },
+    "./lib/provider-model-capabilities": {
+      "default": "./src/lib/provider-model-capabilities.ts"
+    },
     "./lib/provider-catalog-model": {
       "default": "./src/lib/provider-catalog-model.ts"
     },

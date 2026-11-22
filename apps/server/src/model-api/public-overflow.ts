@@ -17,6 +17,7 @@ import {
   type ProviderProtocol,
   providerHttpsRequest,
 } from "@ws-model-proxy/api/lib/provider-egress";
+import { effectiveProviderModelCapabilities } from "@ws-model-proxy/api/lib/provider-model-capabilities";
 import {
   providerProtocolForType,
   providerRequestPathname,
@@ -135,6 +136,11 @@ export type PublicOverflowSkipReason =
   | "GRANTEE_BUDGET_EXCEEDED"
   /** Grant cap cannot be priced (missing price or currency mismatch). Fail closed. */
   | "GRANTEE_CAP_UNPRICEABLE"
+  /**
+   * Configuration, not load: a provider account cap applies and the model has no active
+   * price (or none in the cap's currency). Nothing is sent until the owner sets one.
+   */
+  | "PRICING_UNAVAILABLE"
   | "PROTECTION_POLICY_MISSING"
   /**
    * Transient: no provider attempt could be sent right now (fence allocation,
@@ -607,7 +613,12 @@ async function recheckExternalSendTarget(
           endpointVersion: input.target.endpointVersion,
         },
       },
-      select: { enabled: true, nativeCapabilities: true, Account: { select: { enabled: true } } },
+      select: {
+        enabled: true,
+        type: true,
+        nativeCapabilities: true,
+        Account: { select: { enabled: true, providerType: true } },
+      },
     }),
     ownKey
       ? Promise.resolve({ id: "" })
@@ -624,6 +635,26 @@ async function recheckExternalSendTarget(
   ]);
   if (!model || !member) return gone;
   if (!model.enabled || !model.Account.enabled) return "PROVIDER_UNAVAILABLE";
+  // The request was rendered for the surfaces the model had at listing. Changed APIs (the
+  // surfaces an owner declares) are a new target: a stored-response binding needs native
+  // Responses still; anything else is re-listed (transient), never sent with a stale surface.
+  const current = effectiveProviderModelCapabilities({
+    type: model.type,
+    upstreamModelId: input.target.upstreamModelId,
+    providerType: model.Account.providerType,
+    nativeCapabilities: model.nativeCapabilities,
+  });
+  const listed = input.target.capabilityInventory ?? null;
+  if (orderFreeJson(current) !== orderFreeJson(listed)) {
+    if (!input.exactBinding) return "PROVIDER_UNAVAILABLE";
+    // A binding depends on the Responses surface alone: any change to it (its lifecycle
+    // operations included) or to the protocol ends the binding; other surfaces may change.
+    if (
+      current?.protocol !== listed?.protocol ||
+      orderFreeJson(responsesSurfaceOf(current)) !== orderFreeJson(responsesSurfaceOf(listed))
+    )
+      return "BOUND_TARGET_INVALID";
+  }
   if (input.embeddingContract) {
     const capabilities = parseOpenAiCompatibleCapabilities(model.nativeCapabilities);
     if (
@@ -1056,6 +1087,29 @@ export type PublicOverflowResult =
       providerFailure?: { target: PublicProviderTarget; status?: number; retryAfter?: string };
     };
 
+/** An inventory's native Responses declaration (v3/v4 surface, or the v1/v2 operation set). */
+function responsesSurfaceOf(inventory: OpenAiCompatibleCapabilities | null): unknown {
+  if (!inventory) return null;
+  if (inventory.version === 3 || inventory.version === 4)
+    return inventory.surfaces.openaiResponses ?? null;
+  return inventory.responses ?? null;
+}
+
+/** JSON with object keys sorted: the same inventory compares equal however it was built. */
+function orderFreeJson(value: unknown): string {
+  const sorted = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(sorted);
+    if (item && typeof item === "object")
+      return Object.fromEntries(
+        Object.keys(item as Record<string, unknown>)
+          .sort()
+          .map((key) => [key, sorted((item as Record<string, unknown>)[key])]),
+      );
+    return item;
+  };
+  return JSON.stringify(sorted(value)) ?? "null";
+}
+
 function inventoryMatchesProtocol(
   inventory: OpenAiCompatibleCapabilities | null | undefined,
   protocol: ProviderProtocol,
@@ -1135,6 +1189,7 @@ const providerTargetModelSelect = {
   upstreamModelId: true,
   contextWindow: true,
   maxOutputTokens: true,
+  type: true,
   nativeCapabilities: true,
   health: true,
   healthNextRetryAt: true,
@@ -1313,7 +1368,13 @@ export async function listPublicOverflowTargets(
     const executionTargetId =
       createdTargetId ?? (targetPending ? `pending:${model.id}` : undefined);
     const credential = account.CurrentCredential;
-    const capabilityInventory = parseOpenAiCompatibleCapabilities(model.nativeCapabilities);
+    // A model created without an inventory serves its provider type's default surfaces.
+    const capabilityInventory = effectiveProviderModelCapabilities({
+      type: model.type,
+      upstreamModelId: model.upstreamModelId,
+      providerType: account.providerType,
+      nativeCapabilities: model.nativeCapabilities,
+    });
     const protocol = cloudProtocol(account.providerType, capabilityInventory);
     if (
       !executionTargetId ||
@@ -1335,7 +1396,7 @@ export async function listPublicOverflowTargets(
       providerAccountId: account.id,
       endpointIdentity: account.endpointIdentity,
       endpointVersion: account.endpointVersion,
-      nativeSurfaces: nativeSurfaces(model.nativeCapabilities),
+      nativeSurfaces: nativeSurfaces(capabilityInventory ?? model.nativeCapabilities),
       capabilityInventory,
     };
     if (!model.enabled || !account.enabled || !credential || credential.status !== "ACTIVE") {
@@ -1362,10 +1423,10 @@ export async function listPublicOverflowTargets(
       baseUrl: account.baseUrl,
       authType: account.authType,
       healthStatus: model.health,
-      nativeProtocols: nativeProtocols(model.nativeCapabilities),
+      nativeProtocols: nativeProtocols(capabilityInventory ?? model.nativeCapabilities),
       usageDialect: providerUsageDialect(account.providerType),
-      supportsStreaming: supportsStreaming(model.nativeCapabilities),
-      supportedFeatures: supportedFeatures(model.nativeCapabilities),
+      supportsStreaming: supportsStreaming(capabilityInventory ?? model.nativeCapabilities),
+      supportedFeatures: supportedFeatures(capabilityInventory ?? model.nativeCapabilities),
       credential: {
         id: credential.id,
         credentialType: credential.credentialType,
@@ -2282,7 +2343,7 @@ export class OpenRouterUsageRecords {
         : undefined;
     const charged =
       only?.categoriesComplete === true ? openRouterCharge(finals[0], only) : undefined;
-    if (charged) return withCalculatedCost(charged, pricing);
+    if (charged) return withOpenRouterReportedCost(withCalculatedCost(charged, pricing), pricing);
     const evidence = finals.length > 0 ? normalize(finals.at(-1)) : undefined;
     const rawUsage = finals.map(
       (usage) => JSON.parse(JSON.stringify(usage)) as Prisma.InputJsonValue,
@@ -2467,6 +2528,24 @@ function openRouterCharge(
   };
 }
 
+/**
+ * OpenRouter's `cost` is the charge for this response in USD credits, whatever the
+ * attempt's own schedule can price (a reasoning or audio category it lacks, say). It is
+ * stated in the attempt's schedule version, so settlement takes it whenever that schedule
+ * is in USD; it no longer depends on a calculated cost existing alongside it.
+ */
+function withOpenRouterReportedCost(
+  usage: RawProviderUsage,
+  pricing: ProviderPricingSchedule | undefined,
+): RawProviderUsage {
+  if (usage.reportedCost === undefined) return usage;
+  return {
+    ...usage,
+    reportedCostCurrency: "USD",
+    ...(pricing ? { reportedCostPricingVersion: pricing.version } : {}),
+  };
+}
+
 /** Drops a window's calculated cost; only the merged categories may be priced. */
 function withoutCalculatedCost({
   calculatedCost: _cost,
@@ -2555,6 +2634,72 @@ export function engineCacheConfirmedFromRetainedResponse(
   }
 }
 
+/**
+ * Statuses with which OpenRouter refuses a request before any generation: invalid request,
+ * key, credits, moderation, no endpoint for the model, rate limit. Such a request is not
+ * billed (no generation record exists). Timeouts and upstream failures (408, 5xx) may follow
+ * generation and keep the conservative liability.
+ */
+const OPENROUTER_UNBILLED_REJECTION_STATUSES = new Set([400, 401, 402, 403, 404, 429]);
+const OPENROUTER_REJECTION_MAX_BYTES = 64 * 1024;
+
+/**
+ * Whether a whole OpenRouter response is such a refusal: one of those statuses, the complete
+ * body retained, and that body one JSON error envelope (`{error: {message, ...}}`, or the
+ * Anthropic `{type: "error", error: {...}}`) with no answer or usage in it.
+ */
+export function openRouterUnbilledRejection(
+  status: number,
+  chunks: readonly Uint8Array[],
+  responseBytes: number,
+): boolean {
+  if (!OPENROUTER_UNBILLED_REJECTION_STATUSES.has(status)) return false;
+  if (responseBytes <= 0 || responseBytes > OPENROUTER_REJECTION_MAX_BYTES) return false;
+  const body = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+  if (body.byteLength !== responseBytes) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString("utf8"));
+  } catch {
+    return false;
+  }
+  const envelope = usageRecord(parsed);
+  const error = usageRecord(envelope?.error);
+  if (!envelope || !error || typeof error.message !== "string") return false;
+  if (envelope.type !== undefined && envelope.type !== "error") return false;
+  return !["usage", "choices", "output", "content", "response", "message"].some((key) =>
+    Object.hasOwn(envelope, key),
+  );
+}
+
+/** The settled usage of an unbilled OpenRouter refusal: no tokens, OpenRouter's charge 0. */
+export function openRouterRejectionUsage(
+  pricing: ProviderPricingSchedule | undefined,
+): RawProviderUsage {
+  return {
+    inputTokens: 0n,
+    outputTokens: 0n,
+    categoriesComplete: true,
+    reportedCost: "0",
+    reportedCostCurrency: "USD",
+    ...(pricing
+      ? {
+          reportedCostPricingVersion: pricing.version,
+          // Nothing is zero in every currency: an attempt priced in another currency than
+          // OpenRouter's USD settles at the same zero.
+          calculatedCost: "0",
+          calculatedCostCurrency: pricing.currency,
+          calculatedCostPricingVersion: pricing.version,
+          calculatedCostSource: "openrouter-rejection",
+          calculatedCostConfidence: "REPORTED",
+        }
+      : {}),
+    reportedCostSource: "openrouter-rejection",
+    accountingVersion: "provider-billable-v1",
+    confidence: "REPORTED",
+  };
+}
+
 export function retainProviderUsageTail(
   chunks: Uint8Array[],
   currentBytes: number,
@@ -2629,6 +2774,7 @@ async function readRetryableProviderUsage(
   pricing?: ProviderPricingSchedule,
   dialect: ProviderUsageDialect = "generic",
   surface: ProtocolSurface = "openai-chat",
+  status?: number,
 ): Promise<RawProviderUsage | undefined> {
   const chunks: Uint8Array[] = [];
   let retainedBytes = 0;
@@ -2665,7 +2811,15 @@ async function readRetryableProviderUsage(
     return undefined;
   }
   const usage = parseProviderUsage(chunks, pricing, dialect, surface);
-  return usage ? { ...usage, observationComplete: true } : undefined;
+  if (usage) return { ...usage, observationComplete: true };
+  // An OpenRouter rate limit (429) before generation is not billed either.
+  if (
+    dialect === "openrouter" &&
+    status !== undefined &&
+    openRouterUnbilledRejection(status, chunks, receivedBytes)
+  )
+    return { ...openRouterRejectionUsage(pricing), observationComplete: true };
+  return undefined;
 }
 
 async function recordProviderHealth(
@@ -3620,6 +3774,7 @@ export async function dispatchPublicOverflow(
           pricing,
           target.usageDialect,
           nativeSurface,
+          status,
         );
         const retryAfter = response.headers["retry-after"];
         providerFailure = {
@@ -3667,6 +3822,8 @@ export async function dispatchPublicOverflow(
           revisionSequence: 1n,
           revisionKind: "SNAPSHOT",
           observationComplete: response.complete,
+          httpStatusCode: status,
+          errorClass: classifyProviderFailure(status),
           usageSource: retryUsage ? `${upstream.protocol}-retryable-response` : undefined,
           usage: retryUsage,
         });
@@ -3733,8 +3890,11 @@ export async function dispatchPublicOverflow(
           depthParser = undefined;
         }
       };
-      let accountingIncomplete = request.stream;
-      const terminalDecoder = request.stream ? new SseDecoder() : undefined;
+      // A provider answers a streamed request it refuses with a JSON error body, not SSE: only
+      // a successful stream is decoded as one (a refusal's bytes reach the caller untouched).
+      const sseBody = request.stream && httpOk;
+      let accountingIncomplete = sseBody;
+      const terminalDecoder = sseBody ? new SseDecoder() : undefined;
       // Observe every record through EOF, including after a client terminal.
       // A bounded post-terminal drain that cannot reach EOF keeps liability;
       // OpenRouter never settles from only the retained prefix/tail windows.
@@ -3836,6 +3996,22 @@ export async function dispatchPublicOverflow(
                       ),
                       surface,
                     );
+          // OpenRouter refused the request before generating anything and bills nothing:
+          // settle at its real charge (zero), not at the conservative reservation.
+          // The whole HTTP message arrived (`response.complete`): a streamed request's JSON
+          // error body is no SSE stream, so its framing never reaches a protocol terminal.
+          const unbilledRejection =
+            combinedUsage === undefined &&
+            target.usageDialect === "openrouter" &&
+            response.complete === true &&
+            !cancelledAtSettlement &&
+            !request.signal.aborted &&
+            openRouterUnbilledRejection(
+              status,
+              !request.stream && !nonstreamOverflow ? nonstreamChunks : usageChunks,
+              responseBytes,
+            );
+          const rejectionUsage = unbilledRejection ? openRouterRejectionUsage(pricing) : undefined;
           const combinedCost =
             combinedUsage && pricing ? calculatedCostForUsage(combinedUsage, pricing) : undefined;
           const observedUsage: RawProviderUsage | undefined = combinedCost
@@ -3848,14 +4024,16 @@ export async function dispatchPublicOverflow(
                 calculatedCostConfidence:
                   pricing!.confidence === "REPORTED" ? "CALCULATED" : pricing!.confidence,
               } as RawProviderUsage)
-            : combinedUsage;
+            : (combinedUsage ?? rejectionUsage);
+          // A whole rejection envelope is a complete observation of a request with no charge.
+          const usageObservationComplete = observationComplete || unbilledRejection;
           const usage = observedUsage
             ? {
                 ...observedUsage,
                 // Transport completion is independent from whether the provider
                 // exposes every token category. A complete cost-only observation
                 // may settle spend, while truncated observations remain audit-only.
-                observationComplete,
+                observationComplete: usageObservationComplete,
               }
             : undefined;
           // Publish the settled usage before the terminal resolves so the
@@ -3873,8 +4051,14 @@ export async function dispatchPublicOverflow(
             reason: settlement.budgetReason,
             revisionSequence: 1n,
             revisionKind: "SNAPSHOT",
-            observationComplete,
-            usageSource: usage ? `${upstream.protocol}-response` : "missing-provider-usage",
+            observationComplete: usageObservationComplete,
+            httpStatusCode: status,
+            ...(status >= 400 ? { errorClass: classifyProviderFailure(status) } : {}),
+            usageSource: unbilledRejection
+              ? "openrouter-rejection"
+              : usage
+                ? `${upstream.protocol}-response`
+                : "missing-provider-usage",
             usage,
           });
           // If client commitment already began, retain event creation order
@@ -4112,9 +4296,11 @@ export async function dispatchPublicOverflow(
         if (firstClientByteAt) return;
         firstClientByteAt = new Date();
         firstClientBytePersistence = Promise.allSettled([
-          prisma.relayRequest.updateMany({
-            where: { id: request.requestId, providerAttemptId: attemptId },
-            data: { streamCommitted: true },
+          // The attempt's own commitment (relay_request has no per-attempt columns).
+          // Once, under the attempt's fence; an adapted non-stream attempt has already settled.
+          prisma.attempt.updateMany({
+            where: { id: attemptId, fencingToken, kind: "CLOUD", firstByteAt: null },
+            data: { streamCommitted: true, firstByteAt: firstClientByteAt },
           }),
           // Time-to-first-token for usage rollups; first commitment wins.
           prisma.relayRequest.updateMany({
@@ -4281,7 +4467,10 @@ export async function dispatchPublicOverflow(
             ? "GRANTEE_BUDGET_EXCEEDED"
             : lastAdmission.reason === "GRANTEE_CAP_UNPRICEABLE"
               ? "GRANTEE_CAP_UNPRICEABLE"
-              : "BUDGET_EXCEEDED"
+              : lastAdmission.reason === "PRICING_UNAVAILABLE" ||
+                  lastAdmission.reason === "CURRENCY_UNAVAILABLE"
+                ? "PRICING_UNAVAILABLE"
+                : "BUDGET_EXCEEDED"
         : (lastSendFailure ?? "PROVIDER_UNAVAILABLE"),
   };
 }

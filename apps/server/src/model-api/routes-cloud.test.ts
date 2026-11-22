@@ -43,6 +43,9 @@ vi.mock("./public-overflow.js", async (importOriginal) => ({
 }));
 
 const prisma = (await import("@ws-model-proxy/db")).default;
+const { providerModelInventory } = await import(
+  "@ws-model-proxy/api/lib/provider-model-capabilities"
+);
 const db = prisma as unknown as ReturnType<typeof mockDeep<PrismaClient>>;
 const { createModelApiRoutes } = await import("./routes.js");
 const { ModelApiConcurrencyLimiter } = await import("./limits.js");
@@ -272,15 +275,27 @@ describe("cloud members on the model API", () => {
     expect(calls[1]).toMatchObject({ eligibleExecutionTargetIds: ["target-owner"] });
     expect(calls[1]?.admittedExecutionTargetId).toBeUndefined();
     expect(calls[1]?.forcedPoolMemberId).toBeUndefined();
+    // The request log records the cloud route in its real columns (BUG-8: the commit wrote
+    // columns relay_request no longer has, so Prisma refused every one).
     expect(db.relayRequest.update).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          fallbackRoute: "pool-external",
-          selectedExecutionTargetId: "target-owner",
-          providerAccountId: "account-owner",
+          route: "cloud",
+          selectedTargetId: "target-owner",
+          selectedProviderModelId: "owner-model",
+          attemptCount: 1,
         }),
       }),
     );
+    expect(db.relayRequest.create.mock.calls[0]?.[0]?.data).toMatchObject({ external: true });
+    expect(db.attempt.updateMany).toHaveBeenCalledWith({
+      where: { id: "attempt-1", fencingToken: 1n, kind: "CLOUD" },
+      data: {
+        nativeSurface: "OPENAI_CHAT_COMPLETIONS",
+        adapterMode: "NATIVE",
+        adapterVersion: null,
+      },
+    });
   });
 
   it("serves the share holder's own key when it dispatches, and never reaches the owner's tier", async () => {
@@ -454,4 +469,162 @@ describe("bounded external nonstream adaptation", () => {
       expect(overflow.dispatchPublicOverflow).toHaveBeenCalledOnce();
     },
   );
+});
+
+describe("provider-only refusals name their cause", () => {
+  const MESSAGES_ONLY = providerTarget({
+    nativeSurfaces: ["anthropic-messages"],
+    nativeProtocols: ["openai"],
+    capabilityInventory: providerModelInventory({
+      providerType: "openrouter",
+      surfaces: ["ANTHROPIC_MESSAGES"],
+    }),
+  });
+  const adaptingPool = { ...OWNER_PAID_POOL, protocolAdaptationEnabled: true };
+  const chatBody = (fields: Record<string, unknown>) =>
+    app().request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_key_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "owner/chat:external",
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 50,
+        ...fields,
+      }),
+    });
+
+  it("a cap without a price is a configuration answer, not a retryable 503 (BUG-2)", async () => {
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({ pools: [OWNER_PAID_POOL], tests: [] });
+    overflow.dispatchPublicOverflow.mockResolvedValue({
+      dispatched: false,
+      reason: "PRICING_UNAVAILABLE",
+    });
+    const response = await chat();
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: { code: "provider_pricing_missing", message: expect.stringMatching(/price/u) },
+    });
+  });
+
+  it("a request the adapter refuses is a 400 naming the field, never sent (BUG-7 class)", async () => {
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({ pools: [adaptingPool], tests: [] });
+    overflow.listPublicOverflowTargets.mockResolvedValue(listing([MESSAGES_ONLY]));
+    const response = await chatBody({ seed: 7 });
+    expect(response.status).toBe(400);
+    expect(JSON.stringify(await response.json())).toMatch(/seed/u);
+    expect(overflow.dispatchPublicOverflow).not.toHaveBeenCalled();
+  });
+
+  it("max_tokens over every external model's limit names the limit (BUG-9)", async () => {
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({ pools: [OWNER_PAID_POOL], tests: [] });
+    const response = await chatBody({ max_tokens: 100_000 });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: {
+        code: "context_length_exceeded",
+        param: "max_tokens",
+        message: expect.stringMatching(/100000.*4000 tokens/u),
+      },
+    });
+    expect(overflow.dispatchPublicOverflow).not.toHaveBeenCalled();
+    // Responses names its own output field.
+    const responses = await app().request("/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_key_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "owner/chat:external",
+        input: "hello",
+        max_output_tokens: 100_000,
+      }),
+    });
+    expect(responses.status).toBe(400);
+    expect(await responses.json()).toMatchObject({
+      error: { param: "max_output_tokens", message: expect.stringMatching(/^max_output_tokens/u) },
+    });
+  });
+
+  it("an adapted tool request without the single-call opt-in says so (BUG-9)", async () => {
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({ pools: [adaptingPool], tests: [] });
+    overflow.listPublicOverflowTargets.mockResolvedValue(listing([MESSAGES_ONLY]));
+    const response = await chatBody({
+      tools: [{ type: "function", function: { name: "f", parameters: { type: "object" } } }],
+    });
+    expect(response.status).toBe(400);
+    expect(JSON.stringify(await response.json())).toMatch(/parallel_tool_calls/u);
+  });
+
+  it("an unknown model is 404 model_not_found, as documented (BUG-9)", async () => {
+    const response = await app().request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_key_test", "content-type": "application/json" },
+      body: JSON.stringify({ model: "owner/nope", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({
+      error: { code: "model_not_found", param: "model", type: "invalid_request_error" },
+    });
+  });
+
+  it("a Chat stream asking for usage is adapted to a Messages-only member (BUG-7)", async () => {
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({ pools: [adaptingPool], tests: [] });
+    overflow.listPublicOverflowTargets.mockResolvedValue(listing([MESSAGES_ONLY]));
+    overflow.dispatchPublicOverflow.mockResolvedValue({
+      dispatched: false,
+      reason: "PROVIDER_UNAVAILABLE",
+    });
+    await chatBody({ stream: true, stream_options: { include_usage: true } });
+    expect(overflow.dispatchPublicOverflow).toHaveBeenCalledOnce();
+    const sent = overflow.dispatchPublicOverflow.mock.calls[0]?.[0] as Dispatch;
+    const rendered = await sent.renderForTarget!(MESSAGES_ONLY, "anthropic-messages");
+    expect(rendered.path).toBe("/v1/messages");
+    expect(JSON.parse(new TextDecoder().decode(rendered.body))).toMatchObject({
+      model: "openai/gpt-x",
+      stream: true,
+    });
+  });
+});
+
+describe("/v1/models and external-only pools (BUG-10)", () => {
+  const listModels = async () => {
+    const response = await app().request("/models", {
+      headers: { authorization: "Bearer wsmp_key_test" },
+    });
+    expect(response.status).toBe(200);
+    return ((await response.json()) as { data: Array<{ id: string }> }).data.map(
+      (model) => model.id,
+    );
+  };
+
+  it("lists a pool with only cloud members by its :external name (its plain name never serves)", async () => {
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({
+      pools: [OWNER_PAID_POOL],
+      tests: [],
+      shadowed: new Set(),
+    });
+    expect(await listModels()).toEqual(["owner/chat:external"]);
+  });
+
+  it("lists a pool served only by the caller's own key, whatever its cloud mode", async () => {
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({
+      pools: [{ ...POOL, externalMemberCount: 0, fallbackMode: "OFF" }],
+      tests: [],
+      shadowed: new Set(),
+    });
+    expect(await listModels()).toEqual(["owner/chat:external"]);
+  });
+
+  it("lists nothing when the cloud mode does not cover the caller, or there is no cloud member", async () => {
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({
+      pools: [{ ...OWNER_PAID_POOL, fallbackMode: "OWNER" }],
+      tests: [],
+      shadowed: new Set(),
+    });
+    expect(await listModels()).toEqual([]);
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({
+      pools: [{ ...OWNER_PAID_POOL, externalMemberCount: 0 }],
+      tests: [],
+      shadowed: new Set(),
+    });
+    expect(await listModels()).toEqual([]);
+  });
 });

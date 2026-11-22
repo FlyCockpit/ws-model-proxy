@@ -180,11 +180,17 @@ const chatMessageFields = [
   "function_call",
   "reasoning",
   "reasoning_content",
+  "reasoning_details",
 ] as const;
 
 // Null audio, a null function_call, and empty annotations are absence.
-// `reasoning` and `reasoning_content` are omitted. A final message or completed
-// stream whose only visible text is either field still fails.
+// `reasoning` and `reasoning_content` are omitted, and so is OpenRouter's structured
+// `reasoning_details` (an array of reasoning records repeating that text, or encrypted).
+// A final message or completed stream whose only visible text is reasoning still fails.
+function isPlainRecord(value: unknown): boolean {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export function acceptChatMessageExtras(
   message: Record<string, unknown>,
   path: string,
@@ -200,14 +206,21 @@ export function acceptChatMessageExtras(
     if (message.annotations.length)
       unsupported(`${path}.annotations`, "citations are not safely adaptable");
   }
-  const dropped: Array<"reasoning" | "reasoning_content"> = [];
+  const dropped: Array<"reasoning" | "reasoning_content" | "reasoning_details"> = [];
   for (const field of ["reasoning", "reasoning_content"] as const) {
     const reasoning = message[field];
     if (reasoning === undefined || reasoning === null || reasoning === "") continue;
     if (typeof reasoning !== "string") invalid(`${path}.${field}`, "must be text or null");
     dropped.push(field);
   }
-  const droppedField = dropped[0];
+  const details = message.reasoning_details;
+  if (details !== undefined && details !== null) {
+    if (!Array.isArray(details) || details.some((record) => !isPlainRecord(record)))
+      invalid(`${path}.reasoning_details`, "must be an array of objects or null");
+  }
+  const droppedField =
+    dropped[0] ??
+    (Array.isArray(details) && details.length > 0 ? ("reasoning_details" as const) : undefined);
   if (mode === "final" && droppedField) {
     const hasContent = typeof message.content === "string" && message.content.length > 0;
     const hasRefusal = typeof message.refusal === "string" && message.refusal.length > 0;
@@ -607,4 +620,26 @@ export function validateBase64(value: unknown, parameter: string): string {
   if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data))
     invalid(parameter, "must be valid base64");
   return data;
+}
+
+/**
+ * Anthropic's `caller` on a tool use names who called the tool. `{type: "direct"}` (the model
+ * itself, what every plain tool use carries) is the only call a client tool result can answer;
+ * a call made by a server tool (code execution, ...) is not adaptable.
+ */
+export function acceptDirectToolCaller(value: unknown, path: string) {
+  if (value === undefined || value === null) return;
+  if (typeof value !== "object" || Array.isArray(value)) invalid(path, "must be an object");
+  const caller = value as Record<string, unknown>;
+  rejectUnknown(caller, ["type"], path);
+  if (caller.type !== "direct") unsupported(`${path}.type`, "is not a direct model tool call");
+}
+
+/**
+ * A Responses message's `phase` (`commentary` for a preamble, `final_answer`): its text is
+ * visible assistant text either way, so it adapts as text.
+ */
+export function acceptMessagePhase(item: Record<string, unknown>, path: string) {
+  if (item.phase !== undefined && item.phase !== null && typeof item.phase !== "string")
+    invalid(`${path}.phase`, "must be text or null");
 }

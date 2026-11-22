@@ -22,7 +22,12 @@ const world = vi.hoisted(() => ({
     Pools: Array<{ poolId: string }>;
   },
   member: true,
-  model: null as null | { enabled: boolean; accountEnabled: boolean },
+  model: null as null | {
+    enabled: boolean;
+    accountEnabled: boolean;
+    type?: string;
+    nativeCapabilities?: unknown;
+  },
   account: { providerType: "openrouter", allowDataCollection: true } as null | {
     providerType: string;
     allowDataCollection: boolean;
@@ -71,8 +76,9 @@ vi.mock("@ws-model-proxy/db", async () => {
         world.model
           ? {
               enabled: world.model.enabled,
-              nativeCapabilities: null,
-              Account: { enabled: world.model.accountEnabled },
+              type: world.model.type,
+              nativeCapabilities: world.model.nativeCapabilities ?? null,
+              Account: { enabled: world.model.accountEnabled, providerType: "openrouter" },
             }
           : null,
     },
@@ -157,6 +163,18 @@ const granteeConsent: ExternalSendConsentIdentity = {
   ownerUserId: "owner",
   shareId: "share",
 };
+
+/** The same JSON with every object's keys in reverse order (jsonb does not keep key order). */
+function reversedKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(reversedKeys);
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .reverse()
+        .map(([key, item]) => [key, reversedKeys(item)]),
+    );
+  return value;
+}
 
 function claim(
   consent: ExternalSendConsentIdentity = ownerConsent,
@@ -317,6 +335,78 @@ describe("E0 cloud send claim", () => {
     await expect(claim()).resolves.toEqual({ claimed: false, reason: "PROVIDER_UNAVAILABLE" });
     world.model = null;
     await expect(claim()).resolves.toEqual({ claimed: false, reason: "PROVIDER_UNAVAILABLE" });
+  });
+
+  it("never sends a request rendered for APIs the model no longer has", async () => {
+    const { providerModelInventory } = await import(
+      "@ws-model-proxy/api/lib/provider-model-capabilities"
+    );
+    const chat = providerModelInventory({
+      providerType: "openrouter",
+      surfaces: ["OPENAI_CHAT_COMPLETIONS"],
+    });
+    const listed = { ...target(), capabilityInventory: chat };
+    const claimFor = () =>
+      claimPublicProviderCredentialForSend({
+        userId: "owner",
+        target: listed,
+        keyring,
+        consent: ownerConsent,
+      });
+    // Unchanged (stored with its keys in another order, as jsonb returns them): sent.
+    world.model = {
+      enabled: true,
+      accountEnabled: true,
+      type: "LLM",
+      nativeCapabilities: reversedKeys(chat),
+    };
+    await expect(claimFor()).resolves.toMatchObject({ claimed: true });
+    // The owner switched it to Messages between listing and the send boundary.
+    world.model.nativeCapabilities = providerModelInventory({
+      providerType: "openrouter",
+      surfaces: ["ANTHROPIC_MESSAGES"],
+    });
+    await expect(claimFor()).resolves.toEqual({ claimed: false, reason: "PROVIDER_UNAVAILABLE" });
+  });
+
+  it("keeps a Responses binding only while its Responses surface is unchanged", async () => {
+    const { providerModelInventory } = await import(
+      "@ws-model-proxy/api/lib/provider-model-capabilities"
+    );
+    const both = providerModelInventory({
+      providerType: "openrouter",
+      surfaces: ["OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES"],
+    });
+    if (both.version !== 4) throw new Error("expected a v4 inventory");
+    // Listed with retrieve support (an inventory that declares it).
+    const withRetrieve = {
+      ...both,
+      surfaces: {
+        ...both.surfaces,
+        openaiResponses: {
+          ...both.surfaces.openaiResponses!,
+          operations: ["create", "retrieve"] as Array<"create" | "retrieve">,
+        },
+      },
+    };
+    const claimBound = () =>
+      claimPublicProviderCredentialForSend({
+        userId: "owner",
+        target: { ...target(), capabilityInventory: withRetrieve },
+        keyring,
+        consent: ownerConsent,
+        exactBinding: true,
+      });
+    world.model = { enabled: true, accountEnabled: true, type: "LLM" };
+    // Chat dropped, Responses untouched: the binding still holds.
+    world.model.nativeCapabilities = {
+      ...withRetrieve,
+      surfaces: { openaiResponses: withRetrieve.surfaces.openaiResponses },
+    };
+    await expect(claimBound()).resolves.toMatchObject({ claimed: true });
+    // Retrieve support removed (create only): the bound retrieve is never sent.
+    world.model.nativeCapabilities = both;
+    await expect(claimBound()).resolves.toEqual({ claimed: false, reason: "BOUND_TARGET_INVALID" });
   });
 
   it("throws (nothing sent) when the credential rotated meanwhile", async () => {

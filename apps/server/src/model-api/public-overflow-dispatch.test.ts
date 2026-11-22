@@ -20,6 +20,16 @@ const world = vi.hoisted(() => ({
   admitted: [] as Array<Record<string, unknown>>,
   sent: [] as Array<{ baseUrl: string; path: string; auth: unknown; body: string }>,
   providerStatus: 200,
+  /** The provider's answer body (default: a one-word chat completion). */
+  providerBody: undefined as string | undefined,
+  providerType: "generic",
+  attemptUpdates: [] as Array<Record<string, unknown>>,
+  /** The attempt row as admission, settlement and `attempt.updateMany` leave it. */
+  attemptRow: { state: "ACTIVE", firstByteAt: null as Date | null, streamCommitted: false },
+  /** A second cloud member, tried after the first. */
+  twoMembers: false,
+  /** Per-call provider answers (status, body), used before providerStatus/providerBody. */
+  providerAnswers: [] as Array<{ status: number; body?: string }>,
   /** The credential was rotated after listing: the claim finds none current. */
   rotated: false,
 }));
@@ -52,7 +62,7 @@ vi.mock("@ws-model-proxy/db", async () => {
     Account: {
       id: "account",
       userId: "owner",
-      providerType: "generic",
+      providerType: world.providerType,
       providerVersion: null,
       allowDataCollection: false,
       baseUrl: "https://provider.example/v1",
@@ -110,6 +120,21 @@ vi.mock("@ws-model-proxy/db", async () => {
   return {
     default: {
       $transaction: async (work: (client: typeof tx) => unknown) => work(tx),
+      attempt: {
+        updateMany: async (args: {
+          where: { state?: string; firstByteAt?: null };
+          data: { firstByteAt?: Date; streamCommitted?: boolean };
+        }) => {
+          world.attemptUpdates.push(args);
+          // Every predicate the dispatcher writes under, applied to the one row.
+          const row = world.attemptRow;
+          if (args.where.state !== undefined && args.where.state !== row.state) return { count: 0 };
+          if (args.where.firstByteAt === null && row.firstByteAt !== null) return { count: 0 };
+          Object.assign(row, args.data);
+          return { count: 1 };
+        },
+      },
+      relayRequest: { updateMany: async () => ({ count: 1 }) },
       pool: {
         findFirst: async () => ({
           id: "pool",
@@ -122,7 +147,18 @@ vi.mock("@ws-model-proxy/db", async () => {
             ownKeyEquivalentModel: null,
           },
           Advanced: null,
-          Members: [{ id: "member", cloudOrder: 0, ProviderModel: model() }],
+          Members: [
+            { id: "member", cloudOrder: 0, ProviderModel: model() },
+            ...(world.twoMembers
+              ? [
+                  {
+                    id: "member-2",
+                    cloudOrder: 1,
+                    ProviderModel: { ...model(), id: "model-2", Target: { id: "target-2" } },
+                  },
+                ]
+              : []),
+          ],
         }),
       },
       user: { findUnique: async () => active },
@@ -144,6 +180,7 @@ vi.mock("./provider-budget.js", async (importOriginal) => ({
   },
   reconcileProviderBudget: async (terminal: Record<string, unknown>) => {
     world.calls.push(`reconcile:${String(terminal.reason)}`);
+    world.attemptRow.state = String(terminal.reason);
     world.reconciled.push(terminal);
   },
 }));
@@ -197,16 +234,22 @@ vi.mock("@ws-model-proxy/api/lib/provider-egress", async (importOriginal) => ({
       auth,
       body: new TextDecoder().decode(options.body),
     });
-    const payload = JSON.stringify({
-      id: "chatcmpl-1",
-      object: "chat.completion",
-      model: "vendor/model",
-      choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
-      usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
-    });
+    const answer = world.providerAnswers.shift();
+    const payload =
+      answer?.body ??
+      world.providerBody ??
+      JSON.stringify({
+        id: "chatcmpl-1",
+        object: "chat.completion",
+        model: "vendor/model",
+        choices: [
+          { index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" },
+        ],
+        usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+      });
     const body = Readable.from([Buffer.from(payload)]);
     return Object.assign(body, {
-      statusCode: world.providerStatus,
+      statusCode: answer?.status ?? world.providerStatus,
       headers: { "content-type": "application/json" },
       // IncomingMessage: the whole body arrived.
       complete: true,
@@ -287,6 +330,12 @@ beforeEach(() => {
   world.admitted.length = 0;
   world.sent.length = 0;
   world.providerStatus = 200;
+  world.providerBody = undefined;
+  world.providerType = "generic";
+  world.attemptUpdates.length = 0;
+  world.attemptRow = { state: "ACTIVE", firstByteAt: null, streamCommitted: false };
+  world.twoMembers = false;
+  world.providerAnswers.length = 0;
   world.rotated = false;
   world.admission = { admitted: true, providerAttemptId: "attempt", reservationIds: ["r1"] };
   const keyring = parseProviderCredentialKeyring(KEYRING);
@@ -362,6 +411,162 @@ describe("owner/pool:external dispatch", () => {
       fencingToken: 7n,
       revisionKind: "SNAPSHOT",
     });
+  });
+
+  it("settles an OpenRouter refusal at OpenRouter's charge, zero, not at the reservation", async () => {
+    world.providerType = "openrouter";
+    world.providerStatus = 400;
+    world.providerBody = JSON.stringify({
+      error: { message: "rp5test/does-not-exist is not a valid model ID", code: 400 },
+      user_id: "user_x",
+    });
+    const result = await dispatchPublicOverflow(request());
+    if (result.dispatched) {
+      await result.response.text();
+      await result.terminal;
+    }
+    expect(world.reconciled[0]).toMatchObject({
+      reason: "FAILED",
+      observationComplete: true,
+      usageSource: "openrouter-rejection",
+      usage: { reportedCost: "0", reportedCostCurrency: "USD", reportedCostPricingVersion: "p1" },
+    });
+  });
+
+  it("settles a streamed request's OpenRouter refusal at zero too (its JSON body is no SSE)", async () => {
+    world.providerType = "openrouter";
+    world.providerStatus = 401;
+    world.providerBody = JSON.stringify({
+      error: { message: "No auth credentials found", code: 401 },
+    });
+    const result = await dispatchPublicOverflow({ ...requestWith({ stream: true }), stream: true });
+    if (!result.dispatched) throw new Error("expected the refusal to be the outcome");
+    // The provider's JSON error reaches the caller as it came (it is no SSE stream to decode).
+    expect(result.response.status).toBe(401);
+    expect(await result.response.text()).toBe(world.providerBody);
+    await result.terminal;
+    expect(world.reconciled[0]).toMatchObject({
+      observationComplete: true,
+      usageSource: "openrouter-rejection",
+      usage: { reportedCost: "0" },
+    });
+  });
+
+  it("settles a rate-limited attempt it retries at zero (OpenRouter's 429 is not billed)", async () => {
+    world.providerType = "openrouter";
+    world.providerStatus = 429;
+    world.providerBody = JSON.stringify({ error: { message: "Rate limit exceeded", code: 429 } });
+    const result = await dispatchPublicOverflow({ ...request(), retrySingleTargetPrecommit: true });
+    expect(result.dispatched).toBe(false);
+    expect(world.reconciled[0]).toMatchObject({
+      reason: "FAILED",
+      observationComplete: true,
+      httpStatusCode: 429,
+      errorClass: "RATE_LIMIT",
+      usage: { reportedCost: "0", observationComplete: true },
+    });
+  });
+
+  it("a 429 then a success: the refused attempt costs nothing, the served one its usage", async () => {
+    world.providerType = "openrouter";
+    world.twoMembers = true;
+    world.providerAnswers.push(
+      {
+        status: 429,
+        body: JSON.stringify({ error: { message: "Rate limit exceeded", code: 429 } }),
+      },
+      {
+        status: 200,
+        body: JSON.stringify({
+          id: "gen-1",
+          object: "chat.completion",
+          model: "vendor/model",
+          choices: [
+            { index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" },
+          ],
+          usage: {
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            total_tokens: 6,
+            cost: 0.000007,
+            is_byok: false,
+          },
+        }),
+      },
+    );
+    const result = await dispatchPublicOverflow(request());
+    if (!result.dispatched) throw new Error("expected the second member to serve");
+    expect(await result.response.text()).toContain('"content":"hi"');
+    await result.terminal;
+    expect(world.sent).toHaveLength(2);
+    expect(world.reconciled).toHaveLength(2);
+    expect(world.reconciled[0]).toMatchObject({
+      providerModelId: "model",
+      reason: "FAILED",
+      httpStatusCode: 429,
+      usage: { reportedCost: "0" },
+    });
+    expect(world.reconciled[1]).toMatchObject({
+      providerModelId: "model-2",
+      reason: "COMPLETED",
+      httpStatusCode: 200,
+      usage: {
+        reportedCost: 0.000007,
+        reportedCostCurrency: "USD",
+        reportedCostPricingVersion: "p1",
+      },
+    });
+  });
+
+  it("records the first client byte on the attempt once, even after it settled", async () => {
+    const result = await dispatchPublicOverflow(request());
+    if (!result.dispatched) throw new Error("expected a dispatch");
+    await result.response.text();
+    await result.terminal;
+    // The attempt settled before the client's first byte (a held non-stream body).
+    expect(world.attemptRow.state).toBe("COMPLETED");
+    await result.markFirstClientByte();
+    const first = world.attemptRow.firstByteAt;
+    expect(first).toBeInstanceOf(Date);
+    // Recorded on the settled row, which stays settled.
+    expect(world.attemptRow).toEqual({
+      state: "COMPLETED",
+      firstByteAt: first,
+      streamCommitted: true,
+    });
+    expect(world.attemptUpdates).toEqual([
+      {
+        where: { id: expect.any(String), fencingToken: 7n, kind: "CLOUD", firstByteAt: null },
+        data: { streamCommitted: true, firstByteAt: first },
+      },
+    ]);
+    // Once: a second commitment neither writes nor moves the stored first byte.
+    await result.markFirstClientByte();
+    expect(world.attemptUpdates).toHaveLength(1);
+    expect(world.attemptRow.firstByteAt).toBe(first);
+  });
+
+  it.each([
+    [
+      "a 5xx (generation may have run)",
+      502,
+      '{"error":{"message":"upstream failed"}}',
+      "openrouter",
+    ],
+    ["a body that is not an error envelope", 400, '{"choices":[]}', "openrouter"],
+    ["another provider type", 400, '{"error":{"message":"bad"}}', "generic"],
+  ])("keeps the conservative liability for %s", async (_label, status, body, providerType) => {
+    world.providerType = providerType;
+    world.providerStatus = status;
+    world.providerBody = body;
+    const result = await dispatchPublicOverflow(request());
+    if (result.dispatched) {
+      await result.response.text();
+      await result.terminal;
+    }
+    expect(world.reconciled).toHaveLength(1);
+    expect(world.reconciled[0]?.usage).toBeUndefined();
+    expect(world.reconciled[0]?.usageSource).toBe("missing-provider-usage");
   });
 
   it("tries only the members the caller found servable", async () => {

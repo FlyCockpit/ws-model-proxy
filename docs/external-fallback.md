@@ -659,7 +659,8 @@ preserve the upstream status as described under [Own-key failure and accounting]
 | --- | --- |
 | Local wait expired, pool has local members (including a capped provider wait that expired) | Tries the local members again for the rest of the pool's max wait. The `:external` caller already waited all of it, so a slot must be free right now. If not: `429 rate_limited`, like the plain name after the same wait. The place in the local queue is not kept. |
 | No compatible or healthy local member, context too large, or local failures after every member was tried | The same error the plain name gets. |
-| Pool has only external members, no external member fits the request | `400 unsupported_capability` |
+| Pool has only external members, no external member fits the request | `400 unsupported_capability`; `400 context_length_exceeded` naming the limit when the request is over every member's maximum output or context window; the adapter's `400` naming the field when only translation could serve it and the field is outside the translated subset |
+| Pool has only external members, a provider account cap applies and the model has no active price in its currency | `400 provider_pricing_missing` |
 | Pool has only external members, the compatible ones are all in a provider health cooldown | `503 external_unavailable` |
 | Pool has only external members, provider busy | `429 rate_limited` |
 | Pool has only external members, this share holder's monthly cap is used up | `429 grantee_spend_cap` (no remaining amount, cap id, or account label) |
@@ -696,11 +697,16 @@ instance whose node is connected; empty and disconnected pools are omitted. Full
 saturated pools stay listed. `owner/pool:external` is listed next to a listed plain
 name when this caller could be served that way (switch on, the cloud mode covers the
 caller, and at least one cloud member or an own-key route), from configuration, not
-provider health.
+provider health. A pool with only cloud members lists `owner/pool:external` alone on
+the same conditions (its plain name is never callable).
 
 Attempts that are refused before provider I/O settle their token-count and spend
 reservations at zero. If bytes may have reached the provider and no trustworthy
-usage is available, settlement retains the conservative reserved amount.
+usage is available, settlement retains the conservative reserved amount. One
+exception: OpenRouter bills nothing for a request it refuses before generating (a
+`400`, `401`, `402`, `403`, `404` or `429` answer whose whole body is one JSON error
+envelope, at most 64 KiB); such an attempt settles at OpenRouter's charge, zero. A
+`408`, a `5xx`, or any other body keeps the reserved amount.
 
 ## Stored Responses
 
@@ -766,6 +772,39 @@ revoked and deleted, and cloud modes can still be turned off; catalog searches
 and credential tests refuse because they would contact a provider. Secrets are
 never returned.
 
+### Provider models
+
+A provider model serves the generation APIs it is stored with (`surfaces` on
+`providers.models.create` / `update`, the **APIs** checkboxes on the Providers page);
+requests on another API are translated to one of them when the pool allows protocol
+adaptation. Without a choice the provider type decides:
+
+| Account | Default APIs |
+| --- | --- |
+| `openrouter` | Chat Completions; plus Responses for `openai/*` models and Anthropic Messages for `anthropic/*` models |
+| `generic` | Chat Completions |
+
+A `generic` account speaks one wire protocol, so its models declare either Anthropic
+Messages alone or OpenAI APIs (Chat Completions, Responses). A model stored before it
+had an API list serves its provider type's defaults.
+
+Every cloud request is bounded, and its spend reserved, by the model's context window
+and maximum output tokens, so a language model can be turned on only with both set
+(the model's **Settings**). An `openrouter` model added while the OpenRouter catalog
+lists it takes what the catalog knows: its features (tools, reasoning, structured
+output, modalities), the context window and maximum output the owner left empty, and
+the catalog price as its first active price.
+
+A price names at least input and output per million tokens. Reasoning tokens are
+output tokens: a price without a reasoning rate charges them at the output rate.
+Cache read and write rates are optional; without one, a reply that reports such
+tokens keeps the reserved amount unless the provider reports its own cost (OpenRouter
+does). A provider account cap needs an active price in the cap's currency: without
+one, a pool with only external members answers `400 provider_pricing_missing` (the
+pool owner sets the price) instead of trying the provider.
+
+The provider usage list shows each reply's prompt tokens (cached and cache-write
+tokens included) and completion tokens (reasoning tokens included).
 
 ## OpenRouter privacy (`data_collection: "deny"`)
 
@@ -857,7 +896,9 @@ cache writes (`cache_creation.ephemeral_1h_input_tokens`), positive
 `video_tokens` / `image_tokens`, two spellings of the same count, a non-object
 detail container, and any other unrecognized or malformed field keep the
 response on the conservative liability path. Spend settles from OpenRouter's
-`cost` ("the total amount charged to your account"). With `is_byok: true` the
+`cost` ("the total amount charged to your account"), whether or not the model's price
+can itself price every reported category (a reasoning reply, say), as long as that price
+is in USD. With `is_byok: true` the
 upstream provider also bills the key owner, so spend is `cost +
 cost_details.upstream_inference_cost` ("the actual cost charged by the upstream
 AI provider"); an `is_byok` usage without a valid upstream cost keeps the liability.

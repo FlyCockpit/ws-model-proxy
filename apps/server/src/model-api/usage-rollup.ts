@@ -204,7 +204,8 @@ export function rollupIncrementForRequest(
     errors: row.status === "FAILED" ? 1 : 0,
     cancels: row.status === "CANCELED" ? 1 : 0,
     retries: Math.max(0, row.attemptCount - 1),
-    cloudRequests: row.external ? 1 : 0,
+    // Served by a provider (pool cloud member or own key), not merely asked for `:external`.
+    cloudRequests: row.route === "cloud" || row.route === "own_key" ? 1 : 0,
     rejectedCapacity: rejected.startsWith("capacity") ? 1 : 0,
     rejectedContext: rejected.startsWith("context") ? 1 : 0,
     rejectedSpend: rejected.startsWith("spend") ? 1 : 0,

@@ -151,7 +151,12 @@ export function createProtocolAdaptationTransform({
   logContext?: AdapterLogContext;
 }): TransformStream<Uint8Array, Uint8Array> {
   const parser = new CanonicalStreamParser(source, { signal, maxEventBytes, maxAggregateBytes });
-  const renderer = new CanonicalStreamRenderer(target, { signal, maxAggregateBytes });
+  const renderer = new CanonicalStreamRenderer(target, {
+    signal,
+    maxAggregateBytes,
+    // A Chat client gets OpenAI's usage chunk only when it asked for one.
+    usageChunk: request?.source !== "openai-chat" || request.streamUsage === true,
+  });
   let failed = false;
   let hasOutput = false;
   let observedUsage: CanonicalUsage = {};

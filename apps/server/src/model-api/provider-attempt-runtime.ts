@@ -1,5 +1,6 @@
 import prisma from "@ws-model-proxy/db";
 import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
+import { PROVIDER_ATTEMPT_OWNER_EPOCH } from "./provider-budget.js";
 import {
   providerBreakerRefuses,
   providerBreakerState,
@@ -468,23 +469,88 @@ export async function recordProviderAttemptEvent(input: {
     else facts[key] = value;
   }
   if (usage) for (const [key, value] of Object.entries(usage)) facts[`usage.${key}`] = value;
-  await prisma.$transaction(async (tx) => {
-    const last = await tx.attemptEvent.findFirst({
-      where: { attemptId },
-      orderBy: { sequence: "desc" },
-      select: { sequence: true },
+  try {
+    await prisma.$transaction(async (tx) => {
+      // A target skipped before admission (no compatible surface, render failure, no output
+      // bound, a refused reservation, ...) has no attempt row yet: its skip is recorded as a
+      // terminal attempt of its own, so the event has one to belong to and the attempt list
+      // shows why the target was not tried.
+      if (endsUnadmittedAttempt(input)) {
+        const now = new Date();
+        await tx.attempt.createMany({
+          data: [
+            {
+              id: attemptId,
+              userId,
+              requestId,
+              kind: "CLOUD",
+              purpose: "EXECUTION",
+              state: input.terminalState === "CANCELLED" ? "CANCELLED" : "FAILED",
+              ownerEpoch: PROVIDER_ATTEMPT_OWNER_EPOCH,
+              fencingToken: input.fencingToken ?? 0n,
+              heartbeatAt: now,
+              expiresAt: now,
+              terminalAt: now,
+              terminalReason: reason ?? eventType,
+              poolId: input.poolId ?? null,
+              poolMemberId: input.poolMemberId ?? null,
+              targetId: input.executionTargetId ?? null,
+              providerAccountId: input.providerAccountId,
+              providerModelId: input.providerModelId,
+              requestedSurface: input.requestedSurface ?? "unknown",
+              nativeSurface: input.nativeSurface ?? null,
+              adapterMode: input.adapterMode ?? null,
+              adapterVersion: input.adapterVersion ?? null,
+            },
+          ],
+          // An admitted attempt already has its row (and its own state).
+          skipDuplicates: true,
+        });
+      }
+      await appendAttemptEvent(tx, { userId, attemptId, requestId, eventType, reason, facts });
     });
-    await tx.attemptEvent.create({
-      data: {
-        userId,
-        attemptId,
-        requestId,
-        sequence: (last?.sequence ?? 0) + 1,
-        eventType,
-        reason: reason ?? null,
-        metadata: facts,
-      },
+  } catch (error) {
+    // Telemetry never fails the request, but a lost event is reported, not swallowed.
+    console.warn("[provider-attempt] attempt event not recorded", {
+      eventType,
+      reason: reason ?? null,
+      error: error instanceof Error ? `${error.name}: ${error.message.slice(0, 300)}` : "unknown",
     });
+  }
+}
+
+/** A skip, or a terminal event of an attempt that may never have been admitted. */
+function endsUnadmittedAttempt(input: { eventType: string; terminalState?: string }): boolean {
+  return input.eventType === "SKIP" || (input.eventType === "TERMINAL" && !!input.terminalState);
+}
+
+async function appendAttemptEvent(
+  tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
+  event: {
+    userId: string;
+    attemptId: string;
+    requestId: string;
+    eventType: string;
+    reason: string | undefined;
+    facts: Record<string, string | number | boolean | null>;
+  },
+) {
+  const { userId, attemptId, requestId, eventType, reason, facts } = event;
+  const last = await tx.attemptEvent.findFirst({
+    where: { attemptId },
+    orderBy: { sequence: "desc" },
+    select: { sequence: true },
+  });
+  await tx.attemptEvent.create({
+    data: {
+      userId,
+      attemptId,
+      requestId,
+      sequence: (last?.sequence ?? 0) + 1,
+      eventType,
+      reason: reason ?? null,
+      metadata: facts,
+    },
   });
 }
 

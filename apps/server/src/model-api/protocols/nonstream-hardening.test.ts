@@ -617,13 +617,13 @@ describe("upstream reply envelopes ignore unknown fields", () => {
                 type: "message",
                 status: "completed",
                 role: "assistant",
-                phase: "nope",
+                vendor_phase: "nope",
                 content: [{ type: "output_text", text: "ok", annotations: [] }],
               },
             ],
           },
         }),
-      ).toThrow(/phase/u);
+      ).toThrow(/vendor_phase/u);
       expect(() =>
         parseProtocolResponse({
           surface: "anthropic-messages",

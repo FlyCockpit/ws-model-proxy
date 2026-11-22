@@ -28,7 +28,7 @@ import {
   type SurfaceRequestRequirements,
 } from "@ws-model-proxy/api/lib/surface-capabilities";
 import { type AgentAccess, agentNodeAllowed } from "@ws-model-proxy/auth/agent-scopes";
-import prisma from "@ws-model-proxy/db";
+import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { hmacDigestForPurpose } from "@ws-model-proxy/db/node-security";
 import {
   poolOwnerActive,
@@ -460,6 +460,56 @@ function strictlyLargerCeilingRoutes<T extends { poolMemberId: string }>({
     if (ceiling <= fromCeiling) return false;
     return minTokens === null || ceiling >= minTokens;
   });
+}
+
+/**
+ * Why no external target fits when each one refused the request for its limits: the request
+ * asks for more output than any of them gives, or does not fit their context. Null otherwise.
+ */
+function externalLimitMessage(
+  targets: readonly PublicProviderTarget[],
+  request: Parameters<typeof publicTargetCompatibility>[1],
+  modelId: string,
+  outputField: "max_tokens" | "max_output_tokens",
+): { message: string; param: string | null } | undefined {
+  if (
+    targets.length === 0 ||
+    targets.some((item) => publicTargetCompatibility(item, request) !== "CONTEXT_EXCEEDED")
+  )
+    return undefined;
+  const largest = (values: Array<number | null>) =>
+    Math.max(...values.filter((value): value is number => value !== null));
+  const maxOutput = largest(targets.map((item) => item.maxOutputTokens));
+  const requested = request.requestedOutputTokens;
+  if (requested !== undefined && Number.isFinite(maxOutput) && requested > BigInt(maxOutput))
+    return {
+      message: `${outputField} (${requested}) is more than the maximum output of the external models of "${modelId}" (${maxOutput} tokens).`,
+      param: outputField,
+    };
+  const window = largest(targets.map((item) => item.contextWindow));
+  return {
+    message: `The request (about ${request.estimatedInputTokens ?? "?"} input tokens plus ${requested ?? maxOutput} output tokens) does not fit the context window of the external models of "${modelId}" (${window} tokens).`,
+    param: null,
+  };
+}
+
+function externalLimitResponse(
+  operation: Pick<RelayOperation, "family">,
+  refusal: { message: string; param: string | null },
+) {
+  if (operation.family === "messages")
+    return anthropicErrorResponse(400, refusal.message, "invalid_request_error");
+  return new Response(
+    JSON.stringify(
+      openAiErrorBody({
+        message: refusal.message,
+        type: "invalid_request_error",
+        param: refusal.param,
+        code: "context_length_exceeded",
+      }),
+    ),
+    { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
+  );
 }
 
 function contextExceededResponse(
@@ -1169,6 +1219,62 @@ type RouteIdentity = {
 };
 
 class RouteIdentityPersistenceError extends Error {}
+
+/** The route of a request served (or being served) by a provider target. */
+function providerTargetRouteIdentity(provider: PublicProviderTarget): RouteIdentity {
+  return {
+    fallbackRoute: provider.ownKey ? "own-key" : "pool-external",
+    selectedExecutionTargetId: provider.executionTargetId,
+    selectedRuntimeModelId: null,
+    selectedPoolMemberId: provider.ownKey ? null : provider.poolMemberId,
+    selectedProviderModelId: provider.providerModelId,
+  };
+}
+
+/**
+ * A committed external response: the request's route (relay_request: route, target, provider
+ * model, attempts, affinity) and the attempt's surface and adaptation. The data is typed, so a
+ * column that does not exist fails the build rather than every write at runtime (Prisma does
+ * not check nested `data` keys of an inferred argument).
+ */
+async function recordExternalCommit(input: {
+  relayRequestId: string;
+  identity: RouteIdentity;
+  attemptId: string;
+  fencingToken: bigint;
+  attemptCount: number;
+  nativeSurface: string;
+  adapted: boolean;
+  affinity?: { outcome: string; score?: number; prefixDepth?: number };
+}) {
+  const request: Prisma.RelayRequestUncheckedUpdateInput = {
+    ...routeIdentityData(input.identity),
+    attemptCount: input.attemptCount,
+    ...(input.affinity
+      ? {
+          affinityOutcome: input.affinity.outcome,
+          affinityScore: input.affinity.score ?? null,
+          affinityPrefixDepth: input.affinity.prefixDepth ?? null,
+        }
+      : {}),
+  };
+  const attempt: Prisma.AttemptUncheckedUpdateManyInput = {
+    nativeSurface: input.nativeSurface,
+    adapterMode: input.adapted ? "ADAPTED" : "NATIVE",
+    adapterVersion: input.adapted ? "1.0.0" : null,
+  };
+  await Promise.all([
+    prisma.relayRequest.update({
+      where: { id: input.relayRequestId },
+      data: request,
+      select: { id: true },
+    }),
+    prisma.attempt.updateMany({
+      where: { id: input.attemptId, fencingToken: input.fencingToken, kind: "CLOUD" },
+      data: attempt,
+    }),
+  ]);
+}
 
 /** RelayRequest.route values ("local" | "cloud" | "own_key"). */
 function routeColumn(route: FallbackRoute | null | undefined): string | null {
@@ -2992,8 +3098,13 @@ async function failRelayMetadata({
 }
 
 function metadataUpdateError(error: unknown) {
-  void error;
-  console.warn("[model-api] relay metadata update failed");
+  // The class and message (Prisma names the offending field; never a prompt or a secret).
+  console.warn("[model-api] relay metadata update failed", {
+    error:
+      error instanceof Error
+        ? `${error.name}: ${error.message.replace(/\s+/gu, " ").slice(0, 300)}`
+        : "unknown",
+  });
 }
 
 function responseStickinessDigest({
@@ -3743,10 +3854,19 @@ async function modelListResponse(
   );
   const poolFlagsById = new Map<string, ReturnType<typeof multimodalFlagsFromCapabilities>>();
   const servingPoolIds = new Set<string>();
+  /** Pools with no local members: their only callable name is `:external`. */
+  const externalOnlyPoolIds = new Set<string>();
   await Promise.all(
     targets.pools.map(async (pool) => {
       const rows = await poolMemberRows(pool.id);
       if (rows.some((row) => routeIsServing(row, onlineNodeIds))) servingPoolIds.add(pool.id);
+      // No local member: cloud members, or the caller's own-key route, are its only route.
+      if (
+        rows.length === 0 &&
+        (pool.externalMemberCount > 0 ||
+          Boolean(pool.externalEquivalentModel && pool.ownKeyProviderModelId))
+      )
+        externalOnlyPoolIds.add(pool.id);
       poolFlagsById.set(pool.id, poolModelListFlags(rows));
     }),
   );
@@ -3782,11 +3902,12 @@ async function modelListResponse(
         // `owner/pool:external` is listed only when this caller could be served
         // that way, from static configuration (never live health): switch on,
         // the pool's fallback mode covers this requester, and at least one cloud
-        // member (or the requester's own key) is configured. No provider labels
-        // or upstream ids are advertised.
+        // member (or the requester's own key) is configured; next to a listed plain
+        // name, or alone for a pool with only cloud members (its plain name is never
+        // callable). No provider labels or upstream ids are advertised.
         const externalListed =
           external !== undefined &&
-          servingPoolIds.has(pool.id) &&
+          (servingPoolIds.has(pool.id) || externalOnlyPoolIds.has(pool.id)) &&
           (pool.externalMemberCount > 0 ||
             Boolean(pool.externalEquivalentModel && pool.ownKeyProviderModelId)) &&
           evaluateExternalEgress({
@@ -4454,6 +4575,7 @@ async function relayPool({
     apiKeyId: requester.apiKeyId,
     apiKeyPrefix: requester.apiKeyPrefix,
     requestedPoolId: target.id,
+    external: external.requested,
     requestedSurface: telemetrySurfaceForOperation(operation),
     transformerLatencyMs: transformDebug?.latencyMs ?? null,
     operation: operation.capability,
@@ -4468,12 +4590,8 @@ async function relayPool({
     selectedRuntimeModelId: null,
     selectedPoolMemberId: null,
   };
-  const providerRouteIdentity = (provider: PublicProviderTarget): RouteIdentity => ({
-    fallbackRoute: provider.ownKey ? "own-key" : "pool-external",
-    selectedExecutionTargetId: provider.executionTargetId,
-    selectedRuntimeModelId: null,
-    selectedPoolMemberId: provider.ownKey ? null : provider.poolMemberId,
-  });
+  const providerRouteIdentity = (provider: PublicProviderTarget): RouteIdentity =>
+    providerTargetRouteIdentity(provider);
   const persistRouteIdentity = async (identity: RouteIdentity) => {
     // Await supersession before admitting another tier or writing terminal
     // metadata. A failed write stops routing; it cannot leak stale identity
@@ -4495,6 +4613,11 @@ async function relayPool({
     }
   >["providerFailure"];
   let ownKeyOutcome = false;
+  // Why the adapter refused this request for every external target it would have been
+  // translated for: the answer (400, naming the field) when no external target remains.
+  let externalAdaptationRefusal: AdapterError | undefined;
+  // Set when every external target refused the request for its limits: the answer names them.
+  let externalLimitRefusal: { message: string; param: string | null } | undefined;
   const failPoolRelayMetadata = (input: Parameters<typeof failRelayMetadata>[0]) =>
     failRelayMetadata({ ...input, routeIdentity });
   const updatePoolRelayMetadata = (relayRequestId: string, update: RelayMetadataUpdate) =>
@@ -4579,6 +4702,9 @@ async function relayPool({
           : undefined;
     const estimatedInputTokens =
       payloadAwareInputTokens(built.body) ?? conservativeSerializedInputTokens(publicRequestBytes);
+    // Why the strict adapter cannot parse this request (an unsupported field): no target
+    // reached by adaptation can serve it.
+    let canonicalRefusal: AdapterError | undefined;
     const canonical = operation.adaptation
       ? (() => {
           try {
@@ -4586,7 +4712,8 @@ async function relayPool({
               operation.adaptation!.requestedSurface,
               operation.adaptation!.payload,
             );
-          } catch {
+          } catch (error) {
+            if (error instanceof AdapterError) canonicalRefusal = error;
             return null;
           }
         })()
@@ -4724,7 +4851,14 @@ async function relayPool({
       let providerDepthError: AdapterError | undefined;
       const compatibleAll = compatibleTargets(listed.targets).filter((providerTarget) => {
         const nativeSurface = providerTarget.resolvedExecution?.nativeSurface;
-        if (!canonical || !nativeSurface || nativeSurface === requestedSurface) return true;
+        if (!nativeSurface || nativeSurface === requestedSurface) return true;
+        // An adapted target needs the request in the adapter's common subset.
+        if (!canonical) {
+          if (canonicalRefusal && isRequestDepthError(canonicalRefusal))
+            providerDepthError = canonicalRefusal;
+          else if (canonicalRefusal) externalAdaptationRefusal ??= canonicalRefusal;
+          return false;
+        }
         try {
           renderForExecutionTarget({
             request: canonical,
@@ -4740,6 +4874,12 @@ async function relayPool({
             providerDepthError = error;
             return false;
           }
+          // The adapter refuses this request for this target: it can never be sent there
+          // (it was dispatched and skipped as a render failure, a retryable 503, before).
+          if (error instanceof AdapterError) {
+            externalAdaptationRefusal ??= error;
+            return false;
+          }
         }
         return true;
       });
@@ -4753,7 +4893,24 @@ async function relayPool({
       // cooldown: a transient 503-class condition, never 400.
       if (compatible.length === 0 && compatibleTargets(listed.coolingDown).length > 0)
         return { dispatched: false, reason: "PROVIDER_UNHEALTHY" };
-      if (compatible.length === 0) return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
+      if (compatible.length === 0) {
+        externalLimitRefusal ??= externalLimitMessage(
+          listed.targets,
+          tierRequest,
+          externalModelId(target.modelId),
+          operation.family === "responses" ? "max_output_tokens" : "max_tokens",
+        );
+        // Only adaptation could serve this surface, and the adapter refuses the request:
+        // its refusal (naming the field) is the answer.
+        if (
+          canonicalRefusal &&
+          !isRequestDepthError(canonicalRefusal) &&
+          listed.targets.length > 0 &&
+          listed.targets.every((item) => !item.nativeSurfaces.includes(requestedSurface))
+        )
+          externalAdaptationRefusal ??= canonicalRefusal;
+        return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
+      }
       // 0.4.0 cloud members have no physical capacity: the provider is the capacity, and the
       // monthly spend caps (reserved before every send) bound what they may spend. They are
       // dispatched without a capacity lease; dispatchPublicOverflow walks the ranked members
@@ -4968,37 +5125,24 @@ async function relayPool({
       if (!committedResult) throw new Error("external response commit without a dispatch result.");
       routeIdentity = providerRouteIdentity(committedResult.target);
       const externalReason = externalFallbackReasonHeader(reason);
-      await prisma.relayRequest
-        .update({
-          where: { id: relayRequestId },
-          data: {
-            selectedExecutionTargetId: committedResult.target.executionTargetId,
-            selectedRuntimeModelId: null,
-            selectedPoolMemberId: committedResult.target.ownKey
-              ? null
-              : committedResult.target.poolMemberId,
-            selectedNativeSurface:
-              operation.family === "embeddings"
-                ? "OPENAI_EMBEDDINGS"
-                : modelApiSurface(committedResult.nativeSurface),
-            adapterMode: committedResult.nativeSurface === requestedSurface ? "NATIVE" : "ADAPTED",
-            adapterVersion: committedResult.nativeSurface === requestedSurface ? null : "1.0.0",
-            publicEgress: true,
-            publicOverflowReason: reason,
-            fallbackRoute: committedResult.target.ownKey ? "own-key" : "pool-external",
-            providerAccountId: committedResult.target.providerAccountId,
-            providerModelId: committedResult.target.providerModelId,
-            providerAttemptId: committedResult.attemptId,
-            providerFencingToken: committedResult.fencingToken,
-            attemptCount: committedResult.attemptCount,
-            affinityOutcome: committedResult.affinity?.outcome ?? "DISABLED",
-            affinityScore: committedResult.affinity?.score,
-            affinityPrefixDepth: committedResult.affinity?.prefixDepth,
-            affinityReason: committedResult.affinity?.reason,
-          },
-          select: { id: true },
-        })
-        .catch(metadataUpdateError);
+      await recordExternalCommit({
+        relayRequestId,
+        identity: routeIdentity,
+        attemptId: committedResult.attemptId,
+        fencingToken: committedResult.fencingToken,
+        attemptCount: committedResult.attemptCount,
+        nativeSurface:
+          operation.family === "embeddings"
+            ? "OPENAI_EMBEDDINGS"
+            : modelApiSurface(committedResult.nativeSurface),
+        adapted:
+          operation.family !== "embeddings" && committedResult.nativeSurface !== requestedSurface,
+        affinity: {
+          outcome: committedResult.affinity?.outcome ?? "DISABLED",
+          score: committedResult.affinity?.score,
+          prefixDepth: committedResult.affinity?.prefixDepth,
+        },
+      }).catch(metadataUpdateError);
       const routeHeaders = {
         [ROUTE_HEADER]: committedResult.target.ownKey ? "own-key" : "pool-fallback",
         [FALLBACK_REASON_HEADER]: externalReason,
@@ -5252,7 +5396,7 @@ async function relayPool({
     const terminal = terminalExternalFailure({ kind: "unavailable", reason });
     const failure: ModelApiFailure =
       terminal ??
-      (reason === "NO_COMPATIBLE"
+      (reason === "NO_COMPATIBLE" || reason === "UNPRICED"
         ? "unsupported_capability"
         : reason === "SATURATED" || reason === "GRANTEE_SPEND_CAP"
           ? "rate_limited"
@@ -5290,6 +5434,15 @@ async function relayPool({
         message: GRANTEE_SPEND_CAP_MESSAGE,
       });
     }
+    if (reason === "UNPRICED")
+      return externalRouteErrorResponse(operation.family, {
+        code: "provider_pricing_missing",
+        message: `The external provider model for "${externalModelId(target.modelId)}" has no active price, and its provider account has a spend cap that needs one. The pool owner must set the model's price.`,
+      });
+    if (reason === "NO_COMPATIBLE" && externalLimitRefusal)
+      return externalLimitResponse(operation, externalLimitRefusal);
+    if (reason === "NO_COMPATIBLE" && externalAdaptationRefusal && requestedSurface)
+      return adapterRequestErrorResponse(requestedSurface, externalAdaptationRefusal);
     if (reason !== "UNAVAILABLE") {
       const response = operationFailureResponse(operation, failure);
       if (ownKeyOutcome && reason === "SATURATED") response.headers.set("retry-after", "1");
@@ -8182,7 +8335,9 @@ const NO_EXTERNAL_ROUTE: PoolExternalRoute = { requested: false, consent: null, 
  * Why a consented `:external` request needed an external dispatch but none
  * happened. Drives the provider-only pool status (D5 / X1):
  *   NO_COMPATIBLE -> 400 unsupported_capability (no configured external
- *                    target fits the request, cooling down or not);
+ *                    target fits the request, cooling down or not), or the
+ *                    adapter's 400 naming the field when adaptation refused it;
+ *   UNPRICED      -> 400 provider_pricing_missing (a cap applies, no price);
  *   SATURATED     -> 429 rate_limited (provider admission did not admit);
  *   UNAVAILABLE   -> 503 external_unavailable (every compatible target in a
  *                    provider health cooldown, precommit failure, owner or
@@ -8198,6 +8353,8 @@ const NO_EXTERNAL_ROUTE: PoolExternalRoute = { requested: false, consent: null, 
  */
 type ExternalUnavailableReason =
   | "NO_COMPATIBLE"
+  /** A spend cap applies and the model has no usable price: the owner must set one. */
+  | "UNPRICED"
   | "SATURATED"
   | "UNAVAILABLE"
   | "GRANTEE_SPEND_CAP"
@@ -8241,6 +8398,7 @@ function externalUnavailableReason(
   if (reason === "PROVIDER_SATURATED") return "SATURATED";
   if (reason === "GRANTEE_BUDGET_EXCEEDED" || reason === "GRANTEE_CAP_UNPRICEABLE")
     return "GRANTEE_SPEND_CAP";
+  if (reason === "PRICING_UNAVAILABLE") return "UNPRICED";
   return "UNAVAILABLE";
 }
 
@@ -8366,7 +8524,11 @@ async function relayPreparedModeledRequest({
   const resolution = resolveRequestedModelName(targets, prepared.model);
   if (resolution.kind === "not_found") {
     await prepared.dispose?.();
-    return operationFailureResponse(operation, "not_found");
+    // OpenAI's unknown-model answer (`model_not_found`, param `model`); Anthropic not_found_error.
+    return externalRouteErrorResponse(operation.family, {
+      code: "model_not_found",
+      message: "Model not found.",
+    });
   }
   if (resolution.kind === "error") {
     await prepared.dispose?.();
@@ -8855,6 +9017,8 @@ async function relayBoundProviderResponse(input: {
     apiKeyId: input.requester.apiKeyId,
     apiKeyPrefix: input.requester.apiKeyPrefix,
     requestedPoolId: input.stickyRoute.visibleTarget.id,
+    // A bound external follow-up is an `:external` request.
+    external: true,
     requestedSurface: "OPENAI_RESPONSES",
     operation: input.capability,
     requestBytes: input.body.byteLength,
@@ -9080,26 +9244,15 @@ async function relayBoundProviderResponse(input: {
       "The bound provider Responses target is no longer available.",
     );
   }
-  await prisma.relayRequest
-    .update({
-      where: { id: relayRequestId },
-      data: {
-        selectedExecutionTargetId: result.target.executionTargetId,
-        selectedRuntimeModelId: null,
-        selectedPoolMemberId: result.target.ownKey ? null : result.target.poolMemberId,
-        selectedNativeSurface: "OPENAI_RESPONSES",
-        adapterMode: "NATIVE",
-        publicEgress: true,
-        providerAccountId: result.target.providerAccountId,
-        providerModelId: result.target.providerModelId,
-        providerAttemptId: result.attemptId,
-        providerFencingToken: result.fencingToken,
-        attemptCount: 1,
-        fallbackRoute: result.target.ownKey ? "own-key" : "pool-external",
-      },
-      select: { id: true },
-    })
-    .catch(metadataUpdateError);
+  await recordExternalCommit({
+    relayRequestId,
+    identity: providerTargetRouteIdentity(result.target),
+    attemptId: result.attemptId,
+    fencingToken: result.fencingToken,
+    attemptCount: 1,
+    nativeSurface: "OPENAI_RESPONSES",
+    adapted: false,
+  }).catch(metadataUpdateError);
   const dispatched = result;
   // Terminal transition for the bound attempt. Scheduled only once the
   // response is the request's committed outcome (or a hand-off error ends the

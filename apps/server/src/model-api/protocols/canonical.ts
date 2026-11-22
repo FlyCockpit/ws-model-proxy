@@ -63,6 +63,8 @@ export type CanonicalRequest = {
   /** Adapted paths deliberately force one tool call at a time. */
   parallelToolCalls: "single";
   stream: boolean;
+  /** A Chat client's `stream_options.include_usage`: only true asks for the usage chunk. */
+  streamUsage?: boolean;
   sampling: {
     temperature?: number;
     topP?: number;

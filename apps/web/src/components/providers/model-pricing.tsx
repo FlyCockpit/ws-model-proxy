@@ -24,7 +24,7 @@ type PriceVersion = Awaited<
 
 const MONEY = /^(0|[1-9][0-9]{0,20})(\.[0-9]{1,9})?$/;
 /** Per-million-token rates the editor offers; input and output are required by the server. */
-const RATES = ["input", "output", "cacheRead", "cacheWrite"] as const;
+const RATES = ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const;
 const STATUS_TONE: Record<PriceVersion["status"], PillTone> = {
   DRAFT: "muted",
   ACTIVE: "good",
@@ -203,6 +203,7 @@ function NewPriceForm({ model }: { model: ProviderModel }) {
       currency: model.price?.currency ?? "USD",
       input: "",
       output: "",
+      reasoning: "",
       cacheRead: "",
       cacheWrite: "",
     },
@@ -214,6 +215,7 @@ function NewPriceForm({ model }: { model: ProviderModel }) {
           .regex(/^[A-Z]{3}$/, t("dashboard:providers.pricing.currencyInvalid")),
         input: money,
         output: money,
+        reasoning: optionalMoney,
         cacheRead: optionalMoney,
         cacheWrite: optionalMoney,
       }),
@@ -239,7 +241,7 @@ function NewPriceForm({ model }: { model: ProviderModel }) {
       }}
     >
       <p className="text-xs text-muted-foreground">{t("dashboard:providers.pricing.newHint")}</p>
-      <div className="grid min-w-0 gap-2 sm:grid-cols-5">
+      <div className="grid min-w-0 gap-2 sm:grid-cols-6">
         {RATES.map((rate) => (
           <form.Field key={rate} name={rate}>
             {(field) => (

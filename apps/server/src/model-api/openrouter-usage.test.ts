@@ -12,6 +12,8 @@ import openRouterFixture from "./fixtures/openrouter-usage.json";
 import { providerBillableTokens } from "./provider-budget-accounting.js";
 import { parsePricingSchedule } from "./provider-pricing.js";
 import {
+  openRouterRejectionUsage,
+  openRouterUnbilledRejection,
   type ProviderUsageDialect,
   parseProviderUsage,
   providerUsageDialect,
@@ -143,6 +145,47 @@ describe("OpenRouter usage dialect", () => {
         // OpenRouter's `cost` equals the catalog-rate calculation exactly.
         expect(usage?.reportedCost?.toString()).toBe(cache.cost);
         expect(usage?.calculatedCost?.toString()).toBe(cache.cost);
+      },
+    );
+
+    // Real-model run 2026-11-22: reasoning models (deepseek-v4.1-flash on Chat, gpt-6-luna on
+    // Responses) and Claude Haiku 5.5 on Messages, priced as the providers router stores a
+    // price a person enters (input and output only, CATALOG_CHARGE_RULES).
+    const entered = () => ({ ...catalogPricing({ input: "0.3", output: "1.2" }), version: "v1" });
+    it.each([
+      ["2026-11-22-reasoning-chat-nonstream", "openai-chat", 36n, 4n, 18n, "0.000013564"],
+      ["2026-11-22-reasoning-chat-stream", "openai-chat", 41n, 15n, 41n, "0.00003975"],
+      ["2026-11-22-reasoning-chat-tool-nonstream", "openai-chat", 305n, 50n, 0n, "0.0000909"],
+      ["2026-11-22-reasoning-chat-tool-stream", "openai-chat", 311n, 45n, 1n, "0.00001704"],
+      ["2026-11-22-reasoning-responses-nonstream", "openai-responses", 11n, 7n, 8n, "0.0000086"],
+      ["2026-11-22-reasoning-responses-stream", "openai-responses", 17n, 19n, 9n, "0.0000157"],
+      ["2026-11-22-claude-messages-nonstream", "anthropic-messages", 18n, 4n, 0n, "0.0000038"],
+      ["2026-11-22-claude-messages-stream", "anthropic-messages", 23n, 15n, 0n, "0.0000098"],
+      [
+        "2026-11-22-claude-messages-tool-nonstream",
+        "anthropic-messages",
+        386n,
+        50n,
+        0n,
+        "0.0000636",
+      ],
+      ["2026-11-22-claude-messages-tool-stream", "anthropic-messages", 386n, 50n, 0n, "0.0000636"],
+    ] as const)(
+      "offers OpenRouter's cost for %s (%s) in the attempt's price, reasoning or not",
+      (name, surface, input, output, reasoning, cost) => {
+        const pricing = entered();
+        const usage = parseProviderUsage([live(name)], pricing, "openrouter", surface);
+        expect(usage).toMatchObject({ categoriesComplete: true, inputTokens: input });
+        expect(usage?.outputTokens).toBe(output);
+        expect(usage?.reasoningTokens).toBe(reasoning);
+        // Settlement takes a reported cost only in the attempt's schedule version and
+        // currency (provider-budget reportedMatches): OpenRouter's cost is USD.
+        expect(usage?.reportedCost?.toString()).toBe(cost);
+        expect(usage?.reportedCostCurrency).toBe("USD");
+        expect(usage?.reportedCostPricingVersion).toBe("v1");
+        // Reasoning tokens are output tokens: a schedule without a reasoning rate prices
+        // them at the output rate instead of leaving the cost unknown.
+        expect(usage?.calculatedCost).toBeDefined();
       },
     );
 
@@ -944,5 +987,47 @@ describe("OpenRouter usage dialect", () => {
         ),
       ).toBe(generic);
     }
+  });
+
+  describe("refusals OpenRouter does not bill", () => {
+    const body = (value: unknown) => [encode(JSON.stringify(value))];
+    const bytes = (value: unknown) => encode(JSON.stringify(value)).byteLength;
+    const refusal = { error: { message: "x is not a valid model ID", code: 400 }, user_id: "u" };
+    it("is a whole JSON error envelope under a pre-generation status", () => {
+      for (const status of [400, 401, 402, 403, 404, 429])
+        expect(openRouterUnbilledRejection(status, body(refusal), bytes(refusal))).toBe(true);
+      const anthropic = { type: "error", error: { type: "invalid_request_error", message: "bad" } };
+      expect(openRouterUnbilledRejection(400, body(anthropic), bytes(anthropic))).toBe(true);
+    });
+    it.each([
+      ["a timeout", 408, refusal],
+      ["an upstream failure", 502, refusal],
+      ["an answer next to the error", 400, { ...refusal, choices: [] }],
+      ["usage next to the error", 400, { ...refusal, usage: { prompt_tokens: 3 } }],
+      ["an error without a message", 400, { error: { code: 400 } }],
+      ["another envelope type", 400, { type: "message", error: { message: "x" } }],
+    ])("is not %s", (_label, status, value) => {
+      expect(openRouterUnbilledRejection(status, body(value), bytes(value))).toBe(false);
+    });
+    it("needs the whole body", () => {
+      expect(openRouterUnbilledRejection(400, body(refusal), bytes(refusal) + 1)).toBe(false);
+      expect(openRouterUnbilledRejection(400, [encode('{"error":')], 9)).toBe(false);
+    });
+    it("settles at zero in the attempt's own currency as well as OpenRouter's USD", () => {
+      const eur = {
+        ...catalogPricing({ input: "1", output: "2" }),
+        currency: "EUR",
+        version: "e1",
+      };
+      expect(openRouterRejectionUsage(eur)).toMatchObject({
+        reportedCost: "0",
+        reportedCostCurrency: "USD",
+        reportedCostPricingVersion: "e1",
+        calculatedCost: "0",
+        calculatedCostCurrency: "EUR",
+        calculatedCostPricingVersion: "e1",
+        categoriesComplete: true,
+      });
+    });
   });
 });
