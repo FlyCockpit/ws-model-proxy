@@ -65,7 +65,13 @@ function SheetContent({
         {showCloseButton && (
           <SheetPrimitive.Close
             data-slot="sheet-close"
-            render={<Button variant="ghost" className="absolute top-1 right-1" size="icon-touch" />}
+            render={
+              <Button
+                variant="ghost"
+                className="absolute top-1 right-0 ring-inset"
+                size="icon-touch"
+              />
+            }
           >
             <XIcon />
             <span className="sr-only">{label}</span>

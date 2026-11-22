@@ -7,6 +7,7 @@
 - [External fallback](external-fallback.md)
 - [Transcription interoperability](transcription-interoperability.md)
 - [Web routes](../sitemap.md)
+- [Web UI edge lines](ui.md)
 - [wsmp CLI](../apps/cli/README.md)
 - [Relay protocol 4.0](../apps/cli/docs/relay-protocol.md)
 - [File recovery](../apps/cli/docs/file-recovery.md)

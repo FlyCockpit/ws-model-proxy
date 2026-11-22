@@ -23,7 +23,9 @@ vi.mock("@tanstack/react-router", () => ({
 }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock("@ws-model-proxy/ui/components/dropdown-menu", () => {
-  const Container = ({ children }: { children: ReactNode }) => <div>{children}</div>;
+  const Container = ({ children, className }: { children: ReactNode; className?: string }) => (
+    <div className={className}>{children}</div>
+  );
   return {
     DropdownMenu: Container,
     DropdownMenuContent: Container,
@@ -31,8 +33,16 @@ vi.mock("@ws-model-proxy/ui/components/dropdown-menu", () => {
     DropdownMenuLabel: Container,
     DropdownMenuSeparator: () => <hr />,
     DropdownMenuTrigger: Container,
-    DropdownMenuItem: ({ children, onClick }: { children: ReactNode; onClick: () => void }) => (
-      <button type="button" onClick={onClick}>
+    DropdownMenuItem: ({
+      children,
+      onClick,
+      inset,
+    }: {
+      children: ReactNode;
+      onClick: () => void;
+      inset?: boolean;
+    }) => (
+      <button type="button" onClick={onClick} data-inset={inset ? "" : undefined}>
         {children}
       </button>
     ),
@@ -84,5 +94,20 @@ describe("UserMenuContent sign-out", () => {
     fireEvent.click(screen.getByRole("button", { name: "userMenu.signOut" }));
     await waitFor(() => expect(boundary.undo).toHaveBeenCalledOnce());
     expect(boundary.assign).not.toHaveBeenCalled();
+  });
+});
+describe("UserMenuContent layout", () => {
+  it("is at least 224px wide and truncates the email with the full address in its title", () => {
+    render(<UserMenuContent />);
+    const email = screen.getByText("user@example.test");
+    expect(email.classList.contains("truncate")).toBe(true);
+    expect(email.getAttribute("title")).toBe("user@example.test");
+    expect(email.closest(".min-w-56")).not.toBeNull();
+  });
+  it("puts Sign Out on the menu's label line (inset), like the icon rows", () => {
+    render(<UserMenuContent />);
+    expect(
+      screen.getByRole("button", { name: "userMenu.signOut" }).hasAttribute("data-inset"),
+    ).toBe(true);
   });
 });

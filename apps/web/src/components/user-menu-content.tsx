@@ -59,7 +59,9 @@ export default function UserMenuContent() {
           <DropdownMenuLabel className="space-y-0.5">
             <span className="block text-muted-foreground">{t("userMenu.myAccount")}</span>
             <span className="block truncate text-foreground">{session.user.name}</span>
-            <span className="block truncate font-normal">{session.user.email}</span>
+            <span className="block truncate font-normal" title={session.user.email}>
+              {session.user.email}
+            </span>
           </DropdownMenuLabel>
           <DropdownMenuSeparator />
           {userMenuItems.map((item) => (
@@ -67,13 +69,14 @@ export default function UserMenuContent() {
               key={item.id}
               onClick={() => navigate({ to: toLangRoute(item.path), params: { lang } })}
             >
-              <item.icon className="mr-2 size-4" />
+              <item.icon className="size-4" />
               {t(item.labelKey)}
             </DropdownMenuItem>
           ))}
           <DropdownMenuSeparator />
           <DropdownMenuItem
             variant="destructive"
+            inset
             onClick={async () => {
               // Dynamic import so the better-auth client chunk stays off the
               // eager bundle (UserMenu renders in the root on every page). By

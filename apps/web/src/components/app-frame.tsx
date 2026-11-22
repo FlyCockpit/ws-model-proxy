@@ -72,6 +72,8 @@ export function AppFrame({ lang }: { lang: string }) {
               key={group.id}
               className={cn(
                 "flex flex-col gap-1",
+                // Collapsed: the 44px links centre on the rail, the line the toggle above sits on.
+                sidebarCollapsed && "items-center",
                 group.id === "footer" && "mt-auto border-t pt-2",
               )}
             >

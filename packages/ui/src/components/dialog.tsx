@@ -63,9 +63,14 @@ function DialogContent({
           <DialogPrimitive.Close
             data-slot="dialog-close"
             render={
+              // 28px at every width, centred on the title line (p-4 plus half the 20px title
+              // line = top-3 plus half the button). The hit area is a centred 44px square
+              // (after:size-11), measured from the border box: an inset expansion starts inside
+              // the 1px border and gave 42px. At right-2 its edge meets the popup's edge, which
+              // callers clip (overflow-x-hidden).
               <Button
                 variant="ghost"
-                className="absolute top-2 right-2 after:absolute after:-inset-2 after:content-['']"
+                className="absolute top-3 right-2 after:absolute after:top-1/2 after:left-1/2 after:size-11 after:-translate-x-1/2 after:-translate-y-1/2 after:content-['']"
                 size="icon-sm"
               />
             }

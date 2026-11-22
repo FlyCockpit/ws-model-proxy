@@ -68,13 +68,28 @@ describe.each([
   it("uses the Spanish accessible name and a 44px hit area", async () => {
     await mountTranslated();
     const close = await screen.findByRole("button", { name: "Cerrar" });
+    // Sheet: the button itself is 44px. Dialog: a 28px button with a centred 44px ::after,
+    // sized from the border box (an `after:-inset-*` expansion starts inside the 1px border
+    // and measured 42px in the browser).
     const hitAreaClasses =
       name === "Sheet"
         ? ["size-11"]
-        : ["size-7", "after:absolute", "after:-inset-2", "after:content-['']"];
+        : [
+            "size-7",
+            "after:absolute",
+            "after:top-1/2",
+            "after:left-1/2",
+            "after:size-11",
+            "after:-translate-x-1/2",
+            "after:-translate-y-1/2",
+            "after:content-['']",
+          ];
     for (const className of hitAreaClasses) {
       expect(close.classList.contains(className)).toBe(true);
     }
+    expect([...close.classList].some((className) => className.startsWith("after:-inset"))).toBe(
+      false,
+    );
     fireEvent.click(close);
     expect(screen.queryByRole("dialog")).toBeNull();
   });
