@@ -1,5 +1,6 @@
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { ProviderLiability, RawProviderUsage, UsageConfidence } from "./provider-budget.js";
+import { additionalBillableTokens } from "./provider-budget-accounting.js";
 
 const MAX_SIGNED_BIGINT = 9_223_372_036_854_775_807n;
 
@@ -241,7 +242,7 @@ export function calculatedCostForUsage(
   const cacheWrite = usage.cacheWriteTokens ?? 0n;
   const reasoning = usage.reasoningTokens ?? 0n;
   const tool = usage.toolTokens ?? 0n;
-  const additional = usage.additionalBillableTokens ?? 0n;
+  const additional = additionalBillableTokens(usage) ?? 0n;
   const charge = (tokens: bigint, rate: Prisma.Decimal) => rate.mul(tokens.toString());
   let total = charge(input, pricing.rates.input).plus(charge(output, pricing.rates.output));
   const cacheReadRate = pricing.rules.inputIncludesCacheRead

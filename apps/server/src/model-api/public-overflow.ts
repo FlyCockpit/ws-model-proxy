@@ -1747,21 +1747,28 @@ export function usageFromObject(
         rejectedPredictionTokens,
       ])
     : completionTotal;
-  const explicitAdditional = usageInteger(usage.additional_billable_tokens);
-  const additionalParts = [
-    explicitAdditional,
-    inputAudioTokens,
+  // Additional (audio, prediction) tokens keep their side, so a view can add them back to the
+  // provider's prompt and completion counts. An undirected count would not be attributable:
+  // there is no such usage key, and an unknown one marks the categories incomplete below.
+  // An observation that reports any of them defines both sides (an unreported side is zero):
+  // later observations overlay earlier ones field by field, and the two sides must be replaced
+  // together, as one priced category, or a side from an earlier observation would be added to
+  // a later observation's counts.
+  const additionalOutputParts = [
     outputAudioTokens,
     acceptedPredictionTokens,
     rejectedPredictionTokens,
   ];
-  const additionalBillableTokens = additionalParts.some((item) => item !== undefined)
-    ? additionalParts.reduce<bigint>((sum, item) => sum + (item ?? 0n), 0n)
+  const additionalReported =
+    inputAudioTokens !== undefined || additionalOutputParts.some((item) => item !== undefined);
+  const additionalInputTokens = additionalReported ? (inputAudioTokens ?? 0n) : undefined;
+  const additionalOutputTokens = additionalReported
+    ? additionalOutputParts.reduce<bigint>((sum, item) => sum + (item ?? 0n), 0n)
     : undefined;
   const authoritativeBillableTokens = usageInteger(usage.billable_tokens);
   const reportedTotalTokens = usageInteger(usage.total_tokens);
   const reportedCost = usageCost(usage.cost ?? usage.total_cost);
-  if (
+  const noCounters =
     inputTokens === undefined &&
     outputTokens === undefined &&
     cacheReadTokens === undefined &&
@@ -1769,10 +1776,12 @@ export function usageFromObject(
     authoritativeBillableTokens === undefined &&
     reasoningTokens === undefined &&
     usageInteger(usage.tool_tokens) === undefined &&
-    additionalBillableTokens === undefined &&
-    reportedCost === undefined
-  )
-    return undefined;
+    additionalInputTokens === undefined &&
+    additionalOutputTokens === undefined &&
+    reportedCost === undefined;
+  // A usage record proper (a root `usage`, or one nested in `response` / `message`), as
+  // opposed to a response or message object that carries no usage.
+  const usageContainer = root.usage != null || usageRecord(raw?.usage) !== undefined;
   const knownUsageKeys = new Set([
     "input_tokens",
     "prompt_tokens",
@@ -1787,7 +1796,6 @@ export function usageFromObject(
     "cache_creation_input_tokens",
     "billable_tokens",
     "tool_tokens",
-    "additional_billable_tokens",
     "cost",
     "total_cost",
     "currency",
@@ -1872,7 +1880,6 @@ export function usageFromObject(
     "cache_creation_input_tokens",
     "billable_tokens",
     "tool_tokens",
-    "additional_billable_tokens",
   ];
   const hasInvalidKnownInteger = knownIntegerFields.some(
     (key) => Object.hasOwn(usage, key) && usageInteger(usage[key]) === undefined,
@@ -1894,6 +1901,11 @@ export function usageFromObject(
     hasInvalidKnownDetail ||
     hasInvalidKnownInteger ||
     impossibleBreakdown;
+  // An observation without counters is no observation, unless it is a usage record that
+  // reports categories this normalizer cannot account for: it stays as evidence that marks the
+  // reply's categories incomplete (fail closed), rather than letting other observations settle
+  // as complete without it.
+  if (noCounters && !(usageContainer && hasUnknownCategories)) return undefined;
   const normalizedCategoryTotal =
     inputTokens !== undefined && outputTokens !== undefined
       ? [
@@ -1903,7 +1915,8 @@ export function usageFromObject(
           cacheWriteTokens,
           reasoningTokens,
           usageInteger(usage.tool_tokens),
-          additionalBillableTokens,
+          additionalInputTokens,
+          additionalOutputTokens,
         ].reduce<bigint>((sum, item) => sum + (item ?? 0n), 0n)
       : undefined;
   const categoriesComplete = hasUnknownCategories
@@ -1920,7 +1933,8 @@ export function usageFromObject(
     cacheWriteTokens,
     reasoningTokens,
     toolTokens: usageInteger(usage.tool_tokens),
-    additionalBillableTokens,
+    additionalInputTokens,
+    additionalOutputTokens,
     authoritativeBillableTokens,
     reportedTotalTokens,
     categoriesComplete,
@@ -2072,6 +2086,9 @@ function reportedTokensFromSettledUsage(usage: RawProviderUsage | undefined): nu
     usage.cacheReadTokens,
     usage.cacheWriteTokens,
     usage.reasoningTokens,
+    usage.toolTokens,
+    usage.additionalInputTokens,
+    usage.additionalOutputTokens,
   ];
   let total = 0n;
   let known = false;
@@ -2088,7 +2105,12 @@ function reportedPromptTokensFromSettledUsage(
   usage: RawProviderUsage | undefined,
 ): number | undefined {
   if (!usage) return undefined;
-  const parts = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens];
+  const parts = [
+    usage.inputTokens,
+    usage.cacheReadTokens,
+    usage.cacheWriteTokens,
+    usage.additionalInputTokens,
+  ];
   let total = 0n;
   let known = false;
   for (const part of parts) {
@@ -4089,6 +4111,8 @@ export async function dispatchPublicOverflow(
                   cacheWriteTokens: usage.cacheWriteTokens?.toString() ?? null,
                   reasoningTokens: usage.reasoningTokens?.toString() ?? null,
                   toolTokens: usage.toolTokens?.toString() ?? null,
+                  additionalInputTokens: usage.additionalInputTokens?.toString() ?? null,
+                  additionalOutputTokens: usage.additionalOutputTokens?.toString() ?? null,
                   categoriesComplete: usage.categoriesComplete ?? null,
                   accountingVersion: usage.accountingVersion,
                   confidence: usage.confidence,

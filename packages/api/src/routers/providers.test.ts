@@ -833,6 +833,227 @@ describe("provider review follow-ups", () => {
     expect(page.items[1]).toMatchObject({ inputTokens: null, outputTokens: null });
   });
 
+  describe("usage rows keep every token category on its side", () => {
+    const ledgerRow = (
+      tokens: Partial<Record<string, bigint | null>>,
+      rawUsage: unknown = null,
+    ) => ({
+      id: "use-1",
+      createdAt: new Date("2026-11-22T10:00:00Z"),
+      providerModelId: "model-1",
+      poolId: "pool-1",
+      inputTokens: null,
+      outputTokens: null,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      reasoningTokens: null,
+      toolTokens: null,
+      additionalBillableTokens: null,
+      additionalInputTokens: null,
+      additionalOutputTokens: null,
+      rawUsage,
+      settledCost: new Prisma.Decimal("0.01"),
+      currency: "USD",
+      confidence: "REPORTED",
+      ...tokens,
+    });
+    const shown = async (row: ReturnType<typeof ledgerRow>) => {
+      db.usageLedger.findMany.mockResolvedValue([row] as never);
+      const [item] = (await client().usage.list({ limit: 10 })).items;
+      return { inputTokens: item?.inputTokens, outputTokens: item?.outputTokens };
+    };
+    // The pricing-test example: prompt 100 (20 cached, 5 audio), completion 50 (10 reasoning,
+    // 3 audio, 4 accepted and 2 rejected prediction). The view once showed 95/41.
+    const example = {
+      inputTokens: 75n,
+      cacheReadTokens: 20n,
+      outputTokens: 31n,
+      reasoningTokens: 10n,
+      additionalBillableTokens: 14n,
+    };
+    const exampleRaw = {
+      prompt_tokens: 100,
+      completion_tokens: 50,
+      total_tokens: 150,
+      prompt_tokens_details: { cached_tokens: 20, audio_tokens: 5 },
+      completion_tokens_details: {
+        reasoning_tokens: 10,
+        audio_tokens: 3,
+        accepted_prediction_tokens: 4,
+        rejected_prediction_tokens: 2,
+      },
+    };
+
+    it("shows the pricing-test example as the provider counted it", async () => {
+      expect(
+        await shown(
+          ledgerRow(
+            { ...example, additionalInputTokens: 5n, additionalOutputTokens: 9n },
+            exampleRaw,
+          ),
+        ),
+      ).toEqual({ inputTokens: 100, outputTokens: 50 });
+    });
+
+    it.each([
+      ["cache read", { inputTokens: 93n, cacheReadTokens: 7n }, 100, 50],
+      ["cache write", { inputTokens: 93n, cacheWriteTokens: 7n }, 100, 50],
+      ["input audio", { inputTokens: 93n, additionalInputTokens: 7n }, 100, 50],
+      ["reasoning", { outputTokens: 43n, reasoningTokens: 7n }, 100, 50],
+      ["tool", { outputTokens: 43n, toolTokens: 7n }, 100, 50],
+      ["output audio or prediction", { outputTokens: 43n, additionalOutputTokens: 7n }, 100, 50],
+    ])("adds %s back to its side", async (_label, tokens, inputTokens, outputTokens) => {
+      expect(await shown(ledgerRow({ inputTokens: 100n, outputTokens: 50n, ...tokens }))).toEqual({
+        inputTokens,
+        outputTokens,
+      });
+    });
+
+    it("keeps a side unknown when only the other side was counted", async () => {
+      // A partial observation (prompt and input audio only) records the output side as zero.
+      expect(
+        await shown(
+          ledgerRow({ inputTokens: 18n, additionalInputTokens: 2n, additionalOutputTokens: 0n }),
+        ),
+      ).toEqual({ inputTokens: 20, outputTokens: null });
+      expect(
+        await shown(
+          ledgerRow({ outputTokens: 9n, additionalInputTokens: 0n, additionalOutputTokens: 1n }),
+        ),
+      ).toEqual({ inputTokens: null, outputTokens: 10 });
+      // A legacy row whose only known count is the additional total.
+      expect(
+        await shown(
+          ledgerRow(
+            { additionalBillableTokens: 3n },
+            { prompt_tokens_details: { audio_tokens: 3 } },
+          ),
+        ),
+      ).toEqual({ inputTokens: null, outputTokens: null });
+    });
+
+    it("attributes a row written before the split from its raw usage", async () => {
+      expect(await shown(ledgerRow(example, exampleRaw))).toEqual({
+        inputTokens: 100,
+        outputTokens: 50,
+      });
+      // A merged observation list: only an observation consistent with the row's counters
+      // counts (the first two report more input audio than the stored total).
+      expect(
+        await shown(
+          ledgerRow({ inputTokens: 18n, outputTokens: 9n, additionalBillableTokens: 1n }, [
+            [{ prompt_tokens_details: { audio_tokens: 9 } }],
+            { input_tokens: 20, input_tokens_details: { audio_tokens: 2 } },
+            { output_tokens: 10, output_tokens_details: { audio_tokens: 1 } },
+          ]),
+        ),
+      ).toEqual({ inputTokens: 18, outputTokens: 10 });
+      // Observations are stored de-duplicated (A, B, A on the wire is [A, B]): the one whose
+      // prompt count matches the row supplied the total, whatever its position.
+      const A = {
+        prompt_tokens: 20,
+        completion_tokens: 10,
+        prompt_tokens_details: { audio_tokens: 2 },
+        completion_tokens_details: { audio_tokens: 1 },
+      };
+      const B = {
+        prompt_tokens: 20,
+        completion_tokens: 10,
+        prompt_tokens_details: { audio_tokens: 3 },
+      };
+      expect(
+        await shown(
+          ledgerRow({ inputTokens: 18n, outputTokens: 9n, additionalBillableTokens: 3n }, [A, B]),
+        ),
+      ).toEqual({ inputTokens: 20, outputTokens: 10 });
+      // Only an observation whose mixed total equals the stored one can have supplied it.
+      expect(
+        await shown(
+          ledgerRow({ inputTokens: 18n, outputTokens: 9n, additionalBillableTokens: 4n }, [
+            A,
+            {
+              prompt_tokens: 21,
+              completion_tokens: 10,
+              prompt_tokens_details: { audio_tokens: 3 },
+              completion_tokens_details: { audio_tokens: 1 },
+            },
+          ]),
+        ),
+      ).toEqual({ inputTokens: 21, outputTokens: 10 });
+      // An observation without a prompt count cannot be checked against the row, so it is no
+      // candidate (here B reports only completion counts).
+      expect(
+        await shown(
+          ledgerRow({ inputTokens: 18n, outputTokens: 9n, additionalBillableTokens: 3n }, [
+            A,
+            { completion_tokens: 10, completion_tokens_details: { audio_tokens: 1 } },
+          ]),
+        ),
+      ).toEqual({ inputTokens: 20, outputTokens: 10 });
+      // The normalizer reads `input_tokens` before `prompt_tokens`; so does the attribution.
+      expect(
+        await shown(
+          ledgerRow(
+            { inputTokens: 18n, outputTokens: 10n, additionalBillableTokens: 2n },
+            {
+              input_tokens: 20,
+              prompt_tokens: 100,
+              completion_tokens: 10,
+              prompt_tokens_details: { audio_tokens: 2 },
+            },
+          ),
+        ),
+      ).toEqual({ inputTokens: 20, outputTokens: 10 });
+      // Candidates that disagree, none, no raw usage, or audio above the total: the whole
+      // total counts as output, so the row's sum is never lost.
+      expect(
+        await shown(
+          ledgerRow(
+            {
+              inputTokens: 18n,
+              cacheWriteTokens: 1n,
+              outputTokens: 9n,
+              additionalBillableTokens: 3n,
+            },
+            // Both yield the stored total 3 and fit the prompt (one with the cache write).
+            [
+              {
+                prompt_tokens: 20,
+                prompt_tokens_details: { audio_tokens: 2 },
+                completion_tokens_details: { audio_tokens: 1 },
+              },
+              {
+                prompt_tokens: 20,
+                prompt_tokens_details: { audio_tokens: 1 },
+                completion_tokens_details: { audio_tokens: 2 },
+              },
+            ],
+          ),
+        ),
+      ).toEqual({ inputTokens: 19, outputTokens: 12 });
+      expect(await shown(ledgerRow({ ...example }, null))).toEqual({
+        inputTokens: 95,
+        outputTokens: 55,
+      });
+      expect(
+        await shown(
+          ledgerRow(
+            { inputTokens: 10n, outputTokens: 5n, additionalBillableTokens: 2n },
+            { prompt_tokens_details: { audio_tokens: 9 } },
+          ),
+        ),
+      ).toEqual({ inputTokens: 10, outputTokens: 7 });
+      expect(
+        await shown(
+          ledgerRow(
+            { inputTokens: 10n, outputTokens: 5n, additionalBillableTokens: 2n },
+            { prompt_tokens: "12", prompt_tokens_details: { audio_tokens: 1e300 } },
+          ),
+        ),
+      ).toEqual({ inputTokens: 10, outputTokens: 7 });
+    });
+  });
+
   it("another person's key, model and price are not found", async () => {
     db.providerCredential.findFirst.mockResolvedValue(null);
     db.providerModel.findFirst.mockResolvedValue(null);

@@ -175,6 +175,89 @@ describe("usageFactsFromProviderUsage", () => {
   });
 });
 
+describe("prompt and completion totals keep every token category", () => {
+  const chat = (usage: Record<string, unknown>) =>
+    usageFactsFromRelayTerminal({
+      usageSample: sampleOf(JSON.stringify({ id: "chatcmpl", usage })),
+      usage: null,
+    });
+
+  it("shows the provider's own counts for the pricing-test example (once 95/41)", () => {
+    expect(
+      chat({
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        total_tokens: 150,
+        prompt_tokens_details: { cached_tokens: 20, audio_tokens: 5 },
+        completion_tokens_details: {
+          reasoning_tokens: 10,
+          audio_tokens: 3,
+          accepted_prediction_tokens: 4,
+          rejected_prediction_tokens: 2,
+        },
+      }),
+    ).toMatchObject({ promptTokens: 100, completionTokens: 50, totalTokens: 150 });
+  });
+
+  it("keeps the Responses audio and prediction categories", () => {
+    expect(
+      usageFactsFromRelayTerminal({
+        usageSample: sampleOf(
+          JSON.stringify({
+            type: "response.completed",
+            response: {
+              usage: {
+                input_tokens: 20,
+                output_tokens: 12,
+                total_tokens: 32,
+                input_tokens_details: { cached_tokens: 3, audio_tokens: 2 },
+                output_tokens_details: {
+                  reasoning_tokens: 4,
+                  audio_tokens: 1,
+                  accepted_prediction_tokens: 2,
+                  rejected_prediction_tokens: 1,
+                },
+              },
+            },
+          }),
+        ),
+        usage: null,
+      }),
+    ).toMatchObject({ promptTokens: 20, completionTokens: 12, totalTokens: 32 });
+  });
+
+  // Each category is a subset of the provider's prompt (100) or completion (50) count.
+  it.each([
+    ["input audio", { audio_tokens: 7 }, {}],
+    ["output audio", {}, { audio_tokens: 7 }],
+    ["accepted prediction", {}, { accepted_prediction_tokens: 7 }],
+    ["rejected prediction", {}, { rejected_prediction_tokens: 7 }],
+    ["reasoning", {}, { reasoning_tokens: 7 }],
+    ["cache read", { cached_tokens: 7 }, {}],
+  ])("adds %s back to its side", (_label, prompt, completion) => {
+    expect(
+      chat({
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        prompt_tokens_details: prompt,
+        completion_tokens_details: completion,
+      }),
+    ).toMatchObject({ promptTokens: 100, completionTokens: 50, usageKnown: true });
+  });
+
+  it("counts tool tokens as completion", () => {
+    expect(
+      usageFactsFromProviderUsage({
+        inputTokens: 10n,
+        outputTokens: 4n,
+        toolTokens: 3n,
+        additionalInputTokens: 2n,
+        additionalOutputTokens: 5n,
+      }),
+    ).toMatchObject({ promptTokens: 12, completionTokens: 12, totalTokens: 24 });
+  });
+});
+
 describe("engineCacheConfirmedFromUsageFacts", () => {
   it("is unknown (not a miss) when no usage was reported", () => {
     expect(engineCacheConfirmedFromUsageFacts(UNKNOWN_USAGE_FACTS)).toBeUndefined();

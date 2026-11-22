@@ -673,6 +673,37 @@ describe("spend settlement", () => {
     });
   });
 
+  it("records each side of the additional tokens beside their priced total", async () => {
+    const input = await admitted();
+    await reconcileProviderBudget({
+      ...terminalFor(input),
+      reason: "COMPLETED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+      usage: {
+        inputTokens: 75n,
+        cacheReadTokens: 20n,
+        outputTokens: 31n,
+        reasoningTokens: 10n,
+        additionalInputTokens: 5n,
+        additionalOutputTokens: 9n,
+        categoriesComplete: true,
+        reportedCost: "0.01",
+        reportedCostCurrency: "EUR",
+        reportedCostPricingVersion: "v1",
+        observationComplete: true,
+        accountingVersion: "provider-billable-v1",
+        confidence: "REPORTED",
+      },
+    });
+    expect(state.ledger[0]).toMatchObject({
+      additionalInputTokens: 5n,
+      additionalOutputTokens: 9n,
+      additionalBillableTokens: 14n,
+      billableTotal: 150n,
+    });
+  });
+
   it("settles an OpenRouter refusal at zero for an attempt priced in another currency", async () => {
     const input = attempt({
       liability: {

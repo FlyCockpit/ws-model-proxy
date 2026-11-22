@@ -105,6 +105,8 @@ const FENCE_PROTOCOL_SITES: Record<string, string> = {
     "The 1.0 hardening: the protocol, the fence triggers and the deploy's bypass marker.",
   "packages/db/prisma/fixtures/0_init.sql":
     "Migration test fixture (CI check 4): its transaction carries the bypass marker.",
+  "packages/db/prisma/fixtures/20261112000000_upgrade_to_1_0_0.sql":
+    "Migration test fixture (CI check 4): its transaction carries the bypass marker.",
 };
 
 function findAdvisoryReferences(file: string, source: string): string[] {
@@ -192,6 +194,8 @@ const HOT_PATH_WRITERS: Record<string, string> = {
     "D: the 0.4.3 hardening's backfills (no-ops on the new database it runs on)",
   "packages/db/prisma/migrations/20261112000000_upgrade_to_1_0_0/migration.sql":
     "D: the 1.0 upgrade's backfills under exclusive table locks",
+  "packages/db/prisma/fixtures/20261112000000_upgrade_to_1_0_0.sql":
+    "D: migration test fixture rows (pre-split usage ledger revisions) in a disposable database",
 };
 
 // ---------------------------------------------------------------------------

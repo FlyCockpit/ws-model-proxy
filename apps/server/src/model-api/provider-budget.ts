@@ -34,7 +34,11 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
 import { providerAccountSpend, shareSpend } from "@ws-model-proxy/db/spend";
-import { type ProviderTokenUsage, providerBillableTokens } from "./provider-budget-accounting.js";
+import {
+  additionalBillableTokens,
+  type ProviderTokenUsage,
+  providerBillableTokens,
+} from "./provider-budget-accounting.js";
 
 export type UsageConfidence = "REPORTED" | "CALCULATED" | "ESTIMATED";
 
@@ -196,7 +200,9 @@ export function assertUsage(usage: RawProviderUsage | undefined): void {
     usage.cacheWriteTokens,
     usage.reasoningTokens,
     usage.toolTokens,
-    usage.additionalBillableTokens,
+    usage.additionalInputTokens,
+    usage.additionalOutputTokens,
+    additionalBillableTokens(usage),
     usage.authoritativeBillableTokens,
     usage.reportedTotalTokens,
   ];
@@ -276,7 +282,9 @@ function terminalPayloadHash(
           cacheWriteTokens: usage.cacheWriteTokens,
           reasoningTokens: usage.reasoningTokens,
           toolTokens: usage.toolTokens,
-          additionalBillableTokens: usage.additionalBillableTokens,
+          // Both sides are derived from `rawUsage` (hashed below), so the hash keeps the total
+          // and a revision's identity does not depend on the release that settles it.
+          additionalBillableTokens: additionalBillableTokens(usage),
           authoritativeBillableTokens: usage.authoritativeBillableTokens,
           reportedTotalTokens: usage.reportedTotalTokens,
           categoriesComplete: usage.categoriesComplete,
@@ -857,7 +865,9 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
           cacheWriteTokens: usage?.cacheWriteTokens,
           reasoningTokens: usage?.reasoningTokens,
           toolTokens: usage?.toolTokens,
-          additionalBillableTokens: usage?.additionalBillableTokens,
+          additionalInputTokens: usage?.additionalInputTokens,
+          additionalOutputTokens: usage?.additionalOutputTokens,
+          additionalBillableTokens: usage ? additionalBillableTokens(usage) : undefined,
           authoritativeBillableTokens: usage?.authoritativeBillableTokens,
           reportedTotalTokens: usage?.reportedTotalTokens,
           billableTotal: accountingMatches ? billableTotal : undefined,

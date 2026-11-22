@@ -16,8 +16,9 @@ import { mergeProviderUsage, parseProviderUsage } from "./public-overflow.js";
 import { type ResponseUsageSample, USAGE_SAMPLE_TAIL_BYTES } from "./response-usage-sample.js";
 
 export type RelayUsageFacts = {
-  /** Total prompt tokens: uncached input + cache reads + cache writes. */
+  /** Total prompt tokens: uncached input + cache reads + cache writes + input audio. */
   promptTokens: number | null;
+  /** Total completion tokens: output + reasoning + tool + output audio and predictions. */
   completionTokens: number | null;
   totalTokens: number | null;
   /** Null when the upstream did not report prompt-cache reads. */
@@ -62,6 +63,9 @@ export function usageFactsFromProviderUsage(
         | "cacheReadTokens"
         | "cacheWriteTokens"
         | "reasoningTokens"
+        | "toolTokens"
+        | "additionalInputTokens"
+        | "additionalOutputTokens"
         | "reportedTotalTokens"
       >
     | null
@@ -73,11 +77,16 @@ export function usageFactsFromProviderUsage(
   const cacheRead = toInt(usage.cacheReadTokens);
   const cacheWrite = toInt(usage.cacheWriteTokens);
   const reasoning = toInt(usage.reasoningTokens);
-  // The normalizer reports OpenAI input exclusive of cached tokens and
-  // Anthropic input exclusive of cache reads/writes; adding them back yields
-  // the total prompt size used as the cache hit-rate denominator.
-  const promptTokens = input === null ? null : sum(input, cacheRead, cacheWrite);
-  const completionTokens = output === null ? null : sum(output, reasoning);
+  const tool = toInt(usage.toolTokens);
+  const additionalInput = toInt(usage.additionalInputTokens);
+  const additionalOutput = toInt(usage.additionalOutputTokens);
+  // The normalizer splits every billable category out of the provider's
+  // counts (OpenAI input exclusive of cached and audio tokens, Anthropic input
+  // exclusive of cache reads/writes); adding each side's categories back
+  // yields the provider's prompt (the cache hit-rate denominator) and
+  // completion sizes.
+  const promptTokens = input === null ? null : sum(input, cacheRead, cacheWrite, additionalInput);
+  const completionTokens = output === null ? null : sum(output, reasoning, tool, additionalOutput);
   const reportedTotal = toInt(usage.reportedTotalTokens);
   const usageKnown = promptTokens !== null || completionTokens !== null;
   return {

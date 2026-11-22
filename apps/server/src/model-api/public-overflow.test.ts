@@ -1107,7 +1107,8 @@ it("keeps unrecognized gateway cache/cost metadata conservative without changing
     outputTokens: 7n,
     cacheReadTokens: 3n,
     reasoningTokens: 2n,
-    additionalBillableTokens: 6n,
+    additionalInputTokens: 5n,
+    additionalOutputTokens: 1n,
     categoriesComplete: false,
   });
 });

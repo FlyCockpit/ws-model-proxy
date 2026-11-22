@@ -8,12 +8,18 @@ vi.hoisted(() => {
   process.env.SIGNUP_ENABLED ??= "true";
 });
 
+import { additionalBillableTokens, providerBillableTokens } from "./provider-budget-accounting.js";
 import {
   calculatedCostForUsage,
   liabilityFromPricing,
   parsePricingSchedule,
 } from "./provider-pricing.js";
-import { parseProviderUsage, retainProviderUsageTail, usageFromObject } from "./public-overflow.js";
+import {
+  mergeProviderUsage,
+  parseProviderUsage,
+  retainProviderUsageTail,
+  usageFromObject,
+} from "./public-overflow.js";
 
 const pricing = parsePricingSchedule({
   id: "pricing",
@@ -153,7 +159,8 @@ describe("provider pricing and usage accounting", () => {
       cacheReadTokens: 20n,
       outputTokens: 31n,
       reasoningTokens: 10n,
-      additionalBillableTokens: 14n,
+      additionalInputTokens: 5n,
+      additionalOutputTokens: 9n,
       reportedTotalTokens: 150n,
       categoriesComplete: true,
     });
@@ -164,6 +171,149 @@ describe("provider pricing and usage accounting", () => {
         accepted_prediction_tokens: 4,
         rejected_prediction_tokens: 2,
       },
+    });
+  });
+
+  it("prices both additional sides at the one additional rate, as the mixed total was", () => {
+    const withAdditional = parsePricingSchedule({
+      id: "audio",
+      version: "v1",
+      currency: "USD",
+      accountingVersion: "provider-billable-v1",
+      confidence: "CALCULATED",
+      effectiveAt: new Date("2026-08-25T00:00:00Z"),
+      pricing: {
+        ratesPerMillion: {
+          input: "1",
+          output: "2",
+          cacheRead: "0.5",
+          reasoning: "2",
+          additional: "100",
+        },
+      },
+      chargeRules: {
+        inputIncludesCacheRead: false,
+        inputIncludesCacheWrite: false,
+        outputIncludesReasoning: false,
+        outputIncludesTool: false,
+        reasoningAllowanceTokens: 0,
+        toolAllowanceTokens: 0,
+        cacheReadAllowanceTokens: 0,
+        cacheWriteAllowanceTokens: 0,
+        additionalAllowanceTokens: 0,
+        unknownCategories: "FAIL_CLOSED",
+      },
+    });
+    if (!withAdditional) throw new Error("expected a schedule");
+    // The pricing-test example: 75*1 + 20*0.5 + 31*2 + 10*2 + (5 + 9)*100 = 1567 per million.
+    const usage = usageFromObject({
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        total_tokens: 150,
+        prompt_tokens_details: { cached_tokens: 20, audio_tokens: 5 },
+        completion_tokens_details: {
+          reasoning_tokens: 10,
+          audio_tokens: 3,
+          accepted_prediction_tokens: 4,
+          rejected_prediction_tokens: 2,
+        },
+      },
+    });
+    expect(calculatedCostForUsage(usage!, withAdditional)?.toString()).toBe("0.001567");
+    expect(providerBillableTokens(usage!)).toBe(150n);
+  });
+
+  it("replaces both additional sides together when a later observation overlays an earlier one", () => {
+    // Two observations of one reply: the first reports input audio, the second only output
+    // audio. The second's counts win as a whole, as the single mixed total did: 20 + 9 + 1.
+    const first = {
+      usage: {
+        prompt_tokens: 20,
+        completion_tokens: 10,
+        total_tokens: 30,
+        prompt_tokens_details: { audio_tokens: 2 },
+      },
+    };
+    const second = {
+      usage: {
+        prompt_tokens: 20,
+        completion_tokens: 10,
+        total_tokens: 30,
+        completion_tokens_details: { audio_tokens: 1 },
+      },
+    };
+    const expected = {
+      inputTokens: 20n,
+      outputTokens: 9n,
+      additionalInputTokens: 0n,
+      additionalOutputTokens: 1n,
+      categoriesComplete: true,
+    };
+    const streamed = parseProviderUsage([
+      Buffer.from(`data: ${JSON.stringify(first)}\n\ndata: ${JSON.stringify(second)}\n\n`),
+    ]);
+    const merged = mergeProviderUsage(usageFromObject(first), usageFromObject(second));
+    for (const usage of [streamed, merged]) {
+      expect(usage).toMatchObject(expected);
+      expect(providerBillableTokens(usage!)).toBe(30n);
+      expect(additionalBillableTokens(usage!)).toBe(1n);
+    }
+  });
+
+  it("keeps an observation of only unknown categories as evidence that fails closed", () => {
+    const counted = { usage: { prompt_tokens: 10, completion_tokens: 5 } };
+    const unknownOnly = { usage: { additional_billable_tokens: 3 } };
+    expect(usageFromObject(unknownOnly)).toMatchObject({
+      inputTokens: undefined,
+      outputTokens: undefined,
+      categoriesComplete: false,
+      rawUsage: { additional_billable_tokens: 3 },
+    });
+    const streamed = parseProviderUsage(
+      [Buffer.from(`data: ${JSON.stringify(counted)}\n\ndata: ${JSON.stringify(unknownOnly)}\n\n`)],
+      pricing,
+    );
+    const merged = mergeProviderUsage(usageFromObject(counted), usageFromObject(unknownOnly));
+    for (const usage of [streamed, merged]) {
+      expect(usage).toMatchObject({
+        inputTokens: 10n,
+        outputTokens: 5n,
+        categoriesComplete: false,
+      });
+      expect(usage?.calculatedCost).toBeUndefined();
+      expect(providerBillableTokens(usage!)).toBeUndefined();
+    }
+  });
+
+  it("still ignores a Responses event whose response carries no usage", () => {
+    const created = { type: "response.created", response: { id: "resp", status: "in_progress" } };
+    const completed = {
+      type: "response.completed",
+      response: { id: "resp", usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 } },
+    };
+    expect(usageFromObject(created)).toBeUndefined();
+    expect(
+      parseProviderUsage(
+        [Buffer.from(`data: ${JSON.stringify(created)}\n\ndata: ${JSON.stringify(completed)}\n\n`)],
+        pricing,
+      ),
+    ).toMatchObject({ inputTokens: 7n, outputTokens: 3n, categoriesComplete: true });
+  });
+
+  it("fails closed on an additional count without a side", () => {
+    // No provider sends an undirected `additional_billable_tokens`; it is an unknown key,
+    // so the categories are incomplete and no cost is calculated from them.
+    expect(
+      usageFromObject({
+        usage: { prompt_tokens: 10, completion_tokens: 5, additional_billable_tokens: 3 },
+      }),
+    ).toMatchObject({
+      inputTokens: 10n,
+      outputTokens: 5n,
+      additionalInputTokens: undefined,
+      additionalOutputTokens: undefined,
+      categoriesComplete: false,
     });
   });
 
@@ -191,7 +341,8 @@ describe("provider pricing and usage accounting", () => {
       outputTokens: 4n,
       cacheReadTokens: 3n,
       reasoningTokens: 4n,
-      additionalBillableTokens: 6n,
+      additionalInputTokens: 2n,
+      additionalOutputTokens: 4n,
       categoriesComplete: true,
     });
   });
@@ -209,7 +360,7 @@ describe("provider pricing and usage accounting", () => {
       inputTokens: 7n,
       outputTokens: 5n,
       reasoningTokens: 4n,
-      additionalBillableTokens: 1n,
+      additionalOutputTokens: 1n,
       categoriesComplete: true,
     });
   });

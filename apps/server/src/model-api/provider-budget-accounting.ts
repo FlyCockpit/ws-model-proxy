@@ -5,8 +5,13 @@ export interface ProviderTokenUsage {
   cacheWriteTokens?: bigint;
   reasoningTokens?: bigint;
   toolTokens?: bigint;
-  /** Only categories not already represented by the fields above. */
-  additionalBillableTokens?: bigint;
+  /**
+   * Prompt-side categories not represented above (input audio). Like the
+   * output side below, priced at the schedule's single `additional` rate.
+   */
+  additionalInputTokens?: bigint;
+  /** Completion-side categories not represented above (output audio, accepted/rejected predictions). */
+  additionalOutputTokens?: bigint;
   /** True only when every provider-billable category is represented above. */
   categoriesComplete?: boolean;
   /** Provider-authoritative total. It is used instead of, never added to, categories. */
@@ -26,7 +31,17 @@ export function providerBillableTokens(usage: ProviderTokenUsage): bigint | unde
     usage.cacheWriteTokens,
     usage.reasoningTokens,
     usage.toolTokens,
-    usage.additionalBillableTokens,
+    usage.additionalInputTokens,
+    usage.additionalOutputTokens,
   ];
   return categories.reduce<bigint>((sum, value) => sum + (value ?? 0n), 0n);
+}
+
+/** Both additional sides together (the priced `additional` category); absent when neither is known. */
+export function additionalBillableTokens(
+  usage: Pick<ProviderTokenUsage, "additionalInputTokens" | "additionalOutputTokens">,
+): bigint | undefined {
+  if (usage.additionalInputTokens === undefined && usage.additionalOutputTokens === undefined)
+    return undefined;
+  return (usage.additionalInputTokens ?? 0n) + (usage.additionalOutputTokens ?? 0n);
 }

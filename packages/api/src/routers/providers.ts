@@ -50,6 +50,7 @@ import {
 } from "../lib/provider-views";
 import { isUniqueViolation, notFound, RETRY_CONFLICT_MESSAGE, refuse } from "../lib/refuse";
 import type { Tx } from "../lib/runtime-store";
+import { usageLedgerTokenTotals } from "../lib/usage-ledger-tokens";
 
 function userIdOf(context: SignedInContext): string {
   return context.session.user.id;
@@ -180,13 +181,6 @@ function sealCredential(
 async function dropCloudMembers(tx: Tx, providerModelIds: string[]) {
   if (providerModelIds.length === 0) return;
   await tx.poolMember.deleteMany({ where: { providerModelId: { in: providerModelIds } } });
-}
-
-/** The sum of the known parts, or null when none is known. */
-function tokenSum(...parts: Array<bigint | null>): number | null {
-  const known = parts.filter((part): part is bigint => part !== null);
-  if (known.length === 0) return null;
-  return Number(known.reduce((sum, part) => sum + part, 0n));
 }
 
 let catalog: ReturnType<typeof createProviderCatalog> | null = null;
@@ -1066,6 +1060,11 @@ export const providersRouter = {
           cacheReadTokens: true,
           cacheWriteTokens: true,
           reasoningTokens: true,
+          toolTokens: true,
+          additionalBillableTokens: true,
+          additionalInputTokens: true,
+          additionalOutputTokens: true,
+          rawUsage: true,
           settledCost: true,
           currency: true,
           confidence: true,
@@ -1078,10 +1077,9 @@ export const providersRouter = {
           createdAt: row.createdAt.toISOString(),
           providerModelId: row.providerModelId,
           poolId: row.poolId,
-          // The ledger keeps cache and reasoning tokens apart from input and output; the
-          // view shows the provider's own prompt and completion counts.
-          inputTokens: tokenSum(row.inputTokens, row.cacheReadTokens, row.cacheWriteTokens),
-          outputTokens: tokenSum(row.outputTokens, row.reasoningTokens),
+          // The ledger keeps every category apart from input and output; the view shows
+          // the provider's own prompt and completion counts.
+          ...usageLedgerTokenTotals(row),
           cost: row.settledCost === null ? null : moneyString(row.settledCost),
           currency: row.currency,
           confidence: row.confidence,

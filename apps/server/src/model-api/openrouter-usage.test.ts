@@ -82,7 +82,8 @@ describe("OpenRouter usage dialect", () => {
       cacheReadTokens: 600n,
       cacheWriteTokens: 0n,
       reasoningTokens: 30n,
-      additionalBillableTokens: 0n,
+      additionalInputTokens: 0n,
+      additionalOutputTokens: 0n,
       reportedTotalTokens: 1280n,
       categoriesComplete: true,
     });
@@ -951,10 +952,12 @@ describe("OpenRouter usage dialect", () => {
       { usage: { prompt_tokens: -1, completion_tokens: 1 } },
     ];
     // Parser output at c689d6e (before #62), pinned so a change to the shared
-    // generic parser cannot pass by moving both dialects together.
+    // generic parser cannot pass by moving both dialects together. Since then
+    // the additional (audio) tokens keep their side: 5 input + 1 output, once
+    // one mixed 6.
     const preDialectOutputs = [
       '{"inputTokens":"20n","outputTokens":"10n","reportedTotalTokens":"30n","categoriesComplete":true,"rawUsage":{"prompt_tokens":20,"completion_tokens":10,"total_tokens":30},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
-      '{"inputTokens":"12n","outputTokens":"7n","cacheReadTokens":"3n","reasoningTokens":"2n","additionalBillableTokens":"6n","reportedTotalTokens":"30n","categoriesComplete":true,"rawUsage":{"prompt_tokens":20,"completion_tokens":10,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":3,"audio_tokens":5},"completion_tokens_details":{"reasoning_tokens":2,"audio_tokens":1},"cost":0.01},"reportedCost":0.01,"reportedCostSource":"provider-runtime","accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
+      '{"inputTokens":"12n","outputTokens":"7n","cacheReadTokens":"3n","reasoningTokens":"2n","additionalInputTokens":"5n","additionalOutputTokens":"1n","reportedTotalTokens":"30n","categoriesComplete":true,"rawUsage":{"prompt_tokens":20,"completion_tokens":10,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":3,"audio_tokens":5},"completion_tokens_details":{"reasoning_tokens":2,"audio_tokens":1},"cost":0.01},"reportedCost":0.01,"reportedCostSource":"provider-runtime","accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
       '{"inputTokens":"5n","outputTokens":"3n","cacheReadTokens":"2n","reasoningTokens":"1n","reportedTotalTokens":"11n","categoriesComplete":true,"rawUsage":{"input_tokens":7,"output_tokens":4,"total_tokens":11,"input_tokens_details":{"cached_tokens":2},"output_tokens_details":{"reasoning_tokens":1}},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
       '{"inputTokens":"12n","outputTokens":"1n","cacheReadTokens":"3n","cacheWriteTokens":"4n","categoriesComplete":true,"rawUsage":{"input_tokens":12,"cache_read_input_tokens":3,"cache_creation_input_tokens":4,"output_tokens":1},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',
       '{"outputTokens":"7n","rawUsage":{"output_tokens":7},"accountingVersion":"provider-billable-v1","confidence":"REPORTED"}',

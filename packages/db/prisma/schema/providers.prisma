@@ -286,7 +286,13 @@ model UsageLedger {
   cacheWriteTokens             BigInt?
   reasoningTokens              BigInt?
   toolTokens                   BigInt?
+  /// The priced `additional` category: additionalInputTokens + additionalOutputTokens. Rows
+  /// written before the split have only this total; `rawUsage` attributes it.
   additionalBillableTokens     BigInt?
+  /// Input audio tokens, outside inputTokens.
+  additionalInputTokens        BigInt?
+  /// Output audio and accepted/rejected prediction tokens, outside outputTokens.
+  additionalOutputTokens       BigInt?
   authoritativeBillableTokens  BigInt?
   reportedTotalTokens          BigInt?
   billableTotal                BigInt?
