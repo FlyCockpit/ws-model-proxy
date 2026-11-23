@@ -66,9 +66,11 @@ function SheetContent({
           <SheetPrimitive.Close
             data-slot="sheet-close"
             render={
+              // 44px box flush with the edge: the focus ring is drawn inside it, so neither the
+              // viewport nor the sheet's overflow-x-hidden clips it.
               <Button
                 variant="ghost"
-                className="absolute top-1 right-0 ring-inset"
+                className="absolute top-1 right-0 focus-visible:ring-inset focus-visible:ring-offset-0"
                 size="icon-touch"
               />
             }

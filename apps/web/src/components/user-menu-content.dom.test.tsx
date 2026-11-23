@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
+import type { ReactElement, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const boundary = vi.hoisted(() => ({
@@ -22,9 +22,20 @@ vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => vi.fn(),
 }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
-vi.mock("@ws-model-proxy/ui/components/dropdown-menu", () => {
-  const Container = ({ children, className }: { children: ReactNode; className?: string }) => (
-    <div className={className}>{children}</div>
+vi.mock("@ws-model-proxy/ui/components/dropdown-menu", async () => {
+  const { cloneElement } = await import("react");
+  const Container = ({
+    children,
+    className,
+    align,
+  }: {
+    children: ReactNode;
+    className?: string;
+    align?: string;
+  }) => (
+    <div className={className} data-align={align}>
+      {children}
+    </div>
   );
   return {
     DropdownMenu: Container,
@@ -32,7 +43,15 @@ vi.mock("@ws-model-proxy/ui/components/dropdown-menu", () => {
     DropdownMenuGroup: Container,
     DropdownMenuLabel: Container,
     DropdownMenuSeparator: () => <hr />,
-    DropdownMenuTrigger: Container,
+    DropdownMenuTrigger: ({
+      children,
+      render,
+      ...props
+    }: {
+      children: ReactNode;
+      render: ReactElement<{ "aria-label"?: string }>;
+      "aria-label"?: string;
+    }) => cloneElement(render, props, children),
     DropdownMenuItem: ({
       children,
       onClick,
@@ -103,6 +122,18 @@ describe("UserMenuContent layout", () => {
     expect(email.classList.contains("truncate")).toBe(true);
     expect(email.getAttribute("title")).toBe("user@example.test");
     expect(email.closest(".min-w-56")).not.toBeNull();
+  });
+  it("aligns the menu's trailing edge with the trigger's", () => {
+    render(<UserMenuContent />);
+    const email = screen.getByText("user@example.test");
+    expect(email.closest(".min-w-56")?.getAttribute("data-align")).toBe("end");
+  });
+  it("caps and truncates the trigger's name at md+, with the full name in its title", () => {
+    render(<UserMenuContent />);
+    const trigger = screen.getByRole("button", { name: "userMenu.open" });
+    for (const className of ["md:min-w-11", "md:max-w-48", "md:shrink"])
+      expect(trigger.classList.contains(className)).toBe(true);
+    expect(trigger.getAttribute("title")).toBe(trigger.querySelector(".truncate")?.textContent);
   });
   it("puts Sign Out on the menu's label line (inset), like the icon rows", () => {
     render(<UserMenuContent />);

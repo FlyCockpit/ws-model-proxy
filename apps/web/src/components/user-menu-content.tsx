@@ -45,16 +45,26 @@ export default function UserMenuContent() {
 
   return (
     <DropdownMenu defaultOpen>
+      {/* A 44px icon below md:. From md: it shows the name, at most 192px wide, and shrinks (to
+          44px) before the header controls run past the trailing line; the name truncates and the
+          full name is in the title (same as UserMenu's eager trigger). */}
       <DropdownMenuTrigger
         aria-label={t("userMenu.open")}
         render={
-          <Button variant="outline" size="touch" className="w-11 px-0! md:w-auto md:px-3.5!" />
+          <Button
+            variant="outline"
+            size="touch"
+            className="w-11 px-0! md:w-auto md:min-w-11 md:max-w-48 md:shrink md:px-3.5!"
+            title={session.user.name}
+          />
         }
       >
         <User className="size-4 md:hidden" aria-hidden="true" />
-        <span className="hidden md:inline">{session.user.name}</span>
+        <span className="hidden truncate md:block">{session.user.name}</span>
       </DropdownMenuTrigger>
-      <DropdownMenuContent className="min-w-56 bg-card">
+      {/* At least 224px so the email fits; `end` keeps the menu's trailing edge on the
+          trigger's, the header's trailing line. */}
+      <DropdownMenuContent align="end" className="min-w-56 bg-card">
         <DropdownMenuGroup>
           <DropdownMenuLabel className="space-y-0.5">
             <span className="block text-muted-foreground">{t("userMenu.myAccount")}</span>

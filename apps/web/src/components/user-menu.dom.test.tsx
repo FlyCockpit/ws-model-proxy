@@ -88,6 +88,15 @@ describe("UserMenu", () => {
     );
     expect(screen.queryByRole("link", { name: "userMenu.signIn" })).toBeNull();
   });
+  it("caps and truncates the eager trigger's name at md+, with the full name in its title", () => {
+    boundary.state = signedIn("a-very-long-display-name");
+    setup();
+    const trigger = screen.getByRole("button", { name: "userMenu.open" });
+    for (const className of ["md:min-w-11", "md:max-w-48", "md:shrink"])
+      expect(trigger.classList.contains(className)).toBe(true);
+    expect(trigger.getAttribute("title")).toBe("a-very-long-display-name");
+    expect(trigger.querySelector(".truncate")?.textContent).toBe("a-very-long-display-name");
+  });
   it("does not auto-open the lazy menu for a different identity", async () => {
     boundary.state = signedIn("u1");
     const view = setup();

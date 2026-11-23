@@ -90,7 +90,10 @@ export default function UserMenu() {
       size="touch"
       aria-label={t("userMenu.open")}
       aria-haspopup="menu"
-      className="w-11 px-0! md:w-auto md:px-3.5!"
+      // Same as UserMenuContent's trigger: from md: it is at most 192px, shrinks (to 44px) before
+      // the header controls run past the trailing line, and truncates the name.
+      className="w-11 px-0! md:w-auto md:min-w-11 md:max-w-48 md:shrink md:px-3.5!"
+      title={state.session.user.name}
       inert={inert}
       onPointerEnter={prefetchMenu}
       onFocus={prefetchMenu}
@@ -100,7 +103,7 @@ export default function UserMenu() {
       }}
     >
       <User className="size-4 md:hidden" aria-hidden="true" />
-      <span className="hidden md:inline">{state.session.user.name}</span>
+      <span className="hidden truncate md:block">{state.session.user.name}</span>
     </Button>
   );
 

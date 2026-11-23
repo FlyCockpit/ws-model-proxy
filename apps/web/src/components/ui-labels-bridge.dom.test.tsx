@@ -90,6 +90,13 @@ describe.each([
     expect([...close.classList].some((className) => className.startsWith("after:-inset"))).toBe(
       false,
     );
+    // Sheet: the 44px box is flush with the viewport edge (right-0), so its focus ring is
+    // drawn inside the box (an outer ring plus offset is clipped). Dialog: at right-2 the outer
+    // ring has room inside the popup.
+    if (name === "Sheet") {
+      expect(close.classList.contains("focus-visible:ring-inset")).toBe(true);
+      expect(close.classList.contains("focus-visible:ring-offset-0")).toBe(true);
+    }
     fireEvent.click(close);
     expect(screen.queryByRole("dialog")).toBeNull();
   });
