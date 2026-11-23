@@ -127,6 +127,18 @@ describe("createApp CORS preflight (CORS_ALLOW_HEADERS wiring)", () => {
     expect(allowedHeaders(res)).toContain(APP_LOCALE_HEADER);
   });
 
+  it("allows the keepalive opt-out and exposes the keepalive marker to browsers", async () => {
+    const res = await preflight("content-type,x-wsmp-keepalive");
+    expect(allowedHeaders(res)).toContain("x-wsmp-keepalive");
+    const { app } = await createApp({ auth: memoryAuth as never });
+    const simple = await app.request(
+      new Request(`${BASE}/health`, { headers: { host: "proxy.example.com", Origin: APP_ORIGIN } }),
+    );
+    expect(simple.headers.get("access-control-expose-headers")?.toLowerCase()).toContain(
+      "x-wsmp-keepalive",
+    );
+  });
+
   it("allows the invite header the sign-up page sets on an invite sign-up", async () => {
     expect(CORS_ALLOW_HEADERS).toContain(SHARE_INVITE_HEADER);
     const res = await preflight(`content-type,${SHARE_INVITE_HEADER}`);

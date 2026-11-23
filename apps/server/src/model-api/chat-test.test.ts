@@ -2,6 +2,7 @@ import type { Session } from "@ws-model-proxy/auth";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("@ws-model-proxy/env/server", () => ({ env: { MODEL_API_KEEPALIVE_AFTER_MS: 0 } }));
 vi.mock("@ws-model-proxy/db", () => ({ default: {} }));
 vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
   isForceTwoFactorRequired: vi.fn(async () => false),

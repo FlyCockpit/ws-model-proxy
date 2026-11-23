@@ -125,6 +125,94 @@ The override also passes `BACKUP_S3_*` from the env file to the app and the
 backup service for an off-site copy (see
 [`docs/backup-and-restore.md`](docs/backup-and-restore.md)).
 
+### Home server behind a Cloudflare Tunnel
+
+A home machine with no public IP can serve the app through a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+(a named tunnel, Free or Pro plan). `cloudflared` on the machine opens an outbound connection to
+Cloudflare; nothing listens on the router and no port is forwarded:
+
+```text
+browser / API client / wsmp node
+  → https://wsmp.example.com (Cloudflare edge: TLS, your hostname)
+  → tunnel (outbound from home)
+  → cloudflared on the home machine
+  → [optional: Traefik / Caddy / nginx]
+  → app on 127.0.0.1:3000 (compose.yaml)  → Postgres (no published port)
+```
+
+Nodes connect to the same public hostname (`wss://wsmp.example.com/api/cli/ws`); they need no
+inbound ports either. A sample `~/.cloudflared/config.yml` for `cloudflared` on the host, in
+front of the shipped `compose.yaml`:
+
+```yaml
+tunnel: <tunnel-uuid>
+credentials-file: /home/you/.cloudflared/<tunnel-uuid>.json
+ingress:
+  - hostname: wsmp.example.com
+    service: http://127.0.0.1:3000
+  - service: http_status:404
+```
+
+WebSockets need no extra setting. Keep the app reachable only through the tunnel: `compose.yaml`
+already publishes it on `127.0.0.1` only. When `cloudflared` runs in Docker instead, put it on
+the compose network, use `service: http://app:3000`, and remove the app's `ports:` mapping. Never
+publish the app on `0.0.0.0` or a LAN address.
+
+Environment for the tunnel (in your private env file):
+
+| Topology | `TRUST_PROXY_HOPS` | Notes |
+|---|---|---|
+| `cloudflared` → app | `1` | Cloudflare writes the client address into `X-Forwarded-For`; the app's socket peer is `cloudflared`. |
+| `cloudflared` → Traefik / Caddy / nginx → app | `2` | That proxy must append `cloudflared`'s address to the `X-Forwarded-For` it received, not replace it: Traefik with `forwardedHeaders.trustedIPs` covering `cloudflared`'s address, Caddy with `trusted_proxies` covering it, nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` (and no `real_ip` module rewriting the client address). The count must equal the number of proxies that append; one too many lets a client choose its own rate-limit key. |
+
+- `BETTER_AUTH_URL=https://wsmp.example.com` (the tunnel hostname). Leave `CORS_ORIGIN` and
+  `MEDIA_PUBLIC_BASE_URL` unset; they default to the same origin. The terminal, Test-page
+  realtime and node-events origin checks accept exactly this origin. `PUBLIC_APP_URL` (only read
+  by the translation tooling) is the same hostname when you set it.
+- `TRUST_PROXY_HOPS=0` would put every client into the tunnel's single rate-limit bucket, and a
+  burst of reconnects after an edge restart could trip the per-IP upgrade limits for all of
+  them; `pnpm run doctor` warns about `0` in production.
+- The app does not read `CF-Connecting-IP`. The hop count above gives the same client address
+  without trusting a header that any client reaching the app directly could set.
+- SMTP: home ISPs usually block port 25, so send through a relay (your mail provider or a
+  transactional service) on `SMTP_PORT=587` (STARTTLS) or `465` (TLS from the first byte).
+
+Cloudflare limits that matter to this app:
+
+- **100 MB request bodies** (Free/Pro). Only transcription and translation uploads come near it.
+  A file may be as large as the smallest of the admin attachment limit (**Admin → Settings**,
+  25 MiB by default), the pool's or model's own limit, and the deployment ceiling
+  (`MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES`, 90 MiB per file, and
+  `MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES`, 91 MiB per request). The ceiling's defaults fit
+  under the edge's cap, so an admin can raise the setting all the way: an upload over the ceiling
+  but under 100,000,000 bytes gets the server's JSON 413 naming the limits, and only a larger one
+  meets the edge's own HTML 413. Do not raise the ceiling past 100,000,000 bytes behind the
+  tunnel, or uploads between the two get the edge's HTML 413 instead of the server's answer. Split longer audio (OpenAI's own API takes
+  25 MB per file, so OpenAI clients already do). Other bodies are smaller: model API JSON 32 MiB,
+  `/v1/files` 25 MiB by default (`MEDIA_MAX_UPLOAD_BYTES`).
+- **524 after about 100 s without a response byte.** Slow model API answers are kept alive after
+  30 s (see [Slow answers and the keepalive](#slow-answers-and-the-keepalive)). Text, `srt` and
+  `vtt` transcriptions, streaming transcriptions and `/v1/audio/speech` are not, so use a JSON
+  transcription format for long audio.
+- **WebSockets and edge restarts.** Cloudflare closes a WebSocket that is idle for about 100 s
+  and drops open ones when its edge restarts. Each socket stays busy and recovers on its own:
+  - Node relay (`/api/cli/ws`): `wsmp` sends a heartbeat every 20 s. After a drop it reconnects
+    (1 s, doubling to 5 min, with jitter). A pool request that has sent nothing yet may fail
+    over to another member; otherwise a request in flight on that node fails: with 503
+    (`disconnected`) before its answer started, as the in-body error of a kept-alive answer, or
+    cut off if its answer was already streaming. The node's open browser terminals end; node
+    commands keep running.
+  - Browser terminals: the server pings every 25 s. After a drop the page reconnects (0.5 s to
+    15 s) and reattaches its terminals with their scrollback; the shells keep running.
+  - `/v1/realtime` live transcription: the server pings every 25 s. A dropped session is not
+    resumed; the client opens a new one, as with OpenAI's Realtime API.
+  - Node live updates on the dashboard (SSE): a comment every 25 s; the page reconnects and
+    refetches.
+
+Not needed behind a tunnel: ACME / Let's Encrypt and Traefik `certresolver` labels (Cloudflare
+holds the certificate for the hostname), opening ports 80/443, and dynamic DNS. The server does
+not compress responses; Cloudflare compresses at the edge.
+
 ### Node client (`wsmp`)
 
 > **Server 1.0 needs wsmp 1.0 or newer** (relay protocol 4.0). It refuses 0.4.x CLIs with an upgrade message. Upgrade the server and every node together; see [UPGRADING.md](UPGRADING.md). You can also build from this repository: `cargo install --path apps/cli --bin wsmp`.
@@ -225,6 +313,36 @@ ASR, diarization, alignment, language detection, or transcoding. It forwards
 supported timestamps, diarization fields, provider extensions, response
 formats, and SSE bytes unchanged, while each served model's capabilities decide which pool
 members may take the request.
+
+#### Slow answers and the keepalive
+
+A request can be silent for minutes before its first byte: it may wait for capacity, fail over
+between pool members, and a non-streaming engine sends nothing until it has finished. Proxies cut
+such a request (Cloudflare answers 524 after about 100 s, nginx's default read timeout is 60 s),
+so once a model API request has been read and validated, the server waits
+`MODEL_API_KEEPALIVE_AFTER_MS` (default `30000`; `0` turns it off) for the answer. An answer
+ready by then is sent as it is, with its real status. Otherwise the server commits `200` with
+`x-wsmp-keepalive: 1` and keeps the connection busy every 15 s until the answer is ready:
+
+- **JSON answers** get newlines before the JSON, which every JSON parser skips. A failure after
+  the commit is the protocol's error object in the body, with `error.status` set to the status it
+  would have had (`{"error":{"message":…,"code":…,"status":503}}`, or Anthropic's
+  `{"type":"error","error":{…,"status":503}}`). A client that checks only the HTTP status should
+  also check for `error` in a body that carries `x-wsmp-keepalive: 1`.
+- An answer whose headers came in time but whose body is slow is kept alive the same way: JSON
+  gets newlines until its first byte, a stream gets comments in silent gaps between events.
+- **Streams** (`stream: true`) get SSE comment lines (`: keepalive`), which SSE parsers skip,
+  also during a long silence after the stream has started (written only between events). A
+  failure after the commit is the protocol's stream error event.
+- The routing headers decided later (`x-wsmp-route`, `x-wsmp-fallback`) are absent from a
+  committed answer. Pool failover still works after the commit: the keepalive bytes are not
+  answer bytes.
+- It covers `/v1/chat/completions`, `/v1/responses` (and its retrieve, cancel, compact and
+  count calls), `/v1/messages` (and `count_tokens`), `/v1/embeddings`, and transcriptions and
+  translations with a JSON `response_format` (`json`, `verbose_json`, `diarized_json`; the
+  default). Text, `srt` and `vtt` transcriptions, streaming transcriptions and `/v1/audio/speech`
+  keep their exact bytes and are not kept alive.
+- Send `x-wsmp-keepalive: off` on a request to opt out and always get real status codes.
 
 ### Why is my model missing?
 

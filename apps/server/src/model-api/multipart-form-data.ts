@@ -56,8 +56,10 @@ class SpoolBudget {
     let released = false;
     return {
       reserve: (count: number) => {
+        // The shared spool is full of other uploads: a busy server, not an
+        // oversized request (that is the per-file and multipart limit).
         if (this.bytes + count > env.MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES)
-          throw new MultipartIngressError("request_too_large");
+          throw new MultipartIngressError("rate_limited");
         this.bytes += count;
         reserved += count;
       },

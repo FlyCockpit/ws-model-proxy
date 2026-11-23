@@ -97,6 +97,16 @@ import {
 } from "./chat-test-routing-mode.js";
 import { responseWithFirstClientByte } from "./client-byte-commit.js";
 import { clientCredential } from "./client-credential.js";
+import {
+  ANTHROPIC_JSON_KEEPALIVE,
+  ANTHROPIC_MESSAGES_KEEPALIVE,
+  type CommitKeepalive,
+  OPENAI_CHAT_KEEPALIVE,
+  OPENAI_JSON_KEEPALIVE,
+  OPENAI_RESPONSES_KEEPALIVE,
+  TRANSCRIPTION_KEEPALIVE,
+  withCommitKeepalive,
+} from "./commit-keepalive.js";
 import { recordLearnedFix, recordLearnedHeader } from "./compat/profile-store.js";
 import type { CompatRefusal } from "./compat/request-policy.js";
 import type { ProxyExtras } from "./compat/runtime-compat.js";
@@ -273,6 +283,7 @@ import {
   servedModelCapabilities,
   undeclaredRequestedFeatures,
 } from "./served-model-capabilities.js";
+import { transcriptionUploadTooLargeMessage } from "./transcription-body-guard.js";
 import {
   isBasicTranscriptionRequest,
   TranscriptionRequestError,
@@ -2419,6 +2430,15 @@ async function prepareMultipartModeledRequest(
     console.warn("[model-api] multipart ingress rejected", {
       code: error instanceof MultipartIngressError ? error.code : "invalid_multipart",
     });
+    if (error instanceof MultipartIngressError && error.code === "request_too_large") {
+      return openAiFailureJsonResponse(
+        "request_too_large",
+        transcriptionUploadTooLargeMessage({
+          maxMultipartBytes: env.MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES,
+          maxFileBytes: env.MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES,
+        }),
+      );
+    }
     if (error instanceof MultipartIngressError && error.code !== "invalid_multipart") {
       return openAiFailureJsonResponse(error.code);
     }
@@ -8720,6 +8740,7 @@ async function authenticatedModeledHandler({
   manager,
   limiter,
   capacityRuntime,
+  keepalive,
 }: {
   request: Request;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
@@ -8727,11 +8748,13 @@ async function authenticatedModeledHandler({
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   capacityRuntime?: CapacityAdmissionRuntime;
+  keepalive?: CommitKeepalive;
 }) {
   const token = await authenticateRequest(request);
   if (!token) return openAiFailureJsonResponse("access_denied", "Missing or invalid API key.");
   const prepared = await prepare(request);
   if (prepared instanceof Response) return prepared;
+  keepalive?.prepared(prepared);
   // Every downstream path may attempt cleanup (including asynchronous relay
   // completion). Make it idempotent, and retain handler-level ownership until
   // routing has been handed off so unexpected DB/limiter/health failures cannot
@@ -8772,12 +8795,14 @@ async function completionsHandler({
   manager,
   limiter,
   capacityRuntime,
+  keepalive,
 }: {
   request: Request;
   family: "chat.completions";
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   capacityRuntime?: CapacityAdmissionRuntime;
+  keepalive?: CommitKeepalive;
 }) {
   return authenticatedModeledHandler({
     request,
@@ -8791,6 +8816,7 @@ async function completionsHandler({
     manager,
     limiter,
     capacityRuntime,
+    keepalive,
   });
 }
 
@@ -8853,6 +8879,7 @@ export async function chatTestCompletionsHandler({
   limiter,
   capacityRuntime,
   source = "TEST",
+  keepalive,
 }: {
   request: Request;
   userId: string;
@@ -8861,9 +8888,11 @@ export async function chatTestCompletionsHandler({
   capacityRuntime?: CapacityAdmissionRuntime;
   /** MCP diagnostics reuse this core; tag their traffic separately. */
   source?: "TEST" | "AGENT_TEST";
+  keepalive?: CommitKeepalive;
 }) {
   const prepared = await prepareJsonModeledRequest(request);
   if (prepared instanceof Response) return prepared;
+  keepalive?.prepared(prepared);
 
   const requester = requesterFromChatTestUser(userId, source);
   const targets = await listCallableTargetsForUser(userId);
@@ -9392,12 +9421,14 @@ export async function responsesCreateHandler({
   limiter,
   capacityRuntime,
   chatTestUserId,
+  keepalive,
 }: {
   request: Request;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   capacityRuntime?: CapacityAdmissionRuntime;
   chatTestUserId?: string;
+  keepalive?: CommitKeepalive;
 }) {
   const token = chatTestUserId ? null : await authenticateRequest(request);
   if (!token && !chatTestUserId)
@@ -9405,6 +9436,7 @@ export async function responsesCreateHandler({
 
   const prepared = await prepareJsonModeledRequest(request, true);
   if (prepared instanceof Response) return prepared;
+  keepalive?.prepared(prepared);
   const requester = chatTestUserId
     ? requesterFromChatTestUser(chatTestUserId)
     : requesterFromToken(token!);
@@ -9594,6 +9626,7 @@ async function responsesStickyHandler({
   manager,
   limiter,
   capacityRuntime,
+  keepalive,
 }: {
   request: Request;
   responseId: string;
@@ -9603,9 +9636,11 @@ async function responsesStickyHandler({
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   capacityRuntime?: CapacityAdmissionRuntime;
+  keepalive?: CommitKeepalive;
 }) {
   const token = await authenticateRequest(request);
   if (!token) return openAiFailureJsonResponse("access_denied", "Missing or invalid API key.");
+  keepalive?.prepared({ stream: false });
 
   const requester = requesterFromToken(token);
   const targets = await listCallableTargetsForApiKey(token);
@@ -9711,6 +9746,7 @@ export async function anthropicMessagesHandler({
   limiter,
   capacityRuntime,
   chatTestUserId,
+  keepalive,
 }: {
   request: Request;
   countTokens: boolean;
@@ -9718,6 +9754,7 @@ export async function anthropicMessagesHandler({
   limiter: ModelApiConcurrencyLimiter;
   capacityRuntime?: CapacityAdmissionRuntime;
   chatTestUserId?: string;
+  keepalive?: CommitKeepalive;
 }) {
   const token = chatTestUserId ? null : await authenticateRequest(request);
   if (!token && !chatTestUserId) {
@@ -9728,6 +9765,7 @@ export async function anthropicMessagesHandler({
   const prepared = await prepareAnthropicModeledRequest(request, ingress);
   if (prepared instanceof Response) return prepared;
   if (countTokens) prepared.stream = false;
+  keepalive?.prepared(prepared);
   const targets = chatTestUserId
     ? await listCallableTargetsForUser(chatTestUserId)
     : await listCallableTargetsForApiKey(token!);
@@ -9785,61 +9823,73 @@ export function createModelApiRoutes(dependencies: ModelApiRouteDependencies = {
   });
 
   app.post("/chat/completions", async (c) =>
-    completionsHandler({
-      request: c.req.raw,
-      family: "chat.completions",
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    }),
+    withCommitKeepalive(c.req.raw, OPENAI_CHAT_KEEPALIVE, (keepalive) =>
+      completionsHandler({
+        request: c.req.raw,
+        family: "chat.completions",
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    ),
   );
 
   app.post("/embeddings", async (c) =>
-    authenticatedModeledHandler({
-      request: c.req.raw,
-      operation: {
-        family: "embeddings",
-        method: "POST",
-        path: "/v1/embeddings",
-        capability: "embeddings",
-      },
-      prepare: prepareJsonModeledRequest,
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    }),
+    withCommitKeepalive(c.req.raw, OPENAI_JSON_KEEPALIVE, (keepalive) =>
+      authenticatedModeledHandler({
+        request: c.req.raw,
+        operation: {
+          family: "embeddings",
+          method: "POST",
+          path: "/v1/embeddings",
+          capability: "embeddings",
+        },
+        prepare: prepareJsonModeledRequest,
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    ),
   );
 
   app.post("/audio/transcriptions", async (c) =>
-    authenticatedModeledHandler({
-      request: c.req.raw,
-      operation: {
-        family: "audio",
-        method: "POST",
-        path: "/v1/audio/transcriptions",
-        capability: "audio.transcriptions",
-      },
-      prepare: prepareMultipartModeledRequest,
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    }),
+    withCommitKeepalive(c.req.raw, TRANSCRIPTION_KEEPALIVE, (keepalive) =>
+      authenticatedModeledHandler({
+        request: c.req.raw,
+        operation: {
+          family: "audio",
+          method: "POST",
+          path: "/v1/audio/transcriptions",
+          capability: "audio.transcriptions",
+        },
+        prepare: prepareMultipartModeledRequest,
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    ),
   );
 
   app.post("/audio/translations", async (c) =>
-    authenticatedModeledHandler({
-      request: c.req.raw,
-      operation: {
-        family: "audio",
-        method: "POST",
-        path: "/v1/audio/translations",
-        capability: "audio.translations",
-      },
-      prepare: prepareMultipartModeledRequest,
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    }),
+    withCommitKeepalive(c.req.raw, TRANSCRIPTION_KEEPALIVE, (keepalive) =>
+      authenticatedModeledHandler({
+        request: c.req.raw,
+        operation: {
+          family: "audio",
+          method: "POST",
+          path: "/v1/audio/translations",
+          capability: "audio.translations",
+        },
+        prepare: prepareMultipartModeledRequest,
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    ),
   );
 
   app.post("/audio/speech", async (c) =>
@@ -9859,123 +9909,150 @@ export function createModelApiRoutes(dependencies: ModelApiRouteDependencies = {
   );
 
   app.post("/responses", async (c) =>
-    responsesCreateHandler({
-      request: c.req.raw,
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    }),
+    withCommitKeepalive(c.req.raw, OPENAI_RESPONSES_KEEPALIVE, (keepalive) =>
+      responsesCreateHandler({
+        request: c.req.raw,
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    ),
   );
 
   app.post("/messages", async (c) =>
-    anthropicMessagesHandler({
-      request: c.req.raw,
-      countTokens: false,
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    }),
+    withCommitKeepalive(c.req.raw, ANTHROPIC_MESSAGES_KEEPALIVE, (keepalive) =>
+      anthropicMessagesHandler({
+        request: c.req.raw,
+        countTokens: false,
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    ),
   );
 
   app.post("/messages/count_tokens", async (c) =>
-    anthropicMessagesHandler({
-      request: c.req.raw,
-      countTokens: true,
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    }),
+    withCommitKeepalive(c.req.raw, ANTHROPIC_JSON_KEEPALIVE, (keepalive) =>
+      anthropicMessagesHandler({
+        request: c.req.raw,
+        countTokens: true,
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    ),
   );
 
   app.post("/responses/count_tokens", async (c) =>
-    authenticatedModeledHandler({
-      request: c.req.raw,
-      operation: {
-        family: "responses",
-        method: "POST",
-        path: "/v1/responses/count_tokens",
-        capability: "responses.countTokens",
-      },
-      prepare: prepareJsonModeledRequest,
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    }),
+    withCommitKeepalive(c.req.raw, OPENAI_JSON_KEEPALIVE, (keepalive) =>
+      authenticatedModeledHandler({
+        request: c.req.raw,
+        operation: {
+          family: "responses",
+          method: "POST",
+          path: "/v1/responses/count_tokens",
+          capability: "responses.countTokens",
+        },
+        prepare: prepareJsonModeledRequest,
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    ),
   );
 
   app.get("/responses/:responseId", async (c) => {
     const responseId = responseIdParam(c.req.param("responseId"));
     if (responseId instanceof Response) return responseId;
-    return responsesStickyHandler({
-      request: c.req.raw,
-      responseId,
-      method: "GET",
-      path: responsePathWithQuery(c.req.raw, encodedResponsePath(responseId)),
-      capability: "responses.retrieve",
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    });
+    return withCommitKeepalive(c.req.raw, OPENAI_JSON_KEEPALIVE, (keepalive) =>
+      responsesStickyHandler({
+        request: c.req.raw,
+        responseId,
+        method: "GET",
+        path: responsePathWithQuery(c.req.raw, encodedResponsePath(responseId)),
+        capability: "responses.retrieve",
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    );
   });
 
   app.delete("/responses/:responseId", async (c) => {
     const responseId = responseIdParam(c.req.param("responseId"));
     if (responseId instanceof Response) return responseId;
-    return responsesStickyHandler({
-      request: c.req.raw,
-      responseId,
-      method: "DELETE",
-      path: encodedResponsePath(responseId),
-      capability: "responses.delete",
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    });
+    return withCommitKeepalive(c.req.raw, OPENAI_JSON_KEEPALIVE, (keepalive) =>
+      responsesStickyHandler({
+        request: c.req.raw,
+        responseId,
+        method: "DELETE",
+        path: encodedResponsePath(responseId),
+        capability: "responses.delete",
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    );
   });
 
   app.post("/responses/:responseId/cancel", async (c) => {
     const responseId = responseIdParam(c.req.param("responseId"));
     if (responseId instanceof Response) return responseId;
-    return responsesStickyHandler({
-      request: c.req.raw,
-      responseId,
-      method: "POST",
-      path: encodedResponsePath(responseId, "/cancel"),
-      capability: "responses.cancel",
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    });
+    return withCommitKeepalive(c.req.raw, OPENAI_JSON_KEEPALIVE, (keepalive) =>
+      responsesStickyHandler({
+        request: c.req.raw,
+        responseId,
+        method: "POST",
+        path: encodedResponsePath(responseId, "/cancel"),
+        capability: "responses.cancel",
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    );
   });
 
   app.get("/responses/:responseId/input_items", async (c) => {
     const responseId = responseIdParam(c.req.param("responseId"));
     if (responseId instanceof Response) return responseId;
-    return responsesStickyHandler({
-      request: c.req.raw,
-      responseId,
-      method: "GET",
-      path: responsePathWithQuery(c.req.raw, encodedResponsePath(responseId, "/input_items")),
-      capability: "responses.listInputItems",
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    });
+    return withCommitKeepalive(c.req.raw, OPENAI_JSON_KEEPALIVE, (keepalive) =>
+      responsesStickyHandler({
+        request: c.req.raw,
+        responseId,
+        method: "GET",
+        path: responsePathWithQuery(c.req.raw, encodedResponsePath(responseId, "/input_items")),
+        capability: "responses.listInputItems",
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    );
   });
 
   app.post("/responses/:responseId/compact", async (c) => {
     const responseId = responseIdParam(c.req.param("responseId"));
     if (responseId instanceof Response) return responseId;
-    return responsesStickyHandler({
-      request: c.req.raw,
-      responseId,
-      method: "POST",
-      path: encodedResponsePath(responseId, "/compact"),
-      capability: "responses.compact",
-      manager,
-      limiter: concurrencyLimiter,
-      capacityRuntime: admissionRuntime,
-    });
+    return withCommitKeepalive(c.req.raw, OPENAI_JSON_KEEPALIVE, (keepalive) =>
+      responsesStickyHandler({
+        request: c.req.raw,
+        responseId,
+        method: "POST",
+        path: encodedResponsePath(responseId, "/compact"),
+        capability: "responses.compact",
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+        keepalive,
+      }),
+    );
   });
 
   app.all("/*", () => openAiFailureJsonResponse("not_found"));

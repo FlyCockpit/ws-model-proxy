@@ -305,13 +305,19 @@ export const ENV_VARS: EnvVar[] = [
     key: "MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES",
     group: "runtime",
     source: "default",
-    default: "104857600",
+    default: "94371840",
+    comment: [
+      "Deployment ceiling for one transcription/translation audio file (90 MiB); the admin",
+      "attachment limit (25 MiB by default) and pool/model limits can only narrow it.",
+      "The defaults keep the whole request under the 100 MB body cap of Cloudflare's",
+      "Free and Pro plans; raise both caps only when no such proxy sits in front.",
+    ],
   },
   {
     key: "MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES",
     group: "runtime",
     source: "default",
-    default: "105906176",
+    default: "95420416",
     comment: [
       "Raw multipart cap including file data, fields, boundaries, and headers; immutable hard cap 1074790400.",
     ],
@@ -339,6 +345,19 @@ export const ENV_VARS: EnvVar[] = [
     group: "runtime",
     source: "default",
     default: "900000",
+  },
+  {
+    key: "MODEL_API_KEEPALIVE_AFTER_MS",
+    group: "runtime",
+    source: "default",
+    default: "30000",
+    comment: [
+      "A model API request with no response after this many milliseconds is",
+      "committed as 200 and kept alive (whitespace before JSON, SSE comments in",
+      "streams), so a proxy idle timeout (Cloudflare 524 after ~100 s, nginx 60 s)",
+      "cannot cut a slow model. Later errors are written in the body with",
+      "error.status. 0 turns it off; a request can opt out with `x-wsmp-keepalive: off`.",
+    ],
   },
   {
     key: "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED",

@@ -98,18 +98,21 @@ export const env = createEnv({
       .min(0)
       .default(512 * 1024 * 1024),
     MODEL_API_TRANSCRIPTION_SPOOL_DIR: z.string().min(1).optional(),
+    // Defaults fit a whole request (file + 1 MiB of fields and framing) under
+    // the 100 MB (10^8 bytes) request-body cap of Cloudflare's Free and Pro
+    // plans, so the client gets this server's JSON 413, not the edge's.
     MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES: z.coerce
       .number()
       .int()
       .positive()
       .max(1024 * 1024 * 1024)
-      .default(100 * 1024 * 1024),
+      .default(90 * 1024 * 1024),
     MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: z.coerce
       .number()
       .int()
       .positive()
       .max(1025 * 1024 * 1024)
-      .default(101 * 1024 * 1024),
+      .default(91 * 1024 * 1024),
     MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES: z.coerce
       .number()
       .int()
@@ -126,6 +129,12 @@ export const env = createEnv({
       .int()
       .positive()
       .default(15 * 60 * 1000),
+    // Model API commit keepalive (apps/server/src/model-api/commit-keepalive.ts):
+    // a prepared request with no response after this long is committed as 200
+    // and kept alive (whitespace for JSON, SSE comments for streams) so an idle
+    // timeout in front (Cloudflare 524 at ~100 s, nginx 60 s) cannot cut it.
+    // 0 turns it off.
+    MODEL_API_KEEPALIVE_AFTER_MS: z.coerce.number().int().min(0).max(600_000).default(30_000),
     // Kill switch for direct public-provider egress. On by default. Off stops
     // provider HTTP, hides `owner/pool:external` names, and answers them with
     // 403 external_providers_disabled; provider keys stay viewable, revocable,

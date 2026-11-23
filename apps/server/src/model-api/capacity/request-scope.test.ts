@@ -156,6 +156,36 @@ describe("capacity request scope", () => {
     expect(leaseStore.release).toHaveBeenCalledOnce();
   });
 
+  it("closes on cancel only after the body's own cancel has released its owner", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const leaseStore = store();
+    let owner: CapacityLeaseOwner | undefined;
+    const app = new Hono();
+    app.use("*", capacityRequestScopeMiddleware);
+    app.post("/slow-cancel", async () => {
+      owner = new CapacityLeaseOwner(leaseStore, lease, undefined, 0);
+      // Nothing is ever enqueued, so a read is in flight when the client
+      // cancels; the source releases its owner only after an async step.
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          async cancel() {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            await owner?.release(new Error("client cancelled"));
+          },
+        }),
+      );
+    });
+    const response = await app.request("/slow-cancel", { method: "POST" });
+    const reader = response.body!.getReader();
+    const pending = reader.read();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await reader.cancel("client left");
+    await pending;
+    expect(owner?.signal.reason).toMatchObject({ message: "client cancelled" });
+    expect(warn).not.toHaveBeenCalled();
+    expect(leaseStore.release).toHaveBeenCalledOnce();
+  });
+
   it("releases an owner created after its scope closed immediately", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const leaseStore = store();

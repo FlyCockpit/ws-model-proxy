@@ -26,9 +26,11 @@ function getTransporter(): Transporter {
     );
   }
 
+  const port = SMTP_PORT ?? 587;
   transporter = nodemailer.createTransport({
     host: SMTP_HOST,
-    port: SMTP_PORT ?? 587,
+    port,
+    secure: smtpImplicitTls(port),
     // Bounded waits so a hung SMTP server cannot hold a send (and its retries) open for
     // minutes: nodemailer's defaults are 2 min to connect and 10 min of socket inactivity.
     connectionTimeout: SMTP_CONNECTION_TIMEOUT_MS,
@@ -46,6 +48,15 @@ function getTransporter(): Transporter {
  * The nodemailer transport is created lazily on the first call so the
  * application boots cleanly even when SMTP is not configured.
  */
+/**
+ * Port 465 (SMTPS) speaks TLS from the first byte; every other port (587, 25,
+ * 2525) starts in plain text and upgrades with STARTTLS when the server offers
+ * it. Nodemailer needs `secure: true` for the first and false for the rest.
+ */
+export function smtpImplicitTls(port: number): boolean {
+  return port === 465;
+}
+
 export async function sendEmail({ to, subject, html }: SendEmailOptions): Promise<void> {
   const transport = getTransporter();
   const from = env.SMTP_FROM ?? "noreply@example.com";

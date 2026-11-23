@@ -2,17 +2,17 @@ import { lstat } from "node:fs/promises";
 import { Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@ws-model-proxy/env/server", () => ({
-  env: {
-    MODEL_API_TRANSCRIPTION_MAX_CONCURRENT_UPLOADS: 4,
-    MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES: 1024 * 1024,
-    MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES: 1024,
-    MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: 4096,
-    MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
-    MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 5_000,
-    MODEL_API_TRANSCRIPTION_SPOOL_DIR: "/tmp/wsmp-multipart-adversarial-tests",
-  },
+const mockEnv = vi.hoisted(() => ({
+  MODEL_API_TRANSCRIPTION_MAX_CONCURRENT_UPLOADS: 4,
+  MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES: 1024 * 1024,
+  MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES: 1024,
+  MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: 4096,
+  MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
+  MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 5_000,
+  MODEL_API_TRANSCRIPTION_SPOOL_DIR: "/tmp/wsmp-multipart-adversarial-tests",
 }));
+
+vi.mock("@ws-model-proxy/env/server", () => ({ env: mockEnv }));
 
 const { MultipartIngressError, parseMultipartToSpool } = await import("./multipart-form-data.js");
 const disposables: Array<{ dispose(): Promise<void> }> = [];
@@ -64,6 +64,25 @@ describe("multipart ingress adversarial matrix", () => {
     ).rejects.toMatchObject({ code: "request_too_large" } satisfies Partial<
       InstanceType<typeof MultipartIngressError>
     >);
+  });
+
+  it("answers a full shared spool as busy (429), not as an oversized request", async () => {
+    const spoolBytes = mockEnv.MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES;
+    mockEnv.MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES = 512;
+    try {
+      const form = new FormData();
+      form.set("model", "m");
+      form.set("file", new File([new Uint8Array(1000)], "voice.wav", { type: "audio/wav" }));
+      const request = new Request("https://proxy.test/v1/audio/transcriptions", {
+        method: "POST",
+        body: form,
+      });
+      await expect(
+        parseMultipartToSpool(request, request.headers.get("content-type")!),
+      ).rejects.toMatchObject({ code: "rate_limited" });
+    } finally {
+      mockEnv.MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES = spoolBytes;
+    }
   });
 
   it("accepts a file exactly at the configured streaming limit", async () => {

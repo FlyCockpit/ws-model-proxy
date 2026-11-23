@@ -4,6 +4,12 @@ import { Hono } from "hono";
 import { forcedTwoFactorResponse } from "../force-2fa-gate.js";
 import { relaySessionManager } from "../relay/session-manager.js";
 import { capacityRequestScopeMiddleware } from "./capacity/request-scope.js";
+import {
+  ANTHROPIC_MESSAGES_KEEPALIVE,
+  OPENAI_CHAT_KEEPALIVE,
+  OPENAI_RESPONSES_KEEPALIVE,
+  withCommitKeepalive,
+} from "./commit-keepalive.js";
 import { type DiagnosticCoreDependencies, diagnosticsCapacityRuntime } from "./diagnostics.js";
 import { modelApiConcurrencyLimiter } from "./limits.js";
 import { openAiFailureJsonResponse } from "./openai-errors.js";
@@ -153,14 +159,17 @@ export function createChatTestRoutes({
     }
 
     const userId = session.user.id;
-    return answer(userId, () =>
-      chatTestCompletionsHandler({
-        request: c.req.raw,
-        userId,
-        manager,
-        limiter: concurrencyLimiter,
-        capacityRuntime: admissionRuntime,
-      }),
+    return withCommitKeepalive(c.req.raw, OPENAI_CHAT_KEEPALIVE, (keepalive) =>
+      answer(userId, () =>
+        chatTestCompletionsHandler({
+          request: c.req.raw,
+          userId,
+          manager,
+          limiter: concurrencyLimiter,
+          capacityRuntime: admissionRuntime,
+          keepalive,
+        }),
+      ),
     );
   });
 
@@ -169,14 +178,17 @@ export function createChatTestRoutes({
     if (!session?.user)
       return openAiFailureJsonResponse("access_denied", "Authentication is required.");
     const userId = session.user.id;
-    return answer(userId, () =>
-      responsesCreateHandler({
-        request: c.req.raw,
-        chatTestUserId: userId,
-        manager,
-        limiter: concurrencyLimiter,
-        capacityRuntime: admissionRuntime,
-      }),
+    return withCommitKeepalive(c.req.raw, OPENAI_RESPONSES_KEEPALIVE, (keepalive) =>
+      answer(userId, () =>
+        responsesCreateHandler({
+          request: c.req.raw,
+          chatTestUserId: userId,
+          manager,
+          limiter: concurrencyLimiter,
+          capacityRuntime: admissionRuntime,
+          keepalive,
+        }),
+      ),
     );
   });
 
@@ -185,15 +197,18 @@ export function createChatTestRoutes({
     if (!session?.user)
       return openAiFailureJsonResponse("access_denied", "Authentication is required.");
     const userId = session.user.id;
-    return answer(userId, () =>
-      anthropicMessagesHandler({
-        request: c.req.raw,
-        chatTestUserId: userId,
-        countTokens: false,
-        manager,
-        limiter: concurrencyLimiter,
-        capacityRuntime: admissionRuntime,
-      }),
+    return withCommitKeepalive(c.req.raw, ANTHROPIC_MESSAGES_KEEPALIVE, (keepalive) =>
+      answer(userId, () =>
+        anthropicMessagesHandler({
+          request: c.req.raw,
+          chatTestUserId: userId,
+          countTokens: false,
+          manager,
+          limiter: concurrencyLimiter,
+          capacityRuntime: admissionRuntime,
+          keepalive,
+        }),
+      ),
     );
   });
 

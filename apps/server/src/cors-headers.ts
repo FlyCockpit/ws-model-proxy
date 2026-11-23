@@ -34,4 +34,12 @@ export const CORS_ALLOW_HEADERS = [
   "x-csrf-token",
   APP_LOCALE_HEADER,
   SHARE_INVITE_HEADER,
+  // A model API client's opt-out of the commit keepalive (model-api/commit-keepalive.ts).
+  "x-wsmp-keepalive",
+] as const;
+
+/** Response headers a cross-origin browser client may read. */
+export const CORS_EXPOSE_HEADERS = [
+  // Marks a committed 200 whose body may carry an in-body error (commit-keepalive.ts).
+  "x-wsmp-keepalive",
 ] as const;

@@ -75,16 +75,22 @@ export function bindResponseToCapacityScope(
     return response;
   }
   const reader = response.body.getReader();
+  // Cancelling the reader settles a read already in flight at once (as EOF),
+  // before the source's own cancel has finished releasing what it holds. Only
+  // the cancel path closes the scope then, after that release.
+  let cancelling = false;
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       let chunk: Awaited<ReturnType<typeof reader.read>>;
       try {
         chunk = await reader.read();
       } catch (error) {
+        if (cancelling) return;
         await scope.close();
         controller.error(error);
         return;
       }
+      if (cancelling) return;
       if (chunk.done) {
         await scope.close();
         controller.close();
@@ -93,6 +99,7 @@ export function bindResponseToCapacityScope(
       controller.enqueue(chunk.value);
     },
     async cancel(reason) {
+      cancelling = true;
       try {
         await reader.cancel(reason);
       } finally {

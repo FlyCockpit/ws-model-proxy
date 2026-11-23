@@ -49,7 +49,7 @@ import {
 } from "./access-revocation.js";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
 import { resolveClientIp, withResolvedClientIp } from "./client-ip.js";
-import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
+import { CORS_ALLOW_HEADERS, CORS_EXPOSE_HEADERS } from "./cors-headers.js";
 import {
   EMAIL_RECIPIENT_PATHS,
   emailRecipientLimit,
@@ -458,7 +458,10 @@ export async function createApp(options: CreateAppOptions = {}) {
   for (const transcriptionPath of ["/v1/audio/transcriptions", "/v1/audio/translations"] as const) {
     app.use(
       transcriptionPath,
-      transcriptionContentLengthGuard(env.MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES),
+      transcriptionContentLengthGuard({
+        maxMultipartBytes: env.MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES,
+        maxFileBytes: env.MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES,
+      }),
     );
   }
   const generalModelApiBodyLimit = bodyLimit({
@@ -757,6 +760,7 @@ export async function createApp(options: CreateAppOptions = {}) {
         // the preflight fails and the request never leaves the browser — a
         // failure mode invisible in local dev. See cors-headers.ts.
         allowHeaders: [...CORS_ALLOW_HEADERS],
+        exposeHeaders: [...CORS_EXPOSE_HEADERS],
         credentials: true,
       }),
     );

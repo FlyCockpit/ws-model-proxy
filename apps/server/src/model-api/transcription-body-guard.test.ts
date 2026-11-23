@@ -6,7 +6,7 @@ describe("transcription content-length guard", () => {
   it("does not consume a chunked body before the route reads it incrementally", async () => {
     const app = new Hono();
     const observed: number[] = [];
-    app.use("/upload", transcriptionContentLengthGuard(4));
+    app.use("/upload", transcriptionContentLengthGuard({ maxMultipartBytes: 4, maxFileBytes: 3 }));
     app.post("/upload", async (c) => {
       const reader = c.req.raw.body?.getReader();
       if (!reader) throw new Error("expected body");
@@ -33,7 +33,7 @@ describe("transcription content-length guard", () => {
   it("returns 413 from content-length without pulling the body", async () => {
     const app = new Hono();
     const pull = vi.fn();
-    app.use("/upload", transcriptionContentLengthGuard(4));
+    app.use("/upload", transcriptionContentLengthGuard({ maxMultipartBytes: 4, maxFileBytes: 3 }));
     app.post("/upload", (c) => c.text("unexpected"));
     const request = new Request("http://test/upload", {
       method: "POST",
@@ -45,7 +45,13 @@ describe("transcription content-length guard", () => {
     const pullsBeforeDispatch = pull.mock.calls.length;
     const response = await app.request(request);
     expect(response.status).toBe(413);
-    await expect(response.json()).resolves.toMatchObject({ error: { code: "request_too_large" } });
+    await expect(response.json()).resolves.toMatchObject({
+      error: {
+        code: "request_too_large",
+        message:
+          "Transcription upload is too large: this server accepts requests up to 4 bytes with an audio file up to 3 bytes. Split or compress the audio and send each part separately.",
+      },
+    });
     expect(pull).toHaveBeenCalledTimes(pullsBeforeDispatch);
   });
 });

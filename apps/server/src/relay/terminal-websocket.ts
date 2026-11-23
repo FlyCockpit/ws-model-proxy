@@ -1391,6 +1391,61 @@ export async function admitBrowserConnection(input: BrowserConnInput): Promise<v
 type TerminalWsContext = WSContext<WebSocketLike>;
 const browserSockets = new WeakMap<TerminalWsContext, RelaySocket>();
 
+/**
+ * WebSocket ping cadence for a browser terminal socket, and how long the
+ * browser may go without answering one. A terminal with no input or output is
+ * otherwise silent, and a proxy closes an idle WebSocket (a Cloudflare Tunnel
+ * after about 100 s). Browsers answer pings on their own, so a live tab always
+ * keeps its socket; a peer gone without a close is terminated, and the page
+ * reconnects and reattaches its terminals.
+ */
+export const TERMINAL_PING_INTERVAL_MS = 25_000;
+export const TERMINAL_PONG_TIMEOUT_MS = 60_000;
+const terminalKeepalives = new WeakMap<TerminalWsContext, ReturnType<typeof setInterval>>();
+
+type PingableSocket = {
+  ping(): void;
+  terminate(): void;
+  on(event: "pong", listener: () => void): unknown;
+};
+
+function pingableSocket(raw: unknown): PingableSocket | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const candidate = raw as Partial<PingableSocket>;
+  return typeof candidate.ping === "function" &&
+    typeof candidate.terminate === "function" &&
+    typeof candidate.on === "function"
+    ? (raw as PingableSocket)
+    : null;
+}
+
+function startTerminalKeepalive(ws: TerminalWsContext) {
+  const raw = pingableSocket(ws.raw);
+  if (!raw || terminalKeepalives.has(ws)) return;
+  let lastPong = Date.now();
+  raw.on("pong", () => {
+    lastPong = Date.now();
+  });
+  const timer = setInterval(() => {
+    if (Date.now() - lastPong > TERMINAL_PONG_TIMEOUT_MS) {
+      raw.terminate();
+      return;
+    }
+    try {
+      raw.ping();
+    } catch {
+      // Closing; the close event detaches the socket.
+    }
+  }, TERMINAL_PING_INTERVAL_MS);
+  timer.unref?.();
+  terminalKeepalives.set(ws, timer);
+}
+
+function stopTerminalKeepalive(ws: TerminalWsContext) {
+  clearInterval(terminalKeepalives.get(ws));
+  terminalKeepalives.delete(ws);
+}
+
 function browserSocketFor(ws: TerminalWsContext): RelaySocket {
   const existing = browserSockets.get(ws);
   if (existing) return existing;
@@ -1478,6 +1533,7 @@ export function terminalSocketEvents(session: Session | null): WSEvents<WebSocke
         return;
       }
       const socket = browserSocketFor(ws);
+      startTerminalKeepalive(ws);
       // Registers synchronously (pending), before this handler returns and
       // before any frame of the socket is handled.
       settleSocketHandler(
@@ -1501,11 +1557,13 @@ export function terminalSocketEvents(session: Session | null): WSEvents<WebSocke
       }
     },
     onClose(_event, ws) {
+      stopTerminalKeepalive(ws);
       const socket = browserSocketFor(ws);
       terminalBrowserHub.handleClose(socket);
       browserSockets.delete(ws);
     },
     onError(_event, ws) {
+      stopTerminalKeepalive(ws);
       const socket = browserSocketFor(ws);
       terminalBrowserHub.handleClose(socket);
       browserSockets.delete(ws);

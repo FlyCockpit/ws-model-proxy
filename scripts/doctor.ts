@@ -172,6 +172,32 @@ function checkDatabase() {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. Client IP topology (production only — warn-only)
+// ---------------------------------------------------------------------------
+function checkTrustProxyHops() {
+  if (process.env.NODE_ENV !== "production") return;
+  const hops = process.env.TRUST_PROXY_HOPS?.trim();
+  // Unset or malformed: the env check above already fails and says why.
+  if (!hops || !/^\d{1,2}$/.test(hops)) return;
+  if (Number(hops) === 0) {
+    record({
+      name: "TRUST_PROXY_HOPS",
+      status: "warn",
+      detail: "0 in production: X-Forwarded-For is ignored and the client IP is the socket peer",
+      hint: "Behind any reverse proxy or tunnel every client then shares the proxy's rate-limit bucket. Set the number of proxies in front of the app: 1 for one proxy or cloudflared straight to the app, 2 for cloudflared in front of Traefik/Caddy/nginx. Keep 0 only when clients connect to the app directly.",
+      required: false,
+    });
+    return;
+  }
+  record({
+    name: "TRUST_PROXY_HOPS",
+    status: "ok",
+    detail: `${hops} proxy hop(s)`,
+    required: false,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // 4. SMTP connectivity (optional — warn-only)
 // ---------------------------------------------------------------------------
 function checkSmtp(): Promise<void> {
@@ -263,6 +289,7 @@ function printSummary() {
 async function main() {
   checkPortless();
   await checkEnv();
+  checkTrustProxyHops();
   // Stop further checks if env failed — they would all fail with confusing
   // messages and the user needs to fix env first.
   const envOk = results.find((r) => r.name === "env (zod schema)")?.status === "ok";

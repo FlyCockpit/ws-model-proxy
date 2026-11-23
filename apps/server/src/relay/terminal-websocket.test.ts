@@ -74,6 +74,8 @@ const {
   admitBrowserConnection,
   createTerminalWebsocketMiddleware,
   terminalBrowserHub,
+  TERMINAL_PING_INTERVAL_MS,
+  TERMINAL_PONG_TIMEOUT_MS,
   terminalSocketEvents,
 } = await import("./terminal-websocket.js");
 const { settleSocketHandler } = await import("./socket-handler.js");
@@ -1488,6 +1490,54 @@ describe("terminal browser hub", () => {
       expect(next.jsonSends()).toEqual([expect.objectContaining({ type: "terminals" })]),
     );
     nextEvents.onClose?.(new Event("close") as CloseEvent, nextWs);
+  });
+
+  it("pings an open terminal socket so an idle one survives proxy idle timeouts", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      const socket = new FakeSocket();
+      let pong: (() => void) | undefined;
+      const raw = {
+        ping: vi.fn(),
+        terminate: vi.fn(),
+        on: (event: string, listener: () => void) => {
+          if (event === "pong") pong = listener;
+        },
+      };
+      const ws = new WSContext<WebSocketLike>({
+        get readyState() {
+          return socket.readyState as 0 | 1 | 2 | 3;
+        },
+        raw: raw as unknown as WebSocketLike,
+        send: (data) => socket.send(data as string | ArrayBuffer),
+        close: (code, reason) => socket.close(code, reason),
+      });
+      const events = terminalSocketEvents({
+        user: { id: "user-id" },
+        session: { id: "session-id" },
+      } as unknown as Session);
+      db.session.findUnique.mockResolvedValueOnce(admissionRow());
+      events.onOpen?.(new Event("open"), ws);
+      vi.advanceTimersByTime(TERMINAL_PING_INTERVAL_MS);
+      expect(raw.ping).toHaveBeenCalledTimes(1);
+      // Answered pings keep it open indefinitely.
+      for (let tick = 0; tick < 4; tick += 1) {
+        pong?.();
+        vi.advanceTimersByTime(TERMINAL_PING_INTERVAL_MS);
+      }
+      expect(raw.terminate).not.toHaveBeenCalled();
+      expect(raw.ping).toHaveBeenCalledTimes(5);
+      // A peer that stops answering is terminated once the pong timeout passes.
+      vi.advanceTimersByTime(TERMINAL_PONG_TIMEOUT_MS + TERMINAL_PING_INTERVAL_MS);
+      expect(raw.terminate).toHaveBeenCalled();
+      // Close stops the pings.
+      events.onClose?.(new Event("close") as CloseEvent, ws);
+      const pings = raw.ping.mock.calls.length;
+      vi.advanceTimersByTime(TERMINAL_PING_INTERVAL_MS * 3);
+      expect(raw.ping).toHaveBeenCalledTimes(pings);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("closes a marked owner on the session recheck belt", async () => {
