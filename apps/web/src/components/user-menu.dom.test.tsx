@@ -63,6 +63,24 @@ describe("UserMenu", () => {
     expect(screen.getByRole("link", { name: "userMenu.signIn" })).toBeTruthy();
     expect(view.container.querySelector("a button")).toBeNull();
   });
+  it("shows a compact phone sign-in icon and its text only from sm, named by aria-label", () => {
+    setup();
+    const signin = screen.getByRole("link", { name: "userMenu.signIn" });
+    expect(signin.getAttribute("href")).toBe("/en-US/login");
+    expect(signin.getAttribute("aria-label")).toBe("userMenu.signIn");
+    for (const className of ["w-11", "px-0", "sm:w-auto", "sm:px-3.5", "h-11"])
+      expect(signin.classList.contains(className)).toBe(true);
+    // Outline variant; the touch size's px-3.5 gives way to px-0 below sm.
+    expect(signin.classList.contains("border-border")).toBe(true);
+    expect(signin.classList.contains("px-3.5")).toBe(false);
+    const icon = signin.querySelector("svg");
+    expect(icon?.getAttribute("aria-hidden")).toBe("true");
+    expect(icon?.classList.contains("sm:hidden")).toBe(true);
+    const text = signin.querySelector("span");
+    expect(text?.textContent).toBe("userMenu.signIn");
+    expect(text?.classList.contains("hidden")).toBe(true);
+    expect(text?.classList.contains("sm:inline")).toBe(true);
+  });
   it("shows a neutral disabled account button during an error carrying a known session", () => {
     boundary.state = { status: "error", session: signedIn("u1").session, error: new Error("429") };
     setup();

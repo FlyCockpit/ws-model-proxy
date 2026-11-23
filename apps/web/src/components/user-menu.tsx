@@ -4,7 +4,7 @@ import { Button } from "@ws-model-proxy/ui/components/button";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { User, UserPlus } from "lucide-react";
+import { LogIn, User, UserPlus } from "lucide-react";
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -72,9 +72,14 @@ export default function UserMenu() {
           to="/$lang/login"
           params={{ lang }}
           search={{ redirectTo: undefined }}
-          className={buttonVariants({ size: "touch", variant: "outline" })}
+          aria-label={t("userMenu.signIn")}
+          className={cn(
+            buttonVariants({ size: "touch", variant: "outline" }),
+            "w-11 px-0 sm:w-auto sm:px-3.5",
+          )}
         >
-          {t("userMenu.signIn")}
+          <LogIn className="size-4 sm:hidden" aria-hidden="true" />
+          <span className="hidden sm:inline">{t("userMenu.signIn")}</span>
         </Link>
       </div>
     );
