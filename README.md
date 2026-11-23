@@ -141,8 +141,15 @@ browser / API client / wsmp node
 ```
 
 Nodes connect to the same public hostname (`wss://wsmp.example.com/api/cli/ws`); they need no
-inbound ports either. A sample `~/.cloudflared/config.yml` for `cloudflared` on the host, in
-front of the shipped `compose.yaml`:
+inbound ports either. Create the named tunnel either way:
+
+- **Remotely managed:** create it in the Zero Trust dashboard, add the public hostname
+  `wsmp.example.com` → `http://127.0.0.1:3000` there, and run the connector with the tunnel
+  token. The token is a secret: keep it in your private env file, never in the checkout.
+- **Locally managed:** `cloudflared tunnel login`, `cloudflared tunnel create wsmp`,
+  `cloudflared tunnel route dns wsmp wsmp.example.com`, then a `config.yml`. A sample
+  `~/.cloudflared/config.yml` for `cloudflared` on the host, in front of the shipped
+  `compose.yaml`:
 
 ```yaml
 tunnel: <tunnel-uuid>
@@ -156,7 +163,13 @@ ingress:
 WebSockets need no extra setting. Keep the app reachable only through the tunnel: `compose.yaml`
 already publishes it on `127.0.0.1` only. When `cloudflared` runs in Docker instead, put it on
 the compose network, use `service: http://app:3000`, and remove the app's `ports:` mapping. Never
-publish the app on `0.0.0.0` or a LAN address.
+publish the app on `0.0.0.0` or a LAN address (Docker's published ports bypass host firewalls
+such as `ufw`), and forward no router ports. Keep `config.yml` and the credentials JSON outside
+the checkout (for example `/etc/cloudflared`, mounted read-only into the container). The official
+`cloudflare/cloudflared` image runs as UID 65532 and the credentials file is readable by its
+owner only, so hand both to that UID: `sudo chmod 400 /etc/cloudflared/<tunnel-uuid>.json`,
+`sudo chown -R 65532:65532 /etc/cloudflared`, `sudo chmod 700 /etc/cloudflared`; otherwise the
+tunnel never connects.
 
 Environment for the tunnel (in your private env file):
 
@@ -165,6 +178,11 @@ Environment for the tunnel (in your private env file):
 | `cloudflared` → app | `1` | Cloudflare writes the client address into `X-Forwarded-For`; the app's socket peer is `cloudflared`. |
 | `cloudflared` → Traefik / Caddy / nginx → app | `2` | That proxy must append `cloudflared`'s address to the `X-Forwarded-For` it received, not replace it: Traefik with `forwardedHeaders.trustedIPs` covering `cloudflared`'s address, Caddy with `trusted_proxies` covering it, nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` (and no `real_ip` module rewriting the client address). The count must equal the number of proxies that append; one too many lets a client choose its own rate-limit key. |
 
+- With a proxy between `cloudflared` and the app, give `cloudflared` a plain-HTTP route to it
+  that does not redirect to HTTPS (not an HTTPS entrypoint with `noTLSVerify`; the hop is local),
+  make the proxy trust only `cloudflared`'s address for forwarded headers, and keep the proxy's
+  own ports off the internet and the LAN: anyone who reaches it could send a forged
+  `X-Forwarded-For` through a hop the app trusts.
 - `BETTER_AUTH_URL=https://wsmp.example.com` (the tunnel hostname). Leave `CORS_ORIGIN` and
   `MEDIA_PUBLIC_BASE_URL` unset; they default to the same origin. The terminal, Test-page
   realtime and node-events origin checks accept exactly this origin. `PUBLIC_APP_URL` (only read
@@ -250,7 +268,7 @@ Required production values:
 - `BETTER_AUTH_SECRET`: 32+ byte random secret. API keys, agent tokens, node credentials, enrollment codes, share invites, signed media URLs and the Responses and cache-affinity routing digests derive purpose-specific HMAC keys from this value. Rotating it invalidates all of those: every node must log in again with a new enrollment code, and every API key and agent token must be recreated.
 - `BETTER_AUTH_URL`: public HTTPS app URL.
 - `NODE_ENV=production`.
-- `TRUST_PROXY_HOPS`: how many reverse proxies sit in front of the app. Use `1` behind one reverse proxy (Dokploy/Traefik, Caddy, nginx), `0` when clients connect directly, and more for chained proxies (`2` for Cloudflare in front of your proxy). The client IP used for rate limits is the `X-Forwarded-For` entry this many hops from the right. Too high lets clients forge their IP; too low puts every client in one rate-limit bucket. The server refuses to start in production without it.
+- `TRUST_PROXY_HOPS`: how many reverse proxies sit in front of the app. Use `1` behind one reverse proxy (Dokploy/Traefik, Caddy, nginx, or a Cloudflare Tunnel whose `cloudflared` talks to the app directly), `0` when clients connect directly, and more for chained proxies (`2` for Cloudflare or `cloudflared` in front of your proxy; see [Home server behind a Cloudflare Tunnel](#home-server-behind-a-cloudflare-tunnel)). The client IP used for rate limits is the `X-Forwarded-For` entry this many hops from the right. Too high lets clients forge their IP; too low puts every client in one rate-limit bucket. The server refuses to start in production without it.
   An appended port (`1.2.3.4:5678`, `[2001:db8::1]:5678`, as Azure Application Gateway adds by default) is stripped, so port appending can stay on.
 
 Optional values include SMTP settings (enables verification, password reset, and email 2FA delivery; see below), one rate-limit multiplier (`WMP_RATE_LIMIT_SCALE`, 0.1-100, scaling every built-in budget; the per-recipient email and failed-password caps are always on), and display/build values such as `VITE_APP_NAME`, `VITE_SERVER_URL`, and `BUILD_VERSION`. If `SIGNUP_ENABLED=false` on a fresh production database, set `ADMIN_EMAIL` to the sole operator address allowed to bootstrap its first admin. Case and surrounding whitespace are canonicalized before account creation. Prefer `pnpm generate:secrets` over hand-editing production env.
