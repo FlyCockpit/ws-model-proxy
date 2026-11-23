@@ -1,23 +1,34 @@
 #!/usr/bin/env node
 // Invoked only through test-adopt-released.sh's local-only URL guard.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { hardeningSqlBody } from "../../packages/db/scripts/hardening-sql.mjs";
 import { testContainerPrefix } from "../lib/test-container-prefix.mjs";
-import { diffCatalogs, readSchemaCatalog, UPGRADE_MIGRATION } from "./lib/baseline.mjs";
+import {
+  BASELINE_VARIANTS,
+  diffCatalogs,
+  readSchemaCatalog,
+  UPGRADE_MIGRATION,
+} from "./lib/baseline.mjs";
 import { withDatabase } from "./lib/local-db-name.mjs";
 import { pgConnectionString } from "./lib/migration-state.mjs";
-import { loadPg, ROOT } from "./lib/prisma.mjs";
+import { FIXTURES_DIR, loadPg, prisma, ROOT } from "./lib/prisma.mjs";
 import { adminClient, createDatabase, removeDatabase } from "./lib/scratch-db.mjs";
 
 const pg = loadPg();
 const serverUrl = process.env.DATABASE_URL;
 const suffix = randomBytes(8).toString("hex");
-const names = [`wmp_test_${suffix}`, `wmp_test_${suffix}f`];
+// Released 0.4.3, fresh, and one per BASELINE_VARIANTS build.
+const names = [
+  `wmp_test_${suffix}`,
+  `wmp_test_${suffix}f`,
+  ...BASELINE_VARIANTS.map((_, i) => `wmp_test_${suffix}v${i}`),
+];
 // The released image's container: `<prefix>-fx-release-<hex>`, the prefix from
 // `--container-prefix <name>`, else TEST_CONTAINER_PREFIX, else the shared
 // default `wmp` (scripts/lib/test-container-prefix.mjs).
@@ -85,6 +96,65 @@ async function catalog(url) {
     }
   });
 }
+/**
+ * The migration fixture rows a 0.4.x database can hold (fixtures/0_init.sql),
+ * loaded before the upgrade in one transaction, the way CI check 4 loads them.
+ */
+async function loadFixture(url) {
+  const sql = await readFile(path.join(FIXTURES_DIR, "0_init.sql"), "utf8");
+  await withClient(url, async (client) => {
+    await client.query("BEGIN");
+    await client.query(sql);
+    await client.query("COMMIT");
+  });
+}
+/** fixtures/0_init.check.sql after the upgrade: every statement must return no rows. */
+async function checkFixture(url, what) {
+  const sql = await readFile(path.join(FIXTURES_DIR, "0_init.check.sql"), "utf8");
+  const results = await withClient(url, (client) => client.query(sql));
+  const rows = (Array.isArray(results) ? results : [results]).flatMap((r) => r.rows ?? []);
+  assert.deepEqual(rows, [], `${what}: fixtures/0_init.check.sql found problems`);
+}
+/**
+ * The schema a variant build's own startup created (`prisma db push` of its
+ * schema, then its schema-hardening.sql), reproduced from its commit the way
+ * 0_init reproduces v0.4.3: Prisma's from-empty SQL, then the hardening body,
+ * in one transaction. Needs the commit in the clone (CI: fetch-depth 0).
+ */
+async function buildVariantSchema(url, ref) {
+  const git = (args) =>
+    execFileSync("git", args, { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  try {
+    git(["cat-file", "-e", `${ref}^{commit}`]);
+  } catch {
+    throw new Error(
+      `commit ${ref} is not in this clone: fetch the full history (git fetch --unshallow)`,
+    );
+  }
+  const schemaDir = path.join(temp, `schema-${ref.slice(0, 12)}`);
+  await mkdir(schemaDir);
+  for (const file of git(["ls-tree", "--name-only", ref, "packages/db/prisma/schema/"])
+    .split("\n")
+    .filter((name) => name.endsWith(".prisma")))
+    await writeFile(path.join(schemaDir, path.basename(file)), git(["show", `${ref}:${file}`]));
+  const ddl = await prisma(
+    ["migrate", "diff", "--from-empty", "--to-schema", schemaDir, "--script"],
+    {
+      capture: true,
+    },
+  );
+  if (ddl.code !== 0 || !ddl.stdout.includes("CREATE TABLE"))
+    throw new Error(`prisma migrate diff of ${ref}'s schema failed (exit ${ddl.code})`);
+  const hardening = hardeningSqlBody(
+    git(["show", `${ref}:packages/db/prisma/schema-hardening.sql`]),
+  );
+  await withClient(url, async (client) => {
+    await client.query("BEGIN");
+    await client.query(ddl.stdout);
+    await client.query(hardening);
+    await client.query("COMMIT");
+  });
+}
 try {
   // Also guard direct invocation of this .mjs entry point.
   await command("bash", ["scripts/assert-local-database.sh", "db:test-adopt-released"]);
@@ -93,7 +163,9 @@ try {
     assert.equal(await createDatabase(admin, name), true, "scratch database must be new");
     created.push(name);
   }
-  const [releasedUrl, freshUrl] = names.map((name) => withDatabase(serverUrl, name));
+  const [releasedUrl, freshUrl, ...variantUrls] = names.map((name) =>
+    withDatabase(serverUrl, name),
+  );
   const envFile = path.join(temp, "released.env");
   await writeFile(
     envFile,
@@ -139,6 +211,7 @@ try {
     await delay(1000);
   }
   await command("docker", ["stop", "--time", "10", container]);
+  await loadFixture(releasedUrl);
   // Managed providers commonly put extensions in public. Their objects must
   // not prevent adopting the application schema or comparing the upgrade.
   await withClient(releasedUrl, async (client) => {
@@ -162,9 +235,36 @@ try {
   });
   const [live, expected] = await Promise.all([catalog(releasedUrl), catalog(freshUrl)]);
   assert.deepEqual(diffCatalogs(expected, live), { missing: [], unexpected: [] });
+  await checkFixture(releasedUrl, "released v0.4.3");
   console.log(
-    `PASS: released v0.4.3 adopted, upgrade applied, catalog identical to fresh (${expected.length} rows; provider extensions ignored).`,
+    `PASS: released v0.4.3 with fixture rows adopted, upgrade applied, fixture checks clean, catalog identical to fresh (${expected.length} rows; provider extensions ignored).`,
   );
+  for (const [i, variant] of BASELINE_VARIANTS.entries()) {
+    await buildVariantSchema(variantUrls[i], variant.ref);
+    await loadFixture(variantUrls[i]);
+    const adopted = await command(
+      process.execPath,
+      ["scripts/db/migrate-runtime.mjs", "apply", "--role", "server"],
+      { ...runnerEnv, DATABASE_URL: variantUrls[i] },
+    );
+    assert.ok(
+      adopted.includes(`adopted a database of the ${variant.label}`),
+      `${variant.label} must be adopted as itself`,
+    );
+    assert.ok(
+      adopted.includes(`Applying migration \`${UPGRADE_MIGRATION}\``),
+      "upgrade must actually run",
+    );
+    assert.match(adopted, /database is up to date/);
+    assert.deepEqual(diffCatalogs(expected, await catalog(variantUrls[i])), {
+      missing: [],
+      unexpected: [],
+    });
+    await checkFixture(variantUrls[i], variant.label);
+    console.log(
+      `PASS: ${variant.label} (built from its commit) with fixture rows adopted, upgrade applied, fixture checks clean, catalog identical to fresh.`,
+    );
+  }
 } catch (error) {
   // Keep messages/assertions useful without printing generated URLs or secrets.
   console.error(

@@ -75,7 +75,7 @@ import { randomBytes } from "node:crypto";
  *
  * Never prints DATABASE_URL.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -84,6 +84,8 @@ import {
   BASELINE_GUIDE,
   BASELINE_MIGRATION,
   BASELINE_RELEASE,
+  BASELINE_VARIANTS,
+  BASELINES_DIR,
   compareBaseline,
   describeDifferences,
   upgradeAdmitted,
@@ -280,14 +282,27 @@ function refuseCommon(state) {
 }
 
 /**
- * no-history-nonempty under the runner lock: adopt a released 0.4.3 database
- * (lib/baseline.mjs). Only when its schema is exactly 0_init's is 0_init
- * recorded as applied; anything else is refused with the differences, and
- * nothing is changed.
+ * BASELINE_VARIANTS with their SQL, read from the baselines directory next to
+ * the migrations. A missing file only means that variant is never adopted.
+ */
+export function readBaselineVariants(migrationsDir) {
+  return BASELINE_VARIANTS.flatMap(({ label, file }) => {
+    const full = path.join(migrationsDir, "..", BASELINES_DIR, file);
+    return existsSync(full) ? [{ label, file, sql: readFileSync(full, "utf8") }] : [];
+  });
+}
+
+/**
+ * no-history-nonempty under the runner lock: adopt a released 0.4.3 database,
+ * or one of a 0.4.x build after it (BASELINE_VARIANTS; lib/baseline.mjs).
+ * Only when its schema is exactly 0_init's (or 0_init's plus a variant's) is
+ * 0_init recorded as applied; anything else is refused with the differences,
+ * and nothing is changed.
  */
 async function adoptBaseline(ctx, lock) {
   const init = readMigrationsFolder(ctx.migrationsDir).find((m) => m.name === BASELINE_MIGRATION);
   if (!init || !checkWrapper(init.sql).ok) refuseCommon({ state: "no-history-nonempty" });
+  const variants = readBaselineVariants(ctx.migrationsDir);
   log(
     `the database has tables but no migration history: comparing its schema with ${BASELINE_MIGRATION} (the ${BASELINE_RELEASE} schema)…`,
   );
@@ -306,12 +321,13 @@ async function adoptBaseline(ctx, lock) {
   }, BASELINE_COMPARE_TIMEOUT_MS);
   try {
     result = ctx.compareBaseline
-      ? await ctx.compareBaseline(client, init)
+      ? await ctx.compareBaseline(client, init, variants)
       : await compareBaseline(client, {
           schema: ctx.schema,
           body: unwrapBody(init.sql),
           scratchName: `_wmp_baseline_${randomBytes(8).toString("hex")}`,
           timeoutMs: BASELINE_COMPARE_TIMEOUT_MS,
+          variants,
         });
   } catch (error) {
     const why = timedOut
@@ -334,7 +350,11 @@ async function adoptBaseline(ctx, lock) {
       `the database's schema differs from ${BASELINE_MIGRATION} (${result.missing.length} missing, ${result.unexpected.length} unexpected; listed above), ` +
         "so it was not adopted and nothing was changed. If DATABASE_URL names another app's database, fix DATABASE_URL. " +
         `A ws-model-proxy database older than ${BASELINE_RELEASE}: start the ${BASELINE_RELEASE} image once with APPLY_SCHEMA=safe, then this image. ` +
-        `A ${BASELINE_RELEASE} database that was changed by hand: undo those changes (or restore a backup) and start again. See ${BASELINE_GUIDE}.`,
+        `A ${BASELINE_RELEASE} database that was changed by hand: undo those changes (or restore a backup) and start again. ` +
+        (variants.length
+          ? `It is not the schema of ${variants.map((v) => `the ${v.label}`).join(" or ")} either. `
+          : "") +
+        `See ${BASELINE_GUIDE}.`,
     );
   }
   lock.assertHeld(`recording ${BASELINE_MIGRATION} as applied`);
@@ -345,8 +365,11 @@ async function adoptBaseline(ctx, lock) {
     throw new Refusal(
       `prisma migrate resolve --applied ${BASELINE_MIGRATION} failed (exit ${resolved.code}). ${RUNBOOK}.`,
     );
+  const variant = result.variant && variants.find((v) => v.label === result.variant);
   log(
-    `adopted a ${BASELINE_RELEASE} database: its schema matches ${BASELINE_MIGRATION} exactly (${result.liveCount} objects), which is now recorded as applied.`,
+    variant
+      ? `adopted a database of the ${variant.label}: its schema matches ${BASELINE_MIGRATION} plus ${BASELINES_DIR}/${variant.file} exactly (${result.liveCount} objects); ${BASELINE_MIGRATION} is now recorded as applied.`
+      : `adopted a ${BASELINE_RELEASE} database: its schema matches ${BASELINE_MIGRATION} exactly (${result.liveCount} objects), which is now recorded as applied.`,
   );
 }
 
@@ -460,8 +483,8 @@ function refuseMismatch(state) {
       `applied migration file(s) changed after they were applied: ${state.checksumMismatch.join(", ")}. ` +
         "Applied migrations are immutable, and the database was never migrated for these edits, so this " +
         "image describes a schema the database does not have. Restore the original file contents (from the " +
-        "commit that first shipped them) and put any change in a NEW migration. CI check 3 (immutability) " +
-        `should have blocked this. ${RUNBOOK}.`,
+        "commit that first shipped them) and put any change in a NEW migration. A migration released or " +
+        `deployed is never edited (docs/schema-migrations.md rule 1). ${RUNBOOK}.`,
     );
   }
 }

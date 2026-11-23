@@ -79,6 +79,88 @@ describe("baseline", () => {
     assert.equal(seen.at(-1), "ROLLBACK");
     assert.ok(seen.includes('CREATE SCHEMA "_wmp_baseline_0123456789abcdef"'));
   });
+
+  // A fake session: the catalog of "public" is the live one; the scratch schema's
+  // grows with each body applied to it.
+  function fakeSession(live) {
+    const seen = [];
+    let scratch = [];
+    const client = {
+      escapeIdentifier: (name) => `"${name}"`,
+      query: async (sql, params) => {
+        seen.push(sql.split("\n")[0].trim());
+        if (sql === "BODY") scratch = ["relation a", "constraint a.old"];
+        if (sql === "VARIANT") scratch = ["relation a", "constraint a.new", "column a.extra"];
+        if (sql === "OTHER") scratch = [...scratch, "column a.other"];
+        if (params)
+          return { rows: (params[0] === "public" ? live : scratch).map((item) => ({ item })) };
+        return { rows: [] };
+      },
+    };
+    return { client, seen };
+  }
+  const options = (variants) => ({
+    schema: "public",
+    body: "BODY",
+    scratchName: "_wmp_baseline_0123456789abcdef",
+    variants,
+  });
+
+  test("compareBaseline: 0_init itself matches before any variant runs", async () => {
+    const { client, seen } = fakeSession(["relation a", "constraint a.old"]);
+    const result = await compareBaseline(
+      /** @type {never} */ (client),
+      options([{ label: "dev", sql: "VARIANT" }]),
+    );
+    assert.deepEqual(result, {
+      missing: [],
+      unexpected: [],
+      liveCount: 2,
+      equal: true,
+      variant: null,
+    });
+    assert.ok(!seen.includes("VARIANT"));
+    assert.equal(seen.at(-1), "ROLLBACK");
+  });
+
+  test("compareBaseline: a variant on top of 0_init matches and is named", async () => {
+    const live = ["relation a", "constraint a.new", "column a.extra"];
+    const { client, seen } = fakeSession(live);
+    const result = await compareBaseline(
+      /** @type {never} */ (client),
+      options([{ label: "dev", sql: "VARIANT" }]),
+    );
+    assert.deepEqual(result, {
+      missing: [],
+      unexpected: [],
+      liveCount: 3,
+      equal: true,
+      variant: "dev",
+    });
+    // The variant runs in the same scratch schema, after 0_init's body.
+    assert.ok(seen.indexOf("VARIANT") > seen.indexOf("BODY"));
+    assert.equal(seen.at(-1), "ROLLBACK");
+  });
+
+  test("compareBaseline: no match reports the differences from 0_init, not from a variant", async () => {
+    const { client, seen } = fakeSession(["relation a", "constraint a.hand-made"]);
+    const result = await compareBaseline(
+      /** @type {never} */ (client),
+      options([
+        { label: "dev", sql: "VARIANT" },
+        { label: "later", sql: "OTHER" },
+      ]),
+    );
+    assert.deepEqual(result, {
+      missing: ["constraint a.old"],
+      unexpected: ["constraint a.hand-made"],
+      liveCount: 2,
+      equal: false,
+      variant: null,
+    });
+    assert.ok(seen.includes("VARIANT") && seen.includes("OTHER"));
+    assert.equal(seen.at(-1), "ROLLBACK");
+  });
 });
 
 test("diffCatalogs tolerates live-only extensions but requires baseline extensions", () => {

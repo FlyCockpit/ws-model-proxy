@@ -15,7 +15,7 @@ The SQL is committed and reviewed like code. That is what lets one PR backfill d
 
 Three rules never bend:
 
-1. **A migration on the default branch is immutable.** Never edit, rename, or delete it. Fix mistakes with a new migration. CI check 3 enforces this.
+1. **A migration on the default branch is never edited.** Never edit, rename, or delete it. Fix mistakes with a new migration. The one exception is the release cut: it folds the migrations added since the last release, unchanged and in order, into that release's migration (1.0: `20261112000000_upgrade_to_1_0_0`). CI check 3 fails any change to a migration file a release tag (`vX.Y.Z`) holds; the deploy runner refuses an applied file that changed.
 2. **Every schema change ships with its migration in the same PR.** A schema edit without SQL fails CI check 1.
 3. **Agents never run `prisma migrate dev` or `prisma migrate reset`.** Use the wrappers below. They are guarded to touch only this checkout's own local database.
 
@@ -96,7 +96,7 @@ The runner reads the database's migration history and decides one of these state
 | `pending` | The image has migrations the database lacks. | Refuses if one is unsafe for the running release (an in-place drop / rename / type change, unannotated SQL it cannot read) or reuses a name an earlier deletion removes, except on a brand-new database and for the one-time 1.0 upgrade ([§ Upgrading a 0.4.x database](#upgrading-a-04x-database)). Otherwise runs the pre-migration backup hook only with `BACKUP_ENABLED=true`, then `prisma migrate deploy`. | Waits. |
 | `db-ahead` | The database has applied migrations this image does not contain (a rollback or stale deploy). | Starts only if every newer migration is rollback-safe and none of their deletions has run; otherwise refuses. | Same rule. |
 | `failed` | A migration is recorded as failed. | Tries [automatic recovery](#automatic-recovery); otherwise refuses. | Waits while a runner works on it; otherwise refuses. |
-| `no-history-nonempty` | Tables but no `_prisma_migrations`. | Adopts a released 0.4.3 schema, refuses anything else ([§ Upgrading a 0.4.x database](#upgrading-a-04x-database)). | Waits (the leader may be adopting it). |
+| `no-history-nonempty` | Tables but no `_prisma_migrations`. | Adopts a released 0.4.3 schema (or that of the 0.4.x build fa1c7aad), refuses anything else ([§ Upgrading a 0.4.x database](#upgrading-a-04x-database)). | Waits (the leader may be adopting it). |
 | `unreachable` | Cannot connect. | Refuses (the platform retries). | Keeps waiting until timeout. |
 
 Followers poll for at most 300 s (`WAIT_TIMEOUT_MS`), never run scheduled deletions, and refuse on timeout, `db-ahead`, or a `failed` migration nobody is working on.
@@ -127,7 +127,7 @@ packages/db/prisma/migrations/<timestamp>_<name>/
   contract.sql    # optional; applied by the deploy runner later (contract)
 ```
 
-Prisma reads only `migration.sql`. CI check 3 hashes every file in a merged folder, so a `contract.sql` is immutable once merged. `pnpm db:migrate` splits a removal: `migration.sql` relaxes a dropped column (`-- wmp:relax`) and drops foreign keys that would block the old release's writes; `contract.sql` holds the `DROP`. It refuses a primary-key change, table / enum / enum value renames (use `@@map` / `@map`), and an enum value removal without `--remap`. **A deleted name is never reused.**
+Prisma reads only `migration.sql`. CI check 3 hashes every file in a released folder, and the deploy runner every file it applied, so a `contract.sql` is never edited once merged. `pnpm db:migrate` splits a removal: `migration.sql` relaxes a dropped column (`-- wmp:relax`) and drops foreign keys that would block the old release's writes; `contract.sql` holds the `DROP`. It refuses a primary-key change, table / enum / enum value renames (use `@@map` / `@map`), and an enum value removal without `--remap`. **A deleted name is never reused.**
 
 **When a deletion runs.** The runner (`apply`) runs due contracts after the database is up to date, in folder order. A `contract.sql` is due when a release containing its folder **first became ready** at least 7 days ago, no release lacking it was seen alive in the last 7 days, no hold is active ([§ Holding deletions by hand](#holding-deletions-by-hand)), and it passes validation against the live database. On a brand-new database every contract runs right after the deploy. At the moment of deletion the runner logs `[migrate] DATA DELETED: <what> (…; backup: <label|none configured>)` and records it in `_wmp_migration`; that log line is the only notice (there is no email). Every start logs one `[migrate] scheduled deletion` line per pending deletion.
 
@@ -156,15 +156,16 @@ The hardening takes every table it touches in one up-front `LOCK TABLE … NOWAI
 1.0 ships two migrations that replace `db push` + hardening:
 
 - **`0_init`** — exactly the released **v0.4.3** schema: Prisma's from-empty SQL for the v0.4.3 `packages/db/prisma/schema`, then the v0.4.3 `schema-hardening.sql`. A 0.4.3 database already holds this.
-- **`20261112000000_upgrade_to_1_0_0`** — Prisma's diff from v0.4.3 to the 1.0 schema, the 1.0 hardening with its one-time backfills (`runGeneration` 0 rows, retired completion capability keys, sidecars whose owner lost `canUse` on the target), and `DROP FUNCTION IF EXISTS wmp_schema_hardening_state();` (the 0.4.x hardening version gate).
+- **`20261112000000_upgrade_to_1_0_0`** — Prisma's diff from v0.4.3 to the 1.0 schema, the 1.0 hardening with its one-time backfills (`runGeneration` 0 rows, retired completion capability keys, sidecars whose owner lost `canUse` on the target), `DROP FUNCTION IF EXISTS wmp_schema_hardening_state();` (the 0.4.x hardening version gate), then the per-PR migrations folded into it at the release cut, unchanged and in order (the usage ledger's `additionalInputTokens` / `additionalOutputTokens`).
 
 A new database runs both in order. A 0.4.3 database has tables but no `_prisma_migrations`, so the runner adopts it (`adoptBaseline` in `scripts/db/migrate-runtime.mjs`, `scripts/db/lib/baseline.mjs`), under its advisory lock:
 
 1. It applies `0_init`'s body inside a transaction that is **always rolled back**, in a temporary schema `_wmp_baseline_<hex>` of the same database, and compares that catalog with the live one: tables, columns (type, nullability, default, identity, generated, collation), constraints including CHECK, indexes, triggers, functions and procedures, enums, sequences, policies, extensions. It ignores column order, ownership, privileges, the `wmp_schema_hardening_state()` gate, `_prisma_migrations` and `_wmp_*`. Comparing on the same server means no catalog text is committed and the PostgreSQL version cannot cause a false difference. Bound: 30 s (`BASELINE_COMPARE_TIMEOUT_MS`). The database role needs the CREATE privilege on the database for the temporary schema.
 2. **Equal** → `prisma migrate resolve --applied 0_init` (logged `adopted a v0.4.3 database: …`). The upgrade migration then runs like any pending migration, after the optional pre-migration backup (`BACKUP_ENABLED=true`). It changes the released hardening in place, so the runner admits it only while the applied history is exactly `[0_init]` (or empty); CI check 5 reports the two one-time migrations instead of failing them.
-3. **Different** → `NOT ADOPTED`, up to 25 differences printed per side, and a refusal. Nothing is changed.
+3. **Different** → it applies each file of `BASELINE_VARIANTS` (`packages/db/prisma/baselines/`) on top, in the same scratch schema, and compares again. These are the 0.4.x builds deployed from the default branch after v0.4.3, before migrations existed: `v0.4.3-fa1c7aad.sql` (build `fa1c7aad`) adds nine nullable columns and changes five hardening objects, copied verbatim and frozen. **Equal** → adopted the same way at `0_init` (logged `adopted a database of the 0.4.x build fa1c7aad …`); the upgrade migration adds those columns `IF NOT EXISTS`, keeping their values, and re-creates the hardening, so the result is the same 1.0 schema.
+4. **Still different** → `NOT ADOPTED`, up to 25 differences from `0_init` printed per side, and a refusal. Nothing is changed.
 
-A fresh 1.0 database, an adopted 0.4.3 database, and a database built by the former 1.0 `db push` + hardening path end with identical catalogs.
+A fresh 1.0 database, an adopted 0.4.3 database, an adopted fa1c7aad database, and a database built by the former 1.0 `db push` + hardening path end with identical catalogs (`pnpm db:test-adopt-released` checks the first three; it builds the fa1c7aad schema from that commit, so it needs the full history).
 
 **Operator steps.** Take a backup first. Stop the 0.4.x server if you can (it cannot serve 1.0 nodes anyway); the upgrade's LOCK retries if it cannot. Replace `APPLY_SCHEMA` with nothing (the server migrates by default) or `MIGRATE_ON_START=true`, then start 1.0.
 
@@ -175,7 +176,7 @@ A fresh 1.0 database, an adopted 0.4.3 database, and a database built by the for
 - A 0.4.3 database whose schema was **changed by hand** (the listed differences) → undo exactly those changes, or restore the pre-upgrade backup, and start again.
 - `could not compare the database with 0_init` → usually a missing CREATE privilege on the database; grant it to the app role for the upgrade.
 
-**Regenerating (before 1.0.0 ships only).** `node scripts/db/generate-initial-migrations.mjs` rewrites both files from the `v0.4.3` git tag (`git fetch --tags`) and the current schema and `schema-hardening.sql`; `--check` exits 1 when they are stale. Once 1.0.0 is released both folders are immutable like every migration.
+**Regenerating (before 1.0.0 ships only).** `node scripts/db/generate-initial-migrations.mjs` rewrites `0_init` from the `v0.4.3` git tag (`git fetch --tags`) and the upgrade migration's `-- section hardening` from `schema-hardening.sql`; `--check` exits 1 when either is stale. The rest of the upgrade migration is no longer generated (a fresh diff would lose the folded migrations and the `IF NOT EXISTS` adds). Once 1.0.0 is released both folders are immutable like every released migration.
 
 ## A database with tables but no migration history
 

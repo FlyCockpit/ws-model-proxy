@@ -9,8 +9,9 @@
 --
 -- These rows are what a 0.4.3 database can hold and the 1.0 upgrade
 -- (20261112000000_upgrade_to_1_0_0) must carry over: runtime instances from before runs existed
--- (runGeneration 0), retired completion capability keys, and a sidecar whose target pool its
--- owner can no longer use. Synthetic data only: no real people, no real secrets.
+-- (runGeneration 0), retired completion capability keys, a sidecar whose target pool its owner
+-- can no longer use, and usage ledger revisions from before the additional tokens were split by
+-- side. Synthetic data only: no real people, no real secrets.
 
 -- Fixture writer: the deploy/fixture marker satisfies every graph-write fence (as the
 -- hardening and its tests do); transaction-local.
@@ -133,3 +134,24 @@ INSERT INTO verification (id, identifier, value, "expiresAt") VALUES
   ('fx-oauth-code', 'fixture-code-digest', '{"type":"authorization_code","query":{"client_id":"fx-oauth-client","scope":"offline_access mcp:write mcp:files offline_access profile profile","redirect_uri":"https://client.example.test/callback","state":"unchanged"},"sessionId":"fixture-session","userId":"fx-owner-b","referenceId":"fx-ref-full","resource":["https://proxy.example.test/mcp"]}', '2026-01-01'),
   ('fx-verification-plain', 'fixture-otp', 'not JSON', '2026-01-01'),
   ('fx-verification-json', 'fixture-other', '{"scope":"profile","marker":"keep"}', '2026-01-01');
+
+-- Usage ledger revisions as 0.4.3 wrote them, before 1.0 split the additional tokens by side
+-- (additionalInputTokens / additionalOutputTokens): one mixed `additionalBillableTokens` total with
+-- the provider's raw usage beside it, and one without additional tokens. The ledger is append-only,
+-- so the upgrade leaves the sides NULL on these rows; readers attribute the total from `rawUsage`.
+INSERT INTO usage_ledger (id, "userId", "providerAccountId", "providerModelId", "requestId",
+  "attemptId", "fencingToken", "inputTokens", "outputTokens", "cacheReadTokens",
+  "reasoningTokens", "additionalBillableTokens", "reportedTotalTokens", "billableTotal",
+  "categoriesComplete", "observationComplete", "rawUsage", "settledCost", currency,
+  "pricingVersion", "accountingVersion", "payloadHash", "usageKnown", "costKnown",
+  "terminalReason", confidence) VALUES
+  ('fx-ledger-audio', 'fx-owner-a', 'fx-account', 'fx-model', 'fx-request-1', 'fx-attempt-1', 1,
+   75, 31, 20, 10, 14, 150, 150, true, true,
+   '{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":20,"audio_tokens":5},"completion_tokens_details":{"reasoning_tokens":10,"audio_tokens":3,"accepted_prediction_tokens":4,"rejected_prediction_tokens":2}}'::jsonb,
+   0.000123456, 'USD', 'v1', 'provider-billable-v1', repeat('a', 64), true, true,
+   'COMPLETED', 'REPORTED'),
+  ('fx-ledger-plain', 'fx-owner-a', 'fx-account', 'fx-model', 'fx-request-2', 'fx-attempt-2', 1,
+   12, 7, NULL, NULL, NULL, 19, 19, true, true,
+   '{"prompt_tokens":12,"completion_tokens":7,"total_tokens":19}'::jsonb,
+   0.000001, 'USD', 'v1', 'provider-billable-v1', repeat('b', 64), true, true,
+   'COMPLETED', 'REPORTED');

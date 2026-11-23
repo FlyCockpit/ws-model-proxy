@@ -5,9 +5,9 @@ import {
   hardeningBody,
   initSql,
   readSection,
+  replaceSection,
   section,
   upgradeHardening,
-  upgradeSql,
 } from "./generate-initial-migrations.mjs";
 import { checkWrapper, unwrapBody } from "./lib/sql.mjs";
 
@@ -22,6 +22,15 @@ describe("generate-initial-migrations", () => {
     );
     // PL/pgSQL BEGIN has no semicolon and stays.
     assert.match(hardeningBody("BEGIN;\nDO $x$ BEGIN\nNULL;\nEND $x$;\nCOMMIT;"), /DO \$x\$ BEGIN/);
+  });
+
+  test("replaceSection swaps one section's body and keeps everything around it", () => {
+    const text = `head\n${section("prisma", "A;")}\n${section("hardening", "OLD;")}\ntail;\n`;
+    assert.equal(
+      replaceSection(text, "hardening", "  NEW;\n"),
+      `head\n${section("prisma", "A;")}\n${section("hardening", "NEW;")}\ntail;\n`,
+    );
+    assert.throws(() => replaceSection(text, "data", "X;"), /missing or ambiguous/);
   });
 
   test("sections round-trip", () => {
@@ -51,17 +60,9 @@ describe("generate-initial-migrations", () => {
     );
   });
 
-  test("both files carry an intact transactional wrapper", () => {
-    for (const sql of [
-      initSql("CREATE TABLE a (id int);", "SELECT 1;"),
-      upgradeSql("", "SELECT 2;"),
-    ]) {
-      assert.equal(checkWrapper(sql).ok, true, checkWrapper(sql).reason);
-      assert.ok(unwrapBody(sql).includes("-- section"));
-    }
-    assert.match(
-      upgradeSql("", "SELECT 2;"),
-      /DROP FUNCTION IF EXISTS wmp_schema_hardening_state\(\);/,
-    );
+  test("0_init carries an intact transactional wrapper", () => {
+    const sql = initSql("CREATE TABLE a (id int);", "SELECT 1;");
+    assert.equal(checkWrapper(sql).ok, true, checkWrapper(sql).reason);
+    assert.ok(unwrapBody(sql).includes("-- section"));
   });
 });

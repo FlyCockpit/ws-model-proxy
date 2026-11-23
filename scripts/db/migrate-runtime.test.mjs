@@ -7,10 +7,10 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, beforeEach, describe, test } from "node:test";
-import { UPGRADE_MIGRATION } from "./lib/baseline.mjs";
+import { BASELINE_VARIANTS, UPGRADE_MIGRATION } from "./lib/baseline.mjs";
 import { MIGRATION_RUNNER_LOCK_KEY, PRISMA_ADVISORY_LOCK } from "./lib/migration-state.mjs";
 import { RETIRED_MAINTENANCE_MARKER, wrapTransactional } from "./lib/sql.mjs";
-import { HOLD_MAX_DAYS, run, runHold } from "./migrate-runtime.mjs";
+import { HOLD_MAX_DAYS, readBaselineVariants, run, runHold } from "./migrate-runtime.mjs";
 
 const URL = "postgresql://u:p@127.0.0.1:5432/app";
 const dir = mkdtempSync(path.join(tmpdir(), "migrate-runtime-test-"));
@@ -964,6 +964,73 @@ describe("a database with tables but no migration history (0.4.3 adoption)", () 
     assert.match(r.out, /1 missing, 1 unexpected/);
     assert.match(r.out, /docs\/schema-migrations\.md § Upgrading a 0\.4\.x database/);
     assert.equal(db.history, false);
+  });
+
+  // A migrations directory with the baselines directory beside it, as in the image.
+  const vroot = mkdtempSync(path.join(tmpdir(), "migrate-runtime-variant-"));
+  after(() => rmSync(vroot, { recursive: true, force: true }));
+  const vdir = path.join(vroot, "migrations");
+  for (const name of ["0_init", NEXT]) {
+    mkdirSync(path.join(vdir, name), { recursive: true });
+    writeFileSync(
+      path.join(vdir, name, "migration.sql"),
+      readFileSync(path.join(dir, name, "migration.sql")),
+    );
+  }
+  const [fa1c] = BASELINE_VARIANTS;
+  mkdirSync(path.join(vroot, "baselines"));
+  writeFileSync(path.join(vroot, "baselines", fa1c.file), "SELECT 'variant';\n");
+
+  test("readBaselineVariants reads each variant file beside the migrations; a missing one is skipped", () => {
+    assert.deepEqual(readBaselineVariants(vdir), [
+      { label: fa1c.label, file: fa1c.file, sql: "SELECT 'variant';\n" },
+    ]);
+    assert.deepEqual(readBaselineVariants(path.join(vroot, "nowhere", "migrations")), []);
+  });
+
+  test("adopts a database of a 0.4.x build variant at 0_init and names it, then migrates", async () => {
+    const db = legacy();
+    const r = await runtime(db, {
+      migrationsDir: vdir,
+      compareBaseline: async (_client, init, variants) => {
+        assert.equal(init.name, "0_init");
+        assert.deepEqual(
+          variants.map((v) => [v.label, v.sql]),
+          [[fa1c.label, "SELECT 'variant';\n"]],
+        );
+        return { equal: true, missing: [], unexpected: [], liveCount: 4, variant: fa1c.label };
+      },
+      deploy: (d) => {
+        d.rows.push(applied(NEXT));
+        return 0;
+      },
+    });
+    assert.equal(r.code, 0, r.out);
+    assert.deepEqual(r.calls, ["migrate resolve --applied 0_init", "migrate deploy"]);
+    assert.ok(
+      r.out.includes(
+        `adopted a database of the ${fa1c.label}: its schema matches 0_init plus baselines/${fa1c.file} exactly (4 objects); 0_init is now recorded as applied.`,
+      ),
+      r.out,
+    );
+    assert.doesNotMatch(r.out, /adopted a v0\.4\.3 database/);
+  });
+
+  test("a refusal also says the schema is not a variant's", async () => {
+    const db = legacy();
+    const r = await runtime(db, {
+      migrationsDir: vdir,
+      compareBaseline: async () => ({
+        equal: false,
+        missing: ["column node.extra text"],
+        unexpected: [],
+        liveCount: 3,
+        variant: null,
+      }),
+    });
+    assert.equal(r.code, 1, r.out);
+    assert.deepEqual(r.calls, []);
+    assert.ok(r.out.includes(`It is not the schema of the ${fa1c.label} either.`), r.out);
   });
 
   test("a comparison that cannot run is refused without changing anything", async () => {

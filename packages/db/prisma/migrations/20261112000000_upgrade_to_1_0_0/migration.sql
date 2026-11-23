@@ -12,22 +12,24 @@ DO $wmp$ BEGIN PERFORM set_config('wmp.history', coalesce(to_regclass('_prisma_m
 -- nothing on a new database.
 
 -- section prisma
+-- IF NOT EXISTS: a database of the 0.4.x build fa1c7aad already has these columns
+-- (packages/db/prisma/baselines/v0.4.3-fa1c7aad.sql; adopted at 0_init, scripts/db/lib/baseline.mjs).
 -- AlterTable
-ALTER TABLE "user" ADD COLUMN     "terminalNodeOrder" TEXT[] DEFAULT ARRAY[]::TEXT[],
-ADD COLUMN     "terminalTabOrder" TEXT[] DEFAULT ARRAY[]::TEXT[];
+ALTER TABLE "user" ADD COLUMN IF NOT EXISTS "terminalNodeOrder" TEXT[] DEFAULT ARRAY[]::TEXT[],
+ADD COLUMN IF NOT EXISTS "terminalTabOrder" TEXT[] DEFAULT ARRAY[]::TEXT[];
 
 -- AlterTable
-ALTER TABLE "node_command" ADD COLUMN     "ranMode" TEXT,
-ADD COLUMN     "ranShell" TEXT;
+ALTER TABLE "node_command" ADD COLUMN IF NOT EXISTS "ranMode" TEXT,
+ADD COLUMN IF NOT EXISTS "ranShell" TEXT;
 
 -- AlterTable
-ALTER TABLE "node_agent_update" ADD COLUMN     "artifactSha256" TEXT,
-ADD COLUMN     "availableGeneration" INTEGER,
-ADD COLUMN     "availableVersion" TEXT;
+ALTER TABLE "node_agent_update" ADD COLUMN IF NOT EXISTS "artifactSha256" TEXT,
+ADD COLUMN IF NOT EXISTS "availableGeneration" INTEGER,
+ADD COLUMN IF NOT EXISTS "availableVersion" TEXT;
 
 -- AlterTable
-ALTER TABLE "runtime_model" ADD COLUMN     "declaredReasoning" BOOLEAN,
-ADD COLUMN     "declaredTools" BOOLEAN;
+ALTER TABLE "runtime_model" ADD COLUMN IF NOT EXISTS "declaredReasoning" BOOLEAN,
+ADD COLUMN IF NOT EXISTS "declaredTools" BOOLEAN;
 
 -- AlterTable
 ALTER TABLE "runtime_instance" ALTER COLUMN "runGeneration" SET DEFAULT 1;
@@ -2978,6 +2980,14 @@ WHERE CASE WHEN pg_input_is_valid(value, 'jsonb') THEN
 
 -- The 0.4.x hardening wrapper's version gate; migrations replace it.
 DROP FUNCTION IF EXISTS wmp_schema_hardening_state();
+
+-- The usage ledger's additional tokens by side (the per-PR migration split_additional_tokens,
+-- folded into this release migration unchanged). Nullable, no backfill: the ledger is
+-- append-only, and readers attribute an older revision's total from its rawUsage.
+-- AlterTable
+ALTER TABLE "usage_ledger" ADD COLUMN     "additionalInputTokens" BIGINT;
+
+ALTER TABLE "usage_ledger" ADD COLUMN     "additionalOutputTokens" BIGINT;
 
 -- wmp:commit-marker (lets the runner prove this transaction committed; keep it last)
 DO $wmp$ DECLARE history text := current_setting('wmp.history', true); BEGIN IF history <> '' THEN EXECUTE format('UPDATE %s SET "logs" = %L WHERE "id" = (SELECT "id" FROM %s WHERE "finished_at" IS NULL AND "rolled_back_at" IS NULL ORDER BY "started_at" DESC LIMIT 1)', history::oid::regclass, 'wmp:committed', history::oid::regclass); END IF; END $wmp$;

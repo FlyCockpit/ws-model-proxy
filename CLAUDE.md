@@ -92,7 +92,8 @@ every node together when the protocol changes.
   `packages/db/prisma/migrations/` ([docs/schema-migrations.md](docs/schema-migrations.md)).
 - Schema changes: edit the schema, `pnpm db:migrate <name>` (generates SQL only), review and
   edit the SQL, `pnpm db:migrate:apply`, commit schema and migration folder together. A
-  migration on the default branch is immutable; fix mistakes with a new one.
+  migration on the default branch is never edited; fix mistakes with a new one. Only the release
+  cut folds the unreleased ones into the release migration; a released one never changes.
 - Local databases are per checkout (`pnpm db:worktree`); `pnpm db:reset:local` recreates only
   this checkout's own database, and only one carrying the disposable-local mark (`pnpm db:worktree`
   and the dev compose volume set it; `EXPECTED_DB` never widens a reset). Agents never run

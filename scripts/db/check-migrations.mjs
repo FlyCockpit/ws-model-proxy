@@ -23,8 +23,11 @@ import { spawnSync } from "node:child_process";
  *                    (`wmp:label-kept`, classifyEnumRebuild).
  *   2. Ordering      every migration folder added vs <base> sorts after <base>'s
  *                    latest, and no two folders share a timestamp
- *   3. Immutability  no migration folder on <base> is modified, renamed, or
- *                    deleted, and no file (e.g. contract.sql) is added to one
+ *   3. Immutability  no migration file in a release tag (vX.Y.Z) is modified,
+ *                    renamed, or deleted, and no file (e.g. contract.sql) is
+ *                    added to a released folder. Unreleased folders on <base>
+ *                    may change only at the release cut, which squashes them
+ *                    into the release migration (docs/schema-migrations.md)
  *   4. Applies with data
  *                    base migrations + fixtures (packages/db/prisma/fixtures/<m>.sql
  *                    loaded right after <m>), base contracts, then the new
@@ -140,29 +143,54 @@ export function checkOrdering(baseFolders, headFolders) {
   return { added, details };
 }
 
-/** @param {Array<{ path: string, sha: string }>} baseFiles @param {(rel: string) => Buffer | null} readHead */
-export function checkImmutability(baseFiles, headFilesByFolder, readHead) {
-  const details = [];
-  const baseFolders = new Set();
-  const basePaths = new Set(baseFiles.map((f) => f.path));
-  for (const file of baseFiles) {
+/** A release tag: `vX.Y.Z`, optionally with a prerelease suffix (`v1.0.0-rc.1`). */
+export const RELEASE_TAG_RE = /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
+/** The release tags among `tags`, sorted. */
+export function releaseTags(tags) {
+  return tags.filter((tag) => RELEASE_TAG_RE.test(tag)).sort();
+}
+
+/**
+ * Every migration file some release shipped, with the release it came from.
+ * @param {string[]} tags release tags
+ * @param {(ref: string) => Array<{ path: string, sha: string }>} filesAt
+ * @returns {Array<{ path: string, sha: string, ref: string }>}
+ */
+export function releasedMigrationFiles(tags, filesAt) {
+  return tags.flatMap((ref) => filesAt(ref).map((file) => ({ ...file, ref })));
+}
+
+/**
+ * Check 3. `releasedFiles`: the migration files of every release tag
+ * (`releasedMigrationFiles`), so only what a release shipped is immutable; a
+ * folder that is only on the base branch may change at the release cut.
+ * @param {Array<{ path: string, sha: string, ref?: string }>} releasedFiles
+ * @param {(folder: string) => string[]} headFilesByFolder
+ * @param {(rel: string) => Buffer | null} readHead
+ */
+export function checkImmutability(releasedFiles, headFilesByFolder, readHead) {
+  const details = new Set();
+  const releasedFolders = new Set();
+  const releasedPaths = new Set(releasedFiles.map((f) => f.path));
+  for (const file of releasedFiles) {
     const folder = file.path.split("/")[0];
-    if (file.path.includes("/")) baseFolders.add(folder);
+    if (file.path.includes("/")) releasedFolders.add(folder);
+    const where = file.ref ? `release ${file.ref}` : "a release";
     const bytes = readHead(file.path);
-    if (bytes === null)
-      details.push(`\`${file.path}\` exists on the base branch but was deleted or renamed.`);
+    if (bytes === null) details.add(`\`${file.path}\` is in ${where} but was deleted or renamed.`);
     else if (gitBlobSha(bytes) !== file.sha)
-      details.push(
-        `\`${file.path}\` was modified. Applied migrations are immutable: write a new migration instead.`,
+      details.add(
+        `\`${file.path}\` was modified; it is in ${where}. Released migrations are immutable: write a new migration instead.`,
       );
   }
-  for (const folder of baseFolders) {
+  for (const folder of releasedFolders) {
     for (const rel of headFilesByFolder(folder)) {
-      if (!basePaths.has(rel))
-        details.push(`\`${rel}\` was added inside an existing migration folder.`);
+      if (!releasedPaths.has(rel))
+        details.add(`\`${rel}\` was added inside a released migration folder.`);
     }
   }
-  return details;
+  return [...details];
 }
 
 function baseMigrationFiles(ref) {
@@ -581,10 +609,21 @@ async function main() {
 
   // --- static analysis (checks 2, 3, 5 + report) -------------------------
   add("2", "Ordering", ordering.details);
-  const immutability = checkImmutability(baseMigrationFiles(baseRef), listFolderFiles, (rel) => {
-    const file = path.join(MIGRATIONS_DIR, rel);
-    return existsSync(file) ? readFileSync(file) : null;
-  });
+  // Release tags come with a full clone (CI: fetch-depth 0); none at all means
+  // they were not fetched, and nothing could be checked.
+  const tags = releaseTags(git(["tag", "--list", "v*"]).split("\n").filter(Boolean));
+  const immutability = tags.length
+    ? checkImmutability(
+        releasedMigrationFiles(tags, baseMigrationFiles),
+        listFolderFiles,
+        (rel) => {
+          const file = path.join(MIGRATIONS_DIR, rel);
+          return existsSync(file) ? readFileSync(file) : null;
+        },
+      )
+    : [
+        "No release tag (`vX.Y.Z`) found, so released migrations cannot be checked: run `git fetch --tags`.",
+      ];
   add("3", "Immutability", immutability);
 
   const previous = head.filter((m) => !addedSet.has(m.name));

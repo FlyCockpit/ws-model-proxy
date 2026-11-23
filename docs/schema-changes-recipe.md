@@ -132,7 +132,7 @@ The PR job `migrations` runs `pnpm db:check-migrations --base origin/<base>` aga
 
 1. **Consistency** — the schema must match the database reached two ways: all migrations then all `contract.sql` files, and the base branch's then this PR's.
 2. **Ordering** — every migration the PR adds sorts after the base branch's latest, with a unique timestamp. Fix with `pnpm db:migrate:rebase`.
-3. **Immutability** — no file in a migration folder already on the base branch was modified, renamed, deleted or added.
+3. **Immutability** — no file in a migration folder a release tag (`vX.Y.Z`) holds was modified, renamed, deleted or added. Needs the tags (`git fetch --tags`). Unreleased folders on the base branch change only at the release cut ([schema-migrations.md](schema-migrations.md) rule 1).
 4. **Applies with data** — base migrations with their fixtures, then the PR's; rows survive and every `fixtures/*.check.sql` returns no rows.
 5. **Safe for the running release** — fails an in-place drop, rename or type change in `migration.sql`, SQL the analyzer cannot read without `-- wmp:reviewed <reason>`, an unknown template version, a broken wrapper, a reused deleted name, or a drop + add without `-- intentional: drop and recreate`. The two one-time migrations (`0_init` and `20261112000000_upgrade_to_1_0_0`, which carry the hardening) are reported instead ("One-time migration …"), since they run only on a new database or right after a 0.4.3 database is adopted.
 

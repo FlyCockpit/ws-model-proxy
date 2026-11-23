@@ -6,6 +6,8 @@ import {
   checkImmutability,
   checkOrdering,
   compareSnapshots,
+  releasedMigrationFiles,
+  releaseTags,
   render,
 } from "./check-migrations.mjs";
 import {
@@ -67,14 +69,14 @@ describe("checkImmutability", () => {
         () => [],
         () => null,
       )[0],
-      /deleted or renamed/,
+      /is in a release but was deleted or renamed/,
     );
     const extra = checkImmutability(
       baseFiles,
       () => ["0_init/migration.sql", "0_init/notes.md"],
       () => Buffer.from("CREATE TABLE a ();\n"),
     );
-    assert.match(extra[0], /added inside/);
+    assert.match(extra[0], /added inside a released migration folder/);
   });
 });
 
@@ -174,8 +176,67 @@ describe("checkImmutability: contract.sql", () => {
     );
     assert.match(
       details.join("\n"),
-      /`0_init\/contract\.sql` was added inside an existing migration folder/,
+      /`0_init\/contract\.sql` was added inside a released migration folder/,
     );
+  });
+});
+
+describe("checkImmutability: the release-tag rule", () => {
+  const sha = blob("CREATE TABLE a ();\n");
+  const filesAt = (ref) =>
+    ref === "v1.0.0"
+      ? [{ path: "0_init/migration.sql", sha }]
+      : ref === "v1.1.0"
+        ? [
+            { path: "0_init/migration.sql", sha },
+            { path: "20270101000000_release_1_1_0/migration.sql", sha: blob("SELECT 1;\n") },
+          ]
+        : [];
+
+  test("only vX.Y.Z tags (and prereleases) are releases", () => {
+    assert.deepEqual(releaseTags(["v1.1.0", "v1.0.0", "v1.0.0-rc.1", "vnext", "v1.0", "nightly"]), [
+      "v1.0.0",
+      "v1.0.0-rc.1",
+      "v1.1.0",
+    ]);
+  });
+
+  test("a folder that no release shipped may change or go (the release squash)", () => {
+    // Base branch: 0_init (released in v1.0.0) plus an unreleased per-PR folder,
+    // now folded into another migration and deleted. Nothing released changed.
+    const released = releasedMigrationFiles(["v1.0.0"], filesAt);
+    const head = { "0_init/migration.sql": Buffer.from("CREATE TABLE a ();\n") };
+    assert.deepEqual(
+      checkImmutability(
+        released,
+        (folder) => Object.keys(head).filter((rel) => rel.startsWith(`${folder}/`)),
+        (rel) => head[rel] ?? null,
+      ),
+      [],
+    );
+  });
+
+  test("a file any release shipped may not change, and the release is named once", () => {
+    const released = releasedMigrationFiles(["v1.0.0", "v1.1.0"], filesAt);
+    assert.equal(released.length, 3);
+    const edited = checkImmutability(
+      released,
+      () => [],
+      (rel) =>
+        rel === "0_init/migration.sql" ? Buffer.from("changed") : Buffer.from("SELECT 1;\n"),
+    );
+    assert.deepEqual(edited, [
+      "`0_init/migration.sql` was modified; it is in release v1.0.0. Released migrations are immutable: write a new migration instead.",
+      "`0_init/migration.sql` was modified; it is in release v1.1.0. Released migrations are immutable: write a new migration instead.",
+    ]);
+    const gone = checkImmutability(
+      released,
+      () => [],
+      (rel) => (rel === "0_init/migration.sql" ? Buffer.from("CREATE TABLE a ();\n") : null),
+    );
+    assert.deepEqual(gone, [
+      "`20270101000000_release_1_1_0/migration.sql` is in release v1.1.0 but was deleted or renamed.",
+    ]);
   });
 });
 

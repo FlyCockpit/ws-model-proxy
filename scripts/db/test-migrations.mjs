@@ -233,6 +233,8 @@ function makeRepo() {
   g("init", "-q", "-b", "main");
   g("add", "-A");
   g("commit", "-q", "-m", "base");
+  // The base migration is released: check 3 protects what a release tag holds.
+  g("tag", "v0.0.1");
   return { repo, git: g };
 }
 
@@ -521,6 +523,28 @@ async function main() {
 
     git("add", "-A");
     git("commit", "-q", "-m", "rename");
+
+    await step(
+      "check 3 follows release tags: an unreleased base migration may change, a released one may not",
+      async () => {
+        const file = path.join(migrations, renameFolder, "migration.sql");
+        const original = readFileSync(file, "utf8");
+        writeFileSync(file, `${original}-- folded at the release cut\n`);
+        const unreleased = check();
+        git("tag", "v0.0.2");
+        const released = check();
+        git("tag", "-d", "v0.0.2");
+        writeFileSync(file, original);
+        assert.match(unreleased.out, /3\. Immutability \| PASS/, unreleased.out);
+        assert.match(released.out, /3\. Immutability \| FAIL/, released.out);
+        assert.ok(
+          released.out.includes(
+            `\`${renameFolder}/migration.sql\` was modified; it is in release v0.0.2.`,
+          ),
+          released.out,
+        );
+      },
+    );
 
     await step("runtime: up-to-date database is a no-op", async () => {
       const r = await runtime(localUrl);

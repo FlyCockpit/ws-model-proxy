@@ -19,8 +19,10 @@
  * private temporary schema of the same database, and compares that catalog
  * with the live one (`compareBaseline`). Equal → `prisma migrate resolve
  * --applied 0_init`, and UPGRADE_MIGRATION follows like any pending
- * migration. Different → refused with the differences listed; nothing is
- * changed. Comparing on the same server means no catalog text is committed
+ * migration. Otherwise each of BASELINE_VARIANTS is applied on top in the
+ * same scratch schema and compared again: the 0.4.x schemas deployed from the
+ * default branch after v0.4.3, adopted the same way. None equal → refused
+ * with the differences from 0_init listed; nothing is changed. Comparing on the same server means no catalog text is committed
  * and the PostgreSQL version cannot cause a false difference.
  *
  * Plain Node, no dependencies beyond the `pg` client passed in: it runs
@@ -39,6 +41,27 @@ export const BASELINE_RELEASE = "v0.4.3";
  * `upgradeAdmitted`. CI check 5 reports it instead of failing it.
  */
 export const UPGRADE_MIGRATION = "20261112000000_upgrade_to_1_0_0";
+/**
+ * The other schemas a database without history may hold, each applied on top
+ * of 0_init's body (and of the variants before it) in the comparison only.
+ * `file` is in packages/db/prisma/baselines/ (BASELINES_DIR, next to the
+ * migrations): a frozen copy of what that build changed after v0.4.3.
+ * fa1c7aad is the last 0.4.x build deployed from the default branch before
+ * migrations existed (it adds nine nullable columns and changes five
+ * hardening objects); UPGRADE_MIGRATION adds those columns IF NOT EXISTS and
+ * re-creates the hardening, so it brings both schemas to the same 1.0 schema.
+ */
+export const BASELINE_VARIANTS = [
+  {
+    label: "0.4.x build fa1c7aad (after v0.4.3)",
+    file: "v0.4.3-fa1c7aad.sql",
+    // The build's commit: `pnpm db:test-adopt-released` builds its schema from it.
+    ref: "fa1c7aadb93ed0aafe57241ec7f6f642c335cd36",
+  },
+];
+/** Directory of the variant files, a sibling of the migrations directory. */
+export const BASELINES_DIR = "baselines";
+
 /** The 0.4.x hardening version gate (a function); never part of the comparison. */
 export const LEGACY_HARDENING_STATE_FUNCTION = "wmp_schema_hardening_state";
 export const BASELINE_GUIDE = "docs/schema-migrations.md § Upgrading a 0.4.x database";
@@ -180,13 +203,22 @@ export function diffCatalogs(expected, live) {
 
 /**
  * Compare the live `schema` with what `body` (0_init without its wrapper)
- * creates on an empty schema. Everything runs in one transaction that is
- * always rolled back, so the database is unchanged whatever happens.
+ * creates on an empty schema, then, while unequal, with that plus each of
+ * `variants` in order (BASELINE_VARIANTS). Everything runs in one
+ * transaction that is always rolled back, so the database is unchanged
+ * whatever happens. `variant` is the label of the variant that matched (null:
+ * 0_init itself, or none); `missing`/`unexpected` are always relative to
+ * 0_init, the schema an operator is told to restore.
  * @param {import("pg").Client} client a dedicated session (not the lock session)
- * @param {{ schema: string, body: string, scratchName: string, timeoutMs?: number }} options
- * @returns {Promise<{ equal: boolean, missing: string[], unexpected: string[], liveCount: number }>}
+ * @param {{ schema: string, body: string, scratchName: string, timeoutMs?: number,
+ *   variants?: Array<{ label: string, sql: string }> }} options
+ * @returns {Promise<{ equal: boolean, missing: string[], unexpected: string[], liveCount: number,
+ *   variant: string | null }>}
  */
-export async function compareBaseline(client, { schema, body, scratchName, timeoutMs = 120_000 }) {
+export async function compareBaseline(
+  client,
+  { schema, body, scratchName, timeoutMs = 120_000, variants = [] },
+) {
   if (!/^_wmp_baseline_[a-z0-9]{8,32}$/.test(scratchName))
     throw new Error(`unexpected scratch schema name ${scratchName}`);
   await client.query("BEGIN");
@@ -200,12 +232,23 @@ export async function compareBaseline(client, { schema, body, scratchName, timeo
     await client.query(body);
     const expected = await readSchemaCatalog(client, scratchName);
     const { missing, unexpected } = diffCatalogs(expected, live);
-    return {
-      equal: missing.length === 0 && unexpected.length === 0,
-      missing,
-      unexpected,
-      liveCount: live.length,
-    };
+    const result = { missing, unexpected, liveCount: live.length };
+    if (missing.length === 0 && unexpected.length === 0)
+      return { ...result, equal: true, variant: null };
+    for (const variant of variants) {
+      await client.query(`SET LOCAL search_path TO ${client.escapeIdentifier(scratchName)}`);
+      await client.query(variant.sql);
+      const other = diffCatalogs(await readSchemaCatalog(client, scratchName), live);
+      if (other.missing.length === 0 && other.unexpected.length === 0)
+        return {
+          missing: [],
+          unexpected: [],
+          liveCount: live.length,
+          equal: true,
+          variant: variant.label,
+        };
+    }
+    return { ...result, equal: false, variant: null };
   } finally {
     await client.query("ROLLBACK").catch(() => {});
   }
