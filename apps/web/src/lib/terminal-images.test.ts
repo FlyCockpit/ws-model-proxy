@@ -7,10 +7,12 @@ import {
   TERMINAL_IMAGE_ACK_TIMEOUT_MS,
   TERMINAL_IMAGE_CANCEL,
   TERMINAL_IMAGE_CHUNK_BYTES,
+  TERMINAL_IMAGE_MAX_BYTES,
   TERMINAL_IMAGE_PASTE,
   TERMINAL_IMAGE_REPLY,
   TerminalImageTransfer,
   terminalImagePasteText,
+  terminalImageProblem,
 } from "./terminal-images";
 
 const fromHex = (value: string) => Uint8Array.from(Buffer.from(value, "hex"));
@@ -220,5 +222,21 @@ describe("terminal image uploads", () => {
         () => undefined,
       ),
     ).rejects.toThrow("unavailable");
+  });
+});
+
+describe("terminalImageProblem", () => {
+  it("accepts PNG, JPEG and WebP up to 8 MiB", () => {
+    expect(terminalImageProblem({ type: "image/jpeg", size: 1 })).toBeNull();
+    expect(terminalImageProblem({ type: "image/png", size: TERMINAL_IMAGE_MAX_BYTES })).toBeNull();
+    expect(terminalImageProblem({ type: "image/webp", size: 10 })).toBeNull();
+  });
+
+  it("names what the upload would refuse", () => {
+    expect(terminalImageProblem({ type: "image/heic", size: 10 })).toBe("unsupported");
+    expect(terminalImageProblem({ type: "image/png", size: 0 })).toBe("too_large");
+    expect(terminalImageProblem({ type: "image/png", size: TERMINAL_IMAGE_MAX_BYTES + 1 })).toBe(
+      "too_large",
+    );
   });
 });

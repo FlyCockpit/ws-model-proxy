@@ -216,5 +216,87 @@
     "moveNodeHint": "Arrastra para reordenar, o enfoca y usa las flechas arriba y abajo. Tu orden se guarda en tu cuenta.",
     "moveTabHint": "Arrastra para reordenar, o presiona Alt+Shift con las flechas izquierda y derecha. Tu orden se guarda en tu cuenta.",
     "saveFailed": "No se pudo guardar tu orden. Inténtalo de nuevo."
+  },
+  "utilities": {
+    "button": "Utilidades",
+    "showKeys": "Mostrar teclas",
+    "hideKeys": "Ocultar teclas",
+    "paste": "Pegar…",
+    "photo": "Foto / cámara…",
+    "textSize": "Tamaño del texto (también: pellizca la terminal)",
+    "smaller": "Texto más pequeño",
+    "larger": "Texto más grande",
+    "reset": "Restablecer",
+    "sizePx": "{{size}} px",
+    "cells": "{{cols}}×{{rows}}",
+    "sizeBadge": "{{size}} px · {{cols}}×{{rows}}",
+    "cancel": "Cancelar",
+    "pasteDialog": {
+      "title": "Pegar en la terminal",
+      "description": "Pega desde el portapapeles, o mantén presionado el cuadro y elige Pegar.",
+      "textLabel": "Texto para pegar",
+      "placeholder": "Mantén presionado aquí y elige Pegar, o usa el botón de abajo.",
+      "fromClipboard": "Pegar del portapapeles",
+      "clipboardUnavailable": "Este navegador no permite que las páginas lean el portapapeles aquí. Mantén presionado el cuadro y elige Pegar.",
+      "clipboardBlocked": "El navegador bloqueó la lectura del portapapeles. Mantén presionado el cuadro y elige Pegar.",
+      "clipboardEmpty": "El portapapeles no tiene texto.",
+      "clipboardLoaded": "Se cargó el texto del portapapeles. Revísalo y envíalo.",
+      "empty": "Todavía no hay nada que enviar.",
+      "summary_one": "{{count}} línea, {{bytes}} bytes.",
+      "summary_other": "{{count}} líneas, {{bytes}} bytes.",
+      "bracketed": "Se envía como un solo pegado delimitado, así las líneas no se ejecutan una por una.",
+      "notBracketed": "El programa no pidió pegado delimitado, así que cada salto de línea es un Enter real.",
+      "enterAfter": "Presionar Enter después de enviar",
+      "nothing": "No hay nada que enviar.",
+      "send": "Enviar a la terminal"
+    },
+    "photoDialog": {
+      "title": "Foto o imagen",
+      "description": "La imagen se sube cifrada al nodo y su ruta se escribe en la terminal, como la reciben los agentes de programación.",
+      "choose": "Elegir foto",
+      "camera": "Tomar foto",
+      "thumbnail": "Imagen seleccionada",
+      "unnamed": "Foto",
+      "meta": "{{type}}, {{size}} KiB",
+      "send": "Enviar imagen"
+    }
+  },
+  "keys": {
+    "label": "Teclas de la terminal",
+    "keyboard": "Mostrar u ocultar el teclado",
+    "esc": "Escape",
+    "tab": "Tab",
+    "ctrl": "Ctrl",
+    "alt": "Alt",
+    "modifierHint": "{{key}}: toca para la siguiente tecla, toca dos veces para fijar, mantén para elegir una tecla",
+    "latch": {
+      "off": "{{key}}",
+      "once": "{{key}}, se aplica a la siguiente tecla",
+      "lock": "{{key}}, fijo"
+    },
+    "state": {
+      "off": "mantén",
+      "once": "sig.",
+      "lock": "fijo"
+    },
+    "gridTitle": "{{key}} + … desliza a una tecla y suelta",
+    "swipe": "desliza ↕↔",
+    "swipePad": "Panel de deslizar: arrastra para enviar flechas",
+    "hints": {
+      "home": "inicio",
+      "stop": "parar",
+      "eof": "EOF",
+      "end": "fin",
+      "kill": "cortar",
+      "clear": "limpiar",
+      "search": "buscar",
+      "killLine": "cortar",
+      "word": "palabra",
+      "suspend": "susp",
+      "wordBack": "pal.←",
+      "wordForward": "pal.→",
+      "deleteWord": "borrar pal.",
+      "lastArg": "últ. arg"
+    }
   }
 }

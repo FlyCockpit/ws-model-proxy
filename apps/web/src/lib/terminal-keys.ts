@@ -14,6 +14,11 @@ const NEWLINE_SEQUENCES: Record<Exclude<TerminalShiftEnterMode, "off">, string> 
   "esc-cr": "\u001b\r",
 };
 
+/** What Shift+Enter or Ctrl+Enter send in `mode` (xterm's plain CR when off). */
+export function modifiedEnterSequence(mode: TerminalShiftEnterMode): string {
+  return mode === "off" ? "\r" : NEWLINE_SEQUENCES[mode];
+}
+
 /**
  * The bytes Shift+Enter or Ctrl+Enter send instead of xterm's plain CR, or null to leave the key
  * to xterm. xterm.js has no kitty or modifyOtherKeys support, so both keys otherwise send `\r`

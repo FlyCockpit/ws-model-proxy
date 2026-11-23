@@ -9,8 +9,16 @@ describe("parseTerminalSettings", () => {
         terminalCopy: "auto",
         terminalShiftEnter: "esc-cr",
         terminalMaximized: true,
+        terminalKeysShown: true,
+        terminalFontSize: 16,
       }),
-    ).toEqual({ terminalCopy: "auto", terminalShiftEnter: "esc-cr", terminalMaximized: true });
+    ).toEqual({
+      terminalCopy: "auto",
+      terminalShiftEnter: "esc-cr",
+      terminalMaximized: true,
+      terminalKeysShown: true,
+      terminalFontSize: 16,
+    });
   });
 
   it("falls back per value when missing or unknown", () => {
@@ -21,8 +29,18 @@ describe("parseTerminalSettings", () => {
         terminalCopy: "always",
         terminalShiftEnter: "lf",
         terminalMaximized: 1,
+        terminalKeysShown: "yes",
+        terminalFontSize: 99,
       }),
     ).toEqual({ ...DEFAULT_TERMINAL_SETTINGS, terminalShiftEnter: "lf" });
+  });
+
+  it("keeps only whole text sizes in range", () => {
+    for (const size of [8, 21, 13.5, "14", Number.NaN]) {
+      expect(parseTerminalSettings({ terminalFontSize: size }).terminalFontSize).toBeNull();
+    }
+    expect(parseTerminalSettings({ terminalFontSize: 9 }).terminalFontSize).toBe(9);
+    expect(parseTerminalSettings({ terminalFontSize: 20 }).terminalFontSize).toBe(20);
   });
 
   it("gives the defaults for stored values of the wrong shape, without throwing", () => {

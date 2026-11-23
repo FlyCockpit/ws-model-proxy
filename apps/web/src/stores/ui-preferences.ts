@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
+import { clampTerminalFontSize, TERMINAL_FONT_DEFAULT } from "@/lib/terminal-key-gestures";
 import {
   DEFAULT_TERMINAL_SETTINGS,
   parseTerminalSettings,
@@ -16,6 +17,9 @@ interface UiPreferencesState extends TerminalSettings {
   setTerminalCopy: (mode: TerminalCopyMode) => void;
   setTerminalShiftEnter: (mode: TerminalShiftEnterMode) => void;
   setTerminalMaximized: (maximized: boolean) => void;
+  setTerminalKeysShown: (shown: boolean) => void;
+  /** A size in px (clamped to the range), or null for the default. */
+  setTerminalFontSize: (size: number | null) => void;
 }
 
 export const useUiPreferences = create<UiPreferencesState>()(
@@ -28,6 +32,11 @@ export const useUiPreferences = create<UiPreferencesState>()(
       setTerminalCopy: (mode) => set({ terminalCopy: mode }),
       setTerminalShiftEnter: (mode) => set({ terminalShiftEnter: mode }),
       setTerminalMaximized: (maximized) => set({ terminalMaximized: maximized }),
+      setTerminalKeysShown: (shown) => set({ terminalKeysShown: shown }),
+      setTerminalFontSize: (size) => {
+        const next = size === null ? null : clampTerminalFontSize(size);
+        set({ terminalFontSize: next === TERMINAL_FONT_DEFAULT ? null : next });
+      },
     }),
     {
       name: "ui-preferences",

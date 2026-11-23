@@ -6,6 +6,8 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { TerminalOutputEvent } from "@/hooks/use-terminal-sessions";
 import type { CopyOutGate } from "@/lib/terminal-copy-out";
 import type { TerminalImageAttachment } from "@/lib/terminal-images";
+import { useTerminalModifiers } from "@/stores/terminal-modifiers";
+import type { TerminalControls } from "./use-xterm";
 
 type Written = string | { resize: [number, number] } | "reset";
 
@@ -19,7 +21,10 @@ type FakeTerminal = {
   keyHandler: ((event: KeyboardEvent) => boolean) | null;
   gate: CopyOutGate | null;
   binary: ((data: string) => void) | null;
-  modes: { mouseTrackingMode: string };
+  modes: { mouseTrackingMode: string; applicationCursorKeysMode?: boolean };
+  options: { fontSize?: number };
+  cols: number;
+  rows: number;
   /** Lines scrolled in the scrollback (the normal buffer's wheel). */
   scrolled: number[];
   /** The alternate screen (no scrollback): the wheel sends arrow keys outside a mouse app. */
@@ -44,7 +49,9 @@ vi.mock("@xterm/xterm", () => ({
     focused = 0;
     /** Writes the parser has not reached yet, as xterm queues them. */
     queue: { data: string | Uint8Array; callback?: () => void }[] = [];
-    constructor() {
+    options: { fontSize?: number };
+    constructor(options: { fontSize?: number } = {}) {
+      this.options = { ...options };
       xterm.instances.push(this);
     }
     element: HTMLElement | null = null;
@@ -123,9 +130,13 @@ vi.mock("@xterm/xterm", () => ({
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class {
     fit() {}
-    /** 10x25 px cells: the default 800x600 box is 80x24. */
+    /** 10x25 px cells at 13 px text: the default 800x600 box is 80x24. Cells scale with the text. */
     proposeDimensions() {
-      return { cols: Math.floor(box.width / 10), rows: Math.floor(box.height / 25) };
+      const scale = (xterm.instances.at(-1)?.options.fontSize ?? 13) / 13;
+      return {
+        cols: Math.floor(box.width / (10 * scale)),
+        rows: Math.floor(box.height / (25 * scale)),
+      };
     }
   },
 }));
@@ -1575,5 +1586,213 @@ describe("useTerminalPane sizing", () => {
     expect(term.log).toEqual([]);
     act(() => term.parse());
     expect(term.log).toEqual([{ resize: [120, 24] }]);
+  });
+});
+
+/**
+ * The Utilities controls: on-screen keys and the Paste dialog send from the person's own event
+ * handler as `user` input, so a follower's goes out (and takes over) as a typed key's does; the
+ * key row's latched Ctrl/Alt apply to the next key typed on the keyboard only.
+ */
+describe("useTerminalPane utilities", () => {
+  function pane(
+    options: {
+      follow?: { cols: number; rows: number } | null;
+      selecting?: boolean;
+      fontSize?: number;
+    } = {},
+  ) {
+    const sendInput = vi.fn();
+    const setFontSize = vi.fn();
+    const onFontApplied = vi.fn();
+    const onImage = vi.fn((_file: File) => Promise.reject(new Error("unavailable")));
+    const onImageError = vi.fn();
+    const registered: (TerminalControls | null)[] = [];
+    const container = document.createElement("div");
+    const props = {
+      localId: "local_1",
+      active: true,
+      follow: options.follow ?? null,
+      selecting: options.selecting ?? false,
+      fontSize: options.fontSize ?? 13,
+      shiftEnter: "lf" as "lf" | "esc-cr" | "off",
+      setFontSize,
+      onFontApplied,
+      onImage,
+      onImageError,
+      registerControls: (_id: string, controls: TerminalControls | null) =>
+        registered.push(controls),
+      sendInput,
+      sendResize: () => undefined,
+      subscribeOutput: outputSource().subscribeOutput,
+    };
+    const hook = renderHook((current: typeof props) => useTerminalPane(current), {
+      initialProps: props,
+    });
+    act(() => hook.result.current.containerRef(container));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    act(() => term.parse());
+    const controls = registered.at(-1);
+    if (!controls) throw new Error("no controls");
+    return {
+      term,
+      container,
+      sendInput,
+      setFontSize,
+      onFontApplied,
+      onImage,
+      onImageError,
+      controls,
+      hook,
+      props,
+    };
+  }
+
+  afterEach(() => {
+    useTerminalModifiers.getState().clear();
+    vi.restoreAllMocks();
+  });
+
+  it("sends an on-screen key from a follower as the person's input", () => {
+    const { term, controls, sendInput } = pane({ follow: { cols: 100, rows: 30 } });
+    // xterm's own data with no gesture is dropped for a follower...
+    act(() => term.emit?.("q"));
+    expect(sendInput).not.toHaveBeenCalled();
+    // ...but an on-screen key is the gesture: it goes out as `user` input (and takes over).
+    controls.sendKeys("\x1b");
+    expect(sendInput.mock.calls).toEqual([["local_1", "\x1b", "user"]]);
+  });
+
+  it("pastes from a follower through xterm, without paste markers", () => {
+    const { term, controls, sendInput } = pane({ follow: { cols: 100, rows: 30 } });
+    controls.paste("ls\x1b[201~; rm -rf ~");
+    expect(term.pasted).toEqual(["ls; rm -rf ~"]);
+    expect(sendInput.mock.calls).toEqual([["local_1", "ls; rm -rf ~", "user"]]);
+    sendInput.mockClear();
+    controls.paste("\x1b[200~");
+    expect(sendInput).not.toHaveBeenCalled();
+    // A marker rebuilt from the pieces around a removed one is removed too.
+    controls.paste("\x1b[20\x1b[201~1~echo unexpected");
+    expect(term.pasted.at(-1)).toBe("echo unexpected");
+  });
+
+  it("sends nothing from the controls during Select text, and starts no photo upload", () => {
+    const { term, controls, sendInput, onImage, onImageError } = pane({ selecting: true });
+    controls.sendKeys("\t");
+    controls.paste("text");
+    controls.pasteImages([new File(["x"], "a.png", { type: "image/png" })]);
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(term.pasted).toEqual([]);
+    expect(onImage).not.toHaveBeenCalled();
+    expect(onImageError).toHaveBeenCalledWith(new Error("selecting"));
+  });
+
+  it("applies a latched modifier to the next typed key, once", () => {
+    const { term, container, sendInput } = pane();
+    useTerminalModifiers.getState().tap("ctrl", 0);
+    container.dispatchEvent(new Event("input"));
+    act(() => term.emit?.("c"));
+    act(() => term.emit?.("c"));
+    expect(sendInput.mock.calls).toEqual([
+      ["local_1", "\x03", "user"],
+      ["local_1", "c", "user"],
+    ]);
+    expect(useTerminalModifiers.getState().ctrl).toBe("off");
+  });
+
+  it("applies a latched Alt to arrows in application cursor mode and keeps a lock", () => {
+    const { term, sendInput } = pane();
+    const latch = useTerminalModifiers.getState();
+    latch.tap("alt", 1000);
+    latch.tap("alt", 1100);
+    expect(useTerminalModifiers.getState().alt).toBe("lock");
+    term.modes.applicationCursorKeysMode = true;
+    act(() => term.emit?.("\x1bOA"));
+    act(() => term.emit?.("x"));
+    expect(sendInput.mock.calls).toEqual([
+      ["local_1", "\x1b[1;3A", "user"],
+      ["local_1", "\x1bx", "user"],
+    ]);
+    expect(useTerminalModifiers.getState().alt).toBe("lock");
+  });
+
+  it("never applies a latched modifier to a paste, a wheel or a mouse report", () => {
+    const { term, controls, sendInput } = pane();
+    useTerminalModifiers.getState().tap("ctrl", 0);
+    controls.paste("c");
+    term.modes.mouseTrackingMode = "vt200";
+    term.element?.dispatchEvent(new WheelEvent("wheel", { deltaY: 1, cancelable: true }));
+    act(() => term.emit?.("\x1b[<0;3;4M"));
+    expect(sendInput.mock.calls.map((call) => call[1])).toEqual([
+      "c",
+      "\x1b[<65;1;1M",
+      "\x1b[<0;3;4M",
+    ]);
+    // Still latched for the next key.
+    expect(useTerminalModifiers.getState().ctrl).toBe("once");
+  });
+
+  it("refits a writer to a new text size, so its new size reaches the PTY", () => {
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+    const { term, hook, props, onFontApplied } = pane();
+    expect(term.options.fontSize).toBe(13);
+    hook.rerender({ ...props, fontSize: 26 });
+    expect(term.options.fontSize).toBe(26);
+    // Twice the text: half the cells. xterm's own resize event is what reports it to the PTY.
+    expect(term.log.at(-1)).toEqual({ resize: [40, 12] });
+    expect(onFontApplied).toHaveBeenCalledWith("local_1", { fontSize: 26, cols: 40, rows: 12 });
+    expect(hook.result.current.fontBadge).toEqual({ fontSize: 26, cols: 40, rows: 12 });
+  });
+
+  it("only rescales a follower: it keeps showing the PTY size", () => {
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+    const { term, hook, props, onFontApplied } = pane({ follow: { cols: 100, rows: 30 } });
+    expect([term.cols, term.rows]).toEqual([100, 30]);
+    term.log.length = 0;
+    hook.rerender({ ...props, fontSize: 26 });
+    expect(term.options.fontSize).toBe(26);
+    expect(term.log).toEqual([]);
+    expect([term.cols, term.rows]).toEqual([100, 30]);
+    expect(onFontApplied).toHaveBeenCalledWith("local_1", { fontSize: 26, cols: 100, rows: 30 });
+  });
+
+  it("sends a latched Ctrl+Enter as the Shift+Enter setting says", () => {
+    const { term, hook, props, sendInput } = pane();
+    hook.rerender({ ...props, shiftEnter: "off" });
+    useTerminalModifiers.getState().tap("ctrl", 0);
+    act(() => term.emit?.("\r"));
+    hook.rerender({ ...props, shiftEnter: "esc-cr" });
+    useTerminalModifiers.getState().tap("ctrl", 5000);
+    act(() => term.emit?.("\r"));
+    expect(sendInput.mock.calls.map((call) => call[1])).toEqual(["\r", "\x1b\r"]);
+  });
+
+  it("sets the text size from a two-finger pinch, not from one finger", () => {
+    const { container, setFontSize } = pane({ fontSize: 13 });
+    container.dispatchEvent(touch("touchstart", [{ x: 100, y: 100 }]));
+    container.dispatchEvent(touch("touchmove", [{ x: 100, y: 300 }]));
+    container.dispatchEvent(touch("touchend", []));
+    expect(setFontSize).not.toHaveBeenCalled();
+    container.dispatchEvent(
+      touch("touchstart", [
+        { x: 100, y: 100 },
+        { x: 200, y: 100 },
+      ]),
+    );
+    const move = touch("touchmove", [
+      { x: 50, y: 100 },
+      { x: 250, y: 100 },
+    ]);
+    container.dispatchEvent(move);
+    // Twice the spread: 13 × √2 ≈ 18 px; the page does not zoom.
+    expect(setFontSize).toHaveBeenLastCalledWith(18);
+    expect(move.defaultPrevented).toBe(true);
   });
 });

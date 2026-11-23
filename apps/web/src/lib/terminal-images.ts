@@ -65,6 +65,19 @@ export function terminalImageFormat(mime: string): number {
   return format;
 }
 
+/**
+ * Why an image would be refused before it is sent (the upload's own checks), or null: the
+ * Photo dialog warns before the person sends it.
+ */
+export function terminalImageProblem(file: {
+  type: string;
+  size: number;
+}): "unsupported" | "too_large" | null {
+  if (!formats.includes(file.type)) return "unsupported";
+  if (file.size === 0 || file.size > TERMINAL_IMAGE_MAX_BYTES) return "too_large";
+  return null;
+}
+
 /** tag | random id (16 bytes) | total u32be | offset u32be | format u8 | bytes */
 export function encodeTerminalImageChunk(input: {
   id: string;

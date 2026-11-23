@@ -216,5 +216,87 @@
     "moveNodeHint": "Drag to reorder, or focus and press the up and down arrows. Your order is saved to your account.",
     "moveTabHint": "Drag to reorder, or press Alt+Shift with the left and right arrows. Your order is saved to your account.",
     "saveFailed": "Could not save your order. Try again."
+  },
+  "utilities": {
+    "button": "Utilities",
+    "showKeys": "Show keys",
+    "hideKeys": "Hide keys",
+    "paste": "Paste…",
+    "photo": "Photo / camera…",
+    "textSize": "Text size (also: pinch the terminal)",
+    "smaller": "Smaller text",
+    "larger": "Larger text",
+    "reset": "Reset",
+    "sizePx": "{{size}} px",
+    "cells": "{{cols}}×{{rows}}",
+    "sizeBadge": "{{size}} px · {{cols}}×{{rows}}",
+    "cancel": "Cancel",
+    "pasteDialog": {
+      "title": "Paste into the terminal",
+      "description": "Paste from the clipboard, or long-press the box and choose Paste.",
+      "textLabel": "Text to paste",
+      "placeholder": "Long-press here and choose Paste, or use the button below.",
+      "fromClipboard": "Paste from clipboard",
+      "clipboardUnavailable": "This browser does not let pages read the clipboard here. Long-press the box and choose Paste.",
+      "clipboardBlocked": "The browser blocked reading the clipboard. Long-press the box and choose Paste instead.",
+      "clipboardEmpty": "The clipboard has no text.",
+      "clipboardLoaded": "Clipboard text loaded. Check it, then send.",
+      "empty": "Nothing to send yet.",
+      "summary_one": "{{count}} line, {{bytes}} bytes.",
+      "summary_other": "{{count}} lines, {{bytes}} bytes.",
+      "bracketed": "Sent as one bracketed paste, so the lines do not run one by one.",
+      "notBracketed": "The program did not ask for bracketed paste, so each line break is a real Enter.",
+      "enterAfter": "Press Enter after sending",
+      "nothing": "Nothing to send.",
+      "send": "Send to terminal"
+    },
+    "photoDialog": {
+      "title": "Photo or image",
+      "description": "The image is uploaded encrypted to the node, and its path is typed into the terminal, the way coding agents take images.",
+      "choose": "Choose photo",
+      "camera": "Take photo",
+      "thumbnail": "Selected image",
+      "unnamed": "Photo",
+      "meta": "{{type}}, {{size}} KiB",
+      "send": "Send image"
+    }
+  },
+  "keys": {
+    "label": "Terminal keys",
+    "keyboard": "Show or hide the keyboard",
+    "esc": "Escape",
+    "tab": "Tab",
+    "ctrl": "Ctrl",
+    "alt": "Alt",
+    "modifierHint": "{{key}}: tap for the next key, double-tap to lock, hold to pick a key",
+    "latch": {
+      "off": "{{key}}",
+      "once": "{{key}}, applies to the next key",
+      "lock": "{{key}}, locked"
+    },
+    "state": {
+      "off": "hold",
+      "once": "next",
+      "lock": "locked"
+    },
+    "gridTitle": "{{key}} + … slide to a key and lift",
+    "swipe": "swipe ↕↔",
+    "swipePad": "Swipe pad: drag to send arrow keys",
+    "hints": {
+      "home": "home",
+      "stop": "stop",
+      "eof": "EOF",
+      "end": "end",
+      "kill": "kill",
+      "clear": "clear",
+      "search": "search",
+      "killLine": "kill",
+      "word": "word",
+      "suspend": "susp",
+      "wordBack": "word←",
+      "wordForward": "word→",
+      "deleteWord": "del wd",
+      "lastArg": "last arg"
+    }
   }
 }

@@ -2,14 +2,22 @@ import { type RefCallback, useEffect, useLayoutEffect, useRef, useState } from "
 
 import { useLatestRef } from "@/hooks/use-latest-ref";
 import type { TerminalOutputEvent } from "@/hooks/use-terminal-sessions";
-import { useXterm } from "@/hooks/use-xterm";
+import { type TerminalControls, type TerminalGeometry, useXterm } from "@/hooks/use-xterm";
 import type { Osc52Copy } from "@/lib/terminal-copy-out";
 import type { TerminalImageAttachment } from "@/lib/terminal-images";
+import { applyTerminalModifiers } from "@/lib/terminal-key-encoding";
+import { TERMINAL_FONT_DEFAULT } from "@/lib/terminal-key-gestures";
+import { modifiedEnterSequence } from "@/lib/terminal-keys";
+import { wirePinchFont } from "@/lib/terminal-pinch";
 import {
   DEFAULT_TERMINAL_SHIFT_ENTER_MODE,
   type TerminalShiftEnterMode,
 } from "@/lib/terminal-settings";
 import type { TerminalInputOrigin, TerminalSize } from "@/lib/terminal-writer";
+import { useTerminalModifiers } from "@/stores/terminal-modifiers";
+
+/** How long the text size badge shows after a change. */
+export const TERMINAL_FONT_BADGE_MS = 1400;
 
 type TerminalPaneHandlers = {
   localId: string;
@@ -27,6 +35,14 @@ type TerminalPaneHandlers = {
   shiftEnter?: TerminalShiftEnterMode;
   /** Select text mode: a frozen plain-text copy of the terminal covers it. */
   selecting?: boolean;
+  /** The text size in px (default 13). */
+  fontSize?: number;
+  /** A pinch on the terminal asks for this text size. */
+  setFontSize?: (size: number) => void;
+  /** This pane's on-screen controls, registered while it is mounted (null when it unmounts). */
+  registerControls?: (localId: string, controls: TerminalControls | null) => void;
+  /** The text size changed and the terminal refitted (see useXterm `onFontApplied`). */
+  onFontApplied?: (localId: string, geometry: TerminalGeometry) => void;
   /** The session this tab's input goes to now (see useXterm `currentSession`). */
   currentSession?: (localId: string) => unknown;
   /** A new attach is about to replay the screen: anything tied to the old one is dropped. */
@@ -50,13 +66,43 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
   selectionText: string | null;
   /** Put keyboard focus in the terminal (after a bar over it closes). */
   focusTerminal: () => void;
+  /** The text size and terminal size, briefly after a text size change on the visible pane. */
+  fontBadge: TerminalGeometry | null;
 } {
   const handlersRef = useLatestRef(handlers);
+  const [fontBadge, setFontBadge] = useState<TerminalGeometry | null>(null);
+  const badgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const xterm = useXterm({
     follow: handlers.follow,
     shiftEnter: handlers.shiftEnter ?? DEFAULT_TERMINAL_SHIFT_ENTER_MODE,
     selecting: handlers.selecting ?? false,
     active: handlers.active,
+    fontSize: handlers.fontSize ?? TERMINAL_FONT_DEFAULT,
+    // The key row's latched Ctrl/Alt go to the next key typed on the keyboard.
+    transformInput: (data, applicationCursor) => {
+      const latch = useTerminalModifiers.getState();
+      const mods = latch.active();
+      if (!mods) return data;
+      const modified = applyTerminalModifiers(data, mods, {
+        applicationCursor,
+        modifiedEnter: modifiedEnterSequence(
+          handlersRef.current.shiftEnter ?? DEFAULT_TERMINAL_SHIFT_ENTER_MODE,
+        ),
+      });
+      if (modified === null) return data;
+      latch.consume();
+      return modified;
+    },
+    onFontApplied: (geometry) => {
+      handlersRef.current.onFontApplied?.(handlersRef.current.localId, geometry);
+      if (!handlersRef.current.active) return;
+      setFontBadge(geometry);
+      if (badgeTimerRef.current) clearTimeout(badgeTimerRef.current);
+      badgeTimerRef.current = setTimeout(() => {
+        badgeTimerRef.current = null;
+        setFontBadge(null);
+      }, TERMINAL_FONT_BADGE_MS);
+    },
     onCopy: (copy) => handlersRef.current.onCopy?.(copy),
     currentSession: () => handlersRef.current.currentSession?.(handlersRef.current.localId) ?? null,
     onData: (data, origin) =>
@@ -145,5 +191,32 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
     if (active && host && !selecting) focus();
   }, [active, focus, focusRequest, host, selecting]);
 
-  return { containerRef: xterm.containerRef, selectionText, focusTerminal: focus };
+  // The badge's timer ends with the pane.
+  useEffect(
+    () => () => {
+      if (badgeTimerRef.current) clearTimeout(badgeTimerRef.current);
+    },
+    [],
+  );
+
+  // The Utilities controls act on this pane's xterm while it is mounted.
+  const { controls } = xterm;
+  useEffect(() => {
+    const register = handlersRef.current.registerControls;
+    if (!register) return;
+    register(localId, controls);
+    return () => register(localId, null);
+  }, [controls, handlersRef, localId]);
+
+  // Pinch the terminal to change the text size (not while Select text covers it).
+  useEffect(() => {
+    if (!host) return;
+    return wirePinchFont(host, {
+      enabled: () => handlersRef.current.active && !(handlersRef.current.selecting ?? false),
+      current: () => handlersRef.current.fontSize ?? TERMINAL_FONT_DEFAULT,
+      change: (size) => handlersRef.current.setFontSize?.(size),
+    });
+  }, [handlersRef, host]);
+
+  return { containerRef: xterm.containerRef, selectionText, focusTerminal: focus, fontBadge };
 }

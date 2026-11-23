@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { TERMINAL_FONT_MAX, TERMINAL_FONT_MIN } from "@/lib/terminal-key-gestures";
+
 /**
  * How a copy request from a program in the terminal (OSC 52) reaches the clipboard. An enum, not
  * a boolean, so later choices (for example per-node trust) need no stored-type change.
@@ -17,18 +19,32 @@ export type TerminalSettings = {
   terminalCopy: TerminalCopyMode;
   terminalShiftEnter: TerminalShiftEnterMode;
   terminalMaximized: boolean;
+  /** The Utilities key row (Esc, Tab, Ctrl, Alt, swipe pad) is shown on this device. */
+  terminalKeysShown: boolean;
+  /** The terminal text size in px on this device, or null for the default. */
+  terminalFontSize: number | null;
 };
 
 export const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   terminalCopy: DEFAULT_TERMINAL_COPY_MODE,
   terminalShiftEnter: DEFAULT_TERMINAL_SHIFT_ENTER_MODE,
   terminalMaximized: false,
+  terminalKeysShown: false,
+  terminalFontSize: null,
 };
 
 const terminalSettingsSchema = z.object({
   terminalCopy: z.enum(TERMINAL_COPY_MODES).catch(DEFAULT_TERMINAL_COPY_MODE),
   terminalShiftEnter: z.enum(TERMINAL_SHIFT_ENTER_MODES).catch(DEFAULT_TERMINAL_SHIFT_ENTER_MODE),
   terminalMaximized: z.boolean().catch(false),
+  terminalKeysShown: z.boolean().catch(false),
+  terminalFontSize: z
+    .number()
+    .int()
+    .min(TERMINAL_FONT_MIN)
+    .max(TERMINAL_FONT_MAX)
+    .nullable()
+    .catch(null),
 });
 
 /**

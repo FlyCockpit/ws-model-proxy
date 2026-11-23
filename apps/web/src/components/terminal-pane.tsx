@@ -7,7 +7,9 @@ import { WideContent } from "@/components/wide-content";
 import { useTerminalCopy } from "@/hooks/use-terminal-copy";
 import { useTerminalPane } from "@/hooks/use-terminal-pane";
 import type { TerminalOutputEvent } from "@/hooks/use-terminal-sessions";
+import type { TerminalControls, TerminalGeometry } from "@/hooks/use-xterm";
 import type { TerminalImageAttachment } from "@/lib/terminal-images";
+import { TERMINAL_FONT_DEFAULT } from "@/lib/terminal-key-gestures";
 import { TERMINAL_FONT_FAMILY } from "@/lib/terminal-theme";
 import type { TerminalInputOrigin, TerminalSize } from "@/lib/terminal-writer";
 import { useUiPreferences } from "@/stores/ui-preferences";
@@ -34,6 +36,9 @@ type TerminalPaneProps = {
   /** See useTerminalPane `focusRequest`. */
   focusRequest: number;
   currentSession: (localId: string) => unknown;
+  /** See useTerminalPane `registerControls`. */
+  registerControls?: (localId: string, controls: TerminalControls | null) => void;
+  onFontApplied?: (localId: string, geometry: TerminalGeometry) => void;
   subscribeOutput: (
     localId: string,
     listener: (event: TerminalOutputEvent) => void,
@@ -46,10 +51,14 @@ export function TerminalPane(props: TerminalPaneProps) {
   const { t } = useTranslation("terminals");
   const [uploadPercent, setUploadPercent] = useState<number | null>(null);
   const shiftEnter = useUiPreferences((prefs) => prefs.terminalShiftEnter);
+  const fontSize = useUiPreferences((prefs) => prefs.terminalFontSize) ?? TERMINAL_FONT_DEFAULT;
+  const setFontSize = useUiPreferences((prefs) => prefs.setTerminalFontSize);
   const copy = useTerminalCopy();
-  const { containerRef, selectionText, focusTerminal } = useTerminalPane({
+  const { containerRef, selectionText, focusTerminal, fontBadge } = useTerminalPane({
     ...props,
     shiftEnter,
+    fontSize,
+    setFontSize,
     onCopy: copy.onCopy,
     // A copy prompted before a new attach belongs to the old one.
     onReset: copy.clear,
@@ -122,15 +131,21 @@ export function TerminalPane(props: TerminalPaneProps) {
           // scroll box, and the area it does not cover is shaded. This box cannot be split into
           // a vertical scroller around WideContent: xterm opens directly in it and FitAddon
           // measures it as the pane's size, so it must stay the pane-sized box itself.
+          // A two-finger pinch sets the text size (useTerminalPane), so the browser never
+          // pinch-zooms the page here.
           props.follow
-            ? "overflow-x-auto overflow-y-auto overscroll-contain bg-(--term-shade) [&>.xterm]:w-fit"
+            ? "touch-pan-x touch-pan-y overflow-x-auto overflow-y-auto overscroll-contain bg-(--term-shade) [&>.xterm]:w-fit"
             : // Writing: a one-finger swipe scrolls the terminal like the wheel (useXterm), so
-              // the browser keeps only pinch zoom. Following, the box pans natively.
-              "touch-pinch-zoom overflow-x-hidden overflow-y-hidden [&_*]:touch-pinch-zoom",
+              // the browser keeps no touch gesture. Following, the box pans natively.
+              "touch-none overflow-x-hidden overflow-y-hidden [&_*]:touch-none",
         )}
       />
       {selectionText !== null ? (
-        <SelectTextOverlay text={selectionText} onDone={props.onDoneSelecting} />
+        <SelectTextOverlay
+          text={selectionText}
+          fontSize={fontSize}
+          onDone={props.onDoneSelecting}
+        />
       ) : null}
       {copy.pending && selectionText === null ? (
         // Closing the bar removes the focused button: focus goes back to the terminal.
@@ -144,6 +159,18 @@ export function TerminalPane(props: TerminalPaneProps) {
             focusTerminal();
           }}
         />
+      ) : null}
+      {fontBadge !== null && selectionText === null ? (
+        <div
+          role="status"
+          className="pointer-events-none absolute top-2 left-1/2 -translate-x-1/2 rounded-md border border-(--term-border) bg-(--term-chrome) px-2 py-1 font-mono text-(--term-fg) text-xs"
+        >
+          {t("utilities.sizeBadge", {
+            size: fontBadge.fontSize,
+            cols: fontBadge.cols,
+            rows: fontBadge.rows,
+          })}
+        </div>
       ) : null}
       {uploadPercent !== null ? (
         <div
@@ -185,7 +212,15 @@ function CopyBar({ onCopy, onDismiss }: { onCopy: () => void; onDismiss: () => v
 }
 
 /** Select text: a frozen plain-text copy of the terminal that selects and copies natively. */
-function SelectTextOverlay({ text, onDone }: { text: string; onDone: () => void }) {
+function SelectTextOverlay({
+  text,
+  fontSize,
+  onDone,
+}: {
+  text: string;
+  fontSize: number;
+  onDone: () => void;
+}) {
   const { t } = useTranslation("terminals");
   // Open at the bottom, where the newest output is, once per opening: a stable callback, so a
   // re-render never scrolls the person away from history they are selecting.
@@ -216,8 +251,8 @@ function SelectTextOverlay({ text, onDone }: { text: string; onDone: () => void 
         {/* Its own tab stop: the sideways scroller is a separate box from the vertical one. */}
         <WideContent tabIndex={0} role="region" aria-label={t("selectText.wideLabel")}>
           <pre
-            style={{ fontFamily: TERMINAL_FONT_FAMILY }}
-            className="w-fit select-text whitespace-pre py-2 ps-3 pe-1 text-(--term-fg) text-[13px] leading-[1.2]"
+            style={{ fontFamily: TERMINAL_FONT_FAMILY, fontSize }}
+            className="w-fit select-text whitespace-pre py-2 ps-3 pe-1 text-(--term-fg) leading-[1.2]"
           >
             {text}
           </pre>

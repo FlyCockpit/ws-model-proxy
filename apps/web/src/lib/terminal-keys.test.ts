@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { newlineSequence, type TerminalKeyEvent } from "./terminal-keys";
+import { modifiedEnterSequence, newlineSequence, type TerminalKeyEvent } from "./terminal-keys";
 
 const key = (overrides: Partial<TerminalKeyEvent>): TerminalKeyEvent => ({
   key: "Enter",
@@ -28,5 +28,13 @@ describe("newlineSequence", () => {
     expect(newlineSequence("lf", key({ altKey: true }))).toBeNull();
     expect(newlineSequence("lf", key({ key: "a", shiftKey: true }))).toBeNull();
     expect(newlineSequence("lf", key({ shiftKey: true, isComposing: true }))).toBeNull();
+  });
+});
+
+describe("modifiedEnterSequence", () => {
+  it("is what a hardware Shift+Enter sends in each mode", () => {
+    expect(modifiedEnterSequence("lf")).toBe("\n");
+    expect(modifiedEnterSequence("esc-cr")).toBe("\u001b\r");
+    expect(modifiedEnterSequence("off")).toBe("\r");
   });
 });

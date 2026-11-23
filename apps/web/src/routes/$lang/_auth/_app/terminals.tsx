@@ -22,7 +22,7 @@ import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Maximize2, Minimize2, Settings2, TextSelect, X } from "lucide-react";
-import { type KeyboardEvent, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { CodeSnippet } from "@/components/code-snippet";
@@ -31,18 +31,22 @@ import { LiveUpdatesNotice } from "@/components/live-updates-notice";
 import { refusalMessage } from "@/components/nodes/refusal";
 import { PageHeading } from "@/components/page-stub";
 import { OperatorStepItem } from "@/components/runtimes/operator-step-item";
+import { TerminalKeyRow } from "@/components/terminal-key-row";
 import { TerminalNodeRow } from "@/components/terminal-node-row";
 import { TerminalPane } from "@/components/terminal-pane";
+import { TerminalUtilities } from "@/components/terminal-utilities";
 import { TimeAgo } from "@/components/time-ago";
 import { WideContent } from "@/components/wide-content";
 import { useHideAppChrome } from "@/hooks/use-hide-app-chrome";
 import { type ReorderDrag, usePointerReorder } from "@/hooks/use-pointer-reorder";
 import { useTerminalLayout } from "@/hooks/use-terminal-layout";
+import { useTerminalModifiersLifetime } from "@/hooks/use-terminal-modifiers-lifetime";
 import {
   type OpenTicketInput,
   type TerminalTab,
   useTerminalSessions,
 } from "@/hooks/use-terminal-sessions";
+import type { TerminalControls } from "@/hooks/use-xterm";
 import { nodeLiveInterval } from "@/lib/node-live-updates";
 import { refusalText } from "@/lib/refusal-text";
 import { applySavedOrder, moveItem } from "@/lib/saved-order";
@@ -220,6 +224,18 @@ function TerminalWorkspace({
   // ends it there.
   const selecting = active !== null && sessions.selectingLocalId === active.localId;
   const [focusRequest, setFocusRequest] = useState(0);
+  // Each pane's on-screen controls; the Utilities menu, its dialogs and the key row act on the
+  // visible one.
+  const controlsRef = useRef(new Map<string, TerminalControls>());
+  const registerControls = useCallback((localId: string, controls: TerminalControls | null) => {
+    if (controls) controlsRef.current.set(localId, controls);
+    else controlsRef.current.delete(localId);
+  }, []);
+  const activeControls = () =>
+    activeLocalId === null ? null : (controlsRef.current.get(activeLocalId) ?? null);
+  const [cells, setCells] = useState<{ cols: number; rows: number } | null>(null);
+  const keysShown = useUiPreferences((prefs) => prefs.terminalKeysShown);
+  useTerminalModifiersLifetime();
   // Arrow keys, Home and End move between tabs (the tabs pattern); focus stays on the tab list.
   // With Alt+Shift, Left and Right move the focused tab itself.
   const onTabKeyDown = (event: KeyboardEvent, index: number) => {
@@ -333,6 +349,14 @@ function TerminalWorkspace({
                 onToggleSelecting={() =>
                   sessions.setSelecting(selecting ? null : (active?.localId ?? null))
                 }
+                utilities={
+                  <TerminalUtilities
+                    controls={activeControls}
+                    disabled={active === null}
+                    cells={cells}
+                    onCells={setCells}
+                  />
+                }
               />
             </div>
             {active ? <TabStatus sessions={sessions} tab={active} /> : null}
@@ -359,10 +383,18 @@ function TerminalWorkspace({
                   sizeUnavailable={sessions.sizeUnavailable}
                   focusRequest={focusRequest}
                   currentSession={sessions.currentSession}
+                  registerControls={registerControls}
+                  onFontApplied={(localId, geometry) => {
+                    if (localId === activeLocalId)
+                      setCells({ cols: geometry.cols, rows: geometry.rows });
+                  }}
                   subscribeOutput={sessions.subscribeOutput}
                 />
               ))}
             </div>
+            {/* Shown or hidden only by the person's choice (Utilities), never by a keyboard
+                guess: it is useful without the keyboard too, and each change resizes the PTY. */}
+            {keysShown && active ? <TerminalKeyRow controls={activeControls} /> : null}
           </>
         )}
       </CardContent>
@@ -370,17 +402,19 @@ function TerminalWorkspace({
   );
 }
 
-/** Maximize, Select text, and the terminal settings menu, beside the tabs. */
+/** Maximize, Select text, Utilities, and the terminal settings menu, beside the tabs. */
 function TerminalToolbar({
   maximized,
   selecting,
   canSelect,
   onToggleSelecting,
+  utilities,
 }: {
   maximized: boolean;
   selecting: boolean;
   canSelect: boolean;
   onToggleSelecting: () => void;
+  utilities: ReactNode;
 }) {
   const { t } = useTranslation(["terminals"]);
   const setMaximized = useUiPreferences((prefs) => prefs.setTerminalMaximized);
@@ -401,6 +435,7 @@ function TerminalToolbar({
       >
         <TextSelect aria-hidden="true" />
       </Button>
+      {utilities}
       <TerminalSettingsMenu />
       <Button
         type="button"

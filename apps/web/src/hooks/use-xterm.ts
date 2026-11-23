@@ -15,6 +15,8 @@ import {
 import { type FitEvent, INITIAL_FIT_STATE, isFitHeld, reduceFit } from "@/lib/terminal-fit-state";
 import { clipboardPrefersText } from "@/lib/terminal-image-clipboard";
 import type { TerminalImageAttachment } from "@/lib/terminal-images";
+import { stripPasteMarkers } from "@/lib/terminal-key-encoding";
+import { TERMINAL_FONT_DEFAULT } from "@/lib/terminal-key-gestures";
 import { newlineSequence } from "@/lib/terminal-keys";
 import type { TerminalShiftEnterMode } from "@/lib/terminal-settings";
 import { TERMINAL_FONT_FAMILY, TERMINAL_THEME } from "@/lib/terminal-theme";
@@ -53,7 +55,44 @@ type XtermHandlers = {
    * paste only pastes into the session it started in: a reattach meanwhile cancels it.
    */
   currentSession?: () => unknown;
+  /**
+   * Typed keyboard data (not a paste, a wheel or a reply) on its way out: returns what to send
+   * instead (the key row's latched Ctrl/Alt applied), or the data itself.
+   */
+  transformInput?: (data: string, applicationCursor: boolean) => string;
+  /** A text size change was applied and the terminal refitted to it. */
+  onFontApplied?: (geometry: TerminalGeometry) => void;
 };
+
+export type TerminalGeometry = { fontSize: number; cols: number; rows: number };
+
+/**
+ * What on-screen controls (the Utilities key row, the Paste and Photo dialogs) do to this
+ * terminal. Each call must come from the person's own event handler: it counts as their input,
+ * so a viewer who is not the writer takes over, exactly as a key typed on the keyboard does.
+ */
+export type TerminalControls = {
+  /** Send key bytes as typed input (latched modifiers are the caller's). */
+  sendKeys: (data: string) => void;
+  /** Paste text as the person's paste: bracketed when the program asked for it. */
+  paste: (text: string) => void;
+  /** Upload images and type their paths, as a pasted image is. */
+  pasteImages: (files: File[]) => void;
+  /** Arrows send `ESC O x` (DECCKM) instead of `ESC [ x`. */
+  applicationCursor: () => boolean;
+  /** The program asked for bracketed paste. */
+  bracketedPaste: () => boolean;
+  /** The terminal has keyboard focus (on a phone: its keyboard is up). */
+  focused: () => boolean;
+  focus: () => void;
+  blur: () => void;
+  /** The element that holds the terminal's keyboard focus (to hand focus back to it). */
+  focusTarget: () => HTMLElement | null;
+  /** The terminal's size now, in cells. */
+  size: () => { cols: number; rows: number } | null;
+};
+
+type ControlsImpl = Pick<TerminalControls, "sendKeys" | "paste" | "pasteImages">;
 
 type XtermOptions = XtermHandlers & {
   /** Render at this PTY size (someone else is typing), or null to fit the box. */
@@ -62,6 +101,11 @@ type XtermOptions = XtermHandlers & {
   shiftEnter: TerminalShiftEnterMode;
   /** Select text mode: input is paused, including image pastes that finish uploading meanwhile. */
   selecting: boolean;
+  /**
+   * The text size in px (default 13). A change refits: the writer resizes the PTY, a follower
+   * only rescales.
+   */
+  fontSize?: number;
   /**
    * The pane is the visible tab. A hidden pane never fits or reports a size, and it drops any
    * gesture authorization it had.
@@ -101,12 +145,18 @@ export function useXterm(options: XtermOptions): {
   followResize: (size: TerminalSize) => void;
   /** The scrollback and screen as plain text, for Select text mode. */
   snapshot: () => string;
+  /** On-screen controls for this terminal (a stable object). */
+  controls: TerminalControls;
 } {
   const handlersRef = useLatestRef<XtermHandlers>(options);
   const followRef = useLatestRef(options.follow);
   const shiftEnterRef = useLatestRef(options.shiftEnter);
   const selectingRef = useLatestRef(options.selecting);
   const activeRef = useLatestRef(options.active);
+  const fontSize = options.fontSize ?? TERMINAL_FONT_DEFAULT;
+  const fontSizeRef = useLatestRef(fontSize);
+  /** The current xterm's input paths for on-screen controls, owned by the xterm effect. */
+  const controlsImplRef = useRef<ControlsImpl | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const writerRef = useRef<ReturnType<typeof createReplayAwareWriter> | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -217,7 +267,7 @@ export function useXterm(options: XtermOptions): {
     const term = new Terminal({
       cursorBlink: true,
       fontFamily: TERMINAL_FONT_FAMILY,
-      fontSize: 13,
+      fontSize: fontSizeRef.current,
       lineHeight: 1.2,
       // Option+drag selects text on a Mac even while tmux or an app has the mouse.
       macOptionClickForcesSelection: true,
@@ -307,7 +357,22 @@ export function useXterm(options: XtermOptions): {
       if (imagePaste && typeof data === "string")
         imagePaste.sent =
           handlersRef.current.onImagePaste?.(imagePaste.attachment, data) ?? Promise.resolve(false);
-      else handlersRef.current.onData(data, origin);
+      else handlersRef.current.onData(typedKeyData(data, origin), origin);
+    };
+    /**
+     * Data from a key typed on the keyboard (a phone's sends text, often without a usable keydown)
+     * gets the key row's latched modifiers. A paste, a wheel or touch scroll's input, and replies
+     * never do.
+     */
+    const typedKeyData = (
+      data: string | Uint8Array,
+      origin: Exclude<TerminalInputOrigin, "typed">,
+    ): string | Uint8Array => {
+      const transform = handlersRef.current.transformInput;
+      if (!transform || typeof data !== "string" || origin !== "user" || pasting) return data;
+      if (view?.event?.type === "paste") return data;
+      if (wheelEvent !== null && view?.event === wheelEvent) return data;
+      return transform(data, term.modes.applicationCursorKeysMode);
     };
     const disposeCopyOut = wireTerminalCopyOut(
       term,
@@ -389,6 +454,16 @@ export function useXterm(options: XtermOptions): {
     };
     let disposed = false;
     let uploading = false;
+    /** Set while this hook pastes text itself: a paste is never a key for a latched modifier. */
+    let pasting = false;
+    const pasteText = (text: string) => {
+      pasting = true;
+      try {
+        term.paste(text);
+      } finally {
+        pasting = false;
+      }
+    };
     const pasteImages = async (files: File[], fallbackText = "") => {
       if (uploading) {
         handlersRef.current.onImageError?.(new Error("busy"));
@@ -444,7 +519,7 @@ export function useXterm(options: XtermOptions): {
           (error.message === "update" || error.message === "unavailable")
         ) {
           armInput();
-          term.paste(fallbackText);
+          pasteText(fallbackText);
         } else handlersRef.current.onImageError?.(error);
       } finally {
         uploading = false;
@@ -495,6 +570,35 @@ export function useXterm(options: XtermOptions): {
       term.focus();
       void pasteImages(files);
     };
+    const controlsImpl: ControlsImpl = {
+      sendKeys: (data) => {
+        if (disposed || !activeRef.current || selectingRef.current || data.length === 0) return;
+        // The person's own key, from its event handler: real input, as a keydown is.
+        armTextInput();
+        handlersRef.current.onData(data, "user");
+      },
+      paste: (text) => {
+        if (disposed || !activeRef.current || selectingRef.current) return;
+        const clean = stripPasteMarkers(text);
+        if (clean.length === 0) return;
+        armTextInput();
+        pasteText(clean);
+      },
+      pasteImages: (files) => {
+        if (disposed || files.length === 0) return;
+        // Input is paused during Select text (and a hidden pane takes none): no upload starts.
+        if (selectingRef.current) {
+          handlersRef.current.onImageError?.(new Error("selecting"));
+          return;
+        }
+        if (!activeRef.current) {
+          handlersRef.current.onImageError?.(new Error("hidden"));
+          return;
+        }
+        void pasteImages(files);
+      },
+    };
+    controlsImplRef.current = controlsImpl;
     container.addEventListener("keydown", armKey, true);
     container.addEventListener("compositionstart", armInput, true);
     container.addEventListener("compositionupdate", armInput, true);
@@ -514,6 +618,7 @@ export function useXterm(options: XtermOptions): {
     layout();
     return () => {
       disposed = true;
+      if (controlsImplRef.current === controlsImpl) controlsImplRef.current = null;
       observer.disconnect();
       touchScroll.dispose();
       if (touchScrollRef.current === touchScroll) touchScrollRef.current = null;
@@ -544,6 +649,7 @@ export function useXterm(options: XtermOptions): {
     container,
     dispatchFit,
     followRef,
+    fontSizeRef,
     gate,
     handlersRef,
     inputGate,
@@ -606,6 +712,40 @@ export function useXterm(options: XtermOptions): {
     // Following again: a writer fit still waiting no longer applies.
     if (dispatchFit({ type: "followed" })) layout();
   }, [container, dispatchFit, followCols, followRows, layout]);
+
+  // A new text size: xterm measures the new cell on the next frame, then the pane refits. The
+  // writer's new cols x rows reach the PTY through onResize; a follower keeps the PTY size and
+  // only rescales.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!container || !term || term.options.fontSize === fontSize) return;
+    term.options.fontSize = fontSize;
+    const frame = requestAnimationFrame(() => {
+      if (termRef.current !== term) return;
+      layout();
+      handlersRef.current.onFontApplied?.({ fontSize, cols: term.cols, rows: term.rows });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [container, fontSize, handlersRef, layout]);
+
+  const [controls] = useState<TerminalControls>(() => ({
+    sendKeys: (data) => controlsImplRef.current?.sendKeys(data),
+    paste: (text) => controlsImplRef.current?.paste(text),
+    pasteImages: (files) => controlsImplRef.current?.pasteImages(files),
+    applicationCursor: () => termRef.current?.modes.applicationCursorKeysMode ?? false,
+    bracketedPaste: () => termRef.current?.modes.bracketedPasteMode ?? false,
+    focused: () => {
+      const textarea = termRef.current?.textarea;
+      return !!textarea && textarea.ownerDocument.activeElement === textarea;
+    },
+    focus: () => termRef.current?.focus(),
+    blur: () => termRef.current?.blur(),
+    focusTarget: () => termRef.current?.textarea ?? null,
+    size: () => {
+      const term = termRef.current;
+      return term ? { cols: term.cols, rows: term.rows } : null;
+    },
+  }));
 
   const write = useCallback((data: Uint8Array, replay = false) => {
     writerRef.current?.write(data, replay);
@@ -679,5 +819,6 @@ export function useXterm(options: XtermOptions): {
     focus,
     followResize,
     snapshot,
+    controls,
   };
 }
