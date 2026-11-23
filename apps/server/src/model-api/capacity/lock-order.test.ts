@@ -83,6 +83,8 @@ const ADVISORY_SITES: Record<string, string> = {
     "Writer class D: restore takes the migration runner lock on a dedicated connection before replacing the database.",
   "scripts/db/lib/migration-state.mjs":
     "Writer class D: tryHoldRunnerLock, the non-waiting migration runner lock `pnpm db:migrate:apply` holds on a dedicated local connection before it resolves a failed migration.",
+  "scripts/db/lib/replaces.mjs":
+    "Writer class D: the release reconciliation's transaction-scoped try-lock on Prisma's migration lock (never waits), on the migration runner lock's dedicated session.",
   "scripts/db/test-migrations.mjs":
     "Test driver: holds the runner lock against a disposable Postgres.",
   "scripts/backup/test-backup-restore.mjs":

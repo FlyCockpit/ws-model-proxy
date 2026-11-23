@@ -15,7 +15,7 @@
  *
  * Diffs the Prisma schema against what production ends up with: every
  * migration.sql, then every contract.sql (scripts/db/lib/diff-source.mjs).
- * Splits the result (expand and contract, patterns/schema-migrations.md):
+ * Splits the result (expand and contract, docs/schema-migrations.md):
  *   packages/db/prisma/migrations/<YYYYMMDDHHMMSS>_<name>/migration.sql
  *     what changes at deploy, safe for the release that is still running;
  *   …/contract.sql (only when something is deleted)
@@ -268,8 +268,8 @@ export function report(built, { rel, contractRel }) {
     say("\nThe release that is still running cannot work with this change (CI check 5 fails it):");
     for (const item of built.analysis.incompatible) say(`  line ${item.line}: ${item.what}`);
     say(
-      "  A rename: undo it and keep the database name with @map / @@map (patterns/schema-changes-recipe.md, Recipe 3).",
-      "  A type change: use the two-PR recipe (patterns/schema-changes-recipe.md, Recipe 5).",
+      "  A rename: undo it and keep the database name with @map / @@map (docs/schema-changes-recipe.md, Recipe 3).",
+      "  A type change: use the two-PR recipe (docs/schema-changes-recipe.md, Recipe 5).",
       "  Anything else: stop and ask the owner.",
     );
   }

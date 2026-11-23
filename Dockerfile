@@ -220,7 +220,7 @@ COPY --from=builder /app/apps/web/dist ./apps/web/dist
 # their relative imports and fails when one is not copied here.
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY scripts/db/migrate-runtime.mjs ./scripts/db/
-COPY scripts/db/lib/baseline.mjs scripts/db/lib/contracts.mjs scripts/db/lib/migration-state.mjs scripts/db/lib/prisma.mjs scripts/db/lib/sql.mjs ./scripts/db/lib/
+COPY scripts/db/lib/baseline.mjs scripts/db/lib/contracts.mjs scripts/db/lib/migration-state.mjs scripts/db/lib/prisma.mjs scripts/db/lib/replaces.mjs scripts/db/lib/sql.mjs ./scripts/db/lib/
 COPY scripts/backup/pre-migrate.sh \
      scripts/backup/restore.sh \
      scripts/backup/restore.mjs \

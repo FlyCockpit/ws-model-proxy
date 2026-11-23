@@ -47,12 +47,17 @@
  *   - runtime: two concurrent leaders serialize on the runner lock (one
  *     deploy, both exit 0); a migration another session is still applying
  *     (Prisma's lock held) is refused and left untouched
+ *   - release migrations (scripts/db/test-release.mjs): every prefix of a
+ *     squashed chain reconciles to the fresh schema with its rows; contract
+ *     state carried over; tampered copies, checksum mismatches and unknown
+ *     migrations refused; followers wait; db:migrate:apply reconciles too
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -73,6 +78,7 @@ import { readMigrationsFolder } from "./lib/migration-state.mjs";
 import { loadPg, ROOT } from "./lib/prisma.mjs";
 import { wrapTransactional } from "./lib/sql.mjs";
 import { contractScenarios } from "./test-contracts.mjs";
+import { releaseScenarios } from "./test-release.mjs";
 
 const pg = loadPg();
 const results = [];
@@ -189,7 +195,32 @@ INSERT INTO "project" ("id", "ownerId", "name", "notes") VALUES
   ('fx_project_3', 'fx_user_case', 'fixture project', 'Multi-line
 notes with ''quotes'' and "double quotes"');`);
 
-function makeRepo() {
+/**
+ * The create flow's starting point for `pnpm db:baseline`: a history the
+ * template hands a new app (one `0_init`, no fixtures, no release tag), over a
+ * schema of only the fixture model. The app's own 0.4.3 baseline, 1.0 upgrade
+ * and tags are not that, so baselineScenarios() never uses them.
+ */
+const BASELINE_INIT_SQL = wrapTransactional(`-- CreateTable
+CREATE TABLE "project" (
+    "id" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "ownerId" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "notes" TEXT,
+
+    CONSTRAINT "project_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateIndex
+CREATE INDEX "project_ownerId_createdAt_idx" ON "project"("ownerId", "createdAt" DESC);`);
+
+/**
+ * @param {{ templateHistory?: boolean }} [options] templateHistory: the
+ *   BASELINE_INIT_SQL repo for baselineScenarios() instead of the app's history.
+ */
+function makeRepo({ templateHistory = false } = {}) {
   const repo = mkdtempSync(path.join(tmpdir(), "wmp-migrations-e2e-"));
   for (const rel of [
     "scripts/db",
@@ -206,12 +237,24 @@ function makeRepo() {
       filter: (src) => !/\.test\.mjs$/.test(src),
     });
   }
-  writeFileSync(path.join(repo, "packages/db/prisma/schema/projects.prisma"), FIXTURE_SCHEMA);
-  mkdirSync(path.join(repo, "packages/db/prisma/migrations", FIXTURE_FOLDER));
-  writeFileSync(
-    path.join(repo, "packages/db/prisma/migrations", FIXTURE_FOLDER, "migration.sql"),
-    FIXTURE_SQL,
-  );
+  const schemaDir = path.join(repo, "packages/db/prisma/schema");
+  const migrationsDir = path.join(repo, "packages/db/prisma/migrations");
+  const fixturesDir = path.join(repo, "packages/db/prisma/fixtures");
+  if (templateHistory) {
+    for (const name of readdirSync(schemaDir))
+      if (name !== "schema.prisma") rmSync(path.join(schemaDir, name));
+    for (const name of readdirSync(migrationsDir))
+      if (name !== "migration_lock.toml")
+        rmSync(path.join(migrationsDir, name), { recursive: true });
+    rmSync(fixturesDir, { recursive: true });
+    mkdirSync(path.join(migrationsDir, "0_init"));
+    writeFileSync(path.join(migrationsDir, "0_init", "migration.sql"), BASELINE_INIT_SQL);
+  }
+  writeFileSync(path.join(schemaDir, "projects.prisma"), FIXTURE_SCHEMA);
+  if (!templateHistory) {
+    mkdirSync(path.join(migrationsDir, FIXTURE_FOLDER));
+    writeFileSync(path.join(migrationsDir, FIXTURE_FOLDER, "migration.sql"), FIXTURE_SQL);
+  }
   symlinkSync(path.join(ROOT, "node_modules"), path.join(repo, "node_modules"));
   symlinkSync(
     path.join(ROOT, "packages/db/node_modules"),
@@ -234,8 +277,137 @@ function makeRepo() {
   g("add", "-A");
   g("commit", "-q", "-m", "base");
   // The base migration is released: check 3 protects what a release tag holds.
-  g("tag", "v0.0.1");
+  if (!templateHistory) g("tag", "v0.0.1");
   return { repo, git: g };
+}
+
+/**
+ * `pnpm db:baseline` (the create flow) in a fresh repo with the template's
+ * marker: a lone 0_init is kept byte for byte; an inherited multi-folder
+ * history is folded into a regenerated 0_init; refusals for rows created by
+ * migrations, unrecognized files, and the app's own release tags; tags that
+ * came with the template are only reported.
+ */
+async function baselineScenarios({ serverUrl, env }) {
+  const { repo: b, git: bg } = makeRepo({ templateHistory: true });
+  const mig = path.join(b, "packages/db/prisma/migrations");
+  const marker = path.join(b, "packages/db/prisma/template-history.json");
+  const schemaFile = path.join(b, "packages/db/prisma/schema/projects.prisma");
+  const baseline = () =>
+    sh(process.execPath, [path.join(b, "scripts/db/baseline.mjs")], {
+      cwd: b,
+      env: { ...env, CHECK_DATABASE_URL: serverUrl },
+    });
+  const addMarker = () => {
+    writeFileSync(marker, '{ "note": "test" }\n');
+    bg("add", "-A");
+    bg("commit", "-q", "-m", "marker");
+  };
+  const init = () => readFileSync(path.join(mig, "0_init/migration.sql"), "utf8");
+  try {
+    const original = init();
+    await step(
+      "baseline: a lone inherited 0_init is kept byte for byte; the marker goes",
+      async () => {
+        addMarker();
+        const r = baseline();
+        assert.equal(r.code, 0, r.out);
+        assert.match(r.out, /already a single 0_init/);
+        assert.equal(init(), original);
+        assert.equal(existsSync(marker), false);
+        bg("add", "-A");
+        bg("commit", "-q", "-m", "baseline");
+      },
+    );
+    await step(
+      "baseline: an inherited multi-folder history is folded into a regenerated 0_init",
+      async () => {
+        addMarker();
+        const schema = readFileSync(schemaFile, "utf8");
+        writeFileSync(
+          schemaFile,
+          schema.replace(
+            "  notes     String?",
+            '  notes     String?\n  extra     String?  @map("extra")',
+          ),
+        );
+        const folder = "20990101000000_add_extra";
+        newFolder(mig, folder, wrapTransactional('ALTER TABLE "project" ADD COLUMN "extra" TEXT;'));
+        mkdirSync(path.join(b, "packages/db/prisma/fixtures"), { recursive: true });
+        writeFileSync(
+          path.join(b, "packages/db/prisma/fixtures", `${folder}.check.sql`),
+          "SELECT 1 WHERE false;\n",
+        );
+        bg("add", "-A");
+        bg("commit", "-q", "-m", "template PR");
+        bg("tag", "v9.9.9"); // a template release tag (its tree has the marker)
+        const r = baseline();
+        assert.equal(r.code, 0, r.out);
+        assert.match(r.out, /Proved: 2 inherited migration\(s\) and the new 0_init/);
+        assert.match(r.out, /The release tags v9\.9\.9 came from the template/);
+        assert.deepEqual(readdirSync(mig).sort(), ["0_init", "migration_lock.toml"]);
+        assert.match(init(), /"extra" TEXT/);
+        assert.equal(existsSync(marker), false);
+        assert.match(
+          readFileSync(path.join(b, "packages/db/prisma/fixtures/0_init.check.sql"), "utf8"),
+          /-- from 20990101000000_add_extra\.check\.sql/,
+        );
+        bg("add", "-A");
+        bg("commit", "-q", "-m", "baseline 2");
+        bg("tag", "-d", "v9.9.9");
+      },
+    );
+    await step(
+      "baseline: refuses rows created by migrations, unrecognized files, and the app's own release tags",
+      async () => {
+        addMarker();
+        newFolder(
+          mig,
+          "20990102000000_seed_rows",
+          wrapTransactional(
+            `INSERT INTO "project" ("id", "ownerId", "name") VALUES ('p1', 'u1', 'Seeded');`,
+          ),
+        );
+        bg("add", "-A");
+        bg("commit", "-q", "-m", "data migration");
+        const rows = baseline();
+        assert.equal(rows.code, 1, rows.out);
+        assert.match(
+          rows.out,
+          /create 1 row\(s\) in "project"; a 0_init regenerated from the schema would not/,
+        );
+        assert.equal(
+          existsSync(path.join(mig, "20990102000000_seed_rows")),
+          true,
+          "nothing written",
+        );
+        writeFileSync(path.join(b, "packages/db/prisma/fixtures/draft.sql"), "-- wip\n");
+        bg("add", "-A");
+        bg("commit", "-q", "-m", "stray fixture");
+        const stray = baseline();
+        assert.equal(stray.code, 1, stray.out);
+        assert.match(stray.out, /files this command does not recognize[\s\S]*fixtures\/draft\.sql/);
+        writeFileSync(path.join(b, "packages/db/prisma/fixtures/untracked.sql"), "-- wip\n");
+        assert.match(baseline().out, /uncommitted, untracked or ignored files/);
+        rmSync(path.join(b, "packages/db/prisma/fixtures/untracked.sql"));
+        rmSync(marker);
+        bg("add", "-A");
+        bg("commit", "-q", "-m", "app release");
+        bg("tag", "v1.0.0"); // the app's own release: no marker in its tree
+        writeFileSync(marker, '{ "note": "test" }\n');
+        const tagged = baseline();
+        assert.equal(tagged.code, 1, tagged.out);
+        assert.match(tagged.out, /release tags of its own \(v1\.0\.0\)/);
+      },
+    );
+  } finally {
+    rmSync(b, { recursive: true, force: true });
+  }
+}
+
+function newFolder(migrations, folder, sql) {
+  mkdirSync(path.join(migrations, folder), { recursive: true });
+  writeFileSync(path.join(migrations, folder, "migration.sql"), sql);
 }
 
 async function main() {
@@ -1173,6 +1345,9 @@ async function main() {
       pg,
       sh,
     });
+
+    await releaseScenarios({ step, serverUrl: server.url, repo, pg });
+    await baselineScenarios({ serverUrl: server.url, env });
   } finally {
     server.stop();
     rmSync(repo, { recursive: true, force: true });

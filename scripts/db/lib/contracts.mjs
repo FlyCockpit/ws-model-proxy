@@ -87,8 +87,14 @@ const MIGRATION_DDL = `CREATE TABLE IF NOT EXISTS %1$I."_wmp_migration" (
   contract_last_error text,
   contract_backup text,
   contract_note text,
-  contract_notified_at timestamptz
+  contract_notified_at timestamptz,
+  contract_done_parts text[]
 )`;
+// Added after the table first shipped: existing databases get it here.
+// contract_done_parts: the `-- wmp:from` sections of a release's
+// contract.sql that already ran as replaced migrations' contracts
+// (scripts/db/lib/replaces.mjs); only the rest is applied.
+const MIGRATION_COLUMNS_DDL = `ALTER TABLE %1$I."_wmp_migration" ADD COLUMN IF NOT EXISTS contract_done_parts text[]`;
 export const HOLD_DDL = `CREATE TABLE IF NOT EXISTS %1$I."_wmp_hold" (
   reason text PRIMARY KEY,
   until timestamptz NOT NULL,
@@ -163,6 +169,14 @@ export async function runtimeTablesExist(client, schema) {
 /** CREATE TABLE IF NOT EXISTS for every runner-owned table. Runner lock held. */
 export async function ensureRuntimeTables(client, schema) {
   for (const ddl of RUNTIME_DDL) await client.query(ddlFor(ddl, schema));
+  // Only when missing: ALTER takes an exclusive lock even when it does nothing.
+  const { rows } = await client.query(
+    `SELECT 1 FROM pg_catalog.pg_attribute
+      WHERE attrelid = to_regclass(format('%I."_wmp_migration"', $1::text))
+        AND attname = 'contract_done_parts' AND NOT attisdropped`,
+    [schema],
+  );
+  if (!rows.length) await client.query(ddlFor(MIGRATION_COLUMNS_DDL, schema));
 }
 
 // --- recording applied migrations (F7) ---------------------------------------
