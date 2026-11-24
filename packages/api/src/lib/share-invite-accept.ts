@@ -305,15 +305,22 @@ export async function claimShareInviteForSignup(
   const tokenDigest = shareInviteDigest(token);
   const invite = await prisma.shareInvite.findFirst({
     where: { tokenDigest, ...pendingInviteWhere(now) },
-    select: { id: true, ...claimSelect },
+    select: { id: true, updatedAt: true, ...claimSelect },
   });
   if (!invite) return "invalid";
   const hold = await claimHold(invite, claimant, now);
   if (hold === "in_use") return "in_use";
   if (hold === "taken") return "invalid";
+  // A claim is no owner change: `updatedAt` (the resend cooldown clock) keeps its value, so a
+  // sign-up attempt leaves no trace the owner could see (guarded on it, so a concurrent owner
+  // change is never written back over).
   const claimed = await prisma.shareInvite.updateMany({
-    where: { id: invite.id, ...liveInviteWhere(now, linkHoldWhere(tokenDigest, invite)) },
-    data: { signupClaimedAt: now, signupClaimedEmail: claimant },
+    where: {
+      id: invite.id,
+      updatedAt: invite.updatedAt,
+      ...liveInviteWhere(now, linkHoldWhere(tokenDigest, invite)),
+    },
+    data: { signupClaimedAt: now, signupClaimedEmail: claimant, updatedAt: invite.updatedAt },
   });
   if (claimed.count === 1) return "claimed";
   // Lost the swap: to another claim (in use), or the invite was accepted, revoked, expired or
@@ -325,9 +332,45 @@ export async function claimShareInviteForSignup(
   return still ? "in_use" : "invalid";
 }
 
+/**
+ * Undoes a sign-up's claim when its account was not created: only the claim this e-mail made
+ * at `claimedAt`, and `updatedAt` kept as it is (like the claim), so the invite reads as if that
+ * sign-up never ran. Left alone: a later claim, any change since (acceptance, revocation, resend,
+ * an owner edit), and a claim whose e-mail has an account by now (a concurrent sign-up of the
+ * same e-mail won, and its acceptance needs the claim).
+ */
+export async function releaseShareInviteSignupClaim(
+  token: string,
+  email: string,
+  claimedAt: Date,
+): Promise<void> {
+  if (!SHARE_INVITE_TOKEN_PATTERN.test(token)) return;
+  const claimant = inviteEmailKey(email);
+  const ours = {
+    tokenDigest: shareInviteDigest(token),
+    signupClaimedEmail: claimant,
+    signupClaimedAt: claimedAt,
+  };
+  const invite = await prisma.shareInvite.findFirst({
+    where: ours,
+    select: { id: true, updatedAt: true },
+  });
+  if (!invite) return;
+  const account = await prisma.user.findUnique({
+    where: { email: claimant },
+    select: { id: true },
+  });
+  if (account) return;
+  await prisma.shareInvite.updateMany({
+    where: { id: invite.id, updatedAt: invite.updatedAt, ...ours },
+    data: { signupClaimedAt: null, signupClaimedEmail: null, updatedAt: invite.updatedAt },
+  });
+}
+
 registerShareInviteAcceptor((user) => acceptShareInvitesForProvenEmail(user));
 registerShareInviteLinkAcceptor({
   isPending: (token) => isPendingShareInvite(token),
-  claim: (token, email) => claimShareInviteForSignup(token, email),
+  claim: (token, email, claimedAt) => claimShareInviteForSignup(token, email, claimedAt),
+  release: (token, email, claimedAt) => releaseShareInviteSignupClaim(token, email, claimedAt),
   accept: (user, token) => acceptClaimedShareInvite(user, token),
 });

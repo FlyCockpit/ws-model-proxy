@@ -8,6 +8,7 @@ import {
   isPendingShareInviteToken,
   registerShareInviteAcceptor,
   registerShareInviteLinkAcceptor,
+  releaseShareInviteToken,
 } from "./share-invite-acceptance";
 
 describe("share invite acceptance registry", () => {
@@ -24,17 +25,22 @@ describe("share invite acceptance registry", () => {
     const token = "wsmp_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     const user = { id: "u", email: "other@example.test" };
     await expect(isPendingShareInviteToken(token)).resolves.toBe(false);
-    await expect(claimShareInviteToken(token, user.email)).resolves.toBe("invalid");
+    const claimedAt = new Date();
+    await expect(claimShareInviteToken(token, user.email, claimedAt)).resolves.toBe("invalid");
+    await expect(releaseShareInviteToken(token, user.email, claimedAt)).resolves.toBeUndefined();
     await expect(acceptClaimedShareInviteToken(user, token)).resolves.toBe(false);
     const isPending = vi.fn(async () => true);
     const claim = vi.fn(async () => "claimed" as const);
     const accept = vi.fn(async () => true);
-    registerShareInviteLinkAcceptor({ isPending, claim, accept });
+    const release = vi.fn(async () => {});
+    registerShareInviteLinkAcceptor({ isPending, claim, accept, release });
     await expect(isPendingShareInviteToken(token)).resolves.toBe(true);
-    await expect(claimShareInviteToken(token, user.email)).resolves.toBe("claimed");
+    await expect(claimShareInviteToken(token, user.email, claimedAt)).resolves.toBe("claimed");
+    await releaseShareInviteToken(token, user.email, claimedAt);
     await expect(acceptClaimedShareInviteToken(user, token)).resolves.toBe(true);
     expect(isPending).toHaveBeenCalledWith(token);
-    expect(claim).toHaveBeenCalledWith(token, user.email);
+    expect(claim).toHaveBeenCalledWith(token, user.email, claimedAt);
+    expect(release).toHaveBeenCalledWith(token, user.email, claimedAt);
     expect(accept).toHaveBeenCalledWith(user, token);
   });
 

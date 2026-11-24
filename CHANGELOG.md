@@ -51,6 +51,13 @@ style. See [release notes](docs/release-notes/) for the 0.4.x history.
 
 ### Security
 
+- With SMTP configured, `POST /api/auth/sign-up/email` no longer tells whether an address already
+  has an account: every successful sign-up answers `{"token":null,"user":null}`, a refusal during
+  account creation (for example an invite link whose claim is in use) answers the same and
+  releases any invite claim it made, a requested slug another account holds gets the same 422 for
+  every address, and a NUL byte in a stored field the same 400. Verification mail is sent in the
+  background, so a slow or failing SMTP server no longer shows in the sign-up or resend response.
+
 - The backup writer key (`BACKUP_S3_ACCESS_KEY_ID` / `BACKUP_S3_SECRET_ACCESS_KEY`) is held
   only while the migration runner and its backups run: the entrypoint unsets it before it
   `exec`s the server, so the server's environment and `/proc/1/environ` no longer carry it.

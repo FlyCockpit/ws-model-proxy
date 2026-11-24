@@ -20,7 +20,12 @@ export type ShareInviteLinkAcceptor = {
    * Reserves the token's pending invite for one sign-up's e-mail (atomic). `in_use`: another
    * e-mail's sign-up holds it right now; `invalid`: not pending, or kept by another account.
    */
-  claim: (token: string, email: string) => Promise<ShareInviteClaimResult>;
+  claim: (token: string, email: string, claimedAt: Date) => Promise<ShareInviteClaimResult>;
+  /**
+   * Undoes the claim this sign-up made at `claimedAt` when its account was not created, so a
+   * failed sign-up leaves no reservation behind; a later claim is left alone.
+   */
+  release: (token: string, email: string, claimedAt: Date) => Promise<void>;
   /** Turns the invite this user's sign-up claimed into their share; false when it could not. */
   accept: (user: { id: string; email: string }, token: string) => Promise<boolean>;
 };
@@ -54,8 +59,18 @@ export async function isPendingShareInviteToken(token: string): Promise<boolean>
 export async function claimShareInviteToken(
   token: string,
   email: string,
+  claimedAt: Date,
 ): Promise<ShareInviteClaimResult> {
-  return linkAcceptor ? linkAcceptor.claim(token, email) : "invalid";
+  return linkAcceptor ? linkAcceptor.claim(token, email, claimedAt) : "invalid";
+}
+
+/** Releases a claim a failed sign-up made; a no-op when no link acceptor is registered. */
+export async function releaseShareInviteToken(
+  token: string,
+  email: string,
+  claimedAt: Date,
+): Promise<void> {
+  if (linkAcceptor) await linkAcceptor.release(token, email, claimedAt);
 }
 
 /** Accepts the invite a sign-up claimed; false when no link acceptor is registered. */

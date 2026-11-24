@@ -89,6 +89,7 @@ const accept = vi.fn(async (user: { id: string; email: string }, _token: string)
   return true;
 });
 const acceptEmail = vi.fn(async () => 0);
+const release = vi.fn(async () => {});
 
 const row = (id = "new-user", email = `${id}@example.test`) => ({
   id,
@@ -132,7 +133,7 @@ beforeEach(() => {
   });
   getSignupAccessState.mockResolvedValue(closed);
   registerShareInviteAcceptor(acceptEmail);
-  registerShareInviteLinkAcceptor({ isPending, claim, accept });
+  registerShareInviteLinkAcceptor({ isPending, claim, accept, release });
 });
 afterEach(() => {
   vi.restoreAllMocks();
@@ -141,7 +142,7 @@ afterEach(() => {
 describe("invite-link sign-up with open sign-up off", () => {
   it("admits a pending token as user, claims the invite for the e-mail and accepts it", async () => {
     await expect(signUp("friend")).resolves.toMatchObject({ data: { role: "user" } });
-    expect(claim).toHaveBeenCalledWith(TOKEN, "friend@example.test");
+    expect(claim).toHaveBeenCalledWith(TOKEN, "friend@example.test", expect.any(Date));
     expect(accept).toHaveBeenCalledWith({ id: "friend", email: "friend@example.test" }, TOKEN);
     expect(invite.pending).toBe(false);
     expect(acceptEmail).toHaveBeenCalledTimes(1);

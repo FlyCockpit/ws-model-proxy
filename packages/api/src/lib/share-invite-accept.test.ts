@@ -44,6 +44,7 @@ import {
   acceptShareInvitesForProvenEmail,
   claimShareInviteForSignup,
   isPendingShareInvite,
+  releaseShareInviteSignupClaim,
 } from "./share-invite-accept";
 import { pendingInviteWhere as pending, SHARE_INVITE_SIGNUP_CLAIM_MS } from "./share-invites";
 
@@ -403,20 +404,23 @@ describe("invite-link sign-up claim", () => {
   const now = new Date();
 
   it("claims a free invite for the e-mail with a compare-and-swap on the claim as read", async () => {
-    db.shareInvite.findFirst.mockResolvedValueOnce(invite);
+    // The owner's last change, the resend cooldown clock: a claim must not move it.
+    const updatedAt = new Date(now.getTime() - 120_000);
+    db.shareInvite.findFirst.mockResolvedValueOnce({ ...invite, updatedAt });
     db.shareInvite.updateMany.mockResolvedValueOnce({ count: 1 });
     await expect(claimShareInviteForSignup(TOKEN, " Other@example.test", now)).resolves.toBe(
       "claimed",
     );
-    expect(db.shareInvite.updateMany.mock.calls[0]?.[0]).toEqual({
+    expect(db.shareInvite.updateMany.mock.calls[0]?.[0]).toStrictEqual({
       where: {
         id: "inv1",
+        updatedAt,
         AND: [
           pending(now),
           { tokenDigest: DIGEST, signupClaimedAt: null, signupClaimedEmail: null },
         ],
       },
-      data: { signupClaimedAt: now, signupClaimedEmail: "other@example.test" },
+      data: { signupClaimedAt: now, signupClaimedEmail: "other@example.test", updatedAt },
     });
   });
 
@@ -487,6 +491,56 @@ describe("invite-link sign-up claim", () => {
     );
     db.shareInvite.findFirst.mockResolvedValueOnce(null);
     await expect(claimShareInviteForSignup(TOKEN, "a@example.test")).resolves.toBe("invalid");
+    expect(db.shareInvite.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("releasing a failed sign-up's claim", () => {
+  const claimedAt = new Date();
+  const updatedAt = new Date(claimedAt.getTime() - 120_000);
+  const ours = {
+    tokenDigest: DIGEST,
+    signupClaimedEmail: "friend@example.test",
+    signupClaimedAt: claimedAt,
+  };
+
+  beforeEach(() => {
+    db.shareInvite.findFirst.mockReset();
+    db.shareInvite.updateMany.mockReset();
+    db.user.findUnique.mockReset();
+  });
+
+  it("clears only the claim this e-mail made at that instant, keeping the cooldown clock", async () => {
+    db.shareInvite.findFirst.mockResolvedValueOnce({ id: "inv1", updatedAt });
+    db.user.findUnique.mockResolvedValueOnce(null);
+    db.shareInvite.updateMany.mockResolvedValueOnce({ count: 1 });
+    await releaseShareInviteSignupClaim(TOKEN, " Friend@example.test", claimedAt);
+    expect(db.shareInvite.findFirst).toHaveBeenCalledWith({
+      where: ours,
+      select: { id: true, updatedAt: true },
+    });
+    expect(db.shareInvite.updateMany).toHaveBeenCalledWith({
+      where: { id: "inv1", updatedAt, ...ours },
+      data: { signupClaimedAt: null, signupClaimedEmail: null, updatedAt },
+    });
+  });
+
+  it("keeps a claim whose e-mail has an account by now (a concurrent sign-up won)", async () => {
+    db.shareInvite.findFirst.mockResolvedValueOnce({ id: "inv1", updatedAt });
+    db.user.findUnique.mockResolvedValueOnce({ id: "winner" });
+    await releaseShareInviteSignupClaim(TOKEN, "friend@example.test", claimedAt);
+    expect(db.user.findUnique).toHaveBeenCalledWith({
+      where: { email: "friend@example.test" },
+      select: { id: true },
+    });
+    expect(db.shareInvite.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("writes nothing when the claim is no longer this one, or for a malformed token", async () => {
+    db.shareInvite.findFirst.mockResolvedValueOnce(null);
+    await releaseShareInviteSignupClaim(TOKEN, "friend@example.test", claimedAt);
+    await releaseShareInviteSignupClaim("wsmp_inv_short", "friend@example.test", claimedAt);
+    expect(db.shareInvite.findFirst).toHaveBeenCalledTimes(1);
     expect(db.shareInvite.updateMany).not.toHaveBeenCalled();
   });
 });

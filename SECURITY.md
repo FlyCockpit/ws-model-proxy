@@ -47,6 +47,26 @@ Only the 1.0.x release line is supported. Versions 0.4.x and earlier are unsuppo
   differs, a signed-in person who shares can learn whether an address belongs
   to an account with a proved e-mail. An unproved account and an unknown
   address get the same answer.
+- No account-existence oracle on the anonymous auth endpoints: with SMTP
+  configured, sign-up, resend verification, the password-reset request and a
+  wrong-password sign-in answer byte-identically (status, headers, body) for an
+  unknown, an unverified and a verified address. Sign-up needs the app's help
+  (`packages/auth/src/signup-response.ts`). Better Auth answers a registered
+  address with a synthetic user whose `role` and `slug` are null, so every
+  success body is replaced with `{"token":null,"user":null}`. Only a free
+  address goes on to user creation, so anything that refuses it there (an
+  invite link whose claim is in use, a database refusal, a slug race) gets that
+  same neutral 200, unless no account exists yet (the first-admin bootstrap),
+  and an invite claim it made is released. A requested slug another account
+  holds, and a NUL byte in a stored field, are refused before the address
+  lookup, the same answer for every address. Verification mail (sign-up,
+  resend, sign-in re-send) is sent in the background, so SMTP latency or a
+  failure never shows in the response. Known, deliberate differences: without
+  SMTP an account is usable at once, so sign-up signs a free address in and
+  tells a registered one it is taken; the right password on an unverified
+  account answers `EMAIL_NOT_VERIFIED` and re-sends the link; and a sign-up of a
+  free address creates that account (and mails it), so it can only show that
+  the address *was* free (a later sign-in, the extra time the new account costs).
 
 See `AGENTS.md` for the guardrails an AI coding agent must respect when
 working in this repo.

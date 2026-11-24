@@ -43,6 +43,13 @@ import {
   resolveBootstrapAdminIdentity,
   SignupDisabledError,
 } from "./signup-policy";
+import {
+  neutralizeSignUpResponse,
+  noteInviteClaim,
+  noteUserCreateAttempt,
+  refuseSignUpInputBeforeLookup,
+  releaseClaimOfFailedSignUp,
+} from "./signup-response";
 import { notifyUserBanned } from "./user-ban-listeners";
 import {
   isAdminCreateUserPath,
@@ -147,6 +154,29 @@ async function acceptClaimedInviteQuietly(user: unknown, token: string): Promise
       error instanceof Error ? error.name : "error",
     );
   }
+}
+
+/**
+ * The verification mail, in the recipient's locale. Better Auth's `additionalFields` are present
+ * at runtime but the callback's `user` is typed against the base user shape (`locale` isn't on
+ * it), so the row is read for the locale (the renderer falls back to en-US for any unsupported or
+ * missing value). The callbackURL is rewritten to the locale-prefixed verify-email page with a
+ * safe open-redirect guard; CORS_ORIGIN is the web origin on split-origin deploys so the absolute
+ * callback lands on the app.
+ */
+async function deliverVerificationEmail(
+  user: { id: string; email: string },
+  url: string,
+): Promise<void> {
+  const row = await prisma.user.findUnique({
+    where: { id: user.id },
+    select: { locale: true },
+  });
+  const { subject, html } = renderVerifyEmail({
+    url: withVerificationCallback(url, row?.locale, env.CORS_ORIGIN),
+    locale: row?.locale ?? "en-US",
+  });
+  await sendEmail({ to: user.email, subject, html });
 }
 
 const userSlugInputSchema = z
@@ -298,28 +328,20 @@ export const auth = betterAuth({
     ...passwordResetOptions(emailConfigured, env.CORS_ORIGIN),
   },
   emailVerification: {
+    // Not awaited (as the reset mail): the sign-up and resend answers must not depend on the
+    // delivery, since only a free address (sign-up) or a registered one (resend) gets a mail, so
+    // SMTP latency or a failure would tell the two apart. A failure is logged; the person can ask
+    // for the mail again.
     sendVerificationEmail: async ({ user, url }) => {
-      // Better-Auth's `additionalFields` are present at runtime but the
-      // sendVerificationEmail callback's `user` is typed against the base
-      // user shape — `locale` isn't on it. Fetch the row via Prisma so the
-      // recipient's preferred locale routes through to the renderer (which
-      // falls back to en-US for any unsupported / missing value).
-      const row = await prisma.user.findUnique({
-        where: { id: user.id },
-        select: { locale: true },
-      });
-      const { subject, html } = renderVerifyEmail({
-        // Rewrite callbackURL to the locale-prefixed verify-email page with a
-        // safe open-redirect guard. CORS_ORIGIN is the web origin on
-        // split-origin deploys so the absolute callback lands on the app.
-        url: withVerificationCallback(url, row?.locale, env.CORS_ORIGIN),
-        locale: row?.locale ?? "en-US",
-      });
-      await sendEmail({
-        to: user.email,
-        subject,
-        html,
-      });
+      void Promise.resolve()
+        .then(() => deliverVerificationEmail(user, url))
+        .catch((error: unknown) => {
+          console.error(
+            "verification email send failed",
+            `user=${user.id}`,
+            error instanceof Error ? error.name : "error",
+          );
+        });
     },
     sendOnSignUp: emailConfigured,
     // Re-send when an unverified user tries to sign in (only meaningful with
@@ -416,6 +438,13 @@ export const auth = betterAuth({
     before: createAuthMiddleware(async (ctx) => {
       await refuseImpersonatedAuthWrite(ctx);
       await refuseAdminRestoreOfDeletingUser(ctx);
+      // Sign-up answers the same for a free and a registered address, so it is no
+      // account-existence oracle (./signup-response.ts).
+      await refuseSignUpInputBeforeLookup(ctx);
+    }),
+    after: createAuthMiddleware(async (ctx) => {
+      await releaseClaimOfFailedSignUp(ctx);
+      return neutralizeSignUpResponse(ctx, { requireEmailVerification: emailConfigured });
     }),
   },
   databaseHooks: {
@@ -456,7 +485,11 @@ export const auth = betterAuth({
     user: {
       create: {
         before: async (user, context) => {
+          // Before anything here can refuse: a sign-up refused past this point answers like a
+          // registered address does (./signup-response.ts).
+          noteUserCreateAttempt(context);
           const { signupEnabled, userCount } = await getSignupAccessState();
+          noteUserCreateAttempt(context, userCount);
           const bootstrapAdminIdentity = resolveBootstrapAdminIdentity(user.email);
           // An invite link (the `x-wsmp-invite` header, public sign-up route only). With open
           // sign-up off it is what lets this sign-up through, so it must be pending here and
@@ -486,13 +519,17 @@ export const auth = betterAuth({
           });
           // Reserve the invite for this sign-up's e-mail (compare-and-swap), after every other
           // refusal so a refused request does not hold it. The claim is written outside the
-          // sign-up transaction: if the insert rolls back, the same e-mail can retry at once.
+          // sign-up transaction: if the insert rolls back, the sign-up's after hook releases it
+          // (./signup-response.ts), and the same e-mail can retry at once anyway.
           // Another e-mail inside the claim window gets "in use"; an invite that is no longer
           // available refuses the sign-up only when the invite is what admits it.
           if (inviteToken !== null && context && typeof user.email === "string") {
-            const claim = await claimShareInviteToken(inviteToken, user.email);
-            if (claim === "claimed") inviteClaims.set(context, inviteToken);
-            else if (claim === "in_use") throw inviteInUseError();
+            const claimedAt = new Date();
+            const claim = await claimShareInviteToken(inviteToken, user.email, claimedAt);
+            if (claim === "claimed") {
+              inviteClaims.set(context, inviteToken);
+              noteInviteClaim(context, { token: inviteToken, email: user.email, claimedAt });
+            } else if (claim === "in_use") throw inviteInUseError();
             else if (reliesOnInvite) throw new SignupDisabledError();
           }
           const locale = resolveSignupLocale(context?.headers);
