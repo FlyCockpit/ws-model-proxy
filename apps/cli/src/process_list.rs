@@ -617,15 +617,17 @@ mod tests {
         let name = std::ffi::OsStr::from_bytes(b"wsmp-scantest-\xc3\xa9");
         let program = dir.path().join(name);
         // A shell, not `sleep`: a multicall coreutils (uutils) picks its tool by file name, and
-        // a renamed copy exits at once. It waits for input until the test drops stdin.
+        // a renamed copy exits at once. It says it is running, then waits for input until the
+        // test drops stdin.
         std::fs::copy("/bin/sh", &program).unwrap();
         // Another test thread can fork while the copy is still open for writing, which makes
         // the exec fail with ETXTBSY until that child execs.
         let mut attempts = 0;
         let mut child = loop {
             match std::process::Command::new(&program)
-                .args(["-c", "read line"])
+                .args(["-c", "echo running; read line"])
                 .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
                 .spawn()
             {
                 Err(error)
@@ -637,6 +639,15 @@ mod tests {
                 spawned => break spawned.unwrap(),
             }
         };
+        // `spawn` can return before the child's exec gave it the script's name (until then its
+        // comm is this test thread's name). The script's first line proves the exec happened.
+        let mut running_line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut running_line,
+        )
+        .unwrap();
+        assert_eq!(running_line, "running\n", "the test process did not start");
         let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
         let comm = std::fs::read(format!("/proc/{pid}/comm")).unwrap();
         let listed = super::live();
