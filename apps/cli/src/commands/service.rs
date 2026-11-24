@@ -1252,6 +1252,15 @@ impl SessionDirs {
         }
         None
     }
+
+    /// fnm's default-version directory to search instead of a per-shell one:
+    /// the first candidate that outlives the session and is `installed`.
+    fn fnm_default_bin(&self, installed: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+        self.fnm_default_bins
+            .iter()
+            .find(|candidate| self.scope_of(candidate).is_none() && installed(candidate))
+            .cloned()
+    }
 }
 
 /// The service's `PATH` from the installing shell's: [`review_service_path`]
@@ -1276,13 +1285,8 @@ pub fn service_path(
                     continue;
                 }
                 let replacement = (scope == SessionScope::Shell)
-                    .then(|| {
-                        session.fnm_default_bins.iter().find(|candidate| {
-                            session.scope_of(candidate).is_none() && inspect(candidate).is_some()
-                        })
-                    })
-                    .flatten()
-                    .cloned();
+                    .then(|| session.fnm_default_bin(|candidate| inspect(candidate).is_some()))
+                    .flatten();
                 if let Some(stable) = &replacement {
                     kept.push(stable.clone());
                 }

@@ -113,6 +113,13 @@ impl DeadmanSpec {
         self.fire_in
     }
 
+    /// When the job fires, in Unix seconds, for a job armed at `now` (the
+    /// timer and Task Scheduler take a deadline).
+    #[cfg(any(target_os = "linux", windows))]
+    fn fires_at(&self, now: u64) -> u64 {
+        now + self.fire_in.as_secs()
+    }
+
     /// `update rollback --if-unconfirmed <id> --state-dir <dir>` (after the
     /// program). The state directory must be exact UTF-8 text
     /// ([`crate::commands::service::path_text`]): an error otherwise, before
@@ -406,7 +413,9 @@ impl Scheduler for SystemdTimer {
     }
     fn register(&self, spec: &DeadmanSpec) -> Result<()> {
         let (service_file, timer_file) = Self::files()?;
-        let deadline = super::unix_now() + spec.fire_in.as_secs().max(1);
+        // At least a second away.
+        let now = super::unix_now();
+        let deadline = spec.fires_at(now).max(now + 1);
         let (service, timer) = systemd_units(spec, deadline)?;
         if let Some(dir) = service_file.parent() {
             std::fs::create_dir_all(dir)
@@ -773,7 +782,7 @@ impl Scheduler for ScheduledTask {
             &sid,
             &windows_task_arguments(spec)?,
             now + WINDOWS_KICK_AFTER.as_secs(),
-            now + spec.fire_in.as_secs(),
+            spec.fires_at(now),
         );
         let file = spec.state_dir.join("update").join("deadman-task.xml");
         // Checked before the file is written: `schtasks` is given it.
