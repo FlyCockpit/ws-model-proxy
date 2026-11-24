@@ -1151,6 +1151,7 @@ fn wait_for_reconnect(
 }
 
 /// Held definitions and what their handles reach, for the current trust.
+#[cfg_attr(test, derive(Default))]
 struct NodeRuntimes {
     store: Store,
     /// `runtimeHosts` as last read: always-on addresses are re-checked.
@@ -1237,6 +1238,51 @@ impl NodeRuntimes {
             .values()
             .map(|target| target.endpoint.clone())
             .collect()
+    }
+
+    /// Where a relay request for `handle` goes, when this node serves it.
+    fn target(&self, handle: &str) -> Option<&Target> {
+        self.targets.get(handle)
+    }
+
+    /// Whether the launch version `version_id` with `launch_hash` is held.
+    fn holds(&self, version_id: &str, launch_hash: &str) -> bool {
+        self.store.find(version_id, launch_hash).is_some()
+    }
+
+    /// A runtime step rendered from its held definition, or why it is refused.
+    fn render(
+        &self,
+        job: &crate::protocol::frames::RuntimeJob,
+        trust: TrustValue,
+        facts: &crate::runtimes::render::NodeFacts,
+    ) -> Result<Job, crate::runtimes::render::Refusal> {
+        crate::runtimes::render::render(job, trust, &self.store, facts)
+    }
+
+    /// How long a node command may run, by the held node definition.
+    fn command_max(&self) -> Duration {
+        command_max(&self.store)
+    }
+
+    fn held_definitions(&self) -> Vec<crate::protocol::frames::HeldDefinition> {
+        self.store.held_definitions()
+    }
+
+    fn metric_commands_hash(&self) -> Option<String> {
+        self.store.metric_commands_hash()
+    }
+
+    fn metric_commands(&self) -> Vec<crate::protocol::runtime_spec::NodeMetricCommand> {
+        self.store.metric_commands().to_vec()
+    }
+
+    fn port_range(&self) -> Option<[u16; 2]> {
+        self.store.port_range()
+    }
+
+    fn fabrics_hash(&self) -> Option<String> {
+        self.store.fabrics_hash()
     }
 }
 
@@ -1769,10 +1815,10 @@ fn run_relay_session(
         node: startup.hello_node(node_slug, identity_signature),
         trust: startup.trust(),
         features: node_features(startup),
-        definitions: session.runtimes.store.held_definitions(),
-        held_metric_commands_hash: session.runtimes.store.metric_commands_hash(),
-        held_port_range: session.runtimes.store.port_range(),
-        held_fabrics_hash: session.runtimes.store.fabrics_hash(),
+        definitions: session.runtimes.held_definitions(),
+        held_metric_commands_hash: session.runtimes.metric_commands_hash(),
+        held_port_range: session.runtimes.port_range(),
+        held_fabrics_hash: session.runtimes.fabrics_hash(),
     };
     send_control(&mut socket, &hello, "sending relay hello")?;
     let hello_ok_deadline = HelloOkDeadline(Instant::now());
@@ -2275,7 +2321,7 @@ where
                             .reload(startup.trust_value(), &startup.runtime_hosts());
                         session
                             .execs
-                            .set_command_max(command_max(&session.runtimes.store));
+                            .set_command_max(session.runtimes.command_max());
                         sync_metric_commands(session);
                         send_inventory(session);
                     }
@@ -2395,7 +2441,7 @@ where
             start_relay_request(
                 socket,
                 config,
-                &session.runtimes.targets,
+                &session.runtimes,
                 &session.worker_tx,
                 &mut session.requests,
                 RelayRequest {
@@ -2640,7 +2686,7 @@ where
         .reload(startup.trust_value(), &startup.runtime_hosts());
     session
         .execs
-        .set_command_max(command_max(&session.runtimes.store));
+        .set_command_max(session.runtimes.command_max());
     sync_metric_commands(session);
     emit_control(socket, session, FrameClass::NodeState, node_state(startup))
 }
@@ -2664,9 +2710,8 @@ where
     S: std::io::Read + std::io::Write,
 {
     let terminal_id = job
-        .operator
-        .as_ref()
-        .map(|operator| operator.terminal_id.clone());
+        .operator()
+        .map(|(terminal_id, _)| terminal_id.to_owned());
     let refusal = |error: JobError, detail: Option<String>| NodeFrame::RuntimeJobResult {
         step_id: job.step_id.clone(),
         instance_id: job.instance_id.clone(),
@@ -2698,11 +2743,11 @@ where
             "refusing a runtime step during an update",
         );
     }
-    if let Some(operator) = &job.operator {
+    if let Some((terminal_id, _)) = job.operator() {
         use crate::sessions::OperatorDelivery;
         match session
             .terminals
-            .operator_delivery(&job.step_id, &operator.terminal_id)
+            .operator_delivery(&job.step_id, terminal_id)
         {
             OperatorDelivery::New => {}
             // Already open (re-report it), still pending or already ended:
@@ -2711,7 +2756,7 @@ where
                 let Some(status) = status else {
                     return Ok(());
                 };
-                let ids = operator_ids(&job, &operator.terminal_id);
+                let ids = operator_ids(&job, terminal_id);
                 return send_control(socket, &ids.result(status, None), "re-reporting a step");
             }
             OperatorDelivery::Clash => {
@@ -2740,16 +2785,14 @@ where
         job.phase,
         JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin
     ) {
-        crate::runtimes::render::render(&job, trust, &session.runtimes.store, &facts)
+        session.runtimes.render(&job, trust, &facts)
     } else {
         // Checks and stops run the commands the rank was launched with (its
         // own record), never re-rendered. Checks still need the version held;
         // a stop also works after the server dropped it.
         let held = session
             .runtimes
-            .store
-            .find(&job.launch_version_id, &job.launch_hash)
-            .is_some();
+            .holds(&job.launch_version_id, &job.launch_hash);
         let recorded =
             crate::runtimes::runner::recorded_job(&job.instance_id, job.rank).filter(|known| {
                 known.version_id == job.launch_version_id
@@ -2765,7 +2808,7 @@ where
             from_record(&job, known)
         } else if held {
             // No record: the executor answers `instance_unknown`.
-            crate::runtimes::render::render(&job, trust, &session.runtimes.store, &facts)
+            session.runtimes.render(&job, trust, &facts)
         } else {
             Err(refused_with(missing, "launchVersionId"))
         }
@@ -2795,14 +2838,14 @@ where
         send_outbound_frames(socket, closed)?;
     }
     {
-        let ticket = match &job.operator {
+        let ticket = match job.operator() {
             None => None,
-            Some(operator) => {
+            Some((terminal_id, author)) => {
                 // Taken now, before the runner thread exists: a re-delivery
                 // or a newer dispatch of the step sees it (see `reserve_operator`).
                 match session
                     .terminals
-                    .reserve_operator(&job.step_id, &operator.terminal_id)
+                    .reserve_operator(&job.step_id, terminal_id)
                 {
                     Ok(closed) => send_outbound_frames(socket, closed)?,
                     Err(error) => {
@@ -2813,7 +2856,7 @@ where
                         );
                     }
                 }
-                Some(operator_ticket(&job, operator, &rendered))
+                Some(operator_ticket(&job, terminal_id, author, &rendered))
             }
         };
         // Live speech-to-text sessions on the instance end before its stop
@@ -2897,18 +2940,14 @@ fn from_record(
     let interactive = known
         .parsed_spec()
         .is_some_and(|spec| crate::runtimes::render::interactive_phase(&spec, job.rank, job.phase));
-    if interactive != job.operator.is_some() {
+    if interactive != job.operator().is_some() {
         return Err(crate::runtimes::render::Refusal {
             error: JobError::BadJob,
             detail: Some("operator".into()),
         });
     }
     // The job's reservations, else those of the launch it checks or stops.
-    let reservations = if job.reservations.is_empty() {
-        known.reservations.clone()
-    } else {
-        job.reservations.clone()
-    };
+    let reservations = job.reservations_or(&known.reservations);
     Ok(Job {
         step_id: job.step_id.clone(),
         action: job.phase,
@@ -2925,19 +2964,20 @@ fn from_record(
 /// what the node itself rendered (or recorded), never server-supplied text.
 fn operator_ticket(
     job: &crate::protocol::frames::RuntimeJob,
-    operator: &crate::protocol::frames::JobOperator,
+    terminal_id: &str,
+    author: crate::protocol::frames::CommandAuthor,
     rendered: &Job,
 ) -> crate::runtimes::runner::OperatorTicket {
     let command = rendered.operator_cmd().script.to_string();
     crate::runtimes::runner::OperatorTicket {
-        ids: operator_ids(job, &operator.terminal_id),
+        ids: operator_ids(job, terminal_id),
         screen: crate::runtimes::operator::OperatorScreen {
             node: crate::runtimes::operator::node_name(),
             handle: rendered.handle.clone(),
             phase: rendered.action,
             rank: rendered.rank,
             command,
-            author: operator.command_author,
+            author,
         },
         base_env: crate::sessions::operator_base_env(),
     }
@@ -3059,11 +3099,11 @@ where
 /// Node metric commands follow the held (frozen at Relay only) node
 /// definition; applied as soon as it changes.
 fn sync_metric_commands(session: &mut Session<'_>) {
-    let hash = session.runtimes.store.metric_commands_hash();
+    let hash = session.runtimes.metric_commands_hash();
     if hash != session.metric_commands_applied
         && let Some(telemetry) = session.telemetry.as_ref()
     {
-        telemetry.set_metric_commands(session.runtimes.store.metric_commands().to_vec());
+        telemetry.set_metric_commands(session.runtimes.metric_commands());
         session.metric_commands_applied = hash;
     }
 }
@@ -3144,7 +3184,7 @@ struct RelayRequest {
 fn start_relay_request<S>(
     socket: &mut tungstenite::WebSocket<S>,
     config: &Config,
-    targets: &BTreeMap<String, Target>,
+    runtimes: &NodeRuntimes,
     worker_tx: &SyncSender<FromWorker>,
     requests: &mut RelayRequests,
     request: RelayRequest,
@@ -3181,7 +3221,7 @@ where
         return Ok(());
     }
 
-    let Some(target) = targets.get(&handle) else {
+    let Some(target) = runtimes.target(&handle) else {
         send_relay_error(
             socket,
             &request_id,
@@ -6276,7 +6316,7 @@ mod tests {
         let result = start_relay_request(
             &mut socket,
             &config,
-            &BTreeMap::new(),
+            &NodeRuntimes::default(),
             &worker_tx,
             &mut requests,
             RelayRequest {
@@ -6316,7 +6356,7 @@ mod tests {
         let result = start_relay_request(
             &mut socket,
             &config,
-            &BTreeMap::new(),
+            &NodeRuntimes::default(),
             &worker_tx,
             &mut requests,
             RelayRequest {
@@ -7674,10 +7714,10 @@ mod tests {
         let mut job = stop_job(true);
         job.handle = "i-zzzzzzzzzzzz".into();
         let rendered = recorded(true);
-        let Some(operator) = job.operator.clone() else {
+        let Some((terminal_id, author)) = job.operator() else {
             panic!("operator job");
         };
-        let ticket = operator_ticket(&job, &operator, &rendered);
+        let ticket = operator_ticket(&job, terminal_id, author, &rendered);
         assert_eq!(ticket.screen.handle, "i-abcdefabcdef");
         assert_eq!(ticket.screen.command, "sudo systemctl start x");
         assert_eq!(ticket.ids.terminal_id, "AAAAAAAAAAAAAAAAAAAAAA");

@@ -1941,6 +1941,24 @@ impl DefinitionEnvelope {
 }
 
 impl RuntimeJob {
+    /// The operator terminal an interactive step runs in, and who wrote its command.
+    /// `None` for a step the node runs itself.
+    pub fn operator(&self) -> Option<(&str, CommandAuthor)> {
+        self.operator
+            .as_ref()
+            .map(|operator| (operator.terminal_id.as_str(), operator.command_author))
+    }
+
+    /// The job's reservations, else `launch`'s (those of the launch a stop or check
+    /// names).
+    pub fn reservations_or(&self, launch: &[JobReservation]) -> Vec<JobReservation> {
+        if self.reservations.is_empty() {
+            launch.to_vec()
+        } else {
+            self.reservations.clone()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), FrameRuleError> {
         rule(self.rank < self.nnodes, "rank must be below nnodes")?;
         rule(
