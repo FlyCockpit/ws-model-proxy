@@ -14,13 +14,15 @@ use std::os::unix::fs::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::context::OpContext;
 use super::error::{ErrorCode, FileError, FileResult};
-use super::etag::STRONG_ETAG_MAX_BYTES;
+use super::etag::{STRONG_ETAG_MAX_BYTES, load_all};
+use super::meta::Stat;
 use super::policy::Access;
 use super::redact::{self, FileClass, LineMasker};
-use super::resolve::{ResolveOpts, Stat, resolve};
+use super::resolve::{ResolveOpts, resolve};
 use super::text::{self, Eol, SNIFF_BYTES, floor_boundary, strip_eol};
-use super::{Cancel, FileOps, fmt};
+use super::{Cancel, fmt};
 
 pub const DEFAULT_MAX_LINES: u32 = 400;
 pub const MAX_LINES: u32 = 2000;
@@ -110,61 +112,7 @@ pub(crate) fn clamp_window(args: &ReadArgs) -> FileResult<(usize, usize)> {
     Ok((lines.min(MAX_LINES) as usize, bytes.min(MAX_BYTES) as usize))
 }
 
-/// `Read::read_to_end` in 1 MiB steps, observing cancellation between them.
-pub(crate) fn read_to_end_cancellable<R: Read>(
-    mut reader: R,
-    out: &mut Vec<u8>,
-    cancel: &Cancel,
-) -> FileResult<()> {
-    loop {
-        cancel.check()?;
-        let n = reader.by_ref().take(1 << 20).read_to_end(out)?;
-        if n == 0 {
-            return Ok(());
-        }
-    }
-}
-
-/// Read the whole file (at most `max` bytes) from an open fd.
-pub(crate) fn load_all(
-    file: &mut std::fs::File,
-    stat: &Stat,
-    max: u64,
-    cancel: &Cancel,
-) -> FileResult<Vec<u8>> {
-    if stat.size > max {
-        return Err(FileError::new(
-            ErrorCode::TooLarge,
-            format!("file is larger than {max} bytes"),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(stat.size as usize);
-    read_to_end_cancellable(file.take(max + 1), &mut bytes, cancel)?;
-    if bytes.len() as u64 > max {
-        return Err(FileError::new(
-            ErrorCode::TooLarge,
-            format!("file is larger than {max} bytes"),
-        ));
-    }
-    Ok(bytes)
-}
-
-/// The current etag of an open regular file: strong up to 64 MiB, weak above.
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn current_etag(
-    ops: &FileOps,
-    file: &mut std::fs::File,
-    stat: &Stat,
-    cancel: &Cancel,
-) -> FileResult<String> {
-    if stat.size > STRONG_ETAG_MAX_BYTES {
-        return Ok(ops.key.weak_stat(stat));
-    }
-    let bytes = load_all(file, stat, STRONG_ETAG_MAX_BYTES, cancel)?;
-    Ok(ops.key.strong(stat, &bytes))
-}
-
-pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResult<ReadOutcome> {
+pub(crate) fn read(ops: &OpContext, args: &ReadArgs, cancel: &Cancel) -> FileResult<ReadOutcome> {
     let (max_lines, max_bytes) = clamp_window(args)?;
     let start = args.start_line.unwrap_or(1);
     if start == 0 {
@@ -486,7 +434,7 @@ mod positional {
 /// Files over 64 MiB: weak etag, no line count, no whole-file scan.
 #[allow(clippy::too_many_arguments)]
 fn read_large(
-    ops: &FileOps,
+    ops: &OpContext,
     args: &ReadArgs,
     file: &mut std::fs::File,
     stat: &Stat,
@@ -778,52 +726,4 @@ fn tail_window(
         },
         eol,
     ))
-}
-
-#[cfg(test)]
-mod cancel_tests {
-    use super::*;
-
-    /// A reader that cancels after handing out its first chunk.
-    struct CancelAfterFirst<'a> {
-        cancel: &'a Cancel,
-        served: bool,
-    }
-
-    impl Read for CancelAfterFirst<'_> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.served {
-                return Ok(0);
-            }
-            self.served = true;
-            self.cancel.cancel();
-            let n = buf.len().min(1 << 20);
-            buf[..n].fill(b'a');
-            Ok(n)
-        }
-    }
-
-    #[test]
-    fn the_chunked_reader_observes_a_cancel_between_chunks() {
-        let cancel = Cancel::new();
-        let mut out = Vec::new();
-        let r = read_to_end_cancellable(
-            CancelAfterFirst {
-                cancel: &cancel,
-                served: false,
-            },
-            &mut out,
-            &cancel,
-        );
-        assert_eq!(r.expect_err("cancelled").code, ErrorCode::Cancelled);
-        assert!(
-            !out.is_empty() && out.len() < 1 << 20,
-            "only the first chunk was read"
-        );
-        // an uncancelled reader reads to the end
-        let cancel = Cancel::new();
-        let mut out = Vec::new();
-        read_to_end_cancellable(&[7_u8; 3 << 20][..], &mut out, &cancel).unwrap();
-        assert_eq!(out.len(), 3 << 20);
-    }
 }

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use super::context::Hook;
 use super::policy::{Deny, Protected};
 use super::read::{ReadOutcome, ReadResult};
 use super::{Cancel, ErrorCode, EtagKey, FileOps, FileResult, Policy, Step};
@@ -93,7 +94,7 @@ impl Fx {
         hook: impl Fn(Step) -> FileResult<()> + Send + Sync + 'static,
     ) -> Self {
         let log = Arc::clone(&self.steps);
-        self.ops.hook = Some(Arc::new(move |step| {
+        self.ops.context_mut().hook = Hook::new(Arc::new(move |step| {
             log.lock().expect("log").push(step);
             hook(step)
         }));

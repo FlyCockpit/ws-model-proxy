@@ -65,21 +65,23 @@ impl Object {
     fn tag(self, fx: &Fx, name: &str) -> String {
         match self {
             Self::File => {
-                let stat = crate::file_ops::resolve::Stat::from_metadata(
+                let stat = crate::file_ops::meta::Stat::from_metadata(
                     &std::fs::metadata(fx.root.join(name)).unwrap(),
                 );
                 if stat.size > crate::file_ops::etag::STRONG_ETAG_MAX_BYTES {
-                    fx.ops.key.weak_stat(&stat)
+                    fx.ops.context().key.weak_stat(&stat)
                 } else {
                     fx.etag(name)
                 }
             }
-            Self::Symlink => fx
-                .ops
-                .key
-                .weak_stat(&crate::file_ops::resolve::Stat::from_metadata(
-                    &std::fs::symlink_metadata(fx.root.join(name)).unwrap(),
-                )),
+            Self::Symlink => {
+                fx.ops
+                    .context()
+                    .key
+                    .weak_stat(&crate::file_ops::meta::Stat::from_metadata(
+                        &std::fs::symlink_metadata(fx.root.join(name)).unwrap(),
+                    ))
+            }
         }
     }
     fn save(self, path: &Path, text: &str) {
@@ -1678,7 +1680,7 @@ fn rename_shared_case_alias_origin_is_restored_as_gone() {
                 &ResolveOpts {
                     follow_last: false,
                     make_parents: None,
-                    policy: &fx.ops.policy,
+                    policy: fx.ops.policy(),
                     access: Access::Remove,
                     cancel: None,
                 },
@@ -1693,11 +1695,11 @@ fn rename_shared_case_alias_origin_is_restored_as_gone() {
         let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path).unwrap();
         let _scope = FaultScope::new(&shape.faults(true));
         let method = recovery
-            .preflight_move(&fx.ops, &from, &to, &src, Some(&dst))
+            .preflight_move(fx.ops.context(), &from, &to, &src, Some(&dst))
             .unwrap();
         let error = recovery
             .commit_move(
-                &fx.ops,
+                fx.ops.context(),
                 &from,
                 &to,
                 &mut src,
@@ -1830,7 +1832,7 @@ fn rename_true_alias_pair_with_a_post_publication_save_keeps_the_object() {
                     &ResolveOpts {
                         follow_last: false,
                         make_parents: None,
-                        policy: &fx.ops.policy,
+                        policy: fx.ops.policy(),
                         access: Access::Remove,
                         cancel: None,
                     },
@@ -1853,11 +1855,11 @@ fn rename_true_alias_pair_with_a_post_publication_save_keeps_the_object() {
             let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path).unwrap();
             let _scope = FaultScope::new(&Shape::Link.faults(true));
             let method = recovery
-                .preflight_move(&fx.ops, &from, &to, &src, Some(&dst))
+                .preflight_move(fx.ops.context(), &from, &to, &src, Some(&dst))
                 .unwrap();
             recovery
                 .commit_move(
-                    &fx.ops,
+                    fx.ops.context(),
                     &from,
                     &to,
                     &mut src,
@@ -1905,7 +1907,7 @@ fn rename_prepare_error_exit_closes_the_destination_proof_before_the_restore_unl
             &ResolveOpts {
                 follow_last: false,
                 make_parents: None,
-                policy: &fx.ops.policy,
+                policy: fx.ops.policy(),
                 access: Access::Remove,
                 cancel: None,
             },
@@ -1921,7 +1923,7 @@ fn rename_prepare_error_exit_closes_the_destination_proof_before_the_restore_unl
     faults.push((Primitive::PublishPrepare, 1, Errno::EMFILE));
     let _scope = FaultScope::new(&faults);
     let method = recovery
-        .preflight_move(&fx.ops, &from, &to, &src, Some(&dst))
+        .preflight_move(fx.ops.context(), &from, &to, &src, Some(&dst))
         .unwrap();
     // Stable inodes would link first and fail PublishPrepare before capture.
     recovery.set_link_order(crate::file_ops::recovery::LinkOrder::VacateFirst);
@@ -1954,7 +1956,7 @@ fn rename_prepare_error_exit_closes_the_destination_proof_before_the_restore_unl
     };
     let error = recovery
         .commit_move(
-            &fx.ops,
+            fx.ops.context(),
             &from,
             &to,
             &mut src,
@@ -1997,7 +1999,7 @@ fn rename_true_alias_pair_closes_both_private_proofs_before_committed_unlinks() 
                     &ResolveOpts {
                         follow_last: false,
                         make_parents: None,
-                        policy: &fx.ops.policy,
+                        policy: fx.ops.policy(),
                         access: Access::Remove,
                         cancel: None,
                     },
@@ -2020,7 +2022,7 @@ fn rename_true_alias_pair_closes_both_private_proofs_before_committed_unlinks() 
             let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path).unwrap();
             let _scope = FaultScope::new(&shape.faults(true));
             let method = recovery
-                .preflight_move(&fx.ops, &from, &to, &src, Some(&dst))
+                .preflight_move(fx.ops.context(), &from, &to, &src, Some(&dst))
                 .unwrap();
             #[cfg(target_os = "linux")]
             let checks = if matches!(shape, Shape::Link) {
@@ -2032,7 +2034,7 @@ fn rename_true_alias_pair_closes_both_private_proofs_before_committed_unlinks() 
             };
             recovery
                 .commit_move(
-                    &fx.ops,
+                    fx.ops.context(),
                     &from,
                     &to,
                     &mut src,

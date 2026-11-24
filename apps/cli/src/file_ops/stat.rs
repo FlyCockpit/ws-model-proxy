@@ -3,12 +3,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::context::OpContext;
 use super::error::{ErrorCode, FileError, FileResult};
-use super::etag::STRONG_ETAG_MAX_BYTES;
+use super::etag::{STRONG_ETAG_MAX_BYTES, load_all};
+use super::meta::{Kind, Stat, kind_name};
 use super::policy::Access;
-use super::read::load_all;
-use super::resolve::{Kind, ResolveOpts, Stat, resolve};
-use super::{Cancel, FileOps, fmt};
+use super::resolve::{ResolveOpts, resolve};
+use super::{Cancel, fmt};
 
 pub const MAX_STAT_PATHS: usize = 50;
 
@@ -52,15 +53,6 @@ pub struct StatResult {
     pub entries: Vec<StatEntry>,
 }
 
-pub(crate) fn kind_name(kind: Kind) -> &'static str {
-    match kind {
-        Kind::File => "file",
-        Kind::Dir => "dir",
-        Kind::Symlink => "symlink",
-        Kind::Other => "other",
-    }
-}
-
 /// The owner's user name (Unix); Windows reports none.
 pub(crate) fn owner_name(uid: u32) -> Option<String> {
     #[cfg(unix)]
@@ -78,7 +70,7 @@ pub(crate) fn owner_name(uid: u32) -> Option<String> {
     }
 }
 
-pub(crate) fn stat(ops: &FileOps, args: &StatArgs, cancel: &Cancel) -> FileResult<StatResult> {
+pub(crate) fn stat(ops: &OpContext, args: &StatArgs, cancel: &Cancel) -> FileResult<StatResult> {
     if args.paths.is_empty() || args.paths.len() > MAX_STAT_PATHS {
         return Err(FileError::invalid(format!(
             "paths must hold 1 to {MAX_STAT_PATHS} entries"
@@ -102,7 +94,7 @@ pub(crate) fn stat(ops: &FileOps, args: &StatArgs, cancel: &Cancel) -> FileResul
     Ok(StatResult { entries })
 }
 
-fn stat_one(ops: &FileOps, path: &str, hash: bool, cancel: &Cancel) -> FileResult<StatEntry> {
+fn stat_one(ops: &OpContext, path: &str, hash: bool, cancel: &Cancel) -> FileResult<StatEntry> {
     let opts = |follow_last| ResolveOpts {
         follow_last,
         make_parents: None,

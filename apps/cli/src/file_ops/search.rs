@@ -12,15 +12,17 @@ use std::time::Instant;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
+use super::Cancel;
+use super::context::OpContext;
 use super::error::{ErrorCode, FileError, FileResult};
+use super::etag::read_to_end_cancellable;
 use super::glob::Glob;
+use super::meta::Kind;
 use super::policy::Access;
-use super::read::read_to_end_cancellable;
 use super::redact;
-use super::resolve::{Kind, ResolveOpts, resolve};
+use super::resolve::{ResolveOpts, resolve};
 use super::text::{self, floor_boundary, name_for_display, strip_eol};
 use super::walk::{Entry, Flow, walk};
-use super::{Cancel, FileOps};
 
 pub const DEFAULT_MATCHES: u32 = 100;
 pub const MAX_MATCHES: u32 = 500;
@@ -71,7 +73,7 @@ pub struct SearchResult {
 }
 
 pub(crate) fn search(
-    ops: &FileOps,
+    ops: &OpContext,
     args: &SearchArgs,
     cancel: &Cancel,
 ) -> FileResult<SearchResult> {
@@ -171,8 +173,7 @@ pub(crate) fn search(
         }
         let view = redact::mask(class, content);
         let lines: Vec<&str> = view
-            .text
-            .split_inclusive('\n')
+            .lines()
             .map(|l| std::str::from_utf8(strip_eol(l.as_bytes())).unwrap_or(l))
             .collect();
         let mut emitted_through: Option<usize> = None; // last line index printed

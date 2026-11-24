@@ -15,8 +15,8 @@ use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::{Mode, fstatat};
 
 use super::error::{ErrorCode, FileError, FileResult};
+use super::meta::{Kind, Stat};
 use super::policy::Policy;
-use super::resolve::{Kind, Stat};
 
 /// Bound collection before sorting, independently of result pagination limits.
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;

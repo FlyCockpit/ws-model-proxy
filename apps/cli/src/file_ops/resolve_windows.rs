@@ -24,126 +24,14 @@
 //! it enters (`walk_windows`).
 
 use std::ffi::OsString;
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::path::{Component, Path, PathBuf, Prefix};
 
 use super::error::{ErrorCode, FileError, FileResult};
+use super::meta::{Kind, Stat};
 use super::policy::{Access, Policy};
 
 pub const MAX_PATH_BYTES: usize = 4096;
-
-const S_IFREG: u32 = 0o100_000;
-const S_IFDIR: u32 = 0o040_000;
-const S_IFLNK: u32 = 0o120_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    File,
-    Dir,
-    Symlink,
-    Other,
-}
-
-/// The `stat(2)`-like view of a Windows file. `mode` is synthesized (`0644`, or
-/// `0444` for a read-only file; `0755` for a directory), `uid`/`gid` are 0, and
-/// `dev`/`ino` are the volume serial and file index when they were read from an
-/// open handle (0 otherwise).
-#[derive(Debug, Clone, Copy)]
-pub struct Stat {
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub nlink: u64,
-    pub size: u64,
-    pub dev: u64,
-    pub ino: u64,
-    pub mtime_secs: i64,
-    pub mtime_nanos: i64,
-}
-
-impl Stat {
-    /// From metadata alone: no identity (`dev`/`ino` 0).
-    pub fn from_metadata(meta: &Metadata) -> Self {
-        let file_type = meta.file_type();
-        let (kind_bits, perm) = if file_type.is_symlink() {
-            (S_IFLNK, 0o777)
-        } else if file_type.is_dir() {
-            (S_IFDIR, 0o755)
-        } else if file_type.is_file() {
-            (
-                S_IFREG,
-                if meta.permissions().readonly() {
-                    0o444
-                } else {
-                    0o644
-                },
-            )
-        } else {
-            (0, 0o644)
-        };
-        let since_epoch = meta
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .unwrap_or_default();
-        Self {
-            mode: kind_bits | perm,
-            uid: 0,
-            gid: 0,
-            nlink: 1,
-            size: meta.len(),
-            dev: 0,
-            ino: 0,
-            mtime_secs: i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
-            mtime_nanos: i64::from(since_epoch.subsec_nanos()),
-        }
-    }
-
-    /// From an open handle: metadata plus the file's identity.
-    pub fn of_file(file: &File) -> std::io::Result<Self> {
-        let mut stat = Self::from_metadata(&file.metadata()?);
-        let identity = wsmp_windows::file_identity(file)?;
-        stat.dev = u64::from(identity.volume);
-        stat.ino = identity.index;
-        stat.nlink = u64::from(identity.links);
-        Ok(stat)
-    }
-
-    /// The object at `path` itself (a link is not followed), with its
-    /// identity. Opened for attributes only, which no other handle's sharing
-    /// mode refuses, and without following a reparse point or fetching a cloud
-    /// file's content.
-    pub fn of_path(path: &Path) -> std::io::Result<Self> {
-        use std::os::windows::fs::OpenOptionsExt;
-        // FILE_READ_ATTRIBUTES; FILE_FLAG_BACKUP_SEMANTICS (directories open
-        // too) | FILE_FLAG_OPEN_REPARSE_POINT.
-        let file = std::fs::OpenOptions::new()
-            .access_mode(0x0080)
-            .custom_flags(0x0200_0000 | 0x0020_0000)
-            .open(path)?;
-        Self::of_file(&file)
-    }
-
-    pub fn kind(&self) -> Kind {
-        match self.mode & 0o170_000 {
-            S_IFREG => Kind::File,
-            S_IFDIR => Kind::Dir,
-            S_IFLNK => Kind::Symlink,
-            _ => Kind::Other,
-        }
-    }
-
-    pub fn mtime(&self) -> std::time::SystemTime {
-        let secs = self.mtime_secs.max(0) as u64;
-        std::time::UNIX_EPOCH
-            + std::time::Duration::new(secs, self.mtime_nanos.clamp(0, 999_999_999) as u32)
-    }
-
-    #[allow(dead_code)]
-    pub fn same_object(&self, other: &Stat) -> bool {
-        self.dev == other.dev && self.ino == other.ino
-    }
-}
 
 /// A directory the tools walk: its physical path. Windows has no directory
 /// fds to hold; `walk_windows` re-checks each directory it enters.

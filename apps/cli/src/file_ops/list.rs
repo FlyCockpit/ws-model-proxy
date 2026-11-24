@@ -4,13 +4,15 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
+use super::context::OpContext;
 use super::error::{FileError, FileResult};
 use super::glob::Glob;
+use super::meta::Kind;
 use super::policy::Access;
-use super::resolve::{Kind, ResolveOpts, resolve};
+use super::resolve::{ResolveOpts, resolve};
 use super::text::name_for_display;
 use super::walk::{Flow, walk};
-use super::{Cancel, FileOps, fmt};
+use super::{Cancel, fmt};
 
 pub const DEFAULT_ENTRIES: u32 = 200;
 pub const MAX_ENTRIES: u32 = 2000;
@@ -44,7 +46,7 @@ pub struct ListResult {
     pub resolved_path: Option<String>,
 }
 
-pub(crate) fn list(ops: &FileOps, args: &ListArgs, cancel: &Cancel) -> FileResult<ListResult> {
+pub(crate) fn list(ops: &OpContext, args: &ListArgs, cancel: &Cancel) -> FileResult<ListResult> {
     let depth = args.depth.unwrap_or(1).clamp(1, MAX_DEPTH) as usize;
     let max_entries = args
         .max_entries

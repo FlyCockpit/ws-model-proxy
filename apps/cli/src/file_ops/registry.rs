@@ -46,6 +46,27 @@ impl RegistryEntry {
         }
     }
 
+    /// The pid and INTENT phase of the live process on this host that still
+    /// holds the directory (`None` when its creator is gone: abandoned).
+    pub fn live_holder(&self) -> Option<(u32, String)> {
+        (!self.is_abandoned()).then(|| (self.summary.pid, self.summary.phase.clone()))
+    }
+
+    /// Whether the creating process is gone (or belongs to another host).
+    fn is_abandoned(&self) -> bool {
+        // Telemetry never stats an arbitrary recovery path (possibly blocked NFS).
+        // Stale rows remain visible until an explicit `recover --apply` sweep.
+        let host = crate::hostname::reported_hostname().unwrap_or_else(|| "unknown".to_string());
+        if self.summary.host != host {
+            return true;
+        }
+        !pid_is_live(self.summary.pid)
+    }
+
+    fn cmp_path(&self, other: &Self) -> std::cmp::Ordering {
+        self.path.cmp(&other.path)
+    }
+
     pub fn recovery_path(&self) -> PathBuf {
         super::intent::IntentPath {
             display: self.path.clone(),
@@ -137,29 +158,22 @@ pub fn list_entries() -> Vec<RegistryEntry> {
         };
         entries.push(entry);
     }
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    entries.sort_by(RegistryEntry::cmp_path);
     entries
 }
 
 /// Live R directories whose creating process is gone (or belongs to another
 /// host). In-flight operations of this process are not abandoned.
 pub fn abandoned_entries() -> Vec<RegistryEntry> {
-    list_entries().into_iter().filter(is_abandoned).collect()
+    list_entries()
+        .into_iter()
+        .filter(RegistryEntry::is_abandoned)
+        .collect()
 }
 
 pub fn abandoned_count() -> Option<u32> {
     let count = abandoned_entries().len();
     (count > 0).then(|| count.min(ABANDONED_RECOVERY_WIRE_MAX as usize) as u32)
-}
-
-fn is_abandoned(entry: &RegistryEntry) -> bool {
-    // Telemetry never stats an arbitrary recovery path (possibly blocked NFS).
-    // Stale rows remain visible until an explicit `recover --apply` sweep.
-    let host = crate::hostname::reported_hostname().unwrap_or_else(|| "unknown".to_string());
-    if entry.summary.host != host {
-        return true;
-    }
-    !pid_is_live(entry.summary.pid)
 }
 
 fn pid_is_live(pid: u32) -> bool {

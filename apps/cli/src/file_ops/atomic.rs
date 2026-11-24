@@ -58,26 +58,19 @@ use std::path::Path;
 
 use nix::errno::Errno;
 use nix::fcntl::{AtFlags, OFlag, openat};
-use nix::sys::stat::{Mode, fchmod, fstatat, mode_t};
+use nix::sys::stat::{fchmod, fstatat};
 use nix::unistd::{Gid, Uid, fchown, fsync};
 
+use super::context::OpContext;
 use super::error::{ErrorCode, FileError, FileResult};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::exchange::is_unsupported;
-use super::read::current_etag;
+use super::meta::{Stat, perm_mode};
 use super::recovery::{Held, Published, RecoveryDir, Slot};
-use super::resolve::Stat;
-use super::{Cancel, FileOps, Step};
-
-/// Permission bits as a [`Mode`]. `mode_t` is `u32` on Linux and `u16` on macOS,
-/// so the cast is what makes `Mode::from_bits_truncate` portable.
-#[allow(clippy::unnecessary_cast)]
-pub(crate) fn perm_mode(bits: u32) -> Mode {
-    Mode::from_bits_truncate(bits as mode_t)
-}
+use super::{Cancel, Step};
 
 /// Refuse files an atomic replace would damage.
-pub(crate) fn check_replaceable(ops: &FileOps, stat: &Stat) -> FileResult<()> {
+pub(crate) fn check_replaceable(ops: &OpContext, stat: &Stat) -> FileResult<()> {
     let euid = ops.policy.euid();
     if stat.uid != euid && euid != 0 {
         return Err(FileError::new(
@@ -110,7 +103,7 @@ struct TempGuard<'a> {
 }
 
 impl TempGuard<'_> {
-    fn cleanup(&mut self, ops: &FileOps) -> bool {
+    fn cleanup(&mut self, ops: &OpContext) -> bool {
         if !self.armed {
             return true;
         }
@@ -118,7 +111,7 @@ impl TempGuard<'_> {
         let Some(slot) = self.recovery.capture(self.dir, &self.name, &self.path) else {
             return false;
         };
-        let _ = ops.step(Step::Captured);
+        let _ = ops.hook.step(Step::Captured);
         self.recovery.dispose(ops, &slot, &mut self.identity)
     }
 }
@@ -138,7 +131,7 @@ impl Drop for TempGuard<'_> {
 /// `orig_etag` the etag of the bytes the new content was derived from.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn replace(
-    ops: &FileOps,
+    ops: &OpContext,
     dir: &OwnedFd,
     name: &OsStr,
     dir_path: &Path,
@@ -178,7 +171,7 @@ pub(crate) fn replace(
 /// finishes the recovery directory and lets uncertainty override an earlier error.
 #[allow(clippy::too_many_arguments)]
 fn replace_inner(
-    ops: &FileOps,
+    ops: &OpContext,
     dir: &OwnedFd,
     name: &OsStr,
     dir_path: &Path,
@@ -199,30 +192,29 @@ fn replace_inner(
     };
     let mut armed = true;
     let prepared = (|| -> FileResult<Stat> {
-        ops.step(Step::TempCreated)?;
+        ops.hook.step(Step::TempCreated)?;
         // A failed write or writeback of the private temp is disposed below by
         // its held proof (never fsynced again, never published or certified).
         tmp_file.write_all(content)?;
-        ops.step(Step::TempWritten)?;
+        ops.hook.step(Step::TempWritten)?;
         tmp_file.sync_all()?;
-        ops.step(Step::TempSynced)?;
+        ops.hook.step(Step::TempSynced)?;
         fchown(
             tmp_file.as_fd(),
             Some(Uid::from_raw(orig_stat.uid)),
             Some(Gid::from_raw(orig_stat.gid)),
         )
         .map_err(FileError::errno)?;
-        ops.step(Step::Chowned)?;
+        ops.hook.step(Step::Chowned)?;
         fchmod(tmp_file.as_fd(), perm_mode(orig_stat.mode & 0o7777)).map_err(FileError::errno)?;
-        ops.step(Step::Chmodded)?;
+        ops.hook.step(Step::Chmodded)?;
         tmp_file.sync_all()?;
         let new_stat = Stat::from_metadata(&tmp_file.metadata()?);
         recheck(ops, dir, name, &mut orig, orig_stat, orig_etag, cancel)?;
-        ops.step(Step::EtagRechecked)?;
+        ops.hook.step(Step::EtagRechecked)?;
         cancel.check()?;
-        let mut intent = super::intent::Intent::replace(&dir_path.join(name));
-        intent.published =
-            Some(super::intent::IntentSlot::planned(&dir_path.join(name)).with_stat(&new_stat));
+        let intent = super::intent::Intent::replace(&dir_path.join(name))
+            .publishing(&dir_path.join(name), &new_stat);
         recovery.prepare_intent(intent)?;
         Ok(new_stat)
     })();
@@ -241,16 +233,17 @@ fn replace_inner(
             cancel,
         )?;
         armed = false;
-        let _ = ops.step(Step::Renamed);
+        let _ = ops.hook.step(Step::Renamed);
         // Cancellation is no longer honored after commit, including a hook error.
-        ops.step(Step::BeforeDirSync)
+        ops.hook
+            .step(Step::BeforeDirSync)
             .map_err(|_| FileError::mutation_uncertain())?;
         // The commit already crossed this directory's barrier before its
         // durable `committed` record; a repeat failure cannot undo it.
         if let Err(errno) = fsync(dir.as_fd()) {
             tracing::warn!(%errno, "directory sync after committed replace failed");
         }
-        let _ = ops.step(Step::DirSynced);
+        let _ = ops.hook.step(Step::DirSynced);
         if linked {
             // Link publication gives the public name its own directory entry. On a
             // mount without stable inode numbers (some FUSE filesystems) that name
@@ -276,7 +269,7 @@ fn replace_inner(
 /// Undo restores each captured object to its recorded origin, newest write first.
 #[allow(clippy::too_many_arguments)]
 fn commit_stage(
-    ops: &FileOps,
+    ops: &OpContext,
     recovery: &mut RecoveryDir,
     tmp: &mut Slot,
     original: &mut Held,
@@ -291,8 +284,8 @@ fn commit_stage(
             Ok(()) => {
                 *armed = false;
                 recovery.record_slot_identity(tmp)?;
-                let _ = ops.step(Step::Exchanged);
-                let _ = ops.step(Step::Captured);
+                let _ = ops.hook.step(Step::Exchanged);
+                let _ = ops.hook.step(Step::Captured);
                 if recovery.holds(tmp, original) {
                     recovery.sync_effect(&[tmp.origin_dir()])?;
                     recovery.set_intent_phase(super::intent::IntentPhase::Committed)?;
@@ -305,7 +298,7 @@ fn commit_stage(
                 let y = recovery.capture_origin(tmp);
                 if let Some(slot) = &y {
                     recovery.record_slot_identity(slot)?;
-                    let _ = ops.step(Step::Captured);
+                    let _ = ops.hook.step(Step::Captured);
                 }
                 if let Some(y) = &y
                     && !recovery.holds(y, identity)
@@ -316,7 +309,7 @@ fn commit_stage(
                     // must already be closed (F3).
                     identity.release();
                     if recovery.restore(ops, y) {
-                        let _ = ops.step(Step::Restored);
+                        let _ = ops.hook.step(Step::Restored);
                     }
                 } else {
                     if let Some(y) = y {
@@ -326,7 +319,7 @@ fn commit_stage(
                     // proof, and may unlink an alias of T from this private slot.
                     identity.release();
                     if recovery.restore(ops, tmp) {
-                        let _ = ops.step(Step::Restored);
+                        let _ = ops.hook.step(Step::Restored);
                     }
                 }
                 return if recovery.settled() {
@@ -350,7 +343,7 @@ fn commit_stage(
 /// The name must still point at the file we read, and that file must still
 /// hold the bytes the edit was computed from.
 fn recheck(
-    ops: &FileOps,
+    ops: &OpContext,
     dir: &OwnedFd,
     name: &OsStr,
     orig: &mut File,
@@ -375,20 +368,20 @@ fn recheck(
 }
 
 fn read_from_start(
-    ops: &FileOps,
+    ops: &OpContext,
     file: &mut File,
     stat: &Stat,
     cancel: &Cancel,
 ) -> FileResult<String> {
     use std::io::Seek;
     file.rewind()?;
-    current_etag(ops, file, stat, cancel)
+    ops.key.current(file, stat, cancel)
 }
 
 /// Exclusive create. A failed write captures the name and only disposes the
 /// identity of the held created fd; a squatter is retained with uncertainty.
 pub(crate) fn create_new(
-    ops: &FileOps,
+    ops: &OpContext,
     dir: &OwnedFd,
     dir_path: &Path,
     name: &OsStr,
@@ -398,7 +391,7 @@ pub(crate) fn create_new(
     let mut recovery = RecoveryDir::new(dir, dir_path)?;
     let result = (|| -> FileResult<Stat> {
         // Unsupported directory sync refuses before anything is created.
-        super::recovery::probe_dir_barrier(dir)?;
+        super::exchange::probe_dir_barrier(dir)?;
         // The exclusive create is itself a public effect: later barrier
         // failures while disposing it cannot be reported as a clean refusal.
         let before = recovery.effect_checkpoint();
@@ -430,7 +423,7 @@ pub(crate) fn create_new(
             armed: true,
         };
         let finish = (|| -> FileResult<Stat> {
-            ops.step(Step::Created)?;
+            ops.hook.step(Step::Created)?;
             // On failure the guard captures and disposes the created file by its
             // held identity: its bytes were never acknowledged, and disposal
             // never fsyncs the failed inode again.

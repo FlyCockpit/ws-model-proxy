@@ -18,8 +18,8 @@ use super::exchange::no_replace;
 use super::intent::{
     INTENT_MAX_BYTES, Intent, IntentOp, IntentPhase, IntentSlot, intent_phase_name, parse_intent,
 };
+use super::meta::Stat;
 use super::registry::{self, RegistryEntry};
-use super::resolve::Stat;
 
 const SCAN_REPORT_MAX: usize = 32;
 const SCAN_VISIT_MAX: usize = 10_000;
@@ -153,15 +153,9 @@ pub fn recover_dir(path: &Path, apply: bool, entry: Option<&RegistryEntry>) -> R
         };
     }
     if let Some(entry) = entry
-        && let Some(report) = skip_live_pid(
-            path,
-            &entry.summary.host,
-            entry.summary.pid,
-            Some(entry.summary.phase.clone()),
-            slots.clone(),
-        )
+        && let Some((pid, phase)) = entry.live_holder()
     {
-        return report;
+        return live_report(path, pid, Some(phase), slots.clone());
     }
     let cleanup_lock = match if apply {
         super::recovery::lock_cleanup(path, true)
@@ -321,8 +315,7 @@ fn derived_phase(dir: &Path, intent: &Intent) -> IntentPhase {
         return intent.phase;
     }
     if matches!(intent.op, IntentOp::Rename | IntentOp::Replace)
-        && let Some(published) = &intent.published
-        && let Some(destination) = published.origin.to_path()
+        && let Some((published, Some(destination))) = intent.publication()
         && let Ok(metadata) = fs::symlink_metadata(destination)
         && let Ok(recovery) = open_dir(dir)
         && anchored_identity(&recovery, published)
@@ -344,13 +337,17 @@ fn skip_live_pid(
     if host != current || !pid_is_live(pid) {
         return None;
     }
-    Some(RecoverReport {
+    Some(live_report(path, pid, phase, slots))
+}
+
+fn live_report(path: &Path, pid: u32, phase: Option<String>, slots: Vec<String>) -> RecoverReport {
+    RecoverReport {
         path: path.display().to_string(),
         action: RecoverAction::SkippedLive,
         message: format!("pid {pid} on this host still holds this recovery directory"),
         phase,
         slots,
-    })
+    }
 }
 
 fn apply_intent(path: &Path, intent: &Intent, apply: bool, slots: Vec<String>) -> RecoverReport {
@@ -422,31 +419,28 @@ fn roll_back(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
     // acknowledged): T is identified ONLY by the live `published` pin, moved off
     // the public name if a compensation had not captured it yet, and disposed
     // wherever it sits in R. Every other slot is then restored as usual.
-    let temp_anchor = match &intent.published {
-        Some(published) if intent.op == IntentOp::Replace => published.anchor.as_deref(),
-        _ => None,
-    };
-    if let (Some(published), Some(anchor)) = (&intent.published, temp_anchor)
+    let temp = intent.replace_temp();
+    let temp_anchor = temp.map(|(_, anchor)| anchor);
+    if let Some((published, anchor)) = temp
         && fstatat(recovery.as_fd(), anchor, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok()
     {
         let pin = anchored_identity(&recovery, published)?;
-        if let Some(origin) = intent.source.to_path() {
+        if let Some(origin) = intent.source_path() {
             remove_public_temp(&recovery, &origin, &pin)?;
         }
-        let mut names: Vec<&str> = intent.slots.keys().map(String::as_str).collect();
+        let mut names: Vec<&str> = intent.slots().map(|(name, _)| name).collect();
         names.extend(["tmp", "probe", PUBLISHED_LEFTOVER]);
         for slot_name in names {
             dispose_if_temp(&recovery, slot_name, &pin)?;
         }
         sync_directory(&recovery)?;
     }
-    for (slot_name, slot) in &intent.slots {
-        if temp_anchor.is_some() && slot.anchor.as_deref() == temp_anchor {
+    for (slot_name, slot) in intent.slots() {
+        if temp_anchor.is_some() && slot.anchor() == temp_anchor {
             continue; // the temp's own record: disposed above, never restored
         }
         let origin = slot
-            .origin
-            .to_path()
+            .origin_path()
             .ok_or_else(|| format!("{slot_name} origin path is not recoverable"))?;
         restore_slot(&recovery, slot_name, slot, &origin)?;
     }
@@ -512,11 +506,8 @@ fn roll_forward(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
     let name = dir.file_name().ok_or("recovery path has no file name")?;
     let recovery = open_dir(dir)?;
     // Cleanup retries must cross public barriers even if slots are now absent.
-    for path in std::iter::once(&intent.source)
-        .chain(intent.destination.iter())
-        .chain(intent.published.iter().map(|slot| &slot.origin))
-    {
-        if let Some(path) = path.to_path()
+    for path in intent.public_paths() {
+        if let Some(path) = path
             && let Some(parent) = path.parent()
         {
             sync_directory(&open_dir(parent)?)?;
@@ -527,7 +518,7 @@ fn roll_forward(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
     {
         dispose_exchange_source_leftover(&recovery, intent)?;
     }
-    for (slot_name, slot) in &intent.slots {
+    for (slot_name, slot) in intent.slots() {
         dispose_slot(&recovery, slot_name, slot)?;
     }
     sync_directory(&recovery)?;
@@ -549,7 +540,7 @@ fn restore_slot(
         Err(Errno::ENOENT) => {
             // Absence is not durable restoration evidence. A surviving pin
             // requires proof of the public original before evidence removal.
-            if slot.anchor.as_deref().is_some_and(|name| {
+            if slot.anchor().is_some_and(|name| {
                 fstatat(recovery.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok()
             }) {
                 let pin = anchored_identity(recovery, slot)?;
@@ -631,10 +622,10 @@ fn dispose_slot(recovery: &OwnedFd, slot_name: &str, slot: &IntentSlot) -> Resul
 }
 
 fn dispose_exchange_source_leftover(recovery: &OwnedFd, intent: &Intent) -> Result<(), String> {
-    let Some(source) = intent.source.to_path() else {
+    let Some(source) = intent.source_path() else {
         return Ok(());
     };
-    let Some(destination) = intent.destination.as_ref().and_then(|path| path.to_path()) else {
+    let Some(destination) = intent.destination_path() else {
         return Ok(());
     };
     let Some(src_parent) = source.parent() else {
@@ -657,14 +648,14 @@ fn dispose_exchange_source_leftover(recovery: &OwnedFd, intent: &Intent) -> Resu
     };
     // After exchange-first commit, `to` holds S. Only then may leftover D under
     // the source name be removed.
-    if !intent.published.as_ref().is_some_and(|published| {
+    if !intent.publication().is_some_and(|(published, _)| {
         anchored_identity(recovery, published).is_ok_and(|pin| pin.matches_for_restore(&dest_stat))
     }) {
         return Err(
             "exchange destination identity is not proven; retaining source leftover".to_string(),
         );
     }
-    let source_slot = intent.slots.get("slot-1");
+    let source_slot = intent.slot("slot-1");
     let src_stat = match fstatat(src_dir.as_fd(), src_name, AtFlags::AT_SYMLINK_NOFOLLOW) {
         Ok(raw) => Stat::from_raw(&raw),
         Err(Errno::ENOENT) => return Ok(()),
@@ -697,8 +688,7 @@ fn anchored_identity(
     slot: &IntentSlot,
 ) -> Result<super::recovery::Held, String> {
     let name = slot
-        .anchor
-        .as_deref()
+        .anchor()
         .filter(|name| {
             name.starts_with(".wsmp-pin-")
                 && name.len() == 34
@@ -712,7 +702,7 @@ fn anchored_identity(
     if !slot.matches(&stat)
         || !matches!(
             stat.kind(),
-            super::resolve::Kind::File | super::resolve::Kind::Symlink
+            super::meta::Kind::File | super::meta::Kind::Symlink
         )
     {
         return Err(
@@ -729,12 +719,7 @@ fn anchored_identity(
 
 fn remove_anchors(recovery: &OwnedFd, intent: &Intent) -> Result<(), String> {
     sync_directory(recovery)?;
-    let known: HashSet<&str> = intent
-        .slots
-        .values()
-        .chain(intent.published.iter())
-        .filter_map(|slot| slot.anchor.as_deref())
-        .collect();
+    let known: HashSet<&str> = intent.records().filter_map(IntentSlot::anchor).collect();
     let copy = nix::unistd::dup(recovery.as_fd()).map_err(|error| error.to_string())?;
     let mut entries = nix::dir::Dir::from_fd(copy).map_err(|error| error.to_string())?;
     for entry in entries.iter() {
@@ -752,19 +737,16 @@ fn remove_anchors(recovery: &OwnedFd, intent: &Intent) -> Result<(), String> {
     }
     let mut names = HashSet::new();
     let mut held = Vec::new();
-    for slot in intent.slots.values().chain(intent.published.iter()) {
-        if let Some(name) = &slot.anchor {
-            if !names.insert(name.clone()) {
+    for slot in intent.records() {
+        if let Some(name) = slot.anchor() {
+            if !names.insert(name.to_string()) {
                 continue;
             }
             match anchored_identity(recovery, slot) {
                 Ok(pin) => held.push(pin),
                 Err(error)
-                    if fstatat(
-                        recovery.as_fd(),
-                        name.as_str(),
-                        AtFlags::AT_SYMLINK_NOFOLLOW,
-                    ) == Err(Errno::ENOENT) =>
+                    if fstatat(recovery.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW)
+                        == Err(Errno::ENOENT) =>
                 {
                     let _ = error;
                     names.remove(name);

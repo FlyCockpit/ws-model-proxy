@@ -13,19 +13,19 @@
 use std::os::windows::fs::FileTypeExt;
 use std::path::Path;
 
+use super::context::OpContext;
 use super::error::{ErrorCode, FileError, FileResult};
+use super::meta::{Kind, Stat, kind_name};
 use super::policy::Access;
-use super::read::current_etag;
-use super::resolve::{Kind, ResolveOpts, Resolved, Stat, resolve, same_path};
-use super::stat::kind_name;
-use super::{Cancel, FileOps, Step, check_reason};
+use super::resolve::{ResolveOpts, Resolved, resolve, same_path};
+use super::{Cancel, Step, check_reason};
 
 pub use super::mutate_args::{
     DeleteArgs, DeleteResult, MkdirArgs, MkdirResult, RenameArgs, RenameResult,
 };
 
 fn resolve_path(
-    ops: &FileOps,
+    ops: &OpContext,
     path: &str,
     access: Access,
     follow_last: bool,
@@ -45,7 +45,7 @@ fn resolve_path(
 
 /// The etag a caller would have seen for the object `stat` describes.
 fn object_etag(
-    ops: &FileOps,
+    ops: &OpContext,
     resolved: &Resolved,
     stat: &Stat,
     access: Access,
@@ -57,7 +57,7 @@ fn object_etag(
             if !opened.same_object(stat) {
                 return Err(FileError::conflict("replaced"));
             }
-            Some(current_etag(ops, &mut file, &opened, cancel)?)
+            Some(ops.key.current(&mut file, &opened, cancel)?)
         }
         Kind::Symlink => Some(ops.key.weak_stat(stat)),
         Kind::Dir | Kind::Other => None,
@@ -89,12 +89,12 @@ fn within(inner: &Path, outer: &Path) -> bool {
 }
 
 pub(crate) fn rename(
-    ops: &FileOps,
+    ops: &OpContext,
     args: &RenameArgs,
     cancel: &Cancel,
 ) -> FileResult<RenameResult> {
     check_reason(&args.reason)?;
-    let _namespace = ops.namespace_exclusive(cancel)?;
+    let _namespace = ops.locks.namespace_exclusive(cancel)?;
     let overwrite = args.overwrite.unwrap_or(false);
     if overwrite && args.expected_etag.is_none() {
         return Err(FileError::invalid(
@@ -116,7 +116,9 @@ pub(crate) fn rename(
     }
     // Names that differ in case only are one name on NTFS: the move renames it.
     let case_only = same_path(&from_path, &to_path);
-    let _locks = ops.lock_pair(from_path.clone(), to_path.clone(), cancel)?;
+    let _locks = ops
+        .locks
+        .lock_pair(from_path.clone(), to_path.clone(), cancel)?;
 
     let src = from
         .lstat()?
@@ -132,9 +134,9 @@ pub(crate) fn rename(
             "cannot move a directory into its own subtree",
         ));
     }
-    ops.step(Step::BeforeIdentity)?;
+    ops.hook.step(Step::BeforeIdentity)?;
     ops.policy.check_identity(Access::Remove, &src)?;
-    ops.step(Step::IdentityChecked)?;
+    ops.hook.step(Step::IdentityChecked)?;
     let src_etag = object_etag(ops, &from, &src, Access::Remove, cancel)?;
     if !overwrite && let Some(expected) = &args.expected_etag {
         match &src_etag {
@@ -164,16 +166,16 @@ pub(crate) fn rename(
                 "the destination is a directory or special file and is not overwritten",
             ));
         }
-        ops.step(Step::BeforeIdentity)?;
+        ops.hook.step(Step::BeforeIdentity)?;
         ops.policy.check_identity(Access::Write, dst)?;
-        ops.step(Step::IdentityChecked)?;
+        ops.hook.step(Step::IdentityChecked)?;
         let current = object_etag(ops, &to, dst, Access::Write, cancel)?.unwrap_or_default();
         if args.expected_etag.as_deref() != Some(current.as_str()) {
             return Err(FileError::conflict(&current));
         }
     }
 
-    ops.step(Step::EtagRechecked)?;
+    ops.hook.step(Step::EtagRechecked)?;
     cancel.check()?;
     still_same(&from, &src)?;
     match &dst {
@@ -189,14 +191,14 @@ pub(crate) fn rename(
             }
         })?,
     }
-    let _ = ops.step(Step::Renamed);
+    let _ = ops.hook.step(Step::Renamed);
     // The moved object keeps its identity and bytes: describe it at its new name.
     let etag = match src.kind() {
         Kind::File => Some(
             resolve_path(ops, &args.to, Access::Read, false, Some(cancel))
                 .and_then(|moved| {
                     let (mut file, stat) = moved.open_regular(&ops.policy, Access::Read)?;
-                    current_etag(ops, &mut file, &stat, cancel)
+                    ops.key.current(&mut file, &stat, cancel)
                 })
                 .map_err(|_| FileError::mutation_uncertain())?,
         ),
@@ -209,14 +211,14 @@ pub(crate) fn rename(
     })
 }
 
-pub(crate) fn mkdir(ops: &FileOps, args: &MkdirArgs, cancel: &Cancel) -> FileResult<MkdirResult> {
+pub(crate) fn mkdir(ops: &OpContext, args: &MkdirArgs, cancel: &Cancel) -> FileResult<MkdirResult> {
     check_reason(&args.reason)?;
     if args.mode.is_some() {
         return Err(FileError::invalid(
             "mode is not supported on Windows; leave it out",
         ));
     }
-    let _namespace = ops.namespace_shared(cancel)?;
+    let _namespace = ops.locks.namespace_shared(cancel)?;
     let mut resolved = resolve(
         &args.path,
         &ResolveOpts {
@@ -238,7 +240,7 @@ pub(crate) fn mkdir(ops: &FileOps, args: &MkdirArgs, cancel: &Cancel) -> FileRes
 }
 
 fn mkdir_resolved(
-    ops: &FileOps,
+    ops: &OpContext,
     resolved: &mut Resolved,
     cancel: &Cancel,
 ) -> FileResult<MkdirResult> {
@@ -247,7 +249,7 @@ fn mkdir_resolved(
             created: !resolved.created.is_empty(),
         });
     }
-    let _lock = ops.lock_path(resolved.full_path(), cancel)?;
+    let _lock = ops.locks.lock_path(resolved.full_path(), cancel)?;
     let existing = |resolved: &Resolved| match resolved.lstat()? {
         Some(stat) if stat.kind() == Kind::Dir => Ok(MkdirResult { created: false }),
         _ => Err(FileError::new(
@@ -258,7 +260,7 @@ fn mkdir_resolved(
     if resolved.lstat()?.is_some() {
         return existing(resolved);
     }
-    ops.step(Step::EtagRechecked)?;
+    ops.hook.step(Step::EtagRechecked)?;
     cancel.check()?;
     match std::fs::create_dir(resolved.full_path()) {
         Ok(()) => {
@@ -271,12 +273,12 @@ fn mkdir_resolved(
 }
 
 pub(crate) fn delete(
-    ops: &FileOps,
+    ops: &OpContext,
     args: &DeleteArgs,
     cancel: &Cancel,
 ) -> FileResult<DeleteResult> {
     check_reason(&args.reason)?;
-    let _namespace = ops.namespace_exclusive(cancel)?;
+    let _namespace = ops.locks.namespace_exclusive(cancel)?;
     let resolved = resolve_path(ops, &args.path, Access::Remove, false, Some(cancel))?;
     if resolved.is_self() {
         return Err(FileError::invalid(
@@ -284,7 +286,7 @@ pub(crate) fn delete(
         ));
     }
     let full = resolved.full_path();
-    let _lock = ops.lock_path(full.clone(), cancel)?;
+    let _lock = ops.locks.lock_path(full.clone(), cancel)?;
     let st = resolved
         .lstat()?
         .ok_or_else(|| FileError::new(ErrorCode::NotFound, "no such file or directory"))?;
@@ -302,7 +304,7 @@ pub(crate) fn delete(
             None => return Err(FileError::invalid("directories have no etag")),
         }
     }
-    ops.step(Step::EtagRechecked)?;
+    ops.hook.step(Step::EtagRechecked)?;
     cancel.check()?;
     still_same(&resolved, &st)?;
     // A link to a directory (a directory symlink or a junction) is removed as

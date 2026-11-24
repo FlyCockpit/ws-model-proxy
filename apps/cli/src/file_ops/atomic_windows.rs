@@ -30,13 +30,14 @@ use std::path::{Path, PathBuf};
 
 use rand::distr::{Alphanumeric, SampleString};
 
+use super::context::OpContext;
 use super::error::{ErrorCode, FileError, FileResult};
-use super::read::current_etag;
-use super::resolve::{DirHandle, Stat};
-use super::{Cancel, FileOps, Step};
+use super::meta::Stat;
+use super::resolve::DirHandle;
+use super::{Cancel, Step};
 
 /// Refuse files an atomic replace would damage.
-pub(crate) fn check_replaceable(_ops: &FileOps, stat: &Stat) -> FileResult<()> {
+pub(crate) fn check_replaceable(_ops: &OpContext, stat: &Stat) -> FileResult<()> {
     if stat.nlink > 1 {
         return Err(FileError::new(
             ErrorCode::HardLinked,
@@ -95,7 +96,7 @@ fn create_exclusive(path: &Path) -> FileResult<(File, Staged)> {
 /// derived from. Nothing is ever recovered here: the list is always empty.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn replace(
-    ops: &FileOps,
+    ops: &OpContext,
     _dir: &DirHandle,
     name: &OsStr,
     dir_path: &Path,
@@ -113,19 +114,19 @@ pub(crate) fn replace(
         Alphanumeric.sample_string(&mut rand::rng(), 10)
     ));
     let (mut tmp, mut staged) = create_exclusive(&staging)?;
-    ops.step(Step::TempCreated)?;
+    ops.hook.step(Step::TempCreated)?;
     tmp.write_all(content)?;
-    ops.step(Step::TempWritten)?;
+    ops.hook.step(Step::TempWritten)?;
     tmp.sync_all()?;
-    ops.step(Step::TempSynced)?;
+    ops.hook.step(Step::TempSynced)?;
     drop(tmp);
     recheck(ops, &target, &mut orig, orig_stat, orig_etag, cancel)?;
-    ops.step(Step::EtagRechecked)?;
+    ops.hook.step(Step::EtagRechecked)?;
     cancel.check()?;
     drop(orig);
     rename_retrying(&staging, &target).map_err(|error| FileError::io(&error))?;
     staged.armed = false;
-    let _ = ops.step(Step::Renamed);
+    let _ = ops.hook.step(Step::Renamed);
     Ok((Stat::of_path(&target)?, Vec::new()))
 }
 
@@ -155,7 +156,7 @@ pub(crate) fn rename_retrying(from: &Path, to: &Path) -> std::io::Result<()> {
 /// The name must still open the file we read, and that file must still hold
 /// the bytes the edit was computed from.
 fn recheck(
-    ops: &FileOps,
+    ops: &OpContext,
     target: &Path,
     orig: &mut File,
     orig_stat: &Stat,
@@ -175,7 +176,7 @@ fn recheck(
     use std::io::Seek;
     orig.rewind()?;
     let now = Stat::of_file(orig)?;
-    let current = current_etag(ops, orig, &now, cancel)?;
+    let current = ops.key.current(orig, &now, cancel)?;
     if current != orig_etag {
         return Err(FileError::conflict(&current));
     }
@@ -185,7 +186,7 @@ fn recheck(
 /// Exclusive create. A failed write removes the file it created. `mode` has no
 /// meaning on Windows; callers refuse one before they get here.
 pub(crate) fn create_new(
-    ops: &FileOps,
+    ops: &OpContext,
     _dir: &DirHandle,
     dir_path: &Path,
     name: &OsStr,
@@ -193,7 +194,7 @@ pub(crate) fn create_new(
     _mode: u32,
 ) -> FileResult<(Stat, Vec<String>)> {
     let (mut file, mut staged) = create_exclusive(&dir_path.join(name))?;
-    ops.step(Step::Created)?;
+    ops.hook.step(Step::Created)?;
     file.write_all(content)?;
     file.sync_all()?;
     let stat = Stat::of_file(&file)?;
