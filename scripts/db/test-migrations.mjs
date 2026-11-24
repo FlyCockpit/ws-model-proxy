@@ -282,22 +282,41 @@ function makeRepo({ templateHistory = false } = {}) {
 }
 
 /**
- * `pnpm db:baseline` (the create flow) in a fresh repo with the template's
- * marker: a lone 0_init is kept byte for byte; an inherited multi-folder
- * history is folded into a regenerated 0_init; refusals for rows created by
- * migrations, unrecognized files, and the app's own release tags; tags that
- * came with the template are only reported.
+ * `pnpm db:baseline`. First, in a copy of this app's own history (no marker):
+ * it refuses and writes nothing. Then the create flow in a fresh repo with the
+ * template's marker: a lone 0_init is kept byte for byte; an inherited
+ * multi-folder history is folded into a regenerated 0_init; refusals for rows
+ * created by migrations, unrecognized files, and the app's own release tags;
+ * tags that came with the template are only reported.
  */
 async function baselineScenarios({ serverUrl, env }) {
+  const run = (repo) =>
+    sh(process.execPath, [path.join(repo, "scripts/db/baseline.mjs")], {
+      cwd: repo,
+      env: { ...env, CHECK_DATABASE_URL: serverUrl },
+    });
+  await step("baseline: inert without the template marker (refuses, writes nothing)", async () => {
+    // This app's own history (no marker, several folders), not the template's.
+    const { repo: a } = makeRepo();
+    try {
+      assert.equal(existsSync(path.join(a, "packages/db/prisma/template-history.json")), false);
+      const mig = path.join(a, "packages/db/prisma/migrations");
+      const before = readdirSync(mig).sort();
+      const init = readFileSync(path.join(mig, "0_init/migration.sql"), "utf8");
+      const r = run(a);
+      assert.equal(r.code, 1, r.out);
+      assert.match(r.out, /template-history\.json is absent/);
+      assert.deepEqual(readdirSync(mig).sort(), before);
+      assert.equal(readFileSync(path.join(mig, "0_init/migration.sql"), "utf8"), init);
+    } finally {
+      rmSync(a, { recursive: true, force: true });
+    }
+  });
   const { repo: b, git: bg } = makeRepo({ templateHistory: true });
   const mig = path.join(b, "packages/db/prisma/migrations");
   const marker = path.join(b, "packages/db/prisma/template-history.json");
   const schemaFile = path.join(b, "packages/db/prisma/schema/projects.prisma");
-  const baseline = () =>
-    sh(process.execPath, [path.join(b, "scripts/db/baseline.mjs")], {
-      cwd: b,
-      env: { ...env, CHECK_DATABASE_URL: serverUrl },
-    });
+  const baseline = () => run(b);
   const addMarker = () => {
     writeFileSync(marker, '{ "note": "test" }\n');
     bg("add", "-A");
