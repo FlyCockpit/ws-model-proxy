@@ -35,7 +35,7 @@ use tungstenite::http::HeaderValue;
 use url::Url;
 
 use crate::auth::{CredentialPairing, join};
-use crate::config::{Config, ConfigLock, EndpointAuthMode};
+use crate::config::{Config, EndpointAuthMode};
 use crate::control::ControlServer;
 use crate::control::{self, ControlCommand, ControlResponse};
 use crate::media::{
@@ -62,7 +62,6 @@ use crate::runtimes::executor::Job;
 use crate::sessions::{
     DEFAULT_COMMAND_MAX, ExecLine, ExecRegistry, OutboundFrame, TermHandshake, TerminalRegistry,
 };
-use crate::slug::generated_slug;
 use crate::startup::TerminalStartup;
 use crate::stt_wire::SttServerMessage;
 use crate::tokens::{CompletionTextCollector, standardized_completion_metrics};
@@ -679,28 +678,6 @@ impl ReconnectBackoff {
     }
 }
 
-pub fn ensure_cli_slug(config: &mut Config) -> Result<String> {
-    if let Some(slug) = &config.cli_slug {
-        crate::slug::validate_slug(slug)?;
-        return Ok(slug.clone());
-    }
-    // The initial daemon bootstrap is also a read-modify-write. Re-read while
-    // holding the transitional lock so a simultaneous login/config command
-    // cannot have its generated device slug overwritten by this stale map.
-    let _config_lock = ConfigLock::exclusive()?;
-    let mut current = Config::load_required()?;
-    if let Some(slug) = current.cli_slug.clone() {
-        crate::slug::validate_slug(&slug)?;
-        *config = current;
-        return Ok(slug);
-    }
-    let slug = generated_slug("cli");
-    current.cli_slug = Some(slug.clone());
-    current.save()?;
-    *config = current;
-    Ok(slug)
-}
-
 /// Stop the relay after a shutdown signal. `main` maps this to the signal's
 /// exit status.
 fn check_shutdown() -> Result<()> {
@@ -736,7 +713,7 @@ pub fn connect_foreground() -> Result<()> {
     let mut credential_pairing = CredentialPairing::default();
     loop {
         check_shutdown()?;
-        let node_slug = ensure_cli_slug(&mut config)?;
+        let node_slug = config.ensure_cli_slug()?;
         let mut progress = ConnectProgress::Connecting;
         let wait = match credential_pairing.resolve_credential(
             config.server_url.as_deref(),
@@ -900,7 +877,7 @@ fn reload_config(startup: &TerminalStartup) -> Result<Vec<NodeChange>> {
     let file_trust = crate::trust::configured_on_disk();
     match Config::load_required() {
         Ok(config) => {
-            startup.set_runtime_hosts(config.runtime_hosts.clone());
+            startup.follow_runtime_hosts(&config);
             changes.extend(reload_human_terminal(startup, &config));
         }
         // A config that does not load reads as Relay only below, which ends
@@ -936,7 +913,7 @@ fn reload_config(startup: &TerminalStartup) -> Result<Vec<NodeChange>> {
 /// The browser terminal switch on hot reload: off latches now (and ends
 /// browser shells); on takes a restart of the relay.
 fn reload_human_terminal(startup: &TerminalStartup, config: &Config) -> Option<NodeChange> {
-    if !config.allow_human_terminal && startup.disable_human_terminal() {
+    if startup.follow_human_terminal_off(config) {
         tracing::warn!("config.json turned browser terminals off; ending browser shells");
         return Some(NodeChange::HumanTerminalsDisabled);
     }
@@ -1768,15 +1745,13 @@ fn run_relay_session(
 
     let server_url = config.server_url.as_deref().unwrap_or_default();
     let hello_origin = config.hello_origin().map_err(RelaySessionError::Fatal)?;
-    let identity = startup.identity().ok_or_else(|| {
-        RelaySessionError::Fatal(anyhow::anyhow!(
-            "CLI identity key is unavailable; cannot bind this node"
-        ))
-    })?;
+    startup
+        .ensure_identity()
+        .map_err(RelaySessionError::Fatal)?;
     let (nonce, origin) = wait_for_hello_challenge(&mut socket, StopOn::here())?;
     *progress = ConnectProgress::Challenged;
     check_hello_origin(&origin, &hello_origin, server_url)?;
-    let identity_signature = identity
+    let identity_signature = startup
         .sign_hello(&nonce, node_slug, &origin)
         .map_err(RelaySessionError::Fatal)?;
     // Any edit made while connecting (a hand-written `relay`) applies before

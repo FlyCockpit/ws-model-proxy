@@ -24,7 +24,7 @@ pub struct TerminalStartup {
     /// production startup refuses to connect without a loadable identity.
     identity: Option<CliIdentity>,
     /// `config.json` `allowHumanTerminal` at startup; hot reload only turns it
-    /// off ([`Self::disable_human_terminal`]); on takes a restart.
+    /// off ([`Self::follow_human_terminal_off`]); on takes a restart.
     allow_human_terminal: std::sync::atomic::AtomicBool,
     /// Full control until lowered; a lowering latches for the daemon's life.
     /// Shared with whatever must see a lowering at once (an update worker).
@@ -170,7 +170,7 @@ impl TerminalStartup {
         if let Some(warning) = config.retired_command_policy_warning {
             tracing::warn!("{warning}");
         }
-        let (file_roots, file_roots_source) = crate::config::effective_file_roots(config, home);
+        let (file_roots, file_roots_source) = config.effective_file_roots(home);
         Self {
             key,
             identity: None,
@@ -192,12 +192,48 @@ impl TerminalStartup {
         self
     }
 
-    pub fn key(&self) -> &CliTerminalKey {
-        &self.key
+    /// This daemon's terminal public key (SEC1), which browser approvals sign.
+    pub fn terminal_public_key(&self) -> &[u8; 65] {
+        self.key.public_raw()
     }
 
-    pub fn identity(&self) -> Option<&CliIdentity> {
-        self.identity.as_ref()
+    /// The direction keys of one browser terminal viewer, from this daemon's
+    /// terminal key and the browser's handshake.
+    pub fn derive_terminal_keys(
+        &self,
+        browser_public_raw: &[u8; 65],
+        browser_nonce: &[u8; 16],
+        cli_nonce: &[u8; 16],
+        terminal_id: &str,
+        viewer_id: &str,
+    ) -> Result<crate::terminal_crypto::DirectionKeys> {
+        crate::terminal_crypto::derive_direction_keys_v2(
+            &self.key,
+            browser_public_raw,
+            browser_nonce,
+            cli_nonce,
+            terminal_id,
+            viewer_id,
+        )
+    }
+
+    /// Refuse to bind the node without the identity key (only tests start
+    /// without one).
+    pub fn ensure_identity(&self) -> Result<()> {
+        self.loaded_identity().map(|_| ())
+    }
+
+    /// The hello `identitySignature`: the identity key signs the server's
+    /// challenge for `node_slug` at `origin`.
+    pub fn sign_hello(&self, nonce_b64url: &str, node_slug: &str, origin: &str) -> Result<String> {
+        self.loaded_identity()?
+            .sign_hello(nonce_b64url, node_slug, origin)
+    }
+
+    fn loaded_identity(&self) -> Result<&CliIdentity> {
+        self.identity.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("CLI identity key is unavailable; cannot bind this node")
+        })
     }
 
     pub fn allow_human_terminal(&self) -> bool {
@@ -205,12 +241,14 @@ impl TerminalStartup {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Browser terminals off from now on (`config.json` turned
-    /// `allowHumanTerminal` off). Latches for the daemon's life: turning it
-    /// back on takes a restart. Returns whether it changed.
-    pub fn disable_human_terminal(&self) -> bool {
-        self.allow_human_terminal
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    /// A hot reload's `allowHumanTerminal`: off turns browser terminals off
+    /// from now on, latched for the daemon's life; on changes nothing (that
+    /// takes a restart). Returns whether this turned them off.
+    pub fn follow_human_terminal_off(&self, config: &Config) -> bool {
+        !config.allow_human_terminal
+            && self
+                .allow_human_terminal
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The node's trust for this daemon's lifetime.
@@ -263,7 +301,9 @@ impl TerminalStartup {
             .unwrap_or_default()
     }
 
-    pub fn set_runtime_hosts(&self, hosts: Vec<String>) {
+    /// A hot reload's `runtimeHosts`: they follow the file.
+    pub fn follow_runtime_hosts(&self, config: &Config) {
+        let hosts = config.runtime_hosts.clone();
         if let Ok(mut current) = self.runtime_hosts.lock() {
             *current = hosts;
         }
@@ -534,7 +574,7 @@ mod tests {
                 frozen: false
             }
         );
-        assert!(startup.identity().is_some());
+        assert!(startup.ensure_identity().is_ok());
     }
 
     #[test]
@@ -700,7 +740,7 @@ mod tests {
         let node = startup.hello_node("desk-01", "sig".to_string());
         assert_eq!(node.slug, "desk-01");
         assert_eq!(node.identity_signature, "sig");
-        assert_eq!(node.terminal_public_key, startup.key().public_b64url());
+        assert_eq!(node.terminal_public_key, startup.key.public_b64url());
         let proof = node.terminal_identity.expect("proof");
         let public = decode_public_key(&proof.public_key).expect("public");
         let signature = decode_exact(&proof.signature, 64).expect("signature");
@@ -708,13 +748,13 @@ mod tests {
             &public,
             &signature,
             "desk-01",
-            startup.key().public_raw()
+            startup.terminal_public_key()
         ));
         assert!(!verify_cli_identity(
             &public,
             &signature,
             "desk-02",
-            startup.key().public_raw()
+            startup.terminal_public_key()
         ));
     }
 }

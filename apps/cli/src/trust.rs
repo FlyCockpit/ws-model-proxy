@@ -12,17 +12,12 @@
 
 use anyhow::{Context, Result};
 
-use crate::config::Config;
+use crate::config::{Config, Setting};
 use crate::protocol::frames::TrustValue;
 
 /// The marker every child the node starts carries (jobs, commands, metric
 /// commands, terminals). `wsmp trust full` refuses to run under it.
 pub const JOB_MARKER_ENV: &str = "WSMP_JOB";
-
-/// The trust a config grants: unset is Relay only (fail closed).
-pub fn configured(config: &Config) -> TrustValue {
-    config.trust.unwrap_or(TrustValue::Relay)
-}
 
 /// The trust the daemon starts with. A frozen copy on disk means the node
 /// was lowered, and only `wsmp trust full` removes it (before it writes
@@ -33,7 +28,7 @@ pub fn at_startup(config: &Config) -> TrustValue {
         .map(|path| path.exists())
         .unwrap_or(true);
     if frozen {
-        if config.trust == Some(TrustValue::Full) {
+        if config.configured_trust() == TrustValue::Full {
             tracing::warn!(
                 "config.json says `full` but this node was lowered; only `wsmp trust full` raises it"
             );
@@ -41,7 +36,7 @@ pub fn at_startup(config: &Config) -> TrustValue {
         }
         return TrustValue::Relay;
     }
-    configured(config)
+    config.configured_trust()
 }
 
 /// The trust a hot reload sees: an unreadable or unparsable config, or one
@@ -73,11 +68,7 @@ pub fn persist_relay() -> Result<()> {
         tracing::error!(error = %format!("{error:#}"), "freezing the held definitions failed; holding none");
         crate::runtime_store::freeze_empty().context("marking the node lowered")?;
     }
-    Config::update(false, |config| {
-        config.trust = Some(TrustValue::Relay);
-        Ok(())
-    })
-    .context("persisting trust `relay` to the config")
+    Config::set(Setting::Trust(TrustValue::Relay)).context("persisting trust `relay` to the config")
 }
 
 /// A Full to Relay change: the frozen copy is today's held set, never an
@@ -99,7 +90,7 @@ pub fn effective(config: &Config) -> TrustValue {
     if frozen {
         TrustValue::Relay
     } else {
-        configured(config)
+        config.configured_trust()
     }
 }
 
@@ -109,7 +100,7 @@ pub fn effective(config: &Config) -> TrustValue {
 pub fn persist_full() -> Result<()> {
     crate::runtime_store::unfreeze().context("unfreezing the held definitions")?;
     Config::update(true, |config| {
-        config.trust = Some(TrustValue::Full);
+        config.apply(Setting::Trust(TrustValue::Full));
         Ok(())
     })
     .context("persisting trust `full` to the config")
