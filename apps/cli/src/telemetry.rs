@@ -208,10 +208,9 @@ fn run(tx: SyncSender<FromWorker>, stop: Arc<AtomicBool>, shared: Arc<Mutex<Shar
         {
             runner.set_commands(&commands);
         }
-        runner.tick(now);
         // A finished command run or a changed command state goes out as soon
         // as the minimum gap allows.
-        sources_changed |= runner.take_changed();
+        sources_changed |= runner.tick(now);
         let gap_ok = last_metrics.is_none_or(|at| now.duration_since(at) >= NODE_METRICS_MIN_GAP);
         if gap_ok && (now >= next_metrics || sources_changed) {
             sources_changed = false;

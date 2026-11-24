@@ -330,6 +330,28 @@ impl Registered {
         }
     }
 
+    /// This account's 0.4.x task `name`, registered again under its own name.
+    fn kept_legacy_name(name: &str) -> Self {
+        Self {
+            kept_legacy_name: true,
+            ..Self::new(name)
+        }
+    }
+
+    /// End and delete this account's 0.4.x task `old`.
+    fn retire(&mut self, tasks: &dyn Tasks, old: String) {
+        tasks.end(&old);
+        match tasks.delete(&old) {
+            Ok(()) => self.retired = Some(old),
+            Err(error) => self.retire_failed = Some((old, error)),
+        }
+    }
+
+    /// The 0.4.x-named task `name`, not this account's (or not known to be), stays.
+    fn leave_alone(&mut self, name: String, owner: Option<String>) {
+        self.left_alone = Some((name, owner));
+    }
+
     /// Lines for the install output about the 0.4.x task.
     pub fn notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
@@ -361,15 +383,6 @@ impl Registered {
     }
 }
 
-/// End and delete this account's 0.4.x task `old` into `registered`.
-fn retire(tasks: &dyn Tasks, old: String, registered: &mut Registered) {
-    tasks.end(&old);
-    match tasks.delete(&old) {
-        Ok(()) => registered.retired = Some(old),
-        Err(error) => registered.retire_failed = Some((old, error)),
-    }
-}
-
 /// Register the relay task from `xml_file`, then retire this account's 0.4.x
 /// task (end what it runs, delete it). The 1.0 task is registered first, so
 /// a failure leaves the old task in place, never no task; a failed delete is
@@ -393,16 +406,14 @@ pub fn register(
         && !own_task_exists(tasks, &names.current)?
     {
         tasks.create(old, xml_file)?;
-        let mut registered = Registered::new(old);
-        registered.kept_legacy_name = true;
-        return Ok(registered);
+        return Ok(Registered::kept_legacy_name(old));
     }
     tasks.create(&names.current, xml_file)?;
     let mut registered = Registered::new(&names.current);
     match old {
         Legacy::Absent => {}
-        Legacy::Ours(old) => retire(tasks, old, &mut registered),
-        Legacy::NotOurs { name, owner } => registered.left_alone = Some((name, owner)),
+        Legacy::Ours(old) => registered.retire(tasks, old),
+        Legacy::NotOurs { name, owner } => registered.leave_alone(name, owner),
     }
     Ok(registered)
 }
@@ -424,7 +435,7 @@ pub fn migrate(
     };
     if own_task_exists(tasks, &names.current)? {
         let mut registered = Registered::new(&names.current);
-        retire(tasks, old, &mut registered);
+        registered.retire(tasks, old);
         return Ok(Some(registered));
     }
     register(tasks, names, account, xml_file, false).map(Some)

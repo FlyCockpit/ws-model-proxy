@@ -695,13 +695,9 @@ impl Runner {
         self.states = next;
     }
 
-    /// True once after a run finished or a command's state changed.
-    pub fn take_changed(&mut self) -> bool {
-        std::mem::take(&mut self.changed)
-    }
-
-    /// Collect finished runs and start due ones.
-    pub fn tick(&mut self, now: Instant) {
+    /// Collect finished runs and start due ones. True when a run finished or
+    /// a command's state changed since the last tick.
+    pub fn tick(&mut self, now: Instant) -> bool {
         // A run that never reported (a lost thread) is forgotten after its
         // bound, so its command is not blocked forever.
         let mut given_up = Vec::new();
@@ -799,6 +795,7 @@ impl Runner {
                 },
             );
         }
+        std::mem::take(&mut self.changed)
     }
 
     /// Series to report and every command's status.
@@ -1228,15 +1225,15 @@ escaped{v="a\"b"} 1
     fn runner_reports_values_and_drops_stale_ones() {
         let mut runner = Runner::new();
         runner.set_commands(&[definition("temp", "echo 71")]);
-        runner.take_changed();
+        assert!(runner.tick(Instant::now()), "the new command is a change");
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            runner.tick(Instant::now());
+            let changed = runner.tick(Instant::now());
             let (custom, _) = runner.report(Instant::now());
             if let Some(metric) = custom.first() {
                 assert_eq!(metric.name, "temp");
                 assert_eq!(metric.value, 71.0);
-                assert!(runner.take_changed());
+                assert!(changed);
                 break;
             }
             assert!(Instant::now() < deadline, "no value reported");

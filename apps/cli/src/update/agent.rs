@@ -343,12 +343,12 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(trust: TrustWatch) -> Self {
+    fn new(trust: TrustWatch, force: bool) -> Self {
         Self {
             no_instances: AtomicBool::new(false),
             no_commands: AtomicBool::new(false),
             stage: AtomicStage::new(),
-            force: AtomicBool::new(false),
+            force: AtomicBool::new(force),
             lowered: AtomicBool::new(false),
             trust,
         }
@@ -358,12 +358,90 @@ impl Shared {
     fn revoked(&self) -> bool {
         self.lowered.load(Ordering::SeqCst) || self.trust.revoked()
     }
+
+    /// The owner forced the update after it was asked for (a late `force`).
+    fn force(&self) {
+        self.force.store(true, Ordering::SeqCst);
+    }
+
+    /// The relay loop saw the node lose Full control.
+    fn lower(&self) {
+        self.lowered.store(true, Ordering::SeqCst);
+    }
+
+    /// The relay loop's report of what runs on the node now.
+    fn set_idle(&self, no_instances: bool, no_commands: bool) {
+        self.no_instances.store(no_instances, Ordering::SeqCst);
+        self.no_commands.store(no_commands, Ordering::SeqCst);
+    }
+
+    /// No instance runs and, unless the update is forced, no node command.
+    fn is_idle(&self) -> bool {
+        self.no_instances.load(Ordering::SeqCst)
+            && (self.force.load(Ordering::SeqCst) || self.no_commands.load(Ordering::SeqCst))
+    }
+
+    /// See [`WorkerStage::wants_idle`].
+    fn wants_idle(&self) -> bool {
+        self.stage.load().wants_idle()
+    }
+
+    /// See [`WorkerStage::holds_new_work`].
+    fn holds_new_work(&self) -> bool {
+        self.stage.load().holds_new_work()
+    }
+
+    /// From here to the restart, the relay loop starts no new work.
+    fn hold_new_work(&self) {
+        self.stage.advance(WorkerStage::hold, "hold new work");
+    }
+
+    /// The update will not restart after all: new work may start again.
+    fn release_new_work(&self) {
+        self.stage
+            .advance(WorkerStage::release, "let go of new work");
+    }
+
+    /// Wait (bounded) until the node is idle: no instance runs and, unless the
+    /// update is forced, no node command. A forced update's instances are stopped
+    /// by the server. `false` when it did not go idle in time, or as soon as
+    /// `stopped` (the node was lowered, or its operator turned remote updates
+    /// off: the caller then refuses with that reason).
+    fn wait_idle(
+        &self,
+        progress: &mut dyn Progress,
+        limit: Duration,
+        stopped: &dyn Fn() -> bool,
+    ) -> bool {
+        // The relay loop answers within a poll or two.
+        self.stage.advance(WorkerStage::begin_wait, "wait for idle");
+        let end_wait = || {
+            self.stage
+                .advance(WorkerStage::end_wait, "end the wait for idle")
+        };
+        std::thread::sleep(Duration::from_millis(1500));
+        if self.is_idle() {
+            end_wait();
+            return true;
+        }
+        progress.report(UpdatePhase::WaitingIdle, None, None);
+        let until = Instant::now() + limit;
+        while Instant::now() < until && !stopped() {
+            std::thread::sleep(Duration::from_secs(1));
+            if self.is_idle() {
+                end_wait();
+                return true;
+            }
+        }
+        end_wait();
+        false
+    }
 }
 
 #[cfg(test)]
 impl Default for Shared {
     fn default() -> Self {
-        Self::new(TrustWatch::full_for_tests())
+        Self::new(TrustWatch::full_for_tests(), false)
     }
 }
 
@@ -668,8 +746,7 @@ impl DaemonUpdate {
             );
         };
         let (tx, rx) = mpsc::channel();
-        let shared = Arc::new(Shared::new(trust));
-        shared.force.store(frame.force, Ordering::SeqCst);
+        let shared = Arc::new(Shared::new(trust, frame.force));
         let worker_shared = Arc::clone(&shared);
         let update_id = frame.update_id.clone();
         let spawned = std::thread::Builder::new()
@@ -706,7 +783,7 @@ impl DaemonUpdate {
         match &self.tracking {
             Tracking::Installing(worker) => {
                 if frame.force {
-                    worker.shared.force.store(true, Ordering::SeqCst);
+                    worker.shared.force();
                 }
                 return Vec::new();
             }
@@ -732,7 +809,7 @@ impl DaemonUpdate {
     pub fn holds_new_work(&self) -> bool {
         match &self.tracking {
             Tracking::Restarting => true,
-            Tracking::Installing(worker) => worker.shared.stage.load().holds_new_work(),
+            Tracking::Installing(worker) => worker.shared.holds_new_work(),
             Tracking::Idle
             | Tracking::Initializing(_)
             | Tracking::InitializationFailed
@@ -744,7 +821,7 @@ impl DaemonUpdate {
     /// The worker waits for the node to go idle: the relay loop reports idleness.
     pub fn wants_idle(&self) -> bool {
         self.worker()
-            .is_some_and(|worker| worker.shared.stage.load().wants_idle())
+            .is_some_and(|worker| worker.shared.wants_idle())
     }
 
     fn worker(&self) -> Option<&Worker> {
@@ -756,14 +833,7 @@ impl DaemonUpdate {
 
     pub fn set_idle(&self, no_instances: bool, no_commands: bool) {
         if let Some(worker) = self.worker() {
-            worker
-                .shared
-                .no_instances
-                .store(no_instances, Ordering::SeqCst);
-            worker
-                .shared
-                .no_commands
-                .store(no_commands, Ordering::SeqCst);
+            worker.shared.set_idle(no_instances, no_commands);
         }
     }
 
@@ -800,7 +870,7 @@ impl DaemonUpdate {
     /// is a second way to the same stop.)
     pub fn poll(&mut self, full_control: bool) -> (Vec<NodeFrame>, bool) {
         if !full_control && let Some(worker) = self.worker() {
-            worker.shared.lowered.store(true, Ordering::SeqCst);
+            worker.shared.lower();
         }
         if let Tracking::Initializing(rx) = &self.tracking {
             match rx.try_recv() {
@@ -1054,48 +1124,6 @@ fn spawn_confirm(
     Ok(rx)
 }
 
-/// Wait (bounded) until the node is idle: no instance runs and, unless the
-/// update is forced, no node command. A forced update's instances are stopped
-/// by the server. `false` when it did not go idle in time, or as soon as
-/// `stopped` (the node was lowered, or its operator turned remote updates
-/// off: the caller then refuses with that reason).
-fn wait_idle(
-    shared: &Shared,
-    progress: &mut dyn Progress,
-    limit: Duration,
-    stopped: &dyn Fn() -> bool,
-) -> bool {
-    let idle = || {
-        shared.no_instances.load(Ordering::SeqCst)
-            && (shared.force.load(Ordering::SeqCst) || shared.no_commands.load(Ordering::SeqCst))
-    };
-    // The relay loop answers within a poll or two.
-    shared
-        .stage
-        .advance(WorkerStage::begin_wait, "wait for idle");
-    let end_wait = || {
-        shared
-            .stage
-            .advance(WorkerStage::end_wait, "end the wait for idle")
-    };
-    std::thread::sleep(Duration::from_millis(1500));
-    if idle() {
-        end_wait();
-        return true;
-    }
-    progress.report(UpdatePhase::WaitingIdle, None, None);
-    let until = Instant::now() + limit;
-    while Instant::now() < until && !stopped() {
-        std::thread::sleep(Duration::from_secs(1));
-        if idle() {
-            end_wait();
-            return true;
-        }
-    }
-    end_wait();
-    false
-}
-
 /// What the worker asks of this machine; tests run it as another platform would.
 struct Host {
     /// [`instances_survive`].
@@ -1198,7 +1226,7 @@ fn run_worker(
     let stopped = || proceed().is_err();
     if strategy == UpdateStrategy::SelfReplace
         && !host.instances_survive
-        && !wait_idle(shared, &mut sink, IDLE_WAIT_MAX, &stopped)
+        && !shared.wait_idle(&mut sink, IDLE_WAIT_MAX, &stopped)
     {
         let (reason, detail) = proceed().err().unwrap_or((
             UpdateReason::Busy,
@@ -1213,14 +1241,12 @@ fn run_worker(
         if host.instances_survive {
             return Ok(());
         }
-        shared.stage.advance(WorkerStage::hold, "hold new work");
+        shared.hold_new_work();
         let left = IDLE_WAIT_MAX.saturating_sub(waited_from.elapsed());
-        if wait_idle(shared, progress, left, &stopped) {
+        if shared.wait_idle(progress, left, &stopped) {
             return Ok(());
         }
-        shared
-            .stage
-            .advance(WorkerStage::release, "let go of new work");
+        shared.release_new_work();
         // When stopped, the caller's next check refuses with the reason.
         Err("the node did not go idle within 30 minutes".into())
     };
@@ -2569,7 +2595,7 @@ mod tests {
             );
             let brew = FakeBrew::new("0.4.3");
             brew.hold("info-2");
-            let shared = Arc::new(Shared::new(startup.trust_watch()));
+            let shared = Arc::new(Shared::new(startup.trust_watch(), false));
             shared.no_instances.store(true, Ordering::SeqCst);
             shared.no_commands.store(true, Ordering::SeqCst);
             let (worker, rx) = brew.worker(&shared, true);
@@ -2671,7 +2697,7 @@ mod tests {
                     ..crate::config::Config::default()
                 },
             );
-            let shared = Arc::new(Shared::new(startup.trust_watch()));
+            let shared = Arc::new(Shared::new(startup.trust_watch(), false));
             // Busy: an instance runs.
             shared.no_instances.store(false, Ordering::SeqCst);
             let (tx, rx) = mpsc::channel();
@@ -2997,12 +3023,7 @@ mod tests {
         };
         shared.no_instances.store(true, Ordering::SeqCst);
         shared.no_commands.store(false, Ordering::SeqCst);
-        assert!(!wait_idle(
-            &shared,
-            &mut sink,
-            Duration::from_millis(10),
-            &|| false
-        ));
+        assert!(!shared.wait_idle(&mut sink, Duration::from_millis(10), &|| false));
         assert!(matches!(
             rx.try_recv(),
             Ok(Event::Frame(frame)) if matches!(*frame, NodeFrame::AgentUpdateProgress {
@@ -3011,19 +3032,9 @@ mod tests {
             })
         ));
         shared.force.store(true, Ordering::SeqCst);
-        assert!(wait_idle(
-            &shared,
-            &mut sink,
-            Duration::from_millis(10),
-            &|| false
-        ));
+        assert!(shared.wait_idle(&mut sink, Duration::from_millis(10), &|| false));
         shared.no_instances.store(false, Ordering::SeqCst);
-        assert!(!wait_idle(
-            &shared,
-            &mut sink,
-            Duration::from_millis(10),
-            &|| false
-        ));
+        assert!(!shared.wait_idle(&mut sink, Duration::from_millis(10), &|| false));
     }
 
     #[test]
