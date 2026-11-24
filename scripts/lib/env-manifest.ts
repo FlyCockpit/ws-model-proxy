@@ -488,7 +488,7 @@ export const ENV_VARS: EnvVar[] = [
       "and purpose-specific HMAC credentials derived from it (model API tokens,",
       "CLI tokens, device credentials, sticky-routing digests).",
       "",
-      "Local: filled by `pnpm run setup`, or `pnpm generate:secret`.",
+      "Local: filled by `pnpm setup:app`, or `pnpm generate:secret`.",
       "Production: prefer `pnpm generate:secrets`.",
     ],
   },

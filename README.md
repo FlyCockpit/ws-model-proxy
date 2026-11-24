@@ -189,7 +189,7 @@ Environment for the tunnel (in your private env file):
   by the translation tooling) is the same hostname when you set it.
 - `TRUST_PROXY_HOPS=0` would put every client into the tunnel's single rate-limit bucket, and a
   burst of reconnects after an edge restart could trip the per-IP upgrade limits for all of
-  them; `pnpm run doctor` warns about `0` in production.
+  them; `pnpm doctor:app` warns about `0` in production.
 - The app does not read `CF-Connecting-IP`. The hop count above gives the same client address
   without trusting a header that any client reaching the app directly could set.
 - SMTP: home ISPs usually block port 25, so send through a relay (your mail provider or a

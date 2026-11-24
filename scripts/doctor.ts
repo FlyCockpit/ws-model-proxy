@@ -4,7 +4,7 @@
  *
  * Exit code: 0 if all required checks pass, 1 otherwise.
  *
- * Run: `pnpm doctor`
+ * Run: `pnpm doctor:app`
  */
 
 import "@ws-model-proxy/env/load-dotenv";
@@ -121,7 +121,7 @@ function checkDatabase() {
       name: "database",
       status: "fail",
       detail: "DATABASE_URL is not set",
-      hint: "Set DATABASE_URL in .env or run `pnpm setup`.",
+      hint: "Set DATABASE_URL in .env or run `pnpm setup:app`.",
       required: true,
     });
     return;

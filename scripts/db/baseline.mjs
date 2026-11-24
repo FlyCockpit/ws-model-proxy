@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * `pnpm db:baseline [--dry-run]` — ONCE, in a new app created from the
- * template (patterns/getting-started.md, right after `pnpm run setup`):
+ * template (patterns/getting-started.md, right after `pnpm setup:app`):
  * fold the migration history the app inherited from the template into the
  * app's own single `0_init`, so the app's history starts clean.
  *

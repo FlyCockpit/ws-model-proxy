@@ -17,7 +17,7 @@ under MIT. There is no separate contributor license agreement.
 ## Development setup
 
 The [README](README.md#installation) covers requirements, Docker setup and host development
-with `pnpm dev`. `pnpm doctor` diagnoses common setup problems. See the
+with `pnpm dev`. `pnpm doctor:app` diagnoses common setup problems. See the
 [CLI README](apps/cli/README.md#development) for Rust development in `apps/cli`.
 
 ## Repository rules

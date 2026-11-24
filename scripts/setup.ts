@@ -14,7 +14,7 @@
  *
  * After this, `pnpm dev` is the only remaining step.
  *
- * Run: `pnpm setup`
+ * Run: `pnpm setup:app`
  */
 
 import { spawnSync } from "node:child_process";
@@ -81,7 +81,7 @@ function ensureEnvFile() {
 // apps/web/.env.example is all-optional (every VITE_ var is commented out),
 // so copying it verbatim is a safe, runnable default. Without this file the
 // web app still boots, but onboarding docs previously made this a manual step
-// the user had to remember — fold it into `pnpm setup` instead.
+// the user had to remember — fold it into `pnpm setup:app` instead.
 // ---------------------------------------------------------------------------
 function ensureWebEnvFile() {
   if (existsSync(WEB_ENV_PATH)) {

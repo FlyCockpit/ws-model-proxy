@@ -23,7 +23,7 @@ const ROOT = resolve(import.meta.dirname!, "..");
 // defaults and could inspect an unintended database.
 if (!process.env.DATABASE_URL) {
   console.error("preflight:accounts: DATABASE_URL is not set");
-  console.error("Set DATABASE_URL in .env or run `pnpm setup`.");
+  console.error("Set DATABASE_URL in .env or run `pnpm setup:app`.");
   process.exit(1);
 }
 
