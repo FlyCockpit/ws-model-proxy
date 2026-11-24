@@ -47,7 +47,7 @@ pub struct NodeFacts {
 impl NodeFacts {
     pub fn current() -> Self {
         Self {
-            addresses: crate::telemetry::interface_addresses(),
+            addresses: crate::hardware::interface_addresses(),
             sys: std::path::PathBuf::from("/sys"),
             shells: available_shells(),
         }
@@ -117,45 +117,6 @@ pub fn job_shell(
         .iter()
         .copied()
         .find(|shell| *shell != CommandShell::Cmd)
-}
-
-/// One `sh` word: single quotes, a quote inside as `'\''`.
-fn sh_word(arg: &str) -> String {
-    format!("'{}'", arg.replace('\'', r"'\''"))
-}
-
-/// One PowerShell word: single quotes, every quote character PowerShell reads as one (the
-/// ASCII quote and the typographic ones) doubled.
-fn powershell_word(arg: &str) -> String {
-    let mut out = String::from("'");
-    for ch in arg.chars() {
-        if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
-            out.push(ch);
-        }
-        out.push(ch);
-    }
-    out.push('\'');
-    out
-}
-
-/// An argv as a script for `shell`: the program runs in place of the shell (`exec`) in `sh`.
-/// PowerShell runs it as its last command, so the status check every Windows script ends with
-/// (`windows::powershell_script`) exits with the program's status, or 1 when it could not start.
-/// `None` for `cmd`, which cannot quote an argument safely.
-///
-/// On Windows the script is how the command is shown, and how it runs when its program is not an
-/// `.exe`: one that is starts directly (`windows::invocation`).
-pub fn argv_script(shell: CommandShell, argv: &[String]) -> Option<String> {
-    let words = |word: fn(&str) -> String| argv.iter().map(|arg| word(arg)).collect::<Vec<_>>();
-    match shell {
-        CommandShell::Sh => Some(format!("exec {}", words(sh_word).join(" "))),
-        CommandShell::Pwsh => Some(format!(
-            "$PSNativeCommandArgumentPassing = 'Standard'; & {}",
-            words(powershell_word).join(" ")
-        )),
-        CommandShell::Powershell => Some(format!("& {}", words(powershell_word).join(" "))),
-        CommandShell::Cmd => None,
-    }
 }
 
 fn phase_command(commands: &Commands, phase: JobPhase) -> Option<&CommandLine> {
@@ -254,32 +215,33 @@ pub fn render(
     // A command's script, and an argv's arguments where a program may start without the shell
     // (Windows). Sizes are checked before quoting: an argv is as long as its arguments joined with
     // spaces.
-    let render_one =
-        |command: &CommandLine, field: &str| -> Result<(String, Option<Vec<String>>), Refusal> {
-            let refused = || refuse(JobError::BadJob, field.to_string());
-            match command {
-                CommandLine::Text(text) => {
-                    let rendered = fill(text)?;
-                    if rendered.len() > RUNTIME_COMMAND_MAX_BYTES {
-                        return Err(refused());
-                    }
-                    Ok((rendered, None))
+    let render_one = |command: &CommandLine,
+                      field: &str|
+     -> Result<(String, Option<Vec<String>>), Refusal> {
+        let refused = || refuse(JobError::BadJob, field.to_string());
+        match command {
+            CommandLine::Text(text) => {
+                let rendered = fill(text)?;
+                if rendered.len() > RUNTIME_COMMAND_MAX_BYTES {
+                    return Err(refused());
                 }
-                CommandLine::Argv(argv) => {
-                    let rendered = argv
-                        .iter()
-                        .map(|arg| fill(arg))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let joined = rendered.iter().map(String::len).sum::<usize>()
-                        + rendered.len().saturating_sub(1);
-                    if joined > RUNTIME_COMMAND_MAX_BYTES {
-                        return Err(refused());
-                    }
-                    let script = argv_script(shell, &rendered).ok_or_else(refused)?;
-                    Ok((script, (shell != CommandShell::Sh).then_some(rendered)))
-                }
+                Ok((rendered, None))
             }
-        };
+            CommandLine::Argv(argv) => {
+                let rendered = argv
+                    .iter()
+                    .map(|arg| fill(arg))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let joined = rendered.iter().map(String::len).sum::<usize>()
+                    + rendered.len().saturating_sub(1);
+                if joined > RUNTIME_COMMAND_MAX_BYTES {
+                    return Err(refused());
+                }
+                let script = crate::child_env::argv_script(shell, &rendered).ok_or_else(refused)?;
+                Ok((script, (shell != CommandShell::Sh).then_some(rendered)))
+            }
+        }
+    };
     let (command, command_argv) = match phase_command(commands, job.phase) {
         Some(command) => render_one(command, "command")?,
         None => (String::new(), None),

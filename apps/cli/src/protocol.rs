@@ -19,6 +19,7 @@
 pub mod canonical;
 pub mod frames;
 pub mod runtime_spec;
+pub mod stt;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -61,6 +62,22 @@ pub fn operator_terminals_supported() -> bool {
     cfg!(any(unix, windows))
 }
 
+/// Shells advertised at most (the protocol's bound).
+pub const MAX_SHELLS: usize = 16;
+
+/// A shell id this CLI can offer: `pwsh`, `powershell`, `cmd`, or `wsl:`
+/// followed by 1 to 64 letters, digits, `.`, `_` or `-` (what WSL allows in
+/// a distribution name).
+pub fn valid_shell_id(id: &str) -> bool {
+    matches!(id, "pwsh" | "powershell" | "cmd")
+        || id.strip_prefix("wsl:").is_some_and(|name| {
+            (1..=64).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        })
+}
+
 /// Parse a relay version with exactly two unsigned decimal components.
 pub(crate) fn relay_protocol_major(version: &str) -> Option<u64> {
     let (major, minor) = version.split_once('.')?;
@@ -96,7 +113,7 @@ pub fn encode_control(frame: &NodeFrame) -> Result<String> {
     frame
         .validate()
         .map_err(|error| anyhow::anyhow!("relay frame breaks a protocol rule: {error}"))?;
-    crate::stt_wire::validate_node_frame(frame)?;
+    stt::validate_node_frame(frame)?;
     let text = serde_json::to_string(frame).context("serializing relay control frame")?;
     anyhow::ensure!(
         text.len() <= RELAY_JSON_CONTROL_MAX_BYTES,
@@ -132,7 +149,7 @@ pub fn parse_server_control(text: &str) -> Result<ServerFrame> {
     frame
         .validate()
         .map_err(|error| anyhow::anyhow!("relay server frame breaks a protocol rule: {error}"))?;
-    crate::stt_wire::validate_server_frame(&frame)?;
+    stt::validate_server_frame(&frame)?;
     Ok(frame)
 }
 
@@ -181,7 +198,7 @@ pub fn decode_binary_frame<M: DeserializeOwned>(frame: &[u8]) -> Result<(M, Vec<
 pub fn parse_binary_frame(frame: &[u8]) -> Result<(ServerBinaryMetadata, Vec<u8>)> {
     let (metadata, body) = decode_binary_frame::<ServerBinaryMetadata>(frame)?;
     if let ServerBinaryMetadata::SttAudio { session_id, seq } = &metadata {
-        crate::stt_wire::validate_audio_frame(session_id, *seq, body.len())?;
+        stt::validate_audio_frame(session_id, *seq, body.len())?;
     }
     Ok((metadata, body))
 }
@@ -425,8 +442,7 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     // another node at once; any other bad frame for a live session fails
     // that session (its audio or commands would be lost otherwise).
     if type_name.starts_with("stt.") {
-        let Some(session_id) =
-            string_field(value, "sessionId").filter(|id| crate::stt_wire::is_session_id(id))
+        let Some(session_id) = string_field(value, "sessionId").filter(|id| stt::is_session_id(id))
         else {
             return FrameFault::Ignore;
         };
@@ -501,6 +517,31 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ids_are_the_fixed_shells_or_a_plain_wsl_name() {
+        for id in [
+            "pwsh",
+            "powershell",
+            "cmd",
+            "wsl:Ubuntu-24.04",
+            "wsl:my_distro",
+        ] {
+            assert!(valid_shell_id(id), "{id}");
+        }
+        for id in [
+            "",
+            "bash",
+            "wsl:",
+            "wsl:a b",
+            "wsl:a;calc",
+            "wsl:../x",
+            "wsl:a\\b",
+            &format!("wsl:{}", "a".repeat(65)),
+        ] {
+            assert!(!valid_shell_id(id), "{id}");
+        }
+    }
 
     #[test]
     fn relay_versions_use_numeric_major_components() {

@@ -24,7 +24,7 @@ pub struct ProbeReport {
     pub error: Option<String>,
     /// Engine detection result (online probes only).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub engine: Option<crate::engine::DetectedEngine>,
+    pub engine: Option<crate::engine_facts::DetectedEngine>,
 }
 
 #[derive(Debug, Clone, Serialize)]

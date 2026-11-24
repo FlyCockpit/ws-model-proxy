@@ -3,7 +3,7 @@
 //! after the browser and node declarations) and `wsmp hardware`.
 //!
 //! Sources, each optional:
-//! - NVIDIA: `nvidia-smi` rows ([`crate::telemetry::parse_nvidia_smi`]). A
+//! - NVIDIA: `nvidia-smi` rows ([`parse_nvidia_smi`]). A
 //!   GPU whose `memory.total` is `[N/A]` (GB10 / DGX Spark) shares system
 //!   memory: the node is unified and its pool is `MemTotal`.
 //! - AMD: sysfs `/sys/class/drm/card*/device` (`mem_info_vram_total`,
@@ -26,14 +26,15 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::protocol::NODE_GPU_MAX;
 use crate::protocol::frames::{GpuVendorWire, NodeGpuInfo, NodeGpuMetrics, NodeKind};
-use crate::telemetry::GpuRow;
 
 const TOOL_TIMEOUT: Duration = Duration::from_secs(5);
 const TOOL_OUTPUT_LIMIT: u64 = 256 * 1024;
 const SYSFS_FILE_LIMIT: u64 = 64 * 1024;
 const TEXT_MAX: usize = 256;
 const MIB: u64 = 1024 * 1024;
+const TEXT_FIELD_MAX: usize = 256;
 
 /// What this node detects. `notes` say how each memory figure was derived.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -177,16 +178,11 @@ fn windows_total_mib() -> Option<u64> {
 
 fn gather(nvidia: Vec<GpuRow>) -> Sources {
     let meminfo_total_mib = read_text(Path::new("/proc/meminfo"))
-        .and_then(|text| {
-            crate::telemetry::parse_meminfo(&text)
-                .get("MemTotal")
-                .copied()
-        })
+        .and_then(|text| parse_meminfo(&text).get("MemTotal").copied())
         .or_else(windows_total_mib);
     let mut sources = Sources {
         meminfo_total_mib,
-        cpu_model: read_text(Path::new("/proc/cpuinfo"))
-            .and_then(|text| crate::telemetry::parse_cpu_model(&text)),
+        cpu_model: read_text(Path::new("/proc/cpuinfo")).and_then(|text| parse_cpu_model(&text)),
         nvidia,
         amd: read_amd_sysfs(Path::new("/")),
         ttm_pages_limit: read_ttm_pages_limit(Path::new("/")),
@@ -203,7 +199,7 @@ fn gather(nvidia: Vec<GpuRow>) -> Sources {
             "machdep.cpu.brand_string",
             "iogpu.wired_limit_mb",
         ] {
-            if let crate::telemetry::Bounded::Output(output) = crate::telemetry::run_bounded(
+            if let crate::bounded_run::Bounded::Output(output) = crate::bounded_run::run_bounded(
                 "sysctl",
                 &[key.to_string()],
                 TOOL_TIMEOUT,
@@ -223,8 +219,8 @@ fn gather(nvidia: Vec<GpuRow>) -> Sources {
 fn amd_tool_names() -> BTreeMap<String, String> {
     let run = |program: &str, args: &[&str]| -> Option<String> {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-        match crate::telemetry::run_bounded(program, &args, TOOL_TIMEOUT, TOOL_OUTPUT_LIMIT) {
-            crate::telemetry::Bounded::Output(output) => Some(output),
+        match crate::bounded_run::run_bounded(program, &args, TOOL_TIMEOUT, TOOL_OUTPUT_LIMIT) {
+            crate::bounded_run::Bounded::Output(output) => Some(output),
             _ => None,
         }
     };
@@ -756,10 +752,194 @@ pub fn assemble(sources: Sources) -> Hardware {
     }
 }
 
+/// `text` trimmed and cut to a wire text field, `None` when empty.
+pub(crate) fn clip(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut end = trimmed.len().min(TEXT_FIELD_MAX);
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(trimmed[..end].to_string())
+}
+
+/// `/proc/meminfo` in MiB, keyed by field name.
+pub fn parse_meminfo(text: &str) -> BTreeMap<String, u64> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, rest) = line.split_once(':')?;
+            let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            Some((name.trim().to_string(), kib / 1024))
+        })
+        .collect()
+}
+
+/// `/proc/cpuinfo` model name (x86 `model name`, Arm `Model` or `Hardware`),
+/// else the Arm core mix from `CPU implementer` / `CPU part` (server and
+/// workstation Arm kernels, e.g. GB10, print no model name).
+pub fn parse_cpu_model(text: &str) -> Option<String> {
+    ["model name", "Model", "Hardware", "cpu model"]
+        .iter()
+        .find_map(|key| {
+            text.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                (name.trim() == *key).then(|| clip(value)).flatten()
+            })
+        })
+        .or_else(|| arm_core_mix(text))
+}
+
+/// Arm Ltd (`0x41`) part numbers of cores found in inference machines.
+const ARM_PARTS: &[(&str, &str)] = &[
+    ("0xd03", "Cortex-A53"),
+    ("0xd05", "Cortex-A55"),
+    ("0xd08", "Cortex-A72"),
+    ("0xd0b", "Cortex-A76"),
+    ("0xd0c", "Neoverse-N1"),
+    ("0xd40", "Neoverse-V1"),
+    ("0xd41", "Cortex-A78"),
+    ("0xd44", "Cortex-X1"),
+    ("0xd49", "Neoverse-N2"),
+    ("0xd4f", "Neoverse-V2"),
+    ("0xd80", "Cortex-A520"),
+    ("0xd81", "Cortex-A720"),
+    ("0xd82", "Cortex-X4"),
+    ("0xd84", "Neoverse-V3"),
+    ("0xd85", "Cortex-X925"),
+    ("0xd87", "Cortex-A725"),
+];
+
+/// `10x Arm Cortex-X925 + 10x Arm Cortex-A725`, in first-seen order.
+fn arm_core_mix(text: &str) -> Option<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut implementer: Option<String> = None;
+    for line in text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().to_ascii_lowercase();
+        match name.trim() {
+            "CPU implementer" => implementer = Some(value),
+            "CPU part" => {
+                let core = match implementer.as_deref() {
+                    Some("0x41") => ARM_PARTS
+                        .iter()
+                        .find(|(part, _)| *part == value)
+                        .map_or_else(
+                            || format!("Arm part {value}"),
+                            |(_, core)| format!("Arm {core}"),
+                        ),
+                    Some(other) => format!("implementer {other} part {value}"),
+                    None => continue,
+                };
+                match counts.iter_mut().find(|(known, _)| *known == core) {
+                    Some((_, count)) => *count += 1,
+                    None => counts.push((core, 1)),
+                }
+            }
+            _ => {}
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let mix = counts
+        .iter()
+        .map(|(core, count)| format!("{count}x {core}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    clip(&mix)
+}
+
+/// One `nvidia-smi --query-gpu` row. `[N/A]` and `[Not Supported]` are `None`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GpuRow {
+    pub index: u32,
+    pub name: Option<String>,
+    pub uuid: Option<String>,
+    pub driver_version: Option<String>,
+    pub memory_total_mib: Option<u64>,
+    /// `memory.total` read exactly `[N/A]` (a unified-memory GPU such as
+    /// GB10), not an error like `[Unknown Error]`.
+    pub memory_not_applicable: bool,
+    pub memory_used_mib: Option<u64>,
+    pub utilization_percent: Option<f64>,
+    pub temperature_c: Option<f64>,
+    pub power_w: Option<f64>,
+    pub sm_clock_mhz: Option<f64>,
+}
+
+pub const GPU_QUERY_FIELDS: &str = "index,name,uuid,driver_version,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,clocks.sm";
+
+fn gpu_field(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty() && !value.starts_with('[') && !value.eq_ignore_ascii_case("n/a"))
+        .then_some(value)
+}
+
+/// Parse `--format=csv,noheader,nounits` output for [`GPU_QUERY_FIELDS`].
+pub fn parse_nvidia_smi(text: &str) -> Vec<GpuRow> {
+    text.lines()
+        .filter_map(|line| {
+            let fields = line.split(',').collect::<Vec<_>>();
+            if fields.len() < 10 {
+                return None;
+            }
+            let number =
+                |index: usize| gpu_field(fields[index]).and_then(|v| v.parse::<f64>().ok());
+            Some(GpuRow {
+                index: gpu_field(fields[0])?.parse().ok()?,
+                name: gpu_field(fields[1]).and_then(clip),
+                uuid: gpu_field(fields[2]).and_then(clip),
+                driver_version: gpu_field(fields[3]).and_then(clip),
+                memory_total_mib: number(4).map(|value| value as u64),
+                memory_not_applicable: fields[4].trim().eq_ignore_ascii_case("[n/a]"),
+                memory_used_mib: number(5).map(|value| value as u64),
+                utilization_percent: number(6),
+                temperature_c: number(7),
+                power_w: number(8),
+                sm_clock_mhz: number(9),
+            })
+        })
+        .take(NODE_GPU_MAX)
+        .collect()
+}
+
+#[cfg(unix)]
+pub(crate) fn interface_addresses() -> BTreeMap<String, Vec<String>> {
+    let mut addresses = BTreeMap::<String, Vec<String>>::new();
+    let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
+        return addresses;
+    };
+    for interface in interfaces {
+        let Some(address) = interface.address else {
+            continue;
+        };
+        let text = if let Some(v4) = address.as_sockaddr_in() {
+            v4.ip().to_string()
+        } else if let Some(v6) = address.as_sockaddr_in6() {
+            v6.ip().to_string()
+        } else {
+            continue;
+        };
+        let list = addresses.entry(interface.interface_name).or_default();
+        if list.len() < crate::protocol::NODE_INTERFACE_ADDRESS_MAX {
+            list.push(text);
+        }
+    }
+    addresses
+}
+
+#[cfg(not(unix))]
+pub(crate) fn interface_addresses() -> BTreeMap<String, Vec<String>> {
+    BTreeMap::new()
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
-    use crate::telemetry::{parse_cpu_model, parse_meminfo, parse_nvidia_smi};
     use std::path::PathBuf;
 
     pub const MACHINES: &[&str] = &[
@@ -919,7 +1099,7 @@ mod tests {
     #[test]
     fn a_driver_error_on_a_discrete_nvidia_gpu_never_makes_the_node_unified() {
         let mut sources = sources("rtx-3090");
-        sources.nvidia = crate::telemetry::parse_nvidia_smi(
+        sources.nvidia = parse_nvidia_smi(
             "0, NVIDIA GeForce RTX 3090, GPU-x, 580.82.09, [Unknown Error], [Unknown Error], 0, 34, 28.61, 210\n",
         );
         let hardware = assemble(sources);
@@ -1134,5 +1314,35 @@ mod tests {
             }
             assert!(serde_json::to_string(&hardware).is_ok(), "{machine}");
         }
+    }
+
+    #[test]
+    fn nvidia_smi_rows_map_not_available_to_none() {
+        let rows = parse_nvidia_smi(
+            "0, NVIDIA GeForce RTX 4090, GPU-aaaa, 550.54.14, 24564, 1234, 17, 45, 61.25, 2520\n\
+             1, NVIDIA GB10, GPU-bbbb, 580.82.07, [N/A], [N/A], 3, 40, [N/A], 2418\n\
+             garbage line\n",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].memory_total_mib, Some(24_564));
+        assert_eq!(rows[0].power_w, Some(61.25));
+        assert_eq!(rows[1].memory_total_mib, None);
+        assert!(rows[1].memory_not_applicable);
+        assert!(!rows[0].memory_not_applicable);
+        assert_eq!(rows[1].power_w, None);
+        assert_eq!(rows[1].name.as_deref(), Some("NVIDIA GB10"));
+    }
+
+    #[test]
+    fn proc_parsers_read_linux_formats() {
+        let meminfo = parse_meminfo(
+            "MemTotal:       131072000 kB\nMemAvailable:    65536000 kB\nSwapTotal: 0 kB\n",
+        );
+        assert_eq!(meminfo.get("MemTotal"), Some(&128_000));
+        assert_eq!(meminfo.get("MemAvailable"), Some(&64_000));
+        assert_eq!(
+            parse_cpu_model("processor : 0\nmodel name\t: AMD Ryzen 9 7950X\n").as_deref(),
+            Some("AMD Ryzen 9 7950X")
+        );
     }
 }

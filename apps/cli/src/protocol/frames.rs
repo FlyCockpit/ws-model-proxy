@@ -17,7 +17,6 @@ use super::runtime_spec::{
     RUNTIME_SPEC_MAX_BYTES, ReaderSignal, RuntimeApi, RuntimeKind, RuntimeSpec,
     TranscriptionProfile,
 };
-use crate::stt_wire::SttEvent;
 
 pub const RELAY_PROTOCOL_VERSION: &str = "4.0";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v4";
@@ -1310,6 +1309,46 @@ pub enum SttAdapter {
     Segmented,
 }
 
+/// Token usage an engine reported for one item.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SttEngineUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+}
+
+/// A normalized transcription event (`stt.event`), CLI to server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum SttEvent {
+    Delta {
+        item_seq: u32,
+        text: String,
+    },
+    Completed {
+        item_seq: u32,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine_usage: Option<SttEngineUsage>,
+    },
+    Failed {
+        item_seq: u32,
+        code: String,
+        message: String,
+    },
+    /// The `maxItemSeconds` valve ended the open item.
+    AutoCommitted {
+        item_seq: u32,
+    },
+}
+
 // ── Node → server control frames ──
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2192,8 +2231,8 @@ impl NodeFrame {
                 trust.validate()?;
                 let shells = &features.terminals.shells;
                 rule(
-                    shells.len() <= crate::shells::MAX_SHELLS
-                        && shells.iter().all(|id| crate::shells::valid_id(id))
+                    shells.len() <= super::MAX_SHELLS
+                        && shells.iter().all(|id| super::valid_shell_id(id))
                         && shells
                             .iter()
                             .enumerate()
@@ -2346,7 +2385,7 @@ impl ServerFrame {
             Self::TermOpen {
                 shell: Some(shell), ..
             } => rule(
-                crate::shells::valid_id(shell),
+                super::valid_shell_id(shell),
                 "a terminal shell is pwsh, powershell, cmd or wsl:<name>",
             ),
             // `relayIdSchema`: the answer echoes it, so it must stay small.

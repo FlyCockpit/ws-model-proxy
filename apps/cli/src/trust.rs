@@ -12,12 +12,9 @@
 
 use anyhow::{Context, Result};
 
+use crate::child_env::JOB_MARKER_ENV;
 use crate::config::{Config, Setting};
 use crate::protocol::frames::TrustValue;
-
-/// The marker every child the node starts carries (jobs, commands, metric
-/// commands, terminals). `wsmp trust full` refuses to run under it.
-pub const JOB_MARKER_ENV: &str = "WSMP_JOB";
 
 /// The trust the daemon starts with. A frozen copy on disk means the node
 /// was lowered, and only `wsmp trust full` removes it (before it writes

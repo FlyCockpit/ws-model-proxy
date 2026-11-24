@@ -2202,8 +2202,8 @@ pub(crate) fn login_account() -> String {
 pub(crate) fn linger_on() -> Option<bool> {
     let uid = nix::unistd::Uid::effective().as_raw().to_string();
     let args = ["show-user".to_string(), uid, "-p".into(), "Linger".into()];
-    match crate::telemetry::run_bounded("loginctl", &args, LOGINCTL_TIMEOUT, 4096) {
-        crate::telemetry::Bounded::Output(text) => {
+    match crate::bounded_run::run_bounded("loginctl", &args, LOGINCTL_TIMEOUT, 4096) {
+        crate::bounded_run::Bounded::Output(text) => {
             Some(crate::runtimes::executor::native::linger_enabled(&text))
         }
         _ => None,
@@ -2220,7 +2220,7 @@ fn enable_linger(account: &str) {
         "enable-linger".into(),
         account.to_string(),
     ];
-    let _ = crate::telemetry::run_bounded("loginctl", &args, LOGINCTL_TIMEOUT, 4096);
+    let _ = crate::bounded_run::run_bounded("loginctl", &args, LOGINCTL_TIMEOUT, 4096);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

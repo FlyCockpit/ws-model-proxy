@@ -25,12 +25,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::bounded_run::{Bounded, run_bounded};
 use crate::config::EndpointConfig;
-use crate::engine::{EngineKind, LoadReading};
+use crate::engine::LoadReading;
+use crate::engine_facts::EngineKind;
+use crate::hardware::{
+    GPU_QUERY_FIELDS, GpuRow, clip, interface_addresses, parse_meminfo, parse_nvidia_smi,
+};
 use crate::metric_sources::Runner;
 use crate::protocol::frames::{
     ExecutionMechanism, LoadSource, NodeCpu, NodeCpuMetrics, NodeDiskMetrics, NodeGpuMetrics,
@@ -38,8 +43,10 @@ use crate::protocol::frames::{
     RuntimeLoad,
 };
 use crate::protocol::runtime_spec::NodeMetricCommand;
-use crate::protocol::{NODE_GPU_MAX, NODE_INTERFACE_MAX, NodeFrame, encode_control};
+use crate::protocol::{NODE_INTERFACE_MAX, NodeFrame, encode_control};
 use crate::relay_bus::FromWorker;
+use crate::telemetry_bounds::{BYTE_COUNTER_MAX, is_metric_name};
+use crate::time::now_rfc3339;
 
 /// Built-in `node.metrics` cadence (the protocol allows 20–30 s).
 pub const NODE_METRICS_INTERVAL: Duration = Duration::from_secs(20);
@@ -55,7 +62,6 @@ const STOP_POLL: Duration = Duration::from_millis(200);
 /// Load scrapes in flight at once, across all endpoints. Each worker is
 /// bounded by the engine request timeouts (llama.cpp: two requests).
 const LOAD_SCRAPE_CONCURRENCY: usize = 16;
-const TEXT_FIELD_MAX: usize = 256;
 
 /// Handle owned by one relay session. Dropping it stops the thread; the relay
 /// loop never joins it (a scrape may still be finishing).
@@ -688,87 +694,8 @@ fn same_load(left: &LoadReading, right: &LoadReading) -> bool {
         && close_fraction(left.kv_occupancy, right.kv_occupancy)
 }
 
-/// `[A-Za-z0-9_.:-]{1,64}`: the only metric and label text on the wire.
-pub fn is_metric_name(value: &str) -> bool {
-    (1..=64).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
-}
-
-/// Label keys that match [`is_metric_name`] but cannot be keys: the server
-/// turns a label set into an object, which drops `__proto__` silently, so
-/// both sides reject it (`RESERVED_LABEL_KEYS` in the relay schema).
-pub const RESERVED_LABEL_KEYS: [&str; 1] = ["__proto__"];
-
-/// A custom series' label key: a metric name that is not reserved.
-pub fn is_label_key(value: &str) -> bool {
-    is_metric_name(value) && !RESERVED_LABEL_KEYS.contains(&value)
-}
-
-/// Label values are free text (GPU names have spaces): 1 to 128 characters,
-/// no control characters.
-pub fn is_label_value(value: &str) -> bool {
-    (1..=128).contains(&value.chars().count()) && !value.chars().any(char::is_control)
-}
-
-/// UTC `YYYY-MM-DDTHH:MM:SS.mmmZ`.
-pub fn now_rfc3339() -> String {
-    rfc3339(SystemTime::now())
-}
-
-/// `at` as UTC `YYYY-MM-DDTHH:MM:SS.mmmZ`.
-pub fn rfc3339(at: SystemTime) -> String {
-    let elapsed = at.duration_since(UNIX_EPOCH).unwrap_or_default();
-    format_rfc3339(elapsed.as_secs(), elapsed.subsec_millis())
-}
-
-fn format_rfc3339(unix_secs: u64, millis: u32) -> String {
-    let days = (unix_secs / 86_400) as i64;
-    let seconds_of_day = unix_secs % 86_400;
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
-        seconds_of_day / 3_600,
-        (seconds_of_day / 60) % 60,
-        seconds_of_day % 60
-    )
-}
-
-fn clip(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut end = trimmed.len().min(TEXT_FIELD_MAX);
-    while !trimmed.is_char_boundary(end) {
-        end -= 1;
-    }
-    Some(trimmed[..end].to_string())
-}
-
 fn read_text(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
-}
-
-/// `/proc/meminfo` in MiB, keyed by field name.
-pub fn parse_meminfo(text: &str) -> BTreeMap<String, u64> {
-    text.lines()
-        .filter_map(|line| {
-            let (name, rest) = line.split_once(':')?;
-            let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-            Some((name.trim().to_string(), kib / 1024))
-        })
-        .collect()
 }
 
 pub fn parse_loadavg(text: &str) -> Option<(f64, f64, f64)> {
@@ -808,60 +735,6 @@ impl CpuSampler {
     }
 }
 
-/// One `nvidia-smi --query-gpu` row. `[N/A]` and `[Not Supported]` are `None`.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct GpuRow {
-    pub index: u32,
-    pub name: Option<String>,
-    pub uuid: Option<String>,
-    pub driver_version: Option<String>,
-    pub memory_total_mib: Option<u64>,
-    /// `memory.total` read exactly `[N/A]` (a unified-memory GPU such as
-    /// GB10), not an error like `[Unknown Error]`.
-    pub memory_not_applicable: bool,
-    pub memory_used_mib: Option<u64>,
-    pub utilization_percent: Option<f64>,
-    pub temperature_c: Option<f64>,
-    pub power_w: Option<f64>,
-    pub sm_clock_mhz: Option<f64>,
-}
-
-const GPU_QUERY_FIELDS: &str = "index,name,uuid,driver_version,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,clocks.sm";
-
-fn gpu_field(value: &str) -> Option<&str> {
-    let value = value.trim();
-    (!value.is_empty() && !value.starts_with('[') && !value.eq_ignore_ascii_case("n/a"))
-        .then_some(value)
-}
-
-/// Parse `--format=csv,noheader,nounits` output for [`GPU_QUERY_FIELDS`].
-pub fn parse_nvidia_smi(text: &str) -> Vec<GpuRow> {
-    text.lines()
-        .filter_map(|line| {
-            let fields = line.split(',').collect::<Vec<_>>();
-            if fields.len() < 10 {
-                return None;
-            }
-            let number =
-                |index: usize| gpu_field(fields[index]).and_then(|v| v.parse::<f64>().ok());
-            Some(GpuRow {
-                index: gpu_field(fields[0])?.parse().ok()?,
-                name: gpu_field(fields[1]).and_then(clip),
-                uuid: gpu_field(fields[2]).and_then(clip),
-                driver_version: gpu_field(fields[3]).and_then(clip),
-                memory_total_mib: number(4).map(|value| value as u64),
-                memory_not_applicable: fields[4].trim().eq_ignore_ascii_case("[n/a]"),
-                memory_used_mib: number(5).map(|value| value as u64),
-                utilization_percent: number(6),
-                temperature_c: number(7),
-                power_w: number(8),
-                sm_clock_mhz: number(9),
-            })
-        })
-        .take(NODE_GPU_MAX)
-        .collect()
-}
-
 /// `nvidia-smi`, disabled for the session once it is missing.
 #[derive(Default)]
 struct GpuQuery {
@@ -897,32 +770,6 @@ impl GpuQuery {
                 Vec::new()
             }
         }
-    }
-}
-
-/// What [`run_bounded`] observed.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Bounded {
-    /// The program could not be started (not installed).
-    Unavailable,
-    /// It failed, timed out (and was killed), or printed non-UTF-8.
-    Failed,
-    Output(String),
-}
-
-/// Run a program under [`crate::bounded_run`] (scrubbed environment, no
-/// stdin, stderr discarded, stdout capped at `limit`, killed with its process
-/// group at the deadline, and settled within the deadline plus
-/// [`crate::bounded_run::REAP_GRACE`] even when the kill does not end it).
-/// Success is exactly: stdout closed, the program exited 0 before the
-/// deadline, and at most `limit` bytes of UTF-8. The state table is in
-/// [`crate::bounded_run`] and `tests/telemetry_bounded.rs`.
-pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64) -> Bounded {
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX - 1);
-    match crate::bounded_run::run(program, args, timeout, limit, None) {
-        Ok(bytes) => String::from_utf8(bytes).map_or(Bounded::Failed, Bounded::Output),
-        Err(crate::bounded_run::RunError::Spawn) => Bounded::Unavailable,
-        Err(_) => Bounded::Failed,
     }
 }
 
@@ -998,83 +845,6 @@ pub fn parse_os_release(text: &str) -> (Option<String>, Option<String>) {
     (value("NAME"), value("VERSION_ID"))
 }
 
-/// `/proc/cpuinfo` model name (x86 `model name`, Arm `Model` or `Hardware`),
-/// else the Arm core mix from `CPU implementer` / `CPU part` (server and
-/// workstation Arm kernels, e.g. GB10, print no model name).
-pub fn parse_cpu_model(text: &str) -> Option<String> {
-    ["model name", "Model", "Hardware", "cpu model"]
-        .iter()
-        .find_map(|key| {
-            text.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                (name.trim() == *key).then(|| clip(value)).flatten()
-            })
-        })
-        .or_else(|| arm_core_mix(text))
-}
-
-/// Arm Ltd (`0x41`) part numbers of cores found in inference machines.
-const ARM_PARTS: &[(&str, &str)] = &[
-    ("0xd03", "Cortex-A53"),
-    ("0xd05", "Cortex-A55"),
-    ("0xd08", "Cortex-A72"),
-    ("0xd0b", "Cortex-A76"),
-    ("0xd0c", "Neoverse-N1"),
-    ("0xd40", "Neoverse-V1"),
-    ("0xd41", "Cortex-A78"),
-    ("0xd44", "Cortex-X1"),
-    ("0xd49", "Neoverse-N2"),
-    ("0xd4f", "Neoverse-V2"),
-    ("0xd80", "Cortex-A520"),
-    ("0xd81", "Cortex-A720"),
-    ("0xd82", "Cortex-X4"),
-    ("0xd84", "Neoverse-V3"),
-    ("0xd85", "Cortex-X925"),
-    ("0xd87", "Cortex-A725"),
-];
-
-/// `10x Arm Cortex-X925 + 10x Arm Cortex-A725`, in first-seen order.
-fn arm_core_mix(text: &str) -> Option<String> {
-    let mut counts: Vec<(String, usize)> = Vec::new();
-    let mut implementer: Option<String> = None;
-    for line in text.lines() {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim().to_ascii_lowercase();
-        match name.trim() {
-            "CPU implementer" => implementer = Some(value),
-            "CPU part" => {
-                let core = match implementer.as_deref() {
-                    Some("0x41") => ARM_PARTS
-                        .iter()
-                        .find(|(part, _)| *part == value)
-                        .map_or_else(
-                            || format!("Arm part {value}"),
-                            |(_, core)| format!("Arm {core}"),
-                        ),
-                    Some(other) => format!("implementer {other} part {value}"),
-                    None => continue,
-                };
-                match counts.iter_mut().find(|(known, _)| *known == core) {
-                    Some((_, count)) => *count += 1,
-                    None => counts.push((core, 1)),
-                }
-            }
-            _ => {}
-        }
-    }
-    if counts.is_empty() {
-        return None;
-    }
-    let mix = counts
-        .iter()
-        .map(|(core, count)| format!("{count}x {core}"))
-        .collect::<Vec<_>>()
-        .join(" + ");
-    clip(&mix)
-}
-
 fn interface_names() -> Vec<String> {
     let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
         return Vec::new();
@@ -1098,44 +868,8 @@ fn sys_net_number(interface: &str, file: &str) -> Option<u64> {
         .map(saturating_byte_counter)
 }
 
-/// Kernel counters are u64 lifetime totals, but the server's strict schema
-/// caps them at `Number.MAX_SAFE_INTEGER` (a JS number loses precision above
-/// it and the frame is then rejected as malformed). Saturate to that ceiling;
-/// a saturated value reads as "monotonic since boot, capped here".
-pub const BYTE_COUNTER_MAX: u64 = 9_007_199_254_740_991;
-
 fn saturating_byte_counter(value: u64) -> u64 {
     value.min(BYTE_COUNTER_MAX)
-}
-
-#[cfg(unix)]
-pub(crate) fn interface_addresses() -> BTreeMap<String, Vec<String>> {
-    let mut addresses = BTreeMap::<String, Vec<String>>::new();
-    let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
-        return addresses;
-    };
-    for interface in interfaces {
-        let Some(address) = interface.address else {
-            continue;
-        };
-        let text = if let Some(v4) = address.as_sockaddr_in() {
-            v4.ip().to_string()
-        } else if let Some(v6) = address.as_sockaddr_in6() {
-            v6.ip().to_string()
-        } else {
-            continue;
-        };
-        let list = addresses.entry(interface.interface_name).or_default();
-        if list.len() < crate::protocol::NODE_INTERFACE_ADDRESS_MAX {
-            list.push(text);
-        }
-    }
-    addresses
-}
-
-#[cfg(not(unix))]
-pub(crate) fn interface_addresses() -> BTreeMap<String, Vec<String>> {
-    BTreeMap::new()
 }
 
 fn collect_node_info(gpu: &mut GpuQuery) -> NodeInfo {
@@ -1418,36 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_rfc3339_utc() {
-        assert_eq!(format_rfc3339(0, 0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(format_rfc3339(1_790_000_000, 7), "2026-09-21T14:13:20.007Z");
-        assert_eq!(format_rfc3339(951_782_400, 999), "2000-02-29T00:00:00.999Z");
-    }
-
-    #[test]
-    fn nvidia_smi_rows_map_not_available_to_none() {
-        let rows = parse_nvidia_smi(
-            "0, NVIDIA GeForce RTX 4090, GPU-aaaa, 550.54.14, 24564, 1234, 17, 45, 61.25, 2520\n\
-             1, NVIDIA GB10, GPU-bbbb, 580.82.07, [N/A], [N/A], 3, 40, [N/A], 2418\n\
-             garbage line\n",
-        );
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].memory_total_mib, Some(24_564));
-        assert_eq!(rows[0].power_w, Some(61.25));
-        assert_eq!(rows[1].memory_total_mib, None);
-        assert!(rows[1].memory_not_applicable);
-        assert!(!rows[0].memory_not_applicable);
-        assert_eq!(rows[1].power_w, None);
-        assert_eq!(rows[1].name.as_deref(), Some("NVIDIA GB10"));
-    }
-
-    #[test]
     fn proc_parsers_read_linux_formats() {
-        let meminfo = parse_meminfo(
-            "MemTotal:       131072000 kB\nMemAvailable:    65536000 kB\nSwapTotal: 0 kB\n",
-        );
-        assert_eq!(meminfo.get("MemTotal"), Some(&128_000));
-        assert_eq!(meminfo.get("MemAvailable"), Some(&64_000));
         assert_eq!(
             parse_loadavg("0.50 1.25 2.00 1/234 5678"),
             Some((0.5, 1.25, 2.0))
@@ -1459,10 +1164,6 @@ mod tests {
         assert_eq!(
             parse_os_release("NAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nID=ubuntu\n"),
             (Some("Ubuntu".to_string()), Some("24.04".to_string()))
-        );
-        assert_eq!(
-            parse_cpu_model("processor : 0\nmodel name\t: AMD Ryzen 9 7950X\n").as_deref(),
-            Some("AMD Ryzen 9 7950X")
         );
     }
 
@@ -1978,33 +1679,6 @@ mod tests {
     }
 
     #[test]
-    fn metric_names_match_the_wire_charset() {
-        assert!(is_metric_name("a.b:c-d_1"));
-        assert!(!is_metric_name(""));
-        assert!(!is_metric_name("bad name"));
-        assert!(!is_metric_name(&"x".repeat(65)));
-    }
-
-    #[test]
-    fn label_keys_reject_the_reserved_names_and_keep_similar_names() {
-        assert!(!is_label_key("__proto__"));
-        for key in [
-            "proto",
-            "_proto__",
-            "__proto",
-            "__proto__x",
-            "constructor",
-            "gpu",
-        ] {
-            assert!(is_label_key(key), "{key}");
-        }
-        assert!(!is_label_key(""));
-        assert!(!is_label_key("bad key"));
-        // As a metric name or a label value it stays legal.
-        assert!(is_metric_name("__proto__"));
-    }
-
-    #[test]
     fn load_targets_follow_declared_or_detected_engines() {
         let mut vllm = EndpointConfig {
             slug: "vllm".to_string(),
@@ -2026,9 +1700,9 @@ mod tests {
             status: crate::config::ProbeStatus::Online,
             models: Vec::new(),
             suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
-            engine: Some(crate::engine::DetectedEngine {
+            engine: Some(crate::engine_facts::DetectedEngine {
                 kind: Some(EngineKind::LlamaCpp),
-                ..crate::engine::DetectedEngine::default()
+                ..crate::engine_facts::DetectedEngine::default()
             }),
         });
         let targets = load_targets(&[vllm.clone(), auto, ollama, detected]);

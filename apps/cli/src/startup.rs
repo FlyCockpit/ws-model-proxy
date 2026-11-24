@@ -34,7 +34,7 @@ pub struct TerminalStartup {
     allow_file_tools_as_root: bool,
     file_roots: Vec<std::path::PathBuf>,
     file_roots_configured: bool,
-    file_roots_source: crate::config::FileRootsSource,
+    file_roots_source: crate::protocol::runtime_spec::FileRootsSource,
     /// `config.json` `runtimeHosts`, re-read on hot reload.
     runtime_hosts: std::sync::Mutex<Vec<String>>,
     /// The shells a browser terminal may start, the default first (none on
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn file_roots_default_to_home_and_say_where_they_come_from() {
-        use crate::config::FileRootsSource;
+        use crate::protocol::runtime_spec::FileRootsSource;
         let home = tempfile::tempdir().expect("home");
         let physical = std::fs::canonicalize(home.path()).expect("physical home");
         let startup =

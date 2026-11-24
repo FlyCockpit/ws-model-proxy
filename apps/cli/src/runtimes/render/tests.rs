@@ -560,20 +560,6 @@ fn each_command_keeps_its_own_argv() {
 }
 
 #[test]
-fn powershell_words_double_every_quote_it_reads() {
-    assert_eq!(powershell_word("a\u{2019}b'c"), "'a\u{2019}\u{2019}b''c'");
-    assert_eq!(
-        argv_script(CommandShell::Powershell, &["x".into(), r"C:\dir\".into()]).as_deref(),
-        Some(r"& 'x' 'C:\dir\'")
-    );
-    // What Windows PowerShell 5.1 would change is rendered too: the node refuses it only when the
-    // program is not an `.exe` that starts directly.
-    assert!(argv_script(CommandShell::Powershell, &["x".into(), String::new()]).is_some());
-    assert!(argv_script(CommandShell::Pwsh, &["x".into(), String::new()]).is_some());
-    assert_eq!(argv_script(CommandShell::Cmd, &["x".into()]), None);
-}
-
-#[test]
 fn text_commands_need_the_launch_shell_here() {
     let mut pwsh = spec("Start-Service ollama", 1);
     pwsh["launch"]["shell"] = json!("pwsh");

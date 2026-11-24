@@ -40,7 +40,7 @@ use crate::protocol::runtime_spec::{
 use crate::protocol::{
     NODE_METRIC_COMMAND_VALUES_MAX, NODE_METRIC_COMMANDS_MAX, NODE_METRICS_CUSTOM_MAX,
 };
-use crate::telemetry::{is_label_key, is_metric_name};
+use crate::telemetry_bounds::{is_label_key, is_metric_name};
 
 /// Largest stdout a run may print; more is `output_too_large` and no values.
 pub const OUTPUT_LIMIT: usize = 64 * 1024;
@@ -82,9 +82,9 @@ fn series(name: &str, labels: BTreeMap<String, String>, value: f64) -> Option<Se
         && !reserved(name)
         && value.is_finite()
         && labels.len() <= LABELS_MAX
-        && labels
-            .iter()
-            .all(|(key, value)| is_label_key(key) && crate::telemetry::is_label_value(value)))
+        && labels.iter().all(|(key, value)| {
+            is_label_key(key) && crate::telemetry_bounds::is_label_value(value)
+        }))
     .then(|| Series {
         name: name.to_string(),
         labels,
@@ -335,7 +335,7 @@ fn invocation(command: &CommandLine, shell: Option<CommandShell>) -> Option<Invo
             {
                 return Some(Invocation::List(found.into_os_string(), args.to_vec()));
             }
-            crate::runtimes::render::argv_script(shell, argv)?
+            crate::child_env::argv_script(shell, argv)?
         }
     };
     let program = shell_program(shell).ok()?.into_os_string();
@@ -774,7 +774,7 @@ impl Runner {
                         attempt: attempt_id,
                         command_sha256: spec.command_sha256,
                         outcome,
-                        ts: crate::telemetry::now_rfc3339(),
+                        ts: crate::time::now_rfc3339(),
                         at: Instant::now(),
                     });
                 });

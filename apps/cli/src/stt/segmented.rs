@@ -10,9 +10,10 @@ use tokio::sync::watch;
 
 use super::EngineEndpoint;
 use crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES;
-use crate::stt_wire::{
+use crate::protocol::frames::{SttConfig, SttEngineUsage, SttEvent};
+use crate::protocol::stt::{
     STT_COMPLETED_TEXT_MAX_BYTES, STT_DELTA_TEXT_MAX_BYTES, STT_MESSAGE_MAX_BYTES,
-    STT_TOKEN_COUNT_MAX, SttConfig, SttEngineUsage, SttEvent,
+    STT_TOKEN_COUNT_MAX,
 };
 
 /// Output rate of the resampler and of every posted WAV.

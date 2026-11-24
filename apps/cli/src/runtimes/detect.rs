@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::engine::{self, EngineKind, JSON_BODY_LIMIT};
+use crate::engine::{self, JSON_BODY_LIMIT};
+use crate::engine_facts::EngineKind;
 use crate::protocol::frames::{DetectedServer, NodeFrame};
 use crate::protocol::runtime_spec::{Engine, RuntimeApi};
 use crate::relay_bus::FromWorker;
@@ -139,7 +140,7 @@ pub(crate) fn spawn(tx: SyncSender<FromWorker>, id: String, skip_ports: BTreeSet
 /// model list to the longest common length that fits, then trailing servers.
 /// `None` when not even an empty answer fits (an oversized request id).
 pub fn detected_frame(id: String, servers: Vec<DetectedServer>) -> Option<NodeFrame> {
-    let scanned_at = crate::telemetry::now_rfc3339();
+    let scanned_at = crate::time::now_rfc3339();
     let frame = |servers: Vec<DetectedServer>| NodeFrame::RuntimeDetected {
         id: Some(id.clone()),
         scanned_at: scanned_at.clone(),
@@ -806,7 +807,7 @@ mod tests {
         };
         let frame = |servers: Vec<DetectedServer>| NodeFrame::RuntimeDetected {
             id: None,
-            scanned_at: crate::telemetry::now_rfc3339(),
+            scanned_at: crate::time::now_rfc3339(),
             servers,
         };
         for ok in [
@@ -1071,7 +1072,7 @@ mod tests {
         }
         let frame = NodeFrame::RuntimeDetected {
             id: Some("det-1".into()),
-            scanned_at: crate::telemetry::now_rfc3339(),
+            scanned_at: crate::time::now_rfc3339(),
             servers: vec![server],
         };
         assert!(frame.validate().is_ok());

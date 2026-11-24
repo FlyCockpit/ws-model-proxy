@@ -46,8 +46,9 @@ use super::{
     EngineEndpoint, EngineSocket, Input, SessionThread, ack, emit, emit_event, error, resample,
     segmented,
 };
+use crate::protocol::frames::SttEvent;
+use crate::protocol::stt::STT_COMPLETED_TEXT_MAX_BYTES;
 use crate::protocol::{NodeFrame, RelayFailure};
-use crate::stt_wire::{STT_COMPLETED_TEXT_MAX_BYTES, SttEvent};
 
 /// Connecting, the WebSocket handshake, and each handshake answer.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

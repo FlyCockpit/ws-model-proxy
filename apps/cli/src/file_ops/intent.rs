@@ -215,7 +215,7 @@ impl Intent {
             slots,
             pid: std::process::id(),
             host: crate::hostname::reported_hostname().unwrap_or_else(|| "unknown".to_string()),
-            created_at: crate::telemetry::now_rfc3339(),
+            created_at: crate::time::now_rfc3339(),
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }

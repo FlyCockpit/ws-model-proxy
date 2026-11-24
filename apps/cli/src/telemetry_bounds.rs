@@ -23,7 +23,6 @@ use crate::protocol::{
     NODE_DISK_MAX, NODE_GPU_MAX, NODE_INTERFACE_ADDRESS_MAX, NODE_INTERFACE_MAX,
     NODE_METRIC_COMMANDS_MAX, NODE_METRICS_CUSTOM_MAX, NodeFrame,
 };
-use crate::telemetry::{BYTE_COUNTER_MAX, is_label_key, is_metric_name};
 
 /// `shortTextSchema`: OS name/version/kernel, CPU model, GPU name.
 pub const SHORT_TEXT_MAX: usize = 256;
@@ -45,6 +44,36 @@ pub const GPU_CLOCK_MAX_MHZ: f64 = 100_000.0;
 /// `nonNegativeCountSchema`: `runtime.load` running/waiting/slotsBusy/deferred.
 pub const LOAD_COUNT_MAX: u32 = 1_000_000;
 pub const CUSTOM_LABELS_MAX: usize = 16;
+
+/// Kernel counters are u64 lifetime totals, but the server's strict schema
+/// caps them at `Number.MAX_SAFE_INTEGER` (a JS number loses precision above
+/// it and the frame is then rejected as malformed). Saturate to that ceiling;
+/// a saturated value reads as "monotonic since boot, capped here".
+pub const BYTE_COUNTER_MAX: u64 = 9_007_199_254_740_991;
+
+/// `[A-Za-z0-9_.:-]{1,64}`: the only metric and label text on the wire.
+pub fn is_metric_name(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
+/// Label keys that match [`is_metric_name`] but cannot be keys: the server
+/// turns a label set into an object, which drops `__proto__` silently, so
+/// both sides reject it (`RESERVED_LABEL_KEYS` in the relay schema).
+pub const RESERVED_LABEL_KEYS: [&str; 1] = ["__proto__"];
+
+/// A custom series' label key: a metric name that is not reserved.
+pub fn is_label_key(value: &str) -> bool {
+    is_metric_name(value) && !RESERVED_LABEL_KEYS.contains(&value)
+}
+
+/// Label values are free text (GPU names have spaces): 1 to 128 characters,
+/// no control characters.
+pub fn is_label_value(value: &str) -> bool {
+    (1..=128).contains(&value.chars().count()) && !value.chars().any(char::is_control)
+}
 
 /// Make a telemetry frame fit the server schema. Other frames pass unchanged.
 pub fn conform(message: &mut NodeFrame) {
@@ -193,9 +222,9 @@ pub fn conform_node_metrics(metrics: &mut NodeMetrics) {
                 && series.value.is_finite()
                 && labels.is_none_or(|labels| {
                     labels.len() <= CUSTOM_LABELS_MAX
-                        && labels.iter().all(|(key, value)| {
-                            is_label_key(key) && crate::telemetry::is_label_value(value)
-                        })
+                        && labels
+                            .iter()
+                            .all(|(key, value)| is_label_key(key) && is_label_value(value))
                 })
         });
         custom.truncate(NODE_METRICS_CUSTOM_MAX);
@@ -561,5 +590,32 @@ mod tests {
         let mut conformed = message.clone();
         conform(&mut conformed);
         assert_eq!(conformed, message);
+    }
+
+    #[test]
+    fn metric_names_match_the_wire_charset() {
+        assert!(is_metric_name("a.b:c-d_1"));
+        assert!(!is_metric_name(""));
+        assert!(!is_metric_name("bad name"));
+        assert!(!is_metric_name(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn label_keys_reject_the_reserved_names_and_keep_similar_names() {
+        assert!(!is_label_key("__proto__"));
+        for key in [
+            "proto",
+            "_proto__",
+            "__proto",
+            "__proto__x",
+            "constructor",
+            "gpu",
+        ] {
+            assert!(is_label_key(key), "{key}");
+        }
+        assert!(!is_label_key(""));
+        assert!(!is_label_key("bad key"));
+        // As a metric name or a label value it stays legal.
+        assert!(is_metric_name("__proto__"));
     }
 }

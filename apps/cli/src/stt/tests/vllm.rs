@@ -791,7 +791,7 @@ fn vllm_transcripts_stay_within_the_wire_contract() {
     ));
     for event in events(&sent) {
         if let SttEvent::Delta { text, .. } = event {
-            assert!(text.len() <= crate::stt_wire::STT_DELTA_TEXT_MAX_BYTES);
+            assert!(text.len() <= crate::protocol::stt::STT_DELTA_TEXT_MAX_BYTES);
         }
         let frame = NodeFrame::SttEvent {
             session_id: SESSION.into(),

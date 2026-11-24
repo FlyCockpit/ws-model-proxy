@@ -198,7 +198,7 @@ fn set_at(
     if !file.secrets.contains_key(name) && file.secrets.len() >= NODE_SECRETS_MAX {
         return Err(SecretRefusal::Limit);
     }
-    let updated_at = crate::telemetry::now_rfc3339();
+    let updated_at = crate::time::now_rfc3339();
     file.secrets.insert(
         name.to_string(),
         StoredSecret {

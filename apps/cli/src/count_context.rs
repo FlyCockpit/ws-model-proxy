@@ -9,11 +9,11 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::config::EndpointConfig;
-use crate::engine::{self, EngineKind, read_decoded_body};
+use crate::engine::{self, read_decoded_body};
+use crate::engine_facts::{CountContextFact, CountContextMethod, EngineKind};
 
 /// Largest tokenize JSON body. A near-ceiling count can return a long `tokens`
 /// array; only the length is kept.
@@ -27,80 +27,6 @@ const LLAMA_INPUT_TOKEN_ROUTES: [&str; 2] = [
     "v1/chat/completions/input_tokens",
     "chat/completions/input_tokens",
 ];
-
-/// How this engine counts Chat Completions context. Wire value of
-/// `count_context.result.method`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CountContextMethod {
-    VllmTokenize,
-    TgiChatTokenize,
-    LlamaApplyTemplate,
-    LlamaInputTokens,
-    AdapterCount,
-}
-
-impl CountContextMethod {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::VllmTokenize => "vllm_tokenize",
-            Self::TgiChatTokenize => "tgi_chat_tokenize",
-            Self::LlamaApplyTemplate => "llama_apply_template",
-            Self::LlamaInputTokens => "llama_input_tokens",
-            Self::AdapterCount => "adapter_count",
-        }
-    }
-}
-
-/// Persisted tri-state for `engineFacts.countContext`: a method, explicit
-/// unsupported, or absent (`DetectedEngine.count_context == None`) when the
-/// endpoint has not been probed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CountContextFact {
-    Unsupported,
-    VllmTokenize,
-    TgiChatTokenize,
-    LlamaApplyTemplate,
-    LlamaInputTokens,
-    AdapterCount,
-}
-
-impl CountContextFact {
-    pub fn method(self) -> Option<CountContextMethod> {
-        match self {
-            Self::Unsupported => None,
-            Self::VllmTokenize => Some(CountContextMethod::VllmTokenize),
-            Self::TgiChatTokenize => Some(CountContextMethod::TgiChatTokenize),
-            Self::LlamaApplyTemplate => Some(CountContextMethod::LlamaApplyTemplate),
-            Self::LlamaInputTokens => Some(CountContextMethod::LlamaInputTokens),
-            Self::AdapterCount => Some(CountContextMethod::AdapterCount),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Unsupported => "unsupported",
-            Self::VllmTokenize => "vllm_tokenize",
-            Self::TgiChatTokenize => "tgi_chat_tokenize",
-            Self::LlamaApplyTemplate => "llama_apply_template",
-            Self::LlamaInputTokens => "llama_input_tokens",
-            Self::AdapterCount => "adapter_count",
-        }
-    }
-}
-
-impl From<CountContextMethod> for CountContextFact {
-    fn from(method: CountContextMethod) -> Self {
-        match method {
-            CountContextMethod::VllmTokenize => Self::VllmTokenize,
-            CountContextMethod::TgiChatTokenize => Self::TgiChatTokenize,
-            CountContextMethod::LlamaApplyTemplate => Self::LlamaApplyTemplate,
-            CountContextMethod::LlamaInputTokens => Self::LlamaInputTokens,
-            CountContextMethod::AdapterCount => Self::AdapterCount,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CountContextOutcome {
