@@ -289,6 +289,30 @@ export async function releaseScenarios({ step, serverUrl, repo, pg }) {
     );
 
     await step(
+      "release: a replaced deletion still pending with another contract.sql is refused",
+      async () => {
+        // Not fresh at P2, so P2's contract is recorded but has not run (soaking).
+        const db = await createDb();
+        ok(await deploy(db, image(at(1))));
+        ok(await deploy(db, image(at(2))));
+        const [row] = await q(
+          db,
+          `SELECT contract_applied_at FROM "_wmp_migration" WHERE name = $1`,
+          [P2],
+        );
+        assert.equal(row.contract_applied_at, null);
+        await q(db, `UPDATE "_wmp_migration" SET contract_checksum = $2 WHERE name = $1`, [
+          P2,
+          "0".repeat(64),
+        ]);
+        const r = await deploy(db, image(RELEASE));
+        assert.equal(r.code, 1, r.out);
+        assert.match(r.out, /is not the one .*replaces\.json records \(checksum mismatch\)/);
+        assert.deepEqual(await history(db), [F0, P1, P2]);
+      },
+    );
+
+    await step(
       "release: a plan made stale by another session (it committed P2, then died before recording it) aborts before any SQL runs",
       async () => {
         const { planReconcile, readReleases, applyReconcile, READ_HISTORY_SQL, wrappedBody } =
