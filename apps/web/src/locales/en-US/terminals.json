@@ -298,5 +298,26 @@
       "deleteWord": "del wd",
       "lastArg": "last arg"
     }
+  },
+  "header": {
+    "picker": "Terminal: {{name}}, {{mode}}. Switch terminal",
+    "pickerEmpty": "Switch terminal",
+    "openTerminals": "Open terminals",
+    "typing": "typing",
+    "viewing": "viewing",
+    "newTerminal": "New terminal…",
+    "newTerminalTitle": "New terminal",
+    "more": "More actions",
+    "typeAndView": "Type & view",
+    "session": "Session",
+    "settings": "Terminal settings…",
+    "keepsRunning": "shell keeps running",
+    "endSession": "End session…",
+    "on": "on",
+    "closeNotice": "Close message"
+  },
+  "endConfirm": {
+    "title": "End this session?",
+    "description": "The shell on {{node}} stops for everyone viewing it, and anything running in it is ended. To just leave, use Stop viewing instead."
   }
 }

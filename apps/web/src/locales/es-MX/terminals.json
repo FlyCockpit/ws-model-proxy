@@ -298,5 +298,26 @@
       "deleteWord": "borrar pal.",
       "lastArg": "últ. arg"
     }
+  },
+  "header": {
+    "picker": "Terminal: {{name}}, {{mode}}. Cambiar de terminal",
+    "pickerEmpty": "Cambiar de terminal",
+    "openTerminals": "Terminales abiertas",
+    "typing": "escribiendo",
+    "viewing": "viendo",
+    "newTerminal": "Nueva terminal…",
+    "newTerminalTitle": "Nueva terminal",
+    "more": "Más acciones",
+    "typeAndView": "Escribir y ver",
+    "session": "Sesión",
+    "settings": "Ajustes de la terminal…",
+    "keepsRunning": "el shell sigue en marcha",
+    "endSession": "Terminar sesión…",
+    "on": "activado",
+    "closeNotice": "Cerrar mensaje"
+  },
+  "endConfirm": {
+    "title": "¿Terminar esta sesión?",
+    "description": "El shell en {{node}} se detiene para todos los que lo ven, y se termina todo lo que se ejecuta en él. Para solo salir, usa Dejar de ver."
   }
 }

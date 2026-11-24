@@ -10,18 +10,16 @@ import {
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuLabel,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@ws-model-proxy/ui/components/dropdown-menu";
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@ws-model-proxy/ui/components/dialog";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Maximize2, Minimize2, Settings2, TextSelect, X } from "lucide-react";
+import { Maximize2, Minimize2, TextSelect, X } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -31,13 +29,16 @@ import { LiveUpdatesNotice } from "@/components/live-updates-notice";
 import { refusalMessage } from "@/components/nodes/refusal";
 import { PageHeading } from "@/components/page-stub";
 import { OperatorStepItem } from "@/components/runtimes/operator-step-item";
+import { EndSessionDialog, PhoneTerminalHeader } from "@/components/terminal-header";
 import { TerminalKeyRow } from "@/components/terminal-key-row";
 import { TerminalNodeRow } from "@/components/terminal-node-row";
 import { TerminalPane } from "@/components/terminal-pane";
+import { TerminalSettingsMenu } from "@/components/terminal-settings-menu";
 import { TerminalUtilities } from "@/components/terminal-utilities";
 import { TimeAgo } from "@/components/time-ago";
 import { WideContent } from "@/components/wide-content";
 import { useHideAppChrome } from "@/hooks/use-hide-app-chrome";
+import { useMediaQuery } from "@/hooks/use-media-query";
 import { type ReorderDrag, usePointerReorder } from "@/hooks/use-pointer-reorder";
 import { useTerminalLayout } from "@/hooks/use-terminal-layout";
 import { useTerminalModifiersLifetime } from "@/hooks/use-terminal-modifiers-lifetime";
@@ -51,13 +52,12 @@ import { nodeLiveInterval } from "@/lib/node-live-updates";
 import { refusalText } from "@/lib/refusal-text";
 import { applySavedOrder, moveItem } from "@/lib/saved-order";
 import type { CliTrust } from "@/lib/terminal-cli-identity";
-import { typableCommand } from "@/lib/terminal-protocol";
 import {
-  isTerminalCopyMode,
-  isTerminalShiftEnterMode,
-  TERMINAL_COPY_MODES,
-  TERMINAL_SHIFT_ENTER_MODES,
-} from "@/lib/terminal-settings";
+  TERMINAL_PHONE_HEADER_QUERY,
+  terminalNoticeKey,
+  terminalNoticeNeeded,
+} from "@/lib/terminal-header";
+import { typableCommand } from "@/lib/terminal-protocol";
 import { tabApprovalCode, tabEnded, tabRejection } from "@/lib/terminal-tab-status";
 import { TERMINAL_CHROME_VARS } from "@/lib/terminal-theme";
 import { followSize, writerStatusKey } from "@/lib/terminal-writer";
@@ -235,6 +235,11 @@ function TerminalWorkspace({
     activeLocalId === null ? null : (controlsRef.current.get(activeLocalId) ?? null);
   const [cells, setCells] = useState<{ cols: number; rows: number } | null>(null);
   const keysShown = useUiPreferences((prefs) => prefs.terminalKeysShown);
+  const setMaximized = useUiPreferences((prefs) => prefs.setTerminalMaximized);
+  // Phones get one fixed header row (picker, ⋯, Maximize/Restore); wider screens keep the tabs.
+  const phone = useMediaQuery(TERMINAL_PHONE_HEADER_QUERY);
+  const [newTerminalOpen, setNewTerminalOpen] = useState(false);
+  const toggleSelecting = () => sessions.setSelecting(selecting ? null : (active?.localId ?? null));
   useTerminalModifiersLifetime();
   // Arrow keys, Home and End move between tabs (the tabs pattern); focus stays on the tab list.
   // With Alt+Shift, Left and Right move the focused tab itself.
@@ -284,93 +289,125 @@ function TerminalWorkspace({
       <CardContent
         className={cn("flex min-h-0 min-w-0 flex-1 flex-col gap-3", maximized && "gap-2 px-2")}
       >
-        {sessions.status !== "open" ? (
+        {sessions.status !== "open" && !(phone && tabs.length > 0) ? (
           <p className="text-sm text-muted-foreground" role="status">
             {t(`terminals:socket.${sessions.status}`)}
           </p>
         ) : null}
         {tabs.length === 0 ? null : (
           <>
-            <div className="flex min-w-0 items-center gap-2">
-              <WideContent
-                role="tablist"
-                aria-label={t("terminals:workspaceTitle")}
-                className="flex flex-1 gap-2"
-              >
-                {tabs.map((tab, index) => (
-                  <Button
-                    key={tab.localId}
-                    ref={reorder.itemRef(index)}
-                    {...(canMove(tab) ? reorder.handleProps(index) : {})}
-                    id={tabIdOf(tab.localId)}
-                    type="button"
-                    role="tab"
-                    aria-selected={tab.localId === activeLocalId}
-                    aria-controls={panelIdOf(tab.localId)}
-                    tabIndex={tab.localId === activeLocalId ? 0 : -1}
-                    variant={tab.localId === activeLocalId ? "secondary" : "ghost"}
-                    size="touch"
-                    aria-keyshortcuts={
-                      canMove(tab) ? "Alt+Shift+ArrowLeft Alt+Shift+ArrowRight" : undefined
-                    }
-                    title={canMove(tab) ? t("terminals:order.moveTabHint") : undefined}
-                    className={cn(
-                      "shrink-0 select-none font-mono [-webkit-touch-callout:none]",
-                      reorder.drag?.from === index && "opacity-50",
-                      dropMarkOf(reorder.drag, index) === "before" &&
-                        "shadow-[inset_2px_0_0_0_var(--primary)]",
-                      dropMarkOf(reorder.drag, index) === "after" &&
-                        "shadow-[inset_-2px_0_0_0_var(--primary)]",
-                    )}
-                    // Mouse down does not move focus to the tab; the click decides where it goes.
-                    onMouseDown={(event) => event.preventDefault()}
-                    onClick={(event) => {
-                      sessions.selectTab(tab.localId);
-                      // A pointer click (detail > 0) hands focus to the terminal, even on the
-                      // tab that is already active; keyboard activation keeps it on the tabs.
-                      if (event.detail > 0) setFocusRequest((count) => count + 1);
-                    }}
-                    onKeyDown={(event) => onTabKeyDown(event, index)}
-                  >
-                    <span>{tabName(tab)}</span>
-                    <span className="text-xs text-muted-foreground">
-                      {t(`terminals:phase.${tab.status.phase}`)}
-                    </span>
-                  </Button>
-                ))}
-              </WideContent>
-              <span className="sr-only" role="status" aria-live="polite">
-                {announcement}
-              </span>
-              <TerminalToolbar
-                maximized={maximized}
+            {phone ? (
+              <PhoneTerminalHeader
+                tabs={tabs}
+                active={active}
+                nameOf={tabName}
+                onSelect={(localId) => sessions.selectTab(localId)}
+                onNewTerminal={() => setNewTerminalOpen(true)}
+                controls={activeControls}
+                cells={cells}
+                onCells={setCells}
                 selecting={selecting}
-                canSelect={active !== null}
-                onToggleSelecting={() =>
-                  sessions.setSelecting(selecting ? null : (active?.localId ?? null))
-                }
-                utilities={
-                  <TerminalUtilities
-                    controls={activeControls}
-                    disabled={active === null}
-                    cells={cells}
-                    onCells={setCells}
-                  />
-                }
+                onToggleSelecting={toggleSelecting}
+                maximized={maximized}
+                onToggleMaximized={() => setMaximized(!maximized)}
+                onDetach={sessions.detachTab}
+                onEndSession={sessions.endSession}
               />
-            </div>
-            {active ? <TabStatus sessions={sessions} tab={active} /> : null}
+            ) : (
+              <div className="flex min-w-0 items-center gap-2">
+                <WideContent
+                  role="tablist"
+                  aria-label={t("terminals:workspaceTitle")}
+                  className="flex flex-1 gap-2"
+                >
+                  {tabs.map((tab, index) => (
+                    <Button
+                      key={tab.localId}
+                      ref={reorder.itemRef(index)}
+                      {...(canMove(tab) ? reorder.handleProps(index) : {})}
+                      id={tabIdOf(tab.localId)}
+                      type="button"
+                      role="tab"
+                      aria-selected={tab.localId === activeLocalId}
+                      aria-controls={panelIdOf(tab.localId)}
+                      tabIndex={tab.localId === activeLocalId ? 0 : -1}
+                      variant={tab.localId === activeLocalId ? "secondary" : "ghost"}
+                      size="touch"
+                      aria-keyshortcuts={
+                        canMove(tab) ? "Alt+Shift+ArrowLeft Alt+Shift+ArrowRight" : undefined
+                      }
+                      title={canMove(tab) ? t("terminals:order.moveTabHint") : undefined}
+                      className={cn(
+                        "shrink-0 select-none font-mono [-webkit-touch-callout:none]",
+                        reorder.drag?.from === index && "opacity-50",
+                        dropMarkOf(reorder.drag, index) === "before" &&
+                          "shadow-[inset_2px_0_0_0_var(--primary)]",
+                        dropMarkOf(reorder.drag, index) === "after" &&
+                          "shadow-[inset_-2px_0_0_0_var(--primary)]",
+                      )}
+                      // Mouse down does not move focus to the tab; the click decides where it goes.
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={(event) => {
+                        sessions.selectTab(tab.localId);
+                        // A pointer click (detail > 0) hands focus to the terminal, even on the
+                        // tab that is already active; keyboard activation keeps it on the tabs.
+                        if (event.detail > 0) setFocusRequest((count) => count + 1);
+                      }}
+                      onKeyDown={(event) => onTabKeyDown(event, index)}
+                    >
+                      <span>{tabName(tab)}</span>
+                      <span className="text-xs text-muted-foreground">
+                        {t(`terminals:phase.${tab.status.phase}`)}
+                      </span>
+                    </Button>
+                  ))}
+                </WideContent>
+                <span className="sr-only" role="status" aria-live="polite">
+                  {announcement}
+                </span>
+                <TerminalToolbar
+                  maximized={maximized}
+                  selecting={selecting}
+                  canSelect={active !== null}
+                  onToggleSelecting={toggleSelecting}
+                  utilities={
+                    <TerminalUtilities
+                      controls={activeControls}
+                      disabled={active === null}
+                      cells={cells}
+                      onCells={setCells}
+                    />
+                  }
+                />
+              </div>
+            )}
+            {active && !phone ? (
+              <TabStatus sessions={sessions} tab={active} nameOf={tabName} />
+            ) : null}
             <div
               style={TERMINAL_CHROME_VARS}
               className="relative min-h-0 w-full min-w-0 flex-1 overflow-hidden rounded-md bg-(--term-bg)"
             >
+              {/* Phones have no status row: what must still be said shows over the terminal (at
+                  the bottom during Select text, whose bar is at the top). */}
+              {active && phone && (sessions.status !== "open" || terminalNoticeNeeded(active)) ? (
+                // A new message (another refusal, End session failing again) is a new notice,
+                // shown even if the person closed the one before.
+                <TerminalNotice
+                  key={`${sessions.status}|${terminalNoticeKey(active)}`}
+                  sessions={sessions}
+                  tab={active}
+                  placement={selecting ? "bottom" : "top"}
+                />
+              ) : null}
               {/* Panes stay in session order: they are stacked, and moving one would move its
                   xterm. Only the tab strip follows the saved order. */}
               {sessions.tabs.map((tab) => (
                 <TerminalPane
                   key={tab.localId}
                   localId={tab.localId}
-                  tabId={tabIdOf(tab.localId)}
+                  tabId={phone ? null : tabIdOf(tab.localId)}
+                  label={tabName(tab)}
                   panelId={panelIdOf(tab.localId)}
                   active={tab.localId === activeLocalId}
                   follow={followSize(tab)}
@@ -398,7 +435,51 @@ function TerminalWorkspace({
           </>
         )}
       </CardContent>
+      <NewTerminalDialog
+        open={newTerminalOpen}
+        onOpenChange={setNewTerminalOpen}
+        ready={sessions.status === "open" && sessions.identityStatus !== "loading"}
+        openTerminal={sessions.openTicket}
+      />
     </Card>
+  );
+}
+
+/**
+ * New terminal… from the phone picker: the page's own node list (Browser terminals), in a
+ * dialog that closes once a terminal opens.
+ */
+function NewTerminalDialog({
+  open,
+  onOpenChange,
+  ready,
+  openTerminal,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  ready: boolean;
+  openTerminal: OpenTerminal;
+}) {
+  const { t } = useTranslation(["terminals"]);
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[calc(var(--app-page-height,100dvh)-1rem)] overflow-x-hidden overflow-y-auto sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{t("terminals:header.newTerminalTitle")}</DialogTitle>
+          <DialogDescription>{t("terminals:nodesDescription")}</DialogDescription>
+        </DialogHeader>
+        {open ? (
+          <TerminalNodeList
+            ready={ready}
+            reorderable={false}
+            openTerminal={(input) => {
+              openTerminal(input);
+              onOpenChange(false);
+            }}
+          />
+        ) : null}
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -452,80 +533,87 @@ function TerminalToolbar({
   );
 }
 
-function TerminalSettingsMenu() {
-  const { t } = useTranslation(["terminals"]);
-  const copyMode = useUiPreferences((prefs) => prefs.terminalCopy);
-  const setCopyMode = useUiPreferences((prefs) => prefs.setTerminalCopy);
-  const shiftEnter = useUiPreferences((prefs) => prefs.terminalShiftEnter);
-  const setShiftEnter = useUiPreferences((prefs) => prefs.setTerminalShiftEnter);
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        render={
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-touch"
-            aria-label={t("terminals:toolbar.settings")}
-            title={t("terminals:toolbar.settings")}
-          />
-        }
-      >
-        <Settings2 aria-hidden="true" />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-80 max-w-[calc(100vw-2rem)]">
-        <DropdownMenuRadioGroup
-          value={copyMode}
-          onValueChange={(value) => {
-            if (isTerminalCopyMode(value)) setCopyMode(value);
-          }}
-        >
-          <DropdownMenuLabel>{t("terminals:settings.copy.label")}</DropdownMenuLabel>
-          {TERMINAL_COPY_MODES.map((mode) => (
-            <SettingsRadioItem
-              key={mode}
-              value={mode}
-              title={t(`terminals:settings.copy.${mode}.title`)}
-              help={t(`terminals:settings.copy.${mode}.help`)}
-            />
-          ))}
-        </DropdownMenuRadioGroup>
-        <DropdownMenuSeparator />
-        <DropdownMenuRadioGroup
-          value={shiftEnter}
-          onValueChange={(value) => {
-            if (isTerminalShiftEnterMode(value)) setShiftEnter(value);
-          }}
-        >
-          <DropdownMenuLabel>{t("terminals:settings.shiftEnter.label")}</DropdownMenuLabel>
-          {TERMINAL_SHIFT_ENTER_MODES.map((mode) => (
-            <SettingsRadioItem
-              key={mode}
-              value={mode}
-              title={t(`terminals:settings.shiftEnter.${mode}.title`)}
-              help={t(`terminals:settings.shiftEnter.${mode}.help`)}
-            />
-          ))}
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
-function SettingsRadioItem({ value, title, help }: { value: string; title: string; help: string }) {
-  return (
-    <DropdownMenuRadioItem value={value} closeOnClick={false} className="min-h-11 items-start py-2">
-      <span className="flex min-w-0 flex-col gap-0.5">
-        <span>{title}</span>
-        <span className="text-muted-foreground text-xs">{help}</span>
-      </span>
-    </DropdownMenuRadioItem>
-  );
-}
-
-function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) {
-  const { t } = useTranslation(["terminals", "dashboard"]);
+function TabStatus({
+  sessions,
+  tab,
+  nameOf,
+}: {
+  sessions: Sessions;
+  tab: TerminalTab;
+  nameOf: (tab: TerminalTab) => string;
+}) {
   const ended = tabEnded(tab.status);
+  return (
+    <div className="flex min-w-0 flex-col gap-2 text-sm">
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+        <p className="min-w-0 text-muted-foreground" role="status">
+          <TabStatusMessage tab={tab} />
+        </p>
+        <TabActions sessions={sessions} tab={tab} ended={ended} nameOf={nameOf} />
+      </div>
+      <TabNotices sessions={sessions} tab={tab} />
+    </div>
+  );
+}
+
+/**
+ * The phone's stand-in for the status row, over the top of the terminal: only what must be said
+ * (the connection to the server, how the terminal ended, a refusal, an approval to run, a failed
+ * End session, dropped input). It sits over the output rather than taking layout space, so it
+ * never resizes the PTY; Close puts it away until it has something else to say.
+ */
+function TerminalNotice({
+  sessions,
+  tab,
+  placement,
+}: {
+  sessions: Sessions;
+  tab: TerminalTab;
+  placement: "top" | "bottom";
+}) {
+  const { t } = useTranslation(["terminals"]);
+  const [closed, setClosed] = useState(false);
+  const socket = sessions.status !== "open";
+  if (closed) return null;
+  return (
+    <div
+      className={cn(
+        "absolute inset-x-0 z-10 flex max-h-[50%] min-w-0 items-start gap-2 overflow-x-hidden overflow-y-auto overscroll-contain border-(--term-border) bg-(--term-chrome) py-1 ps-3 pe-1 text-(--term-fg) text-sm",
+        placement === "top" ? "top-0 border-b" : "bottom-0 border-t",
+      )}
+      data-terminal-notice={placement}
+    >
+      <div className="flex min-w-0 flex-1 flex-col gap-2 py-2">
+        {socket ? (
+          <p className="min-w-0 break-words" role="status">
+            {t(`terminals:socket.${sessions.status}`)}
+          </p>
+        ) : null}
+        {terminalNoticeNeeded(tab) ? (
+          <p className="min-w-0 break-words" role="status">
+            <TabStatusMessage tab={tab} quiet />
+          </p>
+        ) : null}
+        <TabNotices sessions={sessions} tab={tab} />
+      </div>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-touch"
+        className="shrink-0 text-(--term-fg) hover:bg-(--term-border) hover:text-(--term-fg)"
+        aria-label={t("terminals:header.closeNotice")}
+        title={t("terminals:header.closeNotice")}
+        onClick={() => setClosed(true)}
+      >
+        <X aria-hidden="true" />
+      </Button>
+    </div>
+  );
+}
+
+/** An approval to run on the node, and a changed node identity to trust. */
+function TabNotices({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) {
+  const { t } = useTranslation(["terminals", "dashboard"]);
   const trust: CliTrust | undefined = sessions.cliTrust[tab.cliDeviceId];
   const changed = tabRejection(tab.status) === "identity_changed" && trust?.status === "changed";
   const approvalCode = tabApprovalCode(tab.status);
@@ -535,14 +623,9 @@ function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) 
       toast.error(t("terminals:trustFailed"));
     }
   };
+  if (!approvalCode && !changed) return null;
   return (
-    <div className="flex min-w-0 flex-col gap-2 text-sm">
-      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-        <p className="min-w-0 text-muted-foreground" role="status">
-          <TabStatusMessage tab={tab} />
-        </p>
-        <TabActions sessions={sessions} tab={tab} ended={ended} />
-      </div>
+    <>
       {approvalCode ? (
         <p className="min-w-0 break-words">
           {t("terminals:approvalNeeded", {
@@ -556,12 +639,15 @@ function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) 
           onTrustNewKey={() => void trustNewKey()}
         />
       ) : null}
-    </div>
+    </>
   );
 }
 
-/** The tab's one-line status: how it ended, why it was refused, or who is typing. */
-function TabStatusMessage({ tab }: { tab: TerminalTab }) {
+/**
+ * The tab's one-line status: how it ended, why it was refused, or who is typing. `quiet` (the
+ * phone, whose picker shows who types) leaves out who is typing and how many view.
+ */
+function TabStatusMessage({ tab, quiet = false }: { tab: TerminalTab; quiet?: boolean }) {
   const { t } = useTranslation(["terminals", "dashboard"]);
   const status = tab.status;
   if (status.phase === "exited") {
@@ -577,11 +663,11 @@ function TabStatusMessage({ tab }: { tab: TerminalTab }) {
       : t("terminals:rejection.other", { reason });
   }
   if (tab.ending === "failed") return t("terminals:endFailed");
-  const writerKey = status.phase === "live" ? writerStatusKey(tab.writer) : null;
+  const writerKey = status.phase === "live" && !quiet ? writerStatusKey(tab.writer) : null;
   return [
     status.phase === "live" && status.inputDropped ? t("terminals:inputDropped") : null,
     writerKey ? t(writerKey) : null,
-    tab.viewerCount > 1
+    tab.viewerCount > 1 && !quiet
       ? t("dashboard:terminals.status.viewers", { count: tab.viewerCount })
       : null,
   ]
@@ -589,17 +675,23 @@ function TabStatusMessage({ tab }: { tab: TerminalTab }) {
     .join(" · ");
 }
 
-/** End session (not for an operator terminal or an ended tab) and detach / close. */
+/**
+ * End session (not for an operator terminal or an ended tab; it asks first) and detach / close.
+ */
 function TabActions({
   sessions,
   tab,
   ended,
+  nameOf,
 }: {
   sessions: Sessions;
   tab: TerminalTab;
   ended: boolean;
+  nameOf: (tab: TerminalTab) => string;
 }) {
   const { t } = useTranslation(["terminals", "dashboard"]);
+  /** The tab End session was pressed on: a confirmation never moves to another tab. */
+  const [confirmFor, setConfirmFor] = useState<string | null>(null);
   return (
     <div className="flex flex-wrap gap-2">
       {/* An operator terminal ends with its command, or by its step's Cancel. */}
@@ -609,11 +701,21 @@ function TabActions({
           variant="outline"
           size="touch"
           disabled={tab.ending === "pending"}
-          onClick={() => sessions.endSession(tab.localId)}
+          onClick={() => setConfirmFor(tab.localId)}
         >
-          {tab.ending === "pending" ? t("terminals:ending") : t("terminals:endSession")}
+          {tab.ending === "pending" ? t("terminals:ending") : t("terminals:header.endSession")}
         </Button>
       )}
+      <EndSessionDialog
+        open={confirmFor === tab.localId}
+        onOpenChange={(open) => {
+          if (!open) setConfirmFor(null);
+        }}
+        nodeName={nameOf(tab)}
+        onConfirm={() => {
+          if (confirmFor === tab.localId) sessions.endSession(tab.localId);
+        }}
+      />
       <Button
         type="button"
         variant="ghost"
@@ -654,6 +756,30 @@ function IdentityChangedNotice({
 
 function TerminalNodes({ ready, openTerminal }: { ready: boolean; openTerminal: OpenTerminal }) {
   const { t } = useTranslation(["terminals"]);
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">{t("terminals:nodesTitle")}</CardTitle>
+        <CardDescription>{t("terminals:nodesDescription")}</CardDescription>
+      </CardHeader>
+      <CardContent className="flex min-w-0 flex-col divide-y">
+        <TerminalNodeList ready={ready} openTerminal={openTerminal} reorderable />
+      </CardContent>
+    </Card>
+  );
+}
+
+/** The nodes a browser terminal can open on (the page's card, and New terminal…). */
+function TerminalNodeList({
+  ready,
+  openTerminal,
+  reorderable,
+}: {
+  ready: boolean;
+  openTerminal: OpenTerminal;
+  reorderable: boolean;
+}) {
+  const { t } = useTranslation(["terminals"]);
   const liveStatus = useNodeLive((state) => state.status);
   const nodes = useQuery({
     ...orpc.nodes.list.queryOptions(),
@@ -686,62 +812,56 @@ function TerminalNodes({ ready, openTerminal }: { ready: boolean; openTerminal: 
       node.trust.effective === "FULL" && !node.trust.lowerPending && node.connection === "ONLINE",
   );
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">{t("terminals:nodesTitle")}</CardTitle>
-        <CardDescription>{t("terminals:nodesDescription")}</CardDescription>
-      </CardHeader>
-      <CardContent className="flex min-w-0 flex-col divide-y">
-        <LiveUpdatesNotice className="pb-2 text-sm text-muted-foreground" />
-        {nodes.isPending ? (
-          <Skeleton aria-hidden="true" className="h-11 w-full" />
-        ) : nodes.isError ? (
-          <InlineRetry message={t("terminals:nodesUnavailable")} onRetry={() => nodes.refetch()} />
-        ) : list.length === 0 ? (
-          <p className="text-sm text-muted-foreground">{t("terminals:noNodes")}</p>
-        ) : (
-          <>
-            {eligible.length === 0 ? (
-              <p className="pb-2 text-sm text-muted-foreground">{t("terminals:noFullNodes")}</p>
-            ) : null}
-            <p className="sr-only" role="status" aria-live="polite">
-              {announcement}
-            </p>
-            {list.map((node, index) => (
-              <TerminalNodeRow
-                key={node.id}
-                node={node}
-                reorder={
-                  list.length > 1 && layout.ready
-                    ? {
-                        rowRef: reorder.itemRef(index),
-                        handleId: nodeHandleIdOf(node.id),
-                        handleProps: reorder.handleProps(index),
-                        onStep: (delta) => {
-                          moveNode(index, index + delta);
-                          refocus(nodeHandleIdOf(node.id));
-                        },
-                        dragging: reorder.drag?.from === index,
-                        dropMark: dropMarkOf(reorder.drag, index),
-                      }
-                    : undefined
-                }
-                ready={ready}
-                busy={openTicket.isPending}
-                opening={openTicket.isPending && openTicket.variables?.nodeId === node.id}
-                onOpen={(shell) =>
-                  openTicket.mutate({
-                    nodeId: node.id,
-                    ...INITIAL_SIZE,
-                    ...(shell ? { shell } : {}),
-                  })
-                }
-              />
-            ))}
-          </>
-        )}
-      </CardContent>
-    </Card>
+    <div className="flex min-w-0 flex-col divide-y">
+      <LiveUpdatesNotice className="pb-2 text-sm text-muted-foreground" />
+      {nodes.isPending ? (
+        <Skeleton aria-hidden="true" className="h-11 w-full" />
+      ) : nodes.isError ? (
+        <InlineRetry message={t("terminals:nodesUnavailable")} onRetry={() => nodes.refetch()} />
+      ) : list.length === 0 ? (
+        <p className="text-sm text-muted-foreground">{t("terminals:noNodes")}</p>
+      ) : (
+        <>
+          {eligible.length === 0 ? (
+            <p className="pb-2 text-sm text-muted-foreground">{t("terminals:noFullNodes")}</p>
+          ) : null}
+          <p className="sr-only" role="status" aria-live="polite">
+            {announcement}
+          </p>
+          {list.map((node, index) => (
+            <TerminalNodeRow
+              key={node.id}
+              node={node}
+              reorder={
+                reorderable && list.length > 1 && layout.ready
+                  ? {
+                      rowRef: reorder.itemRef(index),
+                      handleId: nodeHandleIdOf(node.id),
+                      handleProps: reorder.handleProps(index),
+                      onStep: (delta) => {
+                        moveNode(index, index + delta);
+                        refocus(nodeHandleIdOf(node.id));
+                      },
+                      dragging: reorder.drag?.from === index,
+                      dropMark: dropMarkOf(reorder.drag, index),
+                    }
+                  : undefined
+              }
+              ready={ready}
+              busy={openTicket.isPending}
+              opening={openTicket.isPending && openTicket.variables?.nodeId === node.id}
+              onOpen={(shell) =>
+                openTicket.mutate({
+                  nodeId: node.id,
+                  ...INITIAL_SIZE,
+                  ...(shell ? { shell } : {}),
+                })
+              }
+            />
+          ))}
+        </>
+      )}
+    </div>
   );
 }
 

@@ -168,8 +168,12 @@ export class HoldModifierGesture {
   }
 }
 
-/** The terminal text size range, in whole px. */
-export const TERMINAL_FONT_MIN = 9;
+/**
+ * The terminal text size range, in whole px. 1 px is unreadable on purpose: it shows a whole
+ * wide screen at once. The pane's cols x rows stay within what the CLI accepts
+ * (`boundTerminalSize`).
+ */
+export const TERMINAL_FONT_MIN = 1;
 export const TERMINAL_FONT_MAX = 20;
 export const TERMINAL_FONT_DEFAULT = 13;
 
@@ -177,9 +181,13 @@ export function clampTerminalFontSize(size: number): number {
   return Math.min(TERMINAL_FONT_MAX, Math.max(TERMINAL_FONT_MIN, Math.round(size)));
 }
 
+/** Text size change for doubling (or halving) the distance between the fingers, in px. */
+export const PINCH_PX_PER_DOUBLING = 5;
+
 /**
- * Two-finger pinch to a text size: whole px, damped with a square root so a full spread is
- * about ±5 px rather than doubling the text.
+ * Two-finger pinch to a text size: whole px, the same number of px at every size (so a pinch
+ * works from 1 px as from 20), damped: doubling the spread adds 5 px, four times adds 7, and
+ * pinching in takes off as much as spreading out adds.
  */
 export class PinchFontGesture {
   private readonly startDistance: number;
@@ -192,8 +200,9 @@ export class PinchFontGesture {
   }
 
   sizeAt(distance: number): number {
-    const ratio = Math.sqrt(Math.max(0, distance) / this.startDistance);
-    return clampTerminalFontSize(this.startSize * ratio);
+    const doublings = Math.log2(Math.max(1, distance) / this.startDistance);
+    const change = Math.sign(doublings) * Math.sqrt(Math.abs(doublings)) * PINCH_PX_PER_DOUBLING;
+    return clampTerminalFontSize(this.startSize + change);
   }
 }
 

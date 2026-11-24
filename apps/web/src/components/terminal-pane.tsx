@@ -17,8 +17,12 @@ import { useUiPreferences } from "@/stores/ui-preferences";
 type TerminalPaneProps = {
   localId: string;
   active: boolean;
-  /** The id of this pane's tab, for its tabpanel's label. */
-  tabId: string;
+  /**
+   * The id of this pane's tab, for its tabpanel's label; null on a phone, whose header has a
+   * picker instead of tabs (the pane is then a region named `label`).
+   */
+  tabId: string | null;
+  label: string;
   panelId: string;
   follow: TerminalSize | null;
   /** Select text mode is on for this pane. */
@@ -111,8 +115,9 @@ export function TerminalPane(props: TerminalPaneProps) {
   return (
     <div
       id={props.panelId}
-      role="tabpanel"
-      aria-labelledby={props.tabId}
+      {...(props.tabId
+        ? { role: "tabpanel", "aria-labelledby": props.tabId }
+        : { role: "region", "aria-label": props.label })}
       className={cn(
         // Padding sits here, not on the xterm box: FitAddon measures that box's
         // border-box height, so padding there would overflow by a row.
@@ -163,7 +168,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       {fontBadge !== null && selectionText === null ? (
         <div
           role="status"
-          className="pointer-events-none absolute top-2 left-1/2 -translate-x-1/2 rounded-md border border-(--term-border) bg-(--term-chrome) px-2 py-1 font-mono text-(--term-fg) text-xs"
+          className="pointer-events-none absolute top-2 left-1/2 z-20 -translate-x-1/2 rounded-md border border-(--term-border) bg-(--term-chrome) px-2 py-1 font-mono text-(--term-fg) text-xs"
         >
           {t("utilities.sizeBadge", {
             size: fontBadge.fontSize,

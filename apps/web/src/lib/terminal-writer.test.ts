@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  boundTerminalSize,
   canSendResize,
   classifyBroadcastEpoch,
-  floorTerminalSize,
   followSize,
   isAutomaticReply,
   isFollowing,
@@ -11,6 +11,8 @@ import {
   nextReattach,
   reattachDelayMs,
   shouldForwardTerminalData,
+  TERMINAL_MAX_COLS,
+  TERMINAL_MAX_ROWS,
   TERMINAL_REATTACH_RESET_MS,
   TerminalUserInputGate,
   writerStatusKey,
@@ -150,9 +152,27 @@ describe("slow reattach", () => {
   });
 });
 
-describe("floorTerminalSize", () => {
+describe("boundTerminalSize", () => {
   it("keeps a squeezed pane from shrinking the PTY below 20x5", () => {
-    expect(floorTerminalSize({ cols: 4, rows: 2 })).toEqual({ cols: 20, rows: 5 });
-    expect(floorTerminalSize({ cols: 120, rows: 40 })).toEqual({ cols: 120, rows: 40 });
+    expect(boundTerminalSize({ cols: 4, rows: 2 })).toEqual({ cols: 20, rows: 5 });
+    expect(boundTerminalSize({ cols: 120, rows: 40 })).toEqual({ cols: 120, rows: 40 });
+  });
+
+  it("caps 1 px text in a big box at what the CLI accepts", () => {
+    // About 0.6 x 1.2 px cells: a 2560 x 1300 box fits ~4266 x 1083.
+    expect(boundTerminalSize({ cols: 4266, rows: 1083 })).toEqual({
+      cols: TERMINAL_MAX_COLS,
+      rows: TERMINAL_MAX_ROWS,
+    });
+    expect(TERMINAL_MAX_COLS).toBe(1000);
+    expect(TERMINAL_MAX_ROWS).toBe(1000);
+    // A phone at 1 px stays within it.
+    expect(boundTerminalSize({ cols: 640, rows: 583 })).toEqual({ cols: 640, rows: 583 });
+  });
+
+  it("reports no size for a cell that measured as zero", () => {
+    expect(boundTerminalSize({ cols: Number.POSITIVE_INFINITY, rows: 40 })).toBeNull();
+    expect(boundTerminalSize({ cols: Number.NaN, rows: 40 })).toBeNull();
+    expect(boundTerminalSize({ cols: 0, rows: 40 })).toBeNull();
   });
 });

@@ -66,13 +66,27 @@ afterEach(() => {
   useUiPreferences.getState().setTerminalMaximized(false);
 });
 
+/** The phone header's media query matches (or not), as a phone or a wider screen. */
+function stubPhone(phone: boolean) {
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: phone && query.includes("max-width: 640px"),
+    media: query,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+  }));
+}
+
 describe("command startup failures in the Terminals page", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   it.each([
-    ["en-US", enTerminals, enDashboard],
-    ["es-MX", esTerminals, esDashboard],
+    ["en-US", enTerminals, enDashboard, false],
+    ["es-MX", esTerminals, esDashboard, false],
+    ["en-US", enTerminals, enDashboard, true],
   ])(
-    "explains bad_cwd after a queued command opens a terminal in %s",
-    async (lng, terminals, dashboard) => {
+    "explains bad_cwd after a queued command opens a terminal in %s (phone: %s)",
+    async (lng, terminals, dashboard, phone) => {
+      stubPhone(phone);
       const i18n = createInstance();
       await i18n.init({ lng, resources: { [lng]: { terminals, dashboard } } });
       // Show just the terminal workspace, as a person maximizing the queued command's tab does.
@@ -88,8 +102,11 @@ describe("command startup failures in the Terminals page", () => {
           </QueryClientProvider>,
         );
       });
-      expect(await screen.findByText(terminals.rejection.bad_cwd)).toBeTruthy();
+      const message = await screen.findByText(terminals.rejection.bad_cwd);
       expect(screen.queryByText(/bad_cwd/)).toBeNull();
+      // A phone has no status row: the refusal shows over the terminal instead.
+      expect(message.closest("[data-terminal-notice]") !== null).toBe(phone);
+      expect(document.querySelector('[data-terminal-header="phone"]') !== null).toBe(phone);
       queryClient.clear();
     },
   );

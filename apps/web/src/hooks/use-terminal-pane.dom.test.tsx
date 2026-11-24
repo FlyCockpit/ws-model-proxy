@@ -1791,8 +1791,53 @@ describe("useTerminalPane utilities", () => {
       { x: 250, y: 100 },
     ]);
     container.dispatchEvent(move);
-    // Twice the spread: 13 × √2 ≈ 18 px; the page does not zoom.
+    // Twice the spread: 13 + 5 = 18 px; the page does not zoom.
     expect(setFontSize).toHaveBeenLastCalledWith(18);
     expect(move.defaultPrevented).toBe(true);
+  });
+
+  it("pinches back out of 1 px text", () => {
+    const { container, setFontSize } = pane({ fontSize: 1 });
+    container.dispatchEvent(
+      touch("touchstart", [
+        { x: 100, y: 100 },
+        { x: 200, y: 100 },
+      ]),
+    );
+    container.dispatchEvent(
+      touch("touchmove", [
+        { x: 50, y: 100 },
+        { x: 250, y: 100 },
+      ]),
+    );
+    expect(setFontSize).toHaveBeenLastCalledWith(6);
+  });
+
+  it("fits a writer at 1 px text, within the 1000 x 1000 the CLI accepts", () => {
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+    const { term, hook, props, onFontApplied } = pane();
+    hook.rerender({ ...props, fontSize: 1 });
+    expect(term.options.fontSize).toBe(1);
+    // 800x600 at 1/13 of the cell: 1040 cols (capped at 1000) x 312 rows.
+    expect(term.log.at(-1)).toEqual({ resize: [1000, 312] });
+    expect(onFontApplied).toHaveBeenCalledWith("local_1", { fontSize: 1, cols: 1000, rows: 312 });
+    // Back to the default size: the writer fits its box again.
+    hook.rerender({ ...props, fontSize: 13 });
+    expect(term.log.at(-1)).toEqual({ resize: [80, 24] });
+  });
+
+  it("only rescales a follower at 1 px: no resize goes out", () => {
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+    const { term, hook, props } = pane({ follow: { cols: 100, rows: 30 } });
+    term.log.length = 0;
+    hook.rerender({ ...props, fontSize: 1 });
+    expect(term.log).toEqual([]);
+    expect([term.cols, term.rows]).toEqual([100, 30]);
   });
 });

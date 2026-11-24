@@ -52,11 +52,20 @@ export function followSize(
  */
 export const TERMINAL_MIN_COLS = 20;
 export const TERMINAL_MIN_ROWS = 5;
+/**
+ * The largest size a pane fits to: what the relay and the CLI accept (1-1000 each way). Tiny
+ * text in a big box (1 px on a desktop screen) would fit more; the rest of the box stays empty.
+ */
+export const TERMINAL_MAX_COLS = 1000;
+export const TERMINAL_MAX_ROWS = 1000;
 
-export function floorTerminalSize(size: TerminalSize): TerminalSize {
+/** A fitted size within the floor and the ceiling above, or null if it is not a real size. */
+export function boundTerminalSize(size: TerminalSize): TerminalSize | null {
+  if (!Number.isFinite(size.cols) || !Number.isFinite(size.rows)) return null;
+  if (size.cols <= 0 || size.rows <= 0) return null;
   return {
-    cols: Math.max(TERMINAL_MIN_COLS, size.cols),
-    rows: Math.max(TERMINAL_MIN_ROWS, size.rows),
+    cols: Math.min(TERMINAL_MAX_COLS, Math.max(TERMINAL_MIN_COLS, Math.floor(size.cols))),
+    rows: Math.min(TERMINAL_MAX_ROWS, Math.max(TERMINAL_MIN_ROWS, Math.floor(size.rows))),
   };
 }
 

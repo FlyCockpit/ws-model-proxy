@@ -26,7 +26,7 @@ import {
   wireTouchScroll,
 } from "@/lib/terminal-touch-scroll";
 import {
-  floorTerminalSize,
+  boundTerminalSize,
   sameSize,
   type TerminalInputOrigin,
   type TerminalSize,
@@ -228,11 +228,9 @@ export function useXterm(options: XtermOptions): {
       return false;
     }
     const proposed = fit.proposeDimensions();
-    // Never below the floor: a smaller box clips the terminal instead.
-    const own =
-      proposed && proposed.cols > 0 && proposed.rows > 0
-        ? floorTerminalSize({ cols: proposed.cols, rows: proposed.rows })
-        : null;
+    // Never below the floor (a smaller box clips the terminal instead), and never above what the
+    // CLI accepts (tiny text in a big box leaves the rest of the box empty).
+    const own = proposed ? boundTerminalSize({ cols: proposed.cols, rows: proposed.rows }) : null;
     if (own) measuredRef.current = own;
     const wasUnavailable = sizeUnavailableRef.current && own !== null;
     if (wasUnavailable) sizeUnavailableRef.current = false;

@@ -20,8 +20,8 @@ import {
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Camera, ClipboardPaste, ImagePlus, Keyboard, Wrench } from "lucide-react";
-import { type ChangeEvent, type ReactNode, useId, useRef, useState } from "react";
+import { Camera, ClipboardPaste, Ellipsis, ImagePlus, Keyboard, Wrench } from "lucide-react";
+import { type ChangeEvent, type ReactNode, type Ref, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import type { TerminalControls } from "@/hooks/use-xterm";
@@ -40,20 +40,31 @@ type Cells = { cols: number; rows: number };
 /**
  * The Utilities button beside Select text: show or hide the key row, Paste…, Photo / camera…,
  * and the text size. Everything acts on the visible terminal.
+ *
+ * `variant="more"` is the phone header's one ⋯ menu: the same tools under a "Type & view"
+ * heading, then `extra` (Select text and the Session group).
  */
 export function TerminalUtilities({
   controls,
   disabled,
   cells,
   onCells,
+  variant = "utilities",
+  extra,
+  triggerRef,
 }: {
   controls: ControlsOf;
   disabled: boolean;
   /** The visible terminal's size, for the text size row. */
   cells: Cells | null;
   onCells: (cells: Cells | null) => void;
+  variant?: "utilities" | "more";
+  /** More items after the text size (the ⋯ menu only). */
+  extra?: ReactNode;
+  triggerRef?: Ref<HTMLButtonElement>;
 }) {
   const { t } = useTranslation("terminals");
+  const more = variant === "more";
   const keysShown = useUiPreferences((prefs) => prefs.terminalKeysShown);
   const setKeysShown = useUiPreferences((prefs) => prefs.setTerminalKeysShown);
   const fontSize = useUiPreferences((prefs) => prefs.terminalFontSize) ?? TERMINAL_FONT_DEFAULT;
@@ -81,55 +92,76 @@ export function TerminalUtilities({
           onKeyDown={() => {
             refocusRef.current = false;
           }}
+          ref={triggerRef}
           render={
-            <Button
-              type="button"
-              variant="ghost"
-              size="touch"
-              aria-label={t("utilities.button")}
-              title={t("utilities.button")}
-              className="min-w-11 px-2.5"
-            />
+            more ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-touch"
+                aria-label={t("header.more")}
+                title={t("header.more")}
+                data-terminal-more=""
+              />
+            ) : (
+              <Button
+                type="button"
+                variant="ghost"
+                size="touch"
+                aria-label={t("utilities.button")}
+                title={t("utilities.button")}
+                className="min-w-11 px-2.5"
+              />
+            )
           }
         >
-          <Wrench aria-hidden="true" />
-          <span className="hidden sm:inline">{t("utilities.button")}</span>
+          {more ? (
+            <Ellipsis aria-hidden="true" />
+          ) : (
+            <>
+              <Wrench aria-hidden="true" />
+              <span className="hidden sm:inline">{t("utilities.button")}</span>
+            </>
+          )}
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align="end"
-          className="w-72 max-w-[calc(100vw-2rem)]"
+          className="w-72 max-w-[calc(100vw-1rem)]"
           finalFocus={(closeType) => {
             // Opening a dialog hands focus to it; otherwise back to the terminal if it had it.
             if (closeType === "keyboard") return true;
             return returnFocus() ?? true;
           }}
         >
-          <DropdownMenuItem
-            className="min-h-11"
-            onClick={() => setKeysShown(!keysShown)}
-            data-utility="keys"
-          >
-            <Keyboard aria-hidden="true" />
-            <span className="flex-1">
-              {keysShown ? t("utilities.hideKeys") : t("utilities.showKeys")}
-            </span>
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            className="min-h-11"
-            onClick={() => setDialog("paste")}
-            data-utility="paste"
-          >
-            <ClipboardPaste aria-hidden="true" />
-            {t("utilities.paste")}
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            className="min-h-11"
-            onClick={() => setDialog("photo")}
-            data-utility="photo"
-          >
-            <Camera aria-hidden="true" />
-            {t("utilities.photo")}
-          </DropdownMenuItem>
+          <DropdownMenuGroup>
+            {more ? <DropdownMenuLabel>{t("header.typeAndView")}</DropdownMenuLabel> : null}
+            <DropdownMenuItem
+              className="min-h-11"
+              onClick={() => setKeysShown(!keysShown)}
+              data-utility="keys"
+            >
+              <Keyboard aria-hidden="true" />
+              <span className="flex-1">
+                {keysShown ? t("utilities.hideKeys") : t("utilities.showKeys")}
+              </span>
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              className="min-h-11"
+              onClick={() => setDialog("paste")}
+              data-utility="paste"
+            >
+              <ClipboardPaste aria-hidden="true" />
+              {t("utilities.paste")}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              className="min-h-11"
+              onClick={() => setDialog("photo")}
+              data-utility="photo"
+            >
+              <Camera aria-hidden="true" />
+              {t("utilities.photo")}
+            </DropdownMenuItem>
+          </DropdownMenuGroup>
           <DropdownMenuSeparator />
           <DropdownMenuGroup>
             <DropdownMenuLabel>{t("utilities.textSize")}</DropdownMenuLabel>
@@ -179,6 +211,7 @@ export function TerminalUtilities({
               </DropdownMenuItem>
             </div>
           </DropdownMenuGroup>
+          {extra}
         </DropdownMenuContent>
       </DropdownMenu>
       <PasteDialog

@@ -94,10 +94,18 @@ describe("TerminalUtilities", () => {
     expect(screen.getByRole("menu")).toBeTruthy();
     fireEvent.click(screen.getByRole("menuitem", { name: "utilities.reset" }));
     expect(useUiPreferences.getState().terminalFontSize).toBeNull();
-    act(() => useUiPreferences.getState().setTerminalFontSize(9));
+    act(() => useUiPreferences.getState().setTerminalFontSize(2));
+    const smaller = screen.getByRole("menuitem", { name: "utilities.smaller" });
+    expect(smaller.getAttribute("aria-disabled")).toBeNull();
+    fireEvent.click(smaller);
+    // 1 px is the minimum: A− stops there, and nothing goes below it.
+    expect(useUiPreferences.getState().terminalFontSize).toBe(1);
+    expect(screen.getByText("utilities.sizePx:1")).toBeTruthy();
     expect(
       screen.getByRole("menuitem", { name: "utilities.smaller" }).getAttribute("aria-disabled"),
     ).toBe("true");
+    act(() => useUiPreferences.getState().setTerminalFontSize(0));
+    expect(useUiPreferences.getState().terminalFontSize).toBe(1);
     act(() => useUiPreferences.getState().setTerminalFontSize(40));
     expect(useUiPreferences.getState().terminalFontSize).toBe(20);
   });

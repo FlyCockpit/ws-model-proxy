@@ -36,10 +36,11 @@ describe("parseTerminalSettings", () => {
   });
 
   it("keeps only whole text sizes in range", () => {
-    for (const size of [8, 21, 13.5, "14", Number.NaN]) {
+    for (const size of [0, -1, 0.5, 21, 13.5, "14", Number.NaN]) {
       expect(parseTerminalSettings({ terminalFontSize: size }).terminalFontSize).toBeNull();
     }
-    expect(parseTerminalSettings({ terminalFontSize: 9 }).terminalFontSize).toBe(9);
+    expect(parseTerminalSettings({ terminalFontSize: 1 }).terminalFontSize).toBe(1);
+    expect(parseTerminalSettings({ terminalFontSize: 8 }).terminalFontSize).toBe(8);
     expect(parseTerminalSettings({ terminalFontSize: 20 }).terminalFontSize).toBe(20);
   });
 

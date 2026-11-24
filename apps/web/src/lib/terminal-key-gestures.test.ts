@@ -132,15 +132,30 @@ describe("PinchFontGesture", () => {
   it("changes the size in whole px, damped, within the range", () => {
     const pinch = new PinchFontGesture(100, 13);
     expect(pinch.sizeAt(100)).toBe(13);
-    // Twice the spread: ×√2, not ×2.
+    // Twice the spread: +5 px; four times: +7 (damped); half: -5.
     expect(pinch.sizeAt(200)).toBe(18);
-    expect(pinch.sizeAt(50)).toBe(9);
+    expect(pinch.sizeAt(400)).toBe(20);
+    expect(pinch.sizeAt(50)).toBe(8);
+    expect(pinch.sizeAt(25)).toBe(6);
     expect(pinch.sizeAt(1000)).toBe(TERMINAL_FONT_MAX);
     expect(pinch.sizeAt(0)).toBe(TERMINAL_FONT_MIN);
   });
 
+  it("reaches 1 px and grows back from it", () => {
+    expect(TERMINAL_FONT_MIN).toBe(1);
+    expect(new PinchFontGesture(400, 4).sizeAt(25)).toBe(1);
+    const fromOne = new PinchFontGesture(100, 1);
+    expect(fromOne.sizeAt(50)).toBe(1);
+    expect(fromOne.sizeAt(100)).toBe(1);
+    expect(fromOne.sizeAt(200)).toBe(6);
+    expect(fromOne.sizeAt(800)).toBe(10);
+  });
+
   it("clamps and rounds sizes", () => {
-    expect(clampTerminalFontSize(3)).toBe(TERMINAL_FONT_MIN);
+    expect(clampTerminalFontSize(3)).toBe(3);
+    expect(clampTerminalFontSize(1)).toBe(1);
+    expect(clampTerminalFontSize(0.4)).toBe(TERMINAL_FONT_MIN);
+    expect(clampTerminalFontSize(-5)).toBe(TERMINAL_FONT_MIN);
     expect(clampTerminalFontSize(14.6)).toBe(15);
     expect(clampTerminalFontSize(99)).toBe(TERMINAL_FONT_MAX);
   });
