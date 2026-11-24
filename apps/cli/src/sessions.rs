@@ -1758,8 +1758,7 @@ impl TerminalRegistry {
             Ok(path) => path,
             Err(_) => return vec![*handshake_rejected(handshake, REASON_BAD_CWD)],
         };
-        let keys = terminal_crypto::derive_direction_keys_v2(
-            startup.key(),
+        let keys = startup.derive_terminal_keys(
             &prepared.browser_public,
             &prepared.browser_nonce,
             &cli_nonce,
@@ -1942,7 +1941,7 @@ impl TerminalRegistry {
             viewer_id,
             &pending.browser_public,
             &pending.browser_nonce,
-            startup.key().public_raw(),
+            startup.terminal_public_key(),
             &pending.cli_nonce,
         ) {
             self.pending.remove(&key);
@@ -2062,8 +2061,7 @@ impl TerminalRegistry {
         let Some(viewer_id) = handshake.viewer_id else {
             return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
         };
-        let keys = terminal_crypto::derive_direction_keys_v2(
-            startup.key(),
+        let keys = startup.derive_terminal_keys(
             &prepared.browser_public,
             &prepared.browser_nonce,
             &cli_nonce,
@@ -4966,7 +4964,7 @@ mod tests {
             "viewer-a",
             browser.public_raw(),
             &[4_u8; 16],
-            startup.key().public_raw(),
+            startup.terminal_public_key(),
             &cli_nonce_raw,
         )
         .expect("sign");
@@ -5226,13 +5224,13 @@ mod tests {
         fn bind(&mut self, startup: &TerminalStartup, terminal_id: &str, cli_nonce: &str) {
             let ikm = self
                 .browser
-                .shared_x(startup.key().public_raw())
+                .shared_x(startup.terminal_public_key())
                 .expect("ecdh");
             let cli_nonce = terminal_crypto::decode_nonce(cli_nonce).expect("nonce");
             self.keys = Some(
                 terminal_crypto::derive_direction_keys_v2_from_ikm(
                     &ikm,
-                    startup.key().public_raw(),
+                    startup.terminal_public_key(),
                     self.browser.public_raw(),
                     &self.nonce,
                     &cli_nonce,
@@ -5960,7 +5958,7 @@ mod tests {
                 &viewer.id,
                 viewer.browser.public_raw(),
                 &viewer.nonce,
-                startup.key().public_raw(),
+                startup.terminal_public_key(),
                 &terminal_crypto::decode_nonce(cli_nonce).expect("nonce"),
             )
             .expect("sign");

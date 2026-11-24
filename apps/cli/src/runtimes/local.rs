@@ -99,7 +99,7 @@ pub fn load(config: &Config, stop_proof: bool) -> LocalView {
     let trust = if frozen {
         TrustValue::Relay
     } else {
-        crate::trust::configured(config)
+        config.configured_trust()
     };
     let mut warnings = Vec::new();
     let store = crate::runtime_store::load_for(trust).unwrap_or_else(|error| {

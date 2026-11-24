@@ -34,7 +34,7 @@ use crate::auth::{
     refusal_message,
 };
 use crate::commands::config::Switch;
-use crate::config::{Config, ConfigLock, is_loopback_host, server_url_http_warning};
+use crate::config::{Config, ConfigLock, Setting, is_loopback_host, server_url_http_warning};
 use crate::display_escape::escape_single_line;
 use crate::hostname::hostname_slug;
 use crate::output;
@@ -247,7 +247,7 @@ pub fn run(args: &Args) -> Result<()> {
         if let Some(line) = skipped {
             output::diagnostic(line)?;
         }
-        human_terminal_changed = config.server_url.is_some()
+        human_terminal_changed = config.has_server_url()
             && human_terminal.is_some_and(|allow| allow != config.allow_human_terminal);
         // The one decision: the frozen copy and the saved trust as they are
         // now, under the lock.
@@ -273,12 +273,14 @@ pub fn run(args: &Args) -> Result<()> {
             crate::state::remove_node_credential()
                 .context("removing the earlier server's node credential")?;
         }
-        config.server_url = Some(server_url.clone());
-        config.public_origin = (public_origin != url_origin).then(|| public_origin.clone());
-        config.cli_slug = Some(enrolled.slug.clone());
-        config.trust = Some(decided.saved_trust(trust));
+        config.record_enrollment(
+            &server_url,
+            (public_origin != url_origin).then(|| public_origin.clone()),
+            &enrolled.slug,
+            decided.saved_trust(trust),
+        );
         if let Some(allow) = human_terminal {
-            config.allow_human_terminal = allow;
+            config.apply(Setting::AllowHumanTerminal(allow));
         }
         config.save()?;
         // The marker goes only after the config is saved: until then (or
@@ -291,7 +293,7 @@ pub fn run(args: &Args) -> Result<()> {
                         "warning: clearing the earlier Relay-only setting failed ({error:#})"
                     ))?;
                     let failed = TrustResolution::StaysRelay(StaysRelay::ClearFailed);
-                    config.trust = Some(failed.saved_trust(trust));
+                    config.apply(Setting::Trust(failed.saved_trust(trust)));
                     config.save()?;
                     failed
                 }
@@ -309,7 +311,7 @@ pub fn run(args: &Args) -> Result<()> {
         output::diagnostic(line)?;
     }
     let config = Config::load_required()?;
-    let trust = crate::trust::configured(&config);
+    let trust = config.configured_trust();
     let allow_human_terminal = config.allow_human_terminal;
     if human_terminal.is_none() && !terminal_skipped && trust == TrustValue::Full {
         output::diagnostic(format!(

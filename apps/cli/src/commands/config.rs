@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::config::{Config, normalize_public_origin, server_url_http_warning};
+use crate::config::{Config, Setting, normalize_public_origin, server_url_http_warning};
 use crate::output;
 use crate::slug::validate_slug;
 
@@ -159,13 +159,7 @@ pub fn run(args: &Args) -> Result<()> {
             if let Some(warning) = cfg.retired_command_policy_warning {
                 output::diagnostic(format!("warning: {warning}"))?;
             }
-            let mut shown = serde_json::to_value(&cfg)?;
-            let (roots, source) =
-                crate::config::effective_file_roots(&cfg, dirs::home_dir().as_deref());
-            shown["fileRoots"] = serde_json::to_value(&roots)?;
-            shown["fileRootsSource"] = serde_json::to_value(source)?;
-            shown["maxTerminals"] = cfg.effective_max_terminals().into();
-            shown["remoteUpdates"] = cfg.remote_updates.as_str().into();
+            let mut shown = cfg.shown(dirs::home_dir().as_deref())?;
             if cfg!(windows) {
                 // What a browser can pick now, the default first.
                 shown["terminalShells"] = crate::shells::discover(cfg.terminal_shell.as_deref())
@@ -175,8 +169,8 @@ pub fn run(args: &Args) -> Result<()> {
                     .into();
             }
             // The origin the relay hello signs (pinned, else the server URL's).
-            if cfg.server_url.is_some() || cfg.public_origin.is_some() {
-                shown["helloOrigin"] = match cfg.hello_origin() {
+            if let Some(origin) = cfg.hello_origin_when_set() {
+                shown["helloOrigin"] = match origin {
                     Ok(origin) => origin.into(),
                     Err(error) => {
                         output::diagnostic(format!("warning: {error:#}"))?;
@@ -239,10 +233,7 @@ pub fn run(args: &Args) -> Result<()> {
         }
         Sub::SetSlug { slug } => {
             validate_slug(slug)?;
-            Config::update(false, |cfg| {
-                cfg.cli_slug = Some(slug.clone());
-                Ok(())
-            })?;
+            Config::set(Setting::CliSlug(slug.clone()))?;
             if args.json {
                 output::json(&SetValue {
                     key: "cliSlug",
@@ -253,9 +244,12 @@ pub fn run(args: &Args) -> Result<()> {
             }
         }
         Sub::SetHumanTerminal { state } => {
-            set_flag(args.json, "allowHumanTerminal", state.enabled(), |cfg| {
-                cfg.allow_human_terminal = state.enabled();
-            })?;
+            set_flag(
+                args.json,
+                "allowHumanTerminal",
+                state.enabled(),
+                Setting::AllowHumanTerminal(state.enabled()),
+            )?;
         }
         Sub::SetRuntimeHosts { hosts } => {
             for host in hosts {
@@ -264,10 +258,7 @@ pub fn run(args: &Args) -> Result<()> {
                     "`{host}` is not an IP literal with an optional port"
                 );
             }
-            Config::update(false, |cfg| {
-                cfg.runtime_hosts = hosts.clone();
-                Ok(())
-            })?;
+            Config::set(Setting::RuntimeHosts(hosts.clone()))?;
             let _ = crate::control::request_if_running(crate::control::ControlCommand::Reload);
             if args.json {
                 output::json(&serde_json::json!({"key": "runtimeHosts", "value": hosts}))?;
@@ -277,10 +268,7 @@ pub fn run(args: &Args) -> Result<()> {
         }
         Sub::SetFileRoots { paths } => {
             let roots = crate::config::validate_file_roots(paths, dirs::home_dir().as_deref())?;
-            Config::update(false, |cfg| {
-                cfg.file_roots = roots.clone();
-                Ok(())
-            })?;
+            Config::set(Setting::FileRoots(roots.clone()))?;
             if args.json {
                 output::json(&serde_json::json!({"key":"fileRoots", "value":roots}))?;
             } else {
@@ -288,10 +276,7 @@ pub fn run(args: &Args) -> Result<()> {
             }
         }
         Sub::ClearFileRoots => {
-            Config::update(false, |cfg| {
-                cfg.file_roots.clear();
-                Ok(())
-            })?;
+            Config::set(Setting::FileRoots(Vec::new()))?;
             if args.json {
                 output::json(&serde_json::json!({"key":"fileRoots", "value":[]}))?;
             } else {
@@ -301,27 +286,25 @@ pub fn run(args: &Args) -> Result<()> {
             }
         }
         Sub::SetFileTools { state } => {
-            set_flag(args.json, "fileTools", state.enabled(), |cfg| {
-                cfg.disable_file_tools = !state.enabled();
-            })?;
+            set_flag(
+                args.json,
+                "fileTools",
+                state.enabled(),
+                Setting::FileTools(state.enabled()),
+            )?;
         }
         Sub::SetTerminalApproval { state } => {
             set_flag(
                 args.json,
                 "requireTerminalApproval",
                 state.enabled(),
-                |cfg| {
-                    cfg.require_terminal_approval = state.enabled();
-                },
+                Setting::RequireTerminalApproval(state.enabled()),
             )?;
         }
         Sub::SetMaxTerminals { count } => {
             // clap bounds `count` to `MAX_TERMINALS_RANGE`.
             let count = *count;
-            Config::update(false, |cfg| {
-                cfg.max_terminals = Some(count);
-                Ok(())
-            })?;
+            Config::set(Setting::MaxTerminals(count))?;
             if args.json {
                 output::json(&serde_json::json!({"key": "maxTerminals", "value": count}))?;
             } else {
@@ -330,9 +313,12 @@ pub fn run(args: &Args) -> Result<()> {
             }
         }
         Sub::SetFileToolsAsRoot { state } => {
-            set_flag(args.json, "allowFileToolsAsRoot", state.enabled(), |cfg| {
-                cfg.allow_file_tools_as_root = state.enabled();
-            })?;
+            set_flag(
+                args.json,
+                "allowFileToolsAsRoot",
+                state.enabled(),
+                Setting::AllowFileToolsAsRoot(state.enabled()),
+            )?;
         }
         Sub::SetTerminalShell { shell } => {
             if !cfg!(windows) {
@@ -354,10 +340,7 @@ pub fn run(args: &Args) -> Result<()> {
                     ))?;
                 }
             }
-            Config::update(false, |cfg| {
-                cfg.terminal_shell = value.clone();
-                Ok(())
-            })?;
+            Config::set(Setting::TerminalShell(value.clone()))?;
             if args.json {
                 output::json(&serde_json::json!({"key": "terminalShell", "value": value}))?;
             } else {
@@ -370,10 +353,7 @@ pub fn run(args: &Args) -> Result<()> {
         }
         Sub::SetRemoteUpdates { state } => {
             let state = *state;
-            Config::update(false, |cfg| {
-                cfg.remote_updates = state;
-                Ok(())
-            })?;
+            Config::set(Setting::RemoteUpdates(state))?;
             // The running relay reports the new setting at once.
             let _ = crate::control::request_if_running(crate::control::ControlCommand::Reload);
             if args.json {
@@ -389,16 +369,8 @@ pub fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn set_flag(
-    json: bool,
-    key: &'static str,
-    value: bool,
-    mutate: impl FnOnce(&mut Config),
-) -> Result<()> {
-    Config::update(false, |cfg| {
-        mutate(cfg);
-        Ok(())
-    })?;
+fn set_flag(json: bool, key: &'static str, value: bool, setting: Setting) -> Result<()> {
+    Config::set(setting)?;
     if json {
         output::json(&SetFlag { key, value })?;
     } else {
@@ -491,8 +463,7 @@ fn set_server_with_savers(
             cfg.public_origin.as_deref(),
         )
     });
-    cfg.server_url = Some(url.to_string());
-    let previous = std::mem::replace(&mut cfg.public_origin, public_origin.clone());
+    let previous = cfg.point_at_server(url, public_origin.clone());
     // Save config first: an interruption between saves leaves a legacy-style
     // pair, which the next daemon startup accepts.
     save_config(&cfg)?;

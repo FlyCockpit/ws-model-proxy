@@ -178,10 +178,8 @@ const CLI_ROLLBACK_SECS: u32 = 180;
 
 fn update(args: &Args) -> Result<()> {
     let config = crate::config::Config::load_required()?;
-    let server_url = config
-        .server_url
-        .context("this node is not enrolled; run `wsmp login <url> --code <code>`")?;
-    let manifest = fetch_manifest(&server_url)?;
+    let server_url = config.enrolled_server_url()?;
+    let manifest = fetch_manifest(server_url)?;
     let identity = crate::update::build::identity();
     let current = crate::update::build::version().to_string();
     let same_build = manifest.version == current
