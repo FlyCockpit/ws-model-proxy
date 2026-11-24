@@ -31,6 +31,11 @@ import { useNodeLive } from "@/stores/node-live";
  * reconnects at once. A watchdog ends a stream that heard nothing (not even the server's ping)
  * for {@link NODE_LIVE_WATCHDOG_MS}: after sleep the connection can be half-open.
  *
+ * Leaving the page (`pagehide`) ends the stream without a reconnect, and `pageshow` opens it
+ * again. A page kept in the back/forward cache is frozen, not unloaded: its open stream would
+ * keep one of the browser's six HTTP/1.1 connections to the origin, and after six such
+ * navigations every request of the next page would wait for a free one.
+ *
  * Its status goes to `useNodeLive`; pages poll at their old intervals while it is not live.
  */
 export function useNodeLiveUpdates(sessionKey: string | null): void {
@@ -50,7 +55,8 @@ export function useNodeLiveUpdates(sessionKey: string | null): void {
 
 /**
  * The stream's own lifecycle (what it is doing, as opposed to the status pages see):
- * - `idle`: not started yet.
+ * - `idle`: not started yet, or ended by `pagehide` (the page left, maybe into the back/forward
+ *   cache); `pageshow` starts it again.
  * - `streaming`: an attempt owns `controller`, from the fetch through the read loop. Its
  *   `watchdog` ends it after {@link NODE_LIVE_WATCHDOG_MS} of silence.
  * - `waiting`: the reconnect `timer` is armed.
@@ -190,16 +196,32 @@ function openNodeEventStream(queryClient: QueryClient): () => void {
     }
   };
 
-  // Back online, or back to the tab: no need to wait out the backoff.
+  // Back online, back to the tab, or back from the back/forward cache: no need to wait out the
+  // backoff.
   const reconnectNow = () => {
-    if (currentPhase().kind !== "waiting") return;
+    const kind = currentPhase().kind;
+    if (kind !== "waiting" && kind !== "idle") return;
     if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
     void connect();
   };
   const onVisibility = () => {
     if (document.visibilityState === "visible") reconnectNow();
   };
+  // Leaving the page: end the stream without scheduling a reconnect (see the hook's comment).
+  const onPageHide = () => {
+    const last = currentPhase();
+    if (last.kind === "waiting") clearTimeout(last.timer);
+    else if (last.kind !== "streaming") return;
+    phase = { kind: "idle" };
+    if (last.kind === "streaming") {
+      clearTimeout(last.watchdog);
+      last.controller.abort();
+    }
+    report("failed");
+  };
   window.addEventListener("online", reconnectNow);
+  window.addEventListener("pagehide", onPageHide);
+  window.addEventListener("pageshow", reconnectNow);
   document.addEventListener("visibilitychange", onVisibility);
 
   void connect();
@@ -214,6 +236,8 @@ function openNodeEventStream(queryClient: QueryClient): () => void {
     clearTimeout(flushTimer);
     clearTimeout(noticeTimer);
     window.removeEventListener("online", reconnectNow);
+    window.removeEventListener("pagehide", onPageHide);
+    window.removeEventListener("pageshow", reconnectNow);
     document.removeEventListener("visibilitychange", onVisibility);
     useNodeLive.getState().dispatch("off");
   };

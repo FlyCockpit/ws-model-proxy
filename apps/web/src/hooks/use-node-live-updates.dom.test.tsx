@@ -266,6 +266,78 @@ describe("useNodeLiveUpdates", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("closes the stream on pagehide without reconnecting, and opens it again on pageshow", async () => {
+    // A page kept in the back/forward cache must not hold its stream (one of the six HTTP/1.1
+    // connections to the origin) while it is frozen.
+    mount();
+    await advance(250);
+    expect(flushes()).toBe(1);
+    await act(async () => {
+      window.dispatchEvent(new Event("pagehide"));
+    });
+    expect(streams[0]?.signal.aborted).toBe(true);
+    expect(status()).toBe("down");
+    await advance(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      window.dispatchEvent(new Event("pageshow"));
+    });
+    await advance(250);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(streams[1]?.signal.aborted).toBe(false);
+    expect(status()).toBe("live");
+    // Events missed while frozen: the queries are refreshed after it opens.
+    expect(flushes()).toBe(2);
+  });
+
+  it("lets a pageshow right after pagehide own the stream, whatever the old attempt does later", async () => {
+    // The first attempt's response never arrives; pagehide and pageshow come before it settles.
+    responses = ["hang", "stream"];
+    mount();
+    await act(async () => {
+      window.dispatchEvent(new Event("pagehide"));
+      window.dispatchEvent(new Event("pageshow"));
+    });
+    await advance();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+    expect(streams[0]?.signal.aborted).toBe(false);
+    expect(status()).toBe("live");
+    // The old attempt has settled (aborted): it schedules nothing and changes no status.
+    await advance(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(status()).toBe("live");
+  });
+
+  it("opens no second stream on a pageshow while one is open (first load, or a restore)", async () => {
+    mount();
+    await advance();
+    await act(async () => {
+      window.dispatchEvent(new Event("pageshow"));
+    });
+    await advance(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(status()).toBe("live");
+  });
+
+  it("ends a waiting reconnect on pagehide, so nothing connects until pageshow", async () => {
+    responses = [503, "stream"];
+    mount();
+    await advance();
+    expect(status()).toBe("down");
+    await act(async () => {
+      window.dispatchEvent(new Event("pagehide"));
+    });
+    await advance(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      window.dispatchEvent(new Event("pageshow"));
+    });
+    await advance();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(status()).toBe("live");
+  });
+
   it("says so only after 10 s down, and clears it once live again", async () => {
     responses = ["stream", 503, 503, 503, 503, 503, "stream"];
     mount();
