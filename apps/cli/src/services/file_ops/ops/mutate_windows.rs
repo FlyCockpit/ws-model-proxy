@@ -15,9 +15,9 @@ use std::path::Path;
 
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
-use crate::services::file_ops::fs::meta::{Kind, Stat, kind_name};
 use crate::services::file_ops::fs::policy::Access;
 use crate::services::file_ops::fs::resolve::{ResolveOpts, Resolved, resolve, same_path};
+use crate::services::file_ops::meta::{Kind, Stat, kind_name};
 use crate::services::file_ops::{Cancel, Step, check_reason};
 
 pub use super::mutate_args::{

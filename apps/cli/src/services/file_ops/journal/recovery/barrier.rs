@@ -13,9 +13,9 @@ use nix::unistd::{UnlinkatFlags, unlinkat};
 
 use super::{RecoveryDir, Slot, refused_without_effect, tolerate_dir_fsync};
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
-use crate::services::file_ops::fs::exchange::barrier_error;
-use crate::services::file_ops::fs::meta::Stat;
+use crate::services::file_ops::fs::sync::barrier_error;
 use crate::services::file_ops::journal::intent::{Intent, IntentPhase};
+use crate::services::file_ops::meta::Stat;
 
 impl RecoveryDir {
     pub(in crate::services::file_ops) fn set_intent_phase(

@@ -88,7 +88,7 @@ fn rename_failed_destination_capture_releases_source_before_restore_alias_unlink
                 *injected.lock().unwrap()=Some(FaultScope::new(&rows));
                 #[cfg(target_os="linux")]
                 {
-                    use crate::services::file_ops::fs::exchange::UNLINK_PROBE;
+                    use crate::services::file_ops::journal::exchange::UNLINK_PROBE;
                     use std::os::unix::fs::MetadataExt;
                     let root=root.clone();
                     UNLINK_PROBE.with(|probe|*probe.borrow_mut()=Some(Box::new(move|| {
@@ -138,7 +138,7 @@ fn rename_destination_mismatch_closes_source_proof_before_restore_unlink() {
             std::fs::hard_link(private, public).unwrap();
             #[cfg(target_os = "linux")]
             {
-                use crate::services::file_ops::fs::exchange::UNLINK_PROBE;
+                use crate::services::file_ops::journal::exchange::UNLINK_PROBE;
                 use std::os::unix::fs::MetadataExt;
                 let root = root.clone();
                 UNLINK_PROBE.with(|probe| {
@@ -366,7 +366,7 @@ fn rename_prepare_error_exit_closes_the_destination_proof_before_the_restore_unl
     recovery.set_link_order(crate::services::file_ops::journal::recovery::LinkOrder::VacateFirst);
     #[cfg(target_os = "linux")]
     let checks = {
-        use crate::services::file_ops::fs::exchange::UNLINK_PROBE;
+        use crate::services::file_ops::journal::exchange::UNLINK_PROBE;
         use std::os::unix::fs::MetadataExt;
         let root = fx.root.clone();
         let seen = Arc::new(Mutex::new(0usize));

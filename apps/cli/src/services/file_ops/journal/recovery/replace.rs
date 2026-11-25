@@ -20,11 +20,11 @@ use super::{Held, Published, RecoveryDir, Slot};
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::services::file_ops::fs::exchange::is_unsupported;
-use crate::services::file_ops::fs::meta::{Stat, perm_mode};
+use crate::services::file_ops::journal::exchange::is_unsupported;
 use crate::services::file_ops::journal::intent::Intent;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::services::file_ops::journal::intent::IntentPhase;
+use crate::services::file_ops::meta::{Stat, perm_mode};
 use crate::services::file_ops::{Cancel, Step};
 
 struct TempGuard<'a> {
@@ -253,7 +253,7 @@ pub(in crate::services::file_ops) fn create(
     let mut recovery = RecoveryDir::new(dir, dir_path)?;
     let result = (|| -> FileResult<Stat> {
         // Unsupported directory sync refuses before anything is created.
-        crate::services::file_ops::fs::exchange::probe_dir_barrier(dir)?;
+        crate::services::file_ops::fs::sync::probe_dir_barrier(dir)?;
         // The exclusive create is itself a public effect: later barrier
         // failures while disposing it cannot be reported as a clean refusal.
         let before = recovery.effect_checkpoint();

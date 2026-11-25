@@ -14,15 +14,17 @@
 //! - `ops`, the tools: `read`, `stat`, `list`, `search`, `edit`, `write`,
 //!   `mutate`, and the text helpers they share;
 //! - `journal`, the crash-safe write layer: `atomic` (the replace sequence)
-//!   over `recovery` (per-operation recovery directory), `registry` (its
-//!   durable index), `intent` (the crash map), and `recover` (`wsmp recover`);
+//!   over `recovery` (per-operation recovery directory and its transactions),
+//!   `registry` (its durable index), `intent` (the crash map), `recover`
+//!   (`wsmp recover`), and `exchange` (the rename/link syscalls it moves names
+//!   with, their errno classes and test fault points);
 //! - `fs`, the filesystem primitives: `resolve` (fd walk) + `policy` (protected
-//!   set, roots, root user), the only path enforcement point; `exchange` (the
-//!   rename/link primitives and their errno classes); `walk`; `etag` keys
-//!   content hashes; and `meta`: `Stat` and `Kind`, what every layer knows of a
-//!   file object;
-//! - beside them, `redact` masks secrets before anything is windowed, and
-//!   `error` is the error every layer returns.
+//!   set, roots, root user), the only path enforcement point; `sync` (the
+//!   directory fsync barrier); `walk`; and `etag` keys content hashes;
+//! - beside them, the vocabulary every layer shares: `meta` (`Stat` and
+//!   `Kind`, what every layer knows of a file object) and `error` (the error
+//!   every layer returns); and `redact`, which masks secrets before anything is
+//!   windowed.
 //!
 //! Windows serves the read tools only (`read`, `stat`, `list`, `search`): its
 //! `resolve` and `walk` (`fs/resolve_windows.rs`, `fs/walk_windows.rs`) work on
@@ -42,6 +44,7 @@ pub mod error;
 pub(crate) mod fmt;
 pub mod fs;
 pub(crate) mod journal;
+pub(crate) mod meta;
 pub mod ops;
 pub mod pool;
 pub mod redact;

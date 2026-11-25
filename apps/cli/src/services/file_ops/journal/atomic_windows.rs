@@ -32,8 +32,8 @@ use rand::distr::{Alphanumeric, SampleString};
 
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
-use crate::services::file_ops::fs::meta::Stat;
 use crate::services::file_ops::fs::resolve::DirHandle;
+use crate::services::file_ops::meta::Stat;
 use crate::services::file_ops::{Cancel, Step};
 
 /// Refuse files an atomic replace would damage.

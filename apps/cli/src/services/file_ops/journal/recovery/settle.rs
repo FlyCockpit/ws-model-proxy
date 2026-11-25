@@ -17,8 +17,8 @@ use super::{Held, MAX_REPORTED, RecoveryDir, Slot, unlink_cleanup_lock};
 use crate::services::file_ops::Step;
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
-use crate::services::file_ops::fs::exchange::{Primitive, link_count, run};
-use crate::services::file_ops::fs::meta::Stat;
+use crate::services::file_ops::journal::exchange::{Primitive, link_count, run};
+use crate::services::file_ops::meta::Stat;
 
 impl RecoveryDir {
     pub(in crate::services::file_ops) fn dispose(

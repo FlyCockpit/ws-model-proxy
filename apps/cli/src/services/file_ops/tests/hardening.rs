@@ -1446,7 +1446,7 @@ fn staging_names_are_refused_under_every_folded_spelling() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod exchange_callers {
     use super::*;
-    use crate::services::file_ops::fs::exchange::{FaultScope, Primitive};
+    use crate::services::file_ops::journal::exchange::{FaultScope, Primitive};
     use nix::errno::Errno;
 
     fn inject(errno: Errno) -> FaultScope {
@@ -1539,7 +1539,7 @@ mod exchange_callers {
 #[cfg(target_os = "linux")]
 #[test]
 fn rename_overwrite_refuses_case_differing_hard_link_alias() {
-    use crate::services::file_ops::fs::meta::Stat;
+    use crate::services::file_ops::meta::Stat;
 
     let fx = Fx::new();
     fx.put("a", "keep these bytes\n");
@@ -1580,7 +1580,7 @@ fn rename_overwrite_refuses_case_differing_hard_link_alias() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_case_only_rename_needs_no_overwrite_on_a_case_insensitive_volume() {
-    use crate::services::file_ops::fs::meta::Stat;
+    use crate::services::file_ops::meta::Stat;
 
     let fx = Fx::new();
     fx.put("Probe", "probe");
@@ -1633,8 +1633,8 @@ fn a_case_only_rename_needs_no_overwrite_on_a_case_insensitive_volume() {
 #[cfg(target_os = "macos")]
 #[test]
 fn rename_overwrite_case_only_alias_changes_spelling_on_case_insensitive_volume() {
-    use crate::services::file_ops::fs::exchange::{FaultScope, Primitive};
-    use crate::services::file_ops::fs::meta::Stat;
+    use crate::services::file_ops::journal::exchange::{FaultScope, Primitive};
+    use crate::services::file_ops::meta::Stat;
     use nix::errno::Errno;
 
     let fx = Fx::new();

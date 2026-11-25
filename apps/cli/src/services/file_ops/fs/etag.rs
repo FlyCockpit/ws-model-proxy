@@ -19,9 +19,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 
-use super::meta::Stat;
 use crate::services::file_ops::Cancel;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
+use crate::services::file_ops::meta::Stat;
 
 /// Files at or below this size are hashed in full (also the cap for full-file
 /// scans such as line counting and masking).
@@ -192,8 +192,8 @@ mod tests {
         std::fs::write(&p2, b"x").unwrap();
         // With identity: on Windows plain metadata has none, and the two files would differ only
         // when their modification times do.
-        let s1 = crate::services::file_ops::fs::meta::Stat::of_path(&p1).unwrap();
-        let s2 = crate::services::file_ops::fs::meta::Stat::of_path(&p2).unwrap();
+        let s1 = crate::services::file_ops::meta::Stat::of_path(&p1).unwrap();
+        let s2 = crate::services::file_ops::meta::Stat::of_path(&p2).unwrap();
         let a = EtagKey::from_bytes([1; 32]);
         let b = EtagKey::from_bytes([2; 32]);
         let one = a.strong(&s1, b"HF_TOKEN=hunter2\n");

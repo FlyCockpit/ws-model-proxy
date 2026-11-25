@@ -9,10 +9,10 @@ use super::text;
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
 use crate::services::file_ops::fs::etag::load_all;
-use crate::services::file_ops::fs::meta::Kind;
 use crate::services::file_ops::fs::policy::Access;
 use crate::services::file_ops::fs::resolve::{ResolveOpts, resolve};
 use crate::services::file_ops::journal::atomic;
+use crate::services::file_ops::meta::Kind;
 use crate::services::file_ops::redact::{self, MASK_OPEN};
 use crate::services::file_ops::{Cancel, Step, check_reason};
 

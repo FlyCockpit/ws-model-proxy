@@ -7,8 +7,8 @@ use nix::errno::Errno;
 use serde_json::{Value, json};
 
 use super::{Fx, args};
-use crate::services::file_ops::fs::exchange::{FaultScope, Primitive, fault};
 use crate::services::file_ops::fs::policy::Access;
+use crate::services::file_ops::journal::exchange::{FaultScope, Primitive, fault};
 use crate::services::file_ops::{ErrorCode, FileError, FileResult, Step};
 
 #[derive(Clone, Copy, Debug)]
@@ -1320,7 +1320,7 @@ fn compensation_exchange_error_restores_vacated_source_without_plain_overwrite()
         let error = Op::Rename.run(&fx, &etag).unwrap_err();
         assert_eq!(
             error.code,
-            if crate::services::file_ops::fs::exchange::is_unsupported(errno) {
+            if crate::services::file_ops::journal::exchange::is_unsupported(errno) {
                 ErrorCode::UnsafeFilesystem
             } else {
                 ErrorCode::IoError
@@ -1383,7 +1383,7 @@ fn compensation_replace_cross_directory_exchange_errors_use_only_supported_fallb
             });
             let _scope = FaultScope::new(&[(Primitive::Exchange, 1, errno)]);
             let result = op.run(&fx, &etag);
-            if crate::services::file_ops::fs::exchange::is_unsupported(errno) {
+            if crate::services::file_ops::journal::exchange::is_unsupported(errno) {
                 assert!(result.unwrap().get("recovered").is_none());
                 assert_eq!(fx.get("doc.txt"), "edited");
             } else {
@@ -1405,7 +1405,7 @@ fn compensation_replace_cross_directory_exchange_errors_use_only_supported_fallb
 #[cfg(target_os = "linux")]
 #[test]
 fn compensation_tmpfs_replace_and_edit_exchange_across_recovery_directory() {
-    use crate::services::file_ops::{fs::meta::Stat, journal::atomic};
+    use crate::services::file_ops::{journal::atomic, meta::Stat};
     use nix::fcntl::{OFlag, open};
     use nix::sys::stat::Mode;
     use std::os::fd::AsFd;
@@ -1534,7 +1534,7 @@ fn compensation_no_flags_exchange_less_rename_restores_source_with_one_link() {
 fn compensation_closes_held_descriptors_before_removing_the_recovery_directory() {
     use std::sync::{Arc, Mutex};
 
-    use crate::services::file_ops::fs::exchange::RMDIR_PROBE;
+    use crate::services::file_ops::journal::exchange::RMDIR_PROBE;
 
     /// Descriptors of this process that point under `root` (a disposed file
     /// still open shows as `<path> (deleted)`).

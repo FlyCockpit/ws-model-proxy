@@ -38,10 +38,10 @@ use nix::fcntl::{OFlag, openat, readlinkat};
 use nix::sys::stat::{Mode, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 
-use super::exchange::probe_dir_barrier;
-use super::meta::{Kind, Stat, perm_mode};
 use super::policy::{Access, Policy};
+use super::sync::probe_dir_barrier;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
+use crate::services::file_ops::meta::{Kind, Stat, perm_mode};
 
 pub const MAX_SYMLINK_HOPS: usize = 40;
 pub const MAX_PATH_BYTES: usize = 4096;
@@ -80,7 +80,7 @@ pub type DirHandle = OwnedFd;
 
 impl Resolved {
     /// The entry `name` of a directory a walk holds.
-    pub fn at(parent: &DirHandle, dir_path: PathBuf, name: OsString) -> FileResult<Self> {
+    pub(super) fn at(parent: &DirHandle, dir_path: PathBuf, name: OsString) -> FileResult<Self> {
         Ok(Self {
             dir: parent.try_clone()?,
             dir_path,
@@ -135,7 +135,7 @@ impl Resolved {
     }
 
     /// Open the leaf as a directory (the held dir itself for `.`).
-    pub fn open_dir(&self) -> FileResult<OwnedFd> {
+    pub(super) fn open_dir(&self) -> FileResult<OwnedFd> {
         openat(
             self.dir.as_fd(),
             self.name.as_os_str(),
@@ -198,7 +198,7 @@ impl Resolved {
 
 /// A link's text in the directory `parent` (`None` when it is not a link or not
 /// UTF-8).
-pub fn read_link_at(parent: &DirHandle, name: &str) -> Option<String> {
+pub(super) fn read_link_at(parent: &DirHandle, name: &str) -> Option<String> {
     readlinkat(parent.as_fd(), name)
         .ok()
         .and_then(|target| target.into_string().ok())

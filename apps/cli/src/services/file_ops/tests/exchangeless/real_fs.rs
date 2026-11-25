@@ -157,17 +157,17 @@ pub(super) fn check_real_capabilities(directory: &Path, class: RealClass) {
         Mode::empty(),
     )
     .unwrap();
-    let actual = crate::services::file_ops::fs::exchange::exchange(
+    let actual = crate::services::file_ops::journal::exchange::exchange(
         fd.as_fd(),
         "a".as_ref(),
         fd.as_fd(),
         "b".as_ref(),
     );
     assert!(
-        actual.is_err_and(crate::services::file_ops::fs::exchange::is_unsupported),
+        actual.is_err_and(crate::services::file_ops::journal::exchange::is_unsupported),
         "supplied declared mount must not support exchange"
     );
-    let nr = crate::services::file_ops::fs::exchange::no_replace(
+    let nr = crate::services::file_ops::journal::exchange::no_replace(
         fd.as_fd(),
         "a".as_ref(),
         fd.as_fd(),
@@ -180,7 +180,7 @@ pub(super) fn check_real_capabilities(directory: &Path, class: RealClass) {
         "raw absent-name NR must match declared class"
     );
     if !class.nr {
-        assert!(nr.is_err_and(crate::services::file_ops::fs::exchange::is_unsupported));
+        assert!(nr.is_err_and(crate::services::file_ops::journal::exchange::is_unsupported));
     }
     let source = fx.root.join(if class.nr { "absent" } else { "a" });
     let alias = fx.root.join("alias");
@@ -212,11 +212,11 @@ pub(super) fn check_real_capabilities(directory: &Path, class: RealClass) {
                 .as_ref()
                 .err()
                 .and_then(std::io::Error::raw_os_error)
-                .is_some_and(
-                    |raw| crate::services::file_ops::fs::exchange::is_link_unsupported(
-                        Errno::from_raw(raw)
+                .is_some_and(|raw| {
+                    crate::services::file_ops::journal::exchange::is_link_unsupported(
+                        Errno::from_raw(raw),
                     )
-                )
+                })
         );
         // The no-link daemon cannot create this pair. The runner seeds these two
         // hard links in its backing directory before mounting the none classes.

@@ -52,10 +52,10 @@ use nix::unistd::{UnlinkatFlags, unlinkat};
 use super::write::{DEFAULT_PARENT_MODE, parse_mode};
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
-use crate::services::file_ops::fs::meta::{Kind, Stat, kind_name, perm_mode};
 use crate::services::file_ops::fs::policy::Access;
 use crate::services::file_ops::fs::resolve::{ResolveOpts, Resolved, resolve};
 use crate::services::file_ops::journal::recovery::{self, Held};
+use crate::services::file_ops::meta::{Kind, Stat, kind_name, perm_mode};
 use crate::services::file_ops::{Cancel, Step, check_reason};
 
 pub use super::mutate_args::{
@@ -332,8 +332,8 @@ fn case_only_alias(from: &Resolved, to: &Resolved, src: &Stat, dst: &Stat) -> Fi
 /// Change one entry's spelling with a plain `renameat` (see `same_object_rename`
 /// for when that is the case and its residual), then sync both directories.
 fn case_only_rename(from: &Resolved, to: &Resolved) -> FileResult<()> {
-    crate::services::file_ops::fs::exchange::probe_dir_barrier(&from.dir)?;
-    crate::services::file_ops::fs::exchange::probe_dir_barrier(&to.dir)?;
+    crate::services::file_ops::fs::sync::probe_dir_barrier(&from.dir)?;
+    crate::services::file_ops::fs::sync::probe_dir_barrier(&to.dir)?;
     renameat(
         from.dir.as_fd(),
         from.name.as_os_str(),
@@ -514,7 +514,7 @@ fn mkdir_resolved(
     }
     ops.hook.step(Step::EtagRechecked)?;
     cancel.check()?;
-    crate::services::file_ops::fs::exchange::probe_dir_barrier(&resolved.dir)?;
+    crate::services::file_ops::fs::sync::probe_dir_barrier(&resolved.dir)?;
     match mkdirat(
         resolved.dir.as_fd(),
         resolved.name.as_os_str(),
@@ -603,7 +603,7 @@ pub(crate) fn delete(
     if st.kind() == Kind::Dir {
         // Never capture directories: link-only filesystems cannot restore them.
         // Kernel rmdir removes only an empty directory, preserving saved data.
-        crate::services::file_ops::fs::exchange::probe_dir_barrier(&resolved.dir)?;
+        crate::services::file_ops::fs::sync::probe_dir_barrier(&resolved.dir)?;
         unlinkat(
             resolved.dir.as_fd(),
             resolved.name.as_os_str(),
@@ -628,7 +628,7 @@ pub(crate) fn delete(
 #[cfg(all(test, target_os = "linux"))]
 mod descriptor_tests {
     use super::*;
-    use crate::services::file_ops::fs::exchange::{FaultScope, Primitive};
+    use crate::services::file_ops::journal::exchange::{FaultScope, Primitive};
     use crate::services::file_ops::tests::{Fx, args};
     use serde_json::json;
 
