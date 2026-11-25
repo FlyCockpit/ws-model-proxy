@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::super::policy::Access;
-use super::super::policy::{Deny, Protected};
-use super::super::resolve::{MAX_SYMLINK_HOPS, ResolveOpts, resolve};
+use super::super::fs::policy::Access;
+use super::super::fs::policy::{Deny, Protected};
+use super::super::fs::resolve::{MAX_SYMLINK_HOPS, ResolveOpts, resolve};
 use super::super::{ErrorCode, Policy};
 use super::{Fx, args, code};
 
@@ -420,7 +420,7 @@ fn symlink_swap_race_never_escapes_roots() {
             .ops
             .read(&args(json!({ "path": fx.p("jail/dir/f") })), &fx.cancel)
         {
-            Ok(super::super::read::ReadOutcome::Content(result)) => {
+            Ok(super::super::ops::read::ReadOutcome::Content(result)) => {
                 assert!(!result.text.contains("SECRET-OUTSIDE"), "escaped the roots");
                 inside += 1;
             }

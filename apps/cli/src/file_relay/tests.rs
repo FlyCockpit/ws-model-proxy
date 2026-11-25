@@ -378,7 +378,7 @@ fn delete_recovered_is_optional_and_survives_result_frame_encoding() {
         Vec::new(),
         vec!["/workspace/.wsmp-recover-a1b2c3d4e5".to_string()],
     ] {
-        let value = serde_json::to_value(crate::file_ops::mutate::DeleteResult {
+        let value = serde_json::to_value(crate::file_ops::ops::mutate::DeleteResult {
             deleted: true,
             kind: "file",
             recovered: recovered.clone(),
@@ -951,7 +951,7 @@ fn shared_runtime_keeps_configured_roots() {
         runtime
             .policy()
             .check_path(
-                crate::file_ops::policy::Access::Read,
+                crate::file_ops::fs::policy::Access::Read,
                 std::path::Path::new("/outside/plain")
             )
             .expect_err("outside root")

@@ -10,23 +10,26 @@
 //! Layout, top down (each layer names only the ones below it):
 //! - the facade: [`FileOps`] here, which owns an `OpContext` (`context`:
 //!   policy, etag key, budgets, step hook, path and namespace locks) and hands
-//!   it to the tools;
-//! - the tools: `read`, `stat`, `list`, `search`, `edit`, `write`, `mutate`;
-//!   `pool` runs them off the relay loop;
-//! - `atomic` (the replace sequence) over the recovery journal: `recovery`
-//!   (per-operation recovery directory), `registry` (its durable index),
-//!   `intent` (the crash map), and `exchange` (the rename/link primitives and
-//!   their errno classes);
-//! - `resolve` (fd walk) + `policy` (protected set, roots, root user), the only
-//!   path enforcement point; `etag` keys content hashes; `redact` masks secrets
-//!   before anything is windowed;
-//! - `meta`: `Stat` and `Kind`, what every layer knows of a file object.
+//!   it to the tools; `pool` runs them off the relay loop;
+//! - `ops`, the tools: `read`, `stat`, `list`, `search`, `edit`, `write`,
+//!   `mutate`, and the text helpers they share;
+//! - `journal`, the crash-safe write layer: `atomic` (the replace sequence)
+//!   over `recovery` (per-operation recovery directory), `registry` (its
+//!   durable index), `intent` (the crash map), and `recover` (`wsmp recover`);
+//! - `fs`, the filesystem primitives: `resolve` (fd walk) + `policy` (protected
+//!   set, roots, root user), the only path enforcement point; `exchange` (the
+//!   rename/link primitives and their errno classes); `walk`; `etag` keys
+//!   content hashes; and `meta`: `Stat` and `Kind`, what every layer knows of a
+//!   file object;
+//! - beside them, `redact` masks secrets before anything is windowed, and
+//!   `error` is the error every layer returns.
 //!
 //! Windows serves the read tools only (`read`, `stat`, `list`, `search`): its
-//! `resolve` and `walk` (`resolve_windows.rs`, `walk_windows.rs`) work on paths
-//! and check the object actually opened, and present paths in a POSIX view
-//! (`C:\Users\ada` is `/c/Users/ada`). The write side, its recovery journal and
-//! `wsmp recover` need fd-relative opens and an atomic exchange, and stay Unix.
+//! `resolve` and `walk` (`fs/resolve_windows.rs`, `fs/walk_windows.rs`) work on
+//! paths and check the object actually opened, and present paths in a POSIX
+//! view (`C:\Users\ada` is `/c/Users/ada`). The write side, its recovery
+//! journal and `wsmp recover` need fd-relative opens and an atomic exchange, and
+//! stay Unix.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,60 +37,20 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-#[cfg(unix)]
-pub(crate) mod atomic;
-#[cfg(windows)]
-#[path = "atomic_windows.rs"]
-pub(crate) mod atomic;
 mod context;
-pub(crate) mod diff;
-pub mod edit;
 pub mod error;
-pub mod etag;
-#[cfg(unix)]
-mod exchange;
 pub(crate) mod fmt;
-pub(crate) mod glob;
-#[cfg(unix)]
-mod intent;
-pub mod list;
-pub(crate) mod meta;
-#[cfg(unix)]
-pub mod mutate;
-#[cfg(windows)]
-#[path = "mutate_windows.rs"]
-pub mod mutate;
-mod mutate_args;
-pub mod policy;
+pub mod fs;
+pub(crate) mod journal;
+pub mod ops;
 pub mod pool;
-pub mod read;
-#[cfg(unix)]
-mod recover;
-#[cfg(unix)]
-mod recovery;
-#[cfg(unix)]
-mod registry;
-#[cfg(unix)]
-pub(crate) use recover::{RecoverReport, recover_from_registry, recover_scan};
-#[cfg(unix)]
-pub(crate) use recovery::report_abandoned_recovery;
-#[cfg(unix)]
-pub(crate) use registry::abandoned_count as abandoned_recovery_count;
 pub mod redact;
 #[cfg(unix)]
-pub(crate) mod resolve;
-#[cfg(windows)]
-#[path = "resolve_windows.rs"]
-pub(crate) mod resolve;
-pub mod search;
-pub mod stat;
-pub(crate) mod text;
+pub(crate) use journal::recover::{RecoverReport, recover_from_registry, recover_scan};
 #[cfg(unix)]
-pub(crate) mod walk;
-#[cfg(windows)]
-#[path = "walk_windows.rs"]
-pub(crate) mod walk;
-pub mod write;
+pub(crate) use journal::recovery::report_abandoned_recovery;
+#[cfg(unix)]
+pub(crate) use journal::registry::abandoned_count as abandoned_recovery_count;
 
 pub use error::{ErrorCode, FileError, FileResult};
 
@@ -101,13 +64,14 @@ pub fn display_path(path: &std::path::Path) -> Option<String> {
     }
     #[cfg(windows)]
     {
-        resolve::posix_view(path)
+        fs::resolve::posix_view(path)
     }
 }
 
 use context::{Hook, Locks, OpContext};
-pub use etag::EtagKey;
-pub use policy::{Admission, Policy};
+pub use fs::etag::EtagKey;
+pub use fs::policy::{Admission, Policy};
+use ops::{edit, list, mutate, read, search, stat, write};
 
 #[cfg(test)]
 #[cfg(unix)]

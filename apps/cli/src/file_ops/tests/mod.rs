@@ -8,8 +8,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use super::context::Hook;
-use super::policy::{Deny, Protected};
-use super::read::{ReadOutcome, ReadResult};
+use super::fs::policy::{Deny, Protected};
+use super::ops::read::{ReadOutcome, ReadResult};
 use super::{Cancel, ErrorCode, EtagKey, FileOps, FileResult, Policy, Step};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -32,7 +32,7 @@ pub struct Fx {
     pub ops: FileOps,
     pub cancel: Cancel,
     pub steps: Arc<Mutex<Vec<Step>>>,
-    _registry: crate::file_ops::registry::RegistryGuard,
+    _registry: crate::file_ops::journal::registry::RegistryGuard,
 }
 
 pub fn args<T: DeserializeOwned>(value: Value) -> T {
@@ -84,7 +84,7 @@ impl Fx {
             ops,
             cancel: Cancel::new(),
             steps,
-            _registry: crate::file_ops::registry::install_temp_registry(),
+            _registry: crate::file_ops::journal::registry::install_temp_registry(),
         }
     }
 

@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use super::{Fx, args};
-use crate::file_ops::exchange::{FaultScope, Primitive};
-use crate::file_ops::intent::{Intent, IntentPhase, parse_intent};
-use crate::file_ops::recover::{RecoverAction, recover_dir, scan_recovery_dirs};
+use crate::file_ops::fs::exchange::{FaultScope, Primitive};
+use crate::file_ops::journal::intent::{Intent, IntentPhase, parse_intent};
+use crate::file_ops::journal::recover::{RecoverAction, recover_dir, scan_recovery_dirs};
 use crate::file_ops::{ErrorCode, Step};
 use nix::errno::Errno;
 
@@ -290,7 +290,7 @@ fn assert_clean_refusal(fx: &Fx, case: &str) {
         fx.leftovers("")
     );
     assert!(
-        crate::file_ops::registry::list_entries().is_empty(),
+        crate::file_ops::journal::registry::list_entries().is_empty(),
         "{case}: no registry entry"
     );
     disarm();
@@ -418,7 +418,7 @@ fn actual_io_child() {
             assert!(result.deleted);
             assert!(!fx.root.join("src").exists());
             assert!(fx.leftovers("").is_empty(), "{:?}", fx.leftovers(""));
-            assert!(crate::file_ops::registry::list_entries().is_empty());
+            assert!(crate::file_ops::journal::registry::list_entries().is_empty());
             return;
         }
         "slot-data" => {
@@ -714,7 +714,7 @@ fn assert_no_residue(fx: &Fx, scenario: &str) {
         fx.leftovers("")
     );
     assert!(
-        crate::file_ops::registry::list_entries().is_empty(),
+        crate::file_ops::journal::registry::list_entries().is_empty(),
         "{scenario}: registry entry"
     );
 }
@@ -883,7 +883,7 @@ fn scenario_child() {
 fn interrupted_capture_and_delete_publication_roll_back_automatically() {
     let directory = tempfile::tempdir().unwrap();
     let library = hook(directory.path());
-    let _registry = crate::file_ops::registry::install_temp_registry();
+    let _registry = crate::file_ops::journal::registry::install_temp_registry();
     for (op, phase, automatic) in [
         ("delete", "capturing", true),
         ("delete", "publishing", true),
@@ -910,7 +910,7 @@ fn interrupted_capture_and_delete_publication_roll_back_automatically() {
         assert_eq!(dirs.len(), 1, "{op}/{phase}");
         let dir = &dirs[0];
         assert_eq!(
-            crate::file_ops::intent::intent_phase_name(intent(dir).phase),
+            crate::file_ops::journal::intent::intent_phase_name(intent(dir).phase),
             phase
         );
         depart(dir);
@@ -980,7 +980,7 @@ fn killed_child() {
 fn interrupted_replace_rolls_back_without_publishing_its_temp() {
     let directory = tempfile::tempdir().unwrap();
     let library = hook(directory.path());
-    let _registry = crate::file_ops::registry::install_temp_registry();
+    let _registry = crate::file_ops::journal::registry::install_temp_registry();
     let mut failed = Vec::new();
     for (window, kill_phase, expected) in [
         // Exchange swapped in a third party's file; compensation captured T.
@@ -1177,7 +1177,7 @@ fn state_directory_child() {
     };
     let fx = Fx::new();
     fx.put("src", "original");
-    let registry = crate::file_ops::registry::current_registry_dir();
+    let registry = crate::file_ops::journal::registry::current_registry_dir();
     fs::write(&target, registry.as_os_str().as_encoded_bytes()).unwrap();
     let error = fx
         .ops

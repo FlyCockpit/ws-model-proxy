@@ -79,7 +79,7 @@ fn stat_path_count_is_capped() {
 
 // ---- list -----------------------------------------------------------------
 
-fn list(fx: &Fx, value: Value) -> super::super::list::ListResult {
+fn list(fx: &Fx, value: Value) -> super::super::ops::list::ListResult {
     fx.ops.dir_list(&args(value), &fx.cancel).unwrap()
 }
 
@@ -199,7 +199,7 @@ const SPECIAL_TREE: &str = "/dev";
 
 // ---- search ---------------------------------------------------------------
 
-fn search(fx: &Fx, value: Value) -> super::super::search::SearchResult {
+fn search(fx: &Fx, value: Value) -> super::super::ops::search::SearchResult {
     fx.ops.search(&args(value), &fx.cancel).unwrap()
 }
 
