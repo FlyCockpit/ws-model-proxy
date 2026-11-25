@@ -185,12 +185,9 @@ runner; `prisma migrate resolve` only in the documented recovery steps, run by t
 
 ## Code Structure
 
-- Run [`deslop-please`](https://github.com/deterministic-machines/deslop-please) to check for sloppy code structure.
-- Errors flagged by `deslop-please` must be fixed from first principles, don't do mechanical moves to hide them.
-    - `module-cycle` & `tangle`: what is the indented layer of abstraction? Which module should be at which layer?
-    - `field-leak` & `shallow-module`: Why we have these fields/functions at all? What are the patterns of use? Can they be hidden behind a narrow interface? Don't fix each leak one at a time, fix them holistically.
-    - Draw a diagram to help user understand the before and proposed after structure.
-- In this repo it runs in `apps/cli` (`deslop-please --allow .deslop-please.allow`); the allowlist holds only findings kept on purpose.
+- [`deslop-please`](https://github.com/deterministic-machines/deslop-please) checks the Rust code structure (deep modules, narrow interfaces); fix its findings from first principles, never by mechanical moves that hide them.
+- Run it in `apps/cli`: `deslop-please --allow .deslop-please.allow`.
+- `.deslop-please.allow` lists existing debt that is muted: fixing an entry never fails, a new finding fails. `deslop-please --update-allow .deslop-please.allow` regenerates it and drops comments.
 
 ## Testing and Verification
 
