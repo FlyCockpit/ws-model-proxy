@@ -267,7 +267,7 @@ pub(super) fn check_hello_origin(
     let shown = crate::display_escape::escape_single_line(challenge_origin);
     // Suggest the pin only for a value that is itself a valid public origin,
     // with both arguments quoted for this platform's shell.
-    let fix = crate::node::config::set_server_command(server_url, challenge_origin)
+    let fix = crate::node::origin::set_server_command(server_url, challenge_origin)
         .map(|command| {
             format!(
                 " If `{shown}` is your server's public address, run `{}` and restart wsmp; \

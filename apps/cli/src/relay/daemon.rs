@@ -38,7 +38,7 @@ use anyhow::{Context, Result};
 use tungstenite::http::HeaderValue;
 
 use crate::node::auth::CredentialPairing;
-use crate::node::config::Config;
+use crate::node::config::{Config, ConfigLock, Setting};
 use crate::process::control::ControlServer;
 use crate::relay::startup::TerminalStartup;
 
@@ -84,7 +84,7 @@ pub fn connect_foreground() -> Result<()> {
     let mut credential_pairing = CredentialPairing::default();
     loop {
         check_shutdown()?;
-        let node_slug = config.ensure_cli_slug()?;
+        let node_slug = ensure_cli_slug(&mut config)?;
         let mut progress = ConnectProgress::Connecting;
         let wait = match credential_pairing.resolve_credential(
             config.server_url.as_deref(),
@@ -195,6 +195,29 @@ pub fn connect_foreground() -> Result<()> {
             ),
         }
     }
+}
+
+/// The node's slug, checked. With none set, one is generated and saved:
+/// under the config lock, after re-reading the file, so a simultaneous
+/// login or config command keeps the slug it wrote. Either way `config` is
+/// then the file as saved.
+fn ensure_cli_slug(config: &mut Config) -> Result<String> {
+    if let Some(slug) = &config.cli_slug {
+        crate::slug::validate_slug(slug)?;
+        return Ok(slug.clone());
+    }
+    let lock = ConfigLock::exclusive()?;
+    let mut current = Config::load_required()?;
+    if let Some(slug) = current.cli_slug.clone() {
+        crate::slug::validate_slug(&slug)?;
+        *config = current;
+        return Ok(slug);
+    }
+    let slug = crate::slug::generated_slug("cli");
+    current.apply(Setting::CliSlug(slug.clone()));
+    lock.save(&current)?;
+    *config = current;
+    Ok(slug)
 }
 
 fn wait_for_reconnect(

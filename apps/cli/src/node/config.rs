@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::node::origin::normalize_public_origin;
 use crate::slug::validate_slug;
 use crate::wire::protocol::frames::TrustValue;
 use crate::wire::protocol::runtime_spec::{FileRootsSource, RemoteUpdates};
@@ -17,7 +18,6 @@ use crate::wire::protocol::runtime_spec::{FileRootsSource, RemoteUpdates};
 mod capabilities;
 mod endpoint;
 mod file_roots;
-mod origin;
 mod store;
 
 pub use capabilities::{
@@ -29,14 +29,11 @@ pub use endpoint::{
     CapabilityOverrideMode, EndpointAuthConfig, EndpointAuthMode, EndpointConfig, EndpointEngine,
     EndpointKind, HeaderEnvRef, ModelConfig, ProbeSnapshot, ProbeStatus,
 };
-pub use file_roots::{file_roots_usable, validate_file_roots};
-pub use origin::{
-    is_loopback_host, normalize_public_origin, server_url_http_warning, set_server_command,
-};
+pub use file_roots::validate_file_roots;
 pub use store::ConfigLock;
 
 use endpoint::is_false;
-use file_roots::{deserialize_file_roots, validate_file_root_shape};
+use file_roots::{deserialize_file_roots, file_roots_usable, validate_file_root_shape};
 
 pub const CONFIG_VERSION: u8 = 3;
 
@@ -97,7 +94,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_file_tools_as_root: bool,
     /// Explicit directory allowlist for every file operation. Unset: the
-    /// user's home directory ([`Config::effective_file_roots`]).
+    /// user's home directory ([`Config::relay_limits`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_roots: Vec<PathBuf>,
     /// Turn the node file tools off (no roots at all). Read once when the
@@ -115,32 +112,24 @@ fn is_allowed(value: &RemoteUpdates) -> bool {
     *value == RemoteUpdates::Allowed
 }
 
-impl Config {
-    /// The origin the relay hello may sign: the pinned public origin, else
-    /// the server URL's origin.
-    pub fn hello_origin(&self) -> Result<String> {
-        if let Some(origin) = &self.public_origin {
-            return normalize_public_origin(origin)
-                .with_context(|| format!("validating public origin `{origin}`"));
-        }
-        let server_url = self
-            .server_url
-            .as_deref()
-            .context("server URL is not configured; run `wsmp config set-server <URL>`")?;
-        let url = url::Url::parse(server_url)
-            .with_context(|| format!("parsing server URL `{server_url}`"))?;
-        match url.scheme() {
-            "http" | "https" => Ok(url.origin().ascii_serialization()),
-            other => anyhow::bail!("unsupported server URL scheme `{other}`"),
-        }
-    }
-}
-
 /// One setting changed on this machine: by a `wsmp config set-*` command,
 /// `wsmp login`, or the node's trust rules ([`crate::node::trust`]). Callers check
 /// the value first; [`Config::apply`] only records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Setting {
+    /// `serverUrl`, with `publicOrigin` pinned or (`None`) cleared.
+    Server {
+        url: String,
+        public_origin: Option<String>,
+    },
+    /// What a `wsmp login` enrolled: the server (and its pinned origin, if
+    /// any), the node's slug and the trust decided for it.
+    Enrollment {
+        server_url: String,
+        public_origin: Option<String>,
+        slug: String,
+        trust: TrustValue,
+    },
     /// `cliSlug`, the node's name.
     CliSlug(String),
     /// `allowHumanTerminal`, the browser terminal master switch.
@@ -167,9 +156,25 @@ pub enum Setting {
 }
 
 impl Config {
-    /// Record `setting` in this config (saving is the caller's).
+    /// Record `setting` in this config (saving is the caller's, under its
+    /// [`ConfigLock`]).
     pub fn apply(&mut self, setting: Setting) {
         match setting {
+            Setting::Server { url, public_origin } => {
+                self.server_url = Some(url);
+                self.public_origin = public_origin;
+            }
+            Setting::Enrollment {
+                server_url,
+                public_origin,
+                slug,
+                trust,
+            } => {
+                self.server_url = Some(server_url);
+                self.public_origin = public_origin;
+                self.cli_slug = Some(slug);
+                self.trust = Some(trust);
+            }
             Setting::CliSlug(slug) => self.cli_slug = Some(slug),
             Setting::AllowHumanTerminal(allow) => self.allow_human_terminal = allow,
             Setting::RuntimeHosts(hosts) => self.runtime_hosts = hosts,
@@ -184,52 +189,9 @@ impl Config {
         }
     }
 
-    /// Record `setting` in the config file: one [`Config::update`] (a
-    /// missing file starts from the defaults).
-    pub fn set(setting: Setting) -> Result<()> {
-        Self::update(false, |config| {
-            config.apply(setting);
-            Ok(())
-        })
-    }
-
-    /// Point this config at the server `url`, with `public_origin` pinned or
-    /// (`None`) cleared. Returns the pin it replaced, if any.
-    pub fn point_at_server(&mut self, url: &str, public_origin: Option<String>) -> Option<String> {
-        self.server_url = Some(url.to_string());
-        std::mem::replace(&mut self.public_origin, public_origin)
-    }
-
-    /// What a `wsmp login` enrolled: the server (and its pinned origin, if
-    /// any), the node's slug and the trust decided for it.
-    pub fn record_enrollment(
-        &mut self,
-        server_url: &str,
-        public_origin: Option<String>,
-        slug: &str,
-        trust: TrustValue,
-    ) {
-        self.point_at_server(server_url, public_origin);
-        self.apply(Setting::CliSlug(slug.to_string()));
-        self.apply(Setting::Trust(trust));
-    }
-
     /// Whether a server URL is set (the node was enrolled or pointed at one).
     pub fn has_server_url(&self) -> bool {
         self.server_url.is_some()
-    }
-
-    /// The server URL of an enrolled node.
-    pub fn enrolled_server_url(&self) -> Result<&str> {
-        self.server_url
-            .as_deref()
-            .context("this node is not enrolled; run `wsmp login <url> --code <code>`")
-    }
-
-    /// [`Config::hello_origin`], once a server URL or a public origin is set
-    /// (`None` before).
-    pub fn hello_origin_when_set(&self) -> Option<Result<String>> {
-        (self.server_url.is_some() || self.public_origin.is_some()).then(|| self.hello_origin())
     }
 
     /// The trust this config grants: unset is Relay only (fail closed).
@@ -237,10 +199,40 @@ impl Config {
         self.trust.unwrap_or(TrustValue::Relay)
     }
 
+    /// The origin the relay hello may sign: the pinned public origin, else
+    /// the server URL's origin.
+    pub fn hello_origin(&self) -> Result<String> {
+        if let Some(origin) = &self.public_origin {
+            return normalize_public_origin(origin)
+                .with_context(|| format!("validating public origin `{origin}`"));
+        }
+        let server_url = self
+            .server_url
+            .as_deref()
+            .context("server URL is not configured; run `wsmp config set-server <URL>`")?;
+        let url = url::Url::parse(server_url)
+            .with_context(|| format!("parsing server URL `{server_url}`"))?;
+        match url.scheme() {
+            "http" | "https" => Ok(url.origin().ascii_serialization()),
+            other => anyhow::bail!("unsupported server URL scheme `{other}`"),
+        }
+    }
+
+    /// What the relay applies from this config as it starts: the file grant
+    /// (with whether every root in it is usable) and the browser terminal limit.
+    pub fn relay_limits(&self, home: Option<&Path>) -> RelayLimits {
+        let (file_roots, file_roots_source) = self.effective_file_roots(home);
+        RelayLimits {
+            file_roots,
+            file_roots_source,
+            max_terminals: self.effective_max_terminals(),
+        }
+    }
+
     /// The roots file ops are confined to, and where they come from. A Full
     /// node's commands can already do anything as this user, so the home
     /// directory adds no authority; the deny-list keeps wsmp's own state out.
-    pub fn effective_file_roots(&self, home: Option<&Path>) -> (Vec<PathBuf>, FileRootsSource) {
+    fn effective_file_roots(&self, home: Option<&Path>) -> (Vec<PathBuf>, FileRootsSource) {
         if self.disable_file_tools {
             return (Vec::new(), FileRootsSource::Disabled);
         }
@@ -255,38 +247,76 @@ impl Config {
 
     /// `wsmp config show`: the config as written, plus the values the relay
     /// derives from it (the file roots and their source, the terminal limit,
-    /// the remote update setting, all shown even at their defaults).
-    pub fn shown(&self, home: Option<&Path>) -> Result<serde_json::Value> {
+    /// the remote update setting, all shown even at their defaults; on
+    /// Windows the shells a browser can pick), the origin the hello signs,
+    /// and where this shell looks for the config and the state. Each warning
+    /// goes to `warn` when it is found.
+    pub fn shown(
+        &self,
+        home: impl FnOnce() -> Option<PathBuf>,
+        mut warn: impl FnMut(String) -> Result<()>,
+    ) -> Result<serde_json::Value> {
+        if let Some(warning) = self.retired_command_policy_warning {
+            warn(format!("warning: {warning}"))?;
+        }
         let mut shown = serde_json::to_value(self)?;
-        let (roots, source) = self.effective_file_roots(home);
+        let (roots, source) = self.effective_file_roots(home().as_deref());
         shown["fileRoots"] = serde_json::to_value(&roots)?;
         shown["fileRootsSource"] = serde_json::to_value(source)?;
         shown["maxTerminals"] = self.effective_max_terminals().into();
         shown["remoteUpdates"] = self.remote_updates.as_str().into();
+        if cfg!(windows) {
+            // What a browser can pick now, the default first.
+            shown["terminalShells"] = crate::node::shells::discover(self.terminal_shell.as_deref())
+                .into_iter()
+                .map(|shell| shell.id)
+                .collect::<Vec<_>>()
+                .into();
+        }
+        // The origin the relay hello signs (pinned, else the server URL's),
+        // once a server URL or a public origin is set.
+        if self.has_server_url() || self.public_origin.is_some() {
+            shown["helloOrigin"] = match self.hello_origin() {
+                Ok(origin) => origin.into(),
+                Err(error) => {
+                    warn(format!("warning: {error:#}"))?;
+                    serde_json::Value::Null
+                }
+            };
+        }
+        // Where this shell looks; a service resolving a different state
+        // directory reads a different device credential.
+        shown["configFile"] = crate::paths::config_file()?.display().to_string().into();
+        shown["stateDir"] = crate::paths::state_dir()?.display().to_string().into();
+        // An out-of-range value is shown as written, but flagged: the
+        // relay refuses to start with it, so no limit is in effect.
+        if let Err(error) = self.validate_max_terminals() {
+            shown["maxTerminalsInvalid"] = true.into();
+            warn(format!(
+                "warning: {error}; the relay will not start until it is fixed (`wsmp config set-max-terminals <n>`)"
+            ))?;
+        }
         Ok(shown)
     }
+}
 
-    /// The node's slug, checked. With none set, one is generated and saved:
-    /// under the config lock, after re-reading the file, so a simultaneous
-    /// login or config command keeps the slug it wrote. Either way this
-    /// config is then the file as saved.
-    pub fn ensure_cli_slug(&mut self) -> Result<String> {
-        if let Some(slug) = &self.cli_slug {
-            validate_slug(slug)?;
-            return Ok(slug.clone());
-        }
-        let _config_lock = ConfigLock::exclusive()?;
-        let mut current = Self::load_required()?;
-        if let Some(slug) = current.cli_slug.clone() {
-            validate_slug(&slug)?;
-            *self = current;
-            return Ok(slug);
-        }
-        let slug = crate::slug::generated_slug("cli");
-        current.apply(Setting::CliSlug(slug.clone()));
-        current.save()?;
-        *self = current;
-        Ok(slug)
+/// What the relay applies from a config as it starts ([`Config::relay_limits`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayLimits {
+    /// The roots file ops are confined to.
+    pub file_roots: Vec<PathBuf>,
+    /// Where those roots come from.
+    pub file_roots_source: FileRootsSource,
+    /// Browser terminals open at once: `maxTerminals`, or
+    /// [`DEFAULT_MAX_TERMINALS`] when unset.
+    pub max_terminals: u32,
+}
+
+impl RelayLimits {
+    /// Whether every root is usable now (never an unrestricted fallback). It
+    /// looks at the filesystem, so the relay asks at the point it decides.
+    pub fn file_roots_usable(&self) -> bool {
+        file_roots_usable(&self.file_roots)
     }
 }
 
@@ -445,13 +475,13 @@ impl Default for Config {
 impl Config {
     /// The browser terminal limit this machine applies: `maxTerminals`, or
     /// [`DEFAULT_MAX_TERMINALS`] when unset.
-    pub fn effective_max_terminals(&self) -> u32 {
+    fn effective_max_terminals(&self) -> u32 {
         self.max_terminals.unwrap_or(DEFAULT_MAX_TERMINALS)
     }
 
     /// `maxTerminals` is unset or within [`MAX_TERMINALS_RANGE`]; the relay
     /// refuses to start otherwise.
-    pub fn validate_max_terminals(&self) -> Result<()> {
+    fn validate_max_terminals(&self) -> Result<()> {
         if let Some(count) = self.max_terminals
             && !MAX_TERMINALS_RANGE.contains(&count)
         {

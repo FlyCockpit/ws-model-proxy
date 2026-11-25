@@ -36,8 +36,9 @@ use crate::node::auth::{
     EnrollError, EnrollOutcome, EnrollRequest, enroll, fetch_well_known, is_enrollment_code,
     refusal_message,
 };
-use crate::node::config::{Config, ConfigLock, Setting, is_loopback_host, server_url_http_warning};
+use crate::node::config::{Config, ConfigLock, Setting};
 use crate::node::hostname::hostname_slug;
+use crate::node::origin::{is_loopback_host, server_url_http_warning};
 use crate::node::state::{NodeCredential, save_node_credential};
 use crate::slug::validate_slug;
 use crate::wire::protocol::frames::TrustValue;
@@ -125,7 +126,7 @@ pub fn run(args: &Args) -> Result<()> {
         output::diagnostic(warning)?;
     }
     let known = fetch_well_known(&server_url)?;
-    let public_origin = crate::node::config::normalize_public_origin(&known.origin)
+    let public_origin = crate::node::origin::normalize_public_origin(&known.origin)
         .context("the server announces an invalid public origin")?;
     let url_origin = url::Url::parse(&server_url)?.origin().ascii_serialization();
     let saved = Config::load()?;
@@ -238,7 +239,7 @@ pub fn run(args: &Args) -> Result<()> {
     let human_terminal_changed;
     let resolution;
     {
-        let _lock = ConfigLock::exclusive()?;
+        let lock = ConfigLock::exclusive()?;
         let mut config = Config::load()?;
         // Shadowed on purpose: the outer choice stays as asked, so the "not
         // asked" warning below stays quiet after a skip line.
@@ -274,16 +275,16 @@ pub fn run(args: &Args) -> Result<()> {
             crate::node::state::remove_node_credential()
                 .context("removing the earlier server's node credential")?;
         }
-        config.record_enrollment(
-            &server_url,
-            (public_origin != url_origin).then(|| public_origin.clone()),
-            &enrolled.slug,
-            decided.saved_trust(trust),
-        );
+        config.apply(Setting::Enrollment {
+            server_url: server_url.clone(),
+            public_origin: (public_origin != url_origin).then(|| public_origin.clone()),
+            slug: enrolled.slug.clone(),
+            trust: decided.saved_trust(trust),
+        });
         if let Some(allow) = human_terminal {
             config.apply(Setting::AllowHumanTerminal(allow));
         }
-        config.save()?;
+        lock.save(&config)?;
         // The marker goes only after the config is saved: until then (or
         // when removing it fails) the node stays Relay only.
         if decided == TrustResolution::Clearing {
@@ -295,7 +296,7 @@ pub fn run(args: &Args) -> Result<()> {
                     ))?;
                     let failed = TrustResolution::StaysRelay(StaysRelay::ClearFailed);
                     config.apply(Setting::Trust(failed.saved_trust(trust)));
-                    config.save()?;
+                    lock.save(&config)?;
                     failed
                 }
             };
