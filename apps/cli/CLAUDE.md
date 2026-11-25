@@ -27,7 +27,7 @@ The Rust command-line relay client for WS Model Proxy. The `wsmp` CLI enrolls a 
 | `src/paths.rs` | Cross-platform config/data directories via `dirs`. |
 | `src/logging.rs` | Tracing setup. Logs go to stderr. |
 | `src/exit.rs` | Stable process exit codes. |
-| `tests/cli.rs` | Black-box tests that run the built binary. |
+| `tests/cli/` | Black-box tests that run the built binary (one test binary, a module per command area). |
 | `xtask/` | CLI workspace automation: `sync-docs`. |
 | `wsmp-windows/` | The audited Windows FFI (control-pipe DACL and peer checks, the relay job, the terminal pseudoconsole, the runtime host's job). The only place `unsafe` is allowed. |
 | `docs/` | CLI-specific error handling and release notes. |
@@ -83,7 +83,7 @@ cargo xtask sync-docs --check
 2. Register the module in `src/commands/mod.rs`.
 3. Add a variant to `Command` in `src/cli.rs`.
 4. Add a match arm in `src/main.rs`.
-5. Add focused black-box tests in `tests/cli.rs` when the command affects user-visible behavior.
+5. Add focused black-box tests in the matching `tests/cli/` module when the command affects user-visible behavior.
 
 ## Releasing
 
