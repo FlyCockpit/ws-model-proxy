@@ -400,8 +400,16 @@ impl Record {
 
     /// `job` is about to run (its intent is persisted next): it is pending, and a launch
     /// starts afresh (`Starting`, health counters reset) while a stop is `Stopping`.
-    /// Read-only checks leave the phase alone.
+    /// Read-only checks leave the phase alone. A prepare or start makes `job` the run this
+    /// record holds ([`Record::same_instance`] admitted it).
     fn begin_step(&mut self, job: &Job) {
+        if matches!(job.action, JobPhase::Prepare | JobPhase::Start) {
+            if self.invocations.is_empty() {
+                // A new run: nothing of an earlier one ran outside the units any more.
+                self.outside_units = false;
+            }
+            self.job = job.clone();
+        }
         self.pending = Some(job.clone());
         match job.action {
             JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin => {
@@ -416,8 +424,14 @@ impl Record {
 
     /// An operator step is pending before its person runs it: `Stopping` for a stop,
     /// else `Starting`. The counters stay: the step runs through [`Record::begin_step`]
-    /// once its command succeeded, and [`Record::restore`] undoes this.
+    /// once its command succeeded, and [`Record::restore`] undoes this. A prepare or start
+    /// while nothing of the run is launched makes `job` the run this record holds.
     fn begin_operator_step(&mut self, job: &Job) {
+        if matches!(job.action, JobPhase::Prepare | JobPhase::Start) && self.invocations.is_empty()
+        {
+            self.job = job.clone();
+            self.outside_units = false;
+        }
         self.pending = Some(job.clone());
         self.set_phase(if job.action == JobPhase::Stop {
             InstancePhase::Stopping
@@ -496,6 +510,275 @@ impl Record {
                 )
             })
     }
+
+    /// Verified stopped, with nothing unresolved, at least [`STOPPED_RETENTION_SECS`]
+    /// before `now`: nothing will ask about it any more.
+    fn expired(&self, now: u64) -> bool {
+        self.terminal()
+            && self
+                .stopped_at
+                .is_some_and(|at| now.saturating_sub(at) >= STOPPED_RETENTION_SECS)
+    }
+
+    /// A new launch may change the version (a restart), but only while nothing
+    /// of the old one runs.
+    fn same_instance(&self, job: &Job) -> Result<()> {
+        anyhow::ensure!(
+            self.job.identity_matches(job)
+                || (matches!(job.action, JobPhase::Prepare | JobPhase::Start)
+                    && self.invocations.is_empty()),
+            "instance identity changed"
+        );
+        Ok(())
+    }
+
+    /// What this exact step finished with, when it already did; another intent under
+    /// the same step id is refused.
+    fn finished(&self, job: &Job) -> Result<Option<&Completed>> {
+        let done = self.completed.get(&job.step_id);
+        if let Some(done) = done {
+            anyhow::ensure!(done.hash == job.intent_hash, "step intent changed");
+        }
+        Ok(done)
+    }
+
+    /// The recorded outcome of this exact step, when it already finished.
+    fn done(&self, job: &Job) -> Option<Outcome> {
+        self.completed
+            .get(&job.step_id)
+            .filter(|done| done.hash == job.intent_hash)
+            .map(|done| done.outcome.clone())
+    }
+
+    /// Whether `job` is the step still pending here (a re-delivery of it). Refused while
+    /// another step is unresolved, unless `job` is a stop or the pending step a read-only
+    /// check (one that failed part way had no effect: a later step replaces it).
+    fn resumes(&self, job: &Job) -> Result<bool> {
+        let Some(pending) = &self.pending else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            (pending.step_id == job.step_id && pending.intent_hash == job.intent_hash)
+                || job.action == JobPhase::Stop
+                || matches!(
+                    pending.action,
+                    JobPhase::Readiness | JobPhase::Health | JobPhase::Status
+                ),
+            "another step is unresolved"
+        );
+        Ok(pending.step_id == job.step_id)
+    }
+
+    /// A start or after-join is refused once its unit is launched.
+    fn unlaunched(&self, job: &Job) -> Result<()> {
+        if matches!(job.action, JobPhase::Start | JobPhase::AfterJoin) {
+            anyhow::ensure!(
+                !self.invocations.contains_key(&phase_unit(job)),
+                "instance is already launched"
+            );
+        }
+        Ok(())
+    }
+
+    /// What `execute` would refuse for `job` against this record, short
+    /// of running anything: another instance identity, the same step with
+    /// another intent, a start that already launched, or another step still
+    /// unresolved. An operator step is checked before its person can run it.
+    fn admissible(&self, job: &Job) -> Result<()> {
+        self.same_instance(job)?;
+        self.finished(job)?;
+        self.resumes(job)?;
+        self.unlaunched(job)
+    }
+
+    /// Whether the step pending here is `step_id`.
+    fn pends(&self, step_id: &str) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.step_id == step_id)
+    }
+
+    /// Nothing was ever launched or finished under this record.
+    fn untouched(&self) -> bool {
+        self.invocations.is_empty() && self.completed.is_empty()
+    }
+
+    /// What [`Record::restore`] puts back after an operator step that never ran.
+    fn operator_mark(&self) -> OperatorMark {
+        OperatorMark {
+            created: false,
+            phase: self.phase,
+            stopped_at: self.stopped_at,
+            pending: self.pending.clone(),
+            job: self.job.clone(),
+            outside_units: self.outside_units,
+        }
+    }
+
+    /// `unit` was launched as `invocation` (a systemd invocation, or `external`).
+    fn launched(&mut self, unit: String, invocation: String) {
+        self.invocations.insert(unit, invocation);
+    }
+
+    /// Whether `unit` runs in a unit of the node's own (not `external` or
+    /// `self-detached`).
+    fn watches(&self, unit: &str) -> bool {
+        self.invocations
+            .get(unit)
+            .is_some_and(|invocation| !outside(invocation))
+    }
+
+    /// `job` finished with `outcome`: it is no longer pending and is what the record
+    /// observed last. At [`COMPLETED_LIMIT`] the oldest health or status result (else the
+    /// first) makes room.
+    fn complete(&mut self, job: &Job, outcome: Outcome) {
+        if self.completed.len() >= COMPLETED_LIMIT {
+            let transient = self
+                .completed
+                .iter()
+                .find(|(_, done)| matches!(done.action, JobPhase::Health | JobPhase::Status))
+                .map(|(id, _)| id.clone())
+                .or_else(|| self.completed.keys().next().cloned());
+            if let Some(id) = transient {
+                self.completed.remove(&id);
+            }
+        }
+        self.completed.insert(
+            job.step_id.clone(),
+            Completed {
+                hash: job.intent_hash.clone(),
+                outcome,
+                action: job.action,
+            },
+        );
+        self.outside_units |= self
+            .invocations
+            .values()
+            .any(|invocation| outside(invocation));
+        self.pending = None;
+        self.observed_step = job.step_id.clone();
+        self.observed_hash = job.intent_hash.clone();
+    }
+
+    /// What a stop proof covers beyond the step's own job: every unit this run was
+    /// launched in, and its launch (another version may name other ports, commands and
+    /// slice), added to `units` and `jobs`. `true` when a step of the run ran outside the
+    /// node's units.
+    fn widen_stop_proof<'a>(
+        &'a self,
+        units: &mut std::collections::BTreeSet<String>,
+        jobs: &mut Vec<&'a Job>,
+    ) -> bool {
+        units.extend(owned_units(&self.job));
+        units.insert(rank_slice(&self.job));
+        units.extend(self.invocations.keys().cloned());
+        jobs.push(&self.job);
+        self.outside_units || self.invocations.values().any(|i| outside(i))
+    }
+
+    /// Whether the serving process is up: a status proof for a service the node
+    /// did not start itself, else its own unit.
+    fn serving_confirmed(
+        &self,
+        owner: &str,
+        runtime: &impl Runtime,
+        deadline: Deadline,
+    ) -> Result<bool> {
+        let serving = self.invocations.get(&phase_unit(&self.job));
+        if matches!(
+            serving.map(String::as_str),
+            Some("external" | "self-detached")
+        ) {
+            let status = self
+                .job
+                .status_cmd()
+                .context("external service requires status proof")?;
+            return runtime.status_until(&self.job, status, deadline.cap(Duration::from_secs(30)));
+        }
+        let mut start = self.job.clone();
+        start.action = JobPhase::Start;
+        Ok(runtime.launch_completed(&start, owner, deadline)?.is_some())
+    }
+
+    /// This rank as recorded (nothing checked against the machine).
+    fn view(&self) -> RankView {
+        RankView {
+            job: self.job.clone(),
+            phase: self.phase,
+            pending: self.pending.as_ref().map(|pending| pending.action),
+            units: self
+                .invocations
+                .iter()
+                .filter(|(_, invocation)| !outside(invocation))
+                .map(|(unit, _)| unit.clone())
+                .collect(),
+        }
+    }
+
+    /// What the inventory reports for this rank, verified against the machine: `ready`
+    /// only while every owned unit is the one launched. `stop_proven` is the stop proof
+    /// ([`Executor::stop_unproven`]) for the rank's launch.
+    fn observation(
+        &self,
+        owner: &str,
+        runtime: &impl Runtime,
+        deadline: Deadline,
+        stop_proven: impl FnOnce(&Job) -> bool,
+    ) -> (Job, InstanceRecord) {
+        let job = &self.job;
+        let owned = !self.invocations.is_empty()
+            && self.invocations.iter().all(|(unit, identity)| {
+                if identity == "external" || identity == "self-detached" {
+                    return job.status_cmd().is_some_and(|status| {
+                        runtime
+                            .status_until(job, status, deadline.cap(Duration::from_secs(5)))
+                            .is_ok_and(|alive| alive)
+                    });
+                }
+                runtime
+                    .identity(unit, owner, deadline)
+                    .is_ok_and(|seen| seen.as_ref() == Some(identity))
+            })
+            && (job.management() != Management::Process
+                || self
+                    .serving_confirmed(owner, runtime, deadline)
+                    .is_ok_and(|alive| alive));
+        // `stopped` releases a claim on the server: reported only while the stop is
+        // proven afresh, never from empty units alone.
+        let absent = self.phase == InstancePhase::Stopped
+            && owned_units(job).iter().all(|unit| {
+                runtime
+                    .identity(unit, owner, deadline)
+                    .is_ok_and(|seen| seen.is_none())
+            })
+            && stop_proven(job);
+        let phase = if absent {
+            InstancePhase::Stopped
+        } else if self.pending.is_some() || !owned {
+            InstancePhase::Unknown
+        } else {
+            self.phase
+        };
+        (
+            job.clone(),
+            InstanceRecord {
+                instance_id: job.instance_id.clone(),
+                launch_version_id: job.version_id.clone(),
+                launch_hash: job.launch_hash.clone(),
+                rank: job.rank,
+                intent_hash: self.observed_hash.clone(),
+                step_id: Some(self.observed_step.clone()),
+                phase,
+                unit_name: job.unit_name.clone(),
+                port: job.port,
+                handle: job.handle.clone(),
+                models: job.models(),
+                engine_facts: None,
+                // The runner sets it (`observe_all_idle`).
+                rank_idle: None,
+            },
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -523,47 +806,6 @@ fn failure_code(job: &Job, error: &anyhow::Error) -> JobError {
             JobPhase::Health | JobPhase::Status => JobError::HealthFailed,
             JobPhase::Stop => JobError::CommandFailed,
         })
-}
-
-/// A new launch may change the version (a restart), but only while nothing
-/// of the old one runs.
-fn same_instance(record: &Record, job: &Job) -> Result<()> {
-    anyhow::ensure!(
-        record.job.identity_matches(job)
-            || (matches!(job.action, JobPhase::Prepare | JobPhase::Start)
-                && record.invocations.is_empty()),
-        "instance identity changed"
-    );
-    Ok(())
-}
-
-/// What `execute` would refuse for `job` against an existing record, short
-/// of running anything: another instance identity, the same step with
-/// another intent, a start that already launched, or another step still
-/// unresolved. An operator step is checked before its person can run it.
-fn admissible(record: &Record, job: &Job) -> Result<()> {
-    same_instance(record, job)?;
-    if let Some(done) = record.completed.get(&job.step_id) {
-        anyhow::ensure!(done.hash == job.intent_hash, "step intent changed");
-    }
-    if let Some(pending) = &record.pending {
-        anyhow::ensure!(
-            (pending.step_id == job.step_id && pending.intent_hash == job.intent_hash)
-                || job.action == JobPhase::Stop
-                || matches!(
-                    pending.action,
-                    JobPhase::Readiness | JobPhase::Health | JobPhase::Status
-                ),
-            "another step is unresolved"
-        );
-    }
-    if matches!(job.action, JobPhase::Start | JobPhase::AfterJoin) {
-        anyhow::ensure!(
-            !record.invocations.contains_key(&phase_unit(job)),
-            "instance is already launched"
-        );
-    }
-    Ok(())
 }
 
 /// What a record looked like before an operator step was recorded pending.
@@ -715,9 +957,7 @@ impl Executor {
         self.state
             .records
             .get(&job.key())
-            .and_then(|record| record.completed.get(&job.step_id))
-            .filter(|done| done.hash == job.intent_hash)
-            .map(|done| done.outcome.clone())
+            .and_then(|record| record.done(job))
     }
 
     /// Durable intent before an operator terminal opens: the step is
@@ -731,25 +971,12 @@ impl Executor {
             Some(record) => {
                 // Refused exactly as `execute` would refuse it, before a
                 // person can run anything.
-                if let Err(error) = admissible(record, job) {
+                if let Err(error) = record.admissible(job) {
                     let code = failure_code(job, &error);
                     tracing::warn!(step_id = job.step_id, error = ?code, "refused an operator step");
                     return Err(code);
                 }
-                let mark = OperatorMark {
-                    created: false,
-                    phase: record.phase,
-                    stopped_at: record.stopped_at,
-                    pending: record.pending.clone(),
-                    job: record.job.clone(),
-                    outside_units: record.outside_units,
-                };
-                if matches!(job.action, JobPhase::Prepare | JobPhase::Start)
-                    && record.invocations.is_empty()
-                {
-                    record.job = job.clone();
-                    record.outside_units = false;
-                }
+                let mark = record.operator_mark();
                 record.begin_operator_step(job);
                 mark
             }
@@ -790,16 +1017,12 @@ impl Executor {
         let Some(record) = self.state.records.get_mut(&key) else {
             return;
         };
-        if record
-            .pending
-            .as_ref()
-            .is_none_or(|pending| pending.step_id != job.step_id)
-        {
+        if !record.pends(&job.step_id) {
             return;
         }
         if ran {
             record.abandon_ran(mark.pending);
-        } else if mark.created && record.invocations.is_empty() && record.completed.is_empty() {
+        } else if mark.created && record.untouched() {
             self.state.records.remove(&key);
         } else {
             record.restore(mark);
@@ -813,12 +1036,11 @@ impl Executor {
     pub fn expired(&self) -> bool {
         let now = (self.clock)();
         !self.state.records.is_empty()
-            && self.state.records.values().all(|record| {
-                record.terminal()
-                    && record
-                        .stopped_at
-                        .is_some_and(|at| now.saturating_sub(at) >= STOPPED_RETENTION_SECS)
-            })
+            && self
+                .state
+                .records
+                .values()
+                .all(|record| record.expired(now))
     }
 
     /// Execute one step. Never panics; every failure is an outcome.
@@ -864,9 +1086,8 @@ impl Executor {
         }
         let mut admitted = false;
         if let Some(record) = self.state.records.get(&key) {
-            same_instance(record, job)?;
-            if let Some(done) = record.completed.get(&job.step_id) {
-                anyhow::ensure!(done.hash == job.intent_hash, "step intent changed");
+            record.same_instance(job)?;
+            if let Some(done) = record.finished(job)? {
                 if done.action == JobPhase::Stop {
                     anyhow::ensure!(
                         record.phase == InstancePhase::Stopped,
@@ -899,36 +1120,18 @@ impl Executor {
                 }
                 return Ok(done.outcome.clone());
             }
-            if let Some(pending) = &record.pending {
-                // A read-only check that failed part way had no effect: a
-                // later step replaces it.
-                anyhow::ensure!(
-                    (pending.step_id == job.step_id && pending.intent_hash == job.intent_hash)
-                        || job.action == JobPhase::Stop
-                        || matches!(
-                            pending.action,
-                            JobPhase::Readiness | JobPhase::Health | JobPhase::Status
-                        ),
-                    "another step is unresolved"
-                );
-                // A launch may have happened before the node died: never
-                // replay it, observe it.
-                if pending.step_id == job.step_id
-                    && matches!(
-                        job.action,
-                        JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin
-                    )
-                    && !job.command.trim().is_empty()
-                {
-                    return self.adopt_launch(job, runtime, deadline);
-                }
+            // A launch may have happened before the node died: never
+            // replay it, observe it.
+            if record.resumes(job)?
+                && matches!(
+                    job.action,
+                    JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin
+                )
+                && !job.command.trim().is_empty()
+            {
+                return self.adopt_launch(job, runtime, deadline);
             }
-            if matches!(job.action, JobPhase::Start | JobPhase::AfterJoin) {
-                anyhow::ensure!(
-                    !record.invocations.contains_key(&phase_unit(job)),
-                    "instance is already launched"
-                );
-            }
+            record.unlaunched(job)?;
         } else {
             if job.action == JobPhase::Stop {
                 // No record (lost, or the run never reached this node): the stop is still
@@ -950,13 +1153,6 @@ impl Executor {
             self.state.records.insert(key.clone(), Record::new(job));
         }
         let record = self.state.records.get_mut(&key).context("record")?;
-        if matches!(job.action, JobPhase::Prepare | JobPhase::Start) {
-            if record.invocations.is_empty() {
-                // A new run: nothing of an earlier one ran outside the units any more.
-                record.outside_units = false;
-            }
-            record.job = job.clone();
-        }
         record.begin_step(job);
         // Durable intent BEFORE any external effect.
         if let Err(error) = self.persist() {
@@ -1016,8 +1212,7 @@ impl Executor {
                         .records
                         .get_mut(&key)
                         .context("record")?
-                        .invocations
-                        .insert(unit, invocation);
+                        .launched(unit, invocation);
                     Outcome::ok(false)
                 }
             }
@@ -1028,11 +1223,8 @@ impl Executor {
                 // it, so the start fails and asks for `management: "service"`. (A person's
                 // run in an operator terminal is `external`: its status command decides.)
                 let record = self.state.records.get(&key).context("record")?;
-                let watched = job.management() == Management::Process
-                    && record
-                        .invocations
-                        .get(&phase_unit(job))
-                        .is_some_and(|invocation| !outside(invocation));
+                let watched =
+                    job.management() == Management::Process && record.watches(&phase_unit(job));
                 let detached = || {
                     Err::<Outcome, _>(fail(JobError::ProcessDetached)).context(
                         "the start handed its server off out of wsmp's units; use management \"service\" with stop and status commands",
@@ -1043,7 +1235,7 @@ impl Executor {
                     Ok(runtime.exited_cleanly(&phase_unit(job), deadline)?
                         && probe_once(job, runtime, deadline.cap(Duration::from_secs(10))).is_ok())
                 };
-                if !serving_confirmed(record, &self.state.owner_id, runtime, deadline)? {
+                if !record.serving_confirmed(&self.state.owner_id, runtime, deadline)? {
                     if watched && handed_off()? {
                         return detached();
                     }
@@ -1058,12 +1250,12 @@ impl Executor {
                         .map_err(|_| fail(JobError::ReadinessFailed))?;
                 }
                 if watched
-                    && !serving_confirmed(
-                        self.state.records.get(&key).context("record")?,
-                        &self.state.owner_id,
-                        runtime,
-                        deadline,
-                    )?
+                    && !self
+                        .state
+                        .records
+                        .get(&key)
+                        .context("record")?
+                        .serving_confirmed(&self.state.owner_id, runtime, deadline)?
                 {
                     // A server that answered and then crashed is an ordinary failed
                     // readiness (restarted as usual), not a hand-off.
@@ -1081,12 +1273,13 @@ impl Executor {
             }
             JobPhase::Status => anyhow::bail!("a status probe is answered by the stop proof"),
             JobPhase::Health => {
-                let miss = if serving_confirmed(
-                    self.state.records.get(&key).context("record")?,
-                    &self.state.owner_id,
-                    runtime,
-                    deadline,
-                )? {
+                let miss = if self
+                    .state
+                    .records
+                    .get(&key)
+                    .context("record")?
+                    .serving_confirmed(&self.state.owner_id, runtime, deadline)?
+                {
                     // Keep time to answer: a probe that runs out of it is a `timeout`,
                     // not a step past its deadline.
                     let reserve = deadline
@@ -1164,12 +1357,8 @@ impl Executor {
         let mut units: std::collections::BTreeSet<String> = owned_units(job).into_iter().collect();
         units.insert(rank_slice(job));
         let mut jobs = vec![job];
-        if let Some(record) = record {
-            units.extend(owned_units(&record.job));
-            units.insert(rank_slice(&record.job));
-            units.extend(record.invocations.keys().cloned());
-            jobs.push(&record.job);
-        }
+        let ran_outside =
+            record.is_some_and(|record| record.widen_stop_proof(&mut units, &mut jobs));
         let mut ports: Vec<(&str, u16)> = Vec::new();
         let mut statuses: Vec<(&Job, JobCommand<'_>)> = Vec::new();
         // A status command that can never say stopped (`true`, `exit 0`, ...: the rule a new
@@ -1202,9 +1391,7 @@ impl Executor {
             || jobs
                 .iter()
                 .any(|owner| owner.management() == Management::Service)
-            || record.is_some_and(|record| {
-                record.outside_units || record.invocations.values().any(|i| outside(i))
-            });
+            || ran_outside;
         // Only constant status commands: the empty units and slice and the free ports decide.
         let detached = detached && !(constant_status && statuses.is_empty());
         if detached && statuses.is_empty() {
@@ -1407,8 +1594,7 @@ impl Executor {
             .records
             .get_mut(&job.key())
             .context("record")?
-            .invocations
-            .insert(unit, identity);
+            .launched(unit, identity);
         self.complete(job, Outcome::ok(false))
     }
 
@@ -1432,33 +1618,11 @@ impl Executor {
     }
 
     fn complete(&mut self, job: &Job, outcome: Outcome) -> Result<Outcome> {
-        let record = self.state.records.get_mut(&job.key()).context("record")?;
-        if record.completed.len() >= COMPLETED_LIMIT {
-            let transient = record
-                .completed
-                .iter()
-                .find(|(_, done)| matches!(done.action, JobPhase::Health | JobPhase::Status))
-                .map(|(id, _)| id.clone())
-                .or_else(|| record.completed.keys().next().cloned());
-            if let Some(id) = transient {
-                record.completed.remove(&id);
-            }
-        }
-        record.completed.insert(
-            job.step_id.clone(),
-            Completed {
-                hash: job.intent_hash.clone(),
-                outcome: outcome.clone(),
-                action: job.action,
-            },
-        );
-        record.outside_units |= record
-            .invocations
-            .values()
-            .any(|invocation| outside(invocation));
-        record.pending = None;
-        record.observed_step = job.step_id.clone();
-        record.observed_hash = job.intent_hash.clone();
+        self.state
+            .records
+            .get_mut(&job.key())
+            .context("record")?
+            .complete(job, outcome.clone());
         self.persist()?;
         Ok(outcome)
     }
@@ -1474,58 +1638,9 @@ impl Executor {
             .records
             .values()
             .map(|record| {
-                let job = &record.job;
-                let owned = !record.invocations.is_empty()
-                    && record.invocations.iter().all(|(unit, identity)| {
-                        if identity == "external" || identity == "self-detached" {
-                            return job.status_cmd().is_some_and(|status| {
-                                runtime
-                                    .status_until(job, status, deadline.cap(Duration::from_secs(5)))
-                                    .is_ok_and(|alive| alive)
-                            });
-                        }
-                        runtime
-                            .identity(unit, &self.state.owner_id, deadline)
-                            .is_ok_and(|seen| seen.as_ref() == Some(identity))
-                    })
-                    && (job.management() != Management::Process
-                        || serving_confirmed(record, &self.state.owner_id, runtime, deadline)
-                            .is_ok_and(|alive| alive));
-                // `stopped` releases a claim on the server: reported only while the stop is
-                // proven afresh, never from empty units alone.
-                let absent = record.phase == InstancePhase::Stopped
-                    && owned_units(job).iter().all(|unit| {
-                        runtime
-                            .identity(unit, &self.state.owner_id, deadline)
-                            .is_ok_and(|seen| seen.is_none())
-                    })
-                    && matches!(self.stop_unproven(job, runtime, deadline, false), Ok(None));
-                let phase = if absent {
-                    InstancePhase::Stopped
-                } else if record.pending.is_some() || !owned {
-                    InstancePhase::Unknown
-                } else {
-                    record.phase
-                };
-                (
-                    job.clone(),
-                    InstanceRecord {
-                        instance_id: job.instance_id.clone(),
-                        launch_version_id: job.version_id.clone(),
-                        launch_hash: job.launch_hash.clone(),
-                        rank: job.rank,
-                        intent_hash: record.observed_hash.clone(),
-                        step_id: Some(record.observed_step.clone()),
-                        phase,
-                        unit_name: job.unit_name.clone(),
-                        port: job.port,
-                        handle: job.handle.clone(),
-                        models: job.models(),
-                        engine_facts: None,
-                        // The runner sets it (`observe_all_idle`).
-                        rank_idle: None,
-                    },
-                )
+                record.observation(&self.state.owner_id, runtime, deadline, |job| {
+                    matches!(self.stop_unproven(job, runtime, deadline, false), Ok(None))
+                })
             })
             .collect()
     }
@@ -1547,21 +1662,7 @@ pub struct RankView {
 impl Executor {
     /// Every rank this file records, as recorded.
     pub fn ranks(&self) -> Vec<RankView> {
-        self.state
-            .records
-            .values()
-            .map(|record| RankView {
-                job: record.job.clone(),
-                phase: record.phase,
-                pending: record.pending.as_ref().map(|pending| pending.action),
-                units: record
-                    .invocations
-                    .iter()
-                    .filter(|(_, invocation)| !outside(invocation))
-                    .map(|(unit, _)| unit.clone())
-                    .collect(),
-            })
-            .collect()
+        self.state.records.values().map(Record::view).collect()
     }
 
     /// The stop proof as the inventory asks it (no status command runs):
@@ -1743,30 +1844,6 @@ fn probe_once(
     } else {
         Err(HealthMiss::StatusNotRunning)
     }
-}
-
-/// Whether the serving process is up: a status proof for a service the node
-/// did not start itself, else its own unit.
-fn serving_confirmed(
-    record: &Record,
-    owner: &str,
-    runtime: &impl Runtime,
-    deadline: Deadline,
-) -> Result<bool> {
-    let serving = record.invocations.get(&phase_unit(&record.job));
-    if matches!(
-        serving.map(String::as_str),
-        Some("external" | "self-detached")
-    ) {
-        let status = record
-            .job
-            .status_cmd()
-            .context("external service requires status proof")?;
-        return runtime.status_until(&record.job, status, deadline.cap(Duration::from_secs(30)));
-    }
-    let mut start = record.job.clone();
-    start.action = JobPhase::Start;
-    Ok(runtime.launch_completed(&start, owner, deadline)?.is_some())
 }
 
 pub fn phase_unit(job: &Job) -> String {
