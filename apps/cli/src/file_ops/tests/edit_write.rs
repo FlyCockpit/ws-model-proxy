@@ -6,8 +6,8 @@ use std::sync::{Arc, Barrier};
 
 use serde_json::{Value, json};
 
-use super::super::edit::EditResult;
-use super::super::policy::Policy;
+use super::super::fs::policy::Policy;
+use super::super::ops::edit::EditResult;
 use super::super::{ErrorCode, FileResult, Step};
 use super::{Fx, args, code, real_uid};
 
@@ -901,7 +901,7 @@ fn per_path_lock_serializes_concurrent_edits() {
 
 // ---- file_write -----------------------------------------------------------
 
-fn write(fx: &Fx, value: Value) -> FileResult<super::super::write::WriteResult> {
+fn write(fx: &Fx, value: Value) -> FileResult<super::super::ops::write::WriteResult> {
     fx.ops.write(&args(value), &fx.cancel)
 }
 

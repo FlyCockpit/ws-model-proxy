@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use super::*;
-use crate::file_ops::policy::Deny;
+use crate::file_ops::fs::policy::Deny;
 use crate::file_ops::redact;
 
 // ---- protected paths are compared in the resolver's (physical) namespace ----
@@ -95,7 +95,10 @@ fn an_unreadable_protected_identity_fails_closed() {
 
 // ---- rename is bound to the objects that were checked -----------------------
 
-fn rename(fx: &Fx, value: serde_json::Value) -> FileResult<super::super::mutate::RenameResult> {
+fn rename(
+    fx: &Fx,
+    value: serde_json::Value,
+) -> FileResult<super::super::ops::mutate::RenameResult> {
     fx.ops.rename(&args(value), &fx.cancel)
 }
 
@@ -1294,8 +1297,10 @@ fn a_tail_read_returns_every_requested_line_even_when_they_mask_short() {
     if let Ok(ok) = r {
         // the file's whole tail fits the bound: fine, but then it must be complete
         match ok {
-            crate::file_ops::read::ReadOutcome::Content(c) => assert!(c.text.lines().count() > 12),
-            crate::file_ops::read::ReadOutcome::Unchanged { .. } => panic!("unexpected"),
+            crate::file_ops::ops::read::ReadOutcome::Content(c) => {
+                assert!(c.text.lines().count() > 12)
+            }
+            crate::file_ops::ops::read::ReadOutcome::Unchanged { .. } => panic!("unexpected"),
         }
     }
 }
@@ -1439,21 +1444,21 @@ fn staging_names_are_refused_under_every_folded_spelling() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod exchange_callers {
     use super::*;
-    use crate::file_ops::exchange::{FaultScope, Primitive};
+    use crate::file_ops::fs::exchange::{FaultScope, Primitive};
     use nix::errno::Errno;
 
     fn inject(errno: Errno) -> FaultScope {
         FaultScope::new(&[(Primitive::Exchange, 1, errno)])
     }
 
-    fn edit(fx: &Fx) -> FileResult<super::super::super::edit::EditResult> {
+    fn edit(fx: &Fx) -> FileResult<super::super::super::ops::edit::EditResult> {
         fx.ops.edit(
             &args(json!({ "path": fx.p("doc.txt"), "edits": [{ "oldText": "original", "newText": "edited" }] })),
             &fx.cancel,
         )
     }
 
-    fn overwrite(fx: &Fx) -> FileResult<super::super::super::mutate::RenameResult> {
+    fn overwrite(fx: &Fx) -> FileResult<super::super::super::ops::mutate::RenameResult> {
         fx.put("src.txt", "mine");
         fx.put("dst.txt", "old");
         let etag = fx.etag("dst.txt");
@@ -1532,7 +1537,7 @@ mod exchange_callers {
 #[cfg(target_os = "linux")]
 #[test]
 fn rename_overwrite_refuses_case_differing_hard_link_alias() {
-    use crate::file_ops::meta::Stat;
+    use crate::file_ops::fs::meta::Stat;
 
     let fx = Fx::new();
     fx.put("a", "keep these bytes\n");
@@ -1573,7 +1578,7 @@ fn rename_overwrite_refuses_case_differing_hard_link_alias() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_case_only_rename_needs_no_overwrite_on_a_case_insensitive_volume() {
-    use crate::file_ops::meta::Stat;
+    use crate::file_ops::fs::meta::Stat;
 
     let fx = Fx::new();
     fx.put("Probe", "probe");
@@ -1626,8 +1631,8 @@ fn a_case_only_rename_needs_no_overwrite_on_a_case_insensitive_volume() {
 #[cfg(target_os = "macos")]
 #[test]
 fn rename_overwrite_case_only_alias_changes_spelling_on_case_insensitive_volume() {
-    use crate::file_ops::exchange::{FaultScope, Primitive};
-    use crate::file_ops::meta::Stat;
+    use crate::file_ops::fs::exchange::{FaultScope, Primitive};
+    use crate::file_ops::fs::meta::Stat;
     use nix::errno::Errno;
 
     let fx = Fx::new();

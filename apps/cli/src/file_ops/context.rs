@@ -12,12 +12,12 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use super::error::{ErrorCode, FileError, FileResult};
-use super::etag::EtagKey;
-use super::policy::Policy;
+use super::fs::etag::EtagKey;
+use super::fs::policy::Policy;
+#[cfg(windows)]
+use super::fs::resolve;
 #[cfg(not(windows))]
 use super::redact;
-#[cfg(windows)]
-use super::resolve;
 use super::{Cancel, Limits, Step, StepHook};
 
 /// The state every tool works with: plain parts, each with its own interface.

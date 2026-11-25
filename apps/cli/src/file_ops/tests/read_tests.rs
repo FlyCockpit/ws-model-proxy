@@ -4,8 +4,8 @@ use std::io::Write;
 
 use serde_json::json;
 
-use super::super::read::{More, ReadOutcome};
-use super::super::text::Eol;
+use super::super::ops::read::{More, ReadOutcome};
+use super::super::ops::text::Eol;
 use super::super::{Cancel, ErrorCode};
 use super::{Fx, args, aws_style_id, code, pem};
 

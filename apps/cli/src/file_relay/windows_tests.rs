@@ -13,7 +13,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::file_ops::policy::{Deny, Protected};
+use crate::file_ops::fs::policy::{Deny, Protected};
 
 const WAIT: Duration = Duration::from_secs(10);
 
