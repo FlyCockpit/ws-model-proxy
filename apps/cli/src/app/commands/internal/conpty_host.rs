@@ -211,7 +211,7 @@ mod tests {
     use crate::process::conpty_link::TEST_ARGS;
 
     /// The helper, when a terminal test started this binary as one (see
-    /// [`command`]). Does nothing in a normal test run.
+    /// [`command`](crate::process::conpty_link::command)). Does nothing in a normal test run.
     #[test]
     fn host_entry() {
         use clap::Parser;

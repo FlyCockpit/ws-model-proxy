@@ -1,0 +1,7 @@
+# Existing architectural debt suppressed by `deslop-please --allow`.
+# Fixing an entry here never fails CI; new issues not listed here fail.
+# Shared::set_idle records two facts the relay loop observed; the decision using them (is_idle) is already on Shared.
+field-leak wsmp::relay::update::agent::Shared::no_commands
+field-leak wsmp::relay::update::agent::Shared::no_instances
+# Checking placeholders needs the node's Store, Launch and NodeFacts; moving it into the wire DTO would make protocol depend on render state.
+field-leak wsmp::wire::protocol::frames::runtime::RuntimeJob::placeholders
