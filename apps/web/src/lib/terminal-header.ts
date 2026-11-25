@@ -89,7 +89,7 @@ export function terminalNoticeKey(tab: {
         ? "gone"
         : `exit:${status.exitCode ?? ""}:${status.exitSignal ?? ""}`
       : status.phase === "rejected"
-        ? `rejected:${status.reason}`
+        ? `rejected:${status.reason}:${status.approvalCode ?? ""}`
         : status.phase === "opening"
           ? `approval:${status.approvalCode ?? ""}`
           : `live:${status.inputDropped ? "dropped" : ""}`;

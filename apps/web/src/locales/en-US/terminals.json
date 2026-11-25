@@ -69,6 +69,7 @@
   "exitedGone": "The terminal is no longer running on the node. It ended, or the node restarted, while this page was away.",
   "inputDropped": "Some input was not delivered because it was sent too fast.",
   "approvalNeeded": "Approve this terminal on the node: {{command}}",
+  "approvalNeededReopen": "Approve this browser on the node, then open the terminal again: {{command}}",
   "detach": "Stop viewing",
   "closeTab": "Close tab",
   "endSession": "End session",
@@ -95,6 +96,7 @@
     "other": "The terminal was refused ({{reason}}).",
     "step_detached": "This terminal was disconnected. Open it again from Steps waiting for you.",
     "browser_identity_unavailable": "This browser's terminal identity could not be loaded, and this node requires it. Reload the page to try again.",
+    "approval_required": "This node asks you to approve this browser before it opens a terminal.",
     "bad_cwd": "The node cannot use its home directory to open this terminal."
   },
   "steps": {

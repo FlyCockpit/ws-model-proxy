@@ -1293,8 +1293,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
 
   /** Refuse a tab (before any handshake message goes out, or after the relay refused it). */
   const refuseTab = useCallback(
-    (localId: string, reason: string) => {
-      transitionTabNow(localId, { type: "refused", reason });
+    (localId: string, reason: string, approvalCode: string | null = null) => {
+      transitionTabNow(localId, { type: "refused", reason, approvalCode });
     },
     [transitionTabNow],
   );
@@ -1919,7 +1919,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           pending?.withoutIdentity === true && message.reason === BROWSER_IDENTITY_REQUIRED;
         // The browser identity failed to load: it never will, so say that instead.
         const failed = identityMissing && identityStatusRef.current === "failed";
-        refuseTab(localId, failed ? BROWSER_IDENTITY_UNAVAILABLE : message.reason);
+        // An unapproved browser keeps the code the CLI named: approve it on the node, then reopen.
+        refuseTab(
+          localId,
+          failed ? BROWSER_IDENTITY_UNAVAILABLE : message.reason,
+          failed ? null : message.approvalCode,
+        );
         // Refused only because the browser identity had not loaded: retry
         // once it has.
         if (identityMissing && !failed) attachments.apply(localId, { type: "awaitIdentity" });

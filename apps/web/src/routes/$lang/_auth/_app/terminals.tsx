@@ -94,6 +94,7 @@ const KNOWN_REJECTIONS: ReadonlySet<string> = new Set([
   "bad_cwd",
   "step_detached",
   "browser_identity_unavailable",
+  "approval_required",
 ]);
 
 /**
@@ -628,9 +629,12 @@ function TabNotices({ sessions, tab }: { sessions: Sessions; tab: TerminalTab })
     <>
       {approvalCode ? (
         <p className="min-w-0 break-words">
-          {t("terminals:approvalNeeded", {
-            command: `${APPROVAL_COMMAND_PREFIX} ${approvalCode}`,
-          })}
+          {t(
+            tab.status.phase === "rejected"
+              ? "terminals:approvalNeededReopen"
+              : "terminals:approvalNeeded",
+            { command: `${APPROVAL_COMMAND_PREFIX} ${approvalCode}` },
+          )}
         </p>
       ) : null}
       {changed ? (

@@ -1430,6 +1430,24 @@ describe("useTerminalSessions handshake after the tab ended", () => {
     expect(events).toEqual([]);
   });
 
+  it("keeps the approval code the CLI named when it refuses an unapproved browser", async () => {
+    const { view } = await listAndSubscribe();
+    await attachAsCli(VIEWER_ID, 0, undefined, () =>
+      handlers().onMessage({
+        type: "rejected",
+        terminalId: TERMINAL_ID,
+        reason: "approval_required",
+        approvalCode: "ABCD",
+      }),
+    );
+    await settle();
+    expect(view.result.current.tabs[0]?.status).toEqual({
+      phase: "rejected",
+      reason: "approval_required",
+      approvalCode: "ABCD",
+    });
+  });
+
   it("does not recreate a session for a tab closed during key derivation", async () => {
     const { view, localId, events } = await listAndSubscribe();
     const cli = await attachAsCli(VIEWER_ID, 0, undefined, () =>

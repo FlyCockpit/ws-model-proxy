@@ -163,6 +163,29 @@ describe("Terminals page header", () => {
     expect(screen.getByText(enTerminals.rejection.not_granted)).toBeTruthy();
   });
 
+  it("names the approval command on a tab refused until this browser is approved", async () => {
+    const command = enTerminals.approvalNeededReopen.replace(
+      "{{command}}",
+      "wsmp terminal approve ABCD",
+    );
+    for (const phone of [false, true]) {
+      stubPhone(phone);
+      setSession({
+        tabs: [
+          tab("a", "node-1", {
+            phase: "rejected",
+            reason: "approval_required",
+            approvalCode: "ABCD",
+          }),
+        ],
+      });
+      await renderPage();
+      expect(screen.getByText(enTerminals.rejection.approval_required)).toBeTruthy();
+      expect(screen.getByText(command)).toBeTruthy();
+      cleanup();
+    }
+  });
+
   it("asks before End session on a wide screen, for the tab it was pressed on only", async () => {
     stubPhone(false);
     setSession({});

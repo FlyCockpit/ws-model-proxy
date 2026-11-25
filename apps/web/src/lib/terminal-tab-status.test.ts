@@ -42,6 +42,28 @@ describe("transitionTab", () => {
     expect(run(awaitingApproval, { type: "retry" })).toEqual(OPENING);
   });
 
+  it("keeps the CLI's approval code on an approval_required refusal until a retry", () => {
+    const refused = run(awaitingApproval, {
+      type: "refused",
+      reason: "approval_required",
+      approvalCode: "ABCD",
+    });
+    expect(refused).toEqual({
+      phase: "rejected",
+      reason: "approval_required",
+      approvalCode: "ABCD",
+    });
+    expect(tabApprovalCode(refused)).toBe("ABCD");
+    expect(
+      run(refused, { type: "refused", reason: "approval_required", approvalCode: "ABCD" }),
+    ).toBe(refused);
+    expect(
+      run(refused, { type: "refused", reason: "approval_required", approvalCode: null }),
+    ).toEqual({ phase: "rejected", reason: "approval_required" });
+    expect(run(refused, { type: "retry" })).toEqual(OPENING);
+    expect(tabApprovalCode(rejected)).toBeNull();
+  });
+
   it("ignores an approval request for a tab that is not opening", () => {
     for (const status of [live, rejected, exited, gone]) {
       expect(run(status, { type: "approvalRequested", approvalCode: "X" })).toBe(status);

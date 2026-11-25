@@ -69,6 +69,7 @@
   "exitedGone": "La terminal ya no se ejecuta en el nodo. Terminó, o el nodo se reinició, mientras esta página no estaba conectada.",
   "inputDropped": "Parte de lo que escribiste no se entregó porque se envió demasiado rápido.",
   "approvalNeeded": "Aprueba esta terminal en el nodo: {{command}}",
+  "approvalNeededReopen": "Aprueba este navegador en el nodo y luego vuelve a abrir la terminal: {{command}}",
   "detach": "Dejar de ver",
   "closeTab": "Cerrar pestaña",
   "endSession": "Terminar sesión",
@@ -95,6 +96,7 @@
     "other": "La terminal fue rechazada ({{reason}}).",
     "step_detached": "Esta terminal se desconectó. Ábrela de nuevo desde Pasos que te esperan.",
     "browser_identity_unavailable": "No se pudo cargar la identidad de terminal de este navegador, y este nodo la requiere. Recarga la página para intentarlo de nuevo.",
+    "approval_required": "Este nodo te pide aprobar este navegador antes de abrir una terminal.",
     "bad_cwd": "El nodo no puede usar su directorio personal para abrir esta terminal."
   },
   "steps": {

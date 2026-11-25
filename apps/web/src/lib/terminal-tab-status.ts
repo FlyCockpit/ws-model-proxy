@@ -20,8 +20,12 @@ export type TabStatus =
   | { phase: "opening"; approvalCode: string | null; reopen: TabReopenCause | null }
   /** Attached with session keys. `inputDropped`: the relay dropped some input moments ago. */
   | { phase: "live"; inputDropped: boolean }
-  /** Refused before or while attaching (by this page, the relay or the CLI). */
-  | { phase: "rejected"; reason: string }
+  /**
+   * Refused before or while attaching (by this page, the relay or the CLI). `approvalCode`: the
+   * CLI refused this browser because it is not approved there yet (`approval_required`); approving
+   * that code on the node and opening the terminal again lets it in.
+   */
+  | { phase: "rejected"; reason: string; approvalCode?: string }
   /** The terminal's process ended, with how it ended from the relay's exit message. */
   | { phase: "exited"; cause: "exit"; exitCode: number | null; exitSignal: string | null }
   /** The relay's terminal list no longer has the terminal (it ended while this page was away). */
@@ -36,8 +40,8 @@ export type TabEvent =
   | { type: "approvalRequested"; approvalCode: string | null }
   /** The session keys are in place. */
   | { type: "established" }
-  /** Refused, for `reason`. */
-  | { type: "refused"; reason: string }
+  /** Refused, for `reason` (with the approval code the CLI named, if any). */
+  | { type: "refused"; reason: string; approvalCode?: string | null }
   /** An error from the relay naming this terminal: it refuses an opening tab, nothing else. */
   | { type: "relayError"; reason: string }
   /** The relay detached this viewer while the terminal runs on. */
@@ -61,9 +65,11 @@ export function tabRejection(status: TabStatus): string | null {
   return status.phase === "rejected" ? status.reason : null;
 }
 
-/** The approval code an opening tab waits on, or null. */
+/** The approval code an opening tab waits on, or a refused tab needs before it is opened again. */
 export function tabApprovalCode(status: TabStatus): string | null {
-  return status.phase === "opening" ? status.approvalCode : null;
+  if (status.phase === "opening") return status.approvalCode;
+  if (status.phase === "rejected") return status.approvalCode ?? null;
+  return null;
 }
 
 /**
@@ -88,10 +94,19 @@ export function transitionTab(status: TabStatus, event: TabEvent): TabStatus {
     case "established":
       if (status.phase === "opening") return { phase: "live", inputDropped: false };
       return status;
-    case "refused":
+    case "refused": {
       if (status.phase === "exited") return status;
-      if (status.phase === "rejected" && status.reason === event.reason) return status;
-      return { phase: "rejected", reason: event.reason };
+      const approvalCode = event.approvalCode ?? undefined;
+      if (
+        status.phase === "rejected" &&
+        status.reason === event.reason &&
+        status.approvalCode === approvalCode
+      )
+        return status;
+      return approvalCode === undefined
+        ? { phase: "rejected", reason: event.reason }
+        : { phase: "rejected", reason: event.reason, approvalCode };
+    }
     case "relayError":
       return status.phase === "opening" ? { phase: "rejected", reason: event.reason } : status;
     case "detached":
