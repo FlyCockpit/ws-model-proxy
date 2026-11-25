@@ -5,8 +5,8 @@ import { z } from "zod";
  * frames (`frames.ts`) and the cross-language fixtures under
  * `apps/cli/tests/fixtures/relay-4.0/`. The MCP tool inputs are
  * `packages/api/src/contracts/nodes.ts`, mapped to these args by
- * `packages/api/src/nodes/files.ts`. The Rust mirror is `apps/cli/src/file_ops`
- * (`FileOps::execute`) and `apps/cli/src/file_relay.rs`.
+ * `packages/api/src/nodes/files.ts`. The Rust mirror is `apps/cli/src/services/file_ops`
+ * (`FileOps::execute`) and `apps/cli/src/services/file_relay.rs`.
  *
  * Wire shape recap (control frames stay <= 64 KiB; the frame schemas live in `frames.ts`):
  * - S->N `file.op {opId, op, args, bodyBytes?}`: no mode or grant travels any more; the node
@@ -55,7 +55,7 @@ export function isMutatingFileOp(op: FileOp): op is MutatingFileOp {
   return MUTATING_FILE_OPS.has(op);
 }
 
-/** File error codes of `apps/cli/src/file_ops/error.rs`, plus wire-level refusals. */
+/** File error codes of `apps/cli/src/services/file_ops/error.rs`, plus wire-level refusals. */
 export const FILE_ERROR_CODES = [
   "path_denied",
   "secret_file",

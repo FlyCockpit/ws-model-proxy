@@ -10,7 +10,7 @@
  *   stored and live trust, the live session's owner, file roots, the per-user and per-node
  *   limits, the 1 MiB body and 64 KiB frame caps and every path under the node's roots; it
  *   writes the `NodeAuditEvent` row (path, size, outcome, credential; never content);
- * - the node (`apps/cli/src/file_ops`): its own trust and roots, its deny list (wsmp config,
+ * - the node (`apps/cli/src/services/file_ops`): its own trust and roots, its deny list (wsmp config,
  *   credentials, secrets, runtime stores, the whole state directory), symlink-safe resolution
  *   and its own size limits.
  *

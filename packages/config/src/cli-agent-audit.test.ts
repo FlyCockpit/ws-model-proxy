@@ -26,7 +26,7 @@ describe("cliAgentWireReason", () => {
   // Mutating the constants or this list independently fails here.
   it("matches the CLI's REASON_* constants exactly", () => {
     const source = readFileSync(
-      fileURLToPath(new URL("../../../apps/cli/src/sessions.rs", import.meta.url)),
+      fileURLToPath(new URL("../../../apps/cli/src/relay/sessions.rs", import.meta.url)),
       "utf8",
     );
     const declared = [...source.matchAll(/^const REASON_[A-Z0-9_]+: &str = "([^"]+)";$/gm)].map(

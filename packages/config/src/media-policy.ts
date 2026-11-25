@@ -366,7 +366,7 @@ function mayPassthroughMime(mime: string, profile: ImageInlineProfile): boolean 
  * expands a signed media URL into a `data:` URL for a local upstream.
  * Video/audio are not converted here — only still images.
  *
- * Keep in sync with CLI `is_model_inline_safe_image_mime` in apps/cli/src/media.rs
+ * Keep in sync with CLI `is_model_inline_safe_image_mime` in apps/cli/src/services/media.rs
  * (Rust cannot import this package; both treat JPEG/PNG as safe and alias jpg).
  */
 export function imageNeedsInlineNormalization(mime: string): boolean {

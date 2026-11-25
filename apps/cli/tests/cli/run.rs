@@ -64,11 +64,11 @@ fn run_without_the_stop_marker_keeps_retrying_a_missing_credential() {
 
 #[test]
 fn protocol_helpers_reject_oversized_binary_chunk() {
-    let metadata = wsmp::protocol::NodeBinaryMetadata::RelayResponseBody {
+    let metadata = wsmp::wire::protocol::NodeBinaryMetadata::RelayResponseBody {
         request_id: "request-1".to_string(),
         chunk_id: "0".to_string(),
         is_final: Some(true),
     };
-    let body = vec![0_u8; wsmp::protocol::RELAY_BINARY_CHUNK_MAX_BYTES + 1];
-    assert!(wsmp::protocol::encode_binary_frame(&metadata, &body).is_err());
+    let body = vec![0_u8; wsmp::wire::protocol::RELAY_BINARY_CHUNK_MAX_BYTES + 1];
+    assert!(wsmp::wire::protocol::encode_binary_frame(&metadata, &body).is_err());
 }

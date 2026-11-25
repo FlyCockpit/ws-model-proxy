@@ -7,13 +7,13 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use wsmp::child_env::argv_script;
-use wsmp::protocol::runtime_spec::CommandShell;
-use wsmp::runtimes::executor::Deadline;
-use wsmp::runtimes::executor::windows::{
+use wsmp::process::child_env::argv_script;
+use wsmp::services::runtimes::executor::Deadline;
+use wsmp::services::runtimes::executor::windows::{
     HostLaunch, exited_cleanly, identity, read_record, running, start, stop, stop_slice,
     tasks_alive,
 };
+use wsmp::wire::protocol::runtime_spec::CommandShell;
 
 const OWNER: &str = "abcdefghijklmnopqrstuvwx";
 const EXE: &str = env!("CARGO_BIN_EXE_wsmp");

@@ -37,7 +37,7 @@ const BROWSER_SCALAR = "c6ef9c5d78ae012a011164acb397ce2088685d8f06bf9be0b283ab46
 const BROWSER_X = "D12DFB5289C8D4F81208B70270398C342296970A0BCCB74C736FC7554494BF63";
 const BROWSER_Y = "56FBF3CA366CC23E8157854C13C58D6AAC23F046ADA30F8353E74F33039872AB";
 
-// Crypto v2 vectors. Mirrored in `apps/cli/src/terminal_crypto.rs`.
+// Crypto v2 vectors. Mirrored in `apps/cli/src/wire/terminal_crypto.rs`.
 const VIEWER_A = bytesToBase64Url(Uint8Array.from({ length: 16 }, (_, index) => index + 1));
 const VIEWER_B = bytesToBase64Url(Uint8Array.from({ length: 16 }, (_, index) => index + 17));
 const OUT_KEY = Uint8Array.from({ length: 32 }, (_, index) => 0xa0 + index);
@@ -295,7 +295,7 @@ describe("terminal crypto v2 vectors", () => {
   });
 });
 
-// CLI identity vectors. Mirrored in `apps/cli/src/terminal_crypto.rs`.
+// CLI identity vectors. Mirrored in `apps/cli/src/wire/terminal_crypto.rs`.
 const CLI_ID_SLUG = "desk-01";
 const CLI_ID_STATEMENT =
   "001377736d702d7465726d2d636c692d69642d763100076465736b2d303104dad0b65394221cf9b051e1feca5787d098dfe637fc90b9ef945d0c37725811805271a0461cdb8252d61f1c456fa3e59ab1f45b33accf5f58389e0577b8990bb3";

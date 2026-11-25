@@ -6,7 +6,7 @@
  * `Runtime.kind` / the define envelope's `kind`.
  *
  * The server and the node validate the same rules. The Rust mirror is
- * `apps/cli/src/protocol/runtime_spec.rs`; shared fixtures live in
+ * `apps/cli/src/wire/protocol/runtime_spec.rs`; shared fixtures live in
  * `apps/cli/tests/fixtures/relay-4.0/`. `launchHash = sha256(canonicalJson(spec))`
  * (`runtime-launch-hash.ts`) is the only definition identity a node sees.
  *
@@ -272,7 +272,7 @@ export const runtimeCommandSchema = runtimeTextSchema(RUNTIME_COMMAND_MAX_BYTES)
  * without a shell's parsing, quoting every argument for the shell it starts it from. An argv
  * holds 1 to `RUNTIME_ARGV_MAX` arguments, its program not blank, and joined with spaces is no
  * longer than a text command. The node's twin is `command_line_ok`
- * (`apps/cli/src/runtime_store/validate.rs`).
+ * (`apps/cli/src/node/runtime_store/validate.rs`).
  */
 export const runtimeCommandLineSchema = z.union([
   runtimeCommandSchema,
@@ -809,7 +809,7 @@ const NEVER_STOPPED_STATUS = new Set(["", "true", ":", "exit 0", "/bin/true", "/
  * Whether a status command could ever say stopped (exit 3). Refused: an empty command, `true`,
  * `:`, `exit 0`, `/bin/true` and `/usr/bin/true`, compared after collapsing spaces, tabs and
  * line breaks and dropping trailing semicolons. Nothing else is parsed. The node's twin is
- * `status_can_report_stopped` (`apps/cli/src/protocol/runtime_spec.rs`); shared vectors in
+ * `status_can_report_stopped` (`apps/cli/src/wire/protocol/runtime_spec.rs`); shared vectors in
  * `apps/cli/tests/fixtures/relay-4.0/rules/status-command.json`.
  */
 export function statusCanReportStopped(command: string): boolean {

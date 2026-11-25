@@ -1,0 +1,1350 @@
+//! The one bounded-run primitive: run a program with a hard deadline and
+//! collect its stdout. `nvidia-smi` (node telemetry) and every custom metric
+//! source ([`crate::services::metric_sources`], which run arbitrary commands) go
+//! through [`run`]; nothing else in the telemetry path spawns a process.
+//!
+//! Limits, all enforced here: scrubbed environment, no stdin, stderr
+//! discarded (never read), stdout capped, its own process group, killed at
+//! the deadline, and a bounded reap (see below).
+//!
+//! Management commands (an update's archive and version probes, the service
+//! managers, Homebrew) go through [`run_managed`]: the same group, deadline,
+//! reap, budget and shutdown, but the parent's environment, and stderr read
+//! as well, both pipes drained at once so a program never blocks on a full
+//! one; output past the limit is dropped, never a reason to kill.
+//!
+//! # State table
+//! E = stdout closed (every writer let go of the pipe), X = the program
+//! exited, D = the deadline, C = the caller cancelled or the daemon is
+//! exiting ([`kill_all_active`]).
+//!
+//! | observed | result | group |
+//! |---|---|---|
+//! | E, then X (exit 0) before D, at most `limit` bytes | `Ok(bytes)` | leftovers killed |
+//! | E, then X with a nonzero exit or a signal | `ExitStatus` | leftovers killed |
+//! | E, but the program still runs at D | `Timeout` | killed |
+//! | X, but a helper holds stdout at D | `Timeout` | killed |
+//! | neither by D | `Timeout` | killed |
+//! | more than `limit` bytes | `OutputTooLarge` | killed at once |
+//! | C at any point | `Cancelled` | killed at once |
+//! | the program cannot start | `Spawn` | none |
+//! | no pipe, no budget (too many runs, or too many stuck children) | `Resources` | killed / refused |
+//!
+//! # The one exit path
+//! Every path after spawn goes through [`finish`]: wait (until the deadline
+//! or a cancel) for the direct child to exit without reaping it where the
+//! platform allows, `SIGKILL` its whole process group and the direct child
+//! itself (a child that left its group is still ours to kill), then reap it
+//! for at most [`REAP_GRACE`]. That is the whole reach on Unix: a helper that
+//! detached into a session or group of its own is not killed and can outlive
+//! the deadline (the call still returns as below). A launch guard
+//! ([`crate::process::launch_guard`]) leads a session instead of a group, and is sent SIGTERM instead of being killed: it
+//! ends its session itself, holding its launcher lock until it has (a guard
+//! still ending goes to the reaper). Only a guard someone else killed has its
+//! session killed here. A child that survives even that (blocked in
+//! uninterruptible sleep) is handed to a detached reaper thread; the call
+//! still returns within about `timeout + REAP_GRACE`.
+//!
+//! # Budget
+//! One [`Budget`], one lock, one admission point ([`admit`]): a run holds a
+//! permit from before it spawns until it is fully finished, and a stuck
+//! child keeps its permit until it is reaped. At most [`MAX_RUNS`] permits
+//! exist, and while [`LINGERING_MAX`] children are stuck no new run is
+//! admitted (`Resources`). Stuck children can therefore exceed
+//! [`LINGERING_MAX`] only by runs that were already in flight when the cap
+//! was reached, and never [`MAX_RUNS`] in all. On Unix the run thread reads
+//! stdout itself (non-blocking, polled), so no thread or descriptor outlives
+//! a run; a helper that left the group holding the pipe cannot leak either.
+//!
+//! Windows assigns each suspended child to a job object before it can run.
+//! Terminating the job kills the whole tree, including detached helpers and
+//! helpers whose root already exited. Owner drop also terminates leftovers,
+//! and closing the last job handle kills the tree even on abrupt CLI exit.
+//!
+//! # Daemon exit
+//! Each live run's process group is in a process-wide registry.
+//! [`kill_all_active`] (called on the first shutdown signal and by `main` before it exits) kills them all
+//! (under the registry lock on Unix, so a group is never signalled after
+//! its run reaped it) and refuses later runs: the shutdown check happens
+//! before anything is spawned, and shutdown waits for runs that are already
+//! mid-spawn (each kills its own group at registration), so an exiting daemon does not orphan the group of
+//! a command that was running. A panic in a release build (which aborts)
+//! ends the runs in flight first ([`kill_all_active_for_panic`], installed by
+//! `main`). On Unix, `SIGKILL` of the daemon itself cannot be caught and can
+//! leave a command running until it exits by itself, except a runtime
+//! command: those run under [`crate::process::launch_guard`], which ends them.
+
+#[cfg(windows)]
+use crate::process::job_tree::{Child, JobTree};
+#[cfg(unix)]
+use crate::process::process_list::Process;
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+/// Registered with the subreaper, so its scan never reaps the run's child.
+#[cfg(not(windows))]
+type Child = crate::process::subreaper::Owned<std::process::Child>;
+use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+pub mod management;
+
+/// How long the reap after the group kill may take before the child is left
+/// to a detached reaper thread.
+pub const REAP_GRACE: Duration = Duration::from_millis(1_000);
+/// Children that survived the kill and are still being reaped. At this many,
+/// new runs are refused.
+pub const LINGERING_MAX: usize = 8;
+/// Runs in flight plus stuck children, all counted against one budget. Above
+/// the scheduler's bound of 50 custom sources plus the built-in telemetry.
+pub const MAX_RUNS: usize = 64;
+/// How often the wait loops check the deadline and the cancel flag.
+const POLL: Duration = Duration::from_millis(25);
+const REAP_POLL: Duration = Duration::from_millis(5);
+/// How long shutdown waits for runs that are mid-spawn.
+const SHUTDOWN_SPAWN_WAIT: Duration = Duration::from_secs(1);
+
+/// Why a run produced no output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunError {
+    /// The program could not be started (not installed, not executable).
+    Spawn,
+    /// The deadline passed before the run completed.
+    Timeout,
+    /// stdout was longer than the limit.
+    OutputTooLarge,
+    /// The program exited nonzero (its exit code) or was ended by a signal (`None`).
+    ExitStatus(Option<i32>),
+    /// The caller cancelled, or the daemon is exiting.
+    Cancelled,
+    /// A local resource is missing (no stdout pipe, no thread, or too many
+    /// children stuck from earlier runs); nothing was started or it was
+    /// killed at once.
+    Resources,
+}
+
+/// The one budget. `held` counts permits (a run in flight, or a stuck child
+/// still being reaped); `stuck` counts the latter.
+struct Budget {
+    held: usize,
+    stuck: usize,
+}
+
+static BUDGET: Mutex<Budget> = Mutex::new(Budget { held: 0, stuck: 0 });
+
+/// One run's claim on a budget; released on drop (or moved to a reaper).
+struct Permit(&'static Mutex<Budget>);
+
+fn lock(budget: &'static Mutex<Budget>) -> std::sync::MutexGuard<'static, Budget> {
+    budget.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The only admission check: atomically reserve a permit, or refuse.
+fn admit() -> Option<Permit> {
+    admit_in(&BUDGET)
+}
+
+fn admit_in(shared: &'static Mutex<Budget>) -> Option<Permit> {
+    let mut budget = lock(shared);
+    if budget.stuck >= LINGERING_MAX || budget.held >= MAX_RUNS {
+        return None;
+    }
+    budget.held += 1;
+    Some(Permit(shared))
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut budget = lock(self.0);
+        budget.held = budget.held.saturating_sub(1);
+    }
+}
+
+#[cfg(windows)]
+type Groups = BTreeMap<u64, JobTree>;
+/// Each run's pid, and the launch guard (named by its lifetime) when it is one leading its
+/// session.
+#[cfg(not(windows))]
+type Groups = BTreeMap<u32, Option<Process>>;
+
+#[derive(Default)]
+struct Registry {
+    closed: bool,
+    groups: Groups,
+    /// Runs between the shutdown check and their registration: shutdown
+    /// waits for them, so none can start a command it never signals.
+    spawning: usize,
+    #[cfg(windows)]
+    next_token: u64,
+}
+
+static ACTIVE: Mutex<Registry> = Mutex::new(Registry {
+    closed: false,
+    groups: Groups::new(),
+    spawning: 0,
+    #[cfg(windows)]
+    next_token: 0,
+});
+
+fn lock_registry(shared: &'static Mutex<Registry>) -> std::sync::MutexGuard<'static, Registry> {
+    shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn registry() -> std::sync::MutexGuard<'static, Registry> {
+    lock_registry(&ACTIVE)
+}
+
+/// A run counted as spawning: between the shutdown check and its
+/// registration, so shutdown waits for it. Registering redeems it (under the
+/// registry lock that records the run); dropping it on any other path (an
+/// early return, a failed spawn, a panic) stops counting it, so no path can
+/// leave shutdown waiting for a run that never registers.
+#[must_use = "a run is counted as spawning until its ticket is registered or dropped"]
+struct SpawnTicket {
+    shared: &'static Mutex<Registry>,
+    redeemed: bool,
+}
+
+impl SpawnTicket {
+    /// Stop counting the run, through the registry lock the caller holds.
+    fn redeem(mut self, registry: &mut Registry) {
+        registry.spawning = registry.spawning.saturating_sub(1);
+        self.redeemed = true;
+    }
+}
+
+impl Drop for SpawnTicket {
+    fn drop(&mut self) {
+        if !self.redeemed {
+            let mut registry = lock_registry(self.shared);
+            registry.spawning = registry.spawning.saturating_sub(1);
+        }
+    }
+}
+
+/// The shutdown check that comes BEFORE anything is spawned: `None` when
+/// the process is already exiting (nothing is started). Otherwise the run
+/// is counted as spawning while the [`SpawnTicket`] lives.
+fn begin_spawn() -> Option<SpawnTicket> {
+    begin_spawn_in(&ACTIVE)
+}
+
+fn begin_spawn_in(shared: &'static Mutex<Registry>) -> Option<SpawnTicket> {
+    let mut registry = lock_registry(shared);
+    if registry.closed {
+        return None;
+    }
+    registry.spawning += 1;
+    Some(SpawnTicket {
+        shared,
+        redeemed: false,
+    })
+}
+
+/// Record a live run. `false` when the process began exiting after
+/// [`begin_spawn`]: the group is killed here (under the lock on Unix, so
+/// `kill_all_active` never returns before it), and the caller gives up.
+#[cfg(unix)]
+fn register(ticket: SpawnTicket, pid: u32, guard: Option<Process>) -> bool {
+    register_in(ticket, pid, guard)
+}
+
+#[cfg(unix)]
+fn register_in(ticket: SpawnTicket, pid: u32, guard: Option<Process>) -> bool {
+    let mut registry = lock_registry(ticket.shared);
+    ticket.redeem(&mut registry);
+    if registry.closed {
+        #[cfg(unix)]
+        kill_run(pid, guard);
+        return false;
+    }
+    registry.groups.insert(pid, guard);
+    true
+}
+
+#[cfg(not(windows))]
+fn unregister(pid: u32) {
+    registry().groups.remove(&pid);
+}
+
+/// Ownership: the run owns the child and the registry owns a job handle clone
+/// until termination succeeds, including a pending reaper handoff. Lock order
+/// on Windows: release the registry before touching
+/// a job. No job operation acquires the registry or budget lock. Job operations
+/// hold their lock only for nonblocking OS calls, never for a wait or pipe read.
+#[cfg(windows)]
+fn register_job_in(ticket: SpawnTicket, job: JobTree) -> Option<JobRegistration> {
+    let shared = ticket.shared;
+    let mut registry = lock_registry(shared);
+    let token = registry.next_token.checked_add(1);
+    let Some(token) = token.filter(|_| !registry.closed) else {
+        // Exhaustion must fail closed rather than wrap and reuse an identity.
+        registry.closed = true;
+        drop(registry);
+        kill_group(&job);
+        // Keep this run counted as spawning until its job has been signalled.
+        drop(ticket);
+        return None;
+    };
+    registry.next_token = token;
+    registry.groups.insert(token, job);
+    ticket.redeem(&mut registry);
+    Some(JobRegistration { shared, token })
+}
+
+/// A run's identity, independent of its cached diagnostic PID. This guard
+/// moves to the reaper on a pending kill, so shutdown can still reach the job.
+#[cfg(windows)]
+struct JobRegistration {
+    shared: &'static Mutex<Registry>,
+    token: u64,
+}
+
+#[cfg(windows)]
+impl Drop for JobRegistration {
+    fn drop(&mut self) {
+        lock_registry(self.shared).groups.remove(&self.token);
+    }
+}
+
+/// Shutdown and panic share one deadline for lock retries across every job.
+/// A stuck lock cannot block shutdown, nor prevent signalling accessible jobs.
+#[cfg(windows)]
+fn close_jobs_in(shared: &'static Mutex<Registry>, until: Instant) -> bool {
+    let Ok(mut registry) = crate::process::job_tree::lock_until(shared, until) else {
+        return false;
+    };
+    registry.closed = true;
+    // Retain handles until each owner unregisters: shutdown never relies on a
+    // recycled PID, and panic/abort still closes every live kernel job handle.
+    let jobs = registry.groups.values().cloned().collect::<Vec<_>>();
+    let spawning = registry.spawning;
+    drop(registry);
+    for job in jobs {
+        let _ = job.terminate_until(until);
+    }
+    spawning == 0
+}
+
+#[cfg(windows)]
+fn kill_all_for_panic_in(shared: &'static Mutex<Registry>) {
+    close_jobs_in(shared, Instant::now() + Duration::from_millis(200));
+}
+
+#[cfg(windows)]
+fn kill_all_in(shared: &'static Mutex<Registry>) {
+    let until = Instant::now() + SHUTDOWN_SPAWN_WAIT;
+    while !close_jobs_in(shared, until) && Instant::now() < until {
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Runs in flight (registered and not yet finished).
+pub fn active_runs() -> usize {
+    registry().groups.len()
+}
+
+/// Kill the process group of every run in flight and refuse later runs. Call
+/// on every path that ends the process. Idempotent, and safe to call from any
+/// thread; it waits (at most [`SHUTDOWN_SPAWN_WAIT`]) for runs that are
+/// mid-spawn, so it returns only once nothing it could have started is left.
+pub fn kill_all_active() {
+    kill_all_in(&ACTIVE);
+}
+
+/// The panic-hook variant of [`kill_all_active`]: never blocks (a panic may
+/// come from a thread that holds the registry lock, and waiting for mid-spawn
+/// runs is pointless when the process is about to abort). It closes the
+/// registry and kills what it can reach without waiting for the lock.
+pub fn kill_all_active_for_panic() {
+    kill_all_for_panic_in(&ACTIVE);
+}
+
+#[cfg(unix)]
+fn kill_all_for_panic_in(shared: &'static Mutex<Registry>) {
+    let mut registry = match shared.try_lock() {
+        Ok(registry) => registry,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        // Held by another thread: it is between two statements of a
+        // registry operation, so retry briefly rather than block.
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let until = Instant::now() + Duration::from_millis(200);
+            loop {
+                if let Ok(registry) = shared.try_lock() {
+                    break registry;
+                }
+                if Instant::now() >= until {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    };
+    registry.closed = true;
+    let groups = std::mem::take(&mut registry.groups);
+    #[cfg(unix)]
+    for (pid, guard) in groups {
+        kill_run(pid, guard);
+    }
+}
+
+#[cfg(unix)]
+fn kill_all_in(shared: &'static Mutex<Registry>) {
+    {
+        let mut registry = lock_registry(shared);
+        registry.closed = true;
+        let groups = std::mem::take(&mut registry.groups);
+        // Unix: `killpg` is a non-blocking syscall, and `finish` unregisters
+        // (under this lock) before it reaps, so no signalled id can have been
+        // reaped and recycled.
+        #[cfg(unix)]
+        for (pid, guard) in groups {
+            kill_run(pid, guard);
+        }
+    }
+    // A run past its shutdown check but not yet registered is killed by its
+    // own `register`; wait (bounded) until every such run has passed it.
+    let until = Instant::now() + SHUTDOWN_SPAWN_WAIT;
+    while lock_registry(shared).spawning > 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// A program's arguments: a list std quotes for the platform (each exactly as the OS string it
+/// is: Unix bytes, Windows wide characters, never converted to text on the way), or (Windows)
+/// the command line after the program passed as is, for `cmd.exe`, which does not read its
+/// command line the way std quotes it.
+#[derive(Clone, Copy)]
+enum Args<'a> {
+    List(&'a [&'a OsStr]),
+    #[cfg(windows)]
+    Raw(&'a str),
+}
+
+/// How a run treats the environment, stderr and output past the limit.
+#[derive(Clone, Copy)]
+enum Mode<'a> {
+    /// Telemetry and node commands: the scrubbed environment plus `extra_env`,
+    /// stderr discarded, stdout past the limit ends the run
+    /// (`OutputTooLarge`). `any_status`: stdout whatever the exit status.
+    Scrubbed {
+        extra_env: &'a [(String, String)],
+        any_status: bool,
+    },
+    /// [`run_managed`]: the parent's environment plus `env`, stdout and stderr
+    /// both read (concurrently), each kept up to the limit and the rest
+    /// drained and dropped, every exit status returned.
+    Managed { env: &'a [(&'a str, String)] },
+}
+
+/// What a run produced.
+struct Ran {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    success: bool,
+    /// The exit code; `None` when a signal ended it.
+    code: Option<i32>,
+}
+
+/// What a [`run_managed`] program left: its exit status (a nonzero one is a
+/// result here, not an error) and up to `limit` bytes of each stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Managed {
+    pub success: bool,
+    /// The exit code; `None` when a signal ended it.
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Run a management command with the limits above: its own process group
+/// (a Windows job), killed at `timeout` (on Unix the group and the direct
+/// child: a helper that detached into a session or group of its own is not
+/// reached; on Windows the whole job tree), a bounded
+/// reap, the shared budget and the daemon's shutdown. Unlike [`run`] it
+/// inherits the parent's environment (plus `env`) and reads stderr too.
+/// stdout and stderr are drained at the same time, so a program that fills
+/// one while the other is open never blocks; each keeps its first `limit`
+/// bytes and the rest is read and dropped (never a reason to kill). A helper
+/// that still holds a pipe after the program exited cannot hold the call
+/// past `timeout`: the run is then a `Timeout` and the group is killed.
+pub fn run_managed(
+    program: impl AsRef<OsStr>,
+    args: &[impl AsRef<OsStr>],
+    env: &[(&str, String)],
+    timeout: Duration,
+    limit: usize,
+) -> Result<Managed, RunError> {
+    let deadline = Instant::now() + timeout;
+    run_inner(
+        program.as_ref(),
+        Args::List(&os_args(args)),
+        deadline,
+        limit,
+        None,
+        None,
+        Mode::Managed { env },
+    )
+    .map(|ran| Managed {
+        success: ran.success,
+        code: ran.code,
+        stdout: ran.stdout,
+        stderr: ran.stderr,
+    })
+}
+
+/// Run `program` with the limits above and return its stdout.
+///
+/// `cancel`, when set, ends the run at the next poll (a few milliseconds),
+/// including while it waits for the program to exit after stdout closed.
+pub fn run(
+    program: impl AsRef<OsStr>,
+    args: &[impl AsRef<OsStr>],
+    timeout: Duration,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u8>, RunError> {
+    let deadline = Instant::now() + timeout;
+    run_inner(
+        program.as_ref(),
+        Args::List(&os_args(args)),
+        deadline,
+        limit,
+        cancel,
+        None,
+        Mode::Scrubbed {
+            extra_env: &[],
+            any_status: false,
+        },
+    )
+    .map(|ran| ran.stdout)
+}
+
+/// What [`run_bounded`] observed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Bounded {
+    /// The program could not be started (not installed).
+    Unavailable,
+    /// It failed, timed out (and was killed), or printed non-UTF-8.
+    Failed,
+    Output(String),
+}
+
+/// Run a program under [`run`] (scrubbed environment, no stdin, stderr
+/// discarded, stdout capped at `limit`, killed with its process group at the
+/// deadline, and settled within the deadline plus [`REAP_GRACE`] even when
+/// the kill does not end it). Success is exactly: stdout closed, the program
+/// exited 0 before the deadline, and at most `limit` bytes of UTF-8. The
+/// state table is in the module docs and `tests/telemetry_bounded.rs`.
+pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64) -> Bounded {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX - 1);
+    match run(program, args, timeout, limit, None) {
+        Ok(bytes) => String::from_utf8(bytes).map_or(Bounded::Failed, Bounded::Output),
+        Err(RunError::Spawn) => Bounded::Unavailable,
+        Err(_) => Bounded::Failed,
+    }
+}
+
+/// Total budget variant: settlement shares the caller's absolute deadline.
+/// Pending reaping retains its permit and can never return a success verdict.
+pub fn run_until(
+    program: impl AsRef<OsStr>,
+    args: &[impl AsRef<OsStr>],
+    deadline: Instant,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u8>, RunError> {
+    run_inner(
+        program.as_ref(),
+        Args::List(&os_args(args)),
+        deadline,
+        limit,
+        cancel,
+        Some(deadline),
+        Mode::Scrubbed {
+            extra_env: &[],
+            any_status: false,
+        },
+    )
+    .map(|ran| ran.stdout)
+}
+
+/// [`run_until`] with extra environment on top of the scrubbed parent
+/// environment (runtime commands: node secrets). Never log `env`.
+pub fn run_until_env(
+    program: impl AsRef<OsStr>,
+    args: &[impl AsRef<OsStr>],
+    deadline: Instant,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+    env: &[(String, String)],
+) -> Result<Vec<u8>, RunError> {
+    run_inner(
+        program.as_ref(),
+        Args::List(&os_args(args)),
+        deadline,
+        limit,
+        cancel,
+        Some(deadline),
+        Mode::Scrubbed {
+            extra_env: env,
+            any_status: false,
+        },
+    )
+    .map(|ran| ran.stdout)
+}
+
+/// [`run_until`] for programs that report through stdout and their exit
+/// status at once (`systemctl is-system-running` prints `degraded` and exits
+/// 1): stdout is returned whatever the exit status, never `ExitStatus`. Every
+/// other failure (spawn, timeout, size, cancel) is still an error.
+pub fn run_until_any_status(
+    program: impl AsRef<OsStr>,
+    args: &[impl AsRef<OsStr>],
+    deadline: Instant,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u8>, RunError> {
+    run_inner(
+        program.as_ref(),
+        Args::List(&os_args(args)),
+        deadline,
+        limit,
+        cancel,
+        Some(deadline),
+        Mode::Scrubbed {
+            extra_env: &[],
+            any_status: true,
+        },
+    )
+    .map(|ran| ran.stdout)
+}
+
+/// [`run_until_env`] with the command line after `program` passed as is: `cmd.exe /d /s /c
+/// "…"` runs the text between the outer quotes exactly as written.
+#[cfg(windows)]
+pub fn run_raw_until_env(
+    program: impl AsRef<OsStr>,
+    raw: &str,
+    deadline: Instant,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+    env: &[(String, String)],
+) -> Result<Vec<u8>, RunError> {
+    run_inner(
+        program.as_ref(),
+        Args::Raw(raw),
+        deadline,
+        limit,
+        cancel,
+        Some(deadline),
+        Mode::Scrubbed {
+            extra_env: env,
+            any_status: false,
+        },
+    )
+    .map(|ran| ran.stdout)
+}
+
+/// `args` as the OS strings they are, for [`Args::List`].
+fn os_args(args: &[impl AsRef<OsStr>]) -> Vec<&OsStr> {
+    args.iter().map(AsRef::as_ref).collect()
+}
+
+fn run_inner(
+    program: &OsStr,
+    args: Args<'_>,
+    deadline: Instant,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+    settlement: Option<Instant>,
+    mode: Mode<'_>,
+) -> Result<Ran, RunError> {
+    let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+    if cancelled() {
+        return Err(RunError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(RunError::Timeout);
+    }
+    // The one admission point: reserved before anything is spawned.
+    let Some(permit) = admit() else {
+        return Err(RunError::Resources);
+    };
+    // Shutdown check first: after `kill_all_active` nothing is started. Every
+    // return before the registration below drops the ticket, which stops
+    // counting this run as spawning.
+    let Some(ticket) = begin_spawn() else {
+        return Err(RunError::Cancelled);
+    };
+    let mut command = Command::new(program);
+    match args {
+        Args::List(args) => {
+            command.args(args);
+        }
+        #[cfg(windows)]
+        Args::Raw(raw) => {
+            use std::os::windows::process::CommandExt;
+            command.raw_arg(raw);
+        }
+    }
+    let (drain, any_status) = match mode {
+        Mode::Scrubbed {
+            extra_env,
+            any_status,
+        } => {
+            command
+                .env_clear()
+                .envs(crate::process::child_env::scrub_parent_env(&[]))
+                .envs(
+                    extra_env
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str())),
+                )
+                // Never read, never uploaded.
+                .stderr(Stdio::null());
+            (false, any_status)
+        }
+        Mode::Managed { env } => {
+            command
+                .envs(env.iter().map(|(name, value)| (*name, value.as_str())))
+                .stderr(Stdio::piped());
+            (true, true)
+        }
+    };
+    command.stdin(Stdio::null()).stdout(Stdio::piped());
+    // A launch guard starts a session of its own (a group leader cannot), and its session is
+    // what is killed when it did not end on its own.
+    #[cfg(unix)]
+    let Args::List(args) = args;
+    #[cfg(unix)]
+    let session = args
+        .first()
+        .is_some_and(|arg| *arg == OsStr::new(crate::process::launch_guard::SUBCOMMAND));
+    #[cfg(unix)]
+    if !session {
+        use std::os::unix::process::CommandExt;
+        // Its own group, so the deadline kills the child and every helper still
+        // in that group (not one that made a session or group of its own).
+        command.process_group(0);
+    }
+    if cancelled() || Instant::now() >= deadline {
+        return Err(if cancelled() {
+            RunError::Cancelled
+        } else {
+            RunError::Timeout
+        });
+    }
+    #[cfg(not(windows))]
+    let mut child =
+        match crate::process::subreaper::spawn(|| command.spawn(), |child| Some(child.id())) {
+            Ok(child) => child,
+            Err(_) => return Err(RunError::Spawn),
+        };
+    #[cfg(windows)]
+    let mut child = match crate::process::job_tree::spawn_hidden(command) {
+        Ok(child) => child,
+        Err(_) => return Err(RunError::Spawn),
+    };
+    #[cfg(not(windows))]
+    let pid = child.id();
+    // The guard as it is while unreaped, so no later signal or session kill can reach a process
+    // that got its pid back.
+    #[cfg(not(windows))]
+    let guard = session.then(|| Process::of(pid));
+    #[cfg(not(windows))]
+    let registered = register(ticket, pid, guard);
+    #[cfg(windows)]
+    let registration = register_job_in(ticket, child.job());
+    #[cfg(windows)]
+    let registered = registration.is_some();
+    #[cfg(windows)]
+    let finish = |child, until, permit, cancelled: &dyn Fn() -> bool| {
+        finish_job_until(child, until, permit, cancelled, registration, settlement)
+    };
+    #[cfg(not(windows))]
+    let finish = |child, until, permit, cancelled: &dyn Fn() -> bool| {
+        finish_until(child, until, permit, cancelled, settlement, guard)
+    };
+    if !registered {
+        finish(child, Instant::now(), permit, &|| true);
+        return Err(RunError::Cancelled);
+    }
+    let Some(stdout) = child.stdout.take() else {
+        finish(child, Instant::now(), permit, &|| true);
+        return Err(RunError::Resources);
+    };
+    // Piped only for a managed run, and then required.
+    let stderr = child.stderr.take();
+    if drain && stderr.is_none() {
+        finish(child, Instant::now(), permit, &|| true);
+        return Err(RunError::Resources);
+    }
+    // The pipes are dropped inside `collect`, so nothing holds them after this.
+    let output = match collect(stdout, stderr, deadline, limit, drain, &cancelled) {
+        Collected::Output(stdout, stderr) => Some((stdout, stderr)),
+        Collected::Unfinished => None,
+        Collected::Resources => {
+            finish(child, Instant::now(), permit, &|| true);
+            return Err(RunError::Resources);
+        }
+    };
+    // A managed run keeps at most `limit` bytes and is never over it.
+    let over_limit = output
+        .as_ref()
+        .is_some_and(|(stdout, _)| stdout.len() > limit);
+    // Refused output, a missing pipe result or a cancel: do not wait for exit.
+    let wait_until = if output.is_some() && !over_limit && !cancelled() {
+        deadline
+    } else {
+        Instant::now()
+    };
+    let finished = finish(child, wait_until, permit, &cancelled);
+    if cancelled() {
+        return Err(RunError::Cancelled);
+    }
+    if settlement.is_some() && Instant::now() >= deadline {
+        return Err(RunError::Timeout);
+    }
+    let Some((stdout, stderr)) = output else {
+        return Err(RunError::Timeout);
+    };
+    if over_limit {
+        return Err(RunError::OutputTooLarge);
+    }
+    if !finished.exited {
+        return Err(RunError::Timeout);
+    }
+    match finished.status {
+        Some(status) if status.success() || any_status => Ok(Ran {
+            stdout,
+            stderr,
+            success: status.success(),
+            code: status.code(),
+        }),
+        Some(status) => Err(RunError::ExitStatus(status.code())),
+        // Exited but never reaped in the grace: no verdict on its status.
+        None => Err(RunError::Timeout),
+    }
+}
+
+/// How reading the output ended.
+enum Collected {
+    /// Every pipe closed (or, not draining, more than `limit` bytes arrived
+    /// on stdout: that buffer is then longer than `limit`). stdout, stderr
+    /// (empty when stderr was not piped).
+    Output(Vec<u8>, Vec<u8>),
+    /// The deadline passed or the caller cancelled first.
+    Unfinished,
+    /// The pipe could not be read (no thread, no polling).
+    Resources,
+}
+
+/// Read stdout (and stderr, when piped) until every pipe closes, stdout
+/// exceeds `limit` (not draining), the deadline passes or the caller
+/// cancels. Draining keeps the first `limit` bytes of each and reads the rest
+/// away, so the program never blocks on a full pipe. Consumes the pipes, so
+/// they are closed when this returns.
+///
+/// Unix: the calling thread polls non-blocking descriptors; there is no
+/// reader thread that a helper holding a pipe could pin.
+#[cfg(unix)]
+fn collect(
+    stdout: ChildStdout,
+    stderr: Option<ChildStderr>,
+    deadline: Instant,
+    limit: usize,
+    drain: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Collected {
+    use std::os::fd::OwnedFd;
+    let pipes = std::iter::once(OwnedFd::from(stdout))
+        .chain(stderr.map(OwnedFd::from))
+        .collect();
+    collect_fds(pipes, deadline, limit, drain, cancelled)
+}
+
+/// Bytes read from one pipe before the others (and the deadline and a cancel)
+/// get their turn: a pipe that never runs dry cannot keep the drain away from
+/// them.
+#[cfg(unix)]
+const READ_PER_TURN: usize = 64 * 1024;
+
+/// [`collect`] on the pipes' descriptors: stdout first, then stderr if piped.
+#[cfg(unix)]
+fn collect_fds(
+    pipes: Vec<std::os::fd::OwnedFd>,
+    deadline: Instant,
+    limit: usize,
+    drain: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Collected {
+    use std::io::{ErrorKind, Read};
+    use std::os::fd::AsFd;
+
+    use nix::errno::Errno;
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+    /// One pipe: its reader, what was kept, and whether it is still open.
+    struct Stream {
+        pipe: std::fs::File,
+        buffer: Vec<u8>,
+        open: bool,
+    }
+
+    let mut streams: Vec<Stream> = pipes
+        .into_iter()
+        .map(|fd| Stream {
+            pipe: std::fs::File::from(fd),
+            buffer: Vec::new(),
+            open: true,
+        })
+        .collect();
+    for stream in &streams {
+        let Ok(flags) = fcntl(stream.pipe.as_fd(), FcntlArg::F_GETFL) else {
+            return Collected::Resources;
+        };
+        let nonblocking = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
+        if fcntl(stream.pipe.as_fd(), FcntlArg::F_SETFL(nonblocking)).is_err() {
+            return Collected::Resources;
+        }
+    }
+    let output = |streams: &mut Vec<Stream>| {
+        let mut buffers = streams
+            .iter_mut()
+            .map(|stream| std::mem::take(&mut stream.buffer));
+        let stdout = buffers.next().unwrap_or_default();
+        Collected::Output(stdout, buffers.next().unwrap_or_default())
+    };
+    let mut chunk = [0_u8; 8192];
+    loop {
+        if streams.iter().all(|stream| !stream.open) {
+            return output(&mut streams);
+        }
+        if cancelled() {
+            return Collected::Unfinished;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Collected::Unfinished;
+        }
+        let wait = remaining.min(POLL);
+        let millis = u16::try_from(wait.as_millis()).unwrap_or(u16::MAX);
+        let ready = {
+            let mut fds: Vec<PollFd<'_>> = streams
+                .iter()
+                .filter(|stream| stream.open)
+                .map(|stream| PollFd::new(stream.pipe.as_fd(), PollFlags::POLLIN))
+                .collect();
+            poll(&mut fds, PollTimeout::from(millis))
+        };
+        match ready {
+            Ok(0) | Err(Errno::EINTR) => continue,
+            Ok(_) => {}
+            Err(_) => return Collected::Resources,
+        }
+        // Each open pipe in turn, at most `READ_PER_TURN` bytes each, then
+        // the deadline and a cancel are checked again (top of the loop).
+        for (index, stream) in streams.iter_mut().enumerate() {
+            let mut turn = 0_usize;
+            while stream.open && turn < READ_PER_TURN {
+                match stream.pipe.read(&mut chunk) {
+                    Ok(0) => stream.open = false,
+                    Ok(read) => {
+                        turn += read;
+                        if drain {
+                            let room = limit.saturating_sub(stream.buffer.len());
+                            stream.buffer.extend_from_slice(&chunk[..read.min(room)]);
+                        } else {
+                            stream.buffer.extend_from_slice(&chunk[..read]);
+                            if index == 0 && stream.buffer.len() > limit {
+                                return output(&mut streams);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    // A broken pipe end is the end of that output.
+                    Err(_) => stream.open = false,
+                }
+            }
+        }
+    }
+}
+
+/// Windows has no pollable pipe here: a reader thread owns each pipe and
+/// its result arrives on a channel, so a leaked pipe never blocks the caller
+/// (terminating the Windows job at the deadline closes every writer).
+#[cfg(not(unix))]
+fn collect(
+    stdout: ChildStdout,
+    stderr: Option<ChildStderr>,
+    deadline: Instant,
+    limit: usize,
+    drain: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Collected {
+    use std::io::Read;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    let (done_tx, done_rx) = mpsc::channel::<(usize, Vec<u8>)>();
+    let pipes: Vec<Box<dyn Read + Send>> =
+        std::iter::once(Box::new(stdout) as Box<dyn Read + Send>)
+            .chain(stderr.map(|pipe| Box::new(pipe) as Box<dyn Read + Send>))
+            .collect();
+    let expected = pipes.len();
+    for (index, mut pipe) in pipes.into_iter().enumerate() {
+        let done_tx = done_tx.clone();
+        let reader = thread::Builder::new()
+            .name("wsmp-bounded-read".to_string())
+            .spawn(move || {
+                let mut buffer = Vec::new();
+                if drain {
+                    let _ = pipe.by_ref().take(limit as u64).read_to_end(&mut buffer);
+                    let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+                } else {
+                    let _ = pipe
+                        .take((limit as u64).saturating_add(1))
+                        .read_to_end(&mut buffer);
+                }
+                let _ = done_tx.send((index, buffer));
+            });
+        if reader.is_err() {
+            return Collected::Resources;
+        }
+    }
+    drop(done_tx);
+    let mut buffers: [Option<Vec<u8>>; 2] = [None, None];
+    let mut received = 0;
+    loop {
+        if received == expected {
+            let [stdout, stderr] = buffers;
+            return Collected::Output(stdout.unwrap_or_default(), stderr.unwrap_or_default());
+        }
+        if cancelled() {
+            return Collected::Unfinished;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Collected::Unfinished;
+        }
+        match done_rx.recv_timeout(remaining.min(POLL)) {
+            Ok((index, buffer)) => {
+                // Not draining, stdout over the limit settles the run at once.
+                let over = !drain && index == 0 && buffer.len() > limit;
+                if let Some(slot) = buffers.get_mut(index) {
+                    *slot = Some(buffer);
+                }
+                received += 1;
+                if over {
+                    let [stdout, stderr] = std::mem::take(&mut buffers);
+                    return Collected::Output(
+                        stdout.unwrap_or_default(),
+                        stderr.unwrap_or_default(),
+                    );
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Collected::Unfinished,
+        }
+    }
+}
+
+/// What [`finish`] learned.
+struct Finished {
+    /// The program exited on its own before `until` (it was not killed for
+    /// running too long).
+    exited: bool,
+    /// Its status, when it was reaped within [`REAP_GRACE`].
+    status: Option<ExitStatus>,
+}
+
+/// The one exit path after spawn: wait until `until` (or a cancel) for the
+/// child to exit (unreaped where the platform allows), kill every process
+/// left in its group and the child itself, drop the run from the registry,
+/// then reap the child for at most [`REAP_GRACE`]; a child that is still not
+/// reaped goes to a detached reaper thread that keeps the run's permit.
+///
+/// On Linux the wait uses `waitid(WNOWAIT)`, so the child stays a zombie and
+/// its pid (the group id) cannot be recycled before the kills. Other
+/// Unix targets reap first: POSIX does not reuse a pid while a process group
+/// with that id has members, so a surviving helper keeps the id safe; with no
+/// helper left the kill can only miss (a recycled pid would also have to have
+/// become a group leader in the microseconds between).
+#[cfg(not(windows))]
+fn finish_until(
+    mut child: Child,
+    until: Instant,
+    permit: Permit,
+    cancelled: &dyn Fn() -> bool,
+    settlement: Option<Instant>,
+    guard: Option<Process>,
+) -> Finished {
+    let exited = wait_for_exit(&mut child, until, cancelled);
+    let pid = child.id();
+    if let Some(guard) = guard {
+        // A launch guard ends its session itself, holding its launcher lock until it has. Not
+        // exited, so not reaped: the pid is still the guard's.
+        if !exited {
+            crate::process::launch_guard::terminate_unreaped(guard);
+        }
+    } else {
+        kill_group_or_child(&mut child);
+    }
+    // Off the registry before the reap: the registry never names a pid that
+    // has been reaped (and could be reused).
+    unregister(pid);
+    // A child that already exited keeps the status it exited with; SIGKILL
+    // cannot change it. std caches a status `try_wait` already reaped.
+    let status = reap_within(
+        &mut child,
+        settlement.unwrap_or_else(|| Instant::now() + REAP_GRACE),
+    );
+    // A launch guard that exited (on its own or on SIGTERM) ended its session itself; one that
+    // someone else killed left it to this. A reaped leader's id is not reused while its session
+    // has members. One that is still ending (a kill it keeps retrying) keeps its lock and goes
+    // to the reaper, lingering until it has ended.
+    if let Some(guard) = guard
+        && status.is_some_and(|status| status.code().is_none())
+    {
+        crate::process::launch_guard::end_killed_session(guard);
+    }
+    if status.is_none() {
+        hand_off_to_reaper(child, permit, guard);
+    }
+    Finished { exited, status }
+}
+
+/// Windows settlement uses one grace deadline for termination and reaping.
+/// A busy lock is inconclusive: keep both the registration and permit with
+/// the cleanup owner until the pending job kill is actually issued.
+#[cfg(windows)]
+#[cfg(test)]
+fn finish_job(
+    child: Child,
+    until: Instant,
+    permit: Permit,
+    cancelled: &dyn Fn() -> bool,
+    registration: Option<JobRegistration>,
+) -> Finished {
+    finish_job_until(child, until, permit, cancelled, registration, None)
+}
+
+#[cfg(windows)]
+fn finish_job_until(
+    mut child: Child,
+    until: Instant,
+    permit: Permit,
+    cancelled: &dyn Fn() -> bool,
+    registration: Option<JobRegistration>,
+    settlement: Option<Instant>,
+) -> Finished {
+    let exited = wait_for_exit(&mut child, until, cancelled);
+    let reap_until = settlement.unwrap_or_else(|| Instant::now() + REAP_GRACE);
+    if !child.ensure_terminated(reap_until) {
+        hand_off_job_to_reaper(child, permit, registration);
+        return Finished {
+            exited,
+            status: None,
+        };
+    }
+    drop(registration);
+    let status = reap_within(&mut child, reap_until);
+    if status.is_none() {
+        hand_off_job_to_reaper(child, permit, None);
+    }
+    Finished { exited, status }
+}
+
+fn reap_within(child: &mut Child, until: Instant) -> Option<ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            #[cfg(windows)]
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < until =>
+            {
+                thread::sleep(REAP_POLL);
+            }
+            Ok(None) if Instant::now() < until => thread::sleep(REAP_POLL),
+            _ => return None,
+        }
+    }
+}
+
+/// Wait for a child that survived both kills (uninterruptible sleep) on a
+/// detached thread so it does not stay a zombie. The thread ends when the
+/// child finally dies; until then the run's permit stays held and the child
+/// counts as stuck.
+///
+/// A launch guard (`guard`) still ending its session is [`crate::process::launch_guard::lingering`]
+/// until it is reaped, and its session after that when someone else killed it.
+#[cfg(not(windows))]
+fn hand_off_to_reaper(mut child: Child, permit: Permit, guard: Option<Process>) {
+    lock(permit.0).stuck += 1;
+    let shared = permit.0;
+    let (ended_tx, ended_rx) = std::sync::mpsc::channel::<bool>();
+    if let Some(guard) = guard {
+        let mut reaped = false;
+        crate::process::launch_guard::linger(move || {
+            if !reaped {
+                match ended_rx.try_recv() {
+                    // Killed by someone else: its session is this cleanup's to end.
+                    Ok(true) => reaped = true,
+                    Ok(false) => return true,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                    // No reaper thread: nothing proves the guard ended.
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+                }
+            }
+            crate::process::process_list::kill_session(guard).settled()
+        });
+    }
+    let spawned = thread::Builder::new()
+        .name("wsmp-reaper".to_string())
+        .spawn(move || {
+            let killed = child.wait().is_ok_and(|status| status.code().is_none());
+            let _ = ended_tx.send(killed);
+            {
+                let mut budget = lock(shared);
+                budget.stuck = budget.stuck.saturating_sub(1);
+            }
+            drop(permit);
+        });
+    if spawned.is_err() {
+        // The child (dropped with the closure) is not reaped; nothing more
+        // can be done without a thread.
+        let mut budget = lock(shared);
+        budget.stuck = budget.stuck.saturating_sub(1);
+    }
+}
+
+#[cfg(windows)]
+fn hand_off_job_to_reaper(mut child: Child, permit: Permit, registration: Option<JobRegistration>) {
+    lock(permit.0).stuck += 1;
+    let shared = permit.0;
+    let spawned = thread::Builder::new()
+        .name("wsmp-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+            // wait retries termination before observing even a cached exit.
+            // Drop the child before the guard on errors or thread failure,
+            // leaving kill-on-close as the fallback for the owned wrapper.
+            drop(child);
+            drop(registration);
+            {
+                let mut budget = lock(shared);
+                budget.stuck = budget.stuck.saturating_sub(1);
+            }
+            drop(permit);
+        });
+    if spawned.is_err() {
+        let mut budget = lock(shared);
+        budget.stuck = budget.stuck.saturating_sub(1);
+    }
+}
+
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    let Ok(raw) = i32::try_from(pid) else {
+        return;
+    };
+    if raw <= 1 {
+        return;
+    }
+    // ESRCH (the group is already gone) is fine.
+    let _ = nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(raw),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+}
+
+/// What a registered run is killed as: its group AND the direct child by pid
+/// (it may have left the group). A helper that left the group (`setsid`,
+/// its own `setpgid`) is not reached. On Linux a registered run is still an
+/// unreaped zombie or live process (`waitid(WNOWAIT)` in `finish`), so its
+/// pid cannot have been recycled. Other Unix targets reap first, so this
+/// widens the accepted G1-2 window (a recycled pid, in the microseconds
+/// between the reap and `unregister`) from the group kill to this one.
+/// A launch guard (`guard`) is sent SIGTERM: it ends its session itself before its launcher
+/// lock goes, and the signal is all that happens here. Registered, so unreaped (the same G1-2
+/// window aside): no start time is read first, so shutdown, the panic hook and `register` never
+/// wait for a `ps` under the registry lock.
+#[cfg(unix)]
+fn kill_run(pid: u32, guard: Option<Process>) {
+    if let Some(guard) = guard {
+        crate::process::launch_guard::terminate_unreaped(guard);
+        return;
+    }
+    kill_group(pid);
+    let Ok(raw) = i32::try_from(pid) else {
+        return;
+    };
+    if raw > 1 {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(raw),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn kill_group(job: &JobTree) {
+    let _ = job.terminate();
+}
+
+/// Kill the run: its group, then the direct child itself (it may have left
+/// the group; while unreaped its pid cannot be recycled, and `Child::kill` is
+/// a no-op once std has reaped it). A detached helper (its own session or
+/// group) is not reached.
+#[cfg(unix)]
+fn kill_group_or_child(child: &mut Child) {
+    kill_group(child.id());
+    let _ = child.kill();
+}
+
+/// Poll until the child has exited, `until` passes or the caller cancels,
+/// leaving it unreaped. True when it exited.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn wait_for_exit(child: &mut Child, until: Instant, cancelled: &dyn Fn() -> bool) -> bool {
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+    let Ok(raw) = i32::try_from(child.id()) else {
+        return false;
+    };
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    loop {
+        match waitid(Id::Pid(nix::unistd::Pid::from_raw(raw)), flags) {
+            Ok(WaitStatus::StillAlive) if Instant::now() < until && !cancelled() => {
+                thread::sleep(REAP_POLL);
+            }
+            Ok(WaitStatus::StillAlive) => return false,
+            _ => return true,
+        }
+    }
+}
+
+/// Poll until the child has exited, `until` passes or the caller cancels
+/// (this reaps; see [`finish`]). True when it exited.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn wait_for_exit(child: &mut Child, until: Instant, cancelled: &dyn Fn() -> bool) -> bool {
+    loop {
+        match child.try_wait() {
+            #[cfg(windows)]
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= until || cancelled() {
+                    return false;
+                }
+                thread::sleep(REAP_POLL);
+            }
+            Ok(None) if Instant::now() < until && !cancelled() => thread::sleep(REAP_POLL),
+            Ok(None) => return false,
+            _ => return true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

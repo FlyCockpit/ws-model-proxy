@@ -247,7 +247,7 @@ struct DeadmanFixture {
     tmp: tempfile::TempDir,
     state: std::path::PathBuf,
     units: std::path::PathBuf,
-    current: wsmp::update::state::UpdateState,
+    current: wsmp::relay::update::state::UpdateState,
 }
 
 #[cfg(target_os = "linux")]
@@ -255,7 +255,7 @@ impl DeadmanFixture {
     /// A current update with its own recovery copy for the rollback job.
     fn new() -> Self {
         use std::os::unix::fs::PermissionsExt;
-        use wsmp::update::{install, state};
+        use wsmp::relay::update::{install, state};
         let tmp = tempfile::tempdir().expect("fixture");
         let state_dir = tmp.path().join("state");
         let bin = tmp.path().join("bin");
@@ -291,7 +291,7 @@ impl DeadmanFixture {
         let current = state::UpdateState {
             update_id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
             origin: state::Origin::Server,
-            strategy: wsmp::protocol::runtime_spec::UpdateStrategy::SelfReplace,
+            strategy: wsmp::wire::protocol::runtime_spec::UpdateStrategy::SelfReplace,
             from_version: "0.4.2".into(),
             to_version: "0.4.3".into(),
             to_sha256: Some(install::sha256_file(&layout.live).expect("fixture")),
@@ -320,7 +320,7 @@ impl DeadmanFixture {
     /// The units this release writes for the job (as `SystemdTimer::register` does), and the
     /// `ExecStart` argv of the service: exactly what systemd runs.
     fn arm(&self) -> Vec<String> {
-        use wsmp::update::{deadman, flow};
+        use wsmp::relay::update::{deadman, flow};
         let spec = flow::deadman_spec(
             &self.current,
             &self.state,
@@ -417,8 +417,8 @@ fn the_dead_mans_scheduled_program_runs_again_after_a_failed_restart() {
     assert!(!node.job_removed());
     // The old build (the real wsmp) is live again.
     assert_eq!(
-        wsmp::update::install::sha256_file(&node.current.live_path).unwrap(),
-        wsmp::update::install::sha256_file(Path::new(&job[0])).unwrap()
+        wsmp::relay::update::install::sha256_file(&node.current.live_path).unwrap(),
+        wsmp::relay::update::install::sha256_file(Path::new(&job[0])).unwrap()
     );
 
     // The scheduler's next run: exactly the same program and arguments.
@@ -450,13 +450,16 @@ fn the_dead_mans_scheduled_program_finishes_a_rollback_cut_short_after_the_resto
     let job = node.arm();
     // What the interrupted run did: intent saved, then the restore, then it died.
     node.current.begin_rollback().unwrap();
-    wsmp::update::state::save(&node.state.join("update"), &node.current).unwrap();
-    let layout = wsmp::update::install::Layout {
+    wsmp::relay::update::state::save(&node.state.join("update"), &node.current).unwrap();
+    let layout = wsmp::relay::update::install::Layout {
         recovery: node.current.recovery_path.clone().unwrap(),
-        ..wsmp::update::install::Layout::beside(&node.current.live_path, &node.current.update_id)
-            .unwrap()
+        ..wsmp::relay::update::install::Layout::beside(
+            &node.current.live_path,
+            &node.current.update_id,
+        )
+        .unwrap()
     };
-    assert!(wsmp::update::install::restore(&layout).unwrap());
+    assert!(wsmp::relay::update::install::restore(&layout).unwrap());
     assert!(!node.current.prev_path.exists());
     assert_eq!(node.stored()["phase"], "swapped");
 

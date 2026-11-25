@@ -47,7 +47,7 @@ export const CLI_OUTPUT_ELLIPSIS = "\n…\n";
  * Product credential prefixes removed from command output. Must equal the
  * values of `PRODUCT_CREDENTIAL_PREFIXES` in `@ws-model-proxy/db/node-security`
  * (`apps/server/src/relay/node-operator-services.test.ts` pins that); duplicated
- * here because that module is Node-only. `apps/cli/src/child_env.rs` keeps the
+ * here because that module is Node-only. `apps/cli/src/process/child_env.rs` keeps the
  * same list for the environment scrubber.
  */
 export const CLI_OUTPUT_CREDENTIAL_PREFIXES: readonly string[] = [
@@ -383,7 +383,7 @@ const BOUNDARY = GROUND * DECODER_STATES + DEC_NONE;
  * server's event loop for every byte of headless exec output, so its cost
  * must not depend on what the output looks like.
  *
- * The Rust CLI's capture (`apps/cli/src/terminal_parse.rs`) implements the
+ * The Rust CLI's capture (`apps/cli/src/services/terminal_parse.rs`) implements the
  * same rules for supervised output.
  */
 export class TerminalByteState {

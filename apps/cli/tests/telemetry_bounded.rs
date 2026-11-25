@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use wsmp::bounded_run::{Bounded, run_bounded};
+use wsmp::process::bounded_run::{Bounded, run_bounded};
 
 fn sh(script: &str, timeout: Duration, limit: u64) -> Bounded {
     run_bounded(

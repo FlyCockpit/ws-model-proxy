@@ -16,7 +16,7 @@ function hardwareOf(nodeInfo: unknown, declaredResources: unknown = null) {
   });
 }
 
-/** What a DGX Spark's CLI reports (`apps/cli/src/hardware.rs`, fixture dgx-spark-gb10). */
+/** What a DGX Spark's CLI reports (`apps/cli/src/host/hardware.rs`, fixture dgx-spark-gb10). */
 const GB10_INFO = {
   nodeKind: "unified",
   memoryTotalMiB: 122357,

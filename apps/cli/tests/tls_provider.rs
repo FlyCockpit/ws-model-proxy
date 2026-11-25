@@ -4,7 +4,7 @@
 //! first `wss://` connect.
 //!
 //! This file runs as its own process and deliberately does not call
-//! `wsmp::tls::install_crypto_provider`, so the connect below takes the
+//! `wsmp::services::tls::install_crypto_provider`, so the connect below takes the
 //! crate-feature fallback path that panicked.
 
 use std::net::TcpListener;

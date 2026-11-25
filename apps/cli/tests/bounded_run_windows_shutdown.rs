@@ -6,7 +6,7 @@ mod windows_tree;
 
 use std::time::{Duration, Instant};
 use windows_tree::{Tree, assert_dead};
-use wsmp::bounded_run::{RunError, active_runs, kill_all_active, run};
+use wsmp::process::bounded_run::{RunError, active_runs, kill_all_active, run};
 
 #[test]
 fn shutdown_reaches_the_job_registered_by_run_and_refuses_later_runs() {

@@ -58,7 +58,7 @@ A 1.0 CLI connecting to a 0.4.x server asks the operator to upgrade the server.
 The code and current cross-language vectors define the complete frame and binary formats:
 
 - [Server frames](../../server/src/relay/frames.ts) — TypeScript schemas.
-- [CLI frames](../src/protocol/frames.rs) — Rust frame types.
+- [CLI frames](../src/wire/protocol/frames.rs) — Rust frame types.
 - [Relay 4.0 fixtures](../tests/fixtures/relay-4.0/) — shared vectors.
 
 

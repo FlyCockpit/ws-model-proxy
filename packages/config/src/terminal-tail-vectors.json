@@ -1,5 +1,5 @@
 {
-  "description": "Rolling-tail boundary vectors: feed streamHex in chunk-byte pieces into a tail of at most max bytes that also drops bytes from its front until the terminal parser is in its ground state on a whole character; the result must equal tailHex. Generated from appendRollingTail (packages/config/src/cli-command-output.ts); checked by packages/config/src/cli-command-output.test.ts and apps/cli/src/terminal_parse.rs.",
+  "description": "Rolling-tail boundary vectors: feed streamHex in chunk-byte pieces into a tail of at most max bytes that also drops bytes from its front until the terminal parser is in its ground state on a whole character; the result must equal tailHex. Generated from appendRollingTail (packages/config/src/cli-command-output.ts); checked by packages/config/src/cli-command-output.test.ts and apps/cli/src/services/terminal_parse.rs.",
   "vectors": [
     {
       "streamHex": "706c61696e20746578742074686174206973206c6f6e676572207468616e20746865207461696c",

@@ -658,7 +658,7 @@ fn define_always_on(socket: &mut TcpStream, op: &str, base_url: &str, auth: Opti
     if let Some(env) = auth {
         spec["address"]["auth"] = json!({ "mode": "bearer", "env": env });
     }
-    let hash = wsmp::protocol::canonical::launch_hash(&spec).expect("hash");
+    let hash = wsmp::wire::protocol::canonical::launch_hash(&spec).expect("hash");
     write_text(
         socket,
         &json!({
@@ -806,7 +806,7 @@ fn runtime_jobs_render_only_from_held_definitions() {
             "health": { "intervalMs": 30000, "failureThreshold": 3, "successThreshold": 1 }
         }
     });
-    let hash = wsmp::protocol::canonical::launch_hash(&spec).expect("hash");
+    let hash = wsmp::wire::protocol::canonical::launch_hash(&spec).expect("hash");
     let commands = json!([]);
     let fabrics = json!([]);
     write_text(
@@ -820,11 +820,11 @@ fn runtime_jobs_render_only_from_held_definitions() {
             "node": {
                 "portRange": [30000, 30999],
                 "metricCommands": {
-                    "hash": wsmp::protocol::canonical::canonical_sha256(&commands).expect("hash"),
+                    "hash": wsmp::wire::protocol::canonical::canonical_sha256(&commands).expect("hash"),
                     "commands": commands
                 },
                 "fabrics": {
-                    "hash": wsmp::protocol::canonical::canonical_sha256(&fabrics).expect("hash"),
+                    "hash": wsmp::wire::protocol::canonical::canonical_sha256(&fabrics).expect("hash"),
                     "sets": fabrics
                 },
                 "commandMaxMs": 86_400_000

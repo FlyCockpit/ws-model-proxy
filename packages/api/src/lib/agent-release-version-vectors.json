@@ -1,5 +1,5 @@
 {
-  "description": "Release versions as the node reads them (`is_release_version` in apps/cli/src/protocol/frames.rs): an `agent.update` version or an `availableVersion` the server accepts must be one the node accepts. Checked by both sides.",
+  "description": "Release versions as the node reads them (`is_release_version` in apps/cli/src/wire/protocol/frames.rs): an `agent.update` version or an `availableVersion` the server accepts must be one the node accepts. Checked by both sides.",
   "vectors": [
     { "value": "0.4.3", "valid": true },
     { "value": "0.4.4-rc.1", "valid": true },
@@ -44,7 +44,7 @@
     { "value": "-1.2.3", "valid": false },
     { "value": "1.2.3-a/b", "valid": false }
   ],
-  "comparisonsDescription": "SemVer precedence as the node orders release versions (`compare_release` in apps/cli/src/update/homebrew.rs; build metadata ignored, an empty pre-release identifier kept as one): each entry is [a, b, order] with order -1, 0 or 1 (every pair of the valid versions above, plus edge cases). The server's `compareReleaseVersions` must give the same order; both sides check every entry.",
+  "comparisonsDescription": "SemVer precedence as the node orders release versions (`compare_release` in apps/cli/src/relay/update/homebrew.rs; build metadata ignored, an empty pre-release identifier kept as one): each entry is [a, b, order] with order -1, 0 or 1 (every pair of the valid versions above, plus edge cases). The server's `compareReleaseVersions` must give the same order; both sides check every entry.",
   "comparisons": [
     ["0.4.3", "0.4.3", 0],
     ["0.4.3", "0.4.4-rc.1", -1],

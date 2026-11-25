@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use wsmp::bounded_run::{RunError, active_runs, kill_all_active, run};
+use wsmp::process::bounded_run::{RunError, active_runs, kill_all_active, run};
 
 #[test]
 fn exiting_kills_the_running_group_and_refuses_later_runs() {

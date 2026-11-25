@@ -18,14 +18,15 @@ The Rust command-line relay client for WS Model Proxy. The `wsmp` CLI enrolls a 
 | ---- | ------------ |
 | `src/lib.rs` | Shared implementation modules used by the binary and tests. |
 | `src/main.rs` | Entry point: parse arguments, initialize logging, dispatch, map errors to exit codes. |
-| `src/cli.rs` | Clap argument definitions. Keep CLI shape here and command logic elsewhere. |
-| `src/commands/` | One file per subcommand, each exposing `Args` and `run(&Args)`. |
-| `src/config.rs` | Local JSON config (`config.json`): structs, load/save, validation. |
-| `src/state.rs` | The stored node credential and mutable local relay state. |
-| `src/daemon.rs` | Foreground websocket relay session. |
-| `src/probe.rs` | Model-list and capability probing of a runtime's endpoint. |
+| `src/<layer>/` | The crate's layers, each using only the ones below it: `app`, `relay`, `services`, `host`, `node`, `process`, `wire`, plus crate-root leaves (see `src/lib.rs`). |
+| `src/app/cli.rs` | Clap argument definitions. Keep CLI shape here and command logic elsewhere. |
+| `src/app/commands/` | One file per subcommand, each exposing `Args` and `run(&Args)`, grouped by role (`setup/`, `operate/`, `internal/`). |
+| `src/node/config.rs` | Local JSON config (`config.json`): structs, load/save, validation. |
+| `src/node/state.rs` | The stored node credential and mutable local relay state. |
+| `src/relay/daemon.rs` | Foreground websocket relay session. |
+| `src/host/probe.rs` | Model-list and capability probing of a runtime's endpoint. |
 | `src/paths.rs` | Cross-platform config/data directories via `dirs`. |
-| `src/logging.rs` | Tracing setup. Logs go to stderr. |
+| `src/app/logging.rs` | Tracing setup. Logs go to stderr. |
 | `src/exit.rs` | Stable process exit codes. |
 | `tests/cli/` | Black-box tests that run the built binary (one test binary, a module per command area). |
 | `xtask/` | CLI workspace automation: `sync-docs`. |
@@ -74,14 +75,14 @@ cargo xtask sync-docs --check
 - Quote identifiers and paths in backticks. Keep error messages lowercase and omit trailing periods.
 - Exit codes are public behavior; see `src/exit.rs` before adding or changing one.
 - Any command that prints structured data should support `--json` and emit from a typed `Serialize` struct.
-- Use `src/output.rs` for stdout writes so output behavior stays deliberate.
+- Use `src/app/output.rs` for stdout writes so output behavior stays deliberate.
 - Pure logic tests can live next to code under `#[cfg(test)]`; CLI behavior tests belong in `tests/`.
 
 ## Adding a Command
 
-1. Add `src/commands/<name>.rs` with an `Args` type and `run(&Args) -> anyhow::Result<()>`.
-2. Register the module in `src/commands/mod.rs`.
-3. Add a variant to `Command` in `src/cli.rs`.
+1. Add `src/app/commands/<role>/<name>.rs` with an `Args` type and `run(&Args) -> anyhow::Result<()>`.
+2. Register the module in `src/app/commands/<role>/mod.rs`.
+3. Add a variant to `Command` in `src/app/cli.rs`.
 4. Add a match arm in `src/main.rs`.
 5. Add focused black-box tests in the matching `tests/cli/` module when the command affects user-visible behavior.
 

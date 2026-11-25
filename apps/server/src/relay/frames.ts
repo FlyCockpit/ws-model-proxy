@@ -1,6 +1,6 @@
 /**
  * Relay protocol 4.0: strict schemas for every frame in both directions.
- * The Rust mirror is `apps/cli/src/protocol/frames.rs`; shared fixtures in
+ * The Rust mirror is `apps/cli/src/wire/protocol/frames.rs`; shared fixtures in
  * `apps/cli/tests/fixtures/relay-4.0/` parse on both sides.
  */
 

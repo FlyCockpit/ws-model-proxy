@@ -1,5 +1,5 @@
 {
-  "rules": "see apps/cli/src/runtimes/render.rs (substitute, gpu_ids, positive_decimal, fraction) and packages/api/src/lib/command-render.ts; substitution is raw (no quoting)",
+  "rules": "see apps/cli/src/services/runtimes/render.rs (substitute, gpu_ids, positive_decimal, fraction) and packages/api/src/lib/command-render.ts; substitution is raw (no quoting)",
   "values": {
     "port": "30001",
     "node_rank": "0",

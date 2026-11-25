@@ -7,7 +7,7 @@ mod windows_tree;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows_tree::{Tree, assert_dead};
-use wsmp::bounded_run::{REAP_GRACE, RunError, run};
+use wsmp::process::bounded_run::{REAP_GRACE, RunError, run};
 
 fn cmd(tree: &Tree, mode: &str, cancel: Option<&AtomicBool>) -> Result<Vec<u8>, RunError> {
     run(

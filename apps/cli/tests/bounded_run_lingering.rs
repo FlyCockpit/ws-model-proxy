@@ -10,7 +10,7 @@
 use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
-use wsmp::bounded_run::{RunError, run};
+use wsmp::process::bounded_run::{RunError, run};
 
 /// The child joins the anchor's group (so `killpg(child pid)` finds nothing),
 /// writes a byte, sleeps, then touches the marker if it was left alive.
