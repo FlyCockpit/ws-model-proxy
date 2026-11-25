@@ -25,6 +25,8 @@ mod read_grant;
 mod read_tests;
 mod resolve_policy;
 mod tools;
+#[cfg(target_os = "linux")]
+mod transaction_trace;
 
 pub struct Fx {
     pub _dir: tempfile::TempDir,
