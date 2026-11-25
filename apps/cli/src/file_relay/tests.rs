@@ -27,7 +27,7 @@ struct Harness {
     relay: FileRelay,
     rx: Receiver<(String, Vec<FileFrame>)>,
     /// The trust the relay reads (the daemon's `TrustAuthority`).
-    trust: Arc<crate::startup::TrustAuthority>,
+    trust: Arc<crate::trust::TrustAuthority>,
 }
 
 fn harness_with(runtime: Arc<FileRuntime>, full_control: bool) -> Harness {
@@ -36,7 +36,7 @@ fn harness_with(runtime: Arc<FileRuntime>, full_control: bool) -> Harness {
     let sink: FileSink = Arc::new(move |op_id, frames| {
         let _ = tx.lock().expect("sink").send((op_id, frames));
     });
-    let trust = crate::startup::TrustAuthority::new(full_control);
+    let trust = crate::trust::TrustAuthority::new(full_control);
     Harness {
         relay: FileRelay::new(runtime, Arc::clone(&trust), sink),
         rx,

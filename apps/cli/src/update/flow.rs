@@ -72,7 +72,7 @@ pub struct Machine<'a> {
     /// Homebrew only, before the keg changes: make the installed service
     /// start the stable `opt` path it is given (the path the update probes
     /// after `brew upgrade`), or say why it cannot (the update stops).
-    /// [`crate::commands::service::ensure_stable_executable`] outside tests.
+    /// [`crate::service::files::ensure_stable_executable`] outside tests.
     pub stable_service: fn(&Path) -> anyhow::Result<()>,
 }
 

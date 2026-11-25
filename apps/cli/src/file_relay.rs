@@ -41,7 +41,7 @@ use crate::protocol::frames::FileOpKind;
 use crate::protocol::{
     NodeBinaryMetadata, NodeFrame, RELAY_BINARY_CHUNK_MAX_BYTES, RELAY_JSON_CONTROL_MAX_BYTES,
 };
-use crate::startup::{TrustAuthority, TrustSnapshot};
+use crate::trust::{TrustAuthority, TrustSnapshot};
 
 /// Text above this many bytes travels as a binary `file.data` frame.
 pub const INLINE_TEXT_MAX_BYTES: usize = 48 * 1024;

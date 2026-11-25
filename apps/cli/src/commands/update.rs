@@ -229,7 +229,7 @@ fn update(args: &Args) -> Result<()> {
         );
     }
     // Windows: a build older than 1.0 knows only the 0.4 task names.
-    crate::commands::service::refuse_pre_sid_downgrade(&manifest.version)?;
+    crate::service::task_scheduler::refuse_pre_sid_downgrade(&manifest.version)?;
     let state_dir = crate::paths::state_dir()?;
     let update_dir = state_dir.join("update");
     // Released before the restart: the new build takes it to confirm.
@@ -253,7 +253,7 @@ fn update(args: &Args) -> Result<()> {
             previous.to_version
         );
     }
-    let service = crate::commands::service::installed();
+    let service = crate::service::installed();
     let scheduler = if service {
         crate::update::deadman::platform()
     } else {
@@ -272,7 +272,7 @@ fn update(args: &Args) -> Result<()> {
         current_version: current.clone(),
         before_swap: None,
         proceed: None,
-        stable_service: crate::commands::service::ensure_stable_executable,
+        stable_service: crate::service::files::ensure_stable_executable,
     };
 
     if identity.method == InstallMethod::Homebrew {
@@ -303,7 +303,7 @@ fn update(args: &Args) -> Result<()> {
             &current,
             &manifest.version,
             None,
-            crate::commands::service::Restart::Reloaded,
+            crate::service::Restart::Reloaded,
         );
     }
 
@@ -355,7 +355,7 @@ fn update(args: &Args) -> Result<()> {
         &current,
         &manifest.version,
         Some(CLI_ROLLBACK_SECS),
-        crate::commands::service::Restart::Loaded,
+        crate::service::Restart::Loaded,
     )
 }
 
@@ -377,20 +377,19 @@ fn finish(
     from: &str,
     to: &str,
     rollback: Option<u32>,
-    restart: crate::commands::service::Restart,
+    restart: crate::service::Restart,
 ) -> Result<()> {
     if service {
         // Windows: a node installed by 0.4.x moves onto the SID-named relay
         // task now (a no-op elsewhere, and once moved). A failure leaves the
         // task the relay runs from, so the update goes on.
-        if let Err(error) = crate::commands::service::migrate_relay_task_for(to) {
+        if let Err(error) = crate::service::task_scheduler::migrate_relay_task_for(to) {
             tracing::warn!(
                 error = %format!("{error:#}"),
                 "moving the relay service to its new scheduled-task name failed; run `wsmp service install` to retry"
             );
         }
-        crate::commands::service::restart_quietly(restart)
-            .context("restarting the relay service")?;
+        crate::service::restart_quietly(restart).context("restarting the relay service")?;
         let text = match rollback {
             Some(secs) => format!(
                 "updated wsmp {from} to {to} and restarted the service; it rolls back by itself unless the new build connects within {secs} s (`wsmp update status`)"
@@ -455,7 +454,7 @@ fn status(json: bool) -> Result<()> {
         strategies: crate::update::agent::strategies(
             identity.method,
             identity.live.is_some(),
-            crate::commands::service::installed(),
+            crate::service::installed(),
         ),
         instances_survive: crate::update::agent::instances_survive(),
         last_update,
@@ -517,7 +516,7 @@ fn rollback(update_id: &str) -> Result<()> {
         &update_dir,
         update_id,
         scheduler.as_deref(),
-        &|| crate::commands::service::restart_quietly(crate::commands::service::Restart::Loaded),
+        &|| crate::service::restart_quietly(crate::service::Restart::Loaded),
         &RESTART_RETRY_WAITS,
         log_tail,
     )
@@ -632,7 +631,7 @@ fn early_run_done(update_dir: &std::path::Path) -> bool {
             .flatten()
             .and_then(|current| current.deadman_at)
             .is_some_and(|fires_at| crate::update::unix_now() + 3 < fires_at);
-        if early && let Err(error) = crate::commands::service::kick_relay_task() {
+        if early && let Err(error) = crate::service::task_scheduler::kick_relay_task() {
             tracing::warn!(error = %format!("{error:#}"), "starting the relay task failed");
         }
         early
@@ -648,7 +647,7 @@ fn early_run_done(update_dir: &std::path::Path) -> bool {
 fn log_tail() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        let (_, text) = crate::update::deadman::run_bounded(
+        let (_, text) = crate::bounded_run::management::run_bounded(
             "journalctl",
             &[
                 "--user",

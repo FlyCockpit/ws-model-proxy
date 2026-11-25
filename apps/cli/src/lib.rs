@@ -39,6 +39,7 @@ pub mod relay_bus;
 pub mod runtime_store;
 pub mod runtimes;
 pub mod secrets;
+pub mod service;
 pub mod sessions;
 pub mod shells;
 pub mod shutdown;
@@ -59,6 +60,7 @@ pub mod tls;
 pub mod tokens;
 pub mod trust;
 pub mod update;
+pub mod upstream;
 
 #[cfg(all(test, windows))]
 #[path = "../tests/support/windows_tree.rs"]

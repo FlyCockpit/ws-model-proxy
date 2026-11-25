@@ -19,7 +19,7 @@
 //! touched; install says so.
 //!
 //! The logic is behind [`Tasks`], so it is tested everywhere with a fake
-//! scheduler; `service.rs` implements it with `schtasks` and PowerShell.
+//! scheduler; `task_scheduler.rs` implements it with `schtasks` and PowerShell.
 
 use anyhow::Result;
 

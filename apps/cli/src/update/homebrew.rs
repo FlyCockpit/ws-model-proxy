@@ -129,7 +129,7 @@ fn brew(keg: &Keg) -> PathBuf {
 /// Why Homebrew may not update this install, if it may not: a pinned
 /// formula, or one from another tap.
 pub fn refusal(keg: &Keg) -> Result<Option<String>> {
-    let (ok, listing) = super::deadman::run_bounded(
+    let (ok, listing) = crate::bounded_run::management::run_bounded(
         brew(keg),
         &["list", "--pinned"],
         &[],
@@ -157,8 +157,9 @@ pub fn refusal(keg: &Keg) -> Result<Option<String>> {
 /// Changes Homebrew's tap checkouts only, never an installed keg. It takes
 /// Homebrew's update lock itself: never call it while holding a [`TapLock`].
 pub fn refresh(keg: &Keg) -> Result<()> {
-    let (ok, output) = super::deadman::run_bounded(brew(keg), &["update"], &[], REFRESH_TIMEOUT)
-        .context("running `brew update`")?;
+    let (ok, output) =
+        crate::bounded_run::management::run_bounded(brew(keg), &["update"], &[], REFRESH_TIMEOUT)
+            .context("running `brew update`")?;
     anyhow::ensure!(ok, "`brew update` failed: {}", output.trim());
     Ok(())
 }
@@ -166,7 +167,7 @@ pub fn refresh(keg: &Keg) -> Result<()> {
 /// The version `flycockpit/tap/wsmp` installs now, from the local tap
 /// (`brew info --json=v2`; no refresh of its own).
 pub fn tap_version(keg: &Keg) -> Result<String> {
-    let (ok, json, errors) = super::deadman::run_bounded_split(
+    let (ok, json, errors) = crate::bounded_run::management::run_bounded_split(
         brew(keg),
         &["info", "--json=v2", FORMULA],
         &[("HOMEBREW_NO_AUTO_UPDATE", "1".into())],
@@ -280,7 +281,7 @@ pub fn compare_release(a: &str, b: &str) -> Option<std::cmp::Ordering> {
 /// The path is the output exactly ([`prefix_from_output`]): the lock is the
 /// file `brew` itself takes, never one at a path trimmed differently.
 pub fn prefix(keg: &Keg) -> Result<PathBuf> {
-    let ran = super::deadman::run_bounded_bytes(
+    let ran = crate::bounded_run::management::run_bounded_bytes(
         brew(keg),
         &["--prefix"],
         &[("HOMEBREW_NO_AUTO_UPDATE", "1".into())],
@@ -496,7 +497,7 @@ impl TapLock {
 /// the caller lives; if wsmp dies mid-upgrade, the server's deadline and the
 /// version the next start reports do. Its output on failure.
 pub fn upgrade(keg: &Keg, _checked_under: TapLock) -> Result<()> {
-    let (ok, output) = super::deadman::run_bounded(
+    let (ok, output) = crate::bounded_run::management::run_bounded(
         brew(keg),
         &["upgrade", FORMULA],
         &[

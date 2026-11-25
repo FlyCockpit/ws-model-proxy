@@ -89,7 +89,7 @@ struct ServiceCheck {
 #[cfg(target_os = "linux")]
 fn service_check() -> Option<ServiceCheck> {
     use crate::commands::service;
-    if !service::installed() {
+    if !crate::service::installed() {
         return None;
     }
     let linger = service::linger_on();

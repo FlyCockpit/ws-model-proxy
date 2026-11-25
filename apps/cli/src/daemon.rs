@@ -20,9 +20,9 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::{self};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -100,46 +100,6 @@ const TELEMETRY_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// worker has had a chance to run.
 const UPSTREAM_BODY_HANDOFF_CAPACITY: usize = 1;
 const REQUEST_BODY_INGRESS_CAPACITY: usize = RELAY_REQUEST_BODY_WINDOW_CHUNKS;
-
-// Request workers are synchronous threads, but their HTTP work is async. Keep
-// one process-long runtime and connection pool instead of constructing a Tokio
-// reactor and reqwest client for every relayed request.
-static UPSTREAM_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-static UPSTREAM_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-pub(crate) fn upstream_runtime() -> Result<&'static tokio::runtime::Runtime> {
-    if let Some(runtime) = UPSTREAM_RUNTIME.get() {
-        return Ok(runtime);
-    }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("creating shared cancellable upstream runtime")?;
-    let _ = UPSTREAM_RUNTIME.set(runtime);
-    UPSTREAM_RUNTIME
-        .get()
-        .context("initializing shared cancellable upstream runtime")
-}
-
-pub(crate) fn upstream_http_client() -> Result<&'static reqwest::Client> {
-    if let Some(client) = UPSTREAM_HTTP_CLIENT.get() {
-        return Ok(client);
-    }
-    crate::tls::install_crypto_provider();
-    let client = reqwest::Client::builder()
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
-        // Redirects are an execution boundary: replaying configured credentials
-        // to a Location target (even same-origin) is not safe without validating
-        // every hop. Native relay therefore exposes 3xx to the caller unchanged.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("building shared cancellable upstream client")?;
-    let _ = UPSTREAM_HTTP_CLIENT.set(client);
-    UPSTREAM_HTTP_CLIENT
-        .get()
-        .context("initializing shared cancellable upstream client")
-}
 
 /// A request-body chunk delivered to a worker's upstream request reader.
 struct BodyChunk {
@@ -828,7 +788,7 @@ pub fn connect_foreground() -> Result<()> {
 /// What a control request or a hot reload changed, for the live session.
 ///
 /// Trust itself is not carried here: the effects of a lowering follow the
-/// daemon's [`crate::startup::TrustAuthority`] (its lowering count against
+/// daemon's [`crate::trust::TrustAuthority`] (its lowering count against
 /// the one last applied, [`take_lowering`]), so changes that land in any
 /// order in one loop turn end at whatever trust is now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2355,7 +2315,7 @@ where
                     .unwrap_or_default(),
                 method: identity.method,
                 has_live: identity.live.is_some(),
-                under_service: under_service_manager(),
+                under_service: crate::service::under_service_manager(),
             };
             tracing::info!(update_id, version, force, "update requested");
             let frames = session.update.request(
@@ -3774,7 +3734,7 @@ fn run_upstream_worker(
 ) {
     let request_id = spec.request_id.clone();
     let mut phase = ResponsePhase::Requesting;
-    let result = upstream_runtime().and_then(|runtime| {
+    let result = crate::upstream::runtime().and_then(|runtime| {
         runtime.block_on(execute_upstream_tracked(
             spec,
             body_rx,
@@ -3853,8 +3813,8 @@ async fn execute_upstream_tracked(
     mut cancellation_rx: watch::Receiver<bool>,
     phase: &mut ResponsePhase,
 ) -> Result<()> {
-    let url = endpoint_url(&spec.base_url, &spec.path)?;
-    let client = upstream_http_client()?;
+    let url = crate::upstream::endpoint_url(&spec.base_url, &spec.path)?;
+    let client = crate::upstream::http_client()?;
     let method = reqwest::Method::from_bytes(spec.method.as_bytes())
         .context("parsing relay request method")?;
     let mut builder = client
@@ -4829,11 +4789,6 @@ where
         .map_err(|error| websocket_session_error(error, context))
 }
 
-/// Set by the systemd unit `wsmp service install` writes, which also lists
-/// exit 4 in `RestartPreventExitStatus=`: there, stopping on an unusable
-/// credential cannot turn into a restart loop.
-pub const STOP_ON_REJECTED_CREDENTIAL_ENV: &str = "WSMP_STOP_ON_REJECTED_CREDENTIAL";
-
 /// Whether a missing or rejected credential stops the relay (exit 4), and a
 /// refused relay protocol stops it (exit 5), rather than being retried
 /// in-process (with the normal backoff, capped at 5 min).
@@ -4843,42 +4798,16 @@ pub const STOP_ON_REJECTED_CREDENTIAL_ENV: &str = "WSMP_STOP_ON_REJECTED_CREDENT
 /// daemon, exiting would only restart or lose the relay, so it keeps retrying
 /// and picks up a new `wsmp login` by itself.
 fn stop_on_unusable_credential() -> bool {
-    std::env::var_os(STOP_ON_REJECTED_CREDENTIAL_ENV).is_some_and(|value| value == "1")
+    std::env::var_os(crate::service::STOP_ON_REJECTED_CREDENTIAL_ENV)
+        .is_some_and(|value| value == "1")
         || person_watching()
-}
-
-/// Set by `wsmp run --service`: a service manager started this relay. The
-/// Windows task runs it under `conhost --headless`, whose console stderr is
-/// a terminal that nobody sees.
-static AS_SERVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn run_as_service() {
-    AS_SERVICE.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Whether the installed relay service runs this relay, so an exit is
-/// restarted: the systemd unit `wsmp service install` writes (it sets
-/// [`STOP_ON_REJECTED_CREDENTIAL_ENV`]), its launchd agent (launchd names the
-/// job in `XPC_SERVICE_NAME`), or the Windows task (`wsmp run --service`).
-pub fn under_service_manager() -> bool {
-    if cfg!(target_os = "macos") {
-        return std::env::var("XPC_SERVICE_NAME").is_ok_and(|name| name == "com.flycockpit.wsmp");
-    }
-    if cfg!(windows) {
-        return AS_SERVICE.load(std::sync::atomic::Ordering::SeqCst);
-    }
-    std::env::var_os(STOP_ON_REJECTED_CREDENTIAL_ENV).is_some_and(|value| value == "1")
 }
 
 /// Whether a person sees this relay's stderr: a terminal, and not a service.
 fn person_watching() -> bool {
     use std::io::IsTerminal;
-    !AS_SERVICE.load(std::sync::atomic::Ordering::SeqCst) && std::io::stderr().is_terminal()
+    !crate::service::running_as_service() && std::io::stderr().is_terminal()
 }
-
-/// Set by a systemd unit that also lists exit 5 in `RestartPreventExitStatus=`
-/// so a protocol mismatch stops the service.
-pub const STOP_ON_PROTOCOL_MISMATCH_ENV: &str = "WSMP_STOP_ON_PROTOCOL_MISMATCH";
 
 /// Where an unrecoverable refusal may stop the relay instead of retrying it
 /// slowly: `credential` (exit 4, see [`stop_on_unusable_credential`]) and
@@ -4893,7 +4822,7 @@ impl StopOn {
     fn here() -> Self {
         Self {
             credential: stop_on_unusable_credential(),
-            protocol: std::env::var_os(STOP_ON_PROTOCOL_MISMATCH_ENV)
+            protocol: std::env::var_os(crate::service::STOP_ON_PROTOCOL_MISMATCH_ENV)
                 .is_some_and(|value| value == "1")
                 || person_watching(),
         }
@@ -5208,40 +5137,6 @@ fn websocket_url(server_url: &str) -> Result<Url> {
     };
     url.set_scheme(scheme)
         .map_err(|_| anyhow::anyhow!("setting websocket URL scheme"))?;
-    Ok(url)
-}
-
-/// The upstream URL for `request_path` on a runtime at `base_url` (§4.8):
-/// API paths (`/v1/...`) join onto the base URL, whose API prefix replaces the
-/// leading `/v1`; engine routes (readiness, metrics reader, count route) join
-/// onto the origin. The result must stay on the base URL's origin.
-pub(crate) fn endpoint_url(base_url: &str, request_path: &str) -> Result<Url> {
-    let base =
-        Url::parse(base_url).with_context(|| format!("parsing endpoint URL `{base_url}`"))?;
-    anyhow::ensure!(
-        crate::runtimes::allowlist::path_is_plain(request_path),
-        "the request path is not a plain path"
-    );
-    let prefix = base.path().trim_end_matches('/');
-    let path = match request_path.strip_prefix("/v1") {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            // No prefix: keep `/v1`. A prefix replaces it.
-            if prefix.is_empty() {
-                request_path.to_string()
-            } else {
-                format!("{prefix}{rest}")
-            }
-        }
-        _ => request_path.to_string(),
-    };
-    let mut url = base.clone();
-    url.set_path(&path);
-    url.set_query(None);
-    url.set_fragment(None);
-    anyhow::ensure!(
-        url.origin() == base.origin() && url.path() == path,
-        "the request path leaves the runtime's address"
-    );
     Ok(url)
 }
 
@@ -6424,72 +6319,6 @@ mod tests {
             websocket_url("https://example.test").expect("url").as_str(),
             "wss://example.test/api/cli/ws"
         );
-    }
-
-    #[test]
-    fn api_paths_take_the_prefix_and_engine_routes_the_origin() {
-        let join = |base: &str, path: &str| endpoint_url(base, path).map(|url| url.to_string());
-        for (base, path, want) in [
-            (
-                "http://127.0.0.1:8080/v1",
-                "/v1/chat/completions",
-                "http://127.0.0.1:8080/v1/chat/completions",
-            ),
-            (
-                "http://127.0.0.1:8080",
-                "/v1/chat/completions",
-                "http://127.0.0.1:8080/v1/chat/completions",
-            ),
-            (
-                "http://127.0.0.1:8080/openai",
-                "/v1/chat/completions",
-                "http://127.0.0.1:8080/openai/chat/completions",
-            ),
-            (
-                "http://127.0.0.1:8080/api/v1",
-                "/v1/models",
-                "http://127.0.0.1:8080/api/v1/models",
-            ),
-            (
-                "http://127.0.0.1:8080/v1",
-                "/slots",
-                "http://127.0.0.1:8080/slots",
-            ),
-            (
-                "http://[::1]:8080/v1",
-                "/v1/models",
-                "http://[::1]:8080/v1/models",
-            ),
-            (
-                "http://127.0.0.1:8080/v1",
-                "/v1x/models",
-                "http://127.0.0.1:8080/v1x/models",
-            ),
-        ] {
-            assert_eq!(join(base, path).expect(path), want, "{base} {path}");
-        }
-    }
-
-    #[test]
-    fn a_request_path_never_leaves_the_runtime_address() {
-        for path in [
-            "http://evil.example/x",
-            "/https://evil.example/x",
-            "https:evil.example",
-            "/https:evil.example/x",
-            "/ws:evil.example/x",
-            "/file:etc/passwd",
-            "\\\\evil.example/x",
-            "/v1/../../admin",
-            "//evil.example/x",
-            "/v1/%2e%2e/admin",
-            "/v1/models?x=1",
-        ] {
-            assert!(
-                endpoint_url("http://127.0.0.1:8000/v1", path).is_err(),
-                "{path}"
-            );
-        }
     }
 
     #[test]

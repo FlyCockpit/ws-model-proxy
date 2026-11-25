@@ -159,7 +159,7 @@ pub fn extract(tar: &Path, archive: &Path, into: &Path, target: &str) -> Result<
     std::fs::create_dir_all(into).with_context(|| format!("creating `{}`", into.display()))?;
     // The paths go to `tar` exactly as they are (never as text: a path that is not UTF-8 would
     // name another file).
-    let (ok, output) = super::deadman::run_bounded(
+    let (ok, output) = crate::bounded_run::management::run_bounded(
         tar,
         &[
             OsStr::new("-xf"),
@@ -188,9 +188,13 @@ pub fn extract(tar: &Path, archive: &Path, into: &Path, target: &str) -> Result<
 /// Run `binary --version` (bounded) and return the version it prints after
 /// `wsmp `.
 pub fn probe_version(binary: &Path) -> Result<String> {
-    let (ok, output) =
-        super::deadman::run_bounded(binary, &["--version"], &[], VERSION_PROBE_TIMEOUT)
-            .context("the new build does not run on this machine")?;
+    let (ok, output) = crate::bounded_run::management::run_bounded(
+        binary,
+        &["--version"],
+        &[],
+        VERSION_PROBE_TIMEOUT,
+    )
+    .context("the new build does not run on this machine")?;
     anyhow::ensure!(
         ok,
         "the new build does not run on this machine: {}",

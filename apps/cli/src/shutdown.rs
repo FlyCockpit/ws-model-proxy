@@ -24,7 +24,8 @@
 //! [`crate::bounded_run::kill_all_active`].
 //!
 //! Cleanup is bounded by [`SHUTDOWN_DEADLINE`]. When it expires, or when a
-//! second signal arrives, the watcher kills every tracked child directly,
+//! second signal arrives, the watcher kills every tracked child directly
+//! (through the kill their owner registered, [`register_forced_exit_kill`]),
 //! removes the registered runtime files, and exits at once.
 //!
 //! Windows takes console control events through tokio's handler on its own
@@ -78,7 +79,9 @@ pub fn terminate_by_signal(signal: i32) -> ! {
 }
 
 #[cfg(any(unix, windows))]
-pub use tracked::{ExitCleanup, register_exit_cleanup, request_stop, requested};
+pub use tracked::{
+    ExitCleanup, register_exit_cleanup, register_forced_exit_kill, request_stop, requested,
+};
 
 #[cfg(unix)]
 pub use unix::install;
@@ -87,7 +90,9 @@ pub use unix::install;
 pub use windows::{install, stop_when_console_host_goes};
 
 #[cfg(not(any(unix, windows)))]
-pub use fallback::{ExitCleanup, install, register_exit_cleanup, requested};
+pub use fallback::{
+    ExitCleanup, install, register_exit_cleanup, register_forced_exit_kill, requested,
+};
 
 /// State shared by the platform watchers: the first request, the deadline,
 /// the forced exit, and the runtime-file cleanups it runs.
@@ -95,7 +100,7 @@ pub use fallback::{ExitCleanup, install, register_exit_cleanup, requested};
 mod tracked {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::{Mutex, OnceLock, PoisonError};
     use std::thread;
     use std::time::Instant;
 
@@ -107,6 +112,9 @@ mod tracked {
     static REQUESTED: AtomicI32 = AtomicI32::new(0);
     static CLEANUPS: Mutex<BTreeMap<u64, Cleanup>> = Mutex::new(BTreeMap::new());
     static NEXT_CLEANUP: AtomicU64 = AtomicU64::new(1);
+    /// What kills every tracked child on a forced exit, set by the owner of
+    /// the children before it tracks the first one.
+    static FORCED_EXIT_KILL: OnceLock<fn()> = OnceLock::new();
 
     /// The first shutdown signal received, if any.
     pub fn requested() -> Option<i32> {
@@ -177,7 +185,9 @@ mod tracked {
 
     /// Best-effort synchronous cleanup, then exit without unwinding.
     pub(super) fn force_exit(signal: i32) -> ! {
-        crate::sessions::kill_tracked_children();
+        if let Some(kill) = FORCED_EXIT_KILL.get() {
+            kill();
+        }
         run_exit_cleanups();
         super::terminate_by_signal(signal)
     }
@@ -202,6 +212,12 @@ mod tracked {
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&self.0);
         }
+    }
+
+    /// `kill` SIGKILLs every child still tracked: a forced exit runs it
+    /// first, before the exit cleanups. Only the first registration counts.
+    pub fn register_forced_exit_kill(kill: fn()) {
+        let _ = FORCED_EXIT_KILL.set(kill);
     }
 
     /// Run `cleanup` if the process is forced to exit before the returned
@@ -517,6 +533,8 @@ mod fallback {
     pub fn register_exit_cleanup(_cleanup: impl Fn() + Send + 'static) -> ExitCleanup {
         ExitCleanup
     }
+
+    pub fn register_forced_exit_kill(_kill: fn()) {}
 }
 
 #[cfg(test)]

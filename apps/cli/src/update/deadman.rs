@@ -39,8 +39,8 @@ pub const LINUX_UNIT: &str = "wsmp-update-deadman";
 pub const MACOS_LABEL: &str = "com.flycockpit.wsmp.update-deadman";
 /// Windows task names are machine-wide: one per account, like the relay
 /// task, named after the account SID (0.4.x used `USERNAME`; see
-/// [`crate::commands::service::task_names`]).
-pub use crate::commands::service::task_names::DEADMAN_PREFIX as WINDOWS_TASK_PREFIX;
+/// [`crate::service::task_names`]).
+pub use crate::service::task_names::DEADMAN_PREFIX as WINDOWS_TASK_PREFIX;
 /// The Windows dead-man's early run: start the relay task again after the exit 75.
 pub const WINDOWS_KICK_AFTER: Duration = Duration::from_secs(5);
 
@@ -122,12 +122,12 @@ impl DeadmanSpec {
 
     /// `update rollback --if-unconfirmed <id> --state-dir <dir>` (after the
     /// program). The state directory must be exact UTF-8 text
-    /// ([`crate::commands::service::path_text`]): an error otherwise, before
+    /// ([`crate::service::text::path_text`]): an error otherwise, before
     /// any job is written, rather than a job that looks in another
     /// directory, finds no update there and rolls nothing back.
     pub fn rollback_args(&self) -> Result<Vec<String>> {
         let state_dir =
-            crate::commands::service::path_text("the update state directory", &self.state_dir)?;
+            crate::service::text::path_text("the update state directory", &self.state_dir)?;
         Ok(vec![
             "update".into(),
             "rollback".into(),
@@ -140,7 +140,7 @@ impl DeadmanSpec {
 
     /// The program as exact text ([`Self::rollback_args`]).
     pub fn program_text(&self) -> Result<&str> {
-        crate::commands::service::path_text("the rollback job's wsmp", &self.program)
+        crate::service::text::path_text("the rollback job's wsmp", &self.program)
     }
 }
 
@@ -194,93 +194,6 @@ pub fn disarm(scheduler: &dyn Scheduler) -> Result<()> {
     Ok(())
 }
 
-/// What a management command may print and is kept, per stream.
-const OUTPUT_LIMIT: usize = 1 << 20;
-
-/// Run a short management command with a deadline; its status, stdout and
-/// stderr. It goes through [`crate::bounded_run::run_managed`]: both pipes are
-/// drained at once (a program that fills stderr never blocks), it is killed
-/// at the deadline with its process group (Unix; a helper that detached into
-/// a session of its own is not reached) or its job (Windows), and a helper
-/// that holds a pipe after it exited cannot hold the call past it.
-pub(crate) fn run_bounded_split(
-    program: impl AsRef<std::ffi::OsStr>,
-    args: &[impl AsRef<std::ffi::OsStr>],
-    env: &[(&str, String)],
-    timeout: Duration,
-) -> Result<(bool, String, String)> {
-    let ran = run_bounded_status(program, args, env, timeout)?;
-    Ok((ran.code == Some(0), ran.stdout, ran.stderr))
-}
-
-/// How a [`run_bounded_status`] command ended: it ran to its end.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Exited {
-    /// Its exit code; `None` when a signal ended it.
-    pub code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-/// [`run_bounded_split`] with the exit code: `Ok` only for a command that
-/// ran to its end (whatever its status); an error when it could not be
-/// started, ran out of time, or was stopped, so nothing is known of what it
-/// would have said.
-pub(crate) fn run_bounded_status(
-    program: impl AsRef<std::ffi::OsStr>,
-    args: &[impl AsRef<std::ffi::OsStr>],
-    env: &[(&str, String)],
-    timeout: Duration,
-) -> Result<Exited> {
-    let ran = run_bounded_bytes(program, args, env, timeout)?;
-    Ok(Exited {
-        code: ran.code,
-        stdout: String::from_utf8_lossy(&ran.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&ran.stderr).into_owned(),
-    })
-}
-
-/// [`run_bounded_status`] with stdout and stderr exactly as the program
-/// wrote them (for output that must be read byte for byte, like a path).
-pub(crate) fn run_bounded_bytes(
-    program: impl AsRef<std::ffi::OsStr>,
-    args: &[impl AsRef<std::ffi::OsStr>],
-    env: &[(&str, String)],
-    timeout: Duration,
-) -> Result<crate::bounded_run::Managed> {
-    use crate::bounded_run::{RunError, run_managed};
-    let program = program.as_ref();
-    // The program runs exactly as named; only the messages show it as text.
-    let shown = Path::new(program).display();
-    match run_managed(program, args, env, timeout, OUTPUT_LIMIT) {
-        Ok(ran) => Ok(ran),
-        Err(RunError::Spawn) => Err(anyhow::anyhow!("running `{shown}`: it could not start")),
-        Err(RunError::Timeout) => Err(anyhow::anyhow!(
-            "`{shown}` did not finish within {} s",
-            timeout.as_secs()
-        )),
-        Err(RunError::Cancelled) => Err(anyhow::anyhow!("`{shown}` was stopped: wsmp is exiting")),
-        Err(RunError::Resources) => Err(anyhow::anyhow!(
-            "running `{shown}`: too many commands are running or stuck; try again later"
-        )),
-        // A managed run returns every exit status and drops output past the limit.
-        Err(RunError::ExitStatus(_) | RunError::OutputTooLarge) => {
-            Err(anyhow::anyhow!("running `{shown}` failed unexpectedly"))
-        }
-    }
-}
-
-/// [`run_bounded_split`] with stdout and then stderr as one text.
-pub(crate) fn run_bounded(
-    program: impl AsRef<std::ffi::OsStr>,
-    args: &[impl AsRef<std::ffi::OsStr>],
-    env: &[(&str, String)],
-    timeout: Duration,
-) -> Result<(bool, String)> {
-    let (ok, out, err) = run_bounded_split(program, args, env, timeout)?;
-    Ok((ok, format!("{out}{err}")))
-}
-
 // ── Linux / WSL ──
 
 /// `systemd-calendar` time of `unix_secs` in UTC (`2026-10-28 12:00:00 UTC`).
@@ -301,12 +214,12 @@ pub fn systemd_calendar_utc(unix_secs: u64) -> String {
 /// the job, and the next run finishes it. A run that exits 0, or the job's own
 /// removal (the timer disabled, the files gone), is not repeated. An error, with nothing
 /// rendered, for a program or argument systemd would read differently
-/// ([`crate::commands::service::systemd_exec_path`],
-/// [`crate::commands::service::systemd_exec_arg`]: a `$` in an argument is
+/// ([`crate::service::text::systemd_exec_path`],
+/// [`crate::service::text::systemd_exec_arg`]: a `$` in an argument is
 /// written `$$`, so systemd passes it as it is) or a path that is not exact
 /// text ([`DeadmanSpec::rollback_args`]).
 pub fn systemd_units(spec: &DeadmanSpec, deadline_unix: u64) -> Result<(String, String)> {
-    use crate::commands::service::{systemd_exec_arg, systemd_exec_path};
+    use crate::service::text::{systemd_exec_arg, systemd_exec_path};
     let exec: Vec<String> = std::iter::once(systemd_exec_path(spec.program_text()?))
         .chain(
             spec.rollback_args()?
@@ -369,7 +282,7 @@ pub struct SystemdTimer;
 #[cfg(target_os = "linux")]
 impl SystemdTimer {
     fn env() -> Vec<(&'static str, String)> {
-        crate::commands::service::user_bus_env()
+        crate::service::user_bus_env()
     }
 
     fn systemctl(args: &[&str]) -> Result<(bool, String)> {
@@ -377,7 +290,12 @@ impl SystemdTimer {
             .chain(args.iter().copied())
             .map(str::to_string)
             .collect();
-        run_bounded("systemctl", &args, &Self::env(), Duration::from_secs(15))
+        crate::bounded_run::management::run_bounded(
+            "systemctl",
+            &args,
+            &Self::env(),
+            Duration::from_secs(15),
+        )
     }
 
     fn unit(suffix: &str) -> Result<(bool, bool)> {
@@ -388,7 +306,7 @@ impl SystemdTimer {
 
     /// The unit files, beside the relay's own unit.
     fn files() -> Result<(PathBuf, PathBuf)> {
-        let relay = crate::commands::service::service_file()?;
+        let relay = crate::service::service_file()?;
         let dir = relay
             .parent()
             .context("the systemd user unit directory")?
@@ -468,8 +386,8 @@ impl Scheduler for SystemdTimer {
 /// (`KeepAlive`/`SuccessfulExit` false, `ThrottleInterval`): a rollback whose
 /// relay restart failed, or that could not be recorded, is finished by the
 /// next run. Removing the agent (`bootout`) ends it. Each value is plist text
-/// ([`crate::commands::service::plist_text`]), each path exact text
-/// ([`crate::commands::service::path_text`]): an error, with nothing
+/// ([`crate::service::text::plist_text`]), each path exact text
+/// ([`crate::service::text::path_text`]): an error, with nothing
 /// rendered, for one XML cannot carry.
 pub fn render_macos_plist(
     label: &str,
@@ -477,8 +395,8 @@ pub fn render_macos_plist(
     args: &[String],
     log: &Path,
 ) -> Result<String> {
-    use crate::commands::service::path_text;
-    let escape = crate::commands::service::plist_text;
+    use crate::service::text::path_text;
+    let escape = crate::service::text::plist_text;
     let program = path_text("the rollback job's wsmp", program)?;
     let log = path_text("the dead-man log path", log)?;
     let arguments: String = std::iter::once(program.to_string())
@@ -539,7 +457,7 @@ impl LaunchAgent {
     }
     fn print() -> Result<Option<String>> {
         let target = format!("{}/{MACOS_LABEL}", Self::domain());
-        let (ok, output) = run_bounded(
+        let (ok, output) = crate::bounded_run::management::run_bounded(
             "launchctl",
             &["print".into(), target],
             &[],
@@ -563,13 +481,13 @@ impl Scheduler for LaunchAgent {
         let log = spec.state_dir.join("update").join("deadman.log");
         let body = render_macos_plist(MACOS_LABEL, &spec.program, &spec.rollback_args()?, &log)?;
         let plist_arg =
-            crate::commands::service::path_text("the dead-man LaunchAgent", &plist)?.to_string();
+            crate::service::text::path_text("the dead-man LaunchAgent", &plist)?.to_string();
         if let Some(parent) = plist.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating `{}`", parent.display()))?;
         }
         std::fs::write(&plist, body).with_context(|| format!("writing `{}`", plist.display()))?;
-        let (ok, output) = run_bounded(
+        let (ok, output) = crate::bounded_run::management::run_bounded(
             "launchctl",
             &["bootstrap".into(), Self::domain(), plist_arg],
             &[],
@@ -591,7 +509,7 @@ impl Scheduler for LaunchAgent {
             std::fs::remove_file(&plist)
                 .with_context(|| format!("removing `{}`", plist.display()))?;
         }
-        let _ = run_bounded(
+        let _ = crate::bounded_run::management::run_bounded(
             "launchctl",
             &[
                 "bootout".into(),
@@ -684,7 +602,7 @@ pub fn render_windows_task(
 /// line. An error for a path that is not exact text
 /// ([`DeadmanSpec::rollback_args`]).
 pub fn windows_task_arguments(spec: &DeadmanSpec) -> Result<String> {
-    use crate::commands::service::windows_task::quote_arg;
+    use crate::service::windows_task::quote_arg;
     Ok(std::iter::once("--headless".to_string())
         .chain(std::iter::once(spec.program_text()?.to_string()))
         .chain(spec.rollback_args()?)
@@ -699,12 +617,12 @@ pub struct ScheduledTask;
 #[cfg(windows)]
 impl ScheduledTask {
     fn names() -> Result<(
-        crate::commands::service::task_names::TaskNames,
-        crate::commands::service::task_names::Account,
+        crate::service::task_names::TaskNames,
+        crate::service::task_names::Account,
     )> {
-        let account = crate::commands::service::windows_account()?;
+        let account = crate::service::task_scheduler::windows_account()?;
         Ok((
-            crate::commands::service::task_names::TaskNames::new(WINDOWS_TASK_PREFIX, &account),
+            crate::service::task_names::TaskNames::new(WINDOWS_TASK_PREFIX, &account),
             account,
         ))
     }
@@ -714,8 +632,8 @@ impl ScheduledTask {
     /// The registered dead-man tasks: the SID-named one, and this account's
     /// 0.4.x one (armed by a 0.4.x `wsmp update` into this build).
     fn registered() -> Result<Vec<String>> {
-        use crate::commands::service::task_names::{Legacy, Presence, Tasks, legacy};
-        let tasks = crate::commands::service::SystemTasks;
+        use crate::service::task_names::{Legacy, Presence, Tasks, legacy};
+        let tasks = crate::service::task_scheduler::SystemTasks;
         let (names, account) = Self::names()?;
         let mut found = Vec::new();
         match tasks.exists(&names.current)? {
@@ -743,7 +661,7 @@ impl ScheduledTask {
     }
     fn schtasks(args: &[&str]) -> Result<(bool, String)> {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-        run_bounded("schtasks", &args, &[], Duration::from_secs(30))
+        crate::bounded_run::management::run_bounded("schtasks", &args, &[], Duration::from_secs(30))
     }
 }
 
@@ -758,7 +676,7 @@ impl Scheduler for ScheduledTask {
                 "(Get-ScheduledTask -TaskName {} -ErrorAction Stop).State",
                 powershell_quote(&name)
             );
-            let (_, output) = run_bounded(
+            let (_, output) = crate::bounded_run::management::run_bounded(
                 "powershell",
                 &[
                     "-NoProfile".into(),
@@ -787,16 +705,13 @@ impl Scheduler for ScheduledTask {
         let file = spec.state_dir.join("update").join("deadman-task.xml");
         // Checked before the file is written: `schtasks` is given it.
         let file_arg =
-            crate::commands::service::path_text("the dead-man task definition", &file)?.to_string();
+            crate::service::text::path_text("the dead-man task definition", &file)?.to_string();
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating `{}`", parent.display()))?;
         }
-        std::fs::write(
-            &file,
-            crate::commands::service::windows_task::utf16_bytes(&xml),
-        )
-        .with_context(|| format!("writing `{}`", file.display()))?;
+        std::fs::write(&file, crate::service::windows_task::utf16_bytes(&xml))
+            .with_context(|| format!("writing `{}`", file.display()))?;
         let name = Self::name()?;
         let (ok, output) = Self::schtasks(&["/Create", "/TN", &name, "/XML", &file_arg, "/F"])?;
         anyhow::ensure!(
@@ -834,7 +749,7 @@ pub fn booted_at() -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        let (ok, text) = run_bounded(
+        let (ok, text) = crate::bounded_run::management::run_bounded(
             "sysctl",
             &["-n".to_string(), "kern.boottime".to_string()],
             &[],
@@ -940,126 +855,6 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::FakeScheduler;
     use super::*;
-
-    #[cfg(unix)]
-    fn sh(script: &str) -> Vec<String> {
-        vec!["-c".into(), script.into()]
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_program_that_fills_stderr_before_closing_stdout_is_not_blocked() {
-        // 256 KiB on stderr while stdout is still open, then a line on stdout:
-        // reading stdout to its end first would block the program on the full
-        // stderr pipe until the deadline.
-        let started = Instant::now();
-        let (ok, out, err) = run_bounded_split(
-            "sh",
-            &sh("head -c 262144 /dev/zero | tr '\\0' e >&2; echo done"),
-            &[],
-            Duration::from_secs(20),
-        )
-        .expect("finishes");
-        assert!(ok);
-        assert_eq!(out, "done\n");
-        assert_eq!(err.len(), 262_144);
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "{:?}",
-            started.elapsed()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn output_past_the_limit_is_drained_and_dropped_not_fatal() {
-        let (ok, out, err) = run_bounded_split(
-            "sh",
-            &sh("head -c 3145728 /dev/zero; echo end >&2; exit 3"),
-            &[],
-            Duration::from_secs(20),
-        )
-        .expect("finishes");
-        assert!(!ok, "the exit status is the program's");
-        assert_eq!(out.len(), OUTPUT_LIMIT);
-        assert_eq!(err, "end\n");
-        // stdout first, then stderr, as one text.
-        let (_, text) = run_bounded(
-            "sh",
-            &sh("echo err >&2; echo out"),
-            &[("WSMP_TEST_EXTRA", "x".into())],
-            Duration::from_secs(20),
-        )
-        .expect("finishes");
-        assert_eq!(text, "out\nerr\n");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn management_commands_inherit_the_environment_and_take_extra_values() {
-        let (ok, out, _) = run_bounded_split(
-            "sh",
-            &sh("printf '%s %s' \"$WSMP_TEST_EXTRA\" \"${HOME:+home}\""),
-            &[("WSMP_TEST_EXTRA", "extra".into())],
-            Duration::from_secs(20),
-        )
-        .expect("finishes");
-        assert!(ok);
-        assert_eq!(out, "extra home");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_helper_holding_the_pipes_cannot_hold_the_call_past_its_deadline() {
-        let dir = tempfile::tempdir().expect("dir");
-        let pid_file = dir.path().join("helper.pid");
-        // The program exits at once; the helper it started keeps stdout and
-        // stderr open for 60 s.
-        let script = format!(
-            "sleep 60 & echo $! > '{}'; echo started",
-            pid_file.display()
-        );
-        let started = Instant::now();
-        let result = run_bounded_split("sh", &sh(&script), &[], Duration::from_secs(2));
-        let elapsed = started.elapsed();
-        let error = result.expect_err("the helper holds the pipes past the deadline");
-        assert!(
-            format!("{error:#}").contains("did not finish within 2 s"),
-            "{error:#}"
-        );
-        assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
-        // The helper was in the program's group and was killed with it.
-        let pid: i32 = std::fs::read_to_string(&pid_file)
-            .expect("pid")
-            .trim()
-            .parse()
-            .expect("pid number");
-        let gone = (0..200).any(|_| {
-            let dead = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .map(|stat| stat.contains(") Z "))
-                .unwrap_or(true);
-            if !dead {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            dead
-        });
-        assert!(gone, "the helper {pid} still runs");
-    }
-
-    #[test]
-    fn a_program_that_cannot_start_is_an_error() {
-        let error = run_bounded(
-            "wsmp-no-such-program",
-            &[] as &[&str],
-            &[],
-            Duration::from_secs(5),
-        )
-        .expect_err("missing");
-        assert!(
-            format!("{error:#}").contains("could not start"),
-            "{error:#}"
-        );
-    }
 
     #[test]
     fn task_names_are_quoted_for_powershell() {
@@ -1444,7 +1239,7 @@ mod tests {
         assert_eq!(xml.matches("<Repetition>").count(), 1);
         assert!(xml.contains("&quot;C:\\Users\\A B"));
         assert_eq!(
-            crate::commands::service::task_names::task_name(WINDOWS_TASK_PREFIX, "S-1-5-18"),
+            crate::service::task_names::task_name(WINDOWS_TASK_PREFIX, "S-1-5-18"),
             "wsmp-update-deadman-S-1-5-18"
         );
     }

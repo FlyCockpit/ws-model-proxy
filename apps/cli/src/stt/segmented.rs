@@ -58,7 +58,7 @@ pub fn transcribe(
             message: "the item has no audio".into(),
         });
     }
-    let runtime = match crate::daemon::upstream_runtime() {
+    let runtime = match crate::upstream::runtime() {
         Ok(runtime) => runtime,
         Err(_) => {
             return Some(Outcome::Failed {
@@ -111,8 +111,8 @@ async fn post(endpoint: &EngineEndpoint, request: Request) -> Outcome {
 }
 
 async fn send(endpoint: &EngineEndpoint, request: Request) -> Result<Outcome> {
-    let url = crate::daemon::endpoint_url(&endpoint.base_url, "/v1/audio/transcriptions")?;
-    let mut builder = crate::daemon::upstream_http_client()?
+    let url = crate::upstream::endpoint_url(&endpoint.base_url, "/v1/audio/transcriptions")?;
+    let mut builder = crate::upstream::http_client()?
         .post(url.as_str())
         .timeout(request.timeout)
         .header(
