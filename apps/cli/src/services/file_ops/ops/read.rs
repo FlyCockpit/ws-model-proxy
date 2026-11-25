@@ -285,15 +285,9 @@ pub(crate) fn assemble(
             break;
         }
         let stripped = strip_eol(&raw);
-        let (masked, count): (std::borrow::Cow<'_, str>, usize) =
-            match std::str::from_utf8(stripped) {
-                Ok(body) => masker.mask_line_counted(body),
-                Err(_) if masker.class().is_secret() => {
-                    let (token, count) = masker.mask_invalid(stripped);
-                    (std::borrow::Cow::Owned(token), count)
-                }
-                Err(_) => return Err(binary_error("unknown", size, etag)),
-            };
+        let Some((masked, count)) = masker.mask_bytes(stripped) else {
+            return Err(binary_error("unknown", size, etag));
+        };
         let mut slice: &str = &masked;
         let mut consumed = 0_usize;
         if emitted == 0
@@ -679,14 +673,8 @@ fn tail_window(
     let mut redactions: Vec<u64> = Vec::with_capacity(want);
     for raw in &raw_lines[first_index..] {
         let stripped = strip_eol(raw);
-        let (line, count): (std::borrow::Cow<'_, str>, usize) = match std::str::from_utf8(stripped)
-        {
-            Ok(body) => masker.mask_line_counted(body),
-            Err(_) if masker.class().is_secret() => {
-                let (token, count) = masker.mask_invalid(stripped);
-                (std::borrow::Cow::Owned(token), count)
-            }
-            Err(_) => return Err(binary_error("unknown", stat.size, etag)),
+        let Some((line, count)) = masker.mask_bytes(stripped) else {
+            return Err(binary_error("unknown", stat.size, etag));
         };
         masked.push(line.into_owned());
         redactions.push(count as u64);
