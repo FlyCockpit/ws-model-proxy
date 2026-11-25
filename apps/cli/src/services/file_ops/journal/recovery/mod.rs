@@ -111,6 +111,12 @@
 //! of R and existing reporting bounds. A link error after effect cannot prove
 //! commit across alias names on noino; rename keeps/restores S and keeps D.
 //!
+//! Callers run one transaction per operation: [`replace`] and [`create`]
+//! (for `atomic`), [`rename`] and [`delete`] (for `mutate`). Each allocates its
+//! own [`RecoveryDir`], runs the whole sequence (INTENT, effect fence, public
+//! effect, compensation, disposal, final cleanup) and returns the outcome with
+//! the recovered paths; callers only pin objects with [`Held`].
+//!
 //! The [`RecoveryDir`] methods are split by layer, top down: `publish`
 //! (publication and the rename commit) over `probe` (private capability
 //! probes) over `capture` (capture and restore) over `plan` (INTENT, its
@@ -139,14 +145,21 @@ use crate::services::file_ops::fs::resolve::Resolved;
 
 mod barrier;
 mod capture;
+mod delete;
 #[cfg(test)]
 mod identity_boundary_tests;
 mod plan;
 mod probe;
 mod publish;
+mod rename;
+mod replace;
 mod settle;
 #[cfg(test)]
 mod tests;
+
+pub(in crate::services::file_ops) use delete::delete;
+pub(in crate::services::file_ops) use rename::rename;
+pub(in crate::services::file_ops) use replace::{create, replace};
 
 /// Longest path list carried in a result or error detail (server schema bound).
 const MAX_REPORTED: usize = 4;

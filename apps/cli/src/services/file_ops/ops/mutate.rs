@@ -1,7 +1,8 @@
 //! `forwarder_cli_file_rename`, `forwarder_cli_dir_create`,
 //! `forwarder_cli_file_delete`: the small mutating tools.
 //!
-//! Recovery owns overwrite and exchange-less plain rename in one transaction.
+//! Recovery owns every rename and file/symlink delete as one transaction
+//! (`recovery::rename`, `recovery::delete`); this module checks the request.
 //! Overwrite preflights before any public capture: exchange/NR private dummies,
 //! then link probes on the actual source and destination. Exchange-less NR
 //! overwrite vacates both into R, proves held identity, and publishes source
@@ -51,12 +52,10 @@ use nix::unistd::{UnlinkatFlags, unlinkat};
 use super::write::{DEFAULT_PARENT_MODE, parse_mode};
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
-use crate::services::file_ops::fs::exchange::{Primitive, is_unsupported, no_replace};
 use crate::services::file_ops::fs::meta::{Kind, Stat, kind_name, perm_mode};
 use crate::services::file_ops::fs::policy::Access;
 use crate::services::file_ops::fs::resolve::{ResolveOpts, Resolved, resolve};
-use crate::services::file_ops::journal::recovery::refused_without_effect;
-use crate::services::file_ops::journal::recovery::{Held, Origin, PublishMethod, RecoveryDir};
+use crate::services::file_ops::journal::recovery::{self, Held};
 use crate::services::file_ops::{Cancel, Step, check_reason};
 
 pub use super::mutate_args::{
@@ -364,8 +363,8 @@ fn commit_rename(
     from: &Resolved,
     to: &Resolved,
     overwrite: bool,
-    mut src: Held,
-    mut dst: Option<Held>,
+    src: Held,
+    dst: Option<Held>,
     cancel: &Cancel,
 ) -> FileResult<(Vec<String>, bool)> {
     if overwrite && let Some(dst) = &dst {
@@ -391,221 +390,7 @@ fn commit_rename(
             SameObjectRename::NotSameObject => {}
         }
     }
-    // Direct NR uses a pre-effect journal too.
-    // EINVAL is also how vfat/exFAT/SMB reject a destination name. When a later
-    // private NR probe succeeds, that EINVAL is `invalid_input`, not a missing
-    // rename flag — and nothing is captured.
-    let mut candidate = None;
-    let mut move_errno: Option<Errno> = None;
-    if !(overwrite && dst.is_some()) {
-        candidate = from
-            .lstat()?
-            .map(|stat| Held::open(&from.dir, &from.name, stat))
-            .transpose()?;
-        let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path)?;
-        let intent = crate::services::file_ops::journal::intent::Intent::rename(
-            crate::services::file_ops::journal::intent::IntentOrder::VacateFirst,
-            &from.full_path(),
-            &to.full_path(),
-            false,
-        )
-        .publishing(&to.full_path(), &src.stat());
-        recovery.prepare_intent(intent)?;
-        recovery.set_intent_phase(
-            crate::services::file_ops::journal::intent::IntentPhase::Publishing,
-        )?;
-        let before = recovery.effect_checkpoint();
-        recovery.begin_public_effect()?;
-        let moved = no_replace(
-            from.dir.as_fd(),
-            &from.name,
-            to.dir.as_fd(),
-            &to.name,
-            Primitive::Move,
-        );
-        if let Err(errno) = moved {
-            recovery.effect_refused(before, errno);
-        }
-        match moved {
-            Ok(()) => {
-                let _ = ops.hook.step(Step::Moved);
-                if matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) {
-                    let result = recovery
-                        .sync_effect(&[&from.dir, &to.dir])
-                        .and_then(|()| {
-                            recovery.set_intent_phase(
-                                crate::services::file_ops::journal::intent::IntentPhase::Committed,
-                            )
-                        })
-                        .map(|()| false);
-                    return finish_move(&mut recovery, result);
-                }
-                let origin = Origin::new(&from.dir, &from.name, &from.full_path())
-                    .map_err(FileError::errno)?;
-                let result = match candidate.as_mut() {
-                    Some(candidate) => {
-                        verify_moved(ops, &mut recovery, to, &mut src, candidate, origin)
-                    }
-                    None => Err(recovery.uncertain()),
-                };
-                drop(src);
-                drop(candidate);
-                drop(dst);
-                return finish_move(&mut recovery, result.map(|()| false));
-            }
-            Err(Errno::EEXIST) => return Err(exists_error()),
-            Err(errno) if is_unsupported(errno) => {
-                // Nothing moved. Release this R (pins, journal, registry)
-                // before any fallback allocates its own.
-                recovery.close_unused()?;
-                move_errno = Some(errno);
-            }
-            Err(errno) if refused_without_effect(errno) => {
-                return Err(FileError::errno(errno));
-            }
-            // Ambiguous reply (EIO, timeouts, ENOENT/ESTALE after an NFS
-            // retransmit, EINTR): decide from the names, never the errno.
-            Err(errno) if matches!(from.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) => {
-                return Err(FileError::errno(errno));
-            }
-            Err(_) if matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) => {
-                let _ = ops.hook.step(Step::Moved);
-                let result = recovery
-                    .sync_effect(&[&from.dir, &to.dir])
-                    .and_then(|()| {
-                        recovery.set_intent_phase(
-                            crate::services::file_ops::journal::intent::IntentPhase::Committed,
-                        )
-                    })
-                    .map(|()| false);
-                return finish_move(&mut recovery, result);
-            }
-            Err(_) => return Err(recovery.uncertain()),
-        }
-        if src.stat().kind() == Kind::Dir {
-            if move_errno == Some(Errno::EINVAL) {
-                let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path)?;
-                let result = match recovery.noreplace_works(ops, to) {
-                    Ok(true) => Err(rejected_name()),
-                    Ok(false) => Err(FileError::unsafe_filesystem()),
-                    Err(error) => Err(error),
-                };
-                drop(src);
-                drop(candidate);
-                drop(dst);
-                return finish_move(&mut recovery, result);
-            }
-            return Err(FileError::unsafe_filesystem());
-        }
-    }
-    if !src.is_held() {
-        return Err(unheld_error(&src));
-    }
-    if let Some(dst) = &dst
-        && !dst.is_held()
-    {
-        return Err(unheld_error(dst));
-    }
-    drop(candidate); // fallback owns just S/D, never a duplicate candidate proof
-    let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path)?;
-    let result = recovery
-        .preflight_move(ops, from, to, &src, dst.as_ref())
-        .and_then(|method| {
-            if move_errno == Some(Errno::EINVAL) && matches!(method, Some(PublishMethod::NoReplace))
-            {
-                return Err(rejected_name());
-            }
-            // Overwrite never tried Move. NR working in R does not prove the
-            // public destination name is legal; EEXIST does, EINVAL does not.
-            if dst.is_some() && matches!(method, Some(PublishMethod::NoReplace)) {
-                let intent = crate::services::file_ops::journal::intent::Intent::rename(
-                    crate::services::file_ops::journal::intent::IntentOrder::VacateFirst,
-                    &from.full_path(),
-                    &to.full_path(),
-                    false,
-                )
-                .publishing(&to.full_path(), &src.stat());
-                recovery.prepare_intent(intent)?;
-                recovery.set_intent_phase(crate::services::file_ops::journal::intent::IntentPhase::Publishing)?;
-                let before = recovery.effect_checkpoint();
-                recovery.begin_public_effect()?;
-                let moved = no_replace(
-                    from.dir.as_fd(),
-                    &from.name,
-                    to.dir.as_fd(),
-                    &to.name,
-                    Primitive::Move,
-                );
-                if let Err(errno) = moved {
-                    recovery.effect_refused(before, errno);
-                }
-                match moved {
-                    Ok(()) => {
-                        let _ = ops.hook.step(Step::Moved);
-                        if matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) {
-                            recovery.sync_effect(&[&from.dir, &to.dir])?;
-                            recovery.set_intent_phase(crate::services::file_ops::journal::intent::IntentPhase::Committed)?;
-                            return Ok(false);
-                        }
-                        // Publication is unvalidated. Leave its fence and public
-                        // names intact; do not manufacture a destination origin.
-                        recovery.record_public(&to.dir, &to.name, &to.full_path());
-                        return Err(recovery.uncertain());
-                    }
-                    Err(Errno::EEXIST) => {
-                        recovery.set_intent_phase(crate::services::file_ops::journal::intent::IntentPhase::Prepared)?;
-                    }
-                    Err(Errno::EINVAL) => return Err(rejected_name()),
-                    Err(errno) if refused_without_effect(errno) => {
-                        return Err(FileError::errno(errno));
-                    }
-                    // Ambiguous reply: decide from the names, never the errno.
-                    Err(errno) if matches!(from.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) => {
-                        return Err(FileError::errno(errno));
-                    }
-                    Err(_) if matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) => {
-                        recovery.sync_effect(&[&from.dir, &to.dir])?;
-                        recovery.set_intent_phase(crate::services::file_ops::journal::intent::IntentPhase::Committed)?;
-                        return Ok(false);
-                    }
-                    Err(_) => return Err(recovery.uncertain()),
-                }
-            }
-            recovery.commit_move(ops, from, to, &mut src, dst.as_mut(), method, cancel)
-        });
-    drop(src);
-    drop(dst);
-    finish_move(&mut recovery, result)
-}
-
-fn unheld_error(held: &Held) -> FileError {
-    match held.open_error() {
-        Some(Errno::ENOENT) => FileError::conflict("gone"),
-        Some(errno) => FileError::errno(errno),
-        None => FileError::errno(Errno::EACCES),
-    }
-}
-
-fn finish_move(
-    recovery: &mut RecoveryDir,
-    result: FileResult<bool>,
-) -> FileResult<(Vec<String>, bool)> {
-    let recovered = recovery.finish();
-    match result {
-        Ok(_) if !recovery.acknowledges_success() => Err(recovery.uncertain()),
-        Ok(linked) => Ok((recovered, linked)),
-        // The durable `committed` record proves the rename took effect: a later
-        // durability-barrier failure is reported residue, not an uncertain
-        // outcome. The published etag is re-derived from the public name.
-        Err(error) if recovery.committed_barrier_failed() => {
-            tracing::warn!(error = %error.message, "rename committed; cleanup residue retained");
-            Ok((recovered, true))
-        }
-        Err(error) if error.code == ErrorCode::UncertainOutcome || !recovery.settled() => {
-            Err(recovery.uncertain())
-        }
-        Err(error) => Err(error),
-    }
+    recovery::rename(ops, from, to, src, dst, cancel)
 }
 
 /// A link gives d its own presented inode. Bind its bytes/mtime to the admitted
@@ -675,49 +460,6 @@ fn published_etag(
         }
         _ => Ok(None),
     }
-}
-
-/// Capture a post-move mismatch. Restore only the candidate identity observed
-/// before the move, using NOREPLACE; newer destination successors stay in recovery.
-fn verify_moved(
-    ops: &OpContext,
-    recovery: &mut RecoveryDir,
-    to: &Resolved,
-    src: &mut Held,
-    candidate: &mut Held,
-    origin: Origin,
-) -> FileResult<()> {
-    match to.lstat() {
-        Ok(Some(now)) if src.matches_for_restore(&now) => Ok(()),
-        _ => {
-            if let Some(slot) = recovery.capture_moved(to, candidate, origin) {
-                let _ = ops.hook.step(Step::Captured);
-                if recovery.matches_for_restore(&slot, candidate) {
-                    // Nothing after this uses either proof, and restore may unlink
-                    // a private alias of this inode: close both unconditionally
-                    // (a failed observation must not leave one open).
-                    candidate.release();
-                    src.release();
-                    if !recovery.restore(ops, &slot) {
-                        return Err(recovery.uncertain());
-                    }
-                    let _ = ops.hook.step(Step::Restored);
-                    if recovery.settled() {
-                        return Err(FileError::conflict("replaced"));
-                    }
-                }
-            }
-            Err(recovery.uncertain())
-        }
-    }
-}
-
-fn exists_error() -> FileError {
-    FileError::new(ErrorCode::Exists, "the destination already exists")
-}
-
-fn rejected_name() -> FileError {
-    FileError::invalid("destination name is not valid on this filesystem")
 }
 
 pub(crate) fn mkdir(ops: &OpContext, args: &MkdirArgs, cancel: &Cancel) -> FileResult<MkdirResult> {
@@ -832,7 +574,7 @@ pub(crate) fn delete(
     }
     // Pin the inspected object BEFORE reading its etag. Unheld files/symlinks
     // must fail before any public move (notably unreadable mode-000 on macOS).
-    let mut held = Held::open(&resolved.dir, &resolved.name, st)?;
+    let held = Held::open(&resolved.dir, &resolved.name, st)?;
     if st.kind() != Kind::Dir && !held.is_held() {
         // Nothing moved. Report the real open failure; a name that vanished
         // since the lstat is a conflict, and a kind that is never opened (a
@@ -875,200 +617,20 @@ pub(crate) fn delete(
             recovered: Vec::new(),
         });
     }
-    let mut recovery = RecoveryDir::new(&resolved.dir, &resolved.dir_path)?;
-    let result = (|| {
-        ops.hook.step(Step::Vacating)?;
-        cancel.check()?; // last cancellation point before public capture
-        recovery.prepare_intent(crate::services::file_ops::journal::intent::Intent::delete(
-            &resolved.full_path(),
-        ))?;
-        let mark = recovery.checkpoint();
-        let Some(slot) = recovery.capture(&resolved.dir, &resolved.name, &resolved.full_path())
-        else {
-            return Err(match recovery.abort_capture(mark) {
-                Some(Errno::ENOENT) => FileError::conflict("gone"),
-                Some(errno) => FileError::errno(errno),
-                None => recovery.uncertain(),
-            });
-        };
-        recovery.record_slot_identity(&slot)?;
-        recovery
-            .set_intent_phase(crate::services::file_ops::journal::intent::IntentPhase::Captured)?;
-        let _ = ops.hook.step(Step::Vacated);
-        if !recovery.holds(&slot, &held) {
-            held.release();
-            if recovery.restore(ops, &slot) {
-                let _ = ops.hook.step(Step::Restored);
-            }
-            return if recovery.settled() {
-                Err(FileError::conflict("replaced"))
-            } else {
-                Err(recovery.uncertain())
-            };
-        }
-        // A proven delete is committed; failed cleanup is recoverable success.
-        recovery.set_intent_phase(
-            crate::services::file_ops::journal::intent::IntentPhase::Publishing,
-        )?;
-        recovery.sync_effect(&[&resolved.dir])?;
-        recovery
-            .set_intent_phase(crate::services::file_ops::journal::intent::IntentPhase::Committed)?;
-        recovery.dispose(ops, &slot, &mut held);
-        Ok(())
-    })();
-    held.release();
-    let recovered = recovery.finish();
-    match result {
-        Ok(()) if !recovery.acknowledges_success() => Err(recovery.uncertain()),
-        Ok(()) => Ok(DeleteResult {
-            deleted: true,
-            kind: kind_name(st.kind()),
-            recovered,
-        }),
-        Err(error) if error.code == ErrorCode::UncertainOutcome || !recovery.settled() => {
-            Err(recovery.uncertain())
-        }
-        Err(error) => Err(error),
-    }
+    let recovered = recovery::delete(ops, &resolved, held, cancel)?;
+    Ok(DeleteResult {
+        deleted: true,
+        kind: kind_name(st.kind()),
+        recovered,
+    })
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod descriptor_tests {
     use super::*;
-    use crate::services::file_ops::fs::exchange::{FaultScope, UNLINK_PROBE};
+    use crate::services::file_ops::fs::exchange::{FaultScope, Primitive};
     use crate::services::file_ops::tests::{Fx, args};
     use serde_json::json;
-    use std::os::unix::fs::MetadataExt;
-    use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn verify_moved_observation_failure_closes_both_proofs_before_restore_unlink() {
-        let fx = Fx::new();
-        let path = fx.put("source", "checked source");
-        let from = resolve_path(
-            fx.ops.context(),
-            &fx.p("source"),
-            Access::Remove,
-            false,
-            None,
-        )
-        .unwrap();
-        let stat = from.lstat().unwrap().unwrap();
-        let mut src = Held::open(&from.dir, &from.name, stat).unwrap();
-        let mut candidate = Held::open(&from.dir, &from.name, stat).unwrap();
-        let origin = Origin::new(&from.dir, &from.name, &path).unwrap();
-        std::fs::rename(path, fx.root.join("destination")).unwrap();
-        let to = resolve_path(
-            fx.ops.context(),
-            &fx.p("destination"),
-            Access::Write,
-            false,
-            None,
-        )
-        .unwrap();
-        let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path).unwrap();
-        let _scope = FaultScope::new(&[
-            (Primitive::Identity, 1, Errno::EIO),
-            (Primitive::Restore, 1, Errno::EINVAL),
-        ]);
-        let checks = Arc::new(Mutex::new(0usize));
-        let checked = Arc::clone(&checks);
-        let inode = (stat.dev, stat.ino);
-        UNLINK_PROBE.with(|probe| {
-            *probe.borrow_mut() = Some(Box::new(move || {
-                for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
-                    if let Ok(metadata) = std::fs::metadata(entry.unwrap().path()) {
-                        assert_ne!(
-                            (metadata.dev(), metadata.ino()),
-                            inode,
-                            "source/candidate proof pins the restore alias"
-                        );
-                    }
-                }
-                *checked.lock().unwrap() += 1;
-            }));
-        });
-        let error = verify_moved(
-            fx.ops.context(),
-            &mut recovery,
-            &to,
-            &mut src,
-            &mut candidate,
-            origin,
-        )
-        .unwrap_err();
-        assert_eq!(error.code, ErrorCode::Conflict);
-        assert_eq!(*checks.lock().unwrap(), 1);
-        assert_eq!(fx.get("source"), "checked source");
-        assert!(!fx.root.join("destination").exists());
-        assert!(recovery.finish().is_empty());
-    }
-
-    #[test]
-    fn verify_moved_second_observation_failure_never_unlinks_with_a_proof_open() {
-        let fx = Fx::new();
-        let path = fx.put("source", "checked source");
-        let from = resolve_path(
-            fx.ops.context(),
-            &fx.p("source"),
-            Access::Remove,
-            false,
-            None,
-        )
-        .unwrap();
-        let stat = from.lstat().unwrap().unwrap();
-        let mut src = Held::open(&from.dir, &from.name, stat).unwrap();
-        let mut candidate = Held::open(&from.dir, &from.name, stat).unwrap();
-        let origin = Origin::new(&from.dir, &from.name, &path).unwrap();
-        std::fs::rename(path, fx.root.join("destination")).unwrap();
-        let to = resolve_path(
-            fx.ops.context(),
-            &fx.p("destination"),
-            Access::Write,
-            false,
-            None,
-        )
-        .unwrap();
-        let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path).unwrap();
-        let _scope = FaultScope::new(&[
-            (Primitive::Identity, 1, Errno::EIO),
-            // The third observation is the restore's own disposal proof: its
-            // failure keeps the alias (uncertain). A release that depended on a
-            // successful observation would unlink with src still open.
-            (Primitive::Identity, 3, Errno::EIO),
-            (Primitive::Restore, 1, Errno::EINVAL),
-        ]);
-        let checks = Arc::new(Mutex::new(0usize));
-        let checked = Arc::clone(&checks);
-        let inode = (stat.dev, stat.ino);
-        UNLINK_PROBE.with(|probe| {
-            *probe.borrow_mut() = Some(Box::new(move || {
-                for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
-                    if let Ok(metadata) = std::fs::metadata(entry.unwrap().path()) {
-                        assert_ne!(
-                            (metadata.dev(), metadata.ino()),
-                            inode,
-                            "source/candidate proof pins the restore alias"
-                        );
-                    }
-                }
-                *checked.lock().unwrap() += 1;
-            }));
-        });
-        let error = verify_moved(
-            fx.ops.context(),
-            &mut recovery,
-            &to,
-            &mut src,
-            &mut candidate,
-            origin,
-        )
-        .unwrap_err();
-        assert_eq!(error.code, ErrorCode::UncertainOutcome);
-        assert_eq!(*checks.lock().unwrap(), 0, "no unlink may happen");
-        assert!(!fx.root.join("destination").exists());
-        assert!(!recovery.finish().is_empty(), "the object stays reported");
-    }
 
     #[test]
     fn directory_delete_failed_held_observation_refuses_before_rmdir() {

@@ -1,0 +1,2140 @@
+== replace/exchange
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  p Mkdir
+  s TempCreated
+  s TempWritten
+  d fsync <root>/.wsmp-recover-R/tmp
+  s TempSynced
+  s Chowned
+  s Chmodded
+  d fsync <root>/.wsmp-recover-R/tmp
+  s EtagRechecked
+  d linkat <root>/doc -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/.wsmp-recover-R/tmp -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/tmp -> <root>/doc flags=2
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Exchange
+  s Exchanged
+  s Captured
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/tmp flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  p Hold
+  s Renamed
+  s BeforeDirSync
+  d fsync <root>
+  s DirSynced
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Identity
+  p Rmdir
+  => ok recovered=0
+  | doc="edited\n"
+== replace/no-replace
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  p Mkdir
+  s TempCreated
+  s TempWritten
+  d fsync <root>/.wsmp-recover-R/tmp
+  s TempSynced
+  s Chowned
+  s Chmodded
+  d fsync <root>/.wsmp-recover-R/tmp
+  s EtagRechecked
+  d linkat <root>/doc -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/.wsmp-recover-R/tmp -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/tmp -> <root>/.wsmp-recover-R/probe flags=1
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Exchange
+  p PublishPrepare
+  p ProbeNoReplace
+  p Identity
+  s Vacating
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/doc -> <root>/.wsmp-recover-R/slot-2 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  p Capture
+  p Identity
+  s Vacated
+  s Publishing
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/probe -> <root>/doc flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p Publish
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/slot-2 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  p Hold
+  s Renamed
+  s BeforeDirSync
+  d fsync <root>
+  s DirSynced
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Identity
+  p Rmdir
+  => ok recovered=0
+  | doc="edited\n"
+== replace/link
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  p Mkdir
+  s TempCreated
+  s TempWritten
+  d fsync <root>/.wsmp-recover-R/tmp
+  s TempSynced
+  s Chowned
+  s Chmodded
+  d fsync <root>/.wsmp-recover-R/tmp
+  s EtagRechecked
+  d linkat <root>/doc -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/.wsmp-recover-R/tmp -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d linkat <root>/.wsmp-recover-R/tmp -> <root>/.wsmp-recover-R/probe flags=0
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Exchange
+  p PublishPrepare
+  p ProbeNoReplace
+  p Identity
+  p ProbeLink
+  p LinkCount
+  s LinkProbed
+  p Hold
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/probe flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p LinkCount
+  p Unlink
+  p Hold
+  p Identity
+  p Identity
+  s Vacating
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/doc -> <root>/.wsmp-recover-R/slot-2 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  p Capture
+  p Identity
+  s Vacated
+  s Publishing
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d linkat <root>/.wsmp-recover-R/tmp -> <root>/doc flags=0
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p PublishLink
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/tmp flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p LinkCount
+  p Unlink
+  p Hold
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/slot-2 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  p Hold
+  s Renamed
+  s BeforeDirSync
+  d fsync <root>
+  s DirSynced
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Identity
+  p Rmdir
+  => ok recovered=0
+  | doc="edited\n"
+== replace/fails-before-commit
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  p Mkdir
+  s TempCreated
+  s TempWritten
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/tmp flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0 (failed)
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Unlink
+  p Rmdir
+  => err InvalidInput
+  | doc="original\n"
+== replace/racer-after-recheck
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  p Mkdir
+  s TempCreated
+  s TempWritten
+  d fsync <root>/.wsmp-recover-R/tmp
+  s TempSynced
+  s Chowned
+  s Chmodded
+  d fsync <root>/.wsmp-recover-R/tmp
+  s EtagRechecked
+  d linkat <root>/doc -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/.wsmp-recover-R/tmp -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/tmp -> <root>/doc flags=2
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Exchange
+  s Exchanged
+  s Captured
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent compensating
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/doc -> <root>/.wsmp-recover-R/slot-2 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent compensating
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent compensating
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p Capture
+  s Captured
+  p Identity
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/slot-2 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent compensating
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/tmp -> <root>/doc flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  p Hold
+  p Restore
+  s Restored
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Identity
+  p Rmdir
+  => err Conflict
+  | doc="racer\n"
+== replace/no-replace-racer
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  p Mkdir
+  s TempCreated
+  s TempWritten
+  d fsync <root>/.wsmp-recover-R/tmp
+  s TempSynced
+  s Chowned
+  s Chmodded
+  d fsync <root>/.wsmp-recover-R/tmp
+  s EtagRechecked
+  d linkat <root>/doc -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/.wsmp-recover-R/tmp -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/tmp -> <root>/.wsmp-recover-R/probe flags=1
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Exchange
+  p PublishPrepare
+  p ProbeNoReplace
+  p Identity
+  s Vacating
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/doc -> <root>/.wsmp-recover-R/slot-2 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent compensating
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/slot-2 -> <root>/doc flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Capture
+  p Identity
+  p Restore
+  s Restored
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent compensating
+  d fsync <root>/.wsmp-recover-R
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/probe flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Unlink
+  p Hold
+  p Identity
+  p Identity
+  p Rmdir
+  => err Conflict
+  | doc="racer\n"
+== replace/exchange-ambiguous
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  p Mkdir
+  s TempCreated
+  s TempWritten
+  d fsync <root>/.wsmp-recover-R/tmp
+  s TempSynced
+  s Chowned
+  s Chmodded
+  d fsync <root>/.wsmp-recover-R/tmp
+  s EtagRechecked
+  d linkat <root>/doc -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/.wsmp-recover-R/tmp -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/tmp -> <root>/doc flags=2
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Exchange
+  s Disposing
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  => err UncertainOutcome
+  | .wsmp-lock-R=""
+  | .wsmp-recover-R/
+  | .wsmp-recover-R/.wsmp-lock=""
+  | .wsmp-recover-R/.wsmp-pin-P="edited\n"
+  | .wsmp-recover-R/.wsmp-pin-P="original\n"
+  | .wsmp-recover-R/INTENT
+  | .wsmp-recover-R/tmp="original\n"
+  | doc="edited\n"
+== create/new
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d fsync <root>
+  p Mkdir
+  s Created
+  d fsync <root>/doc
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0 (failed)
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Rmdir
+  => ok recovered=0
+  | doc="created\n"
+== create/fails-after-create
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d fsync <root>
+  p Mkdir
+  s Created
+  d linkat <root>/doc -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/doc -> <root>/.wsmp-recover-R/slot-1 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  p Hold
+  p Hold
+  p Capture
+  s Captured
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/slot-1 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Unlink
+  p Hold
+  p Identity
+  p Rmdir
+  => err InvalidInput
+== rename/direct
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/from -> <root>/to flags=1
+  p Hold
+  p Mkdir
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Move
+  s Moved
+  d fsync <root>
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Identity
+  p Identity
+  p Rmdir
+  => ok recovered=0
+  | to="source\n"
+== rename/fallback-no-replace
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d renameat2 <root>/.wsmp-recover-R/preflight-1 -> <root>/.wsmp-recover-R/probe flags=1
+  p Hold
+  p Mkdir
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Move
+  p Identity
+  p Identity
+  p Rmdir
+  p Mkdir
+  p ProbeCreate
+  p ProbeNoReplace
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/probe flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  s Vacating
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/from -> <root>/.wsmp-recover-R/slot-1 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Capture
+  s Captured
+  p Identity
+  s Vacated
+  p PublishPrepare
+  s DestinationVacated
+  s Publishing
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/slot-1 -> <root>/to flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p Publish
+  s Renamed
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Identity
+  p Rmdir
+  => ok recovered=0
+  | to="source\n"
+== rename/fallback-link
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d linkat <root>/from -> <root>/.wsmp-recover-R/probe flags=0
+  p Hold
+  p Mkdir
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Move
+  p Identity
+  p Identity
+  p Rmdir
+  p Mkdir
+  p ProbeCreate
+  p ProbeNoReplace
+  p Identity
+  p ProbeLink
+  p LinkCount
+  s LinkProbed
+  p Hold
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/probe flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p LinkCount
+  p Unlink
+  p Identity
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/preflight-1 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  p PublishPrepare
+  s Vacating
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  p Identity
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  s DestinationVacated
+  s Publishing
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d linkat <root>/from -> <root>/to flags=0
+  d fsync <root>
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p PublishLink
+  s Linked
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/from -> <root>/.wsmp-recover-R/slot-1 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p Capture
+  s Captured
+  s Vacated
+  s Renamed
+  p Identity
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/slot-1 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p LinkCount
+  p Unlink
+  p Hold
+  p Hold
+  p Identity
+  p Identity
+  p Rmdir
+  => ok recovered=0
+  | to="source\n"
+== rename/directory-einval
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d renameat2 <root>/.wsmp-recover-R/preflight-1 -> <root>/.wsmp-recover-R/probe-nr flags=1
+  p Hold
+  p Mkdir
+  p Move
+  p Rmdir
+  p Mkdir
+  p ProbeCreate
+  p ProbeNoReplace
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/probe-nr flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0 (failed)
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Unlink
+  p Rmdir
+  => err InvalidInput
+  | from/
+== rename/direct-ambiguous
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/from -> <root>/to flags=1
+  p Hold
+  p Mkdir
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Move
+  p Identity
+  s Moved
+  d fsync <root>
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Identity
+  p Rmdir
+  => ok recovered=0
+  | to="source\n"
+== rename/overwrite-exchange
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d renameat2 <root>/.wsmp-recover-R/preflight-1 -> <root>/.wsmp-recover-R/preflight-2 flags=2
+  p Mkdir
+  p ProbeCreate
+  p ProbeCreate
+  p ProbeExchange
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/preflight-1 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/preflight-2 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  s Vacating
+  d linkat <root>/to -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/from -> <root>/to flags=2
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Identity
+  p Identity
+  p Exchange
+  s Exchanged
+  d fsync <root>
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/from -> <root>/.wsmp-recover-R/slot-1 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p Identity
+  p Capture
+  s Captured
+  s Vacated
+  p Identity
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/slot-1 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Unlink
+  p Hold
+  p Identity
+  p Identity
+  p Rmdir
+  => ok recovered=0
+  | to="source\n"
+== rename/overwrite-exchange-refused
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d renameat2 <root>/.wsmp-recover-R/preflight-1 -> <root>/.wsmp-recover-R/preflight-2 flags=2
+  p Mkdir
+  p ProbeCreate
+  p ProbeCreate
+  p ProbeExchange
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/preflight-1 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/preflight-2 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  s Vacating
+  d linkat <root>/to -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Identity
+  p Identity
+  p Exchange
+  p Identity
+  p Identity
+  p Identity
+  p Rmdir
+  => err UnsafeFilesystem
+  | from="source\n"
+  | to="destination\n"
+== rename/overwrite-no-replace
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d renameat2 <root>/.wsmp-recover-R/preflight-1 -> <root>/.wsmp-recover-R/probe flags=1
+  p Mkdir
+  p ProbeCreate
+  p ProbeCreate
+  p ProbeExchange
+  p ProbeNoReplace
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/probe flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/preflight-2 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/from -> <root>/to flags=1 (failed)
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p Unlink
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Move
+  s Vacating
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/to -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/from -> <root>/.wsmp-recover-R/slot-1 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Capture
+  s Captured
+  p Identity
+  s Vacated
+  p PublishPrepare
+  s DestinationVacating
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/to -> <root>/.wsmp-recover-R/slot-2 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  p Capture
+  p Identity
+  s DestinationVacated
+  s Publishing
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/slot-1 -> <root>/to flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p Publish
+  s Renamed
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/slot-2 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Unlink
+  p Hold
+  p Identity
+  p Identity
+  p Identity
+  p Identity
+  p Identity
+  p Rmdir
+  => ok recovered=0
+  | to="source\n"
+== rename/overwrite-link
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d linkat <root>/from -> <root>/.wsmp-recover-R/probe flags=0
+  p Mkdir
+  p ProbeCreate
+  p ProbeCreate
+  p ProbeExchange
+  p ProbeNoReplace
+  p Identity
+  p ProbeLink
+  p LinkCount
+  s LinkProbed
+  p Hold
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/probe flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/to -> <root>/.wsmp-recover-R/probe flags=0
+  p Identity
+  p LinkCount
+  p Unlink
+  p Identity
+  p Identity
+  p ProbeLink
+  p LinkCount
+  s LinkProbed
+  p Hold
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/probe flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p LinkCount
+  p Unlink
+  p Identity
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/preflight-1 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/preflight-2 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  p PublishPrepare
+  s Vacating
+  d linkat <root>/to -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  p Identity
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  s DestinationVacating
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/to -> <root>/.wsmp-recover-R/slot-1 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  p Capture
+  p Identity
+  p Identity
+  s DestinationVacated
+  s Publishing
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d linkat <root>/from -> <root>/to flags=0
+  d fsync <root>
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p PublishLink
+  s Linked
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/from -> <root>/.wsmp-recover-R/slot-2 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p Capture
+  s Captured
+  s Vacated
+  s Renamed
+  p Identity
+  s Disposing
+  p Identity
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/slot-1 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/slot-2 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Unlink
+  p Hold
+  p LinkCount
+  p Unlink
+  p Hold
+  p Hold
+  p Identity
+  p Identity
+  p Identity
+  p Rmdir
+  => ok recovered=0
+  | to="source\n"
+== rename/overwrite-no-replace-racer
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d renameat2 <root>/.wsmp-recover-R/preflight-1 -> <root>/.wsmp-recover-R/probe flags=1
+  p Mkdir
+  p ProbeCreate
+  p ProbeCreate
+  p ProbeExchange
+  p ProbeNoReplace
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/probe flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/preflight-2 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/from -> <root>/to flags=1 (failed)
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  p Unlink
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Move
+  s Vacating
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/to -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/from -> <root>/.wsmp-recover-R/slot-1 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Capture
+  s Captured
+  p Identity
+  s Vacated
+  p PublishPrepare
+  s DestinationVacating
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/to -> <root>/.wsmp-recover-R/slot-2 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent compensating
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/slot-2 -> <root>/to flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Capture
+  p Identity
+  p Restore
+  s Restored
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent compensating
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent compensating
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/slot-1 -> <root>/from flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Restore
+  s Restored
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Identity
+  p Identity
+  p Identity
+  p Identity
+  p Rmdir
+  => err Conflict
+  | from="source\n"
+  | to="racer\n"
+== rename/overwrite-racer
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  p Hold
+  s BeforeIdentity
+  s IdentityChecked
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  d renameat2 <root>/.wsmp-recover-R/preflight-1 -> <root>/.wsmp-recover-R/preflight-2 flags=2
+  p Mkdir
+  p ProbeCreate
+  p ProbeCreate
+  p ProbeExchange
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/preflight-1 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/preflight-2 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Unlink
+  s Vacating
+  d linkat <root>/to -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d linkat <root>/from -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Hold
+  p Hold
+  p Hold
+  p Hold
+  p Identity
+  p Identity
+  p Identity
+  p Identity
+  p Rmdir
+  => err Conflict
+  | from="source\n"
+  | to="racer\n"
+== delete/file
+  p Hold
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  p Identity
+  p Mkdir
+  s Vacating
+  d linkat <root>/doc -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/doc -> <root>/.wsmp-recover-R/slot-1 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  p Hold
+  p Hold
+  p Capture
+  s Vacated
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent publishing
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent committed
+  d fsync <root>/.wsmp-recover-R
+  p Identity
+  s Disposing
+  d unlinkat <root>/.wsmp-recover-R/slot-1 flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Unlink
+  p Hold
+  p Identity
+  p Rmdir
+  => ok recovered=0
+== delete/racer
+  p Hold
+  s EtagRechecked
+  d mkdirat <root>/.wsmp-recover-R flags=448
+  p Identity
+  p Mkdir
+  s Vacating
+  d linkat <root>/doc -> <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d fsync /<state>
+  d fsync /<state>/H.json.tmp
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/doc -> <root>/.wsmp-recover-R/slot-1 flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent capturing
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent prepared
+  d fsync <root>/.wsmp-recover-R
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent captured
+  d fsync <root>/.wsmp-recover-R
+  p Hold
+  p Hold
+  p Capture
+  s Vacated
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync <root>/.wsmp-recover-R/INTENT.new
+  d intent compensating
+  d fsync <root>/.wsmp-recover-R
+  d renameat2 <root>/.wsmp-recover-R/slot-1 -> <root>/doc flags=1
+  d fsync <root>
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  p Identity
+  p Restore
+  s Restored
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-pin-P flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R/INTENT flags=0
+  d unlinkat <root>/.wsmp-recover-R/INTENT.new flags=0 (failed)
+  d fsync /<state>
+  d unlinkat <root>/.wsmp-recover-R/.wsmp-lock flags=0
+  d fsync <root>/.wsmp-recover-R
+  d fsync <root>
+  d unlinkat <root>/.wsmp-recover-R flags=512
+  d fsync <root>
+  d unlinkat <root>/.wsmp-lock-.wsmp-recover-R flags=0
+  p Identity
+  p Rmdir
+  => err Conflict
+  | doc="racer\n"
