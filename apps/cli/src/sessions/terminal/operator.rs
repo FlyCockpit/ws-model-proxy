@@ -562,10 +562,10 @@ fn spawn_operator(
     (cols, rows): (u16, u16),
     tx: &SyncSender<FromWorker>,
     terminal_id: &str,
-) -> anyhow::Result<super::PtyRuntime> {
+) -> anyhow::Result<crate::sessions::pty::PtyRuntime> {
     let (program, args) = op::wrapper_argv(&state.screen.command);
     let (program, args) = crate::launch_guard::command(&program, &args)?;
-    super::spawn_pty(
+    crate::sessions::pty::spawn_pty(
         std::ffi::OsStr::new(&program),
         &args,
         cwd,
@@ -588,7 +588,7 @@ fn spawn_operator(
     (cols, rows): (u16, u16),
     tx: &SyncSender<FromWorker>,
     terminal_id: &str,
-) -> anyhow::Result<super::PtyRuntime> {
+) -> anyhow::Result<crate::sessions::pty::PtyRuntime> {
     use crate::runtimes::executor::windows::{Invocation, ShellLine, invocation};
     let Invocation { program, line } = invocation(
         state.shell,
@@ -598,7 +598,7 @@ fn spawn_operator(
         true,
     )?;
     match line {
-        ShellLine::List(args) => super::spawn_pty(
+        ShellLine::List(args) => crate::sessions::pty::spawn_pty(
             program.as_os_str(),
             &args,
             cwd,
@@ -608,7 +608,7 @@ fn spawn_operator(
             tx,
             terminal_id,
         ),
-        ShellLine::Raw(tail) => super::spawn_pty_raw(
+        ShellLine::Raw(tail) => crate::sessions::pty::spawn_pty_raw(
             program.as_os_str(),
             &tail,
             cwd,
