@@ -71,7 +71,7 @@ impl Object {
     fn tag(self, fx: &Fx, name: &str) -> String {
         match self {
             Self::File => {
-                let stat = crate::services::file_ops::fs::meta::Stat::from_metadata(
+                let stat = crate::services::file_ops::meta::Stat::from_metadata(
                     &std::fs::metadata(fx.root.join(name)).unwrap(),
                 );
                 if stat.size > crate::services::file_ops::fs::etag::STRONG_ETAG_MAX_BYTES {
@@ -81,7 +81,7 @@ impl Object {
                 }
             }
             Self::Symlink => fx.ops.context().key.weak_stat(
-                &crate::services::file_ops::fs::meta::Stat::from_metadata(
+                &crate::services::file_ops::meta::Stat::from_metadata(
                     &std::fs::symlink_metadata(fx.root.join(name)).unwrap(),
                 ),
             ),

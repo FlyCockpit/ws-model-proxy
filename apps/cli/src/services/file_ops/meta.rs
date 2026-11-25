@@ -1,7 +1,7 @@
 //! What every layer of the file tools knows about a file object: [`Stat`], the
-//! portable subset of `stat(2)`, and its [`Kind`]. The bottom layer: it names
-//! nothing else in `file_ops`, so `policy`, `etag`, `resolve`, `exchange` and the
-//! recovery journal all build on it.
+//! portable subset of `stat(2)`, and its [`Kind`]. Shared vocabulary beside
+//! `error`, below every layer: it names nothing else in `file_ops`, so `fs`, the
+//! journal and the tools all build on it.
 //!
 //! On Windows the view is synthesized: `mode` is `0644`, or `0444` for a
 //! read-only file, `0755` for a directory; `uid`/`gid` are 0, and `dev`/`ino`

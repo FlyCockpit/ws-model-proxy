@@ -20,7 +20,7 @@ use nix::errno::Errno;
 use serde_json::{Value, json};
 
 use super::Fx;
-use crate::services::file_ops::fs::exchange::{FaultScope, Primitive};
+use crate::services::file_ops::journal::exchange::{FaultScope, Primitive};
 use crate::services::file_ops::{FileResult, Step};
 
 const GOLDEN: &str = include_str!("transaction_trace.golden");

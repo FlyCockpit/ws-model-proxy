@@ -1,14 +1,15 @@
-//! Safe atomic exchange on held directory descriptors, the other rename and
-//! link primitives (with their test fault points), and how their errnos and a
-//! directory's fsync barrier are classified.
+//! The journal's syscalls: safe atomic exchange on held directory descriptors,
+//! the other rename and link primitives, the link-count read, and how their
+//! errnos are classified, each behind a numbered test fault point
+//! ([`Primitive`], `FaultScope`). Only the journal moves public names, so only
+//! it calls these; the directory fsync barrier every layer needs is `fs::sync`.
 
 use std::ffi::OsStr;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::AsFd;
 
 use nix::errno::Errno;
 
-use super::meta::Stat;
-use crate::services::file_ops::error::{FileError, FileResult};
+use crate::services::file_ops::meta::Stat;
 
 /// Faults are thread-local, indexed by the Nth call of each primitive. Production
 /// calls execute only the syscall. A test scope resets counts and faults.
@@ -269,22 +270,6 @@ pub(in crate::services::file_ops) fn is_unsupported(errno: Errno) -> bool {
 /// EMLINK, space/quota errors and access errors describe this attempt instead.
 pub(in crate::services::file_ops) fn is_link_unsupported(errno: Errno) -> bool {
     is_unsupported(errno) || matches!(errno, Errno::EPERM | Errno::EOPNOTSUPP)
-}
-
-/// Prove the directory accepts fsync BEFORE an unjournaled public effect
-/// (create, mkdir, rmdir, case-only rename). An unsupported directory sync
-/// then refuses as `unsafe_filesystem` with nothing changed.
-pub(crate) fn probe_dir_barrier(dir: &OwnedFd) -> FileResult<()> {
-    nix::unistd::fsync(dir.as_fd()).map_err(barrier_error)
-}
-
-/// A directory that cannot be fsynced at all cannot carry a crash journal:
-/// that is an unsafe filesystem, not a transient I/O error.
-pub(in crate::services::file_ops) fn barrier_error(errno: Errno) -> FileError {
-    match errno {
-        Errno::EINVAL | Errno::ENOTSUP => FileError::unsafe_filesystem(),
-        errno => FileError::errno(errno),
-    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

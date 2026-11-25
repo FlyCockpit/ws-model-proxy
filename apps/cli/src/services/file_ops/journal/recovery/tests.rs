@@ -1,6 +1,6 @@
 use super::*;
 use crate::services::file_ops::Step;
-use crate::services::file_ops::fs::exchange::FaultScope;
+use crate::services::file_ops::journal::exchange::FaultScope;
 use crate::services::file_ops::tests::Fx;
 
 fn root(fx: &Fx) -> OwnedFd {

@@ -17,9 +17,9 @@ use super::intent::{
     INTENT_MAX_BYTES, Intent, IntentOp, IntentPhase, IntentSlot, intent_phase_name, parse_intent,
 };
 use super::registry::{self, RegistryEntry};
-use crate::services::file_ops::fs::exchange::Primitive;
-use crate::services::file_ops::fs::exchange::no_replace;
-use crate::services::file_ops::fs::meta::Stat;
+use crate::services::file_ops::journal::exchange::Primitive;
+use crate::services::file_ops::journal::exchange::no_replace;
+use crate::services::file_ops::meta::Stat;
 
 const SCAN_REPORT_MAX: usize = 32;
 const SCAN_VISIT_MAX: usize = 10_000;
@@ -703,8 +703,8 @@ fn anchored_identity(
     if !slot.matches(&stat)
         || !matches!(
             stat.kind(),
-            crate::services::file_ops::fs::meta::Kind::File
-                | crate::services::file_ops::fs::meta::Kind::Symlink
+            crate::services::file_ops::meta::Kind::File
+                | crate::services::file_ops::meta::Kind::Symlink
         )
     {
         return Err(
@@ -1047,7 +1047,7 @@ mod tests {
         let Some(root) = std::env::var_os("WSMP_RECOVERY_PRODUCER_FIXTURE") else {
             return;
         };
-        use crate::services::file_ops::fs::exchange::{FaultScope, Primitive};
+        use crate::services::file_ops::journal::exchange::{FaultScope, Primitive};
         use crate::services::file_ops::{Cancel, EtagKey, FileOps, Policy, Step};
         let root = PathBuf::from(root);
         let target = root.join("target");
@@ -1550,7 +1550,7 @@ mod tests {
 
     #[test]
     fn committed_delete_cleanup_fault_round_trips_through_recover() {
-        use crate::services::file_ops::fs::exchange::FaultScope;
+        use crate::services::file_ops::journal::exchange::FaultScope;
         use crate::services::file_ops::tests::args;
         let fx = Fx::new();
         fx.put("src", "acknowledged delete");

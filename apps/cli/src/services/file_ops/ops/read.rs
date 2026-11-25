@@ -18,9 +18,9 @@ use super::text::{self, Eol, SNIFF_BYTES, floor_boundary, strip_eol};
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
 use crate::services::file_ops::fs::etag::{STRONG_ETAG_MAX_BYTES, load_all};
-use crate::services::file_ops::fs::meta::Stat;
 use crate::services::file_ops::fs::policy::Access;
 use crate::services::file_ops::fs::resolve::{ResolveOpts, resolve};
+use crate::services::file_ops::meta::Stat;
 use crate::services::file_ops::redact::{self, FileClass, LineMasker};
 use crate::services::file_ops::{Cancel, fmt};
 

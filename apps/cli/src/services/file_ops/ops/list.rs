@@ -8,10 +8,10 @@ use super::glob::Glob;
 use super::text::name_for_display;
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{FileError, FileResult};
-use crate::services::file_ops::fs::meta::Kind;
 use crate::services::file_ops::fs::policy::Access;
 use crate::services::file_ops::fs::resolve::{ResolveOpts, resolve};
 use crate::services::file_ops::fs::walk::{Flow, walk};
+use crate::services::file_ops::meta::Kind;
 use crate::services::file_ops::{Cancel, fmt};
 
 pub const DEFAULT_ENTRIES: u32 = 200;
@@ -81,8 +81,6 @@ pub(crate) fn list(ops: &OpContext, args: &ListArgs, cancel: &Cancel) -> FileRes
             cancel: None,
         },
     )?;
-    let root = resolved.open_dir()?;
-    let root_path = resolved.full_path();
     let prefix = name_for_display(args.path.trim_end_matches('/'));
 
     let mut lines: Vec<String> = Vec::new();
@@ -129,9 +127,7 @@ pub(crate) fn list(ops: &OpContext, args: &ListArgs, cancel: &Cancel) -> FileRes
                 fmt::date_only(entry.stat.mtime())
             ),
             Kind::Symlink => {
-                let target =
-                    crate::services::file_ops::fs::resolve::read_link_at(entry.parent, entry.name)
-                        .unwrap_or_default();
+                let target = entry.read_link().unwrap_or_default();
                 format!("l {shown} -> {}", name_for_display(&target))
             }
             Kind::Other => format!("o {shown}"),
@@ -141,8 +137,7 @@ pub(crate) fn list(ops: &OpContext, args: &ListArgs, cancel: &Cancel) -> FileRes
     };
     let stats = walk(
         &ops.policy,
-        &root,
-        &root_path,
+        &resolved,
         depth,
         &mut || cancel.check(),
         &mut visit,

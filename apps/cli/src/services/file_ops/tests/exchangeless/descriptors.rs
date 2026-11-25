@@ -6,7 +6,7 @@ use super::*;
 #[cfg(target_os = "linux")]
 #[test]
 fn exchangeless_final_unlink_has_no_descriptor_on_disposed_inode() {
-    use crate::services::file_ops::fs::exchange::UNLINK_PROBE;
+    use crate::services::file_ops::journal::exchange::UNLINK_PROBE;
     use std::os::unix::fs::MetadataExt;
     for delete_op in [false, true] {
         for method in METHODS {
@@ -62,7 +62,7 @@ fn exchangeless_final_unlink_has_no_descriptor_on_disposed_inode() {
 #[cfg(target_os = "linux")]
 #[test]
 fn exchangeless_restore_link_unlink_has_no_descriptor_on_disposed_inode() {
-    use crate::services::file_ops::fs::exchange::UNLINK_PROBE;
+    use crate::services::file_ops::journal::exchange::UNLINK_PROBE;
     use std::os::unix::fs::MetadataExt;
     for method in METHODS {
         let fx = Fx::new();
@@ -279,7 +279,7 @@ fn exchangeless_overwrite_initial_mismatch_closes_matching_proofs_for_restore() 
 #[cfg(target_os = "linux")]
 #[test]
 fn exchangeless_supported_overwrite_undo_releases_source_and_destination() {
-    use crate::services::file_ops::fs::exchange::UNLINK_PROBE;
+    use crate::services::file_ops::journal::exchange::UNLINK_PROBE;
     use std::os::unix::fs::MetadataExt;
     let fx = Fx::new();
     fx.put("src", ORIGINAL);

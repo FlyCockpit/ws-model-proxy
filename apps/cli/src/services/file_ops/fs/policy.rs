@@ -11,8 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::meta::Stat;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
+use crate::services::file_ops::meta::Stat;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {

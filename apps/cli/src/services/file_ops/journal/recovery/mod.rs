@@ -139,9 +139,10 @@ use serde_json::json;
 
 use super::intent::{Intent, IntentPhase};
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
-use crate::services::file_ops::fs::exchange::{Primitive, barrier_error, fault, run};
-use crate::services::file_ops::fs::meta::{Kind, Stat};
 use crate::services::file_ops::fs::resolve::Resolved;
+use crate::services::file_ops::fs::sync::barrier_error;
+use crate::services::file_ops::journal::exchange::{Primitive, fault, run};
+use crate::services::file_ops::meta::{Kind, Stat};
 
 mod barrier;
 mod capture;
@@ -505,7 +506,7 @@ impl RecoveryDir {
             // caller's own phase write reports it first in practice.
             return Err(Errno::EIO);
         }
-        if let Err(errno) = crate::services::file_ops::fs::exchange::exchange(
+        if let Err(errno) = crate::services::file_ops::journal::exchange::exchange(
             self.dir.as_fd(),
             &slot.name,
             destination.dir.as_fd(),

@@ -66,7 +66,7 @@ use nix::unistd::{Gid, Uid, fchown};
 use super::recovery;
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
-use crate::services::file_ops::fs::meta::{Stat, perm_mode};
+use crate::services::file_ops::meta::{Stat, perm_mode};
 use crate::services::file_ops::{Cancel, Step};
 
 /// Refuse files an atomic replace would damage.

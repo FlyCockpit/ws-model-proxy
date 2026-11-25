@@ -12,10 +12,10 @@ use nix::errno::Errno;
 use super::{Held, Origin, PublishMethod, RecoveryDir, refused_without_effect};
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
-use crate::services::file_ops::fs::exchange::{Primitive, is_unsupported, no_replace};
-use crate::services::file_ops::fs::meta::Kind;
 use crate::services::file_ops::fs::resolve::Resolved;
+use crate::services::file_ops::journal::exchange::{Primitive, is_unsupported, no_replace};
 use crate::services::file_ops::journal::intent::{Intent, IntentOrder, IntentPhase};
+use crate::services::file_ops::meta::Kind;
 use crate::services::file_ops::{Cancel, Step};
 
 /// Move `src` (held at `from`) to `to`. `dst` is the held destination only for
@@ -285,9 +285,9 @@ fn rejected_name() -> FileError {
 #[cfg(all(test, target_os = "linux"))]
 mod descriptor_tests {
     use super::*;
-    use crate::services::file_ops::fs::exchange::{FaultScope, UNLINK_PROBE};
     use crate::services::file_ops::fs::policy::Access;
     use crate::services::file_ops::fs::resolve::{ResolveOpts, resolve};
+    use crate::services::file_ops::journal::exchange::{FaultScope, UNLINK_PROBE};
     use crate::services::file_ops::tests::Fx;
     use std::os::unix::fs::MetadataExt;
     use std::sync::{Arc, Mutex};

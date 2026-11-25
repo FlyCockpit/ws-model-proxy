@@ -48,7 +48,7 @@ fn recovery_cleanup_abrupt_child_helper() {
         .expect("parent");
     let mut recovery = RecoveryDir::new(&parent, &root).expect("recovery");
     let dir = recovery.path.clone();
-    crate::services::file_ops::fs::exchange::RMDIR_PROBE.with(|probe| {
+    crate::services::file_ops::journal::exchange::RMDIR_PROBE.with(|probe| {
         *probe.borrow_mut() = Some(Box::new(move || {
             std::fs::write(root.join("ready"), dir.as_os_str().as_encoded_bytes()).expect("ready");
             assert!(dir.is_dir(), "directory exists before actual rmdir");

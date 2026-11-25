@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::services::file_ops::fs::meta::{Stat, kind_name};
+use crate::services::file_ops::meta::{Stat, kind_name};
 
 /// Current on-disk INTENT schema. v2 is read only for non-destructive reporting.
 pub const INTENT_VERSION: u32 = 3;

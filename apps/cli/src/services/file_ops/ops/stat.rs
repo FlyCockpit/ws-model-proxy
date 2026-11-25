@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
 use crate::services::file_ops::fs::etag::{STRONG_ETAG_MAX_BYTES, load_all};
-use crate::services::file_ops::fs::meta::{Kind, Stat, kind_name};
 use crate::services::file_ops::fs::policy::Access;
 use crate::services::file_ops::fs::resolve::{ResolveOpts, resolve};
+use crate::services::file_ops::meta::{Kind, Stat, kind_name};
 use crate::services::file_ops::{Cancel, fmt};
 
 pub const MAX_STAT_PATHS: usize = 50;

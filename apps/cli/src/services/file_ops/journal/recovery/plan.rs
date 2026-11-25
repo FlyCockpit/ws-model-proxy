@@ -13,10 +13,11 @@ use rand::distr::{Alphanumeric, SampleString};
 
 use super::{Held, RecoveryDir};
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
-use crate::services::file_ops::fs::exchange::{barrier_error, is_link_unsupported};
-use crate::services::file_ops::fs::meta::{Kind, Stat};
 use crate::services::file_ops::fs::resolve::Resolved;
+use crate::services::file_ops::fs::sync::barrier_error;
+use crate::services::file_ops::journal::exchange::is_link_unsupported;
 use crate::services::file_ops::journal::intent::{Intent, IntentOrder, PinTarget};
+use crate::services::file_ops::meta::{Kind, Stat};
 
 impl RecoveryDir {
     /// Crash map for the slots this rename will capture. Fsynced before any

@@ -18,10 +18,10 @@ use crate::services::file_ops::Cancel;
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
 use crate::services::file_ops::fs::etag::read_to_end_cancellable;
-use crate::services::file_ops::fs::meta::Kind;
 use crate::services::file_ops::fs::policy::Access;
 use crate::services::file_ops::fs::resolve::{ResolveOpts, resolve};
 use crate::services::file_ops::fs::walk::{Entry, Flow, walk};
+use crate::services::file_ops::meta::Kind;
 use crate::services::file_ops::redact;
 
 pub const DEFAULT_MATCHES: u32 = 100;
@@ -136,15 +136,7 @@ pub(crate) fn search(
 
     let scan_file = |state: &mut State, entry: &Entry<'_>, shown: &str| -> FileResult<()> {
         cancel.check()?;
-        let opened = crate::services::file_ops::fs::resolve::Resolved::at(
-            entry.parent,
-            entry
-                .full
-                .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_default(),
-            entry.name.into(),
-        )?;
+        let opened = entry.resolved()?;
         let Ok((mut file, stat)) = opened.open_regular(&ops.policy, Access::Read) else {
             return Ok(());
         };
@@ -245,8 +237,6 @@ pub(crate) fn search(
         };
         scan_file(&mut state, &entry, &prefix)?;
     } else {
-        let root = resolved.open_dir()?;
-        let root_path = resolved.full_path();
         let mut visit = |entry: &Entry<'_>| -> FileResult<Flow> {
             cancel.check()?;
             if started.elapsed() > deadline {
@@ -288,7 +278,7 @@ pub(crate) fn search(
             }
             Ok(())
         };
-        match walk(&ops.policy, &root, &root_path, 64, &mut check, &mut visit) {
+        match walk(&ops.policy, &resolved, 64, &mut check, &mut visit) {
             Err(error) if error.code == crate::services::file_ops::error::ErrorCode::Timeout => {
                 state.note = Some(error.message)
             }

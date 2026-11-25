@@ -14,10 +14,10 @@ use nix::unistd::linkat;
 use super::{Checkpoint, Held, Origin, RecoveryDir, Slot};
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{FileError, FileResult};
-use crate::services::file_ops::fs::exchange::{Primitive, is_unsupported, no_replace, run};
-use crate::services::file_ops::fs::meta::{Kind, Stat};
 use crate::services::file_ops::fs::resolve::Resolved;
+use crate::services::file_ops::journal::exchange::{Primitive, is_unsupported, no_replace, run};
 use crate::services::file_ops::journal::intent::IntentPhase;
+use crate::services::file_ops::meta::{Kind, Stat};
 
 impl RecoveryDir {
     /// A previously moved candidate can reclaim its recorded pre-move origin

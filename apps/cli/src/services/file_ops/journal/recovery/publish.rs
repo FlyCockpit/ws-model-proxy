@@ -12,10 +12,10 @@ use nix::unistd::linkat;
 use super::{Held, LinkOrder, Origin, PublishMethod, Published, RecoveryDir, Slot};
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
-use crate::services::file_ops::fs::exchange::{
+use crate::services::file_ops::fs::resolve::Resolved;
+use crate::services::file_ops::journal::exchange::{
     Primitive, fault, is_link_unsupported, is_unsupported, no_replace, run,
 };
-use crate::services::file_ops::fs::resolve::Resolved;
 use crate::services::file_ops::journal::intent::{IntentOrder, IntentPhase};
 use crate::services::file_ops::{Cancel, Step};
 
@@ -582,7 +582,7 @@ impl RecoveryDir {
         self.set_intent_phase(IntentPhase::Publishing)?;
         let before = self.effect_checkpoint();
         self.begin_public_effect()?;
-        match crate::services::file_ops::fs::exchange::exchange(
+        match crate::services::file_ops::journal::exchange::exchange(
             from.dir.as_fd(),
             &from.name,
             to.dir.as_fd(),

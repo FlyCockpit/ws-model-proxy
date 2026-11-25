@@ -15,11 +15,11 @@ use super::{Held, LinkOrder, Origin, PublishMethod, RecoveryDir, Slot};
 use crate::services::file_ops::Step;
 use crate::services::file_ops::context::OpContext;
 use crate::services::file_ops::error::{FileError, FileResult};
-use crate::services::file_ops::fs::exchange::{
+use crate::services::file_ops::fs::resolve::Resolved;
+use crate::services::file_ops::journal::exchange::{
     Primitive, is_link_unsupported, is_unsupported, link_count, no_replace, run,
 };
-use crate::services::file_ops::fs::meta::Stat;
-use crate::services::file_ops::fs::resolve::Resolved;
+use crate::services::file_ops::meta::Stat;
 
 impl RecoveryDir {
     /// One absent-name ladder, shared by replacement and rename preflight.
@@ -218,7 +218,7 @@ impl RecoveryDir {
             if dst.is_some() {
                 second = Some(self.dummy("preflight-2", to)?);
                 if let Some((slot, held)) = second.as_mut() {
-                    match crate::services::file_ops::fs::exchange::exchange_with(
+                    match crate::services::file_ops::journal::exchange::exchange_with(
                         self.dir.as_fd(),
                         &first.name,
                         self.dir.as_fd(),

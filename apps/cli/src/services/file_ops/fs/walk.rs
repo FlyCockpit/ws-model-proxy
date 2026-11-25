@@ -14,9 +14,10 @@ use nix::dir::Dir;
 use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::{Mode, fstatat};
 
-use super::meta::{Kind, Stat};
 use super::policy::Policy;
+use super::resolve::{Resolved, read_link_at};
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
+use crate::services::file_ops::meta::{Kind, Stat};
 
 /// Bound collection before sorting, independently of result pagination limits.
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
@@ -39,6 +40,23 @@ pub struct Entry<'a> {
     pub depth: usize,
 }
 
+impl Entry<'_> {
+    /// The entry as a resolved path, its parent held, to open it from.
+    pub fn resolved(&self) -> FileResult<Resolved> {
+        let dir_path = self
+            .full
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        Resolved::at(self.parent, dir_path, self.name.into())
+    }
+
+    /// A link's text (`None` when it is not a link or not UTF-8).
+    pub fn read_link(&self) -> Option<String> {
+        read_link_at(self.parent, self.name)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
     Continue,
@@ -54,15 +72,18 @@ pub struct WalkStats {
     pub stopped: bool,
 }
 
-/// Walk below `root` (already resolved and held) up to `max_depth` levels.
+/// Walk below the directory `root` names up to `max_depth` levels. The leaf is
+/// opened as a directory (`O_NOFOLLOW`) and walked from that fd under its
+/// physical path.
 pub fn walk(
     policy: &Policy,
-    root: &OwnedFd,
-    root_path: &Path,
+    root: &Resolved,
     max_depth: usize,
     check: &mut dyn FnMut() -> FileResult<()>,
     visit: &mut dyn FnMut(&Entry<'_>) -> FileResult<Flow>,
 ) -> FileResult<WalkStats> {
+    let dir = root.open_dir()?;
+    let root_path = root.full_path();
     let mut stats = WalkStats::default();
     let mut rel = String::new();
     #[cfg(test)]
@@ -71,8 +92,8 @@ pub fn walk(
     let directory_limit = MAX_DIRECTORY_ENTRIES;
     walk_dir(
         policy,
-        root,
-        root_path,
+        &dir,
+        &root_path,
         &mut rel,
         1,
         max_depth,
@@ -341,10 +362,10 @@ mod tests {
         let policy = Policy::new(vec![], vec![], true);
         let mut visited = 0;
         let mut checked = 0;
+        let root = Resolved::at(&root(), dir.path().to_path_buf(), ".".into()).expect("root");
         let error = walk(
             &policy,
-            &root(),
-            dir.path(),
+            &root,
             1,
             &mut || {
                 checked += 1;

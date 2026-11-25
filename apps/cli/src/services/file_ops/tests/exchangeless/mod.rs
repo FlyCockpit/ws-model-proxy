@@ -11,7 +11,7 @@ use nix::errno::Errno;
 use serde_json::{Value, json};
 
 use super::{Fx, args};
-use crate::services::file_ops::fs::exchange::{FaultScope, Primitive};
+use crate::services::file_ops::journal::exchange::{FaultScope, Primitive};
 use crate::services::file_ops::{Cancel, ErrorCode, FileError, FileOps, FileResult, Step};
 
 const ORIGINAL: &str = "original contents\n";
@@ -275,7 +275,7 @@ fn save_delete_successor(doc: &Path, kind: DeleteKind) {
 // inodes may remain held; this probe never asserts about those descriptors.
 #[cfg(target_os = "linux")]
 fn watch_private_unlinks(fx: &Fx, slots: &[&str]) -> Arc<Mutex<Vec<(u64, u64)>>> {
-    use crate::services::file_ops::fs::exchange::UNLINK_PROBE;
+    use crate::services::file_ops::journal::exchange::UNLINK_PROBE;
     use std::os::unix::fs::MetadataExt;
     let root = fx.root.clone();
     let slots: Vec<_> = slots.iter().map(|slot| (*slot).to_owned()).collect();

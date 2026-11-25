@@ -27,9 +27,9 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf, Prefix};
 
-use super::meta::{Kind, Stat};
 use super::policy::{Access, Policy};
 use crate::services::file_ops::error::{ErrorCode, FileError, FileResult};
+use crate::services::file_ops::meta::{Kind, Stat};
 
 pub const MAX_PATH_BYTES: usize = 4096;
 
@@ -66,7 +66,7 @@ pub struct ResolveOpts<'a> {
 
 impl Resolved {
     /// The entry `name` of a directory a walk holds.
-    pub fn at(parent: &DirHandle, dir_path: PathBuf, name: OsString) -> FileResult<Self> {
+    pub(super) fn at(parent: &DirHandle, dir_path: PathBuf, name: OsString) -> FileResult<Self> {
         Ok(Self {
             dir: parent.clone(),
             dir_path,
@@ -118,7 +118,7 @@ impl Resolved {
     }
 
     /// The leaf as a directory to walk: it must be one, not a link to one.
-    pub fn open_dir(&self) -> FileResult<DirHandle> {
+    pub(super) fn open_dir(&self) -> FileResult<DirHandle> {
         let path = self.full_path();
         let meta = std::fs::symlink_metadata(&path)?;
         if !meta.is_dir() || meta.file_type().is_symlink() {
@@ -168,7 +168,7 @@ impl Resolved {
 
 /// A link's text in the directory `parent`, in the POSIX view when it is an
 /// absolute drive path; `None` when it is not a link or not readable.
-pub fn read_link_at(parent: &DirHandle, name: &str) -> Option<String> {
+pub(super) fn read_link_at(parent: &DirHandle, name: &str) -> Option<String> {
     let target = std::fs::read_link(parent.path.join(name)).ok()?;
     if target.is_absolute() {
         return posix_view(&target);

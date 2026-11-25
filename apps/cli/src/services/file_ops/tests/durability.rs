@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use super::{Fx, args};
-use crate::services::file_ops::fs::exchange::{FaultScope, Primitive};
+use crate::services::file_ops::journal::exchange::{FaultScope, Primitive};
 use crate::services::file_ops::journal::intent::{Intent, IntentPhase, parse_intent};
 use crate::services::file_ops::journal::recover::{RecoverAction, recover_dir, scan_recovery_dirs};
 use crate::services::file_ops::{ErrorCode, Step};
