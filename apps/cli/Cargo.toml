@@ -65,8 +65,9 @@ sha2 = "0.11"
 # second provider (reqwest's `rustls` feature pulls in aws-lc-rs) stops rustls
 # from choosing one, so `wss://` connects panic. `wsmp::tls` installs ring.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
-# Named directly only to install the process-wide `ring` crypto provider (see
-# `wsmp::tls`); default features would add aws-lc-rs back.
+# Named directly to install the process-wide `ring` crypto provider and to build
+# the relay's TLS configuration (see `wsmp::services::tls`); default features
+# would add aws-lc-rs back.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # `signal`: shutdown signals (SIGTERM/SIGINT/SIGHUP on Unix; console control
 # events on Windows) start the bounded relay shutdown (`wsmp::shutdown`). On
@@ -80,6 +81,10 @@ futures-core = "0.3"
 url = "2"
 # Foreground daemon websocket connection to the app relay.
 tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+# The system's root certificates for the relay's TLS configuration, loaded once per
+# process (`wsmp::services::tls`) instead of on every connect as tungstenite's
+# default does. Already in the build through tungstenite and reqwest (owner 11-25).
+rustls-native-certs = "0.8"
 # Structured logging. `--log-format`, `RUST_LOG`/`WSMP_LOG` filtering.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

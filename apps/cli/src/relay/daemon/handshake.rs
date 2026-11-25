@@ -89,6 +89,16 @@ fn relay_redirect_allowed(from: &Url, to: &Url, followed: usize) -> bool {
             || (from.port().is_none() && to.port().is_none()))
 }
 
+/// The connector of a relay connection: for `wss` the process's TLS configuration (its root
+/// certificates loaded once), for `ws` none.
+fn relay_connector(tls: bool) -> io::Result<Option<tungstenite::Connector>> {
+    if !tls {
+        return Ok(None);
+    }
+    crate::services::tls::native_roots_client_config()
+        .map(|config| Some(tungstenite::Connector::Rustls(config)))
+}
+
 fn relay_connect_timeout() -> tungstenite::Error {
     io::Error::new(io::ErrorKind::TimedOut, "relay connection deadline elapsed").into()
 }
@@ -160,13 +170,15 @@ fn connect_relay_with_deadline(
         let handshake_timeout = remaining()?.min(Duration::from_secs(15));
         stream.set_read_timeout(Some(handshake_timeout))?;
         stream.set_write_timeout(Some(handshake_timeout))?;
-        // Exactly connect()'s TLS defaults: rustls, the installed ring provider,
-        // native root certificates, and no custom WebSocket config or connector.
-        // For `wss` that loads the system's root certificates on every call, before
-        // any I/O the socket timeouts bound (on macOS from the keychain, which can
-        // take a second under load). So the handshake runs on a helper and is waited
-        // for within the same deadline, as the resolver is. A handshake given up on
-        // has its socket shut down, so it cannot go on talking to the peer.
+        // connect()'s TLS defaults: rustls, the installed ring provider, native root
+        // certificates, and no custom WebSocket config; the configuration is built
+        // once per process (`native_roots_client_config`). Its first build loads the
+        // system's root certificates before any I/O the socket timeouts bound (on
+        // macOS from the keychain, which can take a second under load). So the
+        // handshake runs on a helper and is waited for within the same deadline, as
+        // the resolver is. A handshake given up on has its socket shut down, so it
+        // cannot go on talking to the peer.
+        let tls = url.scheme() == "wss";
         let wait = remaining()?;
         let helper = HandshakeHelper::take().ok_or_else(relay_connect_timeout)?;
         let abandon = stream.try_clone()?;
@@ -176,11 +188,18 @@ fn connect_relay_with_deadline(
             .name("wsmp-relay-handshake".into())
             .spawn(move || {
                 let _helper = helper;
+                let connector = match relay_connector(tls) {
+                    Ok(connector) => connector,
+                    Err(error) => {
+                        let _ = tx.send(Err(tungstenite::HandshakeError::Failure(error.into())));
+                        return;
+                    }
+                };
                 let _ = tx.send(tungstenite::client_tls_with_config(
                     handshake_request,
                     stream,
                     None,
-                    None,
+                    connector,
                 ));
             })?;
         let Ok(handshake) = rx.recv_timeout(wait) else {
@@ -742,6 +761,80 @@ mod tests {
                 RelaySessionError::Reconnectable { .. }
             ));
         }
+    }
+
+    /// A `wss` connection takes the process's TLS configuration; `ws` takes none.
+    #[test]
+    fn wss_connects_take_the_process_tls_configuration() {
+        let shared = crate::services::tls::native_roots_client_config().expect("native roots");
+        let Ok(Some(tungstenite::Connector::Rustls(config))) = relay_connector(true) else {
+            panic!("no rustls connector for wss");
+        };
+        assert!(std::sync::Arc::ptr_eq(&config, &shared));
+        assert!(matches!(relay_connector(false), Ok(None)));
+    }
+
+    /// The system's root certificates are loaded once per process, not on every `wss` connect.
+    /// A child process takes its roots from `SSL_CERT_FILE`; after a first connect the file is
+    /// removed, and a second connect still reaches its deadline (a per-connect load, as
+    /// tungstenite's default does, would find no roots and fail at once).
+    #[test]
+    fn wss_connects_reuse_the_loaded_root_certificates() {
+        const NAME: &str =
+            "relay::daemon::handshake::tests::wss_connects_reuse_the_loaded_root_certificates";
+        if let Some(roots) = std::env::var_os("WSMP_TEST_ROOTS_CHILD") {
+            let silent_connect = || {
+                // The kernel accepts the connection and nobody answers it: the TLS handshake
+                // waits until the deadline.
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+                let request = format!("wss://{}/relay", listener.local_addr().expect("address"))
+                    .into_client_request()
+                    .expect("request");
+                connect_relay_with_deadline(request, Duration::from_secs(2))
+                    .expect_err("a silent peer")
+            };
+            let timed_out = |error: &tungstenite::Error| matches!(error, tungstenite::Error::Io(io) if io.kind() == io::ErrorKind::TimedOut);
+            let first = silent_connect();
+            assert!(timed_out(&first), "first: {first}");
+            std::fs::remove_file(&roots).expect("remove the roots");
+            let second = silent_connect();
+            assert!(timed_out(&second), "second: {second}");
+            assert_eq!(
+                crate::services::tls::tests::ROOT_LOADS.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            return;
+        }
+        use base64::Engine as _;
+        let native = rustls_native_certs::load_native_certs().certs;
+        let cert = native.first().expect("a native root certificate");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+        let lines = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|line| std::str::from_utf8(line).expect("base64"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dir = tempfile::tempdir().expect("dir");
+        let roots = dir.path().join("roots.pem");
+        std::fs::write(
+            &roots,
+            format!("-----BEGIN CERTIFICATE-----\n{lines}\n-----END CERTIFICATE-----\n"),
+        )
+        .expect("roots");
+        let ran = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", NAME, "--nocapture"])
+            .env("WSMP_TEST_ROOTS_CHILD", &roots)
+            .env("SSL_CERT_FILE", &roots)
+            .env_remove("SSL_CERT_DIR")
+            .output()
+            .expect("child");
+        assert!(
+            ran.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr)
+        );
     }
 
     #[test]
