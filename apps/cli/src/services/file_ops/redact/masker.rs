@@ -14,7 +14,8 @@ use super::{LOOKBACK_BYTES, MASK_CLOSE, MASK_OPEN, token, token_bare};
 
 /// Bounded carry for one overlong terminal-cleaned line. Piece boundaries are
 /// never interpreted as line boundaries. Only exact private-key labels are
-/// carried; all general recovery is enforced by `StreamMasker::prime_recovery`.
+/// carried; the general recovery run is opened by [`Self::recover`] and kept
+/// across blank lines by `StreamMasker` ([`LineMasker::guard_next_line`]).
 #[derive(Default)]
 pub(crate) struct SameLineCarry {
     pem_tail: String,
@@ -111,6 +112,12 @@ impl SameLineCarry {
         }
     }
 
+    /// Restore the carried private-key openers into `masker` (fresh after the
+    /// overlong line), then open the unconditional recovery run: one rule
+    /// covers every overlong value shape. The open quote seeds UntilBlank
+    /// alongside the token's column-0 block and next-nonblank guard. Returns
+    /// the state cost to charge, or `None` when the line could not be carried
+    /// (the stream must turn opaque); `masker` is then untouched.
     pub(crate) fn recover(mut self, masker: &mut LineMasker) -> Option<usize> {
         if self.unrepresentable {
             return None;
@@ -122,6 +129,7 @@ impl SameLineCarry {
                 let _ = masker.scan(&opener);
             }
         }
+        let _ = masker.scan("X_TOKEN=\"");
         Some(cost)
     }
 
@@ -240,11 +248,28 @@ impl LineMasker {
         let _ = self.scan(&String::from_utf8_lossy(line));
     }
 
-    /// A window line that is not valid UTF-8 in a secret-class file: masked
-    /// whole (unknown means masked), and the state advances as for context.
-    pub fn mask_invalid(&mut self, line: &[u8]) -> (String, usize) {
-        self.advance_bytes(line);
-        (token_bare(), 1)
+    /// A window line (without its terminator) with its secrets replaced, and
+    /// how many spans were masked. A line that is not valid UTF-8 is masked
+    /// whole in a secret-class file (unknown means masked; the state advances
+    /// as for context); in any other file it is `None` (binary content) and the
+    /// state does not advance.
+    pub fn mask_bytes<'a>(&mut self, line: &'a [u8]) -> Option<(std::borrow::Cow<'a, str>, usize)> {
+        match std::str::from_utf8(line) {
+            Ok(body) => Some(self.mask_line_counted(body)),
+            Err(_) if self.class.is_secret() => {
+                self.advance_bytes(line);
+                Some((std::borrow::Cow::Owned(token_bare()), 1))
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Advance the state as a line holding just a secret name (`X_TOKEN`)
+    /// would: under the generic rules the next non-blank line is masked, and
+    /// every following line indented deeper than column 0. Output recovery
+    /// re-arms this guard over blank lines.
+    pub fn guard_next_line(&mut self) {
+        let _ = self.scan("X_TOKEN");
     }
 
     /// Masked ranges of `line` (byte ranges in `line` plus their replacement

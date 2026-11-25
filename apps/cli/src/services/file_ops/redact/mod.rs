@@ -71,7 +71,28 @@ pub struct MaskedView {
     /// A masked multi-line run reaches further past its opening line than
     /// [`LOOKBACK_BYTES`]: a windowed read would not see the opener. An edit that
     /// creates such a run is refused (an agent could otherwise build one).
-    pub long_construct: bool,
+    long_construct: bool,
+}
+
+/// One occurrence of an exact-match needle in a masked view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occurrence {
+    /// Byte offset of the match in the masked view.
+    pub at: usize,
+    /// The match's range in the real text; `None` when the match touches a
+    /// masked span (it cannot be edited).
+    pub orig: Option<Range<usize>>,
+}
+
+/// Why the masked view of an edited text is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exposure {
+    /// The edited text holds a masked multi-line run longer than the read
+    /// lookback (see [`MaskedView`]): a read could not mask it.
+    LongConstruct,
+    /// A masked byte of the original that the edit kept is not masked in the
+    /// edited text.
+    Unmasked,
 }
 
 impl MaskedView {
@@ -79,9 +100,41 @@ impl MaskedView {
         self.spans.len()
     }
 
+    /// Every occurrence of `needle` in the masked view, in order, with the
+    /// real-text range it would replace.
+    pub fn occurrences<'a>(&'a self, needle: &'a str) -> impl Iterator<Item = Occurrence> + 'a {
+        self.text.match_indices(needle).map(|(at, _)| {
+            let range = at..at + needle.len();
+            let orig = (!self.overlaps_span(&range))
+                .then(|| self.to_orig(range.start)..self.to_orig(range.end));
+            Occurrence { at, orig }
+        })
+    }
+
+    /// The masked view of `edited`, the real text of `self` after an edit,
+    /// refused when it holds a masked run longer than the read lookback or
+    /// when a masked byte of `self` that the edit kept is no longer masked in
+    /// it. `shift` gives, for a real-text position of `self` outside the
+    /// replaced ranges, how far the replacements before it shift it.
+    pub fn after_edit(
+        &self,
+        class: FileClass,
+        edited: &str,
+        shift: impl Fn(usize) -> i64,
+    ) -> Result<MaskedView, Exposure> {
+        let after = mask(class, edited);
+        if after.long_construct {
+            return Err(Exposure::LongConstruct);
+        }
+        if !self.stays_masked_in(&after, shift) {
+            return Err(Exposure::Unmasked);
+        }
+        Ok(after)
+    }
+
     /// Whether `range` (masked-view bytes) overlaps a masked span. An empty
     /// range overlaps only when strictly inside a span.
-    pub fn overlaps_span(&self, range: &Range<usize>) -> bool {
+    fn overlaps_span(&self, range: &Range<usize>) -> bool {
         // Spans are sorted and disjoint: the first one that ends after
         // `range.start` is the only candidate.
         let idx = self
@@ -116,7 +169,7 @@ impl MaskedView {
     /// masked span of `after`, the masked view of the edited text. `delta`
     /// gives, for a real-text position of `self` outside the replaced ranges,
     /// how far the replacements before it shift it.
-    pub fn stays_masked_in(&self, after: &MaskedView, delta: impl Fn(usize) -> i64) -> bool {
+    fn stays_masked_in(&self, after: &MaskedView, delta: impl Fn(usize) -> i64) -> bool {
         for span in &self.spans {
             let start = (span.orig.start as i64 + delta(span.orig.start)) as usize;
             let end = start + span.orig.len();
@@ -136,11 +189,6 @@ impl MaskedView {
         true
     }
 
-    /// Byte offsets in the masked view where `needle` starts.
-    pub fn match_starts<'a>(&'a self, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
-        self.text.match_indices(needle).map(|(at, _)| at)
-    }
-
     /// The masked view's lines, each with its end of line.
     pub fn lines(&self) -> std::str::SplitInclusive<'_, char> {
         self.text.split_inclusive('\n')
@@ -148,7 +196,7 @@ impl MaskedView {
 
     /// Map a masked-view position that is not strictly inside a span to the
     /// same position in the real text.
-    pub fn to_orig(&self, pos: usize) -> usize {
+    fn to_orig(&self, pos: usize) -> usize {
         let idx = self.spans.partition_point(|span| span.view.end <= pos);
         let delta = if idx == 0 { 0 } else { self.cum[idx - 1] };
         (pos as isize + delta) as usize

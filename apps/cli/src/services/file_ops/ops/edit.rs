@@ -21,7 +21,7 @@ use crate::services::file_ops::fs::etag::load_all;
 use crate::services::file_ops::fs::policy::Access;
 use crate::services::file_ops::fs::resolve::{ResolveOpts, resolve};
 use crate::services::file_ops::journal::atomic;
-use crate::services::file_ops::redact::{self, MASK_OPEN, MaskedView};
+use crate::services::file_ops::redact::{self, Exposure, MASK_OPEN, MaskedView, Occurrence};
 use crate::services::file_ops::{Cancel, check_reason};
 
 pub const MAX_EDITS: usize = 20;
@@ -258,23 +258,22 @@ fn edit_validated(ops: &OpContext, args: &EditArgs, cancel: &Cancel) -> FileResu
     }
     let updated_text = updated.as_str();
 
-    let after_view = redact::mask(class, updated_text);
     // Masking depends on context (the name, the assignment shape, an open quote).
     // An edit that touches no masked value can still change that context, so no
     // masked byte of the original may show up unmasked in the result or in its
     // diff, `dryRun` included.
-    if after_view.long_construct {
-        return Err(FileError::new(
-            ErrorCode::RedactedSpan,
-            "the file contains, or the edit would create, a masked multi-line value longer than the read lookback (1 MiB); a read could not mask it",
-        ));
-    }
-    if !masked_bytes_stay_masked(&view, &planned, &new_texts, &after_view) {
-        return Err(FileError::new(
-            ErrorCode::RedactedSpan,
-            "the edit would expose a redacted value; masked text cannot change context",
-        ));
-    }
+    let after_view = view
+        .after_edit(class, updated_text, shift_of(&planned, &new_texts))
+        .map_err(|exposure| match exposure {
+            Exposure::LongConstruct => FileError::new(
+                ErrorCode::RedactedSpan,
+                "the file contains, or the edit would create, a masked multi-line value longer than the read lookback (1 MiB); a read could not mask it",
+            ),
+            Exposure::Unmasked => FileError::new(
+                ErrorCode::RedactedSpan,
+                "the edit would expose a redacted value; masked text cannot change context",
+            ),
+        })?;
     let summary = diff_lines(&view.text, &after_view.text);
     let (diff, hunks) = if args.return_diff.unwrap_or(true) {
         (Some(summary.diff.clone()), None)
@@ -367,8 +366,8 @@ fn plan_exact(
     budget: &mut SizeBudget,
     cancel: &Cancel,
 ) -> FileResult<()> {
-    let matches: Vec<usize> = view
-        .match_starts(old)
+    let matches: Vec<Occurrence> = view
+        .occurrences(old)
         .take(MAX_MATCHES_PER_EDIT + 1)
         .collect();
     let found = matches.len();
@@ -407,7 +406,7 @@ fn plan_exact(
         let lines: Vec<usize> = matches
             .iter()
             .take(5)
-            .map(|at| line_of(&view.text, *at))
+            .map(|hit| line_of(&view.text, hit.at))
             .collect();
         return Err(FileError::new(
             ErrorCode::MatchCount,
@@ -417,35 +416,26 @@ fn plan_exact(
             json!({ "edit": index, "expected": expected, "found": found, "lines": lines }),
         ));
     }
-    for (n, at) in matches.into_iter().enumerate() {
+    for (n, Occurrence { at, orig }) in matches.into_iter().enumerate() {
         if n % 1024 == 1023 {
             cancel.check()?;
         }
-        let range = at..at + old.len();
-        if view.overlaps_span(&range) {
+        let Some(orig) = orig else {
             return Err(FileError::new(
                 ErrorCode::RedactedSpan,
                 format!("edit {index}: the match touches a redacted value and cannot be edited"),
             )
             .with_detail(json!({ "edit": index, "line": line_of(&view.text, at) })));
-        }
+        };
         budget.add(old.len(), new_len);
-        planned.push(Planned {
-            orig: view.to_orig(range.start)..view.to_orig(range.end),
-            edit: index,
-        });
+        planned.push(Planned { orig, edit: index });
     }
     Ok(())
 }
 
-/// Whether every masked span of `before` that survives the edits lies inside a
-/// masked span of `after` (positions shifted by the planned replacements).
-fn masked_bytes_stay_masked(
-    before: &MaskedView,
-    planned: &[Planned],
-    new_texts: &[String],
-    after: &MaskedView,
-) -> bool {
+/// How far the planned replacements before a position of the original text
+/// (outside the replaced ranges) shift it in the edited text.
+fn shift_of<'a>(planned: &'a [Planned], new_texts: &[String]) -> impl Fn(usize) -> i64 + 'a {
     // `planned` is sorted by original start and non-overlapping.
     let mut prefix: Vec<i64> = Vec::with_capacity(planned.len());
     let mut running = 0_i64;
@@ -453,11 +443,11 @@ fn masked_bytes_stay_masked(
         running += new_texts[plan.edit].len() as i64 - plan.orig.len() as i64;
         prefix.push(running);
     }
-    before.stays_masked_in(after, |start| {
+    move |start| {
         // planned replacements that end at or before this span
         let idx = planned.partition_point(|plan| plan.orig.end <= start);
         if idx == 0 { 0 } else { prefix[idx - 1] }
-    })
+    }
 }
 
 fn plan_lines(
@@ -558,18 +548,22 @@ mod unit {
 
     #[test]
     fn masked_bytes_stay_masked_maps_positions_through_the_replacements() {
-        let before = redact::mask(redact::FileClass::Plain, "A=1\nX_KEY=secret\n");
+        let plain = redact::FileClass::Plain;
+        let before = redact::mask(plain, "A=1\nX_KEY=secret\n");
         let planned = [Planned {
             orig: 0..3,
             edit: 0,
         }];
         let texts = ["A=10000".to_string()];
-        let after = redact::mask(redact::FileClass::Plain, "A=10000\nX_KEY=secret\n");
-        assert!(masked_bytes_stay_masked(&before, &planned, &texts, &after));
-        let unmasked = redact::mask(redact::FileClass::Plain, "A=10000\nX KEY=secret\n");
-        assert!(!masked_bytes_stay_masked(
-            &before, &planned, &texts, &unmasked
-        ));
+        let after = redact::mask(plain, "A=10000\nX_KEY=secret\n");
+        assert_eq!(
+            before.after_edit(plain, "A=10000\nX_KEY=secret\n", shift_of(&planned, &texts)),
+            Ok(after)
+        );
+        assert_eq!(
+            before.after_edit(plain, "A=10000\nX KEY=secret\n", shift_of(&planned, &texts)),
+            Err(Exposure::Unmasked)
+        );
     }
 
     #[test]

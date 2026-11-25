@@ -135,7 +135,9 @@ impl StreamMasker {
                     self.reset_scanner();
                     let carry = std::mem::take(&mut self.carry);
                     if let Some(cost) = carry.recover(&mut self.masker) {
-                        self.prime_recovery();
+                        // `recover` opened the unconditional recovery run; its
+                        // next-nonblank guard is re-armed over blank lines.
+                        self.recovery_pending = true;
                         self.state_input_bytes = cost;
                     } else {
                         self.make_opaque();
@@ -188,7 +190,7 @@ impl StreamMasker {
             rendered.push_str(&raw[line.len()..]);
             if self.recovery_pending {
                 if line.trim().is_empty() {
-                    let _ = self.masker.scan("X_TOKEN");
+                    self.masker.guard_next_line();
                 } else {
                     self.recovery_pending = false;
                 }
@@ -256,14 +258,6 @@ impl StreamMasker {
         self.masker = LineMasker::new(self.masker.class());
         self.state_input_bytes = 0;
         self.recovery_pending = false;
-    }
-
-    fn prime_recovery(&mut self) {
-        // One unconditional recovery rule covers every overlong value shape.
-        // The open quote seeds UntilBlank alongside the token's column-0 block
-        // and next-nonblank guard; PEM labels have already been restored.
-        let _ = self.masker.scan("X_TOKEN=\"");
-        self.recovery_pending = true;
     }
 
     fn make_opaque(&mut self) {
