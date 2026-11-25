@@ -3,7 +3,8 @@
 //! slowly, or stopped with its own exit code ([`StopOn`]).
 
 use std::io;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,6 +28,43 @@ const HELLO_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 const RELAY_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 const RELAY_MAX_REDIRECTS: usize = 3;
+
+/// Relay handshakes still running on helper threads, given up on or not. One stuck before any
+/// I/O (loading the system's root certificates) keeps its place until it ends, so reconnects
+/// cannot pile up threads: past this, an attempt fails at once like one that timed out.
+const MAX_HANDSHAKE_HELPERS: usize = 8;
+
+static HANDSHAKE_HELPERS: AtomicUsize = AtomicUsize::new(0);
+
+/// One of [`MAX_HANDSHAKE_HELPERS`], held by its helper thread until it ends.
+struct HandshakeHelper;
+
+impl HandshakeHelper {
+    fn take() -> Option<Self> {
+        // A CAS loop, as `fetch_update`'s replacement needs a newer compiler than the MSRV.
+        let mut held = HANDSHAKE_HELPERS.load(Ordering::Acquire);
+        loop {
+            if held >= MAX_HANDSHAKE_HELPERS {
+                return None;
+            }
+            match HANDSHAKE_HELPERS.compare_exchange_weak(
+                held,
+                held + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(current) => held = current,
+            }
+        }
+    }
+}
+
+impl Drop for HandshakeHelper {
+    fn drop(&mut self) {
+        HANDSHAKE_HELPERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 type RelaySocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
 
@@ -124,19 +162,43 @@ fn connect_relay_with_deadline(
         stream.set_write_timeout(Some(handshake_timeout))?;
         // Exactly connect()'s TLS defaults: rustls, the installed ring provider,
         // native root certificates, and no custom WebSocket config or connector.
-        let result = tungstenite::client_tls_with_config(request.clone(), stream, None, None)
-            .map_err(|error| match error {
-                tungstenite::HandshakeError::Failure(tungstenite::Error::Io(error))
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    relay_connect_timeout()
-                }
-                tungstenite::HandshakeError::Failure(error) => error,
-                tungstenite::HandshakeError::Interrupted(_) => relay_connect_timeout(),
-            });
+        // For `wss` that loads the system's root certificates on every call, before
+        // any I/O the socket timeouts bound (on macOS from the keychain, which can
+        // take a second under load). So the handshake runs on a helper and is waited
+        // for within the same deadline, as the resolver is. A handshake given up on
+        // has its socket shut down, so it cannot go on talking to the peer.
+        let wait = remaining()?;
+        let helper = HandshakeHelper::take().ok_or_else(relay_connect_timeout)?;
+        let abandon = stream.try_clone()?;
+        let (tx, rx) = mpsc::sync_channel(1);
+        let handshake_request = request.clone();
+        thread::Builder::new()
+            .name("wsmp-relay-handshake".into())
+            .spawn(move || {
+                let _helper = helper;
+                let _ = tx.send(tungstenite::client_tls_with_config(
+                    handshake_request,
+                    stream,
+                    None,
+                    None,
+                ));
+            })?;
+        let Ok(handshake) = rx.recv_timeout(wait) else {
+            let _ = abandon.shutdown(Shutdown::Both);
+            return Err(relay_connect_timeout());
+        };
+        let result = handshake.map_err(|error| match error {
+            tungstenite::HandshakeError::Failure(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                relay_connect_timeout()
+            }
+            tungstenite::HandshakeError::Failure(error) => error,
+            tungstenite::HandshakeError::Interrupted(_) => relay_connect_timeout(),
+        });
         match result {
             Err(tungstenite::Error::Http(response)) if response.status().is_redirection() => {
                 let target = response
