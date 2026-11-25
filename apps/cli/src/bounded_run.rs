@@ -89,6 +89,8 @@ use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod management;
+
 /// How long the reap after the group kill may take before the child is left
 /// to a detached reaper thread.
 pub const REAP_GRACE: Duration = Duration::from_millis(1_000);

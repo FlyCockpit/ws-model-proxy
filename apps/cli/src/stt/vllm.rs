@@ -717,7 +717,7 @@ pub(super) fn open_socket(endpoint: &EngineEndpoint) -> Result<(Socket, TcpStrea
 /// The handshake request for the endpoint's `/v1/realtime`, `ws` or `wss`
 /// after its `http` or `https` base URL, with the configured headers.
 fn realtime_request(endpoint: &EngineEndpoint) -> Result<tungstenite::handshake::client::Request> {
-    let mut url = crate::daemon::endpoint_url(&endpoint.base_url, "/v1/realtime")?;
+    let mut url = crate::upstream::endpoint_url(&endpoint.base_url, "/v1/realtime")?;
     let scheme = match url.scheme() {
         "http" | "ws" => "ws",
         "https" | "wss" => "wss",

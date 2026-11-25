@@ -708,6 +708,8 @@ struct LiveChildGuard(u64);
 
 impl LiveChildGuard {
     fn track(child: LiveChild) -> Self {
+        // Before the first child is listed: a forced exit kills what is listed.
+        crate::shutdown::register_forced_exit_kill(kill_tracked_children);
         let id = NEXT_LIVE_CHILD.fetch_add(1, Ordering::Relaxed);
         LIVE_CHILDREN
             .lock()
@@ -729,7 +731,7 @@ impl Drop for LiveChildGuard {
 /// SIGKILL every exec process group and terminal session still running. Used
 /// by a forced shutdown (deadline or second signal) that cannot wait for the
 /// relay thread's registries; it does not reap and sends no frames.
-pub fn kill_tracked_children() {
+fn kill_tracked_children() {
     kill_live_children(|_| true);
 }
 

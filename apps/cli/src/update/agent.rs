@@ -17,7 +17,7 @@ use crate::protocol::frames::{
     DefinitionSync, InstallMethod, NodeFrame, UpdatePhase, UpdateReason,
 };
 use crate::protocol::runtime_spec::{RemoteUpdates, SelfUpdateFeatures, UpdateStrategy};
-use crate::startup::TrustWatch;
+use crate::trust::TrustWatch;
 
 /// A new build confirms after `hello.ok`, the definition sync and this long alive.
 pub const CONFIRM_ALIVE: Duration = Duration::from_secs(30);
@@ -92,7 +92,7 @@ pub fn features() -> SelfUpdateFeatures {
         strategies: strategies(
             identity.method,
             identity.live.is_some(),
-            crate::daemon::under_service_manager(),
+            crate::service::under_service_manager(),
         ),
         instances_survive: instances_survive(),
         remote: remote_setting(),
@@ -1142,7 +1142,7 @@ impl Host {
         Self {
             instances_survive: instances_survive(),
             remote: remote_setting,
-            stable_service: crate::commands::service::ensure_stable_executable,
+            stable_service: crate::service::files::ensure_stable_executable,
             scheduler: super::deadman::platform,
         }
     }

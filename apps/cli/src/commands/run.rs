@@ -29,7 +29,7 @@ pub fn run(args: &Args) -> Result<()> {
         crate::paths::pin(args.config.clone(), args.state_dir.clone())?;
     }
     if args.service {
-        crate::daemon::run_as_service();
+        crate::service::run_as_service();
         #[cfg(windows)]
         crate::shutdown::stop_when_console_host_goes();
     }

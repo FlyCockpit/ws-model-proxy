@@ -8,7 +8,7 @@
 //!
 //! Keep this file small. Real work belongs in `src/commands/`.
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use wsmp::cli::{Cli, Command};
 use wsmp::exit::ExitCode;
@@ -85,7 +85,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Status(args) => commands::status::run(args),
         Command::Hardware(args) => commands::hardware::run(args),
         Command::Logout(args) => commands::logout::run(args),
-        Command::Completions(args) => commands::completions::run(args),
+        Command::Completions(args) => commands::completions::run(args, Cli::command()),
         Command::Terminal(args) => commands::terminal::run(args),
         Command::Recover(args) => commands::recover::run(args),
         Command::Update(args) => commands::update::run(args),

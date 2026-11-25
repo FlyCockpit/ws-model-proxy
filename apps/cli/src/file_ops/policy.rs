@@ -471,7 +471,7 @@ fn default_protected() -> Vec<Protected> {
     // (systemd: its drop-in directory too; launchd: the plist), the binary that
     // runs, and the launchd log directory. A write there would become a trust,
     // root or config change at the next start.
-    if let Ok(unit) = crate::commands::service::service_file() {
+    if let Ok(unit) = crate::service::service_file() {
         let mut drop_ins = unit.clone().into_os_string();
         drop_ins.push(".d");
         out.push(Protected {
@@ -482,7 +482,7 @@ fn default_protected() -> Vec<Protected> {
         out.push(file(unit, Deny::WriteOnly));
     }
     #[cfg(target_os = "macos")]
-    if let Ok(logs) = crate::commands::service::macos_log_dir() {
+    if let Ok(logs) = crate::service::macos_log_dir() {
         out.push(Protected {
             path: logs,
             subtree: true,
@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn service_unit_and_binary_are_write_protected() {
         let p = Policy::from_environment(Vec::new(), false);
-        let unit = crate::commands::service::service_file().unwrap();
+        let unit = crate::service::service_file().unwrap();
         let mut drop_in = unit.clone().into_os_string();
         drop_in.push(".d/override.conf");
         let exe = std::env::current_exe().unwrap();
