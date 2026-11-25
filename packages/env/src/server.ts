@@ -1,5 +1,7 @@
 import { createEnv } from "@t3-oss/env-core";
 import { z } from "zod";
+import { EnvConfigError } from "./config-error.js";
+import { mcpOriginProblem } from "./mcp-origin.js";
 import { env as sharedEnv, strictBooleanFlag } from "./shared.js";
 import { originUrl } from "./url.js";
 
@@ -203,6 +205,17 @@ export const env = createEnv({
   emptyStringAsUndefined: true,
 });
 
+// ---------------------------------------------------------------------------
+// MCP origin guard — with MCP on, BETTER_AUTH_URL must be https or loopback
+// http (./mcp-origin.ts). Checked here, before the auth module builds the MCP
+// plugin, so the operator gets one actionable line instead of a TypeError.
+// ---------------------------------------------------------------------------
+const mcpProblem = mcpOriginProblem({
+  mcpEnabled: env.WMP_MCP_ENABLED,
+  betterAuthUrl: env.BETTER_AUTH_URL,
+});
+if (mcpProblem) throw new EnvConfigError(mcpProblem);
+
 export const SIGNUP_ENABLED: boolean = env.SIGNUP_ENABLED;
 
 /**
@@ -218,12 +231,12 @@ export const ADMIN_EMAIL: string | undefined = env.ADMIN_EMAIL;
 // ---------------------------------------------------------------------------
 if (env.MEDIA_STORAGE === "local") {
   if (!env.MEDIA_ROOT) {
-    throw new Error(
+    throw new EnvConfigError(
       "[env] MEDIA_STORAGE=local requires MEDIA_ROOT to be set to an absolute path (e.g. /var/lib/wmp/media).",
     );
   }
   if (!isAbsolutePosixOrWin(env.MEDIA_ROOT)) {
-    throw new Error(`[env] MEDIA_ROOT must be an absolute path, got "${env.MEDIA_ROOT}".`);
+    throw new EnvConfigError(`[env] MEDIA_ROOT must be an absolute path, got "${env.MEDIA_ROOT}".`);
   }
 }
 
@@ -274,7 +287,7 @@ if (weakReason) {
     `[env] BETTER_AUTH_SECRET is weak: ${weakReason}. ` +
     "Generate a strong secret with: pnpm generate:secret";
   if (env.NODE_ENV === "production") {
-    throw new Error(msg);
+    throw new EnvConfigError(msg);
   }
   console.warn(msg);
 }

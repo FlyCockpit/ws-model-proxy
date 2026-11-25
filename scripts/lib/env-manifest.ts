@@ -379,6 +379,7 @@ export const ENV_VARS: EnvVar[] = [
       "Kill switch for the MCP server and OAuth provider surface (jwt/mcp/cimd",
       "plugins, /mcp, discovery, MCP login/consent). On by default. Set false to",
       "omit those plugins. Human grant listing/revocation stays available while disabled.",
+      "While on, BETTER_AUTH_URL must be https (plain http only on localhost, [::1], 127.x.x.x).",
     ],
   },
   {

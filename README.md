@@ -266,7 +266,7 @@ Required production values:
 
 - `DATABASE_URL`: Postgres connection string.
 - `BETTER_AUTH_SECRET`: 32+ byte random secret. API keys, agent tokens, node credentials, enrollment codes, share invites, signed media URLs and the Responses and cache-affinity routing digests derive purpose-specific HMAC keys from this value. Rotating it invalidates all of those: every node must log in again with a new enrollment code, and every API key and agent token must be recreated.
-- `BETTER_AUTH_URL`: public HTTPS app URL.
+- `BETTER_AUTH_URL`: public HTTPS app URL. With MCP on (`WMP_MCP_ENABLED`, the default) the server refuses to start on a plain `http` origin other than loopback (`localhost`, `[::1]`, `127.x.x.x`); serve the app over HTTPS, or set `WMP_MCP_ENABLED=false`.
 - `NODE_ENV=production`.
 - `TRUST_PROXY_HOPS`: how many reverse proxies sit in front of the app. Use `1` behind one reverse proxy (Dokploy/Traefik, Caddy, nginx, or a Cloudflare Tunnel whose `cloudflared` talks to the app directly), `0` when clients connect directly, and more for chained proxies (`2` for Cloudflare or `cloudflared` in front of your proxy; see [Home server behind a Cloudflare Tunnel](#home-server-behind-a-cloudflare-tunnel)). The client IP used for rate limits is the `X-Forwarded-For` entry this many hops from the right. Too high lets clients forge their IP; too low puts every client in one rate-limit bucket. The server refuses to start in production without it.
   An appended port (`1.2.3.4:5678`, `[2001:db8::1]:5678`, as Azure Application Gateway adds by default) is stripped, so port appending can stay on.

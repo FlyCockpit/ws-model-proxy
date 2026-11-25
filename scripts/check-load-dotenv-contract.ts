@@ -32,7 +32,7 @@ const checks: Check[] = [
   {
     kind: "contains",
     label: "API/server process entry must load root .env",
-    file: "apps/server/src/index.ts",
+    file: "apps/server/src/start.ts",
     needle: LOAD_DOTENV,
   },
   {

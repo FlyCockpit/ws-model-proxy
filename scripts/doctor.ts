@@ -12,6 +12,7 @@ import "@ws-model-proxy/env/load-dotenv";
 import { spawnSync } from "node:child_process";
 import { connect } from "node:net";
 import { resolve } from "node:path";
+import { isEnvConfigError } from "@ws-model-proxy/env/config-error";
 
 const ROOT = resolve(import.meta.dirname!, "..");
 
@@ -105,7 +106,10 @@ async function checkEnv() {
       name: "env (zod schema)",
       status: "fail",
       detail: message,
-      hint: "Open .env at the repo root and fix the variables called out above.",
+      // An EnvConfigError (e.g. the MCP origin guard) names its variables and fixes itself.
+      hint: isEnvConfigError(err)
+        ? "Change the environment as the message above says; the server refuses to start until then."
+        : "Open .env at the repo root and fix the variables called out above.",
       required: true,
     });
   }

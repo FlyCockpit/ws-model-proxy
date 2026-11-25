@@ -6,7 +6,8 @@
       "inputs": [
         "$TURBO_EXTENDS$",
         "$TURBO_ROOT$/apps/cli/tests/fixtures/relay-4.0/**",
-        "$TURBO_ROOT$/scripts/lib/wait-for-exit.mjs"
+        "$TURBO_ROOT$/scripts/lib/wait-for-exit.mjs",
+        "tsdown.config.ts"
       ]
     }
   }

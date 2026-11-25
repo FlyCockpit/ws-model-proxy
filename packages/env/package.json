@@ -8,7 +8,9 @@
     "./server": "./src/server.ts",
     "./web": "./src/web.ts",
     "./load-dotenv": "./src/load-dotenv.ts",
-    "./root-dotenv": "./src/root-dotenv.ts"
+    "./root-dotenv": "./src/root-dotenv.ts",
+    "./config-error": "./src/config-error.ts",
+    "./mcp-origin": "./src/mcp-origin.ts"
   },
   "dependencies": {
     "@t3-oss/env-core": "^0.13.11",

@@ -1,6 +1,5 @@
-// Load root `.env` before any workspace import validates process.env.
-// Production injects env vars and has no `.env` file — this is a local-dev no-op there.
-import "@ws-model-proxy/env/load-dotenv";
+// Boot module. The process entry is start.ts: it loads the root `.env` first, then imports this
+// module, so every import below sees the final process.env.
 
 import { serve } from "@hono/node-server";
 import { auth } from "@ws-model-proxy/auth";

@@ -762,7 +762,11 @@ Required environment:
   (for example `https://wmp.example.test`). The MCP resource URL, OAuth issuer,
   and DPoP `htu` validation are all derived from this value (see below).
 - `WMP_MCP_ENABLED`: installs the Better Auth MCP/OAuth plugins and opens
-  the MCP surface. Default `true`. Set `false` to close it.
+  the MCP surface. Default `true`. Set `false` to close it. While it is on,
+  `BETTER_AUTH_URL` must be `https`; plain `http` is accepted only on
+  `localhost`, `[::1]` or `127.x.x.x` for local development. Any other `http`
+  origin (for example a LAN address) makes the server and `pnpm doctor:app`
+  refuse to start, naming both fixes.
 
 Optional:
 
