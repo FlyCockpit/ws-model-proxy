@@ -400,6 +400,33 @@ fn a_generated_service_is_written_again_as_install_writes_it() {
     }
 }
 
+/// The relay agent's earlier template ran it at `Background` priority: an
+/// update writes it again as `wsmp service install` writes it now, at
+/// `Standard`.
+#[cfg(unix)]
+#[test]
+fn an_earlier_background_launch_agent_is_written_again_at_standard() {
+    let keg = Keg::new();
+    let file = keg.path("com.flycockpit.wsmp.plist");
+    let want = keg.render(ServiceKind::LaunchdPlist);
+    let standard = "<key>ProcessType</key>\n\t<string>Standard</string>\n";
+    assert!(want.contains(standard), "{want}");
+    let earlier = want.replace(
+        standard,
+        "<key>ProcessType</key>\n\t<string>Background</string>\n",
+    );
+    std::fs::write(&file, &earlier).expect("write");
+    set_mode(&file, ServiceKind::LaunchdPlist.mode());
+    let reloads = std::cell::Cell::new(0);
+    keg.single(&file, ServiceKind::LaunchdPlist, &publish_file, || {
+        reloads.set(reloads.get() + 1);
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(std::fs::read_to_string(&file).expect("read"), want);
+    assert_eq!(reloads.get(), 1);
+}
+
 /// F-FB-2 (the review's C9 probe `partial_custom_noop_wrapper_is_overwritten`, with the
 /// fixed expectation): a wrapper written by hand that only shares wsmp's generic start
 /// (`#!/bin/sh\n`: a valid script that does nothing), beside wsmp's plist, is custom: the

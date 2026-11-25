@@ -182,6 +182,13 @@ pub fn render_systemd_user_unit(executable: &str, pinned: &[(&str, String)]) -> 
 /// plist never embeds secret environment values. Each value is XML text
 /// ([`plist_text`]); an error, with nothing rendered, for one XML cannot
 /// carry.
+///
+/// `ProcessType` is `Standard`, set explicitly: the relay, and every command,
+/// terminal and runtime it starts (which inherit its QoS), run at normal
+/// priority. `Background` would coalesce its timers (a 2 ms sleep took about
+/// 80 ms) and keep its children on the efficiency cores with throttled I/O.
+/// Only the update dead-man runs at `Background`
+/// ([`crate::relay::update::deadman::render_macos_plist`]).
 pub fn render_launch_agent_plist(
     label: &str,
     program: &str,
@@ -207,7 +214,7 @@ pub fn render_launch_agent_plist(
          \t<key>ThrottleInterval</key>\n\
          \t<integer>5</integer>\n\
          \t<key>ProcessType</key>\n\
-         \t<string>Background</string>\n\
+         \t<string>Standard</string>\n\
          \t<key>WorkingDirectory</key>\n\
          \t<string>{working_directory}</string>\n\
          \t<key>StandardOutPath</key>\n\
@@ -463,6 +470,16 @@ mod tests {
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<true/>"));
         assert!(!plist.contains("EnvironmentVariables"));
+        // The relay and what it starts run at normal priority, said explicitly.
+        assert!(
+            plist.contains("<key>ProcessType</key>\n\t<string>Standard</string>\n"),
+            "{plist}"
+        );
+        assert_eq!(
+            plist.matches("<key>ProcessType</key>").count(),
+            1,
+            "{plist}"
+        );
         let escaped = render_launch_agent_plist(
             "label",
             "/tmp/a&b<c>.sh",

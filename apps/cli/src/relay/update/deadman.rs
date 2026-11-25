@@ -385,7 +385,10 @@ impl Scheduler for SystemdTimer {
 /// deadline itself), once, and again a minute after a run that exits nonzero
 /// (`KeepAlive`/`SuccessfulExit` false, `ThrottleInterval`): a rollback whose
 /// relay restart failed, or that could not be recorded, is finished by the
-/// next run. Removing the agent (`bootout`) ends it. Each value is plist text
+/// next run. Removing the agent (`bootout`) ends it. It runs at `Background`
+/// `ProcessType`: it only sleeps until the deadline, unlike the relay agent
+/// (`Standard`, [`crate::host::service::text::render_launch_agent_plist`]).
+/// Each value is plist text
 /// ([`crate::host::service::text::plist_text`]), each path exact text
 /// ([`crate::host::service::text::path_text`]): an error, with nothing
 /// rendered, for one XML cannot carry.
@@ -1037,6 +1040,16 @@ mod tests {
         ));
         assert!(plist.contains("<key>ThrottleInterval</key>\n\t<integer>60</integer>"));
         assert!(plist.contains("<key>RunAtLoad</key>\n\t<true/>"));
+        // Only the dead-man runs at background priority; the relay agent is Standard.
+        assert!(
+            plist.contains("<key>ProcessType</key>\n\t<string>Background</string>\n"),
+            "{plist}"
+        );
+        assert_eq!(
+            plist.matches("<key>ProcessType</key>").count(),
+            1,
+            "{plist}"
+        );
         assert!(plist.contains("/tmp/log &amp; more"));
     }
 

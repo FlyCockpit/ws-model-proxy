@@ -120,7 +120,7 @@ impl ServiceKind {
     /// How every file of this kind wsmp's renderer ever wrote starts: the
     /// same in every template since the first (`0c336eea`; the pre-0.4.0
     /// unit and wrapper ran `daemon start --foreground` and read an
-    /// `EnvironmentFile`; the plist never changed).
+    /// `EnvironmentFile`; the plist's opening never changed).
     fn opening(self) -> &'static str {
         match self {
             Self::SystemdUnit => "[Unit]\nDescription=WS Model Proxy relay\n",
