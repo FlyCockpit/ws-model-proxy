@@ -10,7 +10,7 @@ struct Case {
 
 fn case(name: &str) -> Case {
     let cases: Vec<Case> = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/masking/stream-cases.json"
+        "../../../../tests/fixtures/masking/stream-cases.json"
     ))
     .expect("fixture");
     cases.into_iter().find(|row| row.name == name).expect("row")
@@ -167,9 +167,9 @@ fn real_exec_pipe_output_uses_the_masker_on_both_streams() {
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
     // The same output from the node's default shell: `sh`, or PowerShell on Windows.
     let command = if cfg!(windows) {
-        include_str!("../../../tests/fixtures/masking/stream-exec-colored.ps1")
+        include_str!("../../../../tests/fixtures/masking/stream-exec-colored.ps1")
     } else {
-        include_str!("../../../tests/fixtures/masking/stream-exec-colored.sh")
+        include_str!("../../../../tests/fixtures/masking/stream-exec-colored.sh")
     };
     let _ = execs.start_text(
         &enabled_startup(false),

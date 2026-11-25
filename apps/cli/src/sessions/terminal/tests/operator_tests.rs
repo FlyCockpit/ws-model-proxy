@@ -8,8 +8,10 @@ use crate::runtimes::operator::{
     MAX_OPERATOR_TERMINALS, OperatorEvent, OperatorIds, OperatorOpen, OperatorScreen,
 };
 #[cfg(unix)]
+use crate::sessions::children::reap_pid;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver};
 
 /// A command that succeeds at once, in the platform's operator shell.
 const TRUE: &str = if cfg!(windows) { "exit 0" } else { "true" };
