@@ -28,10 +28,9 @@
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use nix::errno::Errno;
@@ -39,94 +38,13 @@ use nix::fcntl::{OFlag, openat, readlinkat};
 use nix::sys::stat::{Mode, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 
-use super::atomic::perm_mode;
 use super::error::{ErrorCode, FileError, FileResult};
+use super::exchange::probe_dir_barrier;
+use super::meta::{Kind, Stat, perm_mode};
 use super::policy::{Access, Policy};
 
 pub const MAX_SYMLINK_HOPS: usize = 40;
 pub const MAX_PATH_BYTES: usize = 4096;
-
-const S_IFMT: u32 = 0o170_000;
-const S_IFREG: u32 = 0o100_000;
-const S_IFDIR: u32 = 0o040_000;
-const S_IFLNK: u32 = 0o120_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    File,
-    Dir,
-    Symlink,
-    Other,
-}
-
-/// Portable subset of `stat(2)`.
-#[derive(Debug, Clone, Copy)]
-pub struct Stat {
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub nlink: u64,
-    pub size: u64,
-    pub dev: u64,
-    pub ino: u64,
-    pub mtime_secs: i64,
-    pub mtime_nanos: i64,
-}
-
-impl Stat {
-    pub fn from_metadata(meta: &Metadata) -> Self {
-        Self {
-            mode: meta.mode(),
-            uid: meta.uid(),
-            gid: meta.gid(),
-            nlink: meta.nlink(),
-            size: meta.len(),
-            dev: meta.dev(),
-            ino: meta.ino(),
-            mtime_secs: meta.mtime(),
-            mtime_nanos: meta.mtime_nsec(),
-        }
-    }
-
-    /// The object at `path`, links followed (what a protected entry names).
-    pub fn of_path(path: &std::path::Path) -> std::io::Result<Self> {
-        Ok(Self::from_metadata(&std::fs::metadata(path)?))
-    }
-
-    #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
-    pub(crate) fn from_raw(st: &nix::sys::stat::FileStat) -> Self {
-        Self {
-            mode: st.st_mode as u32,
-            uid: st.st_uid as u32,
-            gid: st.st_gid as u32,
-            nlink: st.st_nlink as u64,
-            size: st.st_size.max(0) as u64,
-            dev: st.st_dev as u64,
-            ino: st.st_ino as u64,
-            mtime_secs: st.st_mtime as i64,
-            mtime_nanos: st.st_mtime_nsec as i64,
-        }
-    }
-
-    pub fn kind(&self) -> Kind {
-        match self.mode & S_IFMT {
-            S_IFREG => Kind::File,
-            S_IFDIR => Kind::Dir,
-            S_IFLNK => Kind::Symlink,
-            _ => Kind::Other,
-        }
-    }
-
-    pub fn mtime(&self) -> std::time::SystemTime {
-        let secs = self.mtime_secs.max(0) as u64;
-        std::time::UNIX_EPOCH
-            + std::time::Duration::new(secs, self.mtime_nanos.clamp(0, 999_999_999) as u32)
-    }
-
-    pub fn same_object(&self, other: &Stat) -> bool {
-        self.dev == other.dev && self.ino == other.ino
-    }
-}
 
 /// A directory created by `makeParents`, kept so a failed write can undo it.
 #[derive(Debug)]
@@ -414,7 +332,7 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
                     let mode = opts.make_parents.unwrap_or(0o755);
                     let here = fd_path(&cur).unwrap_or_else(|| join_names(&names));
                     opts.policy.check_path(Access::Write, &here.join(&comp))?;
-                    super::recovery::probe_dir_barrier(&cur)?;
+                    probe_dir_barrier(&cur)?;
                     mkdirat(cur.as_fd(), comp.as_os_str(), perm_mode(mode))
                         .map_err(FileError::errno)?;
                     let parent = cur.try_clone()?;

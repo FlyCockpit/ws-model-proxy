@@ -1532,7 +1532,7 @@ mod exchange_callers {
 #[cfg(target_os = "linux")]
 #[test]
 fn rename_overwrite_refuses_case_differing_hard_link_alias() {
-    use crate::file_ops::resolve::Stat;
+    use crate::file_ops::meta::Stat;
 
     let fx = Fx::new();
     fx.put("a", "keep these bytes\n");
@@ -1573,7 +1573,7 @@ fn rename_overwrite_refuses_case_differing_hard_link_alias() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_case_only_rename_needs_no_overwrite_on_a_case_insensitive_volume() {
-    use crate::file_ops::resolve::Stat;
+    use crate::file_ops::meta::Stat;
 
     let fx = Fx::new();
     fx.put("Probe", "probe");
@@ -1627,7 +1627,7 @@ fn a_case_only_rename_needs_no_overwrite_on_a_case_insensitive_volume() {
 #[test]
 fn rename_overwrite_case_only_alias_changes_spelling_on_case_insensitive_volume() {
     use crate::file_ops::exchange::{FaultScope, Primitive};
-    use crate::file_ops::resolve::Stat;
+    use crate::file_ops::meta::Stat;
     use nix::errno::Errno;
 
     let fx = Fx::new();

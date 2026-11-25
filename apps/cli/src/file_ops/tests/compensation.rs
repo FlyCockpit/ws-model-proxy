@@ -893,11 +893,11 @@ fn compensation_recovery_policy_protects_every_folded_component_and_all_mutation
             format!("nested/{name}/deep/new.txt"),
         ] {
             let path = fx.root.join(relative);
-            assert!(fx.ops.policy.check_path(Access::Read, &path).is_ok());
-            assert!(!fx.ops.policy.hidden_from_walk(&path));
+            assert!(fx.ops.policy().check_path(Access::Read, &path).is_ok());
+            assert!(!fx.ops.policy().hidden_from_walk(&path));
             for access in [Access::Write, Access::Remove] {
                 assert_eq!(
-                    fx.ops.policy.check_path(access, &path).unwrap_err().code,
+                    fx.ops.policy().check_path(access, &path).unwrap_err().code,
                     ErrorCode::PathDenied
                 );
             }
@@ -910,7 +910,7 @@ fn compensation_recovery_policy_protects_every_folded_component_and_all_mutation
     ] {
         assert!(
             fx.ops
-                .policy
+                .policy()
                 .check_path(Access::Write, &fx.root.join(name))
                 .is_ok()
         );
@@ -1405,7 +1405,7 @@ fn compensation_replace_cross_directory_exchange_errors_use_only_supported_fallb
 #[cfg(target_os = "linux")]
 #[test]
 fn compensation_tmpfs_replace_and_edit_exchange_across_recovery_directory() {
-    use crate::file_ops::{atomic, read, resolve::Stat};
+    use crate::file_ops::{atomic, meta::Stat};
     use nix::fcntl::{OFlag, open};
     use nix::sys::stat::Mode;
     use std::os::fd::AsFd;
@@ -1425,7 +1425,12 @@ fn compensation_tmpfs_replace_and_edit_exchange_across_recovery_directory() {
     fx.put("doc.txt", "original");
     let mut original = std::fs::File::open(fx.root.join("doc.txt")).unwrap();
     let stat = Stat::from_metadata(&original.metadata().unwrap());
-    let etag = read::current_etag(&fx.ops, &mut original, &stat, &fx.cancel).unwrap();
+    let etag = fx
+        .ops
+        .context()
+        .key
+        .current(&mut original, &stat, &fx.cancel)
+        .unwrap();
     let dir = open(
         &fx.root,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
@@ -1451,7 +1456,7 @@ fn compensation_tmpfs_replace_and_edit_exchange_across_recovery_directory() {
         Ok(())
     });
     let (_, recovered) = atomic::replace(
-        &fx.ops,
+        fx.ops.context(),
         &dir,
         "doc.txt".as_ref(),
         &fx.root,

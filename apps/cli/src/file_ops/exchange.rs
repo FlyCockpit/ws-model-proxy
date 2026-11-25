@@ -1,9 +1,14 @@
-//! Safe atomic exchange on held directory descriptors.
+//! Safe atomic exchange on held directory descriptors, the other rename and
+//! link primitives (with their test fault points), and how their errnos and a
+//! directory's fsync barrier are classified.
 
 use std::ffi::OsStr;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 
 use nix::errno::Errno;
+
+use super::error::{FileError, FileResult};
+use super::meta::Stat;
 
 /// Faults are thread-local, indexed by the Nth call of each primitive. Production
 /// calls execute only the syscall. A test scope resets counts and faults.
@@ -245,7 +250,7 @@ pub(super) fn link_count(dir: impl AsFd, name: &OsStr) -> Result<u64, Errno> {
             }
         }
         nix::sys::stat::fstatat(dir, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW)
-            .map(|raw| super::resolve::Stat::from_raw(&raw).nlink)
+            .map(|raw| Stat::from_raw(&raw).nlink)
     })
 }
 
@@ -259,6 +264,22 @@ pub(super) fn is_unsupported(errno: Errno) -> bool {
 /// EMLINK, space/quota errors and access errors describe this attempt instead.
 pub(super) fn is_link_unsupported(errno: Errno) -> bool {
     is_unsupported(errno) || matches!(errno, Errno::EPERM | Errno::EOPNOTSUPP)
+}
+
+/// Prove the directory accepts fsync BEFORE an unjournaled public effect
+/// (create, mkdir, rmdir, case-only rename). An unsupported directory sync
+/// then refuses as `unsafe_filesystem` with nothing changed.
+pub(crate) fn probe_dir_barrier(dir: &OwnedFd) -> FileResult<()> {
+    nix::unistd::fsync(dir.as_fd()).map_err(barrier_error)
+}
+
+/// A directory that cannot be fsynced at all cannot carry a crash journal:
+/// that is an unsafe filesystem, not a transient I/O error.
+pub(super) fn barrier_error(errno: Errno) -> FileError {
+    match errno {
+        Errno::EINVAL | Errno::ENOTSUP => FileError::unsafe_filesystem(),
+        errno => FileError::errno(errno),
+    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

@@ -5,14 +5,16 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 use super::atomic;
+use super::context::OpContext;
 use super::diff::diff_lines;
 use super::error::{ErrorCode, FileError, FileResult};
+use super::etag::load_all;
+use super::meta::Kind;
 use super::policy::Access;
-use super::read::{current_etag, load_all};
 use super::redact::{self, MASK_OPEN};
-use super::resolve::{Kind, ResolveOpts, resolve};
+use super::resolve::{ResolveOpts, resolve};
 use super::text;
-use super::{Cancel, FileOps, Step, check_reason};
+use super::{Cancel, Step, check_reason};
 
 /// One MCP request body / relay chunk.
 pub const MAX_WRITE_BYTES: usize = 1024 * 1024;
@@ -111,7 +113,7 @@ pub(crate) fn decode_content(args: &WriteArgs) -> FileResult<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(crate) fn write(ops: &FileOps, args: &WriteArgs, cancel: &Cancel) -> FileResult<WriteResult> {
+pub(crate) fn write(ops: &OpContext, args: &WriteArgs, cancel: &Cancel) -> FileResult<WriteResult> {
     let (content, mode, if_exists) = validate_args(args)?;
     write_validated(ops, args, &content, mode, if_exists, cancel)
 }
@@ -145,14 +147,14 @@ pub(crate) fn validate_args(args: &WriteArgs) -> FileResult<(Vec<u8>, Option<u32
 }
 
 fn write_validated(
-    ops: &FileOps,
+    ops: &OpContext,
     args: &WriteArgs,
     content: &[u8],
     mode: Option<u32>,
     if_exists: IfExists,
     cancel: &Cancel,
 ) -> FileResult<WriteResult> {
-    let _namespace = ops.namespace_shared(cancel)?;
+    let _namespace = ops.locks.namespace_shared(cancel)?;
     let mut resolved = resolve(
         &args.path,
         &ResolveOpts {
@@ -174,7 +176,7 @@ fn write_validated(
 }
 
 fn write_resolved(
-    ops: &FileOps,
+    ops: &OpContext,
     args: &WriteArgs,
     content: &[u8],
     create: (Option<u32>, IfExists),
@@ -186,7 +188,7 @@ fn write_resolved(
         return Err(FileError::invalid("path names a directory"));
     }
     let full = resolved.full_path();
-    let _lock = ops.lock_path(full.clone(), cancel)?;
+    let _lock = ops.locks.lock_path(full.clone(), cancel)?;
     let echo = resolved.echo(&args.path);
     let existing = resolved.lstat()?;
 
@@ -197,7 +199,7 @@ fn write_resolved(
                 "nothing to replace: the file does not exist",
             ));
         }
-        ops.step(Step::EtagRechecked)?;
+        ops.hook.step(Step::EtagRechecked)?;
         cancel.check()?;
         let (created, recovered) = atomic::create_new(
             ops,
@@ -236,7 +238,7 @@ fn write_resolved(
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
     // The atomic recheck binds this fd to the named object. No early return
     // can report success before that check on the replace path.
-    let previous_etag = current_etag(ops, &mut file, &stat, cancel)?;
+    let previous_etag = ops.key.current(&mut file, &stat, cancel)?;
     if args.expected_etag.as_deref() != Some(previous_etag.as_str()) {
         return Err(FileError::conflict(&previous_etag));
     }

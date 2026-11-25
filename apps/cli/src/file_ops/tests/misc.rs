@@ -211,13 +211,23 @@ fn path_locks_serialize_same_path_only_and_time_out_or_cancel() {
         ..Limits::default()
     }));
     let cancel = Cancel::new();
-    let first = ops.lock_path("/x/a".into(), &cancel).unwrap();
+    let first = ops
+        .context()
+        .locks
+        .lock_path("/x/a".into(), &cancel)
+        .unwrap();
     // a different path is not blocked
-    let other = ops.lock_path("/x/b".into(), &cancel).unwrap();
+    let other = ops
+        .context()
+        .locks
+        .lock_path("/x/b".into(), &cancel)
+        .unwrap();
     drop(other);
     // the same path waits, then times out
     let started = Instant::now();
     let err = ops
+        .context()
+        .locks
         .lock_path("/x/a".into(), &cancel)
         .err()
         .expect("must time out");
@@ -227,7 +237,13 @@ fn path_locks_serialize_same_path_only_and_time_out_or_cancel() {
     let waiter_cancel = Cancel::new();
     let handle = {
         let (ops, c) = (Arc::clone(&ops), waiter_cancel.clone());
-        std::thread::spawn(move || ops.lock_path("/x/a".into(), &c).err().map(|e| e.code))
+        std::thread::spawn(move || {
+            ops.context()
+                .locks
+                .lock_path("/x/a".into(), &c)
+                .err()
+                .map(|e| e.code)
+        })
     };
     std::thread::sleep(Duration::from_millis(50));
     waiter_cancel.cancel();
@@ -235,7 +251,12 @@ fn path_locks_serialize_same_path_only_and_time_out_or_cancel() {
     // releasing the lock lets the next holder in promptly
     let waiter = {
         let ops = Arc::clone(&ops);
-        std::thread::spawn(move || ops.lock_path("/x/a".into(), &Cancel::new()).is_ok())
+        std::thread::spawn(move || {
+            ops.context()
+                .locks
+                .lock_path("/x/a".into(), &Cancel::new())
+                .is_ok()
+        })
     };
     std::thread::sleep(Duration::from_millis(50));
     drop(first);

@@ -9,8 +9,9 @@
 use std::path::Path;
 
 use super::error::{ErrorCode, FileError, FileResult};
+use super::meta::{Kind, Stat};
 use super::policy::Policy;
-use super::resolve::{DirHandle, Kind, Stat};
+use super::resolve::DirHandle;
 
 /// Bound collection before sorting, independently of result pagination limits.
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;

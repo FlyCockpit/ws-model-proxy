@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use super::error::{ErrorCode, FileError, FileResult};
-use super::resolve::Stat;
+use super::meta::Stat;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
@@ -39,6 +39,15 @@ pub struct Protected {
     /// The entry covers everything below `path` too.
     pub subtree: bool,
     pub deny: Deny,
+}
+
+/// What admission reads of the policy: whether file roots are configured,
+/// the daemon's effective UID, and whether file tools may run as root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Admission {
+    pub roots_configured: bool,
+    pub euid: u32,
+    pub allow_root: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +129,15 @@ impl Policy {
 
     pub fn roots_configured(&self) -> bool {
         self.roots_usable
+    }
+
+    /// The facts the relay's admission table decides on.
+    pub fn admission(&self) -> Admission {
+        Admission {
+            roots_configured: self.roots_configured(),
+            euid: self.euid(),
+            allow_root: self.allow_root(),
+        }
     }
 
     /// File tools refuse to run as root unless `allowFileToolsAsRoot`.

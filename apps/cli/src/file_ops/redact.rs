@@ -258,6 +258,47 @@ impl MaskedView {
             .count()
     }
 
+    /// Whether a masked span covers part of `range` (real-text bytes).
+    pub fn masks_orig(&self, range: &Range<usize>) -> bool {
+        self.spans
+            .iter()
+            .any(|span| range.start < span.orig.end && span.orig.start < range.end)
+    }
+
+    /// Whether every masked span of `self` that survives an edit lies inside a
+    /// masked span of `after`, the masked view of the edited text. `delta`
+    /// gives, for a real-text position of `self` outside the replaced ranges,
+    /// how far the replacements before it shift it.
+    pub fn stays_masked_in(&self, after: &MaskedView, delta: impl Fn(usize) -> i64) -> bool {
+        for span in &self.spans {
+            let start = (span.orig.start as i64 + delta(span.orig.start)) as usize;
+            let end = start + span.orig.len();
+            // masked-view spans of `after` are sorted; walk the run that covers `start`
+            let mut at = after.spans.partition_point(|s| s.orig.end <= start);
+            let mut cursor = start;
+            while cursor < end {
+                match after.spans.get(at) {
+                    Some(s) if s.orig.start <= cursor => {
+                        cursor = s.orig.end;
+                        at += 1;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    /// Byte offsets in the masked view where `needle` starts.
+    pub fn match_starts<'a>(&'a self, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+        self.text.match_indices(needle).map(|(at, _)| at)
+    }
+
+    /// The masked view's lines, each with its end of line.
+    pub fn lines(&self) -> std::str::SplitInclusive<'_, char> {
+        self.text.split_inclusive('\n')
+    }
+
     /// Map a masked-view position that is not strictly inside a span to the
     /// same position in the real text.
     pub fn to_orig(&self, pos: usize) -> usize {

@@ -34,7 +34,9 @@ use serde_json::{Map, Value};
 
 use crate::display_escape::escape_for_display;
 use crate::file_ops::pool::{FilePool, MAX_IN_FLIGHT};
-use crate::file_ops::{Cancel, ErrorCode, EtagKey, FileError, FileOps, FileResult, Policy};
+use crate::file_ops::{
+    Admission, Cancel, ErrorCode, EtagKey, FileError, FileOps, FileResult, Policy,
+};
 use crate::protocol::frames::FileOpKind;
 use crate::protocol::{
     NodeBinaryMetadata, NodeFrame, RELAY_BINARY_CHUNK_MAX_BYTES, RELAY_JSON_CONTROL_MAX_BYTES,
@@ -130,12 +132,20 @@ impl FileRuntime {
         }
     }
 
-    pub fn policy(&self) -> &Policy {
-        self.ops.policy()
+    /// What admission reads of the policy.
+    pub fn admission(&self) -> Admission {
+        self.ops.admission()
     }
 
     pub fn ops(&self) -> Arc<FileOps> {
         Arc::clone(&self.ops)
+    }
+}
+
+#[cfg(all(test, unix))]
+impl FileRuntime {
+    fn policy(&self) -> &Policy {
+        self.ops.policy()
     }
 }
 
@@ -547,12 +557,12 @@ impl FileRelay {
         if malformed.is_err() {
             return self.refuse(op_id, &summary, "bad_frame");
         }
-        let policy = self.runtime.policy();
+        let admission = self.runtime.admission();
         if let Err(reason) = admit(
             trust.full,
-            policy.roots_configured(),
-            policy.euid(),
-            policy.allow_root(),
+            admission.roots_configured,
+            admission.euid,
+            admission.allow_root,
         ) {
             return self.refuse(op_id, &summary, reason);
         }

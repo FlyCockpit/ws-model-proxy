@@ -13,14 +13,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::atomic;
+use super::context::OpContext;
 use super::diff::diff_lines;
 use super::error::{ErrorCode, FileError, FileResult};
+use super::etag::load_all;
 use super::policy::Access;
-use super::read::{binary_error, load_all};
+use super::read::binary_error;
 use super::redact::{self, MASK_OPEN, MaskedView};
 use super::resolve::{ResolveOpts, resolve};
 use super::text::{self, Eol};
-use super::{Cancel, FileOps, check_reason};
+use super::{Cancel, check_reason};
 
 pub const MAX_EDITS: usize = 20;
 /// Edits load the whole file, so the result is capped (config and script files).
@@ -108,7 +110,7 @@ impl SizeBudget {
     }
 }
 
-pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
+pub(crate) fn edit(ops: &OpContext, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
     validate_args(args)?;
     edit_validated(ops, args, cancel)
 }
@@ -153,8 +155,8 @@ pub(crate) fn validate_args(args: &EditArgs) -> FileResult<()> {
     Ok(())
 }
 
-fn edit_validated(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
-    let _namespace = ops.namespace_shared(cancel)?;
+fn edit_validated(ops: &OpContext, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
+    let _namespace = ops.locks.namespace_shared(cancel)?;
     let resolved = resolve(
         &args.path,
         &ResolveOpts {
@@ -168,7 +170,7 @@ fn edit_validated(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult
     // Lock first (as `write` does): a queued edit then opens the file after the
     // one ahead of it committed, instead of failing its re-check on a stale inode.
     let full = resolved.full_path();
-    let _lock = ops.lock_path(full.clone(), cancel)?;
+    let _lock = ops.locks.lock_path(full.clone(), cancel)?;
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
 
     let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES, cancel)?;
@@ -366,9 +368,7 @@ fn plan_exact(
     cancel: &Cancel,
 ) -> FileResult<()> {
     let matches: Vec<usize> = view
-        .text
-        .match_indices(old)
-        .map(|(at, _)| at)
+        .match_starts(old)
         .take(MAX_MATCHES_PER_EDIT + 1)
         .collect();
     let found = matches.len();
@@ -453,26 +453,11 @@ fn masked_bytes_stay_masked(
         running += new_texts[plan.edit].len() as i64 - plan.orig.len() as i64;
         prefix.push(running);
     }
-    for span in &before.spans {
+    before.stays_masked_in(after, |start| {
         // planned replacements that end at or before this span
-        let idx = planned.partition_point(|plan| plan.orig.end <= span.orig.start);
-        let delta = if idx == 0 { 0 } else { prefix[idx - 1] };
-        let start = (span.orig.start as i64 + delta) as usize;
-        let end = start + span.orig.len();
-        // masked-view spans of `after` are sorted; walk the run that covers `start`
-        let mut at = after.spans.partition_point(|s| s.orig.end <= start);
-        let mut cursor = start;
-        while cursor < end {
-            match after.spans.get(at) {
-                Some(s) if s.orig.start <= cursor => {
-                    cursor = s.orig.end;
-                    at += 1;
-                }
-                _ => return false,
-            }
-        }
-    }
-    true
+        let idx = planned.partition_point(|plan| plan.orig.end <= start);
+        if idx == 0 { 0 } else { prefix[idx - 1] }
+    })
 }
 
 fn plan_lines(
@@ -493,11 +478,7 @@ fn plan_lines(
     let from = line_start(original, start as usize - 1);
     let to = line_start(original, end as usize);
     let range = from..to;
-    if view
-        .spans
-        .iter()
-        .any(|span| range.start < span.orig.end && span.orig.start < range.end)
-    {
+    if view.masks_orig(&range) {
         return Err(FileError::new(
             ErrorCode::RedactedSpan,
             format!("edit {index}: the line range covers a redacted value and cannot be replaced"),

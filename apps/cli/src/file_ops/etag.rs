@@ -8,14 +8,20 @@
 //! (one extra `conflict`, which is safe), and so does replacing a file by a new
 //! inode, which is a replacement anyway. Files over
 //! [`STRONG_ETAG_MAX_BYTES`] get a weak `"w:"` etag over identity and
-//! timestamps instead of a full read.
+//! timestamps instead of a full read. The full reads themselves ([`load_all`],
+//! cancellable in 1 MiB steps) live here too, since that limit caps them.
 
 use std::fs::Metadata;
+use std::io::Read;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::Rng;
 use sha2::{Digest, Sha256};
+
+use super::Cancel;
+use super::error::{ErrorCode, FileError, FileResult};
+use super::meta::Stat;
 
 /// Files at or below this size are hashed in full (also the cap for full-file
 /// scans such as line counting and masking).
@@ -49,7 +55,7 @@ impl EtagKey {
     /// etag is bound to the object (device and inode): a second file with the
     /// same bytes, such as a guess an agent writes next to a masked value, gets a
     /// different etag, so an etag never confirms a guess of a masked value.
-    pub fn strong(&self, stat: &super::resolve::Stat, bytes: &[u8]) -> String {
+    pub fn strong(&self, stat: &Stat, bytes: &[u8]) -> String {
         // device, inode and modification time: a recycled inode number (delete, then
         // create a candidate) is a different file with a different mtime
         let identity = format!(
@@ -62,10 +68,10 @@ impl EtagKey {
 
     /// Weak etag from file identity, size, and modification time.
     pub fn weak(&self, meta: &Metadata) -> String {
-        self.weak_stat(&super::resolve::Stat::from_metadata(meta))
+        self.weak_stat(&Stat::from_metadata(meta))
     }
 
-    pub fn weak_stat(&self, stat: &super::resolve::Stat) -> String {
+    pub fn weak_stat(&self, stat: &Stat) -> String {
         let identity = format!(
             "{}:{}:{}:{}:{}",
             stat.dev, stat.ino, stat.size, stat.mtime_secs, stat.mtime_nanos
@@ -73,6 +79,60 @@ impl EtagKey {
         let mac = hmac_sha256(&self.0, &[b"weak:", identity.as_bytes()]);
         format!("w:{}", &URL_SAFE_NO_PAD.encode(mac)[..ETAG_CHARS])
     }
+
+    /// The current etag of an open regular file: strong up to 64 MiB, weak above.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn current(
+        &self,
+        file: &mut std::fs::File,
+        stat: &Stat,
+        cancel: &Cancel,
+    ) -> FileResult<String> {
+        if stat.size > STRONG_ETAG_MAX_BYTES {
+            return Ok(self.weak_stat(stat));
+        }
+        let bytes = load_all(file, stat, STRONG_ETAG_MAX_BYTES, cancel)?;
+        Ok(self.strong(stat, &bytes))
+    }
+}
+
+/// `Read::read_to_end` in 1 MiB steps, observing cancellation between them.
+pub(crate) fn read_to_end_cancellable<R: Read>(
+    mut reader: R,
+    out: &mut Vec<u8>,
+    cancel: &Cancel,
+) -> FileResult<()> {
+    loop {
+        cancel.check()?;
+        let n = reader.by_ref().take(1 << 20).read_to_end(out)?;
+        if n == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// Read the whole file (at most `max` bytes) from an open fd.
+pub(crate) fn load_all(
+    file: &mut std::fs::File,
+    stat: &Stat,
+    max: u64,
+    cancel: &Cancel,
+) -> FileResult<Vec<u8>> {
+    if stat.size > max {
+        return Err(FileError::new(
+            ErrorCode::TooLarge,
+            format!("file is larger than {max} bytes"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(stat.size as usize);
+    read_to_end_cancellable(file.take(max + 1), &mut bytes, cancel)?;
+    if bytes.len() as u64 > max {
+        return Err(FileError::new(
+            ErrorCode::TooLarge,
+            format!("file is larger than {max} bytes"),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// HMAC-SHA256 over the concatenation of `parts` (RFC 2104).
@@ -132,8 +192,8 @@ mod tests {
         std::fs::write(&p2, b"x").unwrap();
         // With identity: on Windows plain metadata has none, and the two files would differ only
         // when their modification times do.
-        let s1 = crate::file_ops::resolve::Stat::of_path(&p1).unwrap();
-        let s2 = crate::file_ops::resolve::Stat::of_path(&p2).unwrap();
+        let s1 = crate::file_ops::meta::Stat::of_path(&p1).unwrap();
+        let s2 = crate::file_ops::meta::Stat::of_path(&p2).unwrap();
         let a = EtagKey::from_bytes([1; 32]);
         let b = EtagKey::from_bytes([2; 32]);
         let one = a.strong(&s1, b"HF_TOKEN=hunter2\n");
@@ -170,5 +230,53 @@ mod tests {
         assert_eq!(first, key.weak(&std::fs::metadata(&path).unwrap()));
         std::fs::write(&path, b"abcd").unwrap();
         assert_ne!(first, key.weak(&std::fs::metadata(&path).unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    /// A reader that cancels after handing out its first chunk.
+    struct CancelAfterFirst<'a> {
+        cancel: &'a Cancel,
+        served: bool,
+    }
+
+    impl Read for CancelAfterFirst<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.served {
+                return Ok(0);
+            }
+            self.served = true;
+            self.cancel.cancel();
+            let n = buf.len().min(1 << 20);
+            buf[..n].fill(b'a');
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn the_chunked_reader_observes_a_cancel_between_chunks() {
+        let cancel = Cancel::new();
+        let mut out = Vec::new();
+        let r = read_to_end_cancellable(
+            CancelAfterFirst {
+                cancel: &cancel,
+                served: false,
+            },
+            &mut out,
+            &cancel,
+        );
+        assert_eq!(r.expect_err("cancelled").code, ErrorCode::Cancelled);
+        assert!(
+            !out.is_empty() && out.len() < 1 << 20,
+            "only the first chunk was read"
+        );
+        // an uncancelled reader reads to the end
+        let cancel = Cancel::new();
+        let mut out = Vec::new();
+        read_to_end_cancellable(&[7_u8; 3 << 20][..], &mut out, &cancel).unwrap();
+        assert_eq!(out.len(), 3 << 20);
     }
 }

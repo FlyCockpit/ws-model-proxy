@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::resolve::Stat;
-use super::stat::kind_name;
+use super::meta::{Stat, kind_name};
 
 /// Current on-disk INTENT schema. v2 is read only for non-destructive reporting.
 pub const INTENT_VERSION: u32 = 3;
@@ -126,6 +125,51 @@ impl IntentSlot {
             _ => false,
         }
     }
+
+    /// Whether the record already names an object other than `stat`.
+    pub fn names_other(&self, stat: &Stat) -> bool {
+        self.dev.is_some() && !self.matches(stat)
+    }
+
+    /// The recorded origin as a path (`None` when its bytes do not decode).
+    pub fn origin_path(&self) -> Option<PathBuf> {
+        self.origin.to_path()
+    }
+
+    /// The name of the private hardlink pinning this object, if one was made.
+    pub fn anchor(&self) -> Option<&str> {
+        self.anchor.as_deref()
+    }
+
+    /// This record with `stat` as its object, pinned by the hardlink `anchor`
+    /// (none: unpinned).
+    pub fn pinned(self, stat: &Stat, anchor: Option<String>) -> Self {
+        let mut slot = self.with_stat(stat);
+        slot.anchor = anchor;
+        slot
+    }
+
+    /// The object now belongs at `origin`.
+    fn return_to(&mut self, origin: &Path) {
+        self.origin = IntentPath::from_path(origin);
+    }
+
+    /// The moved object `stat` returns to `origin`. Whether this record was
+    /// already pinned on that object.
+    pub fn compensate(&mut self, origin: &Path, stat: &Stat) -> bool {
+        self.return_to(origin);
+        let anchored = self.matches(stat) && self.anchor.is_some();
+        *self = self.clone().with_stat(stat);
+        anchored
+    }
+}
+
+/// Where an object an INTENT records sits before any public effect, so it can
+/// be pinned: at a path, or (a replace's own temp) at `tmp` in the recovery
+/// directory.
+pub enum PinTarget {
+    At(PathBuf),
+    ReplaceTemp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +241,191 @@ impl Intent {
         let mut slots = BTreeMap::new();
         slots.insert("slot-1".to_string(), IntentSlot::planned(path));
         Self::new(IntentOp::Create, None, path, None, slots)
+    }
+
+    /// The object this operation publishes, recorded before any public
+    /// mutation: its identity `stat`, published at `at`.
+    pub fn publishing(mut self, at: &Path, stat: &Stat) -> Self {
+        self.published = Some(IntentSlot::planned(at).with_stat(stat));
+        self
+    }
+
+    /// This INTENT advanced to `phase`.
+    pub fn at_phase(&self, phase: IntentPhase) -> Self {
+        let mut next = self.clone();
+        next.phase = phase;
+        next
+    }
+
+    /// Hand each recorded pre-effect object to `pin`, with where it sits now:
+    /// every slot at its origin, then the published object (a replace's temp
+    /// in R, otherwise the source).
+    pub fn pin_records<E>(
+        &mut self,
+        mut pin: impl FnMut(&mut IntentSlot, PinTarget) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for record in self.slots.values_mut() {
+            if let Some(path) = record.origin_path() {
+                pin(record, PinTarget::At(path))?;
+            }
+        }
+        if let Some(record) = self.published.as_mut() {
+            if self.op == IntentOp::Replace {
+                pin(record, PinTarget::ReplaceTemp)?;
+            } else if let Some(path) = self.source.to_path() {
+                pin(record, PinTarget::At(path))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the object now in slot `key` of R as `stat`. `absent` tells
+    /// whether a slot name no longer exists in R.
+    pub fn record_slot(
+        &mut self,
+        key: String,
+        stat: &Stat,
+        origin: &Path,
+        absent: impl Fn(&str) -> bool,
+    ) {
+        let recorded = self
+            .slots
+            .remove(&key)
+            .or_else(|| {
+                // Replace exchange moves the planned original into tmp, not
+                // slot-1. Transfer its pre-effect map rather than duplicate it.
+                (key == "tmp" && self.op == IntentOp::Replace)
+                    .then(|| self.slots.remove("slot-1"))
+                    .flatten()
+            })
+            .unwrap_or_else(|| IntentSlot::planned(origin));
+        // Exchange and capture renumber slots. Only transfer a pre-effect pin
+        // belonging to this object; a newly captured stranger gains no authority.
+        // A donor slot record whose name is absent in R described this same
+        // object before renumbering: MOVE it, so rollback never waits on a
+        // stale, absent duplicate. The published record is only copied.
+        let recorded = if recorded.matches(stat) {
+            recorded.with_stat(stat)
+        } else {
+            let donor = self
+                .slots
+                .iter()
+                .find(|(_, candidate)| candidate.matches(stat) && candidate.anchor().is_some())
+                .map(|(name, candidate)| (name.clone(), candidate.anchor().map(str::to_string)));
+            let anchor = match donor {
+                Some((name, anchor)) => {
+                    if absent(&name) {
+                        self.slots.remove(&name);
+                    }
+                    anchor
+                }
+                None => self
+                    .published
+                    .iter()
+                    .find(|candidate| candidate.matches(stat))
+                    .and_then(|candidate| candidate.anchor().map(str::to_string)),
+            };
+            recorded.pinned(stat, anchor)
+        };
+        self.slots.insert(key, recorded);
+    }
+
+    /// Map the slot `key` before `from` is captured into it, and mark the
+    /// capture in progress. `absent` tells whether a slot name no longer
+    /// exists in R.
+    pub fn plan_capture(&mut self, key: String, from: &Path, absent: impl Fn(&str) -> bool) {
+        if !self.slots.contains_key(&key) {
+            // Capture renumbering (replace's temp consumes a slot number):
+            // move the pinned pre-effect record of this same origin whose
+            // slot name is absent, so a crash leaves ONE pinned record.
+            let donor = self
+                .slots
+                .iter()
+                .find(|(name, record)| {
+                    record.anchor().is_some()
+                        && record.origin_path().as_deref() == Some(from)
+                        && absent(name)
+                })
+                .map(|(name, _)| name.clone());
+            let record = donor
+                .and_then(|name| self.slots.remove(&name))
+                .unwrap_or_else(|| IntentSlot::planned(from));
+            self.slots.insert(key, record);
+        }
+        if self.phase != IntentPhase::Committed {
+            self.phase = IntentPhase::Capturing;
+        }
+    }
+
+    /// A rejected direct move compensates: `slot-1` now records the source
+    /// `origin` and the moved object's identity `stat`. Returns that record and
+    /// whether it was already pinned on this object.
+    pub fn compensate_move(
+        &mut self,
+        origin: &Path,
+        stat: &Stat,
+    ) -> Option<(&mut IntentSlot, bool)> {
+        self.phase = IntentPhase::Compensating;
+        let record = self.slots.get_mut("slot-1")?;
+        let anchored = record.compensate(origin, stat);
+        Some((record, anchored))
+    }
+
+    /// Slot `key` reclaims its pre-move `origin`; the INTENT compensates.
+    #[cfg(test)]
+    pub fn reclaim_origin(&mut self, key: &str, origin: &Path) {
+        if let Some(record) = self.slots.get_mut(key) {
+            record.return_to(origin);
+        }
+        self.phase = IntentPhase::Compensating;
+    }
+
+    pub fn source_path(&self) -> Option<PathBuf> {
+        self.source.to_path()
+    }
+
+    pub fn destination_path(&self) -> Option<PathBuf> {
+        self.destination.as_ref().and_then(|path| path.to_path())
+    }
+
+    /// The record of the object to publish, and the path it is published
+    /// at (`None` when that does not decode).
+    pub fn publication(&self) -> Option<(&IntentSlot, Option<PathBuf>)> {
+        self.published
+            .as_ref()
+            .map(|published| (published, published.origin_path()))
+    }
+
+    /// A replace's own temp: its published record and pin.
+    pub fn replace_temp(&self) -> Option<(&IntentSlot, &str)> {
+        match &self.published {
+            Some(published) if self.op == IntentOp::Replace => {
+                published.anchor().map(|anchor| (published, anchor))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn slot(&self, name: &str) -> Option<&IntentSlot> {
+        self.slots.get(name)
+    }
+
+    /// The slots, by name.
+    pub fn slots(&self) -> impl Iterator<Item = (&str, &IntentSlot)> {
+        self.slots.iter().map(|(name, slot)| (name.as_str(), slot))
+    }
+
+    /// Every record: the slots, then the published object.
+    pub fn records(&self) -> impl Iterator<Item = &IntentSlot> {
+        self.slots.values().chain(self.published.iter())
+    }
+
+    /// The public paths the operation touches: source, destination, and where
+    /// the published object goes (`None` for one that does not decode).
+    pub fn public_paths(&self) -> impl Iterator<Item = Option<PathBuf>> {
+        std::iter::once(self.source.to_path())
+            .chain(self.destination.iter().map(IntentPath::to_path))
+            .chain(self.published.iter().map(IntentSlot::origin_path))
     }
 
     pub fn summary(&self) -> IntentSummary {
