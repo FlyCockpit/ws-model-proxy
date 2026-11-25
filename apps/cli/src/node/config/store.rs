@@ -9,12 +9,13 @@ use anyhow::{Context, Result};
 use nix::fcntl::{Flock, FlockArg};
 use tempfile::NamedTempFile;
 
-use super::Config;
+use super::{Config, Setting};
 
 /// A short-lived advisory lock shared by every local config mutation.  The
 /// daemon still owns the future control-plane mutation API; this is the
 /// transitional guard that prevents a standalone command from overwriting a
-/// concurrent reload/probe write.
+/// concurrent reload/probe write. Saving the config file takes it
+/// ([`ConfigLock::save`]).
 #[cfg(unix)]
 pub struct ConfigLock {
     // Keeping the RAII guard alive holds the advisory lock for the critical
@@ -67,6 +68,36 @@ impl ConfigLock {
         {
             Ok(Self)
         }
+    }
+
+    /// Save `config` as the config file: only while holding this lock, so
+    /// no other local change lands between its read and this write.
+    pub fn save(&self, config: &Config) -> Result<()> {
+        let path = crate::paths::config_file()?;
+        config.save_to_path(path)
+    }
+
+    /// Record `setting` in the config file: one read-modify-write under this
+    /// lock (a missing file starts from the defaults).
+    pub fn save_setting(setting: Setting) -> Result<()> {
+        let lock = Self::exclusive()?;
+        let mut config = Config::load()?;
+        config.apply(setting);
+        lock.save(&config)
+    }
+
+    /// Save `config` as the config file unless one exists. Returns whether
+    /// it was written.
+    pub fn save_new(&self, config: &Config) -> Result<bool> {
+        let path = crate::paths::config_file()?;
+        if path
+            .try_exists()
+            .with_context(|| format!("checking whether config file `{}` exists", path.display()))?
+        {
+            return Ok(false);
+        }
+        config.save_to_path(path)?;
+        Ok(true)
     }
 }
 
@@ -136,20 +167,6 @@ mod windows_config_lock_tests {
 }
 
 impl Config {
-    /// Execute a complete local read-modify-write under the transitional
-    /// exclusive lock. Callers must not call `save` from `update`; this method
-    /// persists the returned candidate before releasing the lock.
-    pub fn update<T>(required: bool, mutate: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        let _lock = ConfigLock::exclusive()?;
-        let mut config = if required {
-            Self::load_required()?
-        } else {
-            Self::load()?
-        };
-        let output = mutate(&mut config)?;
-        config.save()?;
-        Ok(output)
-    }
     pub fn load() -> Result<Self> {
         Self::load_from_path(&crate::paths::config_file()?)
     }
@@ -171,7 +188,7 @@ impl Config {
         }
     }
 
-    pub fn load_from_path(path: &Path) -> Result<Self> {
+    pub(super) fn load_from_path(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text)
                 .with_context(|| format!("parsing config file `{}`", path.display())),
@@ -182,12 +199,7 @@ impl Config {
         }
     }
 
-    pub fn save(&self) -> Result<()> {
-        let path = crate::paths::config_file()?;
-        self.save_to_path(path)
-    }
-
-    pub fn save_to_path(&self, path: PathBuf) -> Result<()> {
+    pub(super) fn save_to_path(&self, path: PathBuf) -> Result<()> {
         let dir = path
             .parent()
             .map(Path::to_path_buf)
@@ -210,19 +222,6 @@ impl Config {
             .with_context(|| format!("moving temporary config file to `{}`", path.display()))?;
         sync_parent_dir(&path)?;
         Ok(())
-    }
-
-    pub fn save_new(&self) -> Result<bool> {
-        let _lock = ConfigLock::exclusive()?;
-        let path = crate::paths::config_file()?;
-        if path
-            .try_exists()
-            .with_context(|| format!("checking whether config file `{}` exists", path.display()))?
-        {
-            return Ok(false);
-        }
-        self.save_to_path(path)?;
-        Ok(true)
     }
 }
 

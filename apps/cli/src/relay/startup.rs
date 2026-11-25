@@ -69,18 +69,18 @@ impl TerminalStartup {
         if let Some(warning) = config.retired_command_policy_warning {
             tracing::warn!("{warning}");
         }
-        let (file_roots, file_roots_source) = config.effective_file_roots(home);
+        let limits = config.relay_limits(home);
         Self {
             key,
             identity: None,
             allow_human_terminal: std::sync::atomic::AtomicBool::new(config.allow_human_terminal),
             trust: TrustAuthority::new(crate::node::trust::at_startup(config) == TrustValue::Full),
             require_terminal_approval: config.require_terminal_approval,
-            max_terminals: usize::try_from(config.effective_max_terminals()).unwrap_or(usize::MAX),
+            max_terminals: usize::try_from(limits.max_terminals).unwrap_or(usize::MAX),
             allow_file_tools_as_root: config.allow_file_tools_as_root,
-            file_roots_configured: crate::node::config::file_roots_usable(&file_roots),
-            file_roots,
-            file_roots_source,
+            file_roots_configured: limits.file_roots_usable(),
+            file_roots: limits.file_roots,
+            file_roots_source: limits.file_roots_source,
             runtime_hosts: std::sync::Mutex::new(config.runtime_hosts.clone()),
             shells: crate::node::shells::discover(config.terminal_shell.as_deref()),
         }

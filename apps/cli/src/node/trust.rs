@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::node::config::{Config, Setting};
+use crate::node::config::{Config, ConfigLock, Setting};
 use crate::process::child_env::JOB_MARKER_ENV;
 use crate::wire::protocol::frames::TrustValue;
 
@@ -65,7 +65,8 @@ pub fn persist_relay() -> Result<()> {
         tracing::error!(error = %format!("{error:#}"), "freezing the held definitions failed; holding none");
         crate::node::runtime_store::freeze_empty().context("marking the node lowered")?;
     }
-    Config::set(Setting::Trust(TrustValue::Relay)).context("persisting trust `relay` to the config")
+    ConfigLock::save_setting(Setting::Trust(TrustValue::Relay))
+        .context("persisting trust `relay` to the config")
 }
 
 /// A Full to Relay change: the frozen copy is today's held set, never an
@@ -96,11 +97,15 @@ pub fn effective(config: &Config) -> TrustValue {
 /// this; a failure part way leaves the node Relay only.
 pub fn persist_full() -> Result<()> {
     crate::node::runtime_store::unfreeze().context("unfreezing the held definitions")?;
-    Config::update(true, |config| {
-        config.apply(Setting::Trust(TrustValue::Full));
-        Ok(())
-    })
-    .context("persisting trust `full` to the config")
+    save_full().context("persisting trust `full` to the config")
+}
+
+/// `trust: full` into the existing config file, under the config lock.
+fn save_full() -> Result<()> {
+    let lock = ConfigLock::exclusive()?;
+    let mut config = Config::load_required()?;
+    config.apply(Setting::Trust(TrustValue::Full));
+    lock.save(&config)
 }
 
 /// Refuse `command` when a process wsmp started runs it: the commands that

@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::app::output;
-use crate::node::config::{Config, Setting, normalize_public_origin, server_url_http_warning};
+use crate::node::config::{Config, ConfigLock, Setting};
+use crate::node::origin::{normalize_public_origin, server_url_http_warning};
 use crate::slug::validate_slug;
 
 #[derive(Debug, clap::Args)]
@@ -143,8 +144,8 @@ pub fn run(args: &Args) -> Result<()> {
         }
         Sub::Init => {
             let path = crate::paths::config_file()?;
-            let created = Config::default()
-                .save_new()
+            let created = ConfigLock::exclusive()
+                .and_then(|lock| lock.save_new(&Config::default()))
                 .context("writing default config file")?;
             if args.json {
                 output::json(&ConfigInit::new(&path, created))?;
@@ -155,42 +156,7 @@ pub fn run(args: &Args) -> Result<()> {
             }
         }
         Sub::Show => {
-            let cfg = Config::load_required()?;
-            if let Some(warning) = cfg.retired_command_policy_warning {
-                output::diagnostic(format!("warning: {warning}"))?;
-            }
-            let mut shown = cfg.shown(dirs::home_dir().as_deref())?;
-            if cfg!(windows) {
-                // What a browser can pick now, the default first.
-                shown["terminalShells"] =
-                    crate::node::shells::discover(cfg.terminal_shell.as_deref())
-                        .into_iter()
-                        .map(|shell| shell.id)
-                        .collect::<Vec<_>>()
-                        .into();
-            }
-            // The origin the relay hello signs (pinned, else the server URL's).
-            if let Some(origin) = cfg.hello_origin_when_set() {
-                shown["helloOrigin"] = match origin {
-                    Ok(origin) => origin.into(),
-                    Err(error) => {
-                        output::diagnostic(format!("warning: {error:#}"))?;
-                        serde_json::Value::Null
-                    }
-                };
-            }
-            // Where this shell looks; a service resolving a different state
-            // directory reads a different device credential.
-            shown["configFile"] = crate::paths::config_file()?.display().to_string().into();
-            shown["stateDir"] = crate::paths::state_dir()?.display().to_string().into();
-            // An out-of-range value is shown as written, but flagged: the
-            // relay refuses to start with it, so no limit is in effect.
-            if let Err(error) = cfg.validate_max_terminals() {
-                shown["maxTerminalsInvalid"] = true.into();
-                output::diagnostic(format!(
-                    "warning: {error}; the relay will not start until it is fixed (`wsmp config set-max-terminals <n>`)"
-                ))?;
-            }
+            let shown = Config::load_required()?.shown(dirs::home_dir, output::diagnostic)?;
             if args.json {
                 output::json(&shown)?;
             } else {
@@ -234,7 +200,7 @@ pub fn run(args: &Args) -> Result<()> {
         }
         Sub::SetSlug { slug } => {
             validate_slug(slug)?;
-            Config::set(Setting::CliSlug(slug.clone()))?;
+            ConfigLock::save_setting(Setting::CliSlug(slug.clone()))?;
             if args.json {
                 output::json(&SetValue {
                     key: "cliSlug",
@@ -259,7 +225,7 @@ pub fn run(args: &Args) -> Result<()> {
                     "`{host}` is not an IP literal with an optional port"
                 );
             }
-            Config::set(Setting::RuntimeHosts(hosts.clone()))?;
+            ConfigLock::save_setting(Setting::RuntimeHosts(hosts.clone()))?;
             let _ = crate::process::control::request_if_running(
                 crate::process::control::ControlCommand::Reload,
             );
@@ -272,7 +238,7 @@ pub fn run(args: &Args) -> Result<()> {
         Sub::SetFileRoots { paths } => {
             let roots =
                 crate::node::config::validate_file_roots(paths, dirs::home_dir().as_deref())?;
-            Config::set(Setting::FileRoots(roots.clone()))?;
+            ConfigLock::save_setting(Setting::FileRoots(roots.clone()))?;
             if args.json {
                 output::json(&serde_json::json!({"key":"fileRoots", "value":roots}))?;
             } else {
@@ -280,7 +246,7 @@ pub fn run(args: &Args) -> Result<()> {
             }
         }
         Sub::ClearFileRoots => {
-            Config::set(Setting::FileRoots(Vec::new()))?;
+            ConfigLock::save_setting(Setting::FileRoots(Vec::new()))?;
             if args.json {
                 output::json(&serde_json::json!({"key":"fileRoots", "value":[]}))?;
             } else {
@@ -308,7 +274,7 @@ pub fn run(args: &Args) -> Result<()> {
         Sub::SetMaxTerminals { count } => {
             // clap bounds `count` to `MAX_TERMINALS_RANGE`.
             let count = *count;
-            Config::set(Setting::MaxTerminals(count))?;
+            ConfigLock::save_setting(Setting::MaxTerminals(count))?;
             if args.json {
                 output::json(&serde_json::json!({"key": "maxTerminals", "value": count}))?;
             } else {
@@ -344,7 +310,7 @@ pub fn run(args: &Args) -> Result<()> {
                     ))?;
                 }
             }
-            Config::set(Setting::TerminalShell(value.clone()))?;
+            ConfigLock::save_setting(Setting::TerminalShell(value.clone()))?;
             if args.json {
                 output::json(&serde_json::json!({"key": "terminalShell", "value": value}))?;
             } else {
@@ -357,7 +323,7 @@ pub fn run(args: &Args) -> Result<()> {
         }
         Sub::SetRemoteUpdates { state } => {
             let state = *state;
-            Config::set(Setting::RemoteUpdates(state))?;
+            ConfigLock::save_setting(Setting::RemoteUpdates(state))?;
             // The running relay reports the new setting at once.
             let _ = crate::process::control::request_if_running(
                 crate::process::control::ControlCommand::Reload,
@@ -376,7 +342,7 @@ pub fn run(args: &Args) -> Result<()> {
 }
 
 fn set_flag(json: bool, key: &'static str, value: bool, setting: Setting) -> Result<()> {
-    Config::set(setting)?;
+    ConfigLock::save_setting(setting)?;
     if json {
         output::json(&SetFlag { key, value })?;
     } else {
@@ -447,7 +413,7 @@ fn set_server(url: &str, public_origin: Option<String>) -> Result<Option<String>
     set_server_with_savers(
         url,
         public_origin,
-        Config::save,
+        ConfigLock::save,
         crate::node::state::save_node_credential,
     )
 }
@@ -455,10 +421,10 @@ fn set_server(url: &str, public_origin: Option<String>) -> Result<Option<String>
 fn set_server_with_savers(
     url: &str,
     public_origin: Option<String>,
-    save_config: impl Fn(&Config) -> Result<()>,
+    save_config: impl Fn(&ConfigLock, &Config) -> Result<()>,
     save_credential: impl FnOnce(&crate::node::state::NodeCredential) -> Result<()>,
 ) -> Result<Option<String>> {
-    let _lock = crate::node::config::ConfigLock::exclusive()?;
+    let lock = ConfigLock::exclusive()?;
     let previous_config = Config::load()?;
     let mut cfg = previous_config.clone();
     // Only move an enrollment paired with the previous config.
@@ -469,14 +435,18 @@ fn set_server_with_savers(
             cfg.public_origin.as_deref(),
         )
     });
-    let previous = cfg.point_at_server(url, public_origin.clone());
+    let previous = previous_config.public_origin.clone();
+    cfg.apply(Setting::Server {
+        url: url.to_string(),
+        public_origin: public_origin.clone(),
+    });
     // Save config first: an interruption between saves leaves a legacy-style
     // pair, which the next daemon startup accepts.
-    save_config(&cfg)?;
+    save_config(&lock, &cfg)?;
     if let Some(mut credential) = credential {
         credential.server = url.to_string();
         if let Err(error) = save_credential(&credential) {
-            if let Err(rollback) = save_config(&previous_config) {
+            if let Err(rollback) = save_config(&lock, &previous_config) {
                 return Err(error.context(format!(
                     "restoring the previous config also failed: {rollback:#}; retry `wsmp config set-server`"
                 )));
@@ -581,7 +551,9 @@ mod tests {
                     cli_slug: Some("spark-1".into()),
                     ..Config::default()
                 };
-                original.save().expect("initial config");
+                ConfigLock::exclusive()
+                    .and_then(|lock| lock.save(&original))
+                    .expect("initial config");
                 let credential = NodeCredential {
                     node_id: "node-1".into(),
                     slug: "spark-1".into(),
@@ -592,7 +564,7 @@ mod tests {
                 let error = set_server_with_savers(
                     "https://moved.invalid",
                     None,
-                    Config::save,
+                    ConfigLock::save,
                     |candidate| {
                         let saved = Config::load_required().expect("config saved first");
                         assert_eq!(saved.server_url.as_deref(), Some("https://moved.invalid"));
@@ -621,12 +593,14 @@ mod tests {
         isolated_paths(
             "app::commands::setup::config::tests::set_server_does_not_save_credential_when_config_save_fails",
             || {
-                Config {
-                    server_url: Some("https://example.invalid".into()),
-                    ..Config::default()
-                }
-                .save()
-                .expect("initial config");
+                ConfigLock::exclusive()
+                    .and_then(|lock| {
+                        lock.save(&Config {
+                            server_url: Some("https://example.invalid".into()),
+                            ..Config::default()
+                        })
+                    })
+                    .expect("initial config");
                 let original = NodeCredential {
                     node_id: "node-1".into(),
                     slug: "spark-1".into(),
@@ -637,7 +611,7 @@ mod tests {
                 let error = set_server_with_savers(
                     "https://moved.invalid",
                     None,
-                    |_| anyhow::bail!("injected config save failure"),
+                    |_, _| anyhow::bail!("injected config save failure"),
                     |_| panic!("credential must not be saved"),
                 )
                 .expect_err("config save fails");
@@ -659,12 +633,14 @@ mod tests {
         isolated_paths(
             "app::commands::setup::config::tests::set_server_reports_rollback_failure_and_keeps_the_credential_error",
             || {
-                Config {
-                    server_url: Some("https://example.invalid".into()),
-                    ..Config::default()
-                }
-                .save()
-                .expect("initial config");
+                ConfigLock::exclusive()
+                    .and_then(|lock| {
+                        lock.save(&Config {
+                            server_url: Some("https://example.invalid".into()),
+                            ..Config::default()
+                        })
+                    })
+                    .expect("initial config");
                 let original = NodeCredential {
                     node_id: "node-1".into(),
                     slug: "spark-1".into(),
@@ -676,12 +652,12 @@ mod tests {
                 let error = set_server_with_savers(
                     "https://moved.invalid",
                     None,
-                    |config| {
+                    |lock, config| {
                         saves.set(saves.get() + 1);
                         if saves.get() == 2 {
                             anyhow::bail!("injected rollback failure");
                         }
-                        config.save()
+                        lock.save(config)
                     },
                     |_| anyhow::bail!("injected credential save failure"),
                 )
@@ -798,7 +774,9 @@ mod tests {
             server_url: Some("https://example.invalid".into()),
             ..Config::default()
         };
-        config.save().expect("initial config");
+        ConfigLock::exclusive()
+            .and_then(|lock| lock.save(&config))
+            .expect("initial config");
         save_node_credential(&original).expect("enrollment");
         let set_server = |url: &str, public_origin: Option<&str>| {
             // Exercise the command's mutation independently of the process
