@@ -16,8 +16,9 @@ use tempfile::NamedTempFile;
 #[cfg(unix)]
 use nix::fcntl::{Flock, FlockArg};
 
+use crate::engine_facts;
 use crate::protocol::frames::TrustValue;
-use crate::protocol::runtime_spec::RemoteUpdates;
+use crate::protocol::runtime_spec::{FileRootsSource, RemoteUpdates};
 use crate::slug::validate_slug;
 
 pub const CONFIG_VERSION: u8 = 3;
@@ -151,19 +152,6 @@ pub fn validate_file_roots(paths: &[PathBuf], home: Option<&Path>) -> Result<Vec
 /// False if any configured root is unusable; never invent an unrestricted fallback.
 pub fn file_roots_usable(roots: &[PathBuf]) -> bool {
     validate_file_roots(roots, None).is_ok()
-}
-
-/// Where the node's file roots come from (the hello `features.files.source`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FileRootsSource {
-    /// No `fileRoots`: the user's home directory. File ops still need Full
-    /// control, and wsmp's own files stay protected inside it.
-    Default,
-    /// `wsmp config set-file-roots`.
-    Configured,
-    /// `wsmp config set-file-tools off`: no roots at all.
-    Disabled,
 }
 
 /// A short-lived advisory lock shared by every local config mutation.  The
@@ -911,8 +899,8 @@ impl EndpointEngine {
     }
 
     /// The engine kind this declaration names, or `None` for `auto`.
-    pub fn declared_kind(self) -> Option<crate::engine::EngineKind> {
-        use crate::engine::EngineKind;
+    pub fn declared_kind(self) -> Option<engine_facts::EngineKind> {
+        use engine_facts::EngineKind;
         match self {
             Self::Auto => None,
             Self::Generic => Some(EngineKind::Generic),
@@ -992,7 +980,7 @@ pub struct ProbeSnapshot {
     /// Static engine facts from the last probe (engine detection). Reported in
     /// the inventory and never part of the inventory digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub engine: Option<crate::engine::DetectedEngine>,
+    pub engine: Option<engine_facts::DetectedEngine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

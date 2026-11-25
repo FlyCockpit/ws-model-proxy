@@ -799,7 +799,20 @@ pub struct FileFeatures {
     pub as_root: bool,
     /// Where the roots come from: the home directory by default, the
     /// configured list, or none (file tools turned off).
-    pub source: crate::config::FileRootsSource,
+    pub source: FileRootsSource,
+}
+
+/// Where the node's file roots come from (the hello `features.files.source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileRootsSource {
+    /// No `fileRoots`: the user's home directory. File ops still need Full
+    /// control, and wsmp's own files stay protected inside it.
+    Default,
+    /// `wsmp config set-file-roots`.
+    Configured,
+    /// `wsmp config set-file-tools off`: no roots at all.
+    Disabled,
 }
 
 #[cfg(test)]

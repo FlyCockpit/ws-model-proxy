@@ -326,7 +326,7 @@ pub fn run(args: &Args) -> Result<()> {
             }
             let value = (shell != "default").then(|| shell.clone());
             if let Some(id) = &value {
-                if !crate::shells::valid_id(id) {
+                if !crate::protocol::valid_shell_id(id) {
                     anyhow::bail!(
                         "`{id}` is not a shell; use `pwsh`, `powershell`, `cmd`, `wsl:<distribution>` or `default`"
                     );

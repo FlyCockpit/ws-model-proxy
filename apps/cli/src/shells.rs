@@ -10,9 +10,6 @@
 
 use std::path::PathBuf;
 
-/// Shells advertised at most (the protocol's bound).
-pub const MAX_SHELLS: usize = 16;
-
 /// A shell a terminal can start.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shell {
@@ -20,19 +17,6 @@ pub struct Shell {
     pub id: String,
     pub program: PathBuf,
     pub args: Vec<String>,
-}
-
-/// A shell id this CLI can offer: `pwsh`, `powershell`, `cmd`, or `wsl:`
-/// followed by 1 to 64 letters, digits, `.`, `_` or `-` (what WSL allows in
-/// a distribution name).
-pub fn valid_id(id: &str) -> bool {
-    matches!(id, "pwsh" | "powershell" | "cmd")
-        || id.strip_prefix("wsl:").is_some_and(|name| {
-            (1..=64).contains(&name.len())
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-        })
 }
 
 /// The shells found here, `preferred` (the `terminalShell` setting) first
@@ -44,7 +28,7 @@ pub fn discover(preferred: Option<&str>) -> Vec<Shell> {
         let shell = shells.remove(index);
         shells.insert(0, shell);
     }
-    shells.truncate(MAX_SHELLS);
+    shells.truncate(crate::protocol::MAX_SHELLS);
     shells
 }
 
@@ -230,7 +214,7 @@ fn distribution_names(bytes: &[u8]) -> Vec<String> {
     for line in text.lines() {
         let name = line.trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}');
         if !name.is_empty()
-            && valid_id(&format!("wsl:{name}"))
+            && crate::protocol::valid_shell_id(&format!("wsl:{name}"))
             && !names.iter().any(|seen| seen == name)
         {
             names.push(name.to_string());
@@ -242,31 +226,6 @@ fn distribution_names(bytes: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ids_are_the_fixed_shells_or_a_plain_wsl_name() {
-        for id in [
-            "pwsh",
-            "powershell",
-            "cmd",
-            "wsl:Ubuntu-24.04",
-            "wsl:my_distro",
-        ] {
-            assert!(valid_id(id), "{id}");
-        }
-        for id in [
-            "",
-            "bash",
-            "wsl:",
-            "wsl:a b",
-            "wsl:a;calc",
-            "wsl:../x",
-            "wsl:a\\b",
-            &format!("wsl:{}", "a".repeat(65)),
-        ] {
-            assert!(!valid_id(id), "{id}");
-        }
-    }
 
     #[test]
     fn wsl_output_is_read_as_utf16_or_utf8_and_odd_names_are_skipped() {
@@ -319,7 +278,11 @@ mod tests {
         } else {
             assert!(shells.is_empty());
         }
-        assert!(shells.iter().all(|shell| valid_id(&shell.id)));
+        assert!(
+            shells
+                .iter()
+                .all(|shell| crate::protocol::valid_shell_id(&shell.id))
+        );
         assert_eq!(discover(Some("nonexistent")), shells);
     }
 }

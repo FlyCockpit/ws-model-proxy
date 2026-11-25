@@ -5,6 +5,12 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::protocol::runtime_spec::CommandShell;
+
+/// The marker every child the node starts carries (jobs, commands, metric
+/// commands, terminals). `wsmp trust full` refuses to run under it.
+pub const JOB_MARKER_ENV: &str = "WSMP_JOB";
+
 const ALLOWED_EXACT: &[&str] = &[
     "PATH",
     "HOME",
@@ -162,7 +168,7 @@ pub fn scrub_parent_env(denied_names: &[String]) -> Vec<(String, String)> {
     complete_child_env(&mut env, &HostEnvFacts::current(), is_socket);
     // Every child the node starts carries the job marker, so `wsmp trust
     // full` and `wsmp secret` refuse to run from it.
-    env.push((crate::trust::JOB_MARKER_ENV.to_string(), "1".to_string()));
+    env.push((JOB_MARKER_ENV.to_string(), "1".to_string()));
     env
 }
 
@@ -392,6 +398,45 @@ pub fn login_shell() -> (String, Vec<String>) {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "/bin/sh".to_string());
     (program, vec!["-l".to_string()])
+}
+
+/// One `sh` word: single quotes, a quote inside as `'\''`.
+fn sh_word(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// One PowerShell word: single quotes, every quote character PowerShell reads as one (the
+/// ASCII quote and the typographic ones) doubled.
+fn powershell_word(arg: &str) -> String {
+    let mut out = String::from("'");
+    for ch in arg.chars() {
+        if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(ch);
+        }
+        out.push(ch);
+    }
+    out.push('\'');
+    out
+}
+
+/// An argv as a script for `shell`: the program runs in place of the shell (`exec`) in `sh`.
+/// PowerShell runs it as its last command, so the status check every Windows script ends with
+/// (`runtimes::executor::windows::powershell_script`) exits with the program's status, or 1 when it could not start.
+/// `None` for `cmd`, which cannot quote an argument safely.
+///
+/// On Windows the script is how the command is shown, and how it runs when its program is not an
+/// `.exe`: one that is starts directly (`runtimes::executor::windows::invocation`).
+pub fn argv_script(shell: CommandShell, argv: &[String]) -> Option<String> {
+    let words = |word: fn(&str) -> String| argv.iter().map(|arg| word(arg)).collect::<Vec<_>>();
+    match shell {
+        CommandShell::Sh => Some(format!("exec {}", words(sh_word).join(" "))),
+        CommandShell::Pwsh => Some(format!(
+            "$PSNativeCommandArgumentPassing = 'Standard'; & {}",
+            words(powershell_word).join(" ")
+        )),
+        CommandShell::Powershell => Some(format!("& {}", words(powershell_word).join(" "))),
+        CommandShell::Cmd => None,
+    }
 }
 
 #[cfg(test)]
@@ -797,5 +842,19 @@ mod tests {
         assert!(resolve_cwd(Some("~/missing"), &home).is_err());
         assert!(resolve_cwd(Some(file.to_str().expect("utf8")), &home).is_err());
         assert!(resolve_cwd(Some("~/has\0nul"), &home).is_err());
+    }
+
+    #[test]
+    fn powershell_words_double_every_quote_it_reads() {
+        assert_eq!(powershell_word("a\u{2019}b'c"), "'a\u{2019}\u{2019}b''c'");
+        assert_eq!(
+            argv_script(CommandShell::Powershell, &["x".into(), r"C:\dir\".into()]).as_deref(),
+            Some(r"& 'x' 'C:\dir\'")
+        );
+        // What Windows PowerShell 5.1 would change is rendered too: the node refuses it only when the
+        // program is not an `.exe` that starts directly.
+        assert!(argv_script(CommandShell::Powershell, &["x".into(), String::new()]).is_some());
+        assert!(argv_script(CommandShell::Pwsh, &["x".into(), String::new()]).is_some());
+        assert_eq!(argv_script(CommandShell::Cmd, &["x".into()]), None);
     }
 }

@@ -32,9 +32,11 @@ use anyhow::{Context, Result};
 use crate::config::{
     AudioOperationCapabilities, EndpointAuthMode, EndpointConfig, RealtimeAdapter,
 };
+use crate::protocol::frames::{SttConfig, SttEvent};
+use crate::protocol::stt::is_session_id;
 use crate::protocol::{NodeFrame, RelayFailure};
 use crate::relay_bus::FromWorker;
-use crate::stt_wire::{SttConfig, SttEvent, SttServerMessage, is_session_id};
+use crate::stt_wire::SttServerMessage;
 
 /// Live sessions one CLI process serves at once, over all endpoints.
 pub const STT_SESSIONS_MAX: usize = 8;

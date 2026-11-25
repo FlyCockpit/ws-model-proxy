@@ -3637,7 +3637,7 @@ fn count_first_exceeds_ceiling(tokens: u64, ceiling: Option<u64>) -> bool {
 }
 
 struct CountFirstPlan {
-    method: Option<crate::count_context::CountContextMethod>,
+    method: Option<crate::engine_facts::CountContextMethod>,
     adapter_count_route: Option<String>,
     count_ceiling: Option<u64>,
 }
@@ -4113,18 +4113,18 @@ fn append_usage_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
 /// The engine tokenize route this endpoint's last probe found.
 fn endpoint_count_method(
     endpoint: &crate::config::EndpointConfig,
-) -> Option<crate::count_context::CountContextMethod> {
+) -> Option<crate::engine_facts::CountContextMethod> {
     endpoint
         .last_probe
         .as_ref()
         .and_then(|probe| probe.engine.as_ref())
         .and_then(|engine| engine.count_context)
-        .and_then(crate::count_context::CountContextFact::method)
+        .and_then(crate::engine_facts::CountContextFact::method)
 }
 
 /// The wire name of a count method (`AdapterCount` is a reader count).
-fn count_method(method: crate::count_context::CountContextMethod) -> CountMethod {
-    use crate::count_context::CountContextMethod as Local;
+fn count_method(method: crate::engine_facts::CountContextMethod) -> CountMethod {
+    use crate::engine_facts::CountContextMethod as Local;
     match method {
         Local::VllmTokenize => CountMethod::VllmTokenize,
         Local::TgiChatTokenize => CountMethod::TgiChatTokenize,
@@ -6269,7 +6269,7 @@ mod tests {
         // session gets one stt.error, and the relay goes on.
         let oversized = NodeFrame::SttEvent {
             session_id: session.to_string(),
-            event: crate::stt_wire::SttEvent::Delta {
+            event: crate::protocol::frames::SttEvent::Delta {
                 item_seq: 0,
                 text: "secret ".repeat(4_000),
             },

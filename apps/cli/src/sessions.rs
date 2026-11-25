@@ -3325,7 +3325,7 @@ impl ExecRegistry {
                 signal: None,
                 started_at: Some(command.started_at),
                 ends_by: Some(command.ends_by),
-                finished_at: Some(crate::telemetry::now_rfc3339()),
+                finished_at: Some(crate::time::now_rfc3339()),
                 tail: None,
                 truncated: None,
                 output_bytes: None,
@@ -3572,7 +3572,7 @@ impl ExecRegistry {
                 signal: None,
                 started_at: None,
                 ends_by: None,
-                finished_at: Some(crate::telemetry::now_rfc3339()),
+                finished_at: Some(crate::time::now_rfc3339()),
                 tail: None,
                 truncated: None,
                 output_bytes: None,
@@ -3688,7 +3688,7 @@ impl ExecRegistry {
             signal: signal_token(status.1),
             started_at: Some(session.started_at.clone()),
             ends_by: Some(session.ends_by.clone()),
-            finished_at: Some(crate::telemetry::now_rfc3339()),
+            finished_at: Some(crate::time::now_rfc3339()),
             tail: None,
             truncated: None,
             output_bytes: None,
@@ -3915,7 +3915,7 @@ fn exec_process(
                 Some(shell) => shell,
                 None => default_shell()?,
             };
-            let script = crate::runtimes::render::argv_script(shell, argv)
+            let script = crate::child_env::argv_script(shell, argv)
                 .ok_or(no_shell("cmd cannot run an argv"))?;
             (shell, script)
         }
@@ -4059,8 +4059,8 @@ fn spawn_exec(
         _stderr_thread: stderr_thread,
         stop,
         deadline: Instant::now() + lifetime,
-        started_at: crate::telemetry::rfc3339(started),
-        ends_by: crate::telemetry::rfc3339(started + lifetime),
+        started_at: crate::time::rfc3339(started),
+        ends_by: crate::time::rfc3339(started + lifetime),
         stdout_mask: StreamMasker::new(command),
         stderr_mask: StreamMasker::new(command),
         output: OutputRing::default(),

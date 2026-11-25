@@ -895,7 +895,7 @@ mod tests {
             }
             let run = |argv: &[&str], direct: bool| {
                 let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
-                let script = crate::runtimes::render::argv_script(shell, &argv).expect("script");
+                let script = crate::child_env::argv_script(shell, &argv).expect("script");
                 let argv = direct.then_some(argv.as_slice());
                 match run_script(shell, &script, argv, deadline(), None, &[]) {
                     Ok(()) => Some(0),

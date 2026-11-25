@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::config::EndpointConfig;
+use crate::engine_facts::{DetectedEngine, EngineKind};
 
 /// Largest body read from `/props`, `/get_server_info`, `/api/version` and
 /// `/api/v0/models`.
@@ -33,59 +34,6 @@ pub const DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Load scrapes on the telemetry thread; shorter than the sampling interval.
 pub const LOAD_TIMEOUT: Duration = Duration::from_secs(2);
 const SERVED_ALIAS_LIMIT: usize = 64;
-
-/// Inference engine kinds on the relay wire (`engineFacts.engine.value`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EngineKind {
-    Generic,
-    #[serde(rename = "llama.cpp")]
-    LlamaCpp,
-    Vllm,
-    Sglang,
-    Ollama,
-    LmStudio,
-}
-
-impl EngineKind {
-    /// Engines whose live load the telemetry thread can scrape.
-    pub fn has_load_source(self) -> bool {
-        matches!(self, Self::LlamaCpp | Self::Vllm | Self::Sglang)
-    }
-}
-
-/// Static facts one probe found. Persisted in `lastProbe.engine` so a reload
-/// candidate and a reconnect carry them without another network round trip.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct DetectedEngine {
-    /// `None` when detection found nothing recognizable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<EngineKind>,
-    /// Concurrent sequences: llama.cpp `total_slots`, SGLang `max_running_requests`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slots: Option<u32>,
-    /// llama.cpp `default_generation_settings.n_ctx`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ctx_per_slot: Option<u64>,
-    /// Total KV capacity in tokens: vLLM `num_gpu_blocks × block_size`,
-    /// SGLang `max_total_num_tokens`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kv_tokens: Option<u64>,
-    /// Engine-wide context limit (SGLang `context_length`, llama.cpp per-slot).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_model_len: Option<u64>,
-    /// Per model id: vLLM `/v1/models` `max_model_len`.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub model_max_len: BTreeMap<String, u64>,
-    /// Ids one engine process serves (vLLM/SGLang `--served-model-name` lists).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub served_model_aliases: Vec<String>,
-    /// Chat Completions tokenize fact recorded at probe time (`method` or
-    /// `unsupported`). `None` means this endpoint has not been probed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub count_context: Option<crate::count_context::CountContextFact>,
-}
 
 /// The engine this endpoint runs and whether the person declared it.
 pub fn effective_kind(endpoint: &EndpointConfig) -> Option<(EngineKind, bool)> {

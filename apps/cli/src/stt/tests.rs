@@ -781,7 +781,7 @@ fn escape_heavy_transcripts_fail_only_their_item_and_deltas_fit_a_frame() {
     let pieces = segmented::split_delta_text(&control_run);
     assert!(pieces.len() > 1);
     assert!(pieces.iter().all(|piece| {
-        piece.len() <= crate::stt_wire::STT_DELTA_TEXT_MAX_BYTES
+        piece.len() <= crate::protocol::stt::STT_DELTA_TEXT_MAX_BYTES
             && segmented::json_escaped_len(piece) <= segmented::STT_EVENT_TEXT_ESCAPED_MAX_BYTES
     }));
     assert_eq!(pieces.concat(), control_run);
@@ -1207,7 +1207,7 @@ fn engine_answers_map_to_outcomes_and_keep_usage() {
         ),
         segmented::Outcome::Text {
             text: "hola".into(),
-            usage: Some(crate::stt_wire::SttEngineUsage {
+            usage: Some(crate::protocol::frames::SttEngineUsage {
                 input_tokens: Some(120),
                 output_tokens: Some(3),
             }),
@@ -1237,7 +1237,7 @@ fn engine_answers_map_to_outcomes_and_keep_usage() {
         0,
         segmented::Outcome::Text {
             text: "ok".into(),
-            usage: Some(crate::stt_wire::SttEngineUsage {
+            usage: Some(crate::protocol::frames::SttEngineUsage {
                 input_tokens: Some(1),
                 output_tokens: None,
             }),

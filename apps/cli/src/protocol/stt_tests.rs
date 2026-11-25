@@ -1,6 +1,7 @@
 use super::*;
+use crate::protocol::frames::SttEngineUsage;
 use crate::protocol::{
-    FrameFault, NodeFrame, ServerBinaryMetadata, control_frame_fault, encode_control,
+    FrameFault, NodeFrame, RelayFailure, ServerBinaryMetadata, control_frame_fault, encode_control,
     parse_binary_frame, parse_server_control,
 };
 
@@ -299,7 +300,7 @@ fn current_stt_frames_match_shared_golden() {
         let message =
             parse_server_control(wire).unwrap_or_else(|error| panic!("{name}: {error:#}"));
         assert!(
-            SttServerMessage::from_frame(&message).is_some(),
+            crate::stt_wire::SttServerMessage::from_frame(&message).is_some(),
             "{name} is not an stt frame"
         );
         // Decoding and re-encoding is byte for byte, so nothing is lost.
