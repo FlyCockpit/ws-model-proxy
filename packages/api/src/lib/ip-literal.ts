@@ -1,5 +1,5 @@
 /**
- * IP literals shared by the contract, the node (`apps/cli/src/protocol/frames.rs`
+ * IP literals shared by the contract, the node (`apps/cli/src/wire/protocol/frames.rs`
  * `is_fabric_ip`) and the database (`wsmp_is_fabric_ip` in schema-hardening.sql). All three
  * accept exactly the canonical text form, so the same string means the same address
  * everywhere and nothing else (brackets, zone ids, prefixes, shell text) gets through. The

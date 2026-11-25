@@ -76,7 +76,7 @@ fn launch_guard_parent_helper() {
 #[test]
 fn guarded_command_ends_with_its_parent() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = wsmp::launch_guard::lock_path(dir.path());
+    let lock = wsmp::process::launch_guard::lock_path(dir.path());
     let mut parent = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "launch_guard_parent_helper", "--nocapture"])
         .env(HELPER_ENV, dir.path())
@@ -92,7 +92,7 @@ fn guarded_command_ends_with_its_parent() {
     // SIGKILL: nothing of the parent runs on the way out.
     parent.kill().unwrap();
     parent.wait().unwrap();
-    wsmp::launch_guard::settle(dir.path(), Duration::from_secs(5))
+    wsmp::process::launch_guard::settle(dir.path(), Duration::from_secs(5))
         .expect("the guard ends once its parent is gone");
     std::thread::sleep(Duration::from_millis(1500));
     assert!(
@@ -104,7 +104,7 @@ fn guarded_command_ends_with_its_parent() {
 #[test]
 fn guard_passes_output_and_exit_status_through() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = wsmp::launch_guard::lock_path(dir.path());
+    let lock = wsmp::process::launch_guard::lock_path(dir.path());
     let output = guard(std::process::id(), &lock, "printf ran; exit 3")
         .output()
         .unwrap();
@@ -115,7 +115,7 @@ fn guard_passes_output_and_exit_status_through() {
 #[test]
 fn guard_runs_nothing_for_a_parent_that_is_gone() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = wsmp::launch_guard::lock_path(dir.path());
+    let lock = wsmp::process::launch_guard::lock_path(dir.path());
     let marker = dir.path().join("launched");
     let script = format!("touch '{}'", marker.display());
     // Not this test's process id: the guard's parent is gone.
@@ -134,7 +134,7 @@ fn guard_runs_nothing_for_a_parent_that_is_gone() {
 #[test]
 fn guard_ends_what_the_command_left_behind_before_its_lock_goes() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = wsmp::launch_guard::lock_path(dir.path());
+    let lock = wsmp::process::launch_guard::lock_path(dir.path());
     let marker = dir.path().join("launched");
     // The shell exits at once; the helper it forked would launch a second later.
     let script = format!(
@@ -182,7 +182,7 @@ fn a_terminal_interrupt_reaches_a_program_started_without_a_shell() {
 /// Starts `program` under a guard, waits until it marks itself `running`, then interrupts the
 /// guard's group as a terminal does: the command takes it, and the guard passes its status on.
 fn interrupt_ends_command(dir: &Path, running: &Path, program: &str, args: &[&str]) {
-    let lock = wsmp::launch_guard::lock_path(dir);
+    let lock = wsmp::process::launch_guard::lock_path(dir);
     let mut child = guard_program(std::process::id(), &lock, program, args)
         .stdout(Stdio::null())
         .spawn()
@@ -225,7 +225,7 @@ fn leaver_script(tests: &Path, rest: &str) -> String {
 #[test]
 fn guard_ends_what_left_its_group_before_its_lock_goes() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = wsmp::launch_guard::lock_path(dir.path());
+    let lock = wsmp::process::launch_guard::lock_path(dir.path());
     let marker = dir.path().join("launched");
     let status = guard(
         std::process::id(),
@@ -247,9 +247,9 @@ fn guard_ends_what_left_its_group_before_its_lock_goes() {
 #[test]
 fn a_guard_killed_at_its_deadline_takes_its_session_with_it() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = wsmp::launch_guard::guard_lock_arg(dir.path()).unwrap();
+    let lock = wsmp::process::launch_guard::guard_lock_arg(dir.path()).unwrap();
     let marker = dir.path().join("launched");
-    let (exe, args) = wsmp::launch_guard::wrap(
+    let (exe, args) = wsmp::process::launch_guard::wrap(
         env!("CARGO_BIN_EXE_wsmp"),
         std::process::id(),
         &lock,
@@ -261,7 +261,7 @@ fn a_guard_killed_at_its_deadline_takes_its_session_with_it() {
     );
     let env = [(LEAVER_ENV.to_owned(), marker.to_string_lossy().into_owned())];
     // bounded_run sends the guard SIGTERM at the deadline: it ends its session before it exits.
-    let outcome = wsmp::bounded_run::run_until_env(
+    let outcome = wsmp::process::bounded_run::run_until_env(
         &exe,
         &args,
         Instant::now() + Duration::from_millis(300),
@@ -269,7 +269,7 @@ fn a_guard_killed_at_its_deadline_takes_its_session_with_it() {
         None,
         &env,
     );
-    assert_eq!(outcome, Err(wsmp::bounded_run::RunError::Timeout));
+    assert_eq!(outcome, Err(wsmp::process::bounded_run::RunError::Timeout));
     std::thread::sleep(Duration::from_millis(1500));
     assert!(
         !marker.exists(),
@@ -280,7 +280,7 @@ fn a_guard_killed_at_its_deadline_takes_its_session_with_it() {
 #[test]
 fn sigterm_ends_the_guards_session_before_the_guard() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = wsmp::launch_guard::lock_path(dir.path());
+    let lock = wsmp::process::launch_guard::lock_path(dir.path());
     let marker = dir.path().join("launched");
     let mut child = guard(
         std::process::id(),

@@ -9,7 +9,7 @@ import {
  * The metrics reader form (`spec.metricsReader`) on a runtime's Advanced page. The API has no
  * reader presets, so the starting points live here: the engine's own reader, or a route reader
  * that maps the engine's Prometheus series by name (the same series the node's built-in
- * adapters read, `apps/cli/src/engine.rs`).
+ * adapters read, `apps/cli/src/host/engine.rs`).
  */
 
 export type ReaderKind = "none" | "builtin" | "route" | "command";

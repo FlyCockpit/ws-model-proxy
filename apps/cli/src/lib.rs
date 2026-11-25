@@ -3,64 +3,26 @@
 //! The binary entry point stays thin, while command definitions, config, exit
 //! codes, logging, paths, and output helpers live here so they can be tested and
 //! documented like normal Rust code.
+//!
+//! The modules sit in layers, each using only the ones below it (top first):
+//! `app` (the command line), `relay` (the running relay), `services` (the work
+//! the node does), `host` (the machine), `node` (what the node is, on disk),
+//! `process` (child processes) and `wire` (the relay wire format). The leaves
+//! every layer uses (`paths`, `slug`, `time`, `exit`, `display_escape`) stay
+//! at the crate root.
 
-pub mod approvals;
-pub mod auth;
-pub mod bounded_run;
-pub mod child_env;
-pub mod cli;
-pub mod commands;
-pub mod config;
-pub mod control;
-pub mod count_context;
-pub mod daemon;
+pub mod app;
 pub mod display_escape;
-pub mod engine;
-pub mod engine_facts;
 pub mod exit;
-pub mod file_ops;
-pub mod file_relay;
-pub mod hardware;
-pub mod hostname;
-#[cfg(windows)]
-mod job_tree;
-pub mod launch_guard;
-pub mod logging;
-pub mod media;
-pub mod metric_sources;
-pub mod output;
-pub mod output_mask;
+pub mod host;
+pub mod node;
 pub mod paths;
-pub mod probe;
-#[cfg(unix)]
-mod process_list;
-pub mod protocol;
-pub mod relay_bus;
-pub mod runtime_store;
-pub mod runtimes;
-pub mod secrets;
-pub mod service;
-pub mod sessions;
-pub mod shells;
-pub mod shutdown;
+pub mod process;
+pub mod relay;
+pub mod services;
 pub mod slug;
-pub mod startup;
-pub mod state;
-pub mod stt;
-pub mod stt_wire;
-pub mod subreaper;
-pub mod telemetry;
-pub mod telemetry_bounds;
-pub mod terminal_crypto;
-pub mod terminal_identity;
-pub mod terminal_images;
-pub mod terminal_parse;
 pub mod time;
-pub mod tls;
-pub mod tokens;
-pub mod trust;
-pub mod update;
-pub mod upstream;
+pub mod wire;
 
 #[cfg(all(test, windows))]
 #[path = "../tests/support/windows_tree.rs"]

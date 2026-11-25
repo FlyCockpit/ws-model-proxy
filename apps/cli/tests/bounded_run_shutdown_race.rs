@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use wsmp::bounded_run::{kill_all_active, run};
+use wsmp::process::bounded_run::{kill_all_active, run};
 
 fn alive(pid: i32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()

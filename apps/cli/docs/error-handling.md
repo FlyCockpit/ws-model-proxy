@@ -11,7 +11,7 @@ let text = std::fs::read_to_string(&path)
 ```
 
 `main.rs` renders errors through `exit::message_for`, writes diagnostics to
-stderr via `src/output.rs`, and exits with a code from `src/exit.rs`. That's all
+stderr via `src/app/output.rs`, and exits with a code from `src/exit.rs`. That's all
 most CLIs need.
 
 ## When to reach for `thiserror`

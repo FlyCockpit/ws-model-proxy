@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use wsmp::bounded_run::{RunError, run};
+use wsmp::process::bounded_run::{RunError, run};
 
 fn sh(script: &str, timeout: Duration) -> Result<Vec<u8>, RunError> {
     run(

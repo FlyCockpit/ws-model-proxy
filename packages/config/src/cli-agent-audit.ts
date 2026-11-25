@@ -51,7 +51,7 @@ export type CliAgentActionOutcome = (typeof CLI_AGENT_ACTION_OUTCOMES)[number];
 
 /**
  * General rejection codes normalized for command audit metadata, matching
- * the `REASON_*` constants in apps/cli/src/sessions.rs (including
+ * the `REASON_*` constants in apps/cli/src/relay/sessions.rs (including
  * `invalid_input` and `bad_frame`). Supervised files also send file-policy
  * codes such as `path_denied`, `secret_file`, `too_large` and `redacted_span`;
  * the server validates and retains those separately as file error codes.

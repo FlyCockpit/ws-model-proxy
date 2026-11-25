@@ -64,7 +64,7 @@ unless the owner explicitly asks for it in the current task. That covers:
   `SERVER_VERSION` in `apps/server/src/version.ts`.
 - The relay protocol version: `RELAY_PROTOCOL_VERSION`, `RELAY_SUBPROTOCOL`
   and `RELAY_PROTOCOL_VERSIONS` in `apps/server/src/relay/`, and
-  `RELAY_PROTOCOL_VERSION` / `RELAY_SUBPROTOCOL` in `apps/cli/src/protocol/`.
+  `RELAY_PROTOCOL_VERSION` / `RELAY_SUBPROTOCOL` in `apps/cli/src/wire/protocol/`.
 - The release switches in `apps/server/src/node-http.ts`
   (`CLI_RELEASE_BINARIES_BY_DEFAULT`, `CLI_PREVIEW_BRANCH`).
 

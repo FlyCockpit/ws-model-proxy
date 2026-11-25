@@ -6,13 +6,13 @@
 //!   3. Dispatch to the chosen subcommand.
 //!   4. Map any error to a process exit code and a clean stderr message.
 //!
-//! Keep this file small. Real work belongs in `src/commands/`.
+//! Keep this file small. Real work belongs in `src/app/commands/`.
 
 use clap::{CommandFactory, Parser};
 
-use wsmp::cli::{Cli, Command};
+use wsmp::app::cli::{Cli, Command};
 use wsmp::exit::ExitCode;
-use wsmp::{commands, exit, logging, output, shutdown, tls};
+use wsmp::{app::commands, app::logging, app::output, exit, process::shutdown, services::tls};
 
 fn main() {
     let cli = Cli::parse();
@@ -28,11 +28,11 @@ fn main() {
     std::panic::set_hook(Box::new(move |info| {
         #[cfg(unix)]
         let contained_file_panic =
-            cfg!(panic = "unwind") && wsmp::file_ops::pool::worker_panic_is_contained();
+            cfg!(panic = "unwind") && wsmp::services::file_ops::pool::worker_panic_is_contained();
         #[cfg(not(unix))]
         let contained_file_panic = false;
         if !contained_file_panic {
-            wsmp::bounded_run::kill_all_active_for_panic();
+            wsmp::process::bounded_run::kill_all_active_for_panic();
         }
         previous_hook(info);
     }));
@@ -67,7 +67,7 @@ fn main() {
 
     let _ = output::flush_stdout();
     // No metric-source command may outlive the process.
-    wsmp::bounded_run::kill_all_active();
+    wsmp::process::bounded_run::kill_all_active();
     std::process::exit(code as i32);
 }
 
@@ -75,25 +75,25 @@ fn main() {
 /// free of branching and lets every command use `?`.
 fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Command::Login(args) => commands::login::run(args),
-        Command::Trust(args) => commands::trust::run(args),
-        Command::Secret(args) => commands::secret::run(args),
-        Command::Config(args) => commands::config::run(args),
-        Command::Run(args) => commands::run::run(args),
-        Command::Runtime(args) => commands::runtime::run(args),
-        Command::Service(args) => commands::service::run(args),
-        Command::Status(args) => commands::status::run(args),
-        Command::Hardware(args) => commands::hardware::run(args),
-        Command::Logout(args) => commands::logout::run(args),
+        Command::Login(args) => commands::setup::login::run(args),
+        Command::Trust(args) => commands::setup::trust::run(args),
+        Command::Secret(args) => commands::setup::secret::run(args),
+        Command::Config(args) => commands::setup::config::run(args),
+        Command::Run(args) => commands::operate::run::run(args),
+        Command::Runtime(args) => commands::operate::runtime::run(args),
+        Command::Service(args) => commands::setup::service::run(args),
+        Command::Status(args) => commands::operate::status::run(args),
+        Command::Hardware(args) => commands::operate::hardware::run(args),
+        Command::Logout(args) => commands::setup::logout::run(args),
         Command::Completions(args) => commands::completions::run(args, Cli::command()),
-        Command::Terminal(args) => commands::terminal::run(args),
-        Command::Recover(args) => commands::recover::run(args),
-        Command::Update(args) => commands::update::run(args),
-        Command::LaunchGuard(args) => commands::launch_guard::run(args),
+        Command::Terminal(args) => commands::setup::terminal::run(args),
+        Command::Recover(args) => commands::operate::recover::run(args),
+        Command::Update(args) => commands::operate::update::run(args),
+        Command::LaunchGuard(args) => commands::internal::launch_guard::run(args),
         #[cfg(windows)]
-        Command::ConptyHost(args) => commands::conpty_host::run(args),
+        Command::ConptyHost(args) => commands::internal::conpty_host::run(args),
         #[cfg(windows)]
-        Command::RuntimeHost(args) => commands::runtime_host::run(args),
-        Command::LaunchGuardExec(args) => commands::launch_guard::exec(args),
+        Command::RuntimeHost(args) => commands::internal::runtime_host::run(args),
+        Command::LaunchGuardExec(args) => commands::internal::launch_guard::exec(args),
     }
 }

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use wsmp::bounded_run::{REAP_GRACE, RunError, run, run_until_any_status};
+use wsmp::process::bounded_run::{REAP_GRACE, RunError, run, run_until_any_status};
 
 /// A process in its own group, alive for the test: the escaping child joins
 /// that group, so the deadline's `killpg(child pid)` finds nothing to kill.

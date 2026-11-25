@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
-use wsmp::file_ops::{EtagKey, FileOps, Policy, Step};
-use wsmp::file_relay::{FileFrame, FileRelay, FileRuntime, FileSink};
+use wsmp::services::file_ops::{EtagKey, FileOps, Policy, Step};
+use wsmp::services::file_relay::{FileFrame, FileRelay, FileRuntime, FileSink};
 
 const TICK: Duration = Duration::from_millis(25);
 /// A tick may run this late before the loop counts as stalled.
@@ -116,7 +116,7 @@ fn slow_file_ops_never_stall_the_relay_loop() {
     let sink: FileSink = Arc::new(move |id, frames| {
         let _ = tx.lock().expect("tx").send((id, frames));
     });
-    let mut relay = FileRelay::new(runtime, wsmp::trust::TrustAuthority::new(true), sink);
+    let mut relay = FileRelay::new(runtime, wsmp::node::trust::TrustAuthority::new(true), sink);
 
     // A large file to hash for real: `stat` with `hash` reads all of it.
     let big = dir.path().join("big.bin");

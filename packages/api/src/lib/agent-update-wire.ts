@@ -3,7 +3,7 @@
  * and `environment` the node reports, the `agent.update` frame the server sends and the
  * `agent.update.progress` phases and reasons the node answers with. The relay schemas
  * (`apps/server/src/relay/frames.ts`) and the procedures (`nodes/agent-update.ts`) share these;
- * the Rust mirror is `apps/cli/src/protocol/frames.rs`.
+ * the Rust mirror is `apps/cli/src/wire/protocol/frames.rs`.
  */
 import { z } from "zod";
 

@@ -175,7 +175,7 @@ unwrap_used = "warn"        # prefer `?`/`expect("why")` over silent panics
 expect_used = "allow"       # `expect` with a reason is fine; flip to warn if strict
 todo = "warn"               # don't ship `todo!()`
 dbg_macro = "warn"          # don't ship `dbg!()`
-print_stdout = "warn"       # use `src/output.rs` so stdout stays deliberate
+print_stdout = "warn"       # use `src/app/output.rs` so stdout stays deliberate
 print_stderr = "warn"       # use tracing or structured error handling
 
 # ── Release profile ──────────────────────────────────────────────────────────

@@ -117,8 +117,8 @@ ghcr.io/flycockpit/ws-model-proxy:latest   # only when publish_latest is true
 ## Manual Windows checks before a release
 
 CI builds and unit-tests the Windows target, but nothing in CI runs Task Scheduler. Before
-1.0.0 (and any release that touches `src/service.rs`, `src/service/task_scheduler.rs`,
-`src/service/task_names.rs`, `src/service/windows_task.rs`, `src/commands/service.rs` or the
+1.0.0 (and any release that touches `src/host/service.rs`, `src/host/service/task_scheduler.rs`,
+`src/host/service/task_names.rs`, `src/host/service/windows_task.rs`, `src/app/commands/setup/service.rs` or the
 update dead-man), check these by hand on a real Windows 10/11 machine, as a standard user,
 and note the results in the release PR. Inspect tasks with `schtasks /Query /FO LIST /V` and
 `Get-ScheduledTask | ? TaskName -like 'wsmp-*' | ft TaskName,State,@{n='User';e={$_.Principal.UserId}}`.

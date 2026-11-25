@@ -1,6 +1,6 @@
 /**
  * The command a runtime step runs, rendered for the person who authorizes it. Mirrors the
- * node's renderer (`apps/cli/src/runtimes/render.rs` `render`, `typed_values`, `substitute`):
+ * node's renderer (`apps/cli/src/services/runtimes/render.rs` `render`, `typed_values`, `substitute`):
  * the same `{{name}}` syntax, raw substitution (no quoting or escaping: every value is typed
  * first), the same value checks and the same refusals. The shared vectors in
  * `apps/cli/tests/fixtures/relay-4.0/rules/command-render.json` are checked by both sides

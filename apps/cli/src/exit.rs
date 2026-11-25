@@ -21,7 +21,7 @@
 //!      and on Windows the update's dead-man task starts the relay task again.
 //!
 //! A relay stopped by SIGHUP, SIGINT, or SIGTERM cleans up and then dies from
-//! that signal (shell status 128 + signal); see `crate::shutdown`.
+//! that signal (shell status 128 + signal); see `crate::process::shutdown`.
 //!
 //! To give a specific error a non-default code, attach a [`CodedError`] via
 //! `.context(CodedError::new(ExitCode::NotFound))` and [`code_for`] will pick it

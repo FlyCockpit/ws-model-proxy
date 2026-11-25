@@ -1,6 +1,6 @@
 /**
  * Canonical JSON for hashes the server and the node must agree on (relay 4.0 `launchHash`,
- * node metric commands hash). Rust mirror: `apps/cli/src/protocol/canonical.rs`. Shared
+ * node metric commands hash). Rust mirror: `apps/cli/src/wire/protocol/canonical.rs`. Shared
  * vectors: `apps/cli/tests/fixtures/relay-4.0/canonical/vectors.json`.
  *
  * Rules:

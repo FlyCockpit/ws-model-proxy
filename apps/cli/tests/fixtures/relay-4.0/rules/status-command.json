@@ -1,5 +1,5 @@
 {
-  "rules": "see packages/api/src/lib/runtime-spec.ts statusCanReportStopped and apps/cli/src/protocol/runtime_spec.rs status_can_report_stopped: after collapsing spaces, tabs and line breaks and dropping trailing semicolons, a status command that is empty, true, :, exit 0, /bin/true or /usr/bin/true can never exit 3 (stopped)",
+  "rules": "see packages/api/src/lib/runtime-spec.ts statusCanReportStopped and apps/cli/src/wire/protocol/runtime_spec.rs status_can_report_stopped: after collapsing spaces, tabs and line breaks and dropping trailing semicolons, a status command that is empty, true, :, exit 0, /bin/true or /usr/bin/true can never exit 3 (stopped)",
   "refused": [
     "",
     "   ",
