@@ -755,7 +755,7 @@ mod tests {
     // beside it need. The logic is the same on every platform.
     #[cfg(target_os = "linux")]
     #[test]
-    fn an_unreaped_childs_session_is_ended_without_reading_its_start_time() {
+    fn an_unreaped_child_session_is_ended_without_reading_its_start_time() {
         let pair = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize::default())
             .unwrap();

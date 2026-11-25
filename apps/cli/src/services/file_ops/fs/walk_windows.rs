@@ -231,15 +231,23 @@ fn still_itself(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// A temporary directory and its physical path, the form every `DirHandle`
+    /// holds (`resolve` canonicalizes). The raw temp path may name a parent by
+    /// its 8.3 short name (`C:\Users\RUNNER~1\...` on CI), which a walk never
+    /// sees, so a directory entered under it would not resolve to itself.
+    fn physical_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = std::fs::canonicalize(dir.path()).expect("canonical path");
+        (dir, path)
+    }
+
     #[test]
     fn directory_enumeration_enforces_the_entry_cap() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let (_dir, dir) = physical_tempdir();
         for name in ["a", "b", "c"] {
-            std::fs::write(dir.path().join(name), b"").expect("file");
+            std::fs::write(dir.join(name), b"").expect("file");
         }
-        let root = || DirHandle {
-            path: dir.path().to_path_buf(),
-        };
+        let root = || DirHandle { path: dir.clone() };
         assert_eq!(
             read_entries(&root(), &mut || Ok(()), 3, true, &mut WalkStats::default())
                 .expect("at cap")
@@ -256,23 +264,21 @@ mod tests {
 
     #[test]
     fn nested_directory_cap_truncates_and_continues_with_siblings() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(dir.path().join("a-large")).expect("nested dir");
+        let (_dir, dir) = physical_tempdir();
+        std::fs::create_dir(dir.join("a-large")).expect("nested dir");
         for name in ["one", "two", "three"] {
-            std::fs::write(dir.path().join("a-large").join(name), b"").expect("file");
+            std::fs::write(dir.join("a-large").join(name), b"").expect("file");
         }
-        std::fs::create_dir(dir.path().join("z-sibling")).expect("sibling dir");
-        std::fs::write(dir.path().join("z-sibling/keep"), b"").expect("sibling file");
-        let root = DirHandle {
-            path: dir.path().to_path_buf(),
-        };
+        std::fs::create_dir(dir.join("z-sibling")).expect("sibling dir");
+        std::fs::write(dir.join("z-sibling/keep"), b"").expect("sibling file");
+        let root = DirHandle { path: dir.clone() };
         let policy = Policy::new(vec![], vec![], true);
         let mut stats = WalkStats::default();
         let mut visited = Vec::new();
         walk_dir(
             &policy,
             &root,
-            dir.path(),
+            &dir,
             &mut String::new(),
             1,
             3,
@@ -300,20 +306,18 @@ mod tests {
 
     #[test]
     fn root_directory_cap_still_fails_before_visiting_entries() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let (_dir, dir) = physical_tempdir();
         for name in ["a", "b", "c"] {
-            std::fs::write(dir.path().join(name), b"").expect("file");
+            std::fs::write(dir.join(name), b"").expect("file");
         }
-        let root = DirHandle {
-            path: dir.path().to_path_buf(),
-        };
+        let root = DirHandle { path: dir.clone() };
         let policy = Policy::new(vec![], vec![], true);
         let mut stats = WalkStats::default();
         let mut visited = 0;
         let error = walk_dir(
             &policy,
             &root,
-            dir.path(),
+            &dir,
             &mut String::new(),
             1,
             3,
@@ -333,13 +337,11 @@ mod tests {
 
     #[test]
     fn directory_enumeration_checks_cancellation_while_reading_entries() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let (_dir, dir) = physical_tempdir();
         for n in 0..10 {
-            std::fs::write(dir.path().join(n.to_string()), b"").expect("file");
+            std::fs::write(dir.join(n.to_string()), b"").expect("file");
         }
-        let root = || DirHandle {
-            path: dir.path().to_path_buf(),
-        };
+        let root = || DirHandle { path: dir.clone() };
         let mut calls = 0;
         let mut check = || {
             calls += 1;
@@ -366,15 +368,13 @@ mod tests {
 
     #[test]
     fn walk_deadline_stops_enumeration_before_visiting_entries() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("a"), b"").expect("file");
-        let root = || DirHandle {
-            path: dir.path().to_path_buf(),
-        };
+        let (_dir, dir) = physical_tempdir();
+        std::fs::write(dir.join("a"), b"").expect("file");
+        let root = || DirHandle { path: dir.clone() };
         let policy = Policy::new(vec![], vec![], true);
         let mut visited = 0;
         let mut checked = 0;
-        let root = Resolved::at(&root(), dir.path().to_path_buf(), ".".into()).expect("root");
+        let root = Resolved::at(&root(), dir.clone(), ".".into()).expect("root");
         let error = walk(
             &policy,
             &root,
