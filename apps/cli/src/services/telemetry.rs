@@ -429,7 +429,8 @@ struct LoadDone {
 /// and never holds back another endpoint's frame. Due endpoints are started
 /// oldest-due first, so none starves when more are due than workers exist.
 /// A result for an endpoint whose configuration changed (or that was
-/// removed) while it was in flight is discarded.
+/// removed) while it was in flight is discarded: results are taken only after
+/// the configuration at the top of the next round.
 fn run_loads<F>(tx: &SyncSender<FromWorker>, stop: &AtomicBool, shared: &Mutex<Shared>, sample: F)
 where
     F: Fn(&EndpointConfig, &EngineKind) -> Option<LoadReading> + Clone + Send + 'static,
@@ -439,7 +440,8 @@ where
     let mut seen_generation = None;
     let mut in_flight = 0_usize;
     let mut next_epoch = 0_u64;
-    while !stop.load(Ordering::SeqCst) {
+    let mut received = Vec::<LoadDone>::new();
+    while !stop.load(Ordering::SeqCst) || !received.is_empty() {
         let (generation, endpoints) = match shared.lock() {
             Ok(shared) if seen_generation != Some(shared.endpoints_generation) => {
                 (shared.endpoints_generation, Some(shared.endpoints.clone()))
@@ -486,6 +488,50 @@ where
             }
         }
 
+        // The results the last round received, taken only now, after the configuration: one
+        // for an endpoint whose configuration changed (or that was removed) while it was in
+        // flight no longer matches a schedule's epoch.
+        for done in received.drain(..) {
+            in_flight = in_flight.saturating_sub(1);
+            let Some(schedule) = schedules.get_mut(&done.slug) else {
+                continue;
+            };
+            if schedule.epoch != done.epoch {
+                continue;
+            }
+            schedule.in_flight = false;
+            schedule.next_due = done.finished + schedule.interval;
+            let Some(reading) = done.reading else {
+                continue;
+            };
+            let Some(frame) = next_load_frame(
+                &schedule.state,
+                &done.slug,
+                &reading,
+                done.finished,
+                &done.ts,
+            ) else {
+                continue;
+            };
+            let counter_epoch = frame.counter_epoch;
+            let reset = frame.prefix_cache_reset == Some(true);
+            match offer(tx, NodeFrame::RuntimeLoad(frame)) {
+                Sent::Queued => {
+                    schedule
+                        .state
+                        .commit(&done.slug, reading, done.finished, counter_epoch)
+                }
+                Sent::Dropped => {
+                    if reset {
+                        schedule.state.pending_reset = true;
+                    }
+                }
+                Sent::Gone => return,
+            }
+        }
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
         if let Ok(mut map) = persisted_load_counters().lock() {
             let path = if cfg!(test) {
                 None
@@ -532,52 +578,18 @@ where
             }
         }
 
+        #[cfg(test)]
+        tests::before_results();
         let first = match done_rx.recv_timeout(STOP_POLL) {
             Ok(done) => Some(done),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
-        for done in first
-            .into_iter()
-            .chain(std::iter::from_fn(|| done_rx.try_recv().ok()))
-        {
-            in_flight = in_flight.saturating_sub(1);
-            let Some(schedule) = schedules.get_mut(&done.slug) else {
-                continue;
-            };
-            if schedule.epoch != done.epoch {
-                continue;
-            }
-            schedule.in_flight = false;
-            schedule.next_due = done.finished + schedule.interval;
-            let Some(reading) = done.reading else {
-                continue;
-            };
-            let Some(frame) = next_load_frame(
-                &schedule.state,
-                &done.slug,
-                &reading,
-                done.finished,
-                &done.ts,
-            ) else {
-                continue;
-            };
-            let counter_epoch = frame.counter_epoch;
-            let reset = frame.prefix_cache_reset == Some(true);
-            match offer(tx, NodeFrame::RuntimeLoad(frame)) {
-                Sent::Queued => {
-                    schedule
-                        .state
-                        .commit(&done.slug, reading, done.finished, counter_epoch)
-                }
-                Sent::Dropped => {
-                    if reset {
-                        schedule.state.pending_reset = true;
-                    }
-                }
-                Sent::Gone => return,
-            }
-        }
+        received.extend(
+            first
+                .into_iter()
+                .chain(std::iter::from_fn(|| done_rx.try_recv().ok())),
+        );
     }
 }
 
@@ -1138,6 +1150,19 @@ mod tests {
     use super::*;
     use crate::host::engine::LoadSource as EngineLoadSource;
 
+    thread_local! {
+        /// Holds this scheduler thread once, right before it first waits for results, until
+        /// the test lets it go.
+        static RESULTS_GATE: std::cell::RefCell<Option<mpsc::Receiver<()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_results() {
+        if let Some(gate) = RESULTS_GATE.with_borrow_mut(Option::take) {
+            let _ = gate.recv_timeout(Duration::from_secs(10));
+        }
+    }
+
     #[test]
     fn byte_counters_saturate_at_the_json_safe_integer() {
         assert_eq!(saturating_byte_counter(0), 0);
@@ -1541,14 +1566,34 @@ mod tests {
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(256);
+        // The old configuration's scrape starts, then reports 7 only once the configuration
+        // has changed. The scheduler is held right before it first waits for results (after
+        // its loop-top refresh) until that result is queued, so the change can only be taken
+        // with the result. The new configuration's scrape reports 1 only once the old worker
+        // has sent its result, so the scheduler has taken the old result by the time it reports 1.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (changed_tx, changed_rx) = mpsc::channel::<()>();
+        let changed_rx = Arc::new(Mutex::new(changed_rx));
+        let probe = OldScrapeProbe::default();
+        let old_sent = Arc::clone(&probe.old_sent);
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
         let (thread_stop, thread_shared) = (Arc::clone(&stop), Arc::clone(&shared));
         let scheduler = thread::spawn(move || {
-            run_loads(&tx, &thread_stop, &thread_shared, |endpoint, _| {
-                // The old configuration's scrape is slow and reports 7.
+            RESULTS_GATE.set(Some(gate_rx));
+            run_loads(&tx, &thread_stop, &thread_shared, move |endpoint, _| {
                 let running = if endpoint.base_url.is_empty() {
-                    thread::sleep(Duration::from_millis(600));
+                    probe.ran_old.set(true);
+                    let _ = started_tx.send(());
+                    let _ = changed_rx
+                        .lock()
+                        .expect("changed")
+                        .recv_timeout(Duration::from_secs(10));
                     7
                 } else {
+                    let until = Instant::now() + Duration::from_secs(10);
+                    while !probe.old_sent.load(Ordering::SeqCst) && Instant::now() < until {
+                        thread::sleep(Duration::from_millis(5));
+                    }
                     1
                 };
                 Some(LoadReading {
@@ -1558,26 +1603,71 @@ mod tests {
                 })
             });
         });
-        thread::sleep(Duration::from_millis(150));
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the old configuration's scrape started");
         {
             let mut shared = shared.lock().expect("shared");
             shared.endpoints[0].base_url = "http://changed".to_string();
             shared.endpoints_generation += 1;
         }
-        thread::sleep(Duration::from_millis(1_000));
+        changed_tx.send(()).expect("changed");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !old_sent.load(Ordering::SeqCst) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            old_sent.load(Ordering::SeqCst),
+            "the old configuration's result was sent"
+        );
+        gate_tx.send(()).expect("gate");
+        let mut frames = Vec::new();
+        let until = Instant::now() + Duration::from_secs(10);
+        while !frames
+            .iter()
+            .any(|text: &String| text.contains(r#""running":1"#))
+        {
+            let left = until.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(FromWorker::Telemetry(text)) => frames.push(text),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
         stop.store(true, Ordering::SeqCst);
         scheduler.join().expect("scheduler");
-        let frames = std::iter::from_fn(|| rx.try_recv().ok())
-            .filter_map(|message| match message {
+        frames.extend(std::iter::from_fn(|| rx.try_recv().ok()).filter_map(
+            |message| match message {
                 FromWorker::Telemetry(text) => Some(text),
                 _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(!frames.is_empty(), "the new configuration reported");
+            },
+        ));
+        assert!(
+            frames.iter().any(|text| text.contains(r#""running":1"#)),
+            "the new configuration reported: {frames:?}"
+        );
         assert!(
             frames.iter().all(|text| !text.contains(r#""running":7"#)),
             "{frames:?}"
         );
+    }
+
+    /// One worker's copy of the sampler state in
+    /// `a_result_for_a_changed_endpoint_configuration_is_discarded`. A worker drops its copy after
+    /// it sent its result, so the copy that ran the old configuration's scrape sets `old_sent`
+    /// then.
+    #[derive(Clone, Default)]
+    struct OldScrapeProbe {
+        ran_old: std::cell::Cell<bool>,
+        old_sent: Arc<AtomicBool>,
+    }
+
+    impl Drop for OldScrapeProbe {
+        fn drop(&mut self) {
+            if self.ran_old.get() {
+                self.old_sent.store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Run the scheduler over one vLLM endpoint whose sampler returns the

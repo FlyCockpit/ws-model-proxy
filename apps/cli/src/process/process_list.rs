@@ -142,10 +142,38 @@ pub(crate) fn start_ticks(pid: u32) -> Option<u64> {
     stat_started(&stat).map(|Started(ticks)| ticks)
 }
 
-#[cfg(target_os = "linux")]
+/// When `pid`'s process started, `None` when that is not known (see [`read_started`]).
 fn started(pid: Pid) -> Option<Started> {
-    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-    stat_started(&stat)
+    read_started(pid).ok().flatten()
+}
+
+/// When `pid`'s process started: `Ok(None)` only when no process has the pid, `Err` when it
+/// could not be read (or does not parse). An error says nothing about the pid: it is never taken
+/// for "the same process" or for "no process".
+fn read_started(pid: Pid) -> std::io::Result<Option<Started>> {
+    #[cfg(test)]
+    if tests::START_READS_FAIL.get() {
+        return Err(std::io::Error::other(
+            "start times are unreadable in this test",
+        ));
+    }
+    read_started_now(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn read_started_now(pid: Pid) -> std::io::Result<Option<Started>> {
+    match std::fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat_started(&stat).map(Some).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "no start time in the stat")
+        }),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(nix::libc::ESRCH) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -186,7 +214,7 @@ pub(crate) fn live() -> std::io::Result<Vec<Process>> {
 
 /// `lstart` as `ps` prints it (`Mon Oct 26 10:00:00 2026`), digested. `ps` runs with a cleared
 /// environment and `TZ=UTC0`, so every call prints it in the same time zone and locale.
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 fn lstart<'a>(fields: impl Iterator<Item = &'a str>) -> Option<Started> {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -202,6 +230,10 @@ fn lstart<'a>(fields: impl Iterator<Item = &'a str>) -> Option<Started> {
 /// past this, the listing is an error (nothing proven, nothing signalled), never a wait.
 #[cfg(not(target_os = "linux"))]
 const PS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How much of `ps`'s diagnostics is kept: only whether there are any matters.
+#[cfg(not(target_os = "linux"))]
+const PS_STDERR_LIMIT: u64 = 4096;
 
 /// How many `ps` may be running (or given up and not reaped yet) at once. A `ps` stuck in the
 /// kernel keeps its slot until it is reaped, so retries cannot pile up threads and processes:
@@ -260,7 +292,8 @@ fn ps(args: &[&str]) -> std::io::Result<std::process::Output> {
         .env("TZ", "UTC0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        // Read once it exited (see below): `ps` prints a diagnostic there when it fails.
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
     // Read on a thread: a full listing can outgrow the pipe, and `ps` waits until it is read.
     let mut stdout = child
@@ -285,10 +318,16 @@ fn ps(args: &[&str]) -> std::io::Result<std::process::Output> {
                 let stdout = reader
                     .join()
                     .map_err(|_| std::io::Error::other("reading `ps` failed"))??;
+                // `ps` has exited and starts no children, so this ends at once; a diagnostic
+                // longer than the pipe would have kept it from exiting.
+                let mut stderr = Vec::new();
+                if let Some(pipe) = child.stderr.take() {
+                    pipe.take(PS_STDERR_LIMIT).read_to_end(&mut stderr)?;
+                }
                 return Ok(std::process::Output {
                     status,
                     stdout,
-                    stderr: Vec::new(),
+                    stderr,
                 });
             }
             Ok(None) if std::time::Instant::now() < until => {
@@ -330,12 +369,32 @@ fn give_up(mut child: std::process::Child, slot: PsSlot) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn started(pid: Pid) -> Option<Started> {
-    let output = ps(&["-o", "lstart=", "-p", &pid.to_string()]).ok()?;
-    if !output.status.success() {
-        return None;
+fn read_started_now(pid: Pid) -> std::io::Result<Option<Started>> {
+    let output = ps(&["-o", "lstart=", "-p", &pid.to_string()])?;
+    ps_start_time(output.status.code(), &output.stdout, &output.stderr)
+}
+
+/// What `ps -o lstart= -p <pid>` said, from its exit code (`None`: ended by a signal), output and
+/// diagnostics. It exits 1 and prints nothing at all when no process has the pid; any other
+/// failure (a signal, another code, a diagnostic) proves nothing, and neither does a success
+/// without a start time.
+#[cfg(any(test, not(target_os = "linux")))]
+fn ps_start_time(
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> std::io::Result<Option<Started>> {
+    let text = String::from_utf8_lossy(stdout);
+    match code {
+        Some(0) => lstart(text.split_whitespace()).map(Some).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "`ps` printed no start time",
+            )
+        }),
+        Some(1) if text.trim().is_empty() && stderr.is_empty() => Ok(None),
+        _ => Err(std::io::Error::other("`ps` failed")),
     }
-    lstart(String::from_utf8_lossy(&output.stdout).split_whitespace())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -370,7 +429,7 @@ pub(crate) fn session_members(sid: Pid) -> std::io::Result<Vec<Process>> {
 /// launch guard someone else killed), so its pid is the session id. This reaches background
 /// jobs in their own process groups and `nohup`/disowned jobs, which a process group kill
 /// misses. Rounds repeat because members can fork while the kill is in progress, and because a
-/// list that could not be read proves nothing. A live launch guard is never ended this way: a
+/// list or a start time that could not be read proves nothing. A live launch guard is never ended this way: a
 /// scan can be stale by the time its kill lands, so it gets SIGTERM and ends its session itself
 /// (`launch_guard::terminate`).
 ///
@@ -387,14 +446,62 @@ pub(crate) fn session_members(sid: Pid) -> std::io::Result<Vec<Process>> {
 /// matches, and never session 1 or the CLI's own session. A process that calls `setsid()`
 /// itself starts a new session and escapes this kill; that is a documented limit.
 pub(crate) fn kill_session(leader: Process) -> SessionKill {
-    let sid = leader.pid;
+    kill_session_of(Leader {
+        process: leader,
+        unreaped_child: false,
+    })
+}
+
+/// [`kill_session`] for a leader that is the caller's own child and not reaped yet (a zombie
+/// included), such as a PTY shell its owner is closing: its pid cannot name another process
+/// until it is reaped, so no start time is read for it (on macOS each read is a `ps`).
+pub(crate) fn kill_child_session(child: Process) -> SessionKill {
+    kill_session_of(Leader {
+        process: child,
+        unreaped_child: true,
+    })
+}
+
+/// A session leader as [`kill_session_of`] knows it.
+#[derive(Clone, Copy)]
+struct Leader {
+    process: Process,
+    /// The caller's own child, not reaped yet: its pid still names it.
+    unreaped_child: bool,
+}
+
+impl Leader {
+    fn is_current(self) -> bool {
+        self.unreaped_child || self.process.is_current()
+    }
+
+    /// What its pid names now; see [`leader_now`].
+    fn now(self) -> std::io::Result<LeaderNow> {
+        if self.unreaped_child {
+            return Ok(LeaderNow::Same);
+        }
+        leader_now(self.process)
+    }
+
+    fn signal(self, signal: Signal) -> nix::Result<()> {
+        if self.unreaped_child {
+            self.process.signal_unreaped_child(signal)
+        } else {
+            self.process.signal(signal)
+        }
+    }
+}
+
+fn kill_session_of(leader: Leader) -> SessionKill {
+    let sid = leader.process.pid;
     if !signallable(sid) {
         return SessionKill::Reused;
     }
-    // Either the leader is our unreaped child, or it was reaped and its session id stays
+    // Either the leader is not reaped yet, or it was reaped and its session id stays
     // reserved while members remain. A zombie or reaped leader can fail `getsid`; its session
-    // members are still confirmed one by one below.
-    if leader.is_current() && nix::unistd::getsid(Some(sid)).is_ok_and(|actual| actual != sid) {
+    // members are still confirmed one by one below. `getsid` goes first: a leader that still
+    // leads its session (a running PTY shell) needs no start-time read (on macOS, a `ps`).
+    if nix::unistd::getsid(Some(sid)).is_ok_and(|actual| actual != sid) && leader.is_current() {
         return SessionKill::Ended;
     }
     if nix::unistd::getsid(None).is_ok_and(|own| own == sid) {
@@ -402,37 +509,10 @@ pub(crate) fn kill_session(leader: Process) -> SessionKill {
     }
     let own_pid = nix::unistd::getpid();
     for round in 0..SESSION_KILL_ROUNDS {
-        if let Ok(members) = session_members(sid) {
-            // Read by pid, not from the scan: a later leader that is a zombie now is not listed,
-            // and the members of its session are not ours either.
-            if pid_reused(leader) {
-                return SessionKill::Reused;
-            }
-            let listed = members.iter().any(|member| member.pid == sid);
-            let others = members
-                .into_iter()
-                .filter(|member| member.pid != sid && member.pid != own_pid)
-                .collect::<Vec<_>>();
-            if others.is_empty() {
-                // A leader that is still there but could not be killed (a privileged program
-                // it became) leaves the session unproven.
-                if listed
-                    && let Err(error) = leader.signal(Signal::SIGKILL)
-                    && error != Errno::ESRCH
-                {
-                    break;
-                }
-                // The pid may name a later process now, outside the session: its group is not
-                // ours either.
-                return if pid_reused(leader) {
-                    SessionKill::Reused
-                } else {
-                    SessionKill::Ended
-                };
-            }
-            for member in others {
-                let _ = member.signal(Signal::SIGKILL);
-            }
+        match kill_round(leader, own_pid) {
+            Round::Settled(outcome) => return outcome,
+            Round::LeaderStuck => break,
+            Round::Again => {}
         }
         // SIGKILL is asynchronous. Back off a little so a killed process can become a zombie
         // before the next scan.
@@ -447,6 +527,59 @@ pub(crate) fn kill_session(leader: Process) -> SessionKill {
         let _ = leader.signal(Signal::SIGHUP);
     }
     SessionKill::Unproven
+}
+
+/// What one round of [`kill_session`] proved.
+enum Round {
+    Settled(SessionKill),
+    /// Nothing proven (a listing or a start time could not be read), or members were killed:
+    /// list again.
+    Again,
+    /// The leader is still there but could not be killed (a privileged program it became).
+    LeaderStuck,
+}
+
+/// One listing of `leader`'s session: kill the members other than the leader, or once there are
+/// none, the leader.
+fn kill_round(leader: Leader, own_pid: Pid) -> Round {
+    let sid = leader.process.pid;
+    let Ok(members) = session_members(sid) else {
+        return Round::Again;
+    };
+    // Read by pid after the scan, not from it: a later leader that is a zombie now is not listed,
+    // and a scan is not atomic (it can hold our leader and members of a later session under its
+    // pid), so the members of a session its pid leads now are not ours either.
+    match leader.now() {
+        Ok(LeaderNow::Reused) => return Round::Settled(SessionKill::Reused),
+        Ok(LeaderNow::Same | LeaderNow::Gone) => {}
+        Err(_) => return Round::Again,
+    }
+    let listed = members.iter().any(|member| member.pid == sid);
+    let others = members
+        .into_iter()
+        .filter(|member| member.pid != sid && member.pid != own_pid)
+        .collect::<Vec<_>>();
+    if others.is_empty() {
+        // A leader that is still there but could not be killed (a privileged program it
+        // became) leaves the session unproven.
+        if listed
+            && let Err(error) = leader.signal(Signal::SIGKILL)
+            && error != Errno::ESRCH
+        {
+            return Round::LeaderStuck;
+        }
+        // The pid may name a later process now, outside the session: its group is not ours
+        // either. A start time that could not be read proves neither.
+        return match leader.now() {
+            Ok(LeaderNow::Reused) => Round::Settled(SessionKill::Reused),
+            Ok(LeaderNow::Same | LeaderNow::Gone) => Round::Settled(SessionKill::Ended),
+            Err(_) => Round::Again,
+        };
+    }
+    for member in others {
+        let _ = member.signal(Signal::SIGKILL);
+    }
+    Round::Again
 }
 
 /// How [`kill_session`] ended.
@@ -483,17 +616,35 @@ impl Process {
     }
 }
 
-/// Whether `leader`'s pid names a later process now (a zombie included). Unknown start times
-/// prove nothing.
-fn pid_reused(leader: Process) -> bool {
-    started(leader.pid).is_some_and(|now| {
-        reused(
-            leader,
-            Process {
-                pid: leader.pid,
-                started: Some(now),
-            },
-        )
+/// What `leader`'s pid names now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaderNow {
+    /// The leader (a zombie included), or whatever has the pid when the leader's start time was
+    /// never known: unknown start times prove nothing.
+    Same,
+    /// No process.
+    Gone,
+    /// A later process.
+    Reused,
+}
+
+/// What `leader`'s pid names now. A start time that cannot be read now is an error, never
+/// "the same" or "gone".
+fn leader_now(leader: Process) -> std::io::Result<LeaderNow> {
+    if leader.started.is_none() {
+        return Ok(LeaderNow::Same);
+    }
+    let Some(now) = read_started(leader.pid)? else {
+        return Ok(LeaderNow::Gone);
+    };
+    let now = Process {
+        pid: leader.pid,
+        started: Some(now),
+    };
+    Ok(if reused(leader, now) {
+        LeaderNow::Reused
+    } else {
+        LeaderNow::Same
     })
 }
 
@@ -509,6 +660,13 @@ fn reused(leader: Process, now: Process) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Makes every start-time read on this thread fail, as a `ps` that finds no free slot
+        /// or times out does on macOS.
+        pub(super) static START_READS_FAIL: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -562,6 +720,80 @@ mod tests {
         let _ = child.wait();
         assert_eq!(outcome, SessionKill::Reused);
         assert!(alive);
+    }
+
+    /// A start time that cannot be read now proves nothing about a pid: the session of a leader
+    /// whose pid may name another process now is never reported ended, so its caller does not
+    /// kill that process's group (macOS used to, when `ps` found no free slot).
+    // Linux only: with start times unreadable `kill_session` lists the session in every round,
+    // and on macOS each listing is a `ps` that would hold one of the few slots the tests running
+    // beside it need. The logic is the same on every platform.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreadable_start_time_never_proves_a_pid_still_ours() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stale = Process::of(child.id()).another_lifetime();
+        START_READS_FAIL.set(true);
+        let outcome = kill_session(stale);
+        START_READS_FAIL.set(false);
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(outcome, SessionKill::Unproven);
+        assert!(alive);
+    }
+
+    /// A session whose leader is the caller's unreaped child is ended without reading the
+    /// leader's start time (members are still checked one by one).
+    // Linux only: with start times unreadable `kill_session` lists the session in every round,
+    // and on macOS each listing is a `ps` that would hold one of the few slots the tests running
+    // beside it need. The logic is the same on every platform.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreaped_childs_session_is_ended_without_reading_its_start_time() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let mut command = portable_pty::CommandBuilder::new("sleep");
+        command.arg("30");
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        // A known start time (not read: a read can fail under load), so `kill_session` below
+        // needs to read the current one.
+        let leader = Process {
+            pid: Pid::from_raw(i32::try_from(child.process_id().unwrap()).unwrap()),
+            started: Some(Started(1)),
+        };
+        START_READS_FAIL.set(true);
+        let outcome = kill_child_session(leader);
+        let unproven = kill_session(leader);
+        START_READS_FAIL.set(false);
+        let status = child.wait().unwrap();
+        drop(pair.master);
+        assert_eq!(outcome, SessionKill::Ended);
+        assert!(!status.success(), "{status:?}");
+        // The same leader not known to be unreaped proves nothing without its start time.
+        assert_eq!(unproven, SessionKill::Unproven);
+    }
+
+    /// `ps -o lstart= -p` names absence only by exiting 1 with no output and no diagnostic.
+    #[test]
+    fn only_a_silent_exit_1_of_ps_names_no_process() {
+        let started = b"Mon Oct 26 10:00:00 2026\n";
+        assert!(ps_start_time(Some(0), started, b"").unwrap().is_some());
+        assert!(ps_start_time(Some(0), b"", b"").is_err());
+        assert!(ps_start_time(Some(1), b"", b"").unwrap().is_none());
+        assert!(ps_start_time(Some(1), b"\n", b"").unwrap().is_none());
+        assert!(ps_start_time(Some(1), b"", b"ps: out of memory\n").is_err());
+        assert!(ps_start_time(Some(1), started, b"").is_err());
+        assert!(ps_start_time(Some(2), b"", b"").is_err());
+        // Ended by a signal.
+        assert!(ps_start_time(None, b"", b"").is_err());
     }
 
     #[test]

@@ -40,6 +40,18 @@ pub(super) fn end_shell_session(
     }
 }
 
+/// [`end_shell_session`] for a PTY shell that is the caller's child and not reaped yet: its pid
+/// still names it, so its session is ended without start-time reads, and its group by pid if
+/// need be.
+#[cfg(unix)]
+pub(super) fn end_child_shell_session(shell: crate::process::process_list::Process) {
+    if crate::process::process_list::kill_child_session(shell)
+        == crate::process::process_list::SessionKill::Ended
+    {
+        kill_process_group(shell.id(), true);
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn reap_pid(pid: Option<u32>) -> (Option<i32>, Option<i32>) {
     let Some(pid) = pid else {

@@ -740,6 +740,15 @@ mod tests {
     #[test]
     fn a_0_4_3_config_with_version_1_preserves_settings_and_saves_version_3() {
         let text = include_str!("../../tests/fixtures/upgrade-0.4.3/config-version-1.json");
+        // The fixture is a Unix node's file. On Windows `/workspace/models` is drive-relative,
+        // not absolute, so a Windows node's file names a drive-absolute root instead.
+        #[cfg(windows)]
+        let text = &text.replace(r#""/workspace/models""#, r#""C:\\workspace\\models""#);
+        let root = if cfg!(windows) {
+            r"C:\workspace\models"
+        } else {
+            "/workspace/models"
+        };
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("config.json");
         std::fs::write(&path, text).expect("write");
@@ -749,6 +758,7 @@ mod tests {
         assert!(config.require_terminal_approval);
         assert_eq!(config.max_terminals, Some(2));
         assert_eq!(config.remote_updates, RemoteUpdates::Off);
+        assert_eq!(config.file_roots, [PathBuf::from(root)]);
         config.save_to_path(path.clone()).expect("save");
         let mut expected: serde_json::Value = serde_json::from_str(text).expect("fixture");
         expected["version"] = serde_json::json!(CONFIG_VERSION);

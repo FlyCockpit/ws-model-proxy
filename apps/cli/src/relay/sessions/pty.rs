@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use super::children::status_parts;
 use super::children::{LiveChild, LiveChildGuard};
 #[cfg(unix)]
-use super::children::{end_shell_session, reap_after_signal, reap_pid};
+use super::children::{end_child_shell_session, end_shell_session, reap_after_signal, reap_pid};
 #[cfg(unix)]
 use super::pump::pump_polled;
 #[cfg(windows)]
@@ -234,8 +234,13 @@ pub(super) fn shutdown_pty(
         return shutdown_guard_pty(runtime, exited);
     }
     if let Some(shell) = runtime.leader {
-        // A shell that `poll` already reaped is not signalled by pid again.
-        end_shell_session(shell, exited.is_none());
+        match exited {
+            // Only `poll` reaps the shell, and it hands the status here: until then the shell is
+            // this runtime's unreaped child.
+            None => end_child_shell_session(shell),
+            // A shell that `poll` already reaped is not signalled by pid again.
+            Some(_) => end_shell_session(shell, false),
+        }
     }
     // The reader and writer notice `stop` within their poll timeout. Joining
     // either would block: the reader while a background job still holds the
