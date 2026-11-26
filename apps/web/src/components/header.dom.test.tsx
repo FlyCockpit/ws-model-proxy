@@ -82,7 +82,8 @@ describe("header row", () => {
     // The ellipsis needs a block box: `truncate` on the inline-flex link only
     // clips. The caps sit on the span, so a long name leaves the MainNav room.
     expect(classes).not.toContain("truncate");
-    const span = brand.firstElementChild;
+    const [logo, span] = [...brand.children];
+    expect(logo?.tagName).toBe("IMG");
     expect(span?.tagName).toBe("SPAN");
     expect([...(span?.classList ?? [])].sort()).toEqual(
       ["lg:max-w-80", "max-w-40", "sm:max-w-56", "truncate"].sort(),
@@ -90,6 +91,27 @@ describe("header row", () => {
     expect(span?.textContent).toBe("A long model proxy application name");
     expect(view.container.firstElementChild?.classList.contains("min-w-0")).toBe(true);
     expect(view.container.querySelector("[style]")).toBeNull();
+  });
+
+  it.each(SESSIONS)("starts with the logo, named once, while %s", (status) => {
+    fixture.status = status;
+    render(<Header />);
+    const brand = screen.getByRole("link", { name: "A long model proxy application name" });
+    // The image is the link's name; the visible name is aria-hidden, so a
+    // screen reader hears the app name once, not twice.
+    const logo = screen.getByRole("img", { name: "A long model proxy application name" });
+    expect(brand.firstElementChild).toBe(logo);
+    expect(brand.querySelector("span")?.getAttribute("aria-hidden")).toBe("true");
+    // Generated from assets/logo.png (pwa-assets.config.ts): a declared 32px
+    // box, so nothing moves when it loads, with 32/64/128 files picked by drawn size × density, never shrunk.
+    expect(logo.getAttribute("src")).toBe("/pwa-32x32.png");
+    expect(logo.getAttribute("srcset")).toBe(
+      "/pwa-32x32.png 32w, /pwa-64x64.png 64w, /pwa-128x128.png 128w",
+    );
+    expect(logo.getAttribute("sizes")).toBe("48px");
+    expect(logo.getAttribute("width")).toBe("32");
+    expect(logo.getAttribute("height")).toBe("32");
+    expect([...logo.classList]).toEqual(expect.arrayContaining(["size-8", "shrink-0"]));
   });
 
   it.each(["anonymous", "pending", "error"] as const)(

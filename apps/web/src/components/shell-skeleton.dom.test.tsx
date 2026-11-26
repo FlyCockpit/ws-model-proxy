@@ -39,6 +39,10 @@ describe("ShellSkeleton", () => {
     expect(document.querySelector("[data-app-header]")).toBeTruthy();
     expect(document.querySelector("[data-bottom-nav]")).toBeTruthy();
     expect(main.querySelector("[data-route-skeleton]")).toBeTruthy();
+    // The header's logo is on screen from the first frame (the same AppNameLink), so it never pops in.
+    const logo = document.querySelector("[data-app-header] a > img");
+    expect(logo?.getAttribute("src")).toBe("/pwa-32x32.png");
+    expect(logo?.getAttribute("width")).toBe("32");
   });
 
   it("draws the sidebar column and the bottom bar only where the loaded page has them", () => {

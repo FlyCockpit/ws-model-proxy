@@ -52,7 +52,7 @@ export interface ShellFrame {
   skeleton: boolean;
   /** Any skeleton block (`[data-slot=skeleton]`) is in `<main>`: the route's or a query's. */
   loading: boolean;
-  /** Without a header: the start of what the page showed instead, for the report. */
+  /** Without a header: the body's child tags and ids (never its text), for the report. */
   instead?: string;
 }
 
@@ -140,7 +140,7 @@ export function judgeShellLoading(
 
 // Registered before the first navigation; runs at document start in every
 // frame of the page. Self-contained.
-const INIT_SCRIPT = `(() => {
+export const INIT_SCRIPT = `(() => {
   if (window.top !== window) return;
   const box = (el) => {
     if (!el) return null;
@@ -167,7 +167,10 @@ const INIT_SCRIPT = `(() => {
       dark: document.documentElement.classList.contains("dark"),
       skeleton: !!seen("#main-content [data-route-skeleton]"),
       loading: !!seen('#main-content [data-slot="skeleton"]'),
-      instead: seen("[data-app-header]") || !body ? undefined : (body.innerText || "").replace(/s+/g, " ").trim().slice(0, 120) || "(" + [...body.children].map((el) => el.tagName.toLowerCase() + (el.id ? "#" + el.id : "")).join(" ") + ")",
+      // Structure only, never text: a signed-in page shows the user's own
+      // data (nodes, aliases, API keys, terminal output), which must not
+      // reach the check's output or a CI log.
+      instead: seen("[data-app-header]") || !body ? undefined : "(" + [...body.children].map((el) => el.tagName.toLowerCase() + (el.id ? "#" + el.id : "")).join(" ") + ")",
     };
   };
   const frames = [];

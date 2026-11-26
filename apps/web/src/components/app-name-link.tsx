@@ -1,6 +1,8 @@
 import { Link } from "@tanstack/react-router";
 import { env } from "@ws-model-proxy/env/web";
 
+import { APP_LOGO } from "@/lib/app-logo";
+
 /**
  * The app name at the start of the header row. It always goes to the landing
  * page (`/$lang`).
@@ -17,7 +19,14 @@ import { env } from "@ws-model-proxy/env/web";
  * keep a long name from taking the MainNav's room. A name that does not fit
  * ends in an ellipsis (the `truncate` span: an ellipsis needs a block box, and
  * `truncate` on the inline-flex link only clips), and the full name is the
- * link's `title` and accessible name.
+ * link's `title`.
+ *
+ * The logo comes first (lib/app-logo.ts): an `<img>` with its 32px box
+ * declared, so nothing moves when it loads, and the same element in the
+ * loading shell (`ShellSkeleton` renders this link too), so it never pops in.
+ * Its `alt` is the app name and the visible name is `aria-hidden`, so the
+ * link's accessible name is the name once, not twice. It never shrinks: below
+ * the name's room the name gives way.
  */
 export function AppNameLink({ lang }: { lang: string }) {
   const appName = env.VITE_APP_NAME;
@@ -25,10 +34,22 @@ export function AppNameLink({ lang }: { lang: string }) {
     <Link
       to="/$lang"
       params={{ lang }}
-      className="inline-flex min-h-11 min-w-11 max-w-fit grow basis-0 items-center font-semibold text-lg"
+      className="inline-flex min-h-11 min-w-11 max-w-fit grow basis-0 items-center gap-2 font-semibold text-lg"
       title={appName}
     >
-      <span className="max-w-40 truncate sm:max-w-56 lg:max-w-80">{appName}</span>
+      <img
+        src={APP_LOGO.src}
+        srcSet={APP_LOGO.srcSet}
+        sizes={APP_LOGO.sizes}
+        width={APP_LOGO.size}
+        height={APP_LOGO.size}
+        alt={appName}
+        decoding="async"
+        className="size-8 shrink-0"
+      />
+      <span aria-hidden="true" className="max-w-40 truncate sm:max-w-56 lg:max-w-80">
+        {appName}
+      </span>
     </Link>
   );
 }
