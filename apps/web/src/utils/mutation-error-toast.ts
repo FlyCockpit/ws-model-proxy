@@ -8,7 +8,8 @@ import { deletionConflictMessageKey, friendly } from "./friendly-error";
 type Translate = (key: string) => string;
 
 /**
- * Copy for a failed mutation's global error toast: a delete mutation that
+ * Copy for a failed mutation's global error toast: a structured error code the mutation maps in
+ * `meta.errorCodeKeys` gets that copy; a delete mutation that
  * declares `meta.deletionEntity` gets the localized copy for a structured
  * deletion CONFLICT (retained history, requests in flight, …); everything
  * else — including a CONFLICT without a known reason — gets `friendly()`
@@ -19,6 +20,12 @@ export function mutationErrorMessage(
   meta: Mutation["meta"],
   translate: Translate,
 ): string {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? (error as { code?: unknown }).code
+      : null;
+  const codeKey = typeof code === "string" ? meta?.errorCodeKeys?.[code] : undefined;
+  if (codeKey) return translate(codeKey);
   if (meta?.deletionEntity) {
     const key = deletionConflictMessageKey(error, meta.deletionEntity);
     if (key) return translate(key);

@@ -120,7 +120,9 @@ export function McpReauthBranch({ session, clientId, fingerprint, lang }: McpRea
     <div className="flex min-w-0 items-center justify-center px-4 py-10">
       <Card className="w-full min-w-0 max-w-md">
         <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{t("auth:mcpLogin.reauthTitle")}</CardTitle>
+          <CardTitle className="text-2xl">
+            <h1>{t("auth:mcpLogin.reauthTitle")}</h1>
+          </CardTitle>
           <CardDescription className="min-w-0 break-words">
             {t("auth:mcpLogin.reauthDescription", { client: clientId ?? "" })}
           </CardDescription>

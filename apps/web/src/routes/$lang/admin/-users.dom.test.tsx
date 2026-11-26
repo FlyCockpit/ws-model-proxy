@@ -12,6 +12,8 @@ const state = vi.hoisted(() => ({
   // ResponsiveDialog's `(min-width: 48rem)` match (Tailwind `md`, in rem so it follows the user's
   // default font size): a dialog from md up, a bottom drawer below. Any other query never matches.
   desktop: true,
+  locale: "en-US",
+  inviteResult: { userId: "new-id", emailSent: true } as Record<string, unknown>,
 }));
 
 vi.stubGlobal("matchMedia", (query: string) => ({
@@ -33,7 +35,7 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
 });
 
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({ t: (key: string) => key, i18n: { language: state.locale } }),
 }));
 
 vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
@@ -84,6 +86,7 @@ vi.mock("@/utils/orpc", () => {
       mutationFn: async (input: unknown) => {
         state.calls.push({ name, input });
         if (state.failure) throw state.failure;
+        if (name === "invite" || name === "resendInvite") return state.inviteResult;
         return { success: true, pending: false };
       },
     }),
@@ -99,6 +102,7 @@ vi.mock("@/utils/orpc", () => {
           }),
         },
         invite: mutation("invite"),
+        resendInvite: mutation("resendInvite"),
         setRole: mutation("setRole"),
         archive: mutation("archive"),
         unarchive: mutation("unarchive"),
@@ -155,6 +159,9 @@ afterEach(() => {
   state.failure = null;
   state.calls = [];
   state.desktop = true;
+  state.locale = "en-US";
+  state.inviteResult = { userId: "new-id", emailSent: true };
+  vi.mocked(toast.success).mockClear();
   vi.mocked(toast.error).mockClear();
 });
 
@@ -221,5 +228,110 @@ describe("admin invite user", () => {
     expect(surface?.querySelector("[data-slot=responsive-dialog-header]")?.className).toContain(
       "[overflow-wrap:anywhere]",
     );
+  });
+});
+
+describe("admin invite links and archive Undo", () => {
+  async function fillInvite() {
+    fireEvent.click(screen.getByRole("button", { name: "admin:users.invite" }));
+    fireEvent.change(await screen.findByLabelText("admin:users.nameLabel"), {
+      target: { value: "Invited Person" },
+    });
+    fireEvent.change(screen.getByLabelText("admin:users.emailLabel"), {
+      target: { value: "new@example.test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "admin:users.sendInvite" }));
+    await waitFor(() => expect(state.calls.some((call) => call.name === "invite")).toBe(true));
+  }
+
+  it("defaults Email language to the admin UI language and sends no password to the UI", async () => {
+    state.locale = "es-MX";
+    state.users = [user()];
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "admin:users.invite" }));
+    expect((await screen.findByLabelText("admin:users.localeLabel")).textContent).toContain(
+      "common:locale.es-MX",
+    );
+    fireEvent.change(screen.getByLabelText("admin:users.nameLabel"), {
+      target: { value: "Invited Person" },
+    });
+    fireEvent.change(screen.getByLabelText("admin:users.emailLabel"), {
+      target: { value: "new@example.test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "admin:users.sendInvite" }));
+    await waitFor(() =>
+      expect(state.calls).toContainEqual({
+        name: "invite",
+        input: { name: "Invited Person", email: "new@example.test", role: "user", locale: "es-MX" },
+      }),
+    );
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("admin:users.inviteSent"));
+    expect(screen.queryByText("admin:users.setPasswordLinkLabel")).toBeNull();
+  });
+
+  it("reveals a shareable link only when mail was not sent", async () => {
+    state.users = [user()];
+    state.inviteResult = {
+      userId: "new-id",
+      emailSent: false,
+      setPasswordUrl: "https://app.example.test/reset-password/INVITE",
+      expiresAt: "2026-12-01T00:00:00.000Z",
+    };
+    await mount();
+    await fillInvite();
+    expect(await screen.findByText("https://app.example.test/reset-password/INVITE")).toBeTruthy();
+    expect(screen.queryByText("admin:users.tempPasswordLabel")).toBeNull();
+  });
+
+  it("tells the admin to remove a half-created invite, and shows that account", async () => {
+    state.users = [user()];
+    await mount();
+    state.failure = {
+      status: 500,
+      code: "INVITE_INCOMPLETE",
+      message: "raw server message",
+    } as unknown as Error;
+    // The account exists now: the refreshed list shows it.
+    state.users = [user(), user({ id: "new-id", name: "Half Invited", email: "new@example.test" })];
+    await fillInvite();
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("t(admin:users.inviteIncomplete)"),
+    );
+    expect(await screen.findByText("Half Invited")).toBeTruthy();
+  });
+
+  it("resends a pending invite and offers no Resend for a finished account", async () => {
+    state.users = [user({ invitePending: true })];
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "users.resendInvite" }));
+    await waitFor(() =>
+      expect(state.calls).toContainEqual({ name: "resendInvite", input: { userId: "user-1" } }),
+    );
+  });
+
+  it("archives immediately and Undo restores the same user through unarchive", async () => {
+    state.users = [user()];
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "users.archiveUser" }));
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith(
+        "admin:users.userArchived",
+        expect.objectContaining({
+          duration: 8_000,
+          action: expect.objectContaining({ label: "common:actions.undo" }),
+        }),
+      ),
+    );
+    const call = vi
+      .mocked(toast.success)
+      .mock.calls.find(([message]) => message === "admin:users.userArchived");
+    call?.[1]?.action?.onClick();
+    await waitFor(() =>
+      expect(state.calls).toEqual([
+        { name: "archive", input: { userId: "user-1" } },
+        { name: "unarchive", input: { userId: "user-1" } },
+      ]),
+    );
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("admin:users.userRestored"));
   });
 });

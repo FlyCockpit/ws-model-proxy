@@ -19,7 +19,7 @@ beforeAll(async () => {
 });
 
 import type { DeletionEntity } from "./friendly-error";
-import { createAppMutationCache } from "./mutation-error-toast";
+import { createAppMutationCache, mutationErrorMessage } from "./mutation-error-toast";
 
 function DeleteButton({ error, entity }: { error: unknown; entity?: DeletionEntity }) {
   const remove = useMutation({
@@ -91,5 +91,25 @@ describe("app mutation error toast for deletes", () => {
   it("uses the context fallback for other failures", async () => {
     renderDelete({ status: 500, code: "INTERNAL_SERVER_ERROR" }, "user");
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith("t(test:deleteFailed)"));
+  });
+});
+
+describe("mutationErrorMessage for documented error codes", () => {
+  const meta = {
+    errorFallbackKey: "test:inviteFailed",
+    errorCodeKeys: { INVITE_INCOMPLETE: "test:inviteIncomplete" },
+  };
+  const translate = (key: string) => `t(${key})`;
+
+  it("shows the copy the mutation maps for a structured code", () => {
+    expect(mutationErrorMessage({ status: 500, code: "INVITE_INCOMPLETE" }, meta, translate)).toBe(
+      "t(test:inviteIncomplete)",
+    );
+  });
+
+  it("falls back as before for any other code", () => {
+    expect(
+      mutationErrorMessage({ status: 500, code: "INTERNAL_SERVER_ERROR" }, meta, translate),
+    ).toBe("t(test:inviteFailed)");
   });
 });

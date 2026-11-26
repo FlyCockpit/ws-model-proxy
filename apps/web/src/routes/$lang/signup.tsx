@@ -175,7 +175,9 @@ function VerificationPendingCard({
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
           <CardTitle className="text-2xl">
-            {canResend ? t("auth:verifyEmail.sentTitle") : t("auth:verifyEmail.pendingTitle")}
+            <h1>
+              {canResend ? t("auth:verifyEmail.sentTitle") : t("auth:verifyEmail.pendingTitle")}
+            </h1>
           </CardTitle>
           <CardDescription>
             {canResend
@@ -318,7 +320,9 @@ function InvalidInviteCard({
     <Frame>
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{t("auth:invite.invalidTitle")}</CardTitle>
+          <CardTitle className="text-2xl">
+            <h1>{t("auth:invite.invalidTitle")}</h1>
+          </CardTitle>
           <CardDescription>{t("auth:invite.invalidDescription")}</CardDescription>
         </CardHeader>
         <CardContent className="text-center">
@@ -352,7 +356,9 @@ function SignupCardHeader({ validInvite }: { validInvite: InviteDetails | null }
     <CardHeader className="text-center">
       {validInvite ? (
         <>
-          <CardTitle className="text-2xl">{t("auth:invite.title")}</CardTitle>
+          <CardTitle className="text-2xl">
+            <h1>{t("auth:invite.title")}</h1>
+          </CardTitle>
           <CardDescription className="break-words">
             {validInvite.target?.kind === "runtime"
               ? t("auth:invite.runtimeDescription", {
@@ -368,7 +374,9 @@ function SignupCardHeader({ validInvite }: { validInvite: InviteDetails | null }
         </>
       ) : (
         <>
-          <CardTitle className="text-2xl">{t("auth:login.createAccount")}</CardTitle>
+          <CardTitle className="text-2xl">
+            <h1>{t("auth:login.createAccount")}</h1>
+          </CardTitle>
           <CardDescription>{t("auth:login.createDescription")}</CardDescription>
         </>
       )}
@@ -407,7 +415,9 @@ function AcceptInviteCard({
     return (
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{t("auth:invite.acceptedTitle")}</CardTitle>
+          <CardTitle className="text-2xl">
+            <h1>{t("auth:invite.acceptedTitle")}</h1>
+          </CardTitle>
           <CardDescription className="break-words">
             {runtime
               ? t("auth:invite.runtimeAcceptedDescription", { name })
@@ -438,7 +448,7 @@ function AcceptInviteCard({
     <Card className="w-full max-w-md">
       <CardHeader className="text-center">
         <CardTitle className="text-2xl">
-          {result === "invalid" ? t("auth:invite.invalidTitle") : t("auth:invite.title")}
+          <h1>{result === "invalid" ? t("auth:invite.invalidTitle") : t("auth:invite.title")}</h1>
         </CardTitle>
         <CardDescription className="break-words">
           {refusal ??

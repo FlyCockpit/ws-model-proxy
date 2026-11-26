@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { CheckRun } from "./browser-check-lib.ts";
+import { SHELL_PAGES } from "./browser-checks.config.ts";
 import {
   INIT_SCRIPT,
   judgeShellLoading,
+  measure,
   type ShellFrame,
   type ShellRecording,
 } from "./check-shell-loading.ts";
@@ -133,5 +136,38 @@ describe("probe privacy", () => {
   it("records structure only, never page text (a signed-in page shows the user's data)", () => {
     for (const reader of ["innerText", "textContent", "innerHTML", "outerHTML"])
       assert.equal(INIT_SCRIPT.includes(reader), false, reader);
+  });
+});
+
+// No browser: a fake ready-selector timeout exercises the entire case boundary.
+describe("shell warm-up failures", () => {
+  it("reports each missing precondition without escaping the case or printing a stack", async (t) => {
+    const previous = process.env.WMP_CHECK_DISPOSABLE;
+    process.env.WMP_CHECK_DISPOSABLE = "1";
+    t.after(() => {
+      if (previous === undefined) delete process.env.WMP_CHECK_DISPOSABLE;
+      else process.env.WMP_CHECK_DISPOSABLE = previous;
+    });
+    const browser: CheckRun["browser"] = {
+      async run(args) {
+        if (args[0] === "wait" && args[1] !== "input[autocomplete=current-password]")
+          throw new Error("selector timeout\nsecret diagnostics must not appear");
+        const script = args[1] ?? "";
+        if (script.includes("__reactProps")) return '"ready"';
+        if (script.startsWith("location.pathname ===")) return '"app"';
+        return "true";
+      },
+      async evalJson<T>(script: string): Promise<T> {
+        return (script.includes("presets/list") ? { presets: [] } : { id: "fixture" }) as T;
+      },
+      close() {},
+    };
+    const failures = await measure({ base: "http://localhost:3000", browser, args: [] });
+    assert.equal(failures.length, SHELL_PAGES.length * 2);
+    for (const failure of failures) {
+      assert.match(failure, /did not load: .*never appeared;.*check that the account can load/);
+      assert.equal(failure.includes("\n"), false);
+      assert.equal(failure.includes("secret diagnostics"), false);
+    }
   });
 });

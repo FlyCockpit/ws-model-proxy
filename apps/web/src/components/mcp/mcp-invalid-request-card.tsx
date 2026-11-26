@@ -13,7 +13,9 @@ export function McpInvalidRequestCard() {
     <div className="flex min-w-0 items-center justify-center px-4 py-10">
       <Card className="w-full min-w-0 max-w-md">
         <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{t("auth:mcpLogin.invalidTitle")}</CardTitle>
+          <CardTitle className="text-2xl">
+            <h1>{t("auth:mcpLogin.invalidTitle")}</h1>
+          </CardTitle>
           <CardDescription className="min-w-0 break-words">
             {t("auth:mcpLogin.invalidDescription")}
           </CardDescription>

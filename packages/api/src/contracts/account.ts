@@ -218,6 +218,7 @@ export const adminUserSchema = z
     name: z.string(),
     role: z.string(),
     emailVerified: z.boolean(),
+    invitePending: z.boolean(),
     banned: z.boolean().nullable(),
     banReason: z.string().nullable(),
     banExpires: isoDateSchema.nullable(),
@@ -226,6 +227,18 @@ export const adminUserSchema = z
     createdAt: isoDateSchema,
   })
   .strict();
+
+const inviteDeliverySchema = z.discriminatedUnion("emailSent", [
+  z.object({ userId: idSchema, emailSent: z.literal(true) }).strict(),
+  z
+    .object({
+      userId: idSchema,
+      emailSent: z.literal(false),
+      setPasswordUrl: z.string().url(),
+      expiresAt: isoDateSchema,
+    })
+    .strict(),
+]);
 
 /** Kept from 0.3. "Archive" is the word everywhere (it bans the account in Better Auth). */
 export const usersContract = {
@@ -260,10 +273,17 @@ export const usersContract = {
           .regex(/^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,62}$/)
           .optional(),
         role: z.enum(["admin", "user"]).default("user"),
+        locale: z.enum(SUPPORTED_LOCALES),
       })
       .strict(),
-    z.object({ userId: idSchema, tempPassword: z.string(), emailSent: z.boolean() }).strict(),
-    "Admin: invite a person (kept: the temporary password is shown once to the admin).",
+    inviteDeliverySchema,
+    "Admin: invite a person with a one-time set-password link that verifies their email. A link is returned only if email delivery fails or SMTP is absent.",
+  ),
+  resendInvite: mutation(
+    "human_admin",
+    z.object({ userId: idSchema }).strict(),
+    inviteDeliverySchema,
+    "Admin: resend a pending invite, invalidating earlier links.",
   ),
   setRole: mutation(
     "human_admin",

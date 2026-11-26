@@ -22,6 +22,7 @@ import { prismaAdapter } from "better-auth/adapters/prisma";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { admin, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
+import { getAdminInviteLocale } from "./admin-invite-locale";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { refuseImpersonatedAuthWrite } from "./impersonation-read-only";
@@ -76,7 +77,7 @@ async function acceptInvitesQuietly(user: unknown): Promise<void> {
   const row = user as { id?: unknown; email?: unknown; emailVerified?: unknown } | null;
   if (!row || typeof row.id !== "string" || typeof row.email !== "string") return;
   try {
-    // Without SMTP every account is created "verified" without proof, so an e-mail match
+    // Without SMTP public signups are created "verified" without proof, so an e-mail match
     // counts only when verification is on (inviteAcceptance: otherwise the link is needed).
     await acceptShareInvitesForProvenEmail({
       id: row.id,
@@ -126,6 +127,14 @@ function slugChangeRefused(): APIError {
   return new APIError("BAD_REQUEST", {
     message: "Change the account slug in the settings (settings.update), not here.",
     code: "SLUG_CHANGE_UNSUPPORTED",
+  });
+}
+
+/** An e-mail change through Better Auth's update routes (see `databaseHooks.user.update`). */
+function emailChangeRefused(): APIError {
+  return new APIError("BAD_REQUEST", {
+    message: "This app does not change account e-mail addresses.",
+    code: "EMAIL_CHANGE_UNSUPPORTED",
   });
 }
 
@@ -539,7 +548,7 @@ export const auth = betterAuth({
             } else if (claim === "in_use") throw inviteInUseError();
             else if (reliesOnInvite) throw new SignupDisabledError();
           }
-          const locale = resolveSignupLocale(context?.headers);
+          const locale = getAdminInviteLocale() ?? resolveSignupLocale(context?.headers);
           return {
             data: {
               ...user,
@@ -558,8 +567,9 @@ export const auth = betterAuth({
         // The invite link the person signed up through becomes a share (the token is the
         // proof); pending share invites to this e-mail become shares once the e-mail is proven.
         after: async (user, context) => {
-          // An admin-created account's e-mail is marked verified without proof (the admin
-          // knows its temporary password), so its invites wait for the invite link.
+          // An admin-created account has no mailbox proof (spending its set-password link
+          // activates it but proves nothing: the admin may hold the link); its pool invites
+          // wait for verify-email or the share link.
           if (isAdminCreateUserPath(typeof context?.path === "string" ? context.path : null)) {
             return;
           }
@@ -576,8 +586,13 @@ export const auth = betterAuth({
         // changes only through `settings.update`, which claims the renamed IDs against the
         // person's own aliases under their owner fence (packages/api lib/model-names.ts).
         // Better Auth's update routes (`/update-user`, `/admin/update-user`) cannot take it.
+        // The e-mail address cannot change there either: reset and invite links carry only the
+        // user id, and spending one marks the account's current address verified
+        // (password-reset.ts), so a link mailed to the old address would verify the new one. An
+        // address change needs its own flow that also deletes the user's reset links.
         before: async (data) => {
           if ((data as { slug?: unknown }).slug !== undefined) throw slugChangeRefused();
+          if ((data as { email?: unknown }).email !== undefined) throw emailChangeRefused();
         },
         // A user row that now carries an ACTIVE ban (`/admin/ban-user`, or an
         // `/admin/update-user` that sets `banned`) ends the user's in-flight
@@ -587,8 +602,8 @@ export const auth = betterAuth({
         after: async (user, context) => {
           if (!user) return;
           // Verifying the e-mail proves it (for direct shares) and accepts the invites sent to
-          // it — only on the verification routes: an admin-created account is "verified"
-          // without proof.
+          // it — only on the verification routes: an admin invite may verify via a
+          // fallback set-password link held by the admin, without mailbox proof.
           if (isEmailVerificationPath(context?.path)) {
             await recordProvedEmailQuietly(user);
             await acceptInvitesQuietly(user);

@@ -53,7 +53,7 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
       className="fixed bottom-0 left-0 right-0 z-50 border-t bg-background/80 backdrop-blur-lg md:hidden"
       style={{ paddingBottom: "var(--safe-area-bottom)" }}
     >
-      <div className="flex h-14 items-center justify-around">
+      <div className="flex h-(--bottom-nav-bar) items-center justify-around">
         {tabs.map((item) => (
           <Link
             key={item.id}

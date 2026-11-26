@@ -758,6 +758,7 @@ const EXEMPT: Readonly<Record<string, Exemption>> = {
   "settings.onboarding.complete": OWN_ACCOUNT,
   "users.list": ADMIN_USERS,
   "users.invite": ADMIN_USERS,
+  "users.resendInvite": ADMIN_USERS,
   "users.setRole": ADMIN_USERS,
   "users.archive": ADMIN_USERS,
   "users.unarchive": ADMIN_USERS,

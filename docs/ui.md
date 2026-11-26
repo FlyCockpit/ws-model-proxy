@@ -108,7 +108,16 @@ measures the geometry in a browser (§ Layout check).
    (sileo's themes invert the page). Text and state colours reach 4.5:1 on the surface they sit on
    in both themes. A toast's title is one line capped to the pill and shown as written (no Title
    Case); a message that does not fit ends in an ellipsis there and `toast.*`
-   (`packages/ui/src/lib/toast.ts`) repeats it in the description, which wraps. The inline `html` background the init script paints on the first frame gives way
+   (`packages/ui/src/lib/toast.ts`) repeats it in the description, which wraps. Toasts sit
+   bottom-centre above the phone BottomNav (`--bottom-nav-height`, 0 while no nav is on screen),
+   or above the home indicator where there is none, and their action button ("Undo", "Retry") is
+   at least 44px tall on a touch screen. Menus, selects and popovers are opaque `bg-popover`
+   surfaces (no translucency or backdrop blur), so the page never shows through a list. Field
+   outlines (`--input`: inputs, selects, outline buttons, the Off switch track) reach 3:1 on every
+   surface; the focus ring and focused border (`--ring`, a darker or lighter relative of
+   `--primary`'s hue) reach 3:1 on every surface and 2:1 against the resting outline, and the
+   controls draw it opaque and 2px wide; invalid borders are opaque `--destructive` in both themes.
+   `apps/web/src/lib/theme-contrast.test.ts` measures all of these. The inline `html` background the init script paints on the first frame gives way
    to `--background` once the stylesheet applies, so an in-app toggle repaints it.
 4. **Every route renders inside the shell, the 404 included.** The root route renders the shell
    (header, `<main>`, BottomNav) around every match, so the router's `defaultNotFoundComponent`
@@ -222,6 +231,31 @@ browser's terminal identity key and the CLI identity pins in IndexedDB, and the 
 offer flag in `sessionStorage`. None holds account data; anything that does belongs in the query
 cache, or needs its own identity scoping.
 
+## Auth pages and route guards
+
+- **One real `h1` per page.** Every auth page (sign-in and its two-factor step, sign-up and its
+  invite states, forgot/reset password, verify email, MCP sign-in and consent, the forced 2FA
+  setup, the unable-to-connect card) wraps its card title in an `h1`
+  (`<CardTitle className="text-2xl"><h1>…</h1></CardTitle>`; preflight makes it inherit the
+  title's size and weight). The settings layout and the 404 already have theirs. Never use
+  `role="heading"`. Tests: `components/auth/auth-pages.dom.test.tsx`,
+  `components/auth/reset-password-card.dom.test.tsx`.
+- **A signed-out form survives a refocus.** Better Auth refetches the session when the tab regains
+  focus and marks every refetch of an empty session `isPending`, the same snapshot as the first
+  load. `useAuthSession` keeps a document-level "confirmed anonymous" memory
+  (`rememberConfirmedAnonymous` in `lib/auth-session-state.ts`), so once the document settled
+  signed out, a refetch or a failed refetch stays anonymous: the sign-in and sign-up forms keep
+  their typed values instead of flashing their skeleton or the unable-to-connect card. Only the
+  first load waits. A sign-in clears it; a sign-out replaces the document.
+- **Guards wait for the shell to hydrate.** The root route is `ssr: false`: the server sends
+  `ShellSkeleton`, shaped by the URL (sidebar, bottom nav). React hydrates it in a later
+  Suspense pass, so a guard redirect that landed first (a signed-out cold load of
+  `/en-US/nodes`, a signed-in one of `/en-US/signup`) made React hydrate the skeleton for the new
+  URL against the old HTML: React error #418. `resolveRouteSession()` therefore waits, alongside
+  its probe, for `appShellHydrated()` (`lib/app-shell-hydration.ts`): the skeleton carries
+  `data-app-shell` and reports from its first effect (the loaded root reports too), with a 5 s
+  cap; a failed probe is rethrown only after the wait. Server and client navigations do not wait.
+
 ## Layout check
 
 `pnpm check:layout --url <dev server>` measures § Shell rules in a real browser through
@@ -244,3 +278,27 @@ Chromium on Linux draws classic scrollbars, which is what exposes a reserved gut
 scrollbars on macOS hide it). It is not part of CI: it needs a browser and a running app. The
 structure it measures is pinned in CI by the root shell test and G8/G9; the judging logic has unit
 tests (`pnpm check:layout:test`, in `pnpm check:ci`).
+
+Against a running app, `pnpm check:layout --url <app> --accounts <file>` signs in from a
+credentials file instead of `--admin`/`CHECK_LAYOUT_PASSWORD` (`CHECK_LAYOUT_TOTP` may supply the
+admin's Better Auth TOTP secret). Before measuring a page it waits up to 8 s for five unchanged
+content-height reads with no `[data-slot="skeleton"]`, `[aria-busy="true"]` or
+`[data-route-skeleton]` inside `<main>`, and reports "still showing a loading skeleton" apart from
+"kept changing": loading UI must carry one of those markers.
+
+All three checks (`check:layout`, `check:dialogs`, `check:shell-loading`) share
+`scripts/browser-check-lib.ts`. WMP has no mock mode or seed command: they need `--url` at the app's
+auth origin, and the dialog and shell checks create their own runtime, pool and provider fixtures
+and require `WMP_CHECK_DISPOSABLE=1`. Accounts come from signup on a fresh local stack without
+SMTP (start it with `ADMIN_EMAIL=check-admin@example.invalid`), from `WMP_CHECK_ADMIN_EMAIL/PASSWORD`
+and `WMP_CHECK_USER_EMAIL/PASSWORD` (optional `WMP_CHECK_ADMIN_TOTP` / `WMP_CHECK_USER_TOTP`), or
+from `--accounts <file>`: `version: 1`, `accounts.user` and `accounts.admin`, each with `email`,
+`password` and an optional `totp: { secret }` (Better Auth's raw UTF-8 secret, not the base32 one
+in the authenticator URI). Never commit that file. Form sign-in waits for hydration and polls short
+page evaluations from Node (a navigation means look again); the TOTP step is polled the same way;
+passwords and codes travel through stdin and are redacted from failures. A missing precondition
+(credentials file, fixture, a ready marker that never appears) is a one-line failure with the next
+step, never a stack trace or a file excerpt. Every browser session is named
+`<BROWSER_CHECK_SESSION_PREFIX><check>-<pid>`, so concurrent checkouts never share one. WMP has
+no public footer, so the template's long-page footer rule in the shell-loading check does not
+apply.

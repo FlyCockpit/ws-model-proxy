@@ -161,3 +161,57 @@ describe("passwordResetOptions", () => {
     error.mockRestore();
   });
 });
+
+describe("password reset verifies an admin invite", () => {
+  async function spend({ invited }: { invited: boolean }) {
+    const { default: prisma } = await import("@ws-model-proxy/db");
+    const calls: string[] = [];
+    const tx = {
+      $queryRaw: vi.fn(async (strings: TemplateStringsArray, held: string[], wait: boolean) => {
+        calls.push(`lock ${strings.join("?").trim()} ${JSON.stringify(held)} ${wait}`);
+        return [{ acquired: true }];
+      }),
+      user: {
+        updateMany: vi.fn(async (args: unknown) => {
+          calls.push(`verify ${JSON.stringify(args)}`);
+          return { count: 1 };
+        }),
+      },
+      verification: {
+        findFirst: vi.fn(async (args: unknown) => {
+          calls.push(`mark? ${JSON.stringify(args)}`);
+          return invited ? { id: "mark" } : null;
+        }),
+        deleteMany: vi.fn(async (args: unknown) => {
+          calls.push(`delete ${JSON.stringify(args)}`);
+          return { count: 1 };
+        }),
+      },
+    };
+    const transaction = vi.fn(async (operation: (client: typeof tx) => unknown) => operation(tx));
+    Object.assign(prisma, { $transaction: transaction });
+    await passwordResetOptions(true, undefined).onPasswordReset({
+      user: { id: "u1", email: "invitee@example.test" },
+    });
+    expect(transaction).toHaveBeenCalledTimes(1);
+    return calls;
+  }
+  const lock = 'lock SELECT wsmp_acquire_fences(?::text[], ?) AS acquired ["00:owner:u1"] true';
+  const mark = `mark? ${JSON.stringify({ where: { identifier: "admin-invited:u1" }, select: { id: true } })}`;
+  const deleteLinks = `delete ${JSON.stringify({ where: { value: "u1", identifier: { startsWith: "reset-password:" } } })}`;
+
+  it("verifies an invited account and deletes every other reset link, under the owner fence", async () => {
+    // The same per-user lock the invite link writer takes (packages/api set-password-link.ts),
+    // first: a resend racing this reset either sees the account verified, or its link is deleted.
+    expect(await spend({ invited: true })).toEqual([
+      lock,
+      mark,
+      `verify ${JSON.stringify({ where: { id: "u1", email: "invitee@example.test" }, data: { emailVerified: true } })}`,
+      deleteLinks,
+    ]);
+  });
+
+  it("leaves a public sign-up's verification to verify-email (which also proves the mailbox)", async () => {
+    expect(await spend({ invited: false })).toEqual([lock, mark, deleteLinks]);
+  });
+});

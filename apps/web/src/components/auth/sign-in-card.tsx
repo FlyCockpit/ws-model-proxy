@@ -215,7 +215,7 @@ function SignInHeader({ mode, mcpDescription }: { mode: SignInMode; mcpDescripti
   return (
     <CardHeader className="text-center">
       <CardTitle className="text-2xl">
-        {mode === "mcp" ? t("auth:mcpLogin.title") : t("auth:login.signinTitle")}
+        <h1>{mode === "mcp" ? t("auth:mcpLogin.title") : t("auth:login.signinTitle")}</h1>
       </CardTitle>
       {/* The MCP description interpolates the CANONICAL CLIENT NAME
           (untrusted operator-controlled text). The containment lives on
@@ -327,7 +327,9 @@ function TwoFactorCard({
     <div className={AUTH_SCREEN_CLASS}>
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{t("auth:twoFactor.title")}</CardTitle>
+          <CardTitle className="text-2xl">
+            <h1>{t("auth:twoFactor.title")}</h1>
+          </CardTitle>
           <CardDescription>
             {method === "email"
               ? t("auth:twoFactor.emailCodeDescription")

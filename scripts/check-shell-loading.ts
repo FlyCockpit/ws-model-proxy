@@ -4,10 +4,9 @@
  * first is already the app: the real header and bottom nav, in the stored
  * theme, with only the content area as a skeleton, and that nothing outside
  * the content moves until the page has loaded.
- * Rule: patterns/loading-and-errors.md § Route pending states
- * Usage: patterns/agent-ui-testing.md § Shell loading check
+ * Rule: docs/ui.md § Route pending states
+ * Usage: docs/ui.md § Shell loading check
  *
- *   pnpm check:shell-loading                  starts its own mock dev server
  *   pnpm check:shell-loading --url http://127.0.0.1:3001   uses a running one
  *   pnpm check:shell-loading --no-sandbox     Ubuntu 23.10+ (AppArmor) Chromium
  *
@@ -30,11 +29,11 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { type CheckRun, withBrowser } from "./browser-check-lib.ts";
-import { MOCK_SERVER, SHELL_PAGES, signIn } from "./browser-checks.config.ts";
+import { byRole, type CheckRun, sessionName, withBrowser } from "./browser-check-lib.ts";
+import { MOCK_SERVER, SHELL_PAGES, type ShellPage, signIn } from "./browser-checks.config.ts";
 
 // One session per run, so runs in other checkouts on this machine are untouched.
-const SESSION = `check-shell-loading-${process.pid}`;
+const SESSION = sessionName("check-shell-loading");
 const MAX_CLS = 0.05;
 
 type Box = [left: number, top: number, width: number, height: number];
@@ -255,7 +254,7 @@ async function throttle(run: CheckRun): Promise<() => void> {
  * Until the page's loaded-only marker is there and no skeleton is left in
  * `<main>` (60s at most), then one more second for late layout.
  */
-async function waitLoaded({ browser }: CheckRun, ready: string): Promise<void> {
+async function waitLoaded({ browser }: CheckRun, ready: string, needs?: string): Promise<void> {
   const loaded = `!!document.querySelector(${JSON.stringify(ready)}) && !document.querySelector('#main-content [data-slot="skeleton"], #main-content [data-route-skeleton]')`;
   const until = Date.now() + 60_000;
   while (Date.now() < until) {
@@ -265,7 +264,9 @@ async function waitLoaded({ browser }: CheckRun, ready: string): Promise<void> {
     }
     await new Promise((r) => setTimeout(r, 250));
   }
-  throw new Error(`still loading after 60s (waiting for ${ready} and no skeleton)`);
+  throw new Error(
+    `still loading after 60s (waiting for ${ready} and no skeleton)${needs ? `; this page needs ${needs}` : "; check that the account can load its data"}`,
+  );
 }
 
 const VIEWPORTS = [
@@ -273,30 +274,40 @@ const VIEWPORTS = [
   [390, 844],
 ] as const;
 
-async function measure(run: CheckRun): Promise<string[]> {
+/** Warm-up and throttled reload are both case preconditions. */
+async function reload(run: CheckRun, page: ShellPage): Promise<ShellRecording> {
   const { base, browser } = run;
+  await signIn(run, page.role);
+  await browser.run(["eval", "localStorage.setItem('vite-ui-theme', 'dark'); true"]);
+  await browser.run(["open", `${base}${page.path}`]);
+  try {
+    await browser.run(["wait", page.ready]);
+  } catch {
+    throw new Error(
+      `${page.ready} never appeared${page.needs ? `; this page needs ${page.needs}` : "; check that the account can load this page and its data"}`,
+    );
+  }
+  await signIn(run, page.role, { slow: true });
+  const release = await throttle(run);
+  try {
+    await browser.run(["open", `${base}${page.path}`]);
+    await waitLoaded(run, page.ready, page.needs);
+    return await browser.evalJson<ShellRecording>(READ);
+  } finally {
+    release();
+  }
+}
+
+export async function measure(run: CheckRun): Promise<string[]> {
+  const { browser } = run;
   const failures: string[] = [];
-  // Stored dark, OS light: the first frame must already follow the stored choice.
   await browser.run(["set", "media", "light"]);
-  for (const [w, h] of VIEWPORTS) {
-    await browser.run(["set", "viewport", String(w), String(h)]);
-    for (const page of SHELL_PAGES) {
+  for (const page of byRole(SHELL_PAGES)) {
+    for (const [w, h] of VIEWPORTS) {
       const label = `${page.name} ${w}×${h}`;
-      // Slow responses (2s per call) keep the auth check and the page's data
-      // pending long enough to be recorded.
-      await signIn(run, page.role);
-      await browser.run(["eval", "localStorage.setItem('vite-ui-theme', 'dark'); true"]);
-      // Warm the dev server's module graph, so the measured load is the app's,
-      // not Vite's first transform.
-      await browser.run(["open", `${base}${page.path}`]);
-      await browser.run(["wait", page.ready]);
-      await signIn(run, page.role, { slow: true });
-      await browser.run(["eval", "localStorage.setItem('vite-ui-theme', 'dark'); true"]);
-      const release = await throttle(run);
       try {
-        await browser.run(["open", `${base}${page.path}`]);
-        await waitLoaded(run, page.ready);
-        const recording = await browser.evalJson<ShellRecording>(READ);
+        await browser.run(["set", "viewport", String(w), String(h)]);
+        const recording = await reload(run, page);
         failures.push(...judgeShellLoading(label, recording, true));
         const firstPaint = recording.frames.find((frame) => frame.painted);
         console.log(
@@ -304,8 +315,6 @@ async function measure(run: CheckRun): Promise<string[]> {
         );
       } catch (error) {
         failures.push(`${label}: did not load: ${(error as Error).message.split("\n")[0]}`);
-      } finally {
-        release();
       }
     }
   }

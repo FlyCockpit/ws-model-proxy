@@ -4,7 +4,9 @@ import { useTranslation } from "react-i18next";
 
 import { AppNameLink } from "@/components/app-name-link";
 import { PageSkeleton } from "@/components/page-skeleton";
+import { useMountEffect } from "@/hooks/use-mount-effect";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
+import { markAppShellHydrated } from "@/lib/app-shell-hydration";
 
 /** `/$lang/<page>` pages a signed-out person sees: no app frame around them. */
 const PUBLIC_PAGES = new Set([
@@ -41,6 +43,9 @@ export function ShellSkeleton() {
   const segment = pathname.split("/")[1];
   const lang = isSupportedLocale(segment) ? segment : DEFAULT_LOCALE;
   const parts = shellPartsOf(pathname);
+  // The first effect of the hydrated (or client-rendered) skeleton: from here on a route guard
+  // may change the URL (lib/app-shell-hydration.ts).
+  useMountEffect(markAppShellHydrated);
   return (
     <>
       {/* The same landmarks as the loaded shell (root route): a skip link to <main>. */}
@@ -52,6 +57,9 @@ export function ShellSkeleton() {
       </a>
       <div
         data-shell-skeleton=""
+        // APP_SHELL_ATTRIBUTE: what a guard looks for to know a server-rendered shell may still be
+        // hydrating.
+        data-app-shell=""
         className="grid h-svh min-w-0 grid-cols-[minmax(0,1fr)] grid-rows-[auto_1fr_auto] pb-[calc(3.5rem_+_var(--safe-area-bottom))] md:grid-rows-[auto_1fr] md:pb-0"
         style={{
           paddingTop: "var(--safe-area-top)",
@@ -79,7 +87,7 @@ export function ShellSkeleton() {
             className="fixed right-0 bottom-0 left-0 z-50 border-t bg-background/80 md:hidden"
             style={{ paddingBottom: "var(--safe-area-bottom)" }}
           >
-            <div className="flex h-14 items-center justify-around">
+            <div className="flex h-(--bottom-nav-bar) items-center justify-around">
               {Array.from({ length: 5 }, (_, index) => (
                 <Skeleton key={index} className="h-9 w-12 rounded-md" />
               ))}

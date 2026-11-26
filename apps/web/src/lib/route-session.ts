@@ -1,3 +1,4 @@
+import { appShellHydrated } from "@/lib/app-shell-hydration";
 import { admitRouteIdentity } from "@/lib/document-identity";
 import type { RouteSessionResolution } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
@@ -8,12 +9,20 @@ import { getRouteSession } from "@/server/auth-session";
  * different identity than the one this document's cached data belongs to (a
  * switch made in another tab, or while this tab sat on a page whose watcher
  * had not seen it yet), the document is replaced and this never settles, so
- * nothing under the guard renders the previous identity's data. Every session
+ * nothing under the guard renders the previous identity's data. It also waits
+ * for the server-rendered shell skeleton to hydrate, so a guard's redirect
+ * never lands mid-hydration (React #418). Every session
  * guard uses this, never `getRouteSession()` alone (`pnpm
  * policy:web-conventions` G11).
  */
 export async function resolveRouteSession(): Promise<RouteSessionResolution> {
-  const resolution = await getRouteSession();
+  // Nothing a guard decides (redirect, not-found, error) may reach the router
+  // while the server-rendered shell is still hydrating
+  // (lib/app-shell-hydration.ts). The wait runs alongside the probe, and a
+  // failed probe (a transport error) also waits before it reaches the router.
+  const [probe] = await Promise.allSettled([getRouteSession(), appShellHydrated()]);
+  if (probe.status === "rejected") throw probe.reason;
+  const resolution = probe.value;
   await admitRouteIdentity(resolution);
   return resolution;
 }

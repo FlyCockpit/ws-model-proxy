@@ -41,12 +41,15 @@ function setup(url: string) {
   const resetRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: "/$lang/reset-password",
-    validateSearch: parseResetPasswordSearch,
+    validateSearch: (search) => ({
+      ...parseResetPasswordSearch(search),
+      invite: search.invite === "1" || search.invite === 1 ? (1 as const) : undefined,
+    }),
     // Same wiring as routes/$lang/reset-password.tsx.
     component: function Page() {
       const { lang } = resetRoute.useParams();
-      const { token, error } = resetRoute.useSearch();
-      return <ResetPasswordCard lang={lang} token={token} error={error} />;
+      const { token, error, invite } = resetRoute.useSearch();
+      return <ResetPasswordCard lang={lang} token={token} error={error} invite={invite === 1} />;
     },
   });
   const loginRoute = createRoute({
@@ -141,5 +144,29 @@ describe("ResetPasswordCard under the real router", () => {
     await user.click(screen.getByRole("button", { name: "auth:resetPassword.submit" }));
 
     expect(await screen.findByText("auth:resetPassword.invalidTitle")).toBeTruthy();
+  });
+});
+
+describe("reset and invite visible headings", () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+  it.each([
+    [`/en-US/reset-password?token=${TOKEN}`, "auth:resetPassword.title"],
+    ["/en-US/reset-password?error=INVALID_TOKEN", "auth:resetPassword.invalidTitle"],
+    ["/en-US/reset-password", "auth:resetPassword.invalidTitle"],
+    [`/es-MX/reset-password?invite=1&token=${TOKEN}`, "auth:setPassword.title"],
+    ["/es-MX/reset-password?invite=1&error=INVALID_TOKEN", "auth:setPassword.invalidTitle"],
+  ])("%s has exactly one real h1 equal to the visible title", async (url, title) => {
+    setup(url);
+    const heading = await screen.findByRole("heading", { level: 1, name: title });
+    expect(heading.tagName).toBe("H1");
+    expect(document.querySelectorAll("h1")).toHaveLength(1);
+    expect(document.querySelector('[role="heading"]')).toBeNull();
+    if (url.includes("invite=1")) {
+      await waitFor(() => expect(window.location.search).not.toContain("token="));
+      expect(heading.textContent).toBe(title);
+    }
   });
 });

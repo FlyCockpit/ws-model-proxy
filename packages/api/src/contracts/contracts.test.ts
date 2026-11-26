@@ -35,6 +35,7 @@ const INVENTORY = [
   "settings.onboarding.complete",
   "users.list",
   "users.invite",
+  "users.resendInvite",
   "users.setRole",
   "users.archive",
   "users.unarchive",

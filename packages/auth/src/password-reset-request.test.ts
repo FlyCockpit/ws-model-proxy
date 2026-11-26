@@ -5,9 +5,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const sendEmail = vi.hoisted(() => vi.fn(async (_mail: { to: string; html: string }) => {}));
 
 // The reset mail looks up the recipient's locale through the shared Prisma client.
-vi.mock("@ws-model-proxy/db", () => ({
-  default: { user: { findUnique: vi.fn(async () => ({ locale: "en-US" })) } },
-}));
+vi.mock("@ws-model-proxy/db", () => {
+  const user = {
+    findUnique: vi.fn(async () => ({ locale: "en-US" })),
+    updateMany: vi.fn(async () => ({ count: 1 })),
+  };
+  // onPasswordReset's transaction (lock, admin-invited check, delete other links): a no-op here.
+  const tx = {
+    $queryRaw: vi.fn(async () => [{ acquired: true }]),
+    user,
+    verification: {
+      findFirst: vi.fn(async () => null),
+      deleteMany: vi.fn(async () => ({ count: 0 })),
+    },
+  };
+  return {
+    default: {
+      user,
+      $transaction: vi.fn(async (operation: (client: typeof tx) => unknown) => operation(tx)),
+    },
+  };
+});
 vi.mock("@ws-model-proxy/mailer", () => ({
   sendEmail,
   renderResetPassword: (args: { url: string }) => ({ subject: "reset", html: args.url }),

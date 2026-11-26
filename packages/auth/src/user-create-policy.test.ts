@@ -152,7 +152,7 @@ describe("resolveUserCreatePolicy", () => {
         requestedRole: "user",
         contextPath: "/admin/create-user",
       }),
-    ).toEqual({ role: "admin", emailVerified: true });
+    ).toEqual({ role: "admin" });
   });
 
   it("rejects public, unknown, and missing paths when signup is disabled and users exist", () => {
@@ -225,7 +225,7 @@ describe("resolveUserCreatePolicy", () => {
         requestedRole: "user",
         contextPath: "/admin/create-user",
       }),
-    ).toEqual({ role: "user", emailVerified: true });
+    ).toEqual({ role: "user" });
   });
 
   it("preserves an admin-requested admin role", () => {
@@ -237,7 +237,7 @@ describe("resolveUserCreatePolicy", () => {
         requestedRole: "admin",
         contextPath: "/admin/create-user",
       }),
-    ).toEqual({ role: "admin", emailVerified: true });
+    ).toEqual({ role: "admin" });
   });
 
   it("defaults an admin create with no or empty role to user", () => {
@@ -250,23 +250,18 @@ describe("resolveUserCreatePolicy", () => {
 
     expect(resolveUserCreatePolicy({ ...base, requestedRole: undefined })).toEqual({
       role: "user",
-      emailVerified: true,
     });
     expect(resolveUserCreatePolicy({ ...base, requestedRole: "" })).toEqual({
       role: "user",
-      emailVerified: true,
     });
     expect(resolveUserCreatePolicy({ ...base, requestedRole: "   " })).toEqual({
       role: "user",
-      emailVerified: true,
     });
     expect(resolveUserCreatePolicy({ ...base, requestedRole: [] })).toEqual({
       role: "user",
-      emailVerified: true,
     });
     expect(resolveUserCreatePolicy({ ...base, requestedRole: ["", "  "] })).toEqual({
       role: "user",
-      emailVerified: true,
     });
   });
 
@@ -280,19 +275,16 @@ describe("resolveUserCreatePolicy", () => {
 
     expect(resolveUserCreatePolicy({ ...base, requestedRole: "admin,user" })).toEqual({
       role: "admin,user",
-      emailVerified: true,
     });
     expect(resolveUserCreatePolicy({ ...base, requestedRole: ["admin", "user"] })).toEqual({
       role: "admin,user",
-      emailVerified: true,
     });
     expect(resolveUserCreatePolicy({ ...base, requestedRole: [" admin ", "user"] })).toEqual({
       role: "admin,user",
-      emailVerified: true,
     });
   });
 
-  it("marks admin-created users verified even when SMTP is configured", () => {
+  it("keeps admin-created users unverified until the invite link is spent", () => {
     expect(
       resolveUserCreatePolicy({
         signupEnabled: false,
@@ -301,7 +293,7 @@ describe("resolveUserCreatePolicy", () => {
         requestedRole: "user",
         contextPath: "/admin/create-user",
       }),
-    ).toEqual({ role: "user", emailVerified: true });
+    ).toEqual({ role: "user" });
   });
 
   it("does not force emailVerified true for public create when SMTP is configured", () => {
@@ -428,6 +420,6 @@ describe("toUserCreatePolicyInput", () => {
           context: { path: "/admin/create-user" },
         }),
       ),
-    ).toEqual({ role: "admin", emailVerified: true });
+    ).toEqual({ role: "admin" });
   });
 });

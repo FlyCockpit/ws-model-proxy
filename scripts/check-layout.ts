@@ -10,9 +10,10 @@
  *   pnpm check:layout --url http://localhost:3001
  *   CHECK_LAYOUT_PASSWORD=… pnpm check:layout --url … --admin you@example.com
  *                                         also checks the signed-in 404 and
- *                                         an admin page (an admin without 2FA
- *                                         enrolled; the password comes from
+ *                                         an admin page (CHECK_LAYOUT_TOTP for 2FA;
+ *                                         the password comes from
  *                                         the environment only)
+ *   pnpm check:layout --url … --accounts <credentials.json>
  *   pnpm check:layout --url … --no-sandbox   Ubuntu 23.10+ (AppArmor) Chromium
  *
  * At 390×844, 1280×800, 1440×1600 and 390×300 (where every page scrolls), on
@@ -32,9 +33,17 @@
  * Classic (non-overlay) scrollbars are what expose a reserved gutter; headless
  * Chromium on Linux draws them, overlay scrollbars on macOS hide the defect.
  */
-import { execFileSync, spawn } from "node:child_process";
+import {
+  type CheckRun,
+  formSignIn,
+  sessionName,
+  stopped,
+  totpCode,
+  withBrowser,
+} from "./browser-check-lib.ts";
+import { seededAccounts } from "./browser-checks.config.ts";
 
-const SESSION = "check-layout";
+const SESSION = sessionName("check-layout");
 
 /** What the in-page probe reports. Pure data, so `judgeLayout` is testable. */
 export interface Probe {
@@ -110,6 +119,25 @@ export function judgeLayout(page: string, probe: Probe, expect: Expect): string[
   return bad;
 }
 
+/** Loading UI must clear before stable height reads count. */
+export const LOADING_MARKER = '[data-slot="skeleton"], [aria-busy="true"], [data-route-skeleton]';
+
+export const SETTLED = `(async () => {
+  const main = [...document.querySelectorAll("#main-content")].find((el) => el.checkVisibility());
+  if (!main) return JSON.stringify("settled");
+  let last = -1;
+  let still = 0;
+  let loading = false;
+  for (let i = 0; i < 80 && still < 5; i++) {
+    const height = main.scrollHeight;
+    loading = !!main.querySelector(${JSON.stringify(LOADING_MARKER)});
+    still = !loading && height === last ? still + 1 : 0;
+    last = loading ? -1 : height;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return JSON.stringify(still >= 5 ? "settled" : loading ? "loading" : "changing");
+})()`;
+
 // Runs in the page (agent-browser eval). Self-contained: no closures.
 const PROBE = `(async () => {
   const html = document.documentElement;
@@ -147,56 +175,6 @@ const PROBE = `(async () => {
   }
   return JSON.stringify(out);
 })()`;
-
-/**
- * One agent-browser command. Asynchronous, so a signal (Ctrl+C, a kill) is
- * handled between commands instead of after the whole run.
- */
-function browser(args: string[], input?: string): Promise<string> {
-  return new Promise((done, fail) => {
-    const child = spawn("agent-browser", ["--session", SESSION, ...args], {
-      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-    });
-    let out = "";
-    let err = "";
-    child.stdout?.setEncoding("utf8").on("data", (chunk: string) => {
-      out += chunk;
-    });
-    child.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
-      err += chunk;
-    });
-    child.on("error", fail);
-    child.on("close", (code) =>
-      code === 0
-        ? done(out.trim())
-        : fail(new Error(`agent-browser ${args.join(" ")} exited ${code}: ${err.trim()}`)),
-    );
-    if (input !== undefined) child.stdin?.end(input);
-  });
-}
-
-function closeBrowser(): void {
-  try {
-    execFileSync("agent-browser", ["--session", SESSION, "close"], { stdio: "ignore" });
-  } catch {}
-}
-
-async function evalJson<T>(script: string): Promise<T> {
-  let value: unknown = JSON.parse(await browser(["eval", "--stdin"], script));
-  if (typeof value === "string") value = JSON.parse(value);
-  return value as T;
-}
-
-async function waitFor(url: string, ms: number): Promise<void> {
-  const until = Date.now() + ms;
-  while (Date.now() < until) {
-    try {
-      if ((await fetch(url)).ok) return;
-    } catch {}
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  throw new Error(`the dev server did not answer ${url} within ${ms / 1000}s`);
-}
 
 const THEME_KEY = "vite-ui-theme";
 
@@ -240,74 +218,51 @@ const VIEWPORTS = [
   [390, 300],
 ] as const;
 
-/** Signs in through the form; the session cookie then serves the admin pages. */
-async function signIn(base: string, email: string, password: string): Promise<void> {
-  // A roomy viewport, so nothing fixed (dev tools, the BottomNav) covers the button.
-  await browser(["set", "viewport", "1280", "800"]);
-  await browser(["open", `${base}/en-US/login`]);
-  await browser(["wait", "form button[type=submit]"]);
-  await browser(["fill", "input[type=email]", email]);
-  // Through stdin, never argv: the password must not show up in `ps` or in an
-  // error message naming the failed command. React reads the value from the
-  // input event, as it would from typing.
-  await browser(
-    ["eval", "--stdin"],
-    `(() => {
-      const input = document.querySelector("input[type=password]");
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(input, ${JSON.stringify(password)});
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      return true;
-    })()`,
-  );
-  await browser(["click", "form button[type=submit]"]);
-  await browser(["wait", "--fn", "!location.pathname.endsWith('/login')"]).catch(() => {
-    throw new Error(
-      `check:layout: signing in as ${email} did not leave the sign-in page (wrong password, or 2FA enrolled: use an admin without it)`,
-    );
-  });
-}
-
-async function main(): Promise<number> {
-  const args = process.argv.slice(2);
+export async function measure(run: CheckRun): Promise<string[]> {
+  const { base, args, browser: client } = run;
+  const browser = (args: string[], input?: string) => client.run(args, input);
+  const evalJson = <T>(script: string) => client.evalJson<T>(script);
   const option = (flag: string) => {
     const index = args.indexOf(flag);
     return index >= 0 ? args[index + 1] : undefined;
   };
-  const base = option("--url")?.replace(/\/$/, "");
-  const admin = option("--admin");
-  const password = process.env.CHECK_LAYOUT_PASSWORD;
-  if (!base || (admin && !password)) {
-    console.error(
-      "usage: [CHECK_LAYOUT_PASSWORD=…] pnpm check:layout --url <dev server> [--admin <email>] [--no-sandbox]",
-    );
-    return 2;
-  }
-  const onSignal = (signal: NodeJS.Signals) => {
-    closeBrowser();
-    process.exit(signal === "SIGINT" ? 130 : 143);
+  const accounts = args.includes("--accounts") ? seededAccounts(args) : undefined;
+  const admin = accounts?.admin.email ?? option("--admin");
+  const password = accounts?.admin.password ?? process.env.CHECK_LAYOUT_PASSWORD;
+  const secret = accounts ? accounts.admin.totp?.secret : process.env.CHECK_LAYOUT_TOTP;
+  const signIn = async () => {
+    if (!admin || !password) throw new Error("--admin requires CHECK_LAYOUT_PASSWORD");
+    await browser(["cookies", "clear"]);
+    await browser(["set", "viewport", "1280", "800"]);
+    await formSignIn(run, {
+      email: admin,
+      password,
+      totp: secret ? () => totpCode(secret) : undefined,
+    });
   };
-  process.once("SIGINT", onSignal);
-  process.once("SIGTERM", onSignal);
+  if (admin && !password) throw new Error("--admin requires CHECK_LAYOUT_PASSWORD");
   const failures: string[] = [];
   try {
-    await waitFor(`${base}/en-US/login`, 120_000);
-    await browser([
-      "open",
-      "about:blank",
-      ...(args.includes("--no-sandbox") ? ["--args", "--no-sandbox"] : []),
-    ]);
+    await browser(["cookies", "clear"]);
     if (!admin) console.log("check:layout: no --admin, so the signed-in pages are skipped");
     // Signed out first (the sign-in page sends a signed-in visitor on), then
     // the signed-in pages with one sign-in.
     for (const signedIn of [false, true]) {
       if (signedIn && !(admin && password)) continue;
-      if (signedIn && admin && password) await signIn(base, admin, password);
+      if (signedIn && admin && password) await signIn();
       for (const [w, h] of VIEWPORTS) {
         await browser(["set", "viewport", String(w), String(h)]);
         for (const page of PAGES.filter((page) => page.admin === signedIn)) {
           await browser(["open", `${base}${page.path}`]);
           await browser(["wait", page.ready]);
           const label = `${page.name} ${w}×${h}`;
+          const settled = await evalJson<string>(SETTLED);
+          if (settled !== "settled") {
+            failures.push(
+              `${label}: ${settled === "loading" ? "still showing a loading skeleton after 8s; check that its data loads" : "content kept changing for 8s"}`,
+            );
+            continue;
+          }
           const probe = await evalJson<Probe>(PROBE);
           failures.push(...judgeLayout(label, probe, page.expect));
           console.log(
@@ -338,7 +293,7 @@ async function main(): Promise<number> {
     // An action toast: with every oRPC call aborted, the admin users query fails and the app's
     // query cache shows its error toast with Retry. Its label is measured at rest and hovered.
     if (admin && password) {
-      await signIn(base, admin, password);
+      await signIn();
       for (const theme of ["light", "dark"] as const) {
         await browser(["set", "media", theme === "dark" ? "light" : "dark"]);
         await browser(["eval", `localStorage.setItem('${THEME_KEY}', '${theme}'); true`]);
@@ -362,16 +317,11 @@ async function main(): Promise<number> {
         console.log(`check:layout: action toast ${theme} measured`);
       }
     } else console.log("check:layout: no --admin, so the action toast is skipped");
-  } finally {
-    closeBrowser();
-    process.off("SIGINT", onSignal);
-    process.off("SIGTERM", onSignal);
+  } catch (error) {
+    failures.push(stopped(error));
   }
-  for (const failure of failures) console.error(`check:layout: ${failure}`);
-  console.log(
-    failures.length ? `check:layout: ${failures.length} failure(s)` : "check:layout: passed",
-  );
-  return failures.length ? 1 : 0;
+  return failures;
 }
 
-if (import.meta.filename === process.argv[1]) process.exitCode = await main();
+if (import.meta.filename === process.argv[1])
+  process.exitCode = await withBrowser("check:layout", SESSION, measure, { mockServer: false });

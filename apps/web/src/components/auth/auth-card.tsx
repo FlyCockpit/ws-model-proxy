@@ -29,7 +29,9 @@ export function AuthCard({
     <div className={AUTH_SCREEN_CLASS}>
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{title}</CardTitle>
+          <CardTitle className="text-2xl">
+            <h1>{title}</h1>
+          </CardTitle>
           <CardDescription>{description}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">{children}</CardContent>

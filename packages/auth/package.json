@@ -65,6 +65,12 @@
     },
     "./password-reset-request": {
       "default": "./src/password-reset-request.ts"
+    },
+    "./admin-invite-locale": {
+      "default": "./src/admin-invite-locale.ts"
+    },
+    "./credential-setup-lock": {
+      "default": "./src/credential-setup-lock.ts"
     }
   },
   "scripts": {

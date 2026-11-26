@@ -19,7 +19,8 @@
     "saveChanges": "Guardar cambios",
     "saving": "Guardando…",
     "tryAgain": "Intentar de nuevo",
-    "viewAll": "Ver todo"
+    "viewAll": "Ver todo",
+    "undo": "Deshacer"
   },
   "switchState": {
     "on": "Activado",
@@ -30,5 +31,9 @@
   "welcome": "Bienvenido",
   "fileDrop": {
     "ignored": "Suelta los archivos en un área de carga compatible."
+  },
+  "locale": {
+    "en-US": "English (US)",
+    "es-MX": "Español (México)"
   }
 }

@@ -19,7 +19,8 @@
     "saveChanges": "Save changes",
     "saving": "Saving…",
     "tryAgain": "Try again",
-    "viewAll": "View all"
+    "viewAll": "View all",
+    "undo": "Undo"
   },
   "switchState": {
     "on": "On",
@@ -30,5 +31,9 @@
   "welcome": "Welcome",
   "fileDrop": {
     "ignored": "Drop files on a supported upload area."
+  },
+  "locale": {
+    "en-US": "English (US)",
+    "es-MX": "Español (México)"
   }
 }

@@ -63,6 +63,18 @@ describe("account slug through Better Auth", () => {
     });
   });
 
+  // Reset and invite links carry only the user id, and spending one verifies the account's
+  // current address: a link mailed to the old address must never verify a new one.
+  it("refuses an e-mail change in any update", async () => {
+    if (!updateBefore) throw new Error("user update before hook missing");
+    await expect(updateBefore({ email: "new@example.test" })).rejects.toMatchObject({
+      body: { code: "EMAIL_CHANGE_UNSUPPORTED" },
+    });
+    await expect(updateBefore({ name: "New", email: "new@example.test" })).rejects.toMatchObject({
+      body: { code: "EMAIL_CHANGE_UNSUPPORTED" },
+    });
+  });
+
   it("lets every other update through", async () => {
     if (!updateBefore) throw new Error("user update before hook missing");
     await expect(updateBefore({ name: "New", emailVerified: true })).resolves.toBeUndefined();

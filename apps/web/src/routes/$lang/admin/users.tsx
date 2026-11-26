@@ -2,6 +2,11 @@ import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { hasRole } from "@ws-model-proxy/auth/roles";
+import {
+  DEFAULT_LOCALE,
+  isSupportedLocale,
+  SUPPORTED_LOCALES,
+} from "@ws-model-proxy/config/locales";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -31,6 +36,7 @@ import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { LabelledSelect } from "@/components/labelled-select";
 import { SegmentedControl } from "@/components/segmented-control";
+import { announceArchivedWithUndo } from "@/hooks/archive-undo";
 import { useClientDateText } from "@/hooks/use-client-date-text";
 import { useCopyFeedback } from "@/hooks/use-copy-feedback";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
@@ -46,6 +52,7 @@ type UserRow = {
   name: string;
   role: string;
   emailVerified: boolean;
+  invitePending: boolean;
   banned: boolean | null;
   banReason: string | null;
   deletionRequestedAt: Date | string | null;
@@ -57,6 +64,7 @@ function buildInviteSchema(t: TFunction<"admin">) {
     email: z.string().email(t("users.inviteEmailRequired")),
     name: z.string().trim().min(1, t("users.inviteNameRequired")).max(100),
     role: z.enum(["user", "admin"]),
+    locale: z.enum(SUPPORTED_LOCALES),
   });
 }
 
@@ -74,12 +82,11 @@ function AdminUsers() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [search, setSearch] = useState("");
   const [inviteOpen, setInviteOpen] = useState(false);
-  /** Focus returns here when the invite flow (invite, then the temporary password) closes. */
+  /** Focus returns here when the invite flow (invite, then the invite link) closes. */
   const inviteButtonRef = useRef<HTMLButtonElement | null>(null);
   const [reveal, setReveal] = useState<{
     email: string;
-    tempPassword: string;
-    emailSent: boolean;
+    setPasswordUrl: string;
   } | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const debouncedSearch = useDebouncedValue(search.trim(), 300);
@@ -106,10 +113,14 @@ function AdminUsers() {
 
   const archive = useMutation({
     ...orpc.users.archive.mutationOptions({
-      onSuccess: () => {
+      onSuccess: (_data, input) => {
         queryClient.invalidateQueries({ queryKey: orpc.users.key() });
         trigger("success");
-        toast.success(t("admin:users.userArchived"));
+        announceArchivedWithUndo({
+          message: t("admin:users.userArchived"),
+          undoLabel: t("common:actions.undo"),
+          onUndo: () => unarchive.mutate({ userId: input.userId }),
+        });
       },
       onError: () => {
         trigger("error");
@@ -130,6 +141,27 @@ function AdminUsers() {
       },
     }),
     meta: { errorFallbackKey: "admin:users.restoreFailed", deletionEntity: "user" },
+  });
+
+  const resendInvite = useMutation({
+    ...orpc.users.resendInvite.mutationOptions({
+      onSuccess: (result, input) => {
+        queryClient.invalidateQueries({ queryKey: orpc.users.key() });
+        if (result.emailSent) toast.success(t("admin:users.inviteSent"));
+        else
+          setReveal({
+            email: list.data?.users.find((user) => user.id === input.userId)?.email ?? "",
+            setPasswordUrl: result.setPasswordUrl,
+          });
+      },
+      onError: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.users.key() });
+      },
+    }),
+    meta: {
+      errorFallbackKey: "admin:users.resendFailed",
+      errorCodeKeys: { INVITE_NOT_PENDING: "admin:users.inviteNotPending" },
+    },
   });
 
   const remove = useMutation({
@@ -234,6 +266,7 @@ function AdminUsers() {
               trigger("light");
               unarchive.mutate({ userId: user.id });
             }}
+            onResendInvite={(user) => resendInvite.mutate({ userId: user.id })}
             onDelete={(user) => {
               trigger("warning");
               setDeleteId(user.id);
@@ -249,6 +282,7 @@ function AdminUsers() {
         onInvited={(payload) => {
           setInviteOpen(false);
           setReveal(payload);
+          if (!payload) toast.success(t("admin:users.inviteSent"));
           queryClient.invalidateQueries({ queryKey: orpc.users.key() });
         }}
       />
@@ -302,6 +336,7 @@ type UserRowHandlers = {
   onArchive: (user: UserRow) => void;
   onUnarchive: (user: UserRow) => void;
   onDelete: (user: UserRow) => void;
+  onResendInvite: (user: UserRow) => void;
 };
 
 function UsersListContent({
@@ -372,6 +407,7 @@ function UserListItem({
   onSetRole,
   onArchive,
   onUnarchive,
+  onResendInvite,
   onDelete,
 }: { user: UserRow; isSelf: boolean } & UserRowHandlers) {
   const { t } = useTranslation(["admin", "common"]);
@@ -408,6 +444,7 @@ function UserListItem({
         onSetRole={(role) => onSetRole(user, role)}
         onArchive={() => onArchive(user)}
         onUnarchive={() => onUnarchive(user)}
+        onResendInvite={() => onResendInvite(user)}
         onDelete={() => onDelete(user)}
       />
     </li>
@@ -422,6 +459,7 @@ function UserActions({
   onSetRole,
   onArchive,
   onUnarchive,
+  onResendInvite,
   onDelete,
 }: {
   user: UserRow;
@@ -432,6 +470,7 @@ function UserActions({
   onArchive: () => void;
   onUnarchive: () => void;
   onDelete: () => void;
+  onResendInvite: () => void;
 }) {
   const { t } = useTranslation("admin");
   return (
@@ -459,6 +498,9 @@ function UserActions({
             <Shield className="size-4" />
             {t("users.promoteToAdmin")}
           </DropdownMenuItem>
+        )}
+        {user.invitePending && !isArchived && !user.deletionRequestedAt && (
+          <DropdownMenuItem onClick={onResendInvite}>{t("users.resendInvite")}</DropdownMenuItem>
         )}
         {isArchived ? (
           <DropdownMenuItem onClick={onUnarchive}>
@@ -557,23 +599,48 @@ function InviteUserDialog({
 }: {
   open: boolean;
   onOpenChange: (next: boolean) => void;
-  onInvited: (reveal: { email: string; tempPassword: string; emailSent: boolean }) => void;
+  onInvited: (reveal: { email: string; setPasswordUrl: string } | null) => void;
   returnFocus: RefObject<HTMLElement | null>;
 }) {
   const { t } = useTranslation(["admin", "common"]);
   const tAdmin = useNamespaceT("admin");
-  const invite = useMutation(orpc.users.invite.mutationOptions());
+  const { i18n } = useTranslation();
+  const queryClient = useQueryClient();
+  const invite = useMutation({
+    ...orpc.users.invite.mutationOptions({
+      // A failed invite may still have created the account (INVITE_INCOMPLETE): show it.
+      onError: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.users.key() });
+      },
+    }),
+    meta: {
+      errorFallbackKey: "admin:users.inviteFailed",
+      errorCodeKeys: {
+        INVITE_INCOMPLETE: "admin:users.inviteIncomplete",
+        INVITE_NOT_PENDING: "admin:users.inviteNotPending",
+      },
+    },
+  });
 
   const form = useForm({
-    defaultValues: { email: "", name: "", role: "user" as "user" | "admin" },
+    defaultValues: {
+      email: "",
+      name: "",
+      role: "user" as "user" | "admin",
+      locale: isSupportedLocale(i18n.language) ? i18n.language : DEFAULT_LOCALE,
+    },
     validators: { onChange: buildInviteSchema(tAdmin) },
     onSubmit: async ({ value }) => {
-      const result = await invite.mutateAsync(value);
-      onInvited({
-        email: value.email,
-        tempPassword: result.tempPassword,
-        emailSent: result.emailSent,
-      });
+      let result: Awaited<ReturnType<typeof invite.mutateAsync>>;
+      try {
+        result = await invite.mutateAsync(value);
+      } catch {
+        // The mutation cache's error toast says what failed; the dialog stays open.
+        return;
+      }
+      onInvited(
+        result.emailSent ? null : { email: value.email, setPasswordUrl: result.setPasswordUrl },
+      );
       form.reset();
     },
   });
@@ -671,6 +738,24 @@ function InviteUserDialog({
           )}
         </form.Field>
 
+        <form.Field name="locale">
+          {(field) => (
+            <div className="space-y-1.5">
+              <Label htmlFor={field.name}>{t("admin:users.localeLabel")}</Label>
+              <LabelledSelect
+                id={field.name}
+                value={field.state.value}
+                onValueChange={field.handleChange}
+                options={SUPPORTED_LOCALES.map((locale) => ({
+                  value: locale,
+                  label: t(`common:locale.${locale}`),
+                }))}
+              />
+              <p className="text-xs text-muted-foreground">{t("admin:users.localeDescription")}</p>
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
         <form.Field name="role">
           {(field) => (
             <div className="space-y-1.5">
@@ -712,7 +797,7 @@ function RevealInviteDialog({
   onClose,
   returnFocus,
 }: {
-  reveal: { email: string; tempPassword: string; emailSent: boolean } | null;
+  reveal: { email: string; setPasswordUrl: string } | null;
   onClose: () => void;
   returnFocus: RefObject<HTMLElement | null>;
 }) {
@@ -720,7 +805,7 @@ function RevealInviteDialog({
   const { t } = useTranslation(["admin", "common", "errors"]);
   const onCopy = async () => {
     if (!reveal) return;
-    if (await copy(reveal.tempPassword)) toast.success(t("admin:users.passwordCopied"));
+    if (await copy(reveal.setPasswordUrl)) toast.success(t("admin:users.linkCopied"));
     else toast.error(t("errors:couldNotCopy"));
   };
   return (
@@ -731,22 +816,18 @@ function RevealInviteDialog({
         if (!next) onClose();
       }}
       title={t("admin:users.revealTitle")}
-      description={
-        reveal?.emailSent
-          ? t("admin:users.revealEmailedDescription", { email: reveal.email })
-          : t("admin:users.revealNotEmailedDescription", { email: reveal?.email ?? "" })
-      }
+      description={t("admin:users.revealNotEmailedDescription", { email: reveal?.email ?? "" })}
       footer={
         <Button onClick={onClose} className="min-h-[44px]">
-          {t("admin:users.savedPassword")}
+          {t("admin:users.savedLink")}
         </Button>
       }
     >
       <div className="space-y-1.5 pb-2">
-        <Label>{t("admin:users.tempPasswordLabel")}</Label>
+        <Label>{t("admin:users.setPasswordLinkLabel")}</Label>
         <div className="flex items-center gap-2">
           <code className="flex-1 truncate rounded-md border bg-muted px-2 py-1 font-mono text-sm">
-            {reveal?.tempPassword}
+            {reveal?.setPasswordUrl}
           </code>
           <Button
             type="button"
@@ -754,7 +835,7 @@ function RevealInviteDialog({
             size="icon-sm"
             className="min-h-[44px] min-w-[44px]"
             onClick={onCopy}
-            aria-label={t("admin:users.copyTempPasswordAriaLabel")}
+            aria-label={t("admin:users.copyInviteLinkAriaLabel")}
           >
             <Copy className="size-4" />{" "}
             <span className="sr-only">
@@ -762,7 +843,7 @@ function RevealInviteDialog({
             </span>
           </Button>
         </div>
-        <p className="text-xs text-muted-foreground">{t("admin:users.tempPasswordHint")}</p>
+        <p className="text-xs text-muted-foreground">{t("admin:users.inviteLinkHint")}</p>
       </div>
     </ResponsiveDialog>
   );

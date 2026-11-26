@@ -1,0 +1,15 @@
+{
+  "extends": "../packages/config/tsconfig.base.json",
+  "compilerOptions": { "noEmit": true },
+  "include": [
+    "browser-check-lib.ts",
+    "browser-checks.config.ts",
+    "browser-checks.config.test.ts",
+    "check-dialogs.ts",
+    "check-dialogs.test.ts",
+    "check-layout.ts",
+    "check-layout.test.ts",
+    "check-shell-loading.ts",
+    "check-shell-loading.test.ts"
+  ]
+}

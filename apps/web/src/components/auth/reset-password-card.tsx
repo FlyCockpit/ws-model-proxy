@@ -36,10 +36,12 @@ export function ResetPasswordCard({
   lang,
   token: searchToken,
   error,
+  invite = false,
 }: {
   lang: string;
   token: string | undefined;
   error: string | undefined;
+  invite?: boolean;
 }) {
   const { t } = useTranslation(["auth"]);
   // A snapshot on purpose: the route's token disappears once the address bar is cleaned.
@@ -63,8 +65,12 @@ export function ResetPasswordCard({
     return (
       <div ref={stripTokenRef} className="contents">
         <AuthCard
-          title={t("auth:resetPassword.invalidTitle")}
-          description={t("auth:resetPassword.invalidDescription")}
+          title={t(invite ? "auth:setPassword.invalidTitle" : "auth:resetPassword.invalidTitle")}
+          description={t(
+            invite
+              ? "auth:setPassword.invalidDescription"
+              : "auth:resetPassword.invalidDescription",
+          )}
         >
           <Link
             to="/$lang/forgot-password"
@@ -82,8 +88,8 @@ export function ResetPasswordCard({
   return (
     <div ref={stripTokenRef} className="contents">
       <AuthCard
-        title={t("auth:resetPassword.title")}
-        description={t("auth:resetPassword.description")}
+        title={t(invite ? "auth:setPassword.title" : "auth:resetPassword.title")}
+        description={t(invite ? "auth:setPassword.description" : "auth:resetPassword.description")}
       >
         <ResetPasswordForm
           lang={lang}

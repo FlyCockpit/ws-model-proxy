@@ -1,5 +1,6 @@
 /**
- * Renders the admin-invitation message.
+ * Renders the admin-invitation message: a one-time "set your password" link.
+ * The email never carries a password — the invitee chooses their own.
  *
  * Layout (table-based inline-CSS HTML) is identical across locales — only the
  * visible strings come from the JSON bundles. The `{{name}}` placeholder in
@@ -16,8 +17,8 @@ interface InviteUserBundle {
   heading: string;
   body: string; // contains {{name}} placeholder
   emailLabel: string;
-  tempPasswordLabel: string;
   cta: string;
+  expiryNote: string; // contains {{days}} placeholder
   ignoreFooter: string;
 }
 
@@ -46,10 +47,10 @@ export interface RenderInviteUserArgs {
   name: string;
   /** Email address. HTML-escaped before insertion into the body. */
   email: string;
-  /** Generated password. HTML-escaped before insertion. */
-  tempPassword: string;
-  /** Absolute URL the recipient should follow to sign in. */
-  signInUrl: string;
+  /** Absolute one-time URL where the recipient chooses their password. */
+  setPasswordUrl: string;
+  /** Whole days until the link expires, shown in the expiry note. */
+  expiresInDays: number;
   /** BCP-47 locale tag. Falls back to en-US if unsupported. */
   locale: string;
 }
@@ -68,15 +69,17 @@ export function renderInviteUser(args: RenderInviteUserArgs): RenderInviteUserRe
   const heading = fallbackString(bundle.heading, en.heading);
   const bodyTemplate = fallbackString(bundle.body, en.body);
   const emailLabel = fallbackString(bundle.emailLabel, en.emailLabel);
-  const tempPasswordLabel = fallbackString(bundle.tempPasswordLabel, en.tempPasswordLabel);
   const cta = fallbackString(bundle.cta, en.cta);
+  const expiryTemplate = fallbackString(bundle.expiryNote, en.expiryNote);
   const ignoreFooter = fallbackString(bundle.ignoreFooter, en.ignoreFooter);
 
   const safeName = escapeHtml(args.name);
   const safeEmail = escapeHtml(args.email);
-  const safePassword = escapeHtml(args.tempPassword);
-  const href = safeHref(args.signInUrl);
+  const href = safeHref(args.setPasswordUrl);
   const greeting = interpolate(bodyTemplate, { name: safeName });
+  const expiryNote = interpolate(expiryTemplate, {
+    days: escapeHtml(String(Math.max(1, Math.floor(args.expiresInDays)))),
+  });
 
   const html = `<!DOCTYPE html>
 <html lang="${locale}">
@@ -91,13 +94,14 @@ export function renderInviteUser(args: RenderInviteUserArgs): RenderInviteUserRe
             ${greeting}
           </p>
           <p style="margin:0 0 8px;font-size:13px;color:#71717a">${emailLabel}</p>
-          <p style="margin:0 0 16px;font-size:15px;color:#18181b;font-family:ui-monospace,Menlo,Monaco,monospace">${safeEmail}</p>
-          <p style="margin:0 0 8px;font-size:13px;color:#71717a">${tempPasswordLabel}</p>
-          <p style="margin:0 0 24px;font-size:15px;color:#18181b;font-family:ui-monospace,Menlo,Monaco,monospace;word-break:break-all">${safePassword}</p>
-          <p style="margin:0 0 24px;text-align:center">
+          <p style="margin:0 0 24px;font-size:15px;color:#18181b;font-family:ui-monospace,Menlo,Monaco,monospace">${safeEmail}</p>
+          <p style="margin:0 0 16px;text-align:center">
             <a href="${href}" style="display:inline-block;padding:12px 32px;background:#18181b;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;border-radius:6px">
               ${cta}
             </a>
+          </p>
+          <p style="margin:0 0 16px;font-size:13px;color:#71717a;line-height:1.5">
+            ${expiryNote}
           </p>
           <p style="margin:0;font-size:13px;color:#a1a1aa;line-height:1.5">
             ${ignoreFooter}

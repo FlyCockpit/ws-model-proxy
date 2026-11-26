@@ -86,6 +86,12 @@ function contrast(a: Rgb, b: Rgb): number {
 }
 
 const AA = 4.5;
+const scopes = [":root", ".dark"] as const;
+const uiRoot = resolve(import.meta.dirname, "../../../../packages/ui/src");
+const ui = (file: string) => readFileSync(resolve(uiRoot, "components", `${file}.tsx`), "utf8");
+/** The form controls whose focus and invalid states the checks below cover. */
+const controls = ["input", "textarea", "select", "checkbox", "switch"];
+const toggleSource = readFileSync(resolve(uiRoot, "lib/toggle-variants.ts"), "utf8");
 
 const buttonSource = readFileSync(
   resolve(import.meta.dirname, "../../../../packages/ui/src/lib/button-variants.ts"),
@@ -244,6 +250,158 @@ describe("theme token contrast (WCAG AA)", () => {
     expect(offenders).toEqual([]);
   });
 
+  it.each(scopes)(
+    "%s field outlines (--input) reach 3:1 on every surface a field sits on",
+    (scope) => {
+      // WCAG 1.4.11 non-text contrast: the border is what shows where to type (inputs, selects,
+      // outline buttons, the Off switch track).
+      for (const surface of ["background", "card", "popover", "muted"]) {
+        expect(
+          contrast(token(scope, "input"), token(scope, surface)),
+          `${scope} input on ${surface}`,
+        ).toBeGreaterThanOrEqual(3);
+      }
+      // The dark field fill (bg-input/30) must keep placeholder text readable.
+      if (scope === ".dark") {
+        for (const surface of ["background", "card", "popover"]) {
+          const fill = over(token(scope, "input"), 0.3, token(scope, surface));
+          expect(
+            contrast(token(scope, "muted-foreground"), fill),
+            `${scope} placeholder on input fill over ${surface}`,
+          ).toBeGreaterThanOrEqual(AA);
+        }
+      }
+    },
+  );
+
+  it.each(scopes)(
+    "%s focus ring stands out from every surface and the resting outline",
+    (scope) => {
+      for (const ring of ["ring", "sidebar-ring"]) {
+        for (const surface of ["background", "card", "popover", "muted"]) {
+          expect(
+            contrast(token(scope, ring), token(scope, surface)),
+            `${scope} ${ring} on ${surface}`,
+          ).toBeGreaterThanOrEqual(3);
+        }
+        // WCAG 2.4.13 style: the focused border (border-ring) must differ from the resting --input
+        // outline, not only the 2px ring around it.
+        expect(
+          contrast(token(scope, ring), token(scope, "input")),
+          `${scope} ${ring} vs input`,
+        ).toBeGreaterThanOrEqual(2);
+      }
+      // The focused border also sits next to the field's own fill (dark bg-input/30).
+      if (scope === ".dark") {
+        for (const surface of ["background", "card", "popover"]) {
+          const fill = over(token(scope, "input"), 0.3, token(scope, surface));
+          expect(
+            contrast(token(scope, "ring"), fill),
+            `${scope} ring on input fill over ${surface}`,
+          ).toBeGreaterThanOrEqual(3);
+        }
+      }
+    },
+  );
+
+  it("keeps the ring a relative of the brand colour", () => {
+    // Derived from --primary's hue, not a foreign accent.
+    for (const scope of scopes) {
+      const hue = (name: string) =>
+        Number(
+          new RegExp(`--${name}:\\s*oklch\\([\\d.]+ [\\d.]+ ([\\d.]+)\\)`).exec(block(scope))?.[1],
+        );
+      expect(Math.abs(hue("ring") - hue("primary")), scope).toBeLessThanOrEqual(5);
+    }
+  });
+
+  it.each(scopes)("%s invalid borders reach 3:1 on the surface and the field fill", (scope) => {
+    // The border is opaque --destructive in both themes (no dark /50).
+    for (const surface of ["background", "card", "popover", "muted"]) {
+      const bg = token(scope, surface);
+      const fills = scope === ".dark" ? [bg, over(token(scope, "input"), 0.3, bg)] : [bg];
+      for (const fill of fills) {
+        expect(
+          contrast(token(scope, "destructive"), fill),
+          `${scope} destructive border over ${surface}`,
+        ).toBeGreaterThanOrEqual(3);
+      }
+    }
+  });
+
+  it("controls draw opaque focus rings and invalid borders; outline buttons use the field outline", () => {
+    for (const file of [...controls.map(ui), buttonSource, toggleSource]) {
+      expect(file).not.toMatch(
+        /border-destructive\/\d+|ring-ring\/\d+|focus-visible:ring-destructive\/\d+/,
+      );
+      if (file.includes("focus-visible:border-ring")) {
+        expect(file).toContain("focus-visible:ring-2 focus-visible:ring-ring");
+      }
+      // A focused invalid control: the invalid ring (translucent at rest, and its dark variant
+      // more specific than focus-visible:ring-ring) gives way to an opaque 2px destructive ring.
+      if (file.includes("aria-invalid:ring-")) {
+        for (const utility of [
+          "aria-invalid:focus-visible:ring-2",
+          "aria-invalid:focus-visible:ring-destructive",
+          "dark:aria-invalid:focus-visible:ring-destructive",
+        ]) {
+          expect(file).toMatch(new RegExp(`[\\s"]${utility.replace(/[:]/g, "\\:")}[\\s"]`));
+        }
+      }
+    }
+    // The outline button's border is its only edge (theme toggle, Sign In): --input (3:1) in
+    // both themes, never the decorative --border.
+    const outline = /outline:\s*"([^"]*)"/.exec(buttonSource)?.[1] ?? "";
+    expect(outline).toMatch(/(?:^|\s)border-input(?:\s|$)/);
+    expect(outline).not.toMatch(/border-border|dark:border-/);
+  });
+
+  it("an Off switch fills its track with the opaque --input, which the 3:1 checks cover", () => {
+    // A translucent track (dark:bg-input/80) composites below 3:1 on a dark card.
+    const switchSource = ui("switch");
+    expect(switchSource).toContain("data-unchecked:bg-input ");
+    expect(switchSource).not.toMatch(/data-unchecked:bg-input\/\d+/);
+    const translucent = over(token(".dark", "input"), 0.8, token(".dark", "card"));
+    expect(contrast(translucent, token(".dark", "card"))).toBeLessThan(3);
+  });
+
+  it("draws every menu and popup on an opaque popover surface", () => {
+    // A translucent popup (bg-popover/70 + blur) let the page show through the language picker
+    // and the menus. Every class string that paints a popover surface (text-popover-foreground)
+    // is checked, in every ui component, so a new menu, combobox or picker is covered too.
+    const surfaces: string[] = [];
+    const dir = resolve(uiRoot, "components");
+    for (const file of readdirSync(dir)) {
+      if (!file.endsWith(".tsx") || file.endsWith(".test.tsx")) continue;
+      const text = readFileSync(resolve(dir, file), "utf8");
+      for (const match of text.matchAll(/"([^"\n]*text-popover-foreground[^"\n]*)"/g)) {
+        const literal = match[1] ?? "";
+        surfaces.push(file);
+        expect(literal, file).toMatch(/(?:^|\s)bg-popover(?:\s|$)/);
+        expect(literal, file).not.toMatch(/bg-popover\/\d+|backdrop-/);
+      }
+      expect(text, file).not.toMatch(/bg-popover\/\d+/);
+    }
+    for (const file of ["dropdown-menu.tsx", "select.tsx", "popover.tsx"]) {
+      expect(surfaces, file).toContain(file);
+    }
+  });
+
+  it("measures the old focus, outline and invalid colours as failing, so the checks discriminate", () => {
+    // The old rings: 2.4:1 on white, and the dark one 1:1 against the new dark outline.
+    expect(contrast(oklchToSrgb(0.723, 0.014, 214.4), token(":root", "background"))).toBeLessThan(
+      3,
+    );
+    expect(contrast(oklchToSrgb(0.56, 0.021, 213.5), token(".dark", "input"))).toBeLessThan(2);
+    // The old light outline (1.25:1 on white).
+    expect(contrast(oklchToSrgb(0.925, 0.005, 214.3), token(":root", "background"))).toBeLessThan(
+      3,
+    );
+    // The old dark invalid border (destructive/50) on the field fill over a card.
+    const fill = over(token(".dark", "input"), 0.3, token(".dark", "card"));
+    expect(contrast(over(token(".dark", "destructive"), 0.5, fill), fill)).toBeLessThan(3);
+  });
+
   it("measures the old tokens as failing, so the check discriminates", () => {
     const oldLight = oklchToSrgb(0.577, 0.245, 27.325);
     expect(contrast(oldLight, token(":root", "muted"))).toBeLessThan(AA);
@@ -256,5 +414,36 @@ describe("theme token contrast (WCAG AA)", () => {
     // The old light warning and info inks (2.2:1 and 4.3:1 on white).
     expect(contrast(oklchToSrgb(0.75, 0.18, 85), token(":root", "popover"))).toBeLessThan(AA);
     expect(contrast(oklchToSrgb(0.58, 0.16, 250), token(":root", "popover"))).toBeLessThan(AA);
+  });
+});
+
+describe("toast placement and touch targets", () => {
+  it("bottom toasts sit above the phone bottom nav, and above the safe area without one", () => {
+    expect(declarations(':root [data-sileo-viewport][data-position^="bottom"]').get("bottom")).toBe(
+      "max(var(--bottom-nav-height), var(--safe-area-bottom))",
+    );
+    // 0 unless a bottom nav is on screen, which is only below md (48rem).
+    expect(css).toMatch(/--bottom-nav-bar: 3\.5rem;\s*--bottom-nav-height: 0px;/);
+    expect(css).toMatch(
+      /@media \(width < 48rem\) \{\s*:root:has\(\[data-bottom-nav\]\) \{\s*--bottom-nav-height: calc\(var\(--bottom-nav-bar\) \+ var\(--safe-area-bottom\)\);/,
+    );
+    // The nav (and the shell skeleton's copy of it) draws its bar at --bottom-nav-bar, hides from
+    // md and pads the safe area itself, so the offset is exactly the room it takes.
+    for (const file of ["bottom-nav.tsx", "shell-skeleton.tsx"]) {
+      const nav = readFileSync(resolve(import.meta.dirname, "../components", file), "utf8");
+      const start = nav.indexOf('data-bottom-nav=""');
+      expect(start, file).toBeGreaterThan(-1);
+      const element = nav.slice(start, nav.indexOf("justify-around", start));
+      expect(element, file).toContain("md:hidden");
+      expect(element, file).toContain('paddingBottom: "var(--safe-area-bottom)"');
+      expect(element, file).toContain("h-(--bottom-nav-bar)");
+    }
+  });
+
+  it("a toast's action button is at least 44px tall on a touch screen", () => {
+    // sileo draws it 1.75rem (28px) tall with a fixed `height`.
+    expect(css).toMatch(
+      /@media \(pointer: coarse\) \{\s*:root \[data-sileo-viewport\] \[data-sileo-button\] \{\s*height: auto;\s*min-height: 44px;/,
+    );
   });
 });

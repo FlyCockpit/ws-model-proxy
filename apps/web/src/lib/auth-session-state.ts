@@ -62,6 +62,13 @@ export type ClassifyAuthSessionInput = {
   isPending?: boolean;
   error?: unknown;
   isOffline?: boolean;
+  /**
+   * An earlier snapshot in this document already settled anonymous (see
+   * {@link rememberConfirmedAnonymous}). Better Auth marks every refetch of an empty session
+   * `isPending` again (each request sets `isPending: data === null`), so a refocus looks exactly
+   * like the first load; only this memory tells them apart.
+   */
+  confirmedAnonymous?: boolean;
   actions: AuthSessionActions;
 };
 
@@ -124,6 +131,17 @@ export function classifyAuthSession(input: ClassifyAuthSessionInput): AuthSessio
         meta: { ...baseMeta, isDegraded: isOffline },
       };
     }
+    // A visitor already confirmed anonymous stays anonymous while Better Auth revalidates
+    // (window focus, another tab's announcement). Only the first load waits: otherwise every
+    // refocus would unmount whatever the anonymous state renders (the sign-in form and its
+    // typed values) into its skeleton.
+    if (input.confirmedAnonymous === true) {
+      return {
+        state: { status: "anonymous", session: null },
+        actions: input.actions,
+        meta: { ...baseMeta, isRefetching: true },
+      };
+    }
     return {
       state: { status: "pending", session: null },
       actions: input.actions,
@@ -147,9 +165,30 @@ export function classifyAuthSession(input: ClassifyAuthSessionInput): AuthSessio
     };
   }
 
+  // A failed revalidation after the document settled anonymous keeps it anonymous, just as a
+  // confirmed session survives one above: the form stays, not an unable-to-connect card.
+  if (input.confirmedAnonymous === true) {
+    return {
+      state: { status: "anonymous", session: null },
+      actions: input.actions,
+      meta: { ...baseMeta, isDegraded: true },
+    };
+  }
+
   return {
     state: { status: "error", session: null, error: input.error },
     actions: input.actions,
     meta: { ...baseMeta, isDegraded: true },
   };
+}
+
+/**
+ * The memory {@link ClassifyAuthSessionInput.confirmedAnonymous} reads: true once a snapshot
+ * settled anonymous, false again once one is authenticated, and unchanged by pending and error
+ * snapshots.
+ */
+export function rememberConfirmedAnonymous(previous: boolean, state: AuthSessionState): boolean {
+  if (state.state.status === "anonymous") return true;
+  if (state.state.status === "authenticated") return false;
+  return previous;
 }

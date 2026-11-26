@@ -1,15 +1,14 @@
 /**
  * `pnpm check:dialogs`: opens every dialog listed in
- * `scripts/browser-checks.config.ts` (`DIALOGS`) in a real browser (mock mode) and fails
+ * `scripts/browser-checks.config.ts` (`DIALOGS`) in a real browser against a disposable stack and fails
  * when one does not fit: a dialog is for confirmations and short forms, and it
  * must show all of itself without inner scrolling at 1280×800 and 390×844.
- * Rule: patterns/design-system.md § Form surfaces
- * Usage: patterns/agent-ui-testing.md § Dialog fit check
+ * Rule: docs/ui.md § Form surfaces
+ * Usage: docs/ui.md § Dialog fit check
  *
- *   pnpm check:dialogs                    starts its own mock dev server
  *   pnpm check:dialogs --url http://127.0.0.1:3001   uses a running app
  *   pnpm check:dialogs --no-sandbox       Ubuntu 23.10+ (AppArmor) Chromium
- *   pnpm check:dialogs --only "Create project"       one dialog by name
+ *   pnpm check:dialogs --only "New pool"       one dialog by name
  *
  * For each dialog and viewport it fails when:
  * - the popup (`[data-slot=dialog-content]` / `alert-dialog-content`) or any
@@ -22,7 +21,7 @@
  * and leaves this list.
  */
 
-import { type CheckRun, withBrowser } from "./browser-check-lib.ts";
+import { byRole, type CheckRun, sessionName, withBrowser } from "./browser-check-lib.ts";
 import {
   DIALOGS,
   type DialogCase,
@@ -32,7 +31,7 @@ import {
 } from "./browser-checks.config.ts";
 
 // One session per run, so runs in other checkouts on this machine are untouched.
-const SESSION = `check-dialogs-${process.pid}`;
+const SESSION = sessionName("check-dialogs");
 export const DIALOG_VIEWPORTS = [
   [1280, 800],
   [390, 844],
@@ -131,9 +130,9 @@ async function openDialog(run: CheckRun, dialog: DialogCase): Promise<void> {
   await browser.run(["wait", "300"]);
 }
 
-async function measure(run: CheckRun): Promise<string[]> {
+export async function measure(run: CheckRun): Promise<string[]> {
   const only = run.args.includes("--only") ? run.args[run.args.indexOf("--only") + 1] : undefined;
-  const cases = DIALOGS.filter((dialog) => !only || dialog.name === only);
+  const cases = byRole(DIALOGS.filter((dialog) => !only || dialog.name === only));
   if (cases.length === 0) return [`no dialog named ${only} in browser-checks.config.ts`];
   const failures: string[] = [];
   for (const [w, h] of DIALOG_VIEWPORTS) {
@@ -145,7 +144,9 @@ async function measure(run: CheckRun): Promise<string[]> {
         failures.push(...judgeDialog(label, await run.browser.evalJson<DialogProbe>(PROBE)));
         console.log(`check:dialogs: ${label} measured`);
       } catch (error) {
-        failures.push(`${label}: could not open: ${(error as Error).message.split("\n")[0]}`);
+        failures.push(
+          `${label}: could not open: ${(error as Error).message.split("\n")[0]}${dialog.needs ? `; this dialog needs ${dialog.needs}` : ""}`,
+        );
       }
     }
   }

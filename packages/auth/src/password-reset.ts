@@ -1,6 +1,11 @@
 import { DEFAULT_LOCALE, isSupportedLocale } from "@ws-model-proxy/config/locales";
 import prisma from "@ws-model-proxy/db";
 import { renderResetPassword, sendEmail } from "@ws-model-proxy/mailer";
+import {
+  ADMIN_INVITED_PREFIX,
+  lockCredentialSetup,
+  RESET_PASSWORD_IDENTIFIER_PREFIX,
+} from "./credential-setup-lock";
 
 /** A reset link is good for one hour (and one use). The mail copy says so. */
 export const RESET_PASSWORD_TOKEN_EXPIRES_IN_SECONDS = 60 * 60;
@@ -128,9 +133,36 @@ export function passwordResetOptions(
   revokeSessionsOnPasswordReset: true;
   resetPasswordTokenExpiresIn: number;
   sendResetPassword?: SendResetPassword;
+  onPasswordReset: (data: { user: { id: string; email: string } }) => Promise<void>;
 } {
   const base = {
     revokeSessionsOnPasswordReset: true as const,
+    // Spending a reset link of an admin-invited account verifies its address
+    // (credential-setup-lock.ts ADMIN_INVITED_PREFIX: an invite starts unverified
+    // and its link is the only way in). Reset links carry no address, so Better
+    // Auth's update routes refuse an email change (index.ts
+    // `databaseHooks.user.update`). Never WMP's mailbox proof: only verify-email
+    // records that. Under the per-user credential-setup lock, every other reset
+    // link of the user is deleted, so an invite resend racing this reset never
+    // leaves a working link behind.
+    onPasswordReset: async ({ user }: { user: { id: string; email: string } }) => {
+      await prisma.$transaction(async (tx) => {
+        await lockCredentialSetup(tx, user.id);
+        const invited = await tx.verification.findFirst({
+          where: { identifier: `${ADMIN_INVITED_PREFIX}${user.id}` },
+          select: { id: true },
+        });
+        if (invited) {
+          await tx.user.updateMany({
+            where: { id: user.id, email: user.email },
+            data: { emailVerified: true },
+          });
+        }
+        await tx.verification.deleteMany({
+          where: { value: user.id, identifier: { startsWith: RESET_PASSWORD_IDENTIFIER_PREFIX } },
+        });
+      });
+    },
     resetPasswordTokenExpiresIn: RESET_PASSWORD_TOKEN_EXPIRES_IN_SECONDS,
   };
   if (!emailConfigured) return base;

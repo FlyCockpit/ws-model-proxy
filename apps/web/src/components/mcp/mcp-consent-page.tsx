@@ -239,7 +239,9 @@ function McpConsentReview({
     <div className="flex min-w-0 items-center justify-center px-4 py-10">
       <Card className="w-full min-w-0 max-w-md">
         <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{t("auth:mcpConsent.title")}</CardTitle>
+          <CardTitle className="text-2xl">
+            <h1>{t("auth:mcpConsent.title")}</h1>
+          </CardTitle>
           <CardDescription className="min-w-0 break-words">
             {t("auth:mcpConsent.description", { client: clientName })}
           </CardDescription>
@@ -344,7 +346,9 @@ function ConsentTerminalCard({ title, description }: { title: string; descriptio
     <div className="flex min-w-0 items-center justify-center px-4 py-10">
       <Card className="w-full min-w-0 max-w-md">
         <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{title}</CardTitle>
+          <CardTitle className="text-2xl">
+            <h1>{title}</h1>
+          </CardTitle>
           <CardDescription className="min-w-0 break-words">{description}</CardDescription>
         </CardHeader>
       </Card>

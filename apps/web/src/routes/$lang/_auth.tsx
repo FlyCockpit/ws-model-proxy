@@ -109,7 +109,9 @@ function TwoFactorSetupRequired() {
     <div className={AUTH_SCREEN_CLASS}>
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
-          <CardTitle className="text-2xl">{t("twoFactor.requiredTitle")}</CardTitle>
+          <CardTitle className="text-2xl">
+            <h1>{t("twoFactor.requiredTitle")}</h1>
+          </CardTitle>
           <CardDescription>{t("twoFactor.requiredDescription")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">

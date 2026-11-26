@@ -41,8 +41,14 @@
   --state-loading-foreground: var(--foreground);
   --state-loading-bg: color-mix(in oklch, var(--muted-foreground) 12%, transparent);
   --border: oklch(0.925 0.005 214.3);
-  --input: oklch(0.925 0.005 214.3);
-  --ring: oklch(0.723 0.014 214.4);
+  /* Field outlines (inputs, selects, outline buttons, the Off switch track) are
+     non-text UI: >= 3:1 on background, card, popover and muted (WCAG 1.4.11,
+     apps/web lib/theme-contrast.test.ts). --border stays decorative and light. */
+  --input: oklch(0.62 0.012 214.3);
+  /* Focus ring and focused border: a strong relative of --primary (same hue),
+     >= 3:1 on every surface and >= 2:1 against the resting --input outline, so a
+     focused control is clearly not the resting one (theme-contrast.test.ts). */
+  --ring: oklch(0.42 0.08 186.4);
   --grey-50: oklch(0.985 0.002 216);
   --grey-100: oklch(0.96 0.004 216);
   --grey-200: oklch(0.92 0.005 216);
@@ -93,7 +99,7 @@
   --sidebar-accent: oklch(0.963 0.002 197.1);
   --sidebar-accent-foreground: oklch(0.218 0.008 223.9);
   --sidebar-border: oklch(0.925 0.005 214.3);
-  --sidebar-ring: oklch(0.723 0.014 214.4);
+  --sidebar-ring: oklch(0.42 0.08 186.4);
 }
 
 .dark {
@@ -131,8 +137,8 @@
   --state-loading-foreground: var(--foreground);
   --state-loading-bg: color-mix(in oklch, var(--muted-foreground) 15%, transparent);
   --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.56 0.021 213.5);
+  --input: oklch(0.56 0.012 220);
+  --ring: oklch(0.78 0.12 182.5);
   --grey-50: oklch(0.25 0.004 216);
   --grey-100: oklch(0.3 0.006 216);
   --grey-200: oklch(0.35 0.008 216);
@@ -170,7 +176,7 @@
   --sidebar-accent: oklch(0.275 0.011 216.9);
   --sidebar-accent-foreground: oklch(0.987 0.002 197.1);
   --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.56 0.021 213.5);
+  --sidebar-ring: oklch(0.78 0.12 182.5);
 }
 
 @theme inline {
@@ -322,6 +328,17 @@
     --safe-area-bottom: env(safe-area-inset-bottom, 0px);
     --safe-area-left: env(safe-area-inset-left, 0px);
     --safe-area-right: env(safe-area-inset-right, 0px);
+    /* The phone bottom nav's bar (apps/web bottom-nav.tsx and the shell skeleton draw it at this
+       height) and the room it takes at the bottom of the screen: 0 while no bottom nav is on
+       screen (desktop, public pages, software keyboard open). Fixed bottom surfaces (toasts) sit
+       above it. */
+    --bottom-nav-bar: 3.5rem;
+    --bottom-nav-height: 0px;
+  }
+  @media (width < 48rem) {
+    :root:has([data-bottom-nav]) {
+      --bottom-nav-height: calc(var(--bottom-nav-bar) + var(--safe-area-bottom));
+    }
   }
 }
 
@@ -428,6 +445,20 @@
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* Toasts stay bottom-center on every screen, and on phones they sit above the bottom nav instead
+   of covering it (--bottom-nav-height), or above the home indicator where there is no nav. One
+   more attribute than sileo's `[data-sileo-viewport][data-position^="bottom"] { bottom: 0 }`. */
+:root [data-sileo-viewport][data-position^="bottom"] {
+  bottom: max(var(--bottom-nav-height), var(--safe-area-bottom));
+}
+/* sileo draws the action ("Undo", "Retry") 28px tall. On a touch screen it is at least 44px
+   (AGENTS.md: touch targets); the expanded body re-measures itself, so the taller button fits. */
+@media (pointer: coarse) {
+  :root [data-sileo-viewport] [data-sileo-button] {
+    height: auto;
+    min-height: 44px;
+  }
 }
 :root [data-sileo-viewport] [data-sileo-button][data-state] {
   --sileo-btn-color: var(--popover-foreground);

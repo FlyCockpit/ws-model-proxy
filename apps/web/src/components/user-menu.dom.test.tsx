@@ -71,7 +71,7 @@ describe("UserMenu", () => {
     for (const className of ["w-11", "px-0", "sm:w-auto", "sm:px-3.5", "h-11"])
       expect(signin.classList.contains(className)).toBe(true);
     // Outline variant; the touch size's px-3.5 gives way to px-0 below sm.
-    expect(signin.classList.contains("border-border")).toBe(true);
+    expect(signin.classList.contains("border-input")).toBe(true);
     expect(signin.classList.contains("px-3.5")).toBe(false);
     const icon = signin.querySelector("svg");
     expect(icon?.getAttribute("aria-hidden")).toBe("true");

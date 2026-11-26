@@ -121,9 +121,9 @@ function shouldForceEmailVerified({
   isAdminCreate: boolean;
   emailConfigured: boolean;
 }): boolean {
-  // Invites must be usable via the revealed temp password even when SMTP
-  // turns on requireEmailVerification. Public sign-up still follows SMTP.
-  return isAdminCreate || !emailConfigured;
+  // Admin invites stay unverified (pending) until their set-password link is
+  // spent, which activates them (no mailbox proof). Public sign-up still follows SMTP.
+  return !isAdminCreate && !emailConfigured;
 }
 
 function preserveRequestedRole(requestedRole: unknown): string {

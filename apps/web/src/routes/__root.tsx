@@ -33,6 +33,7 @@ import { useAuthSession } from "@/hooks/use-auth-session";
 import { useDocumentLang } from "@/hooks/use-document-lang";
 import { useHashTargetScroll } from "@/hooks/use-hash-target-scroll";
 import { useMobileKeyboard } from "@/hooks/use-mobile-keyboard";
+import { useMountEffect } from "@/hooks/use-mount-effect";
 import { useNodeLiveUpdates } from "@/hooks/use-node-live-updates";
 import { useReloadOnIdentityChange } from "@/hooks/use-reload-on-identity-change";
 import { useStaleBuildRecovery } from "@/hooks/use-stale-build-recovery";
@@ -40,6 +41,7 @@ import { useUserLocaleSync } from "@/hooks/use-user-locale-sync";
 import i18n from "@/i18n";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { I18nReady } from "@/i18n/I18nReady";
+import { markAppShellHydrated } from "@/lib/app-shell-hydration";
 import { MAIN_SCROLLER_ID } from "@/lib/main-scroller";
 import { useAppChrome } from "@/stores/app-chrome";
 import { orpc } from "@/utils/orpc";
@@ -154,6 +156,9 @@ function RootComponent() {
   useDocumentLang();
   useHashTargetScroll();
   useUserLocaleSync();
+  // The loaded shell renders only after the skeleton hydrated: report it too, so no guard waits on
+  // a skeleton that is gone (lib/app-shell-hydration.ts).
+  useMountEffect(markAppShellHydrated);
   // One node event stream per signed-in tab; it survives navigation (app and admin pages alike).
   const { state: authState } = useAuthSession();
   // Keyed by the session, so signing in again (or impersonating) opens a fresh stream.

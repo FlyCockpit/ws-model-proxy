@@ -1,9 +1,9 @@
 {
-  "body": "Hola {{name}}, un administrador ha creado una cuenta para ti. Puedes iniciar sesión con la contraseña temporal que aparece a continuación — por favor cámbiala después de tu primer inicio de sesión.",
-  "cta": "Iniciar sesión",
-  "emailLabel": "Correo electrónico",
+  "body": "Hola {{name}}, un administrador ha creado una cuenta para ti. Elige tu contraseña para terminar de configurarla. Esto también confirma tu correo, así que podrás iniciar sesión enseguida.",
+  "cta": "Crear tu contraseña",
+  "emailLabel": "Tu correo para iniciar sesión",
+  "expiryNote": "Este enlace solo funciona una vez y vence en {{days}} días. Si ya venció, pide a tu administrador que te reenvíe la invitación, o usa \"¿Olvidaste tu contraseña?\" en la página de inicio de sesión.",
   "heading": "Has sido invitado",
   "ignoreFooter": "Si no esperabas esta invitación, puedes ignorar este correo de forma segura.",
-  "subject": "Has sido invitado",
-  "tempPasswordLabel": "Contraseña temporal"
+  "subject": "Has sido invitado"
 }

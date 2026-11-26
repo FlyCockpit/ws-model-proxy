@@ -13,12 +13,15 @@ import { parseResetPasswordSearch } from "@/lib/reset-password-search";
  * then takes it out of the address bar.
  */
 export const Route = createFileRoute("/$lang/reset-password")({
-  validateSearch: parseResetPasswordSearch,
+  validateSearch: (search) => ({
+    ...parseResetPasswordSearch(search),
+    invite: search.invite === "1" || search.invite === 1 ? (1 as const) : undefined,
+  }),
   component: ResetPasswordPage,
 });
 
 function ResetPasswordPage() {
   const { lang } = Route.useParams();
-  const { token, error } = Route.useSearch();
-  return <ResetPasswordCard lang={lang} token={token} error={error} />;
+  const { token, error, invite } = Route.useSearch();
+  return <ResetPasswordCard lang={lang} token={token} error={error} invite={invite === 1} />;
 }

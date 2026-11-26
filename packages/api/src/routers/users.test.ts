@@ -55,7 +55,17 @@ vi.mock("@ws-model-proxy/auth", () => ({
 // call shape via the mock instead. `renderInviteUser` is stubbed to return a
 // stable subject/html so the router can pass them straight through to
 // `sendEmail` — the actual rendering is tested in the mailer package.
+vi.mock("../lib/set-password-link", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/set-password-link")>()),
+  createSetPasswordLink: vi.fn(async () => ({
+    url: "https://app.example.test/api/auth/reset-password/INVITE?callbackURL=x",
+    expiresAt: new Date("2026-12-01T00:00:00Z"),
+  })),
+  markAdminInvited: vi.fn(async () => {}),
+}));
+
 vi.mock("@ws-model-proxy/mailer", () => ({
+  isEmailConfigured: vi.fn(() => true),
   sendEmail: vi.fn(),
   renderInviteUser: vi.fn(() => ({
     subject: "You've been invited",
@@ -65,7 +75,7 @@ vi.mock("@ws-model-proxy/mailer", () => ({
 
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { auth } = await import("@ws-model-proxy/auth");
-const { renderInviteUser, sendEmail } = await import("@ws-model-proxy/mailer");
+const { isEmailConfigured, renderInviteUser, sendEmail } = await import("@ws-model-proxy/mailer");
 const { deleteUserDurably } = await import("@ws-model-proxy/db/parent-deletion");
 
 const db = prisma as unknown as {
@@ -81,6 +91,7 @@ const db = prisma as unknown as {
   cliDeviceCredential: { findMany: MockInstance };
   cliToken: { findMany: MockInstance };
   appSetting: { findUnique: MockInstance };
+  verification: { findMany: MockInstance };
   $transaction: MockInstance;
 };
 
@@ -167,6 +178,7 @@ async function captureConsoleDuring(fn: () => Promise<unknown>): Promise<string>
 describe("usersRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(isEmailConfigured).mockReturnValue(true);
     for (const mock of [
       db.user.findUnique,
       db.user.findMany,
@@ -184,6 +196,13 @@ describe("usersRouter", () => {
     invalidateForceTwoFactorPolicyCache();
     // Current users.ts reads the signup-access gate via appSetting.
     db.appSetting.findUnique.mockResolvedValue(null);
+    // Every listed / resent user is an admin invite unless a test says otherwise.
+    db.verification.findMany.mockImplementation(
+      async (args: { where: { identifier: { in: string[] } } }) =>
+        args.where.identifier.in.map((identifier) => ({
+          value: identifier.slice("admin-invited:".length),
+        })),
+    );
   });
 
   describe("auth gates", () => {
@@ -209,12 +228,12 @@ describe("usersRouter", () => {
       const client = createRouterClient(usersRouter, {
         context: buildContext({ user: { role: "user" } }),
       });
-      await expect(client.invite({ email: "x@example.com", name: "X" })).rejects.toSatisfy(
-        (e: ORPCError) => {
-          expect(e.code).toBe("NOT_FOUND");
-          return true;
-        },
-      );
+      await expect(
+        client.invite({ locale: "en-US", email: "x@example.com", name: "X" }),
+      ).rejects.toSatisfy((e: ORPCError) => {
+        expect(e.code).toBe("NOT_FOUND");
+        return true;
+      });
       expect(authApi.api.createUser).not.toHaveBeenCalled();
     });
   });
@@ -229,6 +248,8 @@ describe("usersRouter", () => {
           name: "A",
           role: "user",
           emailVerified: true,
+          accounts: [{ providerId: "credential" }],
+          sessions: [],
           banned: null,
           banReason: null,
           banExpires: null,
@@ -246,6 +267,40 @@ describe("usersRouter", () => {
       expect(res.users).toHaveLength(1);
       // No `where` clause when no search.
       expect(db.user.findMany.mock.calls[0]?.[0].where).toEqual({});
+    });
+
+    it("reports a pending invite only for an account users.invite created", async () => {
+      const unverified = {
+        email: "p@x.com",
+        slug: "p",
+        name: "P",
+        role: "user",
+        emailVerified: false,
+        accounts: [{ providerId: "credential" }],
+        sessions: [],
+        banned: null,
+        banReason: null,
+        banExpires: null,
+        deletionRequestedAt: null,
+        twoFactorEnabled: null,
+        createdAt: new Date("2026-01-01"),
+      };
+      db.user.findMany.mockResolvedValue([
+        { ...unverified, id: "invited" },
+        { ...unverified, id: "public-signup" },
+      ]);
+      db.user.count.mockResolvedValue(2);
+      db.verification.findMany.mockResolvedValue([{ value: "invited" }]);
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      const res = await client.list();
+      expect(db.verification.findMany).toHaveBeenCalledWith({
+        where: { identifier: { in: ["admin-invited:invited", "admin-invited:public-signup"] } },
+        select: { value: true },
+      });
+      expect(res.users.map((user) => [user.id, user.invitePending])).toEqual([
+        ["invited", true],
+        ["public-signup", false],
+      ]);
     });
 
     it("applies a case-insensitive OR search across name and email", async () => {
@@ -273,21 +328,41 @@ describe("usersRouter", () => {
 
       const client = createRouterClient(usersRouter, { context: buildContext() });
       const res = await client.invite({
+        locale: "en-US",
         email: "NEW@example.com",
         name: "New User",
         role: "user",
       });
 
       expect(res.userId).toBe("new-user-id");
-      expect(res.tempPassword).toEqual(expect.any(String));
-      expect(res.tempPassword.length).toBeGreaterThan(8);
+      expect(res).toEqual({ userId: "new-user-id", emailSent: true });
+      expect(res).not.toHaveProperty("tempPassword");
+      // Marked an admin invite first, then the link.
+      const { createSetPasswordLink, markAdminInvited } = await import("../lib/set-password-link");
+      expect(markAdminInvited).toHaveBeenCalledWith("new-user-id");
+      expect(createSetPasswordLink).toHaveBeenCalledWith({
+        userId: "new-user-id",
+        locale: "en-US",
+      });
+      expect(vi.mocked(markAdminInvited).mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(createSetPasswordLink).mock.invocationCallOrder[0] ?? 0,
+      );
+      expect(sendEmailMock).toHaveBeenCalledTimes(1);
+      expect(renderInviteUser).toHaveBeenCalledWith(
+        expect.objectContaining({
+          setPasswordUrl: expect.stringContaining("reset-password/"),
+          locale: "en-US",
+          expiresInDays: 7,
+        }),
+      );
+      expect(vi.mocked(renderInviteUser).mock.calls[0]?.[0]).not.toHaveProperty("tempPassword");
       expect(res.emailSent).toBe(true);
       // Email should be lowercased by the input zod schema.
       expect(authApi.api.createUser).toHaveBeenCalledWith({
         body: {
           email: "new@example.com",
           name: "New User",
-          password: res.tempPassword,
+          password: expect.any(String),
           role: "user",
         },
       });
@@ -302,12 +377,75 @@ describe("usersRouter", () => {
 
       const client = createRouterClient(usersRouter, { context: buildContext() });
       const res = await client.invite({
+        locale: "en-US",
         email: "new@example.com",
         name: "New User",
       });
 
       expect(res.emailSent).toBe(false);
       expect(res.userId).toBe("new-user-id");
+    });
+
+    it("stops with a clear next step when the invite cannot be marked, before any link", async () => {
+      authApi.api.createUser.mockResolvedValue({ user: { id: "new-user-id" } });
+      const { createSetPasswordLink, markAdminInvited } = await import("../lib/set-password-link");
+      vi.mocked(markAdminInvited).mockRejectedValueOnce(new Error("db down"));
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await expect(
+        client.invite({ locale: "en-US", email: "new@example.com", name: "New" }),
+      ).rejects.toMatchObject({
+        code: "INVITE_INCOMPLETE",
+        status: 500,
+        message: "Couldn't finish the invite. Remove this user and invite them again.",
+      });
+      expect(createSetPasswordLink).not.toHaveBeenCalled();
+      expect(sendEmailMock).not.toHaveBeenCalled();
+    });
+
+    it("keeps a failed first link resendable: the mark is already committed", async () => {
+      authApi.api.createUser.mockResolvedValue({ user: { id: "new-user-id" } });
+      const { createSetPasswordLink, markAdminInvited } = await import("../lib/set-password-link");
+      vi.mocked(createSetPasswordLink).mockRejectedValueOnce(new Error("tx failed"));
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await expect(
+        client.invite({ locale: "en-US", email: "new@example.com", name: "New" }),
+      ).rejects.toMatchObject({ code: "INTERNAL_SERVER_ERROR" });
+      expect(markAdminInvited).toHaveBeenCalledWith("new-user-id");
+    });
+
+    it("carries the selected locale into account creation and mail, and rejects fr-FR", async () => {
+      const { getAdminInviteLocale } = await import("@ws-model-proxy/auth/admin-invite-locale");
+      authApi.api.createUser.mockImplementation(async () => {
+        expect(getAdminInviteLocale()).toBe("es-MX");
+        return { user: { id: "new-user-id" } };
+      });
+      sendEmailMock.mockResolvedValue(undefined);
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await client.invite({ locale: "es-MX", email: "new@example.com", name: "New" });
+      expect(getAdminInviteLocale()).toBeUndefined();
+      expect(renderInviteUser).toHaveBeenCalledWith(expect.objectContaining({ locale: "es-MX" }));
+      await expect(
+        client.invite({ locale: "fr-FR" as "en-US", email: "new@example.com", name: "New" }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      expect(authApi.api.createUser).toHaveBeenCalledTimes(1);
+    });
+
+    it("without SMTP returns only a shareable link, with no delivery attempt", async () => {
+      authApi.api.createUser.mockResolvedValue({ user: { id: "new-user-id" } });
+      vi.mocked(isEmailConfigured).mockReturnValue(false);
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      const result = await client.invite({
+        locale: "en-US",
+        email: "new@example.com",
+        name: "New",
+      });
+      expect(result).toEqual({
+        userId: "new-user-id",
+        emailSent: false,
+        setPasswordUrl: expect.stringContaining("reset-password/"),
+        expiresAt: "2026-12-01T00:00:00.000Z",
+      });
+      expect(sendEmailMock).not.toHaveBeenCalled();
     });
 
     it("translates a duplicate-email error code into a CONFLICT", async () => {
@@ -323,12 +461,12 @@ describe("usersRouter", () => {
       ]) {
         authApi.api.createUser.mockRejectedValueOnce(failure);
         const client = createRouterClient(usersRouter, { context: buildContext() });
-        await expect(client.invite({ email: "dup@example.com", name: "Dup" })).rejects.toSatisfy(
-          (e: ORPCError) => {
-            expect(e.code).toBe("CONFLICT");
-            return true;
-          },
-        );
+        await expect(
+          client.invite({ locale: "en-US", email: "dup@example.com", name: "Dup" }),
+        ).rejects.toSatisfy((e: ORPCError) => {
+          expect(e.code).toBe("CONFLICT");
+          return true;
+        });
       }
       expect(sendEmailMock).not.toHaveBeenCalled();
     });
@@ -343,7 +481,7 @@ describe("usersRouter", () => {
           authApi.api.createUser.mockRejectedValueOnce(new Error(message));
           const client = createRouterClient(usersRouter, { context: buildContext() });
           await expect(
-            client.invite({ email: "new@example.com", name: "New User" }),
+            client.invite({ locale: "en-US", email: "new@example.com", name: "New User" }),
           ).rejects.toMatchObject({ code: "INTERNAL_SERVER_ERROR" });
         }
       } finally {
@@ -357,14 +495,91 @@ describe("usersRouter", () => {
       );
 
       const client = createRouterClient(usersRouter, { context: buildContext() });
-      await expect(client.invite({ email: "new@example.com", name: "New User" })).rejects.toSatisfy(
-        (e: ORPCError) => {
-          expect(e.code).toBe("BAD_REQUEST");
-          expect(e.message).toMatch(/account creation is disabled/i);
-          return true;
-        },
-      );
+      await expect(
+        client.invite({ locale: "en-US", email: "new@example.com", name: "New User" }),
+      ).rejects.toSatisfy((e: ORPCError) => {
+        expect(e.code).toBe("BAD_REQUEST");
+        expect(e.message).toMatch(/account creation is disabled/i);
+        return true;
+      });
       expect(sendEmailMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("resendInvite", () => {
+    const pending = {
+      id: "pending",
+      name: "Invitee",
+      email: "invitee@example.test",
+      locale: "es-MX",
+      emailVerified: false,
+      banned: false,
+      banExpires: null,
+      deletionRequestedAt: null,
+      accounts: [{ providerId: "credential" }],
+      sessions: [],
+    };
+    it("uses the stored locale and rotates the link through the same writer", async () => {
+      db.user.findUnique.mockResolvedValue(pending);
+      sendEmailMock.mockResolvedValue(undefined);
+      const { createSetPasswordLink } = await import("../lib/set-password-link");
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      expect(await client.resendInvite({ userId: "pending" })).toEqual({
+        userId: "pending",
+        emailSent: true,
+      });
+      expect(createSetPasswordLink).toHaveBeenCalledWith({ userId: "pending", locale: "es-MX" });
+      const { markAdminInvited } = await import("../lib/set-password-link");
+      expect(markAdminInvited).not.toHaveBeenCalled();
+      expect(sendEmailMock).toHaveBeenCalledTimes(1);
+    });
+    it("reports a setup that finished while the resend ran as no invite to resend", async () => {
+      // The pre-check saw a pending invite; the writer, under the credential-setup lock, found the
+      // account verified (the invitee set their password meanwhile).
+      db.user.findUnique.mockResolvedValue(pending);
+      const { createSetPasswordLink, SetPasswordLinkNotPendingError } = await import(
+        "../lib/set-password-link"
+      );
+      vi.mocked(createSetPasswordLink).mockRejectedValueOnce(new SetPasswordLinkNotPendingError());
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await expect(client.resendInvite({ userId: "pending" })).rejects.toMatchObject({
+        code: "INVITE_NOT_PENDING",
+        status: 409,
+      });
+      expect(sendEmailMock).not.toHaveBeenCalled();
+    });
+    it("refuses an unverified public sign-up (no admin-invited mark)", async () => {
+      db.user.findUnique.mockResolvedValue(pending);
+      db.verification.findMany.mockResolvedValue([]);
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await expect(client.resendInvite({ userId: "pending" })).rejects.toMatchObject({
+        code: "INVITE_NOT_PENDING",
+      });
+      const { createSetPasswordLink } = await import("../lib/set-password-link");
+      expect(createSetPasswordLink).not.toHaveBeenCalled();
+      expect(sendEmailMock).not.toHaveBeenCalled();
+    });
+    it("refuses verified, SSO, active-session, archived and deleting accounts", async () => {
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      for (const override of [
+        { emailVerified: true },
+        { accounts: [{ providerId: "oidc" }] },
+        { sessions: [{ id: "live" }] },
+        { banned: true },
+        { deletionRequestedAt: new Date() },
+      ]) {
+        db.user.findUnique.mockResolvedValue({ ...pending, ...override });
+        await expect(client.resendInvite({ userId: "pending" })).rejects.toBeInstanceOf(ORPCError);
+      }
+      expect(sendEmailMock).not.toHaveBeenCalled();
+    });
+    it("keeps the human-admin gate", async () => {
+      const client = createRouterClient(usersRouter, {
+        context: buildContext({ user: { role: "user" } }),
+      });
+      await expect(client.resendInvite({ userId: "pending" })).rejects.toMatchObject({
+        code: "NOT_FOUND",
+      });
     });
   });
 
@@ -684,7 +899,7 @@ describe("usersRouter", () => {
       let caught: unknown;
       const output = await captureConsoleDuring(async () => {
         try {
-          await client.invite({ email: "new@example.com", name: "New User" });
+          await client.invite({ locale: "en-US", email: "new@example.com", name: "New User" });
         } catch (err) {
           caught = err;
         }
@@ -709,7 +924,9 @@ describe("usersRouter", () => {
         calls.push(args);
       });
       try {
-        await client.invite({ email: "new@example.com", name: "New User" }).catch(() => {});
+        await client
+          .invite({ locale: "en-US", email: "new@example.com", name: "New User" })
+          .catch(() => {});
       } finally {
         spy.mockRestore();
       }
@@ -729,7 +946,11 @@ describe("usersRouter", () => {
 
       let result: { emailSent: boolean; userId: string } | undefined;
       const output = await captureConsoleDuring(async () => {
-        result = await client.invite({ email: "new@example.com", name: "New User" });
+        result = await client.invite({
+          locale: "en-US",
+          email: "new@example.com",
+          name: "New User",
+        });
       });
       // Restore the default render stub for later tests.
       vi.mocked(renderInviteUser).mockReset();

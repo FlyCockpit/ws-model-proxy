@@ -282,6 +282,12 @@ Optional values include SMTP settings (enables verification, password reset, and
 - On a fresh production database with public signup disabled, only `ADMIN_EMAIL` may bootstrap the first admin.
 - Later users are regular users unless promoted by an admin.
 - Admins can enable or disable open signup. Admin invites still work when open signup is closed.
+- An admin invite sends one email with a one-time set-password link (never a password), in the
+  language picked on the invite form (it defaults to the admin's own and is saved as the user's
+  language). Setting the password through it confirms the email, so no separate verification mail
+  is sent. The link expires after 7 days; "Resend invite" sends a new one and stops the old one,
+  and Forgot password works too. Without SMTP (or when the mail fails) the admin gets the link to
+  share instead. Archiving a user offers Undo for 8 seconds.
 - Auth works with email/password even when SMTP is not configured. When SMTP is configured, email verification is required and the full verification UX (safe callback URLs, resend, localized mail) is enabled.
 - With upload storage configured, chat attachments are kept only for the retention window an admin sets (Admin → Settings).
 

@@ -119,6 +119,11 @@ declare module "@tanstack/react-query" {
        */
       errorFallbackKey?: string;
       /**
+       * i18n keys for structured error codes the procedure documents (`INVITE_INCOMPLETE`): the
+       * global error toast shows that copy instead of `friendly()`'s.
+       */
+      errorCodeKeys?: Readonly<Record<string, string>>;
+      /**
        * Set on delete mutations: a CONFLICT carrying a structured deletion
        * reason (`data.reason`) toasts the entity's specific copy instead of
        * the generic conflict message.

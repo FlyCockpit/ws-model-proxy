@@ -4,6 +4,7 @@ import {
   type AuthSessionData,
   classifyAuthSession,
   nextConfirmedAuthSession,
+  rememberConfirmedAnonymous,
 } from "./auth-session-state";
 
 const actions = { refetch: vi.fn(), retry: vi.fn() };
@@ -96,5 +97,68 @@ describe("classifyAuthSession", () => {
     });
 
     expect(result.state.status).toBe("error");
+  });
+});
+
+describe("confirmed anonymous memory", () => {
+  it("keeps a confirmed-anonymous visitor anonymous while a refetch is pending", () => {
+    // Better Auth marks a refetch of an empty session `isPending` again: a refocus.
+    const result = classifyAuthSession({
+      data: null,
+      isPending: true,
+      confirmedAnonymous: true,
+      actions,
+    });
+
+    expect(result.state.status).toBe("anonymous");
+    expect(result.meta.isRefetching).toBe(true);
+  });
+
+  it("keeps a confirmed-anonymous visitor anonymous through a failed refetch", () => {
+    const result = classifyAuthSession({
+      data: null,
+      error: new Error("network failed"),
+      confirmedAnonymous: true,
+      actions,
+    });
+
+    expect(result.state.status).toBe("anonymous");
+    expect(result.meta.isDegraded).toBe(true);
+  });
+
+  it("still waits (pending) and still errors on the first load", () => {
+    expect(
+      classifyAuthSession({ data: null, isPending: true, confirmedAnonymous: false, actions }).state
+        .status,
+    ).toBe("pending");
+    expect(
+      classifyAuthSession({ data: null, error: new Error("x"), confirmedAnonymous: false, actions })
+        .state.status,
+    ).toBe("error");
+  });
+
+  it("prefers a retained session over the anonymous memory", () => {
+    const result = classifyAuthSession({
+      data: null,
+      isPending: true,
+      confirmedSession: session,
+      confirmedAnonymous: true,
+      actions,
+    });
+
+    expect(result.state).toEqual({ status: "authenticated", session });
+  });
+
+  it("is set by an anonymous snapshot, cleared by an authenticated one, kept by the rest", () => {
+    const anonymous = classifyAuthSession({ data: null, actions });
+    const authenticated = classifyAuthSession({ data: session, actions });
+    const pending = classifyAuthSession({ data: null, isPending: true, actions });
+    const failed = classifyAuthSession({ data: null, error: new Error("x"), actions });
+
+    expect(rememberConfirmedAnonymous(false, anonymous)).toBe(true);
+    expect(rememberConfirmedAnonymous(true, authenticated)).toBe(false);
+    expect(rememberConfirmedAnonymous(true, pending)).toBe(true);
+    expect(rememberConfirmedAnonymous(false, pending)).toBe(false);
+    expect(rememberConfirmedAnonymous(true, failed)).toBe(true);
   });
 });
