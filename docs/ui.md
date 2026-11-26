@@ -106,7 +106,9 @@ measures the geometry in a browser (§ Layout check).
    `--popover-foreground` and maps sileo's state colours to `--state-*`, `--destructive` and
    `--primary`, and the Toaster (`packages/ui/src/components/sileo.tsx`) gets no `theme` prop
    (sileo's themes invert the page). Text and state colours reach 4.5:1 on the surface they sit on
-   in both themes. The inline `html` background the init script paints on the first frame gives way
+   in both themes. A toast's title is one line capped to the pill and shown as written (no Title
+   Case); a message that does not fit ends in an ellipsis there and `toast.*`
+   (`packages/ui/src/lib/toast.ts`) repeats it in the description, which wraps. The inline `html` background the init script paints on the first frame gives way
    to `--background` once the stylesheet applies, so an in-app toggle repaints it.
 4. **Every route renders inside the shell, the 404 included.** The root route renders the shell
    (header, `<main>`, BottomNav) around every match, so the router's `defaultNotFoundComponent`

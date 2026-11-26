@@ -409,6 +409,26 @@
 :root [data-sileo-viewport] [data-sileo-description] {
   color: var(--popover-foreground);
 }
+/* sileo writes titles with `text-transform: capitalize`, which turns a
+   sentence into Title Case and ignores the locale. Titles are written in
+   sentence case through t(), so show them as written. */
+:root [data-sileo-viewport] [data-sileo-title] {
+  text-transform: none;
+}
+/* sileo sizes the pill from the header's measured width but draws it inside a
+   fixed 350px SVG, and its header row never wraps: a long message ran off both
+   edges of the screen. Cap the header row to the pill's maximum (350px - the
+   header's 1rem padding - sileo's 10px pill padding) and end the title with an
+   ellipsis; lib/toast.ts also puts a long message in the description, so the
+   full text is still shown. */
+:root [data-sileo-viewport] [data-sileo-header-inner] {
+  max-width: calc(var(--sileo-width) - 1rem - 10px);
+}
+:root [data-sileo-viewport] [data-sileo-header-inner] [data-sileo-title] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 :root [data-sileo-viewport] [data-sileo-button][data-state] {
   --sileo-btn-color: var(--popover-foreground);
   --sileo-btn-bg: color-mix(in oklch, var(--popover-foreground) 8%, transparent);
