@@ -10,16 +10,15 @@ import {
 } from "@ws-model-proxy/api/lib/runtime-spec";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
+import { AdvancedSection, FormSection } from "@ws-model-proxy/ui/components/form-page";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import type { TFunction } from "i18next";
 import { Plus, Trash2 } from "lucide-react";
-import { type ReactNode, useRef, useState } from "react";
+import { type ComponentProps, type ReactNode, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-
-import { FormAdvanced, FormSection, FormWide } from "@/components/form-surface";
 import { LabelledSelect } from "@/components/labelled-select";
 import { useRowKeys } from "@/components/runtimes/use-row-keys";
 import { SegmentedControl } from "@/components/segmented-control";
@@ -291,6 +290,11 @@ function CheckRow({
   );
 }
 
+/** A form section named by its title, so screen readers list it among the page's regions. */
+function NamedSection({ title, ...props }: ComponentProps<typeof FormSection> & { title: string }) {
+  return <FormSection aria-label={title} title={title} {...props} />;
+}
+
 /** Where the page's own parts go among the editor's sections. */
 export type RuntimeSpecSlots = {
   /** Essential fields of the page (name, node), first. */
@@ -382,15 +386,17 @@ export const RuntimeSpecFields = withFieldGroup({
                   )}
                 </group.Field>
                 {slots.advanced || slots.howItRuns ? (
-                  <div className="flex min-w-0 flex-col gap-3">
+                  // Margins, not a gap: stacked Advanced sections join into one ruled list.
+                  <div className="min-w-0 space-y-8">
                     {slots.advanced}
                     {slots.howItRuns ? (
-                      <FormAdvanced
+                      <AdvancedSection
+                        gridClassName="lg:grid-cols-1"
                         title={t("dashboard:runtime.specForm.sections.howItRuns")}
                         summary={slots.howItRunsSummary}
                       >
                         {slots.howItRuns}
-                      </FormAdvanced>
+                      </AdvancedSection>
                     ) : null}
                   </div>
                 ) : null}
@@ -472,11 +478,10 @@ function DraftSections({
             <div className="flex min-w-0 flex-col gap-8">
               {slots.basics}
               {kind === "ALWAYS_ON" ? (
-                <FormSection
+                <NamedSection
                   id={id("server")}
                   title={t("dashboard:runtime.specForm.sections.server")}
                   description={t("dashboard:runtime.specForm.addressHint")}
-                  columns={2}
                 >
                   <group.Field name="draft.baseUrl">
                     {(field) => (
@@ -490,19 +495,21 @@ function DraftSections({
                     )}
                   </group.Field>
                   <EngineField group={group} id={id} />
-                </FormSection>
+                </NamedSection>
               ) : null}
               {startable && serves ? (
-                <FormSection
+                <NamedSection
+                  gridClassName="lg:grid-cols-1"
                   id={id("model")}
                   title={t("dashboard:runtime.specForm.sections.model")}
                   description={t("dashboard:runtime.specForm.sections.modelHint")}
                 >
                   <ModelList group={group} id={id} />
-                </FormSection>
+                </NamedSection>
               ) : null}
               {startable ? (
-                <FormSection
+                <NamedSection
+                  gridClassName="lg:grid-cols-1"
                   id={id("commands")}
                   title={
                     serves
@@ -526,28 +533,33 @@ function DraftSections({
                       />
                     )}
                   </group.Field>
-                </FormSection>
+                </NamedSection>
               ) : null}
               {startable && serves ? (
-                <FormSection
+                <NamedSection
+                  gridClassName="lg:grid-cols-1"
                   id={id("size")}
                   title={t("dashboard:runtime.specForm.sections.size")}
                   description={t("dashboard:runtime.specForm.resourcesHint")}
                 >
                   <ResourceRows group={group} id={id} resources={draft.resources} />
-                </FormSection>
+                </NamedSection>
               ) : null}
             </div>
-            <div className="flex min-w-0 flex-col gap-3">
-              <h2 className="text-base font-semibold">
-                {t("dashboard:runtime.specForm.sections.advanced")}
-              </h2>
-              <p className="-mt-2 text-sm text-muted-foreground">
-                {t("dashboard:runtime.specForm.sections.advancedHint")}
-              </p>
+            {/* Margins, not a gap: stacked Advanced sections join into one ruled list. */}
+            <div className="min-w-0 space-y-8">
+              <div className="min-w-0 space-y-1">
+                <h2 className="text-base font-semibold">
+                  {t("dashboard:runtime.specForm.sections.advanced")}
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  {t("dashboard:runtime.specForm.sections.advancedHint")}
+                </p>
+              </div>
               {slots.advanced}
               {slots.howItRuns || startable ? (
-                <FormAdvanced
+                <AdvancedSection
+                  gridClassName="lg:grid-cols-1"
                   title={t("dashboard:runtime.specForm.sections.howItRuns")}
                   summary={[
                     slots.howItRunsSummary,
@@ -581,16 +593,17 @@ function DraftSections({
                       )}
                     </group.Field>
                   ) : null}
-                </FormAdvanced>
+                </AdvancedSection>
               ) : null}
               {serves ? <ServingDetails group={group} kind={kind} id={id} draft={draft} /> : null}
               {startable && !serves ? (
-                <FormAdvanced
+                <AdvancedSection
+                  gridClassName="lg:grid-cols-1"
                   title={t("dashboard:runtime.specForm.sections.size")}
                   summary={resourceSummary(t, draft.resources)}
                 >
                   <ResourceRows group={group} id={id} resources={draft.resources} />
-                </FormAdvanced>
+                </AdvancedSection>
               ) : null}
               {startable ? (
                 <MoreCommands group={group} id={id} draft={draft} upFront={service || !serves} />
@@ -845,11 +858,11 @@ function EmbeddingFields({ group, id, index }: { group: Group; id: Ids; index: n
       <legend className="px-1 text-sm font-medium">
         {t("dashboard:runtime.specForm.embedding.title")}
       </legend>
-      <FormWide>
+      <div className="min-w-0 lg:col-span-2">
         <p className="text-xs text-muted-foreground">
           {t("dashboard:runtime.specForm.embedding.hint")}
         </p>
-      </FormWide>
+      </div>
       <group.Field name={`${base}.revision`}>
         {(field) => (
           <TextInput
@@ -1128,7 +1141,11 @@ function ServingDetails({
     .filter(Boolean)
     .join(" · ");
   return (
-    <FormAdvanced title={t("dashboard:runtime.specForm.sections.serving")} summary={summary}>
+    <AdvancedSection
+      gridClassName="lg:grid-cols-1"
+      title={t("dashboard:runtime.specForm.sections.serving")}
+      summary={summary}
+    >
       <div className="grid min-w-0 gap-4 lg:grid-cols-2">
         {kind === "STARTABLE" ? <EngineField group={group} id={id} /> : null}
         <group.Field name="draft.api">
@@ -1220,7 +1237,7 @@ function ServingDetails({
           )}
         </group.Field>
       ))}
-    </FormAdvanced>
+    </AdvancedSection>
   );
 }
 
@@ -1329,7 +1346,11 @@ function MoreCommands({
       : t("dashboard:runtime.specForm.summary.timeoutsDefault"),
   ].join(" · ");
   return (
-    <FormAdvanced title={t("dashboard:runtime.specForm.sections.moreCommands")} summary={summary}>
+    <AdvancedSection
+      gridClassName="lg:grid-cols-1"
+      title={t("dashboard:runtime.specForm.sections.moreCommands")}
+      summary={summary}
+    >
       {draft.commands.map((_, index) => (
         // Positional keys: rows are ranks (row i is rank i), never removed one by one
         <div key={index} className={rankBox(draft.commands.length)}>
@@ -1373,7 +1394,7 @@ function MoreCommands({
           </div>
         </div>
       ))}
-    </FormAdvanced>
+    </AdvancedSection>
   );
 }
 
@@ -1394,7 +1415,11 @@ function LaunchDetails({ group, id, draft }: { group: Group; id: Ids; draft: Spe
       : t("dashboard:runtime.specForm.summary.port", { port: draft.fixedPort.trim() }),
   ].join(" · ");
   return (
-    <FormAdvanced title={t("dashboard:runtime.specForm.sections.launch")} summary={summary}>
+    <AdvancedSection
+      gridClassName="lg:grid-cols-1"
+      title={t("dashboard:runtime.specForm.sections.launch")}
+      summary={summary}
+    >
       <div className="grid min-w-0 gap-4 lg:grid-cols-2">
         <group.Field name="draft.management">
           {(field) => (
@@ -1496,7 +1521,7 @@ function LaunchDetails({ group, id, draft }: { group: Group; id: Ids; draft: Spe
           </div>
         </div>
       ) : null}
-    </FormAdvanced>
+    </AdvancedSection>
   );
 }
 
@@ -1544,7 +1569,11 @@ function Reservations({ group, id, draft }: { group: Group; id: Ids; draft: Spec
           count: draft.reservations.length,
         });
   return (
-    <FormAdvanced title={t("dashboard:runtime.specForm.reservations")} summary={summary}>
+    <AdvancedSection
+      gridClassName="lg:grid-cols-1"
+      title={t("dashboard:runtime.specForm.reservations")}
+      summary={summary}
+    >
       <p className="text-xs text-muted-foreground">
         {t("dashboard:runtime.specForm.reservationsHint")}
       </p>
@@ -1615,7 +1644,7 @@ function Reservations({ group, id, draft }: { group: Group; id: Ids; draft: Spec
           </>
         )}
       </group.Field>
-    </FormAdvanced>
+    </AdvancedSection>
   );
 }
 
@@ -1630,7 +1659,11 @@ function Readiness({ group, id, draft }: { group: Group; id: Ids; draft: SpecDra
       })
     : t("dashboard:runtime.specForm.summary.readinessOff");
   return (
-    <FormAdvanced title={t("dashboard:runtime.specForm.readiness")} summary={summary}>
+    <AdvancedSection
+      gridClassName="lg:grid-cols-1"
+      title={t("dashboard:runtime.specForm.readiness")}
+      summary={summary}
+    >
       <group.Field name="draft.readiness.enabled">
         {(field) => (
           <>
@@ -1679,7 +1712,7 @@ function Readiness({ group, id, draft }: { group: Group; id: Ids; draft: SpecDra
           </>
         )}
       </group.Field>
-    </FormAdvanced>
+    </AdvancedSection>
   );
 }
 
@@ -1692,7 +1725,11 @@ function Health({ group, id, draft }: { group: Group; id: Ids; draft: SpecDraft 
     successes: health.successThreshold || "?",
   });
   return (
-    <FormAdvanced title={t("dashboard:runtime.specForm.health")} summary={summary}>
+    <AdvancedSection
+      gridClassName="lg:grid-cols-1"
+      title={t("dashboard:runtime.specForm.health")}
+      summary={summary}
+    >
       <div className="grid min-w-0 gap-4 sm:grid-cols-3">
         <group.Field name="draft.health.intervalMs">
           {(field) => (
@@ -1717,6 +1754,6 @@ function Health({ group, id, draft }: { group: Group; id: Ids; draft: SpecDraft 
           </group.Field>
         ))}
       </div>
-    </FormAdvanced>
+    </AdvancedSection>
   );
 }

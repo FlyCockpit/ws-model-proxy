@@ -15,6 +15,7 @@ import { WideContent } from "@/components/wide-content";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/activity/commands")({
+  staticData: { pendingShape: "list" },
   component: ActivityCommandsPage,
 });
 

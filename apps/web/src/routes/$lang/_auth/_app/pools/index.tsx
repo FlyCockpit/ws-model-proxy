@@ -24,6 +24,7 @@ import type { PoolView } from "@/lib/pool-ui";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/pools/")({
+  staticData: { pendingShape: "list" },
   component: PoolsPage,
 });
 

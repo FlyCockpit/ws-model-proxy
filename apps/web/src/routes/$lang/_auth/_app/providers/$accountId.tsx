@@ -35,6 +35,7 @@ import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/providers/$accountId")({
+  staticData: { pendingShape: "detail" },
   component: ProviderDetailPage,
 });
 

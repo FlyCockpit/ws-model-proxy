@@ -9,6 +9,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
+import { AdvancedSection } from "@ws-model-proxy/ui/components/form-page";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
@@ -18,18 +19,18 @@ import { Plus } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
-
 import { FieldErrors } from "@/components/field-errors";
-import { FormAdvanced, focusFirstInvalid } from "@/components/form-surface";
 import { InlineRetry } from "@/components/inline-retry";
 import { PageHeading } from "@/components/page-stub";
 import { SegmentedControl } from "@/components/segmented-control";
 import { StatusPill } from "@/components/status-pill";
 import { SwitchRow } from "@/components/switch-row";
+import { focusFirstInvalid } from "@/lib/form-focus";
 import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/providers/")({
+  staticData: { pendingShape: "list" },
   component: ProvidersPage,
 });
 
@@ -201,8 +202,7 @@ function AddAccountDialog({
     await form.handleSubmit();
     // Errors show next to their fields; focus moves to the first one (opening Connection details
     // when the base URL is the problem).
-    if (!form.state.isValid)
-      window.setTimeout(() => focusFirstInvalid(document.getElementById(formId)), 0);
+    if (!form.state.isValid) focusFirstInvalid(document.getElementById(formId));
   };
   return (
     <ResponsiveDialog
@@ -335,7 +335,8 @@ function AddAccountDialog({
                     />
                   )}
                 </form.Field>
-                <FormAdvanced
+                <AdvancedSection
+                  gridClassName="lg:grid-cols-1"
                   title={t("dashboard:providers.form.connection")}
                   summary={t("dashboard:providers.form.connectionSummary", {
                     url: baseUrl,
@@ -346,7 +347,7 @@ function AddAccountDialog({
                   })}
                 >
                   <ConnectionFields form={form} />
-                </FormAdvanced>
+                </AdvancedSection>
               </>
             ) : null
           }

@@ -30,6 +30,7 @@ import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/pools/$poolId/cloud")({
+  staticData: { pendingShape: "form" },
   component: PoolCloudPage,
 });
 

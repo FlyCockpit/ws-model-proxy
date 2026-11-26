@@ -1,12 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { AGENT_SCOPES, type AgentScope } from "@ws-model-proxy/api/contracts";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
+import { AdvancedSection } from "@ws-model-proxy/ui/components/form-page";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import type { TFunction } from "i18next";
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { FormAdvanced } from "@/components/form-surface";
 import { InlineRetry } from "@/components/inline-retry";
 import {
   agentAccessPresets,
@@ -40,10 +40,12 @@ export function AgentAccessChoice({
   // "Custom" chosen by hand keeps the grid open for editing even while it matches a preset.
   const [customChosen, setCustomChosen] = useState(false);
   const selectable = AGENT_SCOPES.filter((scope) => availableScopes.includes(scope));
-  // The one-by-one grid starts open only when the starting access matches no preset.
-  const [gridOpen, setGridOpen] = useState(
+  // The one-by-one grid starts open only when the starting access matches no preset; choosing
+  // "Custom" opens it (a native <details>, opened from the event, no effect).
+  const [gridStartsOpen] = useState(
     () => matchAgentAccessPreset(value.scopes, selectable) === null,
   );
+  const gridRef = useRef<HTMLDetailsElement>(null);
   const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), enabled: value.nodeIds !== null });
   const presets = agentAccessPresets(selectable);
   const matched = matchAgentAccessPreset(value.scopes, selectable);
@@ -69,7 +71,7 @@ export function AgentAccessChoice({
       checked: customChosen || matched === null,
       choose: () => {
         setCustomChosen(true);
-        setGridOpen(true);
+        if (gridRef.current) gridRef.current.open = true;
       },
     },
   ];
@@ -159,14 +161,15 @@ export function AgentAccessChoice({
           </div>
         ) : null}
         {presets.length > 0 ? (
-          <FormAdvanced
+          <AdvancedSection
+            gridClassName="lg:grid-cols-1"
             title={t("access:agents.scopesDetail")}
             summary={chosenNames}
-            open={gridOpen}
-            onOpenChange={setGridOpen}
+            ref={gridRef}
+            defaultOpen={gridStartsOpen}
           >
             {grid}
-          </FormAdvanced>
+          </AdvancedSection>
         ) : (
           grid
         )}

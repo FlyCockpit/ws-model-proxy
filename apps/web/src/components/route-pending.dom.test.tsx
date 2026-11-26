@@ -6,8 +6,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({ pathname: "/en-US/nodes", inFrame: false }));
 
 vi.mock("@tanstack/react-router", () => ({
-  useRouterState: ({ select }: { select: (s: { location: { pathname: string } }) => unknown }) =>
-    select({ location: { pathname: state.pathname } }),
+  useRouterState: ({
+    select,
+  }: {
+    select: (s: { location: { pathname: string }; matches: unknown[] }) => unknown;
+  }) => select({ location: { pathname: state.pathname }, matches: [] }),
+  useMatch: ({ select }: { select: (match: { routeId: string }) => unknown }) =>
+    select({ routeId: "__root__" }),
 }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock("@/components/app-frame", () => ({
@@ -41,6 +46,8 @@ describe("RoutePending", () => {
     render(<RoutePending />);
     expect(screen.queryByTestId("frame")).toBeNull();
     expect(document.querySelector("[data-page-skeleton]")).toBeTruthy();
+    // Inside the frame, the frame owns the padding: the skeleton adds none.
+    expect(document.querySelector("[data-route-skeleton]")?.className).not.toContain("px-4");
   });
 
   it("keeps the page padding but no sidebar frame on admin and public pages", () => {
@@ -48,9 +55,8 @@ describe("RoutePending", () => {
       state.pathname = path;
       const { unmount } = render(<RoutePending />);
       expect(screen.queryByTestId("frame")).toBeNull();
-      expect(document.querySelector("[data-page-skeleton]")?.parentElement?.className).toContain(
-        "px-4",
-      );
+      // Their own page container, as the loaded page has (the app frame is not around them).
+      expect(document.querySelector("[data-route-skeleton]")?.className).toContain("px-4");
       unmount();
     }
   });

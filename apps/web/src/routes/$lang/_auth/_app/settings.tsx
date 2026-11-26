@@ -4,6 +4,8 @@ import { useTranslation } from "react-i18next";
 import { settingsNavItems } from "@/lib/nav-items";
 
 export const Route = createFileRoute("/$lang/_auth/_app/settings")({
+  // A reload into a settings page draws the settings title and nav around its skeleton.
+  staticData: { pendingFrame: "settings" },
   component: SettingsLayout,
 });
 

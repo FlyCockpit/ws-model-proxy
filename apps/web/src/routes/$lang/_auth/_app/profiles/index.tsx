@@ -13,6 +13,7 @@ import { ProfileCard, ProfileCardSkeleton } from "@/components/profiles/profile-
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/profiles/")({
+  staticData: { pendingShape: "list" },
   component: ProfilesPage,
 });
 

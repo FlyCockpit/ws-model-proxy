@@ -24,6 +24,7 @@ import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/runtimes/$runtimeId/advanced")({
+  staticData: { pendingShape: "form" },
   component: RuntimeAdvancedPage,
 });
 

@@ -1,17 +1,17 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@ws-model-proxy/ui/components/button";
+import { AdvancedSection } from "@ws-model-proxy/ui/components/form-page";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
-
-import { FormAdvanced, focusFirstInvalid } from "@/components/form-surface";
 import { LabelledSelect } from "@/components/labelled-select";
 import { SegmentedControl } from "@/components/segmented-control";
 import { SwitchRow } from "@/components/switch-row";
+import { focusFirstInvalid } from "@/lib/form-focus";
 import { orpc } from "@/utils/orpc";
 import { parseLabels } from "./add-node-dialog-utils";
 import { EnrollmentPanel } from "./enrollment-panel";
@@ -96,8 +96,7 @@ export function AddNodeDialog({ open, onOpenChange, lang, replace }: AddNodeDial
     },
     validators: { onChange: buildSchema(t), onSubmit: buildSchema(t) },
     // The options sit in a collapsed section: a refused create opens it and focuses the field.
-    onSubmitInvalid: () =>
-      window.setTimeout(() => focusFirstInvalid(document.getElementById(formId)), 0),
+    onSubmitInvalid: () => focusFirstInvalid(document.getElementById(formId)),
     onSubmit: async ({ value }) => {
       const labels = parseLabels(value.labels);
       await create.mutateAsync(
@@ -268,7 +267,8 @@ export function AddNodeDialog({ open, onOpenChange, lang, replace }: AddNodeDial
                 {([ttlHours, labels, temporary, offlineHours]) => {
                   const labelList = parseLabels(labels);
                   return (
-                    <FormAdvanced
+                    <AdvancedSection
+                      gridClassName="lg:grid-cols-1"
                       title={t("dashboard:nodes.add.options")}
                       summary={[
                         t("dashboard:nodes.add.summary.ttl", {
@@ -346,7 +346,7 @@ export function AddNodeDialog({ open, onOpenChange, lang, replace }: AddNodeDial
                           )}
                         </form.Field>
                       ) : null}
-                    </FormAdvanced>
+                    </AdvancedSection>
                   );
                 }}
               </form.Subscribe>

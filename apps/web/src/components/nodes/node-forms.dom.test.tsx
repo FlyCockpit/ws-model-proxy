@@ -117,7 +117,9 @@ describe("HardwareCard", () => {
         lang="en-US"
       />,
     );
-    const override = document.querySelector("details[data-form-advanced]") as HTMLDetailsElement;
+    const override = document.querySelector(
+      'details[data-slot="advanced-section"]',
+    ) as HTMLDetailsElement;
     expect(override.open).toBe(false);
     expect(override.textContent).toContain("dashboard:nodes.hardware.overrideTitle");
     expect(override.textContent).toContain("dashboard:nodes.hardware.overrideSet");
@@ -132,7 +134,9 @@ describe("HardwareCard", () => {
 
   it("says the detected values rule when nothing is overridden", () => {
     mount(<HardwareCard node={node()} lang="en-US" />);
-    const override = document.querySelector("details[data-form-advanced]") as HTMLDetailsElement;
+    const override = document.querySelector(
+      'details[data-slot="advanced-section"]',
+    ) as HTMLDetailsElement;
     expect(override.textContent).toContain("dashboard:nodes.hardware.overrideNone");
   });
 });
@@ -142,7 +146,9 @@ describe("PlacementCard", () => {
     mount(<PlacementCard node={node()} />);
     const labels = screen.getByLabelText("dashboard:nodes.definition.labels");
     expect(labels.closest("details")).toBeNull();
-    const limits = document.querySelector("details[data-form-advanced]") as HTMLDetailsElement;
+    const limits = document.querySelector(
+      'details[data-slot="advanced-section"]',
+    ) as HTMLDetailsElement;
     expect(limits.open).toBe(false);
     expect(limits.textContent).toContain('"start":"20000","end":"20999","hours":"2"');
     expect(screen.getByLabelText("dashboard:nodes.definition.portStart").closest("details")).toBe(
@@ -152,7 +158,9 @@ describe("PlacementCard", () => {
 
   it("opens the folded limits and focuses the bad port when a save is refused", async () => {
     mount(<PlacementCard node={node()} />);
-    const limits = document.querySelector("details[data-form-advanced]") as HTMLDetailsElement;
+    const limits = document.querySelector(
+      'details[data-slot="advanced-section"]',
+    ) as HTMLDetailsElement;
     limits.open = true;
     const end = screen.getByLabelText("dashboard:nodes.definition.portEnd");
     fireEvent.change(end, { target: { value: "100" } });
@@ -171,7 +179,9 @@ describe("AddNodeDialog", () => {
   it("asks only how many up front; options are folded with a summary and Create is pinned", () => {
     mount(<AddNodeDialog open onOpenChange={() => undefined} lang="en-US" />);
     const dialog = screen.getByRole("dialog");
-    const options = dialog.querySelector("details[data-form-advanced]") as HTMLDetailsElement;
+    const options = dialog.querySelector(
+      'details[data-slot="advanced-section"]',
+    ) as HTMLDetailsElement;
     expect(options.open).toBe(false);
     expect(options.textContent).toContain("dashboard:nodes.add.summary.ttl");
     expect(options.textContent).toContain("dashboard:nodes.add.summary.noLabels");
@@ -188,7 +198,9 @@ describe("AddNodeDialog", () => {
 
   it("keeps Create enabled for a bad label, then opens the options and focuses it", async () => {
     mount(<AddNodeDialog open onOpenChange={() => undefined} lang="en-US" />);
-    const options = document.querySelector("details[data-form-advanced]") as HTMLDetailsElement;
+    const options = document.querySelector(
+      'details[data-slot="advanced-section"]',
+    ) as HTMLDetailsElement;
     options.open = true;
     const labels = screen.getByLabelText("dashboard:nodes.add.labels");
     fireEvent.change(labels, { target: { value: "Not A Label!" } });
@@ -211,7 +223,9 @@ describe("AddNodeDialog", () => {
     fireEvent.click(toggle);
     expect(toggle.closest("label")?.textContent).toContain("common:switchState.on");
     expect(screen.getByLabelText("dashboard:nodes.add.offlineHours")).toBeTruthy();
-    const options = document.querySelector("details[data-form-advanced]") as HTMLDetailsElement;
+    const options = document.querySelector(
+      'details[data-slot="advanced-section"]',
+    ) as HTMLDetailsElement;
     expect(options.textContent).toContain("dashboard:nodes.add.summary.removed");
   });
 
@@ -224,7 +238,7 @@ describe("AddNodeDialog", () => {
         replace={{ nodeId: "node-1", slug: "spark-1" }}
       />,
     );
-    expect(document.querySelector("details[data-form-advanced]")).toBeNull();
+    expect(document.querySelector('details[data-slot="advanced-section"]')).toBeNull();
     expect(screen.getByLabelText("dashboard:nodes.add.ttl")).toBeTruthy();
     expect(screen.queryByRole("switch")).toBeNull();
   });

@@ -34,6 +34,7 @@ import {
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/welcome")({
+  staticData: { pendingShape: "form" },
   validateSearch: (search: Record<string, unknown>): { step?: WelcomeStep } => {
     const step = parseWelcomeStep(search.step);
     return step ? { step } : {};

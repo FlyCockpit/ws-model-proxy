@@ -19,7 +19,7 @@ export default function Header() {
   const isAuthenticated = Boolean(state.session);
 
   return (
-    <div className="min-w-0">
+    <div data-app-header="" className="min-w-0">
       <div className="flex min-w-0 flex-row items-center gap-4 px-4 py-2">
         {/* The first thing in the row to give way (see AppNameLink). */}
         <AppNameLink lang={lang} />

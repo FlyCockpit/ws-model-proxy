@@ -68,6 +68,7 @@ function buildInviteSchema(t: TFunction<"admin">) {
 }
 
 export const Route = createFileRoute("/$lang/admin/users")({
+  staticData: { pendingShape: "list", pendingWidth: "wide" },
   component: AdminUsers,
 });
 

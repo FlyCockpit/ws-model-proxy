@@ -2,6 +2,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
+import {
+  AdvancedSection,
+  FormActionBar,
+  FormSection,
+} from "@ws-model-proxy/ui/components/form-page";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
@@ -11,20 +16,13 @@ import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
-
-import {
-  FormActionBar,
-  FormAdvanced,
-  FormSection,
-  focusField,
-  focusFirstInvalid,
-} from "@/components/form-surface";
 import { InlineRetry } from "@/components/inline-retry";
 import { LabelledSelect } from "@/components/labelled-select";
 import { PageHeading } from "@/components/page-stub";
 import { RuntimeSpecFields } from "@/components/runtimes/runtime-spec-fields";
 import { useAppForm } from "@/hooks/use-app-form";
 import { rejectedDefinesWarning } from "@/lib/define-rejections";
+import { focusField, focusFirstInvalid } from "@/lib/form-focus";
 import { refusalText } from "@/lib/refusal-text";
 import { fillTargets } from "@/lib/runtime-preset-fill";
 import {
@@ -38,6 +36,7 @@ import { SLUG_PATTERN, slugify } from "@/lib/slugify";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/runtimes/new")({
+  staticData: { pendingShape: "form" },
   component: NewRuntimePage,
 });
 
@@ -157,7 +156,7 @@ function RuntimeForm({ preset }: { preset: Preset }) {
     validators: { onSubmit: schema },
     // Errors sit next to their fields; once React shows them, the first one gets focus (its
     // collapsed section opens).
-    onSubmitInvalid: () => window.setTimeout(() => focusFirstInvalid(formRef.current), 0),
+    onSubmitInvalid: () => focusFirstInvalid(formRef.current),
     onSubmit: async ({ value }) => {
       const reading = readSpecEditor(value.spec, value.kind, messages(value.kind));
       if (!reading.ok) return;
@@ -189,7 +188,11 @@ function RuntimeForm({ preset }: { preset: Preset }) {
   });
 
   const basics = (kind: RuntimeKind) => (
-    <FormSection id="runtime-basics" title={t("dashboard:runtime.form.basics")} columns={2}>
+    <FormSection
+      id="runtime-basics"
+      aria-label={t("dashboard:runtime.form.basics")}
+      title={t("dashboard:runtime.form.basics")}
+    >
       <form.Field name="name">
         {(field) => {
           const error = firstMessage(field.state.meta.errors);
@@ -287,7 +290,8 @@ function RuntimeForm({ preset }: { preset: Preset }) {
   const nameAndNote = (
     <form.Subscribe selector={(state) => [state.values.slug, state.values.note] as const}>
       {([slug, note]) => (
-        <FormAdvanced
+        <AdvancedSection
+          gridClassName="lg:grid-cols-1"
           title={t("dashboard:runtime.form.nameAndNote")}
           summary={[
             t("dashboard:runtime.form.summarySlug", { slug: slug || "—" }),
@@ -353,7 +357,7 @@ function RuntimeForm({ preset }: { preset: Preset }) {
               )}
             </form.Field>
           </div>
-        </FormAdvanced>
+        </AdvancedSection>
       )}
     </form.Subscribe>
   );
@@ -429,7 +433,11 @@ function RuntimeForm({ preset }: { preset: Preset }) {
       </form.Subscribe>
       <form.Subscribe selector={(state) => state}>
         {({ isSubmitting, values }) => (
-          <FormActionBar summary={<CreateSummary values={values} />}>
+          <FormActionBar>
+            {/* What will be created, before the actions (primary last). */}
+            <div className="min-w-0 basis-full text-sm break-words text-muted-foreground sm:mr-auto sm:basis-0 sm:flex-1">
+              <CreateSummary values={values} />
+            </div>
             <Link
               to="/$lang/runtimes"
               params={{ lang }}

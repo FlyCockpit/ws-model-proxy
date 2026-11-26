@@ -24,6 +24,7 @@ import { PageHeading } from "@/components/page-stub";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/access/contributions")({
+  staticData: { pendingShape: "list" },
   component: AccessContributionsPage,
 });
 

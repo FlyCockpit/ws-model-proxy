@@ -27,6 +27,7 @@ import { useNamespaceT } from "@/i18n/use-namespace-t";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/settings/")({
+  staticData: { pendingShape: "form" },
   component: ProfileSettings,
 });
 

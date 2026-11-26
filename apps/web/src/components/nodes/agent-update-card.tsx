@@ -520,7 +520,7 @@ function InstallAnyway({
         {t(`${K}.anyway.button`, values)}
       </Button>
       <Dialog open={confirming} onOpenChange={setConfirming}>
-        <DialogContent className="max-h-[90dvh] overflow-x-hidden overflow-y-auto overscroll-contain sm:max-w-lg">
+        <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>{t(`${K}.anyway.title`, values)}</DialogTitle>
             <DialogDescription>
@@ -637,7 +637,7 @@ function ForceUpdateDialog({
   const count = view.runningInstances.length;
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90dvh] overflow-x-hidden overflow-y-auto overscroll-contain sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>{t(`${K}.forceTitle`, { count, slug: view.slug })}</DialogTitle>
           <DialogDescription>{t(`${K}.forceDescription`)}</DialogDescription>

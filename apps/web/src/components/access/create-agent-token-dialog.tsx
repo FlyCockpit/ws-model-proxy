@@ -3,6 +3,15 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
+import {
+  Sheet,
+  SheetBody,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from "@ws-model-proxy/ui/components/sheet";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { type ReactNode, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -11,7 +20,6 @@ import z from "zod";
 import { AgentAccessChoice, agentAccessSummaryText } from "@/components/access/agent-access-choice";
 import { SecretReveal } from "@/components/access/secret-reveal";
 import { CodeSnippet } from "@/components/code-snippet";
-import { FormSheet, focusFirstInvalid } from "@/components/form-surface";
 import { InlineRetry } from "@/components/inline-retry";
 import {
   agentAccessSchema,
@@ -23,6 +31,7 @@ import {
   agentTokenExpiryPresets,
   localDateInputValue,
 } from "@/lib/agent-token-expiry";
+import { focusFirstInvalid } from "@/lib/form-focus";
 import { orpc } from "@/utils/orpc";
 
 /**
@@ -67,15 +76,23 @@ export function CreateAgentTokenDialog({
         )
       : null;
   const renderDialog = (children: ReactNode, footer?: ReactNode) => (
-    <FormSheet
-      open={open}
-      onOpenChange={(next) => (next ? onOpenChange(true) : close())}
-      title={secret ? t("access:agents.created") : t("access:agents.createTitle")}
-      description={secret ? undefined : t("access:agents.tokensDescription")}
-      footer={footer}
-    >
-      {children}
-    </FormSheet>
+    <Sheet open={open} onOpenChange={(next) => (next ? onOpenChange(true) : close())}>
+      {/* The long-form side sheet (template): header and action bar stay put, the body scrolls. */}
+      <SheetContent size="wide" className="overflow-x-hidden pt-(--safe-area-top)">
+        <SheetHeader>
+          <SheetTitle className="text-base font-semibold">
+            {secret ? t("access:agents.created") : t("access:agents.createTitle")}
+          </SheetTitle>
+          {secret ? null : (
+            <SheetDescription className="text-sm">
+              {t("access:agents.tokensDescription")}
+            </SheetDescription>
+          )}
+        </SheetHeader>
+        <SheetBody>{children}</SheetBody>
+        {footer ? <SheetFooter className="sm:flex-col">{footer}</SheetFooter> : null}
+      </SheetContent>
+    </Sheet>
   );
   return secret ? (
     renderDialog(
@@ -185,7 +202,7 @@ function ReadyAgentTokenForm({
     },
     validators: { onSubmit: createSchema },
     // Errors sit next to their field; focus moves to the first one (after React shows them).
-    onSubmitInvalid: () => window.setTimeout(() => focusFirstInvalid(formRef.current), 0),
+    onSubmitInvalid: () => focusFirstInvalid(formRef.current),
     onSubmit: async ({ value }) => {
       const expiresAt = agentTokenExpiry(
         value.expiry,

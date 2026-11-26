@@ -438,7 +438,7 @@ describe("new runtime: the quick path first", { timeout: 20_000 }, () => {
     const error = document.getElementById("runtime-spec-commands-error");
     expect(error?.textContent).not.toBe("");
     // Nothing else is marked invalid, so focus lands on the list's error itself.
-    expect(document.activeElement).toBe(error);
+    await waitFor(() => expect(document.activeElement).toBe(error));
     expect(state.create).not.toHaveBeenCalled();
   });
   it("renames one model in the commands without capturing another model's mentions", async () => {
@@ -488,5 +488,15 @@ describe("new runtime: the quick path first", { timeout: 20_000 }, () => {
       "dashboard:runtime.form.noteTooLong",
     );
     expect(state.create).not.toHaveBeenCalled();
+  });
+  it("names each essential section as a region for screen readers", async () => {
+    mount();
+    fireEvent.click(await screen.findByRole("button", { name: /presets\.vllm\.title/ }));
+    for (const name of [
+      "dashboard:runtime.form.basics",
+      "dashboard:runtime.specForm.sections.model",
+      "dashboard:runtime.specForm.sections.size",
+    ])
+      expect(screen.getByRole("region", { name })).toBeTruthy();
   });
 });

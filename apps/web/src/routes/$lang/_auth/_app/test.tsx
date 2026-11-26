@@ -9,6 +9,7 @@ function parseTestSearch(search: Record<string, unknown>): { target?: string } {
 }
 
 export const Route = createFileRoute("/$lang/_auth/_app/test")({
+  staticData: { pendingShape: "form" },
   validateSearch: parseTestSearch,
   component: TestRoute,
 });

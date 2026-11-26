@@ -241,7 +241,7 @@ function StartAllDialog({
         : slugOf(value);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90dvh] overflow-x-hidden overflow-y-auto overscroll-contain sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>{t(`${K}.dialogTitle`, { count: eligible.length })}</DialogTitle>
           <DialogDescription>{t(`${K}.dialogDescription`)}</DialogDescription>

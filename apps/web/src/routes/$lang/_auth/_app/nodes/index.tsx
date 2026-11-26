@@ -20,6 +20,7 @@ import { useNodeLive } from "@/stores/node-live";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/nodes/")({
+  staticData: { pendingShape: "list" },
   component: NodesPage,
 });
 
@@ -94,10 +95,14 @@ function NodesPage() {
         </ul>
       )}
 
-      <div className="grid min-w-0 gap-4 lg:grid-cols-2">
-        <EnrollmentCodesCard />
-        <FabricsCard lang={lang} />
-      </div>
+      {/* Below the list only once it has settled: the list's skeleton and its result differ in
+          height (no nodes is one short card), and cards drawn under it would jump. */}
+      {nodes.isPending ? null : (
+        <div className="grid min-w-0 gap-4 lg:grid-cols-2">
+          <EnrollmentCodesCard />
+          <FabricsCard lang={lang} />
+        </div>
+      )}
 
       <AddNodeDialog open={adding} onOpenChange={setAdding} lang={lang} />
     </div>

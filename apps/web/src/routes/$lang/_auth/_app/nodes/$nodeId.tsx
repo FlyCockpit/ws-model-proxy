@@ -26,6 +26,7 @@ import { isNotFound } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/nodes/$nodeId")({
+  staticData: { pendingShape: "detail" },
   component: NodeDetailPage,
 });
 

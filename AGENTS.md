@@ -129,7 +129,13 @@ runner; `prisma migrate resolve` only in the documented recovery steps, run by t
 - Route auth checks use `apps/web/src/server/auth-session.ts` plus pure
   decisions from `apps/web/src/lib/route-session-access.ts`. Do not call
   `authClient.getSession()` from route files.
-- Content loading states use layout-matching `Skeleton` components.
+- Content loading states use layout-matching `Skeleton` components. A route's pending state is
+  drawn inside the app frame and shaped by its `staticData.pendingShape` (list, detail, form,
+  dashboard; `apps/web/src/lib/pending-layout.ts`): the header, sidebar and bottom nav are on
+  screen from the first painted frame. Check with `pnpm check:shell-loading --url <app>`.
+- A dialog holds a short form or a confirmation and fits without inner scrolling at 1280×800 and
+  390×844; a longer form is a page or a wide side sheet. Every dialog is listed in
+  `scripts/browser-checks.config.ts`; check with `pnpm check:dialogs --url <app>`.
 - Forms use TanStack Form with native Zod validators.
 - Mobile touch targets should be at least 44px.
 - Respect safe-area CSS variables for edge-to-edge mobile layouts.

@@ -28,6 +28,7 @@ import { StatusPill } from "@/components/status-pill";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/pools/$poolId/aliases")({
+  staticData: { pendingShape: "list" },
   component: PoolAliasesPage,
 });
 

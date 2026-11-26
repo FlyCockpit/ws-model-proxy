@@ -22,6 +22,7 @@ import {
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
+import { AdvancedSection } from "@ws-model-proxy/ui/components/form-page";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
@@ -31,10 +32,9 @@ import { Plus, RefreshCw, Trash } from "lucide-react";
 import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
-
-import { FormAdvanced, focusFirstInvalid } from "@/components/form-surface";
 import { Help } from "@/components/help";
 import { LabelledSelect } from "@/components/labelled-select";
+import { focusFirstInvalid } from "@/lib/form-focus";
 import { specIssueText } from "@/lib/spec-issue-text";
 import { orpc } from "@/utils/orpc";
 
@@ -142,7 +142,7 @@ export function PlacementCard({ node }: { node: NodeDetail }) {
       });
     },
     // The limits sit in a collapsed section: a refused save opens it and focuses the field.
-    onSubmitInvalid: () => window.setTimeout(() => focusFirstInvalid(formRef.current), 0),
+    onSubmitInvalid: () => focusFirstInvalid(formRef.current),
   });
   const formRef = useRef<HTMLFormElement>(null);
 
@@ -202,7 +202,8 @@ export function PlacementCard({ node }: { node: NodeDetail }) {
               }
             >
               {([portStart, portEnd, commandMaxHours]) => (
-                <FormAdvanced
+                <AdvancedSection
+                  gridClassName="lg:grid-cols-1"
                   title={t("dashboard:nodes.definition.limitsTitle")}
                   summary={t("dashboard:nodes.definition.limitsSummary", {
                     start: portStart,
@@ -265,7 +266,7 @@ export function PlacementCard({ node }: { node: NodeDetail }) {
                       </div>
                     )}
                   </form.Field>
-                </FormAdvanced>
+                </AdvancedSection>
               )}
             </form.Subscribe>
             <div className="flex flex-wrap gap-2">
@@ -789,7 +790,8 @@ function HardwareDeclaration({ form, pending }: { form: HardwareForm; pending: b
     >
       <form.Subscribe selector={(state) => state.values}>
         {(values) => (
-          <FormAdvanced
+          <AdvancedSection
+            gridClassName="lg:grid-cols-1"
             title={t("dashboard:nodes.hardware.overrideTitle")}
             summary={overrideSummary(t, values)}
           >
@@ -883,7 +885,7 @@ function HardwareDeclaration({ form, pending }: { form: HardwareForm; pending: b
             <Button type="submit" className="min-h-[44px]" disabled={pending}>
               {t("common:actions.save")}
             </Button>
-          </FormAdvanced>
+          </AdvancedSection>
         )}
       </form.Subscribe>
     </form>

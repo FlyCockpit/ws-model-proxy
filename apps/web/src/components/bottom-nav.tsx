@@ -42,6 +42,7 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
 
   return (
     <nav
+      data-bottom-nav=""
       className="fixed bottom-0 left-0 right-0 z-50 border-t bg-background/80 backdrop-blur-lg md:hidden"
       style={{ paddingBottom: "var(--safe-area-bottom)" }}
     >

@@ -18,6 +18,7 @@ import { TimeAgo } from "@/components/time-ago";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/activity/requests")({
+  staticData: { pendingShape: "list" },
   component: ActivityRequestsPage,
 });
 

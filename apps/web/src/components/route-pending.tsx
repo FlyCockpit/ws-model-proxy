@@ -23,9 +23,6 @@ export function RoutePending() {
         <PageSkeleton />
       </AppFrame>
     );
-  return (
-    <div className="container mx-auto flex min-w-0 max-w-6xl flex-col px-4 py-4 md:py-6">
-      <PageSkeleton />
-    </div>
-  );
+  // Admin and public pages draw their own containers: so does their skeleton.
+  return <PageSkeleton pageContainer />;
 }

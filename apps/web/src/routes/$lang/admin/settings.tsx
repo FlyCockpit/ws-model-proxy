@@ -29,6 +29,7 @@ import { InlineRetry } from "@/components/inline-retry";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/admin/settings")({
+  staticData: { pendingShape: "form", pendingWidth: "narrow" },
   component: AdminSettings,
 });
 

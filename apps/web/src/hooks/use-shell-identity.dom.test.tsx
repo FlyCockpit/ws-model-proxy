@@ -8,11 +8,19 @@ const state = vi.hoisted(() => ({
     session: null | { user: { role?: string | null } };
   },
   matches: [] as Array<{ context: unknown; routeId?: string }>,
+  pathname: undefined as string | undefined,
 }));
 
 vi.mock("@tanstack/react-router", () => ({
-  useRouterState: ({ select }: { select: (router: { matches: unknown[] }) => unknown }) =>
-    select({ matches: state.matches }),
+  useRouterState: ({
+    select,
+  }: {
+    select: (router: { matches: unknown[]; location?: { pathname: string } }) => unknown;
+  }) =>
+    select({
+      matches: state.matches,
+      ...(state.pathname ? { location: { pathname: state.pathname } } : {}),
+    }),
 }));
 vi.mock("@/hooks/use-auth-session", () => ({ useAuthSession: () => ({ state: state.client }) }));
 
@@ -60,6 +68,13 @@ describe("useShellIdentity", () => {
       signedIn: true,
       role: null,
     });
+    // Before any match exists, a signed-in path draws it too (and a public one never does).
+    state.matches = [];
+    state.pathname = "/en-US/pools";
+    expect(renderHook(() => useShellIdentity()).result.current.signedIn).toBe(true);
+    state.pathname = "/en-US/login";
+    expect(renderHook(() => useShellIdentity()).result.current.signedIn).toBe(false);
+    state.pathname = undefined;
     // A public page never does.
     state.matches = [{ routeId: "/$lang/login", context: {} }];
     expect(renderHook(() => useShellIdentity()).result.current.signedIn).toBe(false);

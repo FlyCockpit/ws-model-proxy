@@ -9,6 +9,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
+import { AdvancedSection, FormActionBar } from "@ws-model-proxy/ui/components/form-page";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
@@ -17,8 +18,6 @@ import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
-
-import { FormActionBar, FormAdvanced, focusFirstInvalid } from "@/components/form-surface";
 import { InlineRetry } from "@/components/inline-retry";
 import { RuntimeSpecFields } from "@/components/runtimes/runtime-spec-fields";
 import { VersionHistory } from "@/components/runtimes/version-history";
@@ -26,6 +25,7 @@ import { StatusPill } from "@/components/status-pill";
 import { SwitchRow } from "@/components/switch-row";
 import { useAppForm } from "@/hooks/use-app-form";
 import { rejectedDefinesWarning } from "@/lib/define-rejections";
+import { focusFirstInvalid } from "@/lib/form-focus";
 import { refusalText } from "@/lib/refusal-text";
 import {
   editorValues,
@@ -37,6 +37,7 @@ import {
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/runtimes/$runtimeId/definition")({
+  staticData: { pendingShape: "form" },
   component: RuntimeDefinitionPage,
 });
 
@@ -131,7 +132,7 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
       restartRunning: false,
     },
     validators: { onSubmit: schema },
-    onSubmitInvalid: () => window.setTimeout(() => focusFirstInvalid(formRef.current), 0),
+    onSubmitInvalid: () => focusFirstInvalid(formRef.current),
     onSubmit: async ({ value }) => {
       const reading = readSpecEditor(value.spec, kind, messages);
       if (!reading.ok) return;
@@ -187,7 +188,8 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
         advanced={
           <form.Subscribe selector={(state) => state.values.note}>
             {(note) => (
-              <FormAdvanced
+              <AdvancedSection
+                gridClassName="lg:grid-cols-1"
                 title={t("dashboard:runtime.form.versionNote")}
                 summary={
                   note.trim()
@@ -218,7 +220,7 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
                     </div>
                   )}
                 </form.Field>
-              </FormAdvanced>
+              </AdvancedSection>
             )}
           </form.Subscribe>
         }
@@ -238,9 +240,10 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
       ) : null}
       <form.Subscribe selector={(state) => state}>
         {({ isSubmitting, values }) => (
-          <FormActionBar
-            summary={<EditHint runtime={runtime} spec={values.spec} messages={messages} />}
-          >
+          <FormActionBar>
+            <div className="min-w-0 basis-full text-sm break-words text-muted-foreground sm:mr-auto sm:basis-0 sm:flex-1">
+              <EditHint runtime={runtime} spec={values.spec} messages={messages} />
+            </div>
             <Button type="submit" size="touch" disabled={isSubmitting}>
               {isSubmitting ? t("common:actions.saving") : t("dashboard:runtime.saveVersion")}
             </Button>

@@ -173,7 +173,7 @@ describe("Create agent token", () => {
     fireEvent.click(screen.getByRole("radio", { name: "access:agents.presets.full.name" }));
     expect(summary.textContent).toContain("access:agents.presets.full.name");
     const create = screen.getByRole("button", { name: "access:agents.create" });
-    expect(create.closest('[data-slot="form-sheet-footer"]')).toContain(summary);
+    expect(create.closest('[data-slot="sheet-footer"]')).toContain(summary);
   });
 
   it("shows the name error next to the field and moves focus there", async () => {

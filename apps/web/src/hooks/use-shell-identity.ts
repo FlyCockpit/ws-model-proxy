@@ -1,5 +1,6 @@
 import { useRouterState } from "@tanstack/react-router";
 
+import { shellPartsOf } from "@/components/shell-skeleton";
 import { useAuthSession } from "@/hooks/use-auth-session";
 
 /** Layout routes whose guard admits only a signed-in person. */
@@ -36,7 +37,10 @@ export function useShellIdentity(): ShellIdentity {
       // A reload into a signed-in page, its guard still checking: the page is only ever drawn
       // signed in (a signed-out visit redirects to the login page), so the nav is too, role
       // unknown until the guard answers.
-      return router.matches.some((match) => SIGNED_IN_ROUTES.has(match.routeId)) ? "" : null;
+      if (router.matches.some((match) => SIGNED_IN_ROUTES.has(match.routeId))) return "";
+      // Before the matches exist (the first render of a reload), the path says the same.
+      const pathname = router.location?.pathname;
+      return pathname && shellPartsOf(pathname).bottomNav ? "" : null;
     },
   });
   if (state.session) {

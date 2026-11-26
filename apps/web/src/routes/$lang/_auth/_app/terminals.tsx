@@ -66,6 +66,7 @@ import { useUiPreferences } from "@/stores/ui-preferences";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/terminals")({
+  staticData: { pendingShape: "detail" },
   component: TerminalsPage,
 });
 
@@ -464,7 +465,7 @@ function NewTerminalDialog({
   const { t } = useTranslation(["terminals"]);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[calc(var(--app-page-height,100dvh)-1rem)] overflow-x-hidden overflow-y-auto sm:max-w-md">
+      <DialogContent className="max-h-[calc(var(--app-page-height,100dvh)-1rem)] sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{t("terminals:header.newTerminalTitle")}</DialogTitle>
           <DialogDescription>{t("terminals:nodesDescription")}</DialogDescription>

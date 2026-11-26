@@ -50,6 +50,7 @@ import {
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/runtimes/$runtimeId/")({
+  staticData: { pendingShape: "detail" },
   component: RuntimeOverviewPage,
 });
 

@@ -28,6 +28,7 @@ import { WELCOME_STEPS, type WelcomeStep } from "@/lib/welcome-steps";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/overview")({
+  staticData: { pendingShape: "dashboard" },
   component: OverviewPage,
 });
 

@@ -23,6 +23,7 @@ import { callSnippet, type SnippetKind } from "@/lib/call-snippets";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/models")({
+  staticData: { pendingShape: "list" },
   component: ModelsPage,
 });
 

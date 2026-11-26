@@ -2,6 +2,7 @@ import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
+import { AdvancedSection } from "@ws-model-proxy/ui/components/form-page";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
@@ -11,7 +12,6 @@ import { Plus } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
-
 import { ConfirmAction } from "@/components/access/confirm-action";
 import { OwnKeyChoice } from "@/components/access/own-key-choice";
 import {
@@ -36,14 +36,15 @@ import {
   priorityItems,
   priorityLabel,
 } from "@/components/access/pool-shares-utils";
-import { FormAdvanced, focusFirstInvalid } from "@/components/form-surface";
 import { InlineRetry } from "@/components/inline-retry";
 import { LabelledSelect } from "@/components/labelled-select";
 import { PageHeading } from "@/components/page-stub";
 import { SegmentedControl } from "@/components/segmented-control";
+import { focusFirstInvalid } from "@/lib/form-focus";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/access/shares")({
+  staticData: { pendingShape: "list" },
   component: AccessSharesPage,
 });
 
@@ -241,8 +242,7 @@ function CreateShareForm({
     },
     validators: { onSubmit: createSchema },
     // Errors sit next to their field; focus moves to the first one.
-    onSubmitInvalid: () =>
-      window.setTimeout(() => focusFirstInvalid(document.getElementById(formId)), 0),
+    onSubmitInvalid: () => focusFirstInvalid(document.getElementById(formId)),
     onSubmit: async ({ value }) => {
       const email = value.email.trim().toLowerCase();
       // Both answer alike: a share (a proved mailbox) or an invite, whose link is shown once
@@ -440,7 +440,8 @@ function CreateShareForm({
                     />
                   )}
                 </form.Field>
-                <FormAdvanced
+                <AdvancedSection
+                  gridClassName="lg:grid-cols-1"
                   title={t("access:shares.priority")}
                   summary={t("access:shares.priorityValue", {
                     priority: priorityLabel(t, priority),
@@ -456,7 +457,7 @@ function CreateShareForm({
                       />
                     )}
                   </form.Field>
-                </FormAdvanced>
+                </AdvancedSection>
               </>
             ) : null
           }

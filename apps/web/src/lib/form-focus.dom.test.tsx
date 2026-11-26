@@ -1,13 +1,13 @@
 // @vitest-environment jsdom
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { focusFirstInvalid } from "./form-surface";
+import { focusFirstInvalid } from "./form-focus";
 
 afterEach(cleanup);
 
-describe("focusFirstInvalid", () => {
-  it("opens the collapsed sections around the first invalid input and focuses it", () => {
+describe("focusFirstInvalid (the template's, plus the inline-error fallback)", () => {
+  it("opens the collapsed sections around the first invalid input and focuses it", async () => {
     const { container } = render(
       <form>
         <input id="ok" />
@@ -21,12 +21,12 @@ describe("focusFirstInvalid", () => {
         <input id="later" aria-invalid="true" />
       </form>,
     );
-    expect(focusFirstInvalid(container)).toBe(true);
-    expect(document.activeElement?.id).toBe("bad");
+    focusFirstInvalid(container);
+    await waitFor(() => expect(document.activeElement?.id).toBe("bad"));
     for (const details of container.querySelectorAll("details")) expect(details.open).toBe(true);
   });
 
-  it("falls back to an error no input owns, so it is never left inside a closed section", () => {
+  it("falls back to an error no input owns, so it is never left inside a closed section", async () => {
     const { container } = render(
       <form>
         <details>
@@ -37,17 +37,19 @@ describe("focusFirstInvalid", () => {
         </details>
       </form>,
     );
-    expect(focusFirstInvalid(container)).toBe(true);
-    expect(document.activeElement?.id).toBe("list-error");
+    focusFirstInvalid(container);
+    await waitFor(() => expect(document.activeElement?.id).toBe("list-error"));
     expect(container.querySelector("details")?.open).toBe(true);
   });
 
-  it("does nothing when nothing is invalid", () => {
+  it("does nothing when nothing is invalid", async () => {
     const { container } = render(
       <form>
         <input />
       </form>,
     );
-    expect(focusFirstInvalid(container)).toBe(false);
+    focusFirstInvalid(container);
+    await new Promise((done) => requestAnimationFrame(() => done(null)));
+    expect(document.activeElement).toBe(document.body);
   });
 });

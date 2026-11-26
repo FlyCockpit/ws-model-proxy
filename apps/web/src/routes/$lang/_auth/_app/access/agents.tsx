@@ -27,6 +27,7 @@ import { TimeAgo } from "@/components/time-ago";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/access/agents")({
+  staticData: { pendingShape: "list" },
   component: AccessAgentsPage,
 });
 
@@ -52,7 +53,14 @@ function AccessAgentsPage() {
     <div className="flex min-w-0 flex-col gap-6">
       <PageHeading page="accessAgents" />
       {tokens.isPending ? (
-        <Skeleton aria-hidden="true" className="h-20 w-full rounded-xl" />
+        // The card itself with only the URL as a skeleton, so the page does not move when it loads.
+        <Card aria-hidden="true">
+          <CardContent className="min-w-0 flex-1 space-y-1.5">
+            <p className="text-sm font-medium">{t("access:agents.mcpUrl")}</p>
+            <Skeleton className="h-11 w-full" />
+            <p className="text-xs text-muted-foreground">{t("access:agents.mcpHint")}</p>
+          </CardContent>
+        </Card>
       ) : tokens.isError ? null : (
         <Card>
           <CardContent className="min-w-0 flex-1 space-y-1.5">
@@ -94,7 +102,9 @@ function AccessAgentsPage() {
           )}
         </CardContent>
       </Card>
-      <OAuthConnections />
+      {/* Below the tokens only once they have loaded: their skeleton and the list differ in
+          height, and a card drawn under them would jump. */}
+      {tokens.isPending ? null : <OAuthConnections />}
       <CreateAgentTokenDialog
         open={createOpen}
         onOpenChange={setCreateOpen}

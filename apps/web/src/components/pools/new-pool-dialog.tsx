@@ -2,6 +2,7 @@ import { useForm, useStore } from "@tanstack/react-form";
 import { type UseQueryResult, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
+import { AdvancedSection } from "@ws-model-proxy/ui/components/form-page";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
@@ -11,13 +12,12 @@ import type { TFunction } from "i18next";
 import { useId, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
-
 import { FieldErrors } from "@/components/field-errors";
-import { FormAdvanced, focusFirstInvalid } from "@/components/form-surface";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
 import { SegmentedControl } from "@/components/segmented-control";
 import { type CreatedPool, useCreatePool } from "@/hooks/use-create-pool";
+import { focusFirstInvalid } from "@/lib/form-focus";
 import { MODEL_TYPES, type ModelType, parseMemberChoice, servedModelChoices } from "@/lib/pool-ui";
 import { refusalText } from "@/lib/refusal-text";
 import { SLUG_PATTERN, slugify } from "@/lib/slugify";
@@ -70,8 +70,7 @@ function useNewPoolForm(
     defaultValues,
     validators: { onSubmit: schema },
     // Errors sit next to their field; focus moves to the first one (opening the slug section).
-    onSubmitInvalid: () =>
-      window.setTimeout(() => focusFirstInvalid(document.getElementById(formId)), 0),
+    onSubmitInvalid: () => focusFirstInvalid(document.getElementById(formId)),
     onSubmit: ({ value }) => submit(value),
   });
 }
@@ -209,7 +208,7 @@ export function NewPoolDialog({
     >
       <form
         id={formId}
-        className="flex min-w-0 flex-col gap-4 pb-4"
+        className="flex min-w-0 flex-col gap-3 pb-2 md:gap-4 md:pb-4"
         onSubmit={(event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -495,7 +494,8 @@ function SlugAdvanced({ form, onEdit }: { form: NewPoolForm; onEdit: () => void 
   return (
     <form.Subscribe selector={(state) => state.values.slug}>
       {(slug) => (
-        <FormAdvanced
+        <AdvancedSection
+          gridClassName="lg:grid-cols-1"
           title={t("dashboard:pool.form.slugSection")}
           summary={
             slug
@@ -504,7 +504,7 @@ function SlugAdvanced({ form, onEdit }: { form: NewPoolForm; onEdit: () => void 
           }
         >
           <SlugField form={form} onEdit={onEdit} />
-        </FormAdvanced>
+        </AdvancedSection>
       )}
     </form.Subscribe>
   );

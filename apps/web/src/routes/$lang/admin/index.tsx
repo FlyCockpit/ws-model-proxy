@@ -12,6 +12,7 @@ import { Activity, Settings, Users } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 export const Route = createFileRoute("/$lang/admin/")({
+  staticData: { pendingShape: "dashboard", pendingWidth: "wide" },
   component: AdminOverview,
 });
 

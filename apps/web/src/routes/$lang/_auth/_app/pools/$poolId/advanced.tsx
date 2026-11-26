@@ -33,6 +33,7 @@ import { SLUG_PATTERN } from "@/lib/slugify";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/pools/$poolId/advanced")({
+  staticData: { pendingShape: "form" },
   component: PoolAdvancedPage,
 });
 

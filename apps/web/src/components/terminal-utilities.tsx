@@ -298,7 +298,7 @@ function PasteDialog({ open, onClose, controls, returnFocus }: DialogProps) {
       }}
     >
       <DialogContent
-        className="max-h-[calc(var(--app-page-height,100dvh)-1rem)] overflow-x-hidden overflow-y-auto sm:max-w-md"
+        className="max-h-[calc(var(--app-page-height,100dvh)-1rem)] sm:max-w-md"
         finalFocus={() => returnFocus() ?? true}
       >
         <DialogHeader>
@@ -414,7 +414,7 @@ function PhotoDialog({ open, onClose, controls, returnFocus }: DialogProps) {
       }}
     >
       <DialogContent
-        className="max-h-[calc(var(--app-page-height,100dvh)-1rem)] overflow-x-hidden overflow-y-auto sm:max-w-md"
+        className="max-h-[calc(var(--app-page-height,100dvh)-1rem)] sm:max-w-md"
         finalFocus={() => returnFocus() ?? true}
       >
         <DialogHeader>

@@ -126,7 +126,9 @@ describe("Add account dialog", () => {
     expect(dialog.querySelector("select")).toBeNull();
     expect(within(dialog).getByRole("button", { name: "OpenRouter" })).toBeTruthy();
     // The base URL and key type are under a collapsed "Connection details" with what they are.
-    const details = dialog.querySelector("details[data-form-advanced]") as HTMLDetailsElement;
+    const details = dialog.querySelector(
+      'details[data-slot="advanced-section"]',
+    ) as HTMLDetailsElement;
     expect(details).toBeTruthy();
     expect(details.open).toBe(false);
     expect(details.textContent).toContain("https://openrouter.ai/api/v1");
@@ -148,7 +150,9 @@ describe("Add account dialog", () => {
 
   it("keeps the folded connection summary on the URL that will be used", async () => {
     const dialog = await openDialog();
-    const details = dialog.querySelector("details[data-form-advanced]") as HTMLDetailsElement;
+    const details = dialog.querySelector(
+      'details[data-slot="advanced-section"]',
+    ) as HTMLDetailsElement;
     details.open = true;
     fireEvent.change(within(dialog).getByLabelText("dashboard:providers.form.baseUrl"), {
       target: { value: "https://eu.openrouter.ai/api/v1" },
@@ -164,7 +168,7 @@ describe("Add account dialog", () => {
     fireEvent.click(
       within(dialog).getByRole("button", { name: "dashboard:providers.form.generic" }),
     );
-    expect(dialog.querySelector("details[data-form-advanced]")).toBeNull();
+    expect(dialog.querySelector('details[data-slot="advanced-section"]')).toBeNull();
     expect(
       (within(dialog).getByLabelText("dashboard:providers.form.baseUrl") as HTMLInputElement).value,
     ).toBe("");

@@ -59,7 +59,7 @@ export function ShellSkeleton() {
           paddingRight: "var(--safe-area-right)",
         }}
       >
-        <div className="min-w-0">
+        <div data-app-header="" className="min-w-0">
           <div className="flex min-w-0 flex-row items-center gap-4 px-4 py-2">
             <AppNameLink lang={lang} />
             <div aria-hidden="true" className="ml-auto flex shrink-0 items-center gap-2">
@@ -70,6 +70,22 @@ export function ShellSkeleton() {
           </div>
           <hr />
         </div>
+        {/* Fixed to the bottom, so its place in the document is free: right after the header, it
+            arrives with the first bytes of a slow load instead of last. */}
+        {parts.bottomNav ? (
+          <div
+            aria-hidden="true"
+            data-bottom-nav=""
+            className="fixed right-0 bottom-0 left-0 z-50 border-t bg-background/80 md:hidden"
+            style={{ paddingBottom: "var(--safe-area-bottom)" }}
+          >
+            <div className="flex h-14 items-center justify-around">
+              {Array.from({ length: 5 }, (_, index) => (
+                <Skeleton key={index} className="h-9 w-12 rounded-md" />
+              ))}
+            </div>
+          </div>
+        ) : null}
         <main
           id="main-content"
           tabIndex={-1}
@@ -91,25 +107,17 @@ export function ShellSkeleton() {
               </div>
             ) : null}
             <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
-              <div className="container mx-auto flex min-w-0 max-w-6xl flex-col px-4 py-4 md:py-6">
-                <PageSkeleton />
-              </div>
+              {parts.sidebar ? (
+                <div className="container mx-auto flex min-w-0 max-w-6xl flex-col px-4 py-4 md:py-6">
+                  <PageSkeleton />
+                </div>
+              ) : (
+                // Admin and public pages draw their own containers: so does their skeleton.
+                <PageSkeleton pageContainer />
+              )}
             </div>
           </div>
         </main>
-        {parts.bottomNav ? (
-          <div
-            aria-hidden="true"
-            className="fixed right-0 bottom-0 left-0 z-50 border-t bg-background/80 md:hidden"
-            style={{ paddingBottom: "var(--safe-area-bottom)" }}
-          >
-            <div className="flex h-14 items-center justify-around">
-              {Array.from({ length: 5 }, (_, index) => (
-                <Skeleton key={index} className="h-9 w-12 rounded-md" />
-              ))}
-            </div>
-          </div>
-        ) : null}
       </div>
     </>
   );

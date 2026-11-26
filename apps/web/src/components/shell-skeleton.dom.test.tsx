@@ -6,8 +6,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({ pathname: "/en-US/nodes" }));
 
 vi.mock("@tanstack/react-router", () => ({
-  useRouterState: ({ select }: { select: (s: { location: { pathname: string } }) => unknown }) =>
-    select({ location: { pathname: state.pathname } }),
+  useRouterState: ({
+    select,
+  }: {
+    select: (s: { location: { pathname: string }; matches: unknown[] }) => unknown;
+  }) => select({ location: { pathname: state.pathname }, matches: [] }),
+  useMatch: ({ select }: { select: (match: { routeId: string }) => unknown }) =>
+    select({ routeId: "__root__" }),
   Link: ({ children }: { children: ReactNode }) => <a href="/">{children}</a>,
 }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
@@ -30,6 +35,10 @@ describe("ShellSkeleton", () => {
       "#main-content",
     );
     expect(main.querySelector("[data-page-skeleton]")).toBeTruthy();
+    // The markers check:shell-loading measures: the header, the bottom nav, the route skeleton.
+    expect(document.querySelector("[data-app-header]")).toBeTruthy();
+    expect(document.querySelector("[data-bottom-nav]")).toBeTruthy();
+    expect(main.querySelector("[data-route-skeleton]")).toBeTruthy();
   });
 
   it("draws the sidebar column and the bottom bar only where the loaded page has them", () => {

@@ -18,6 +18,7 @@ import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/admin/observability")({
+  staticData: { pendingShape: "list", pendingWidth: "wide" },
   component: AdminObservability,
 });
 

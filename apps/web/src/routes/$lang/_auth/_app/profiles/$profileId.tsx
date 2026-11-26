@@ -11,6 +11,7 @@ import { isNotFound } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/profiles/$profileId")({
+  staticData: { pendingShape: "form" },
   component: ProfileEditorPage,
 });
 

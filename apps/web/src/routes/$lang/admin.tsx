@@ -9,6 +9,7 @@ import { decideAdminRouteAccess } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
 
 export const Route = createFileRoute("/$lang/admin")({
+  staticData: { pendingFrame: "admin" },
   beforeLoad: async () => {
     // 404-hide the entire admin tree from non-admins. Throwing notFound()
     // (instead of redirect) means an unauthorized visitor can't tell whether

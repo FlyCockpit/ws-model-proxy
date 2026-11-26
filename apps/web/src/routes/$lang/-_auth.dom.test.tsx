@@ -24,8 +24,25 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
     Outlet: () => <div data-testid="page" />,
     Link: ({ children }: { children: ReactNode }) => <a href="/x">{children}</a>,
     // The route guard already resolved the session (it is in the `_auth` match's context).
-    useRouterState: ({ select }: { select: (state: { matches: unknown[] }) => unknown }) =>
-      select({ matches: [{ context: {} }, { context: { session: { user: { role: "user" } } } }] }),
+    useRouterState: ({
+      select,
+    }: {
+      select: (state: { matches: unknown[]; location: { pathname: string } }) => unknown;
+    }) =>
+      select({
+        location: { pathname: "/en-US/nodes" },
+        matches: [
+          { routeId: "__root__", context: {} },
+          { routeId: "/$lang/_auth", context: { session: { user: { role: "user" } } } },
+          {
+            routeId: "/$lang/_auth/_app/nodes/",
+            context: {},
+            staticData: { pendingShape: "list" },
+          },
+        ],
+      }),
+    useMatch: ({ select }: { select: (match: { routeId: string }) => unknown }) =>
+      select({ routeId: "/$lang/_auth" }),
   };
 });
 vi.mock("react-i18next", () => ({
@@ -86,6 +103,10 @@ describe("/$lang/_auth loading states", () => {
     // The signed-in navigation is there already (from the route guard's session).
     expect(sidebar?.querySelectorAll("a").length).toBeGreaterThan(0);
     expect(document.querySelector("[data-page-skeleton]")).toBeTruthy();
+    // In the page's own shape: the nodes page is a list (its route's staticData).
+    expect(
+      document.querySelector("[data-route-skeleton]")?.getAttribute("data-route-skeleton"),
+    ).toBe("list");
     expect(document.querySelector('[data-testid="page"]')).toBeNull();
   });
 

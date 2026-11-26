@@ -26,6 +26,7 @@ import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/pools/$poolId/routing")({
+  staticData: { pendingShape: "form" },
   component: PoolRoutingPage,
 });
 

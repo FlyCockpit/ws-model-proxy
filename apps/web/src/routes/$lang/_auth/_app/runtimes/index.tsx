@@ -19,6 +19,7 @@ import type { RuntimeSummary } from "@/lib/pool-ui";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/runtimes/")({
+  staticData: { pendingShape: "list" },
   component: RuntimesPage,
 });
 
