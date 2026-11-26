@@ -282,7 +282,7 @@ function ReaderTextField({
           <Label htmlFor={id}>{label}</Label>
           <Input
             id={id}
-            className={mono ? "h-11 font-mono text-xs" : "h-11"}
+            className={mono ? "h-11 font-mono text-base md:text-xs" : "h-11"}
             autoCapitalize="none"
             spellCheck={false}
             inputMode={inputMode}
@@ -468,7 +468,7 @@ function ReaderSignalRow({
               </Label>
               <Input
                 id={`reader-map-${index}-${name}`}
-                className="h-11 font-mono text-xs"
+                className="h-11 font-mono text-base md:text-xs"
                 autoCapitalize="none"
                 spellCheck={false}
                 inputMode={name === "scale" ? "decimal" : undefined}

@@ -371,7 +371,7 @@ export const RuntimeSpecFields = withFieldGroup({
                         id={id("json")}
                         rows={22}
                         spellCheck={false}
-                        className="font-mono text-xs"
+                        className="font-mono text-base md:text-xs"
                         value={field.state.value}
                         onBlur={field.handleBlur}
                         onChange={(event) => field.handleChange(event.target.value)}

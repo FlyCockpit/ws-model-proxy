@@ -68,7 +68,13 @@ export function TerminalKeyRow({ controls }: { controls: ControlsOf }) {
     // keeps a 44px target and the swipe pad keeps room.
     <div className="@container relative min-w-0 shrink-0" data-key-row="">
       {grid ? <HoldGrid {...grid} /> : null}
-      <div role="toolbar" aria-label={t("keys.label")} className="flex min-w-0 gap-1">
+      {/* The five controls need 14.75rem at their 2.75rem floors: below that (a large default font on
+          a phone) the row wraps rather than clipping; above it, Ctrl and Alt shrink first. */}
+      <div
+        role="toolbar"
+        aria-label={t("keys.label")}
+        className="flex min-w-0 gap-1 @max-[15rem]:flex-wrap"
+      >
         <RowKey
           label={t("keys.keyboard")}
           className="hidden @min-[19rem]:inline-flex"
@@ -150,6 +156,11 @@ function ModifierKey({
           visibleTop: view?.visualViewport?.offsetTop ?? 0,
           viewportHeight: view?.innerHeight ?? rect.bottom,
           keys: TERMINAL_HOLD_GRID_KEYS.length,
+          // The grid's text and spacing are rem: its rows grow with the root font size.
+          rootPx:
+            Number.parseFloat(
+              view?.getComputedStyle(row.ownerDocument.documentElement).fontSize ?? "",
+            ) || undefined,
         });
         const container = row.ownerDocument.body;
         openRef.current = { layout, container };
@@ -204,7 +215,10 @@ function ModifierKey({
       data-modifier={modifier}
       data-latch={latch}
       className={cn(
-        "min-w-11 shrink-0 touch-none flex-col gap-0 px-1.5 font-mono text-sm leading-tight",
+        // Shrinks to its 44px target when a long state label (es-MX "mantén") or a large default
+        // font would push the row past a phone's width; the label then ends in an ellipsis (the
+        // aria-label keeps the full state).
+        "min-w-11 shrink touch-none flex-col gap-0 px-1.5 font-mono text-sm leading-tight",
         latch === "lock" && "ring-1 ring-primary",
       )}
       {...keepFocus}
@@ -238,7 +252,9 @@ function ModifierKey({
       }}
     >
       <span>{name}</span>
-      <span className="text-[10px] text-muted-foreground">{t(`keys.state.${latch}`)}</span>
+      <span className="max-w-full truncate text-xs text-muted-foreground">
+        {t(`keys.state.${latch}`)}
+      </span>
     </Button>
   );
 }
@@ -259,16 +275,19 @@ function HoldGrid({ modifier, hovered, layout, container }: GridState) {
         left: layout.left,
         width: layout.width,
         bottom: layout.bottom,
+        // Padding and gap from the layout: they shrink with it when the room is short.
+        padding: layout.padding,
       }}
-      className="fixed z-50 rounded-md border border-primary bg-(--term-chrome) p-2 text-(--term-fg) shadow-md"
+      className="fixed z-50 rounded-md border border-primary bg-(--term-chrome) text-(--term-fg) shadow-md"
     >
       <p className={layout.title ? "pb-1 text-xs text-(--term-muted)" : "sr-only"}>
         {t("keys.gridTitle", { key: t(`keys.${modifier}`) })}
       </p>
-      {/* Keys 44px wide (fewer columns on narrower rows) unless the room is too short for that. */}
+      {/* Keys 44px wide at a 16px root (fewer columns on narrower rows) unless the room is too short. */}
       <div
-        className="grid gap-1"
+        className="grid"
         style={{
+          gap: layout.gap,
           gridTemplateColumns: `repeat(${layout.columns}, minmax(0, 1fr))`,
           gridAutoRows: `${layout.cellHeight}px`,
         }}
@@ -279,14 +298,18 @@ function HoldGrid({ modifier, hovered, layout, container }: GridState) {
             <div
               key={key}
               data-grid-key={key}
+              // The key's font size comes from the layout (smaller measures shrink it) with
+              // text-sm's line height; the cell clips, so a key's text never reaches into its
+              // neighbour's hit area.
+              style={{ fontSize: layout.fontSize }}
               className={cn(
-                "flex min-w-0 flex-col items-center justify-center rounded-sm bg-(--term-bg) font-mono text-sm",
+                "flex min-w-0 flex-col items-center justify-center overflow-hidden rounded-sm bg-(--term-bg) font-mono leading-[calc(1.25/0.875)]",
                 hovered === key && "bg-primary text-primary-foreground",
               )}
             >
               <span>{key}</span>
               {hint && layout.hints ? (
-                <span className="max-w-full truncate text-[10px] opacity-70">
+                <span className="max-w-full truncate text-xs opacity-70">
                   {t(`keys.hints.${hint}`)}
                 </span>
               ) : null}

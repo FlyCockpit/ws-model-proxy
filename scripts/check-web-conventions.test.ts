@@ -73,6 +73,67 @@ describe("scanWebSource G8: the shells own the scroller and the footer", () => {
   });
 });
 
+describe("scanWebSource G10: text scales and stays at least 12px", () => {
+  it("rejects px font sizes and rem/em sizes below 0.75", () => {
+    for (const token of [
+      "text-[10px]",
+      "text-[13px]",
+      "md:text-[18px]",
+      "text-[10px]/4",
+      "text-[10px]/[120%]",
+      "text-[length:11px]",
+      "text-[0.625rem]",
+      "text-[0.7rem]",
+      "text-[.7em]",
+      "text-[0.9em]",
+      "[&_code]:text-[0.9em]",
+      "text-[length:calc(0.9em)]",
+      "text-[max(0.9em,0.5rem)]",
+      "text-[min(1rem,2vw)]",
+      "text-[clamp(10px,1vw,2rem)]",
+      "text-[clamp(0.625rem,1vw,2rem)]",
+      "text-[length:2vw]",
+      "text-[3vmin]",
+      "text-[2cqi]",
+      "text-[9pt]",
+      "text-[max(24px,0.75rem)]",
+      "text-[clamp(0.75rem,1vw,40px)]",
+      "text-[length:50%]",
+      "text-[length:calc(50%)]",
+    ])
+      rejects("G10", `<span className="${token} font-medium" />`);
+    rejects("G10", '<span className={cn("uppercase", compact && "text-[11px]")} />');
+    // Class lists outside a className attribute: cva() variants, constants, other props.
+    rejects(
+      "G10",
+      'const badge = cva("inline-flex", { variants: { size: { sm: "text-[10px]" } } });',
+    );
+    rejects("G10", "const LABEL = `max-w-full text-[11px]`;");
+    rejects("G10", '<Code preClassName="text-[10px]" />');
+  });
+  it("accepts the type scale, rem sizes from 0.75 and non-size text utilities", () => {
+    for (const token of [
+      "text-xs",
+      "text-sm/relaxed",
+      "text-[0.75rem]",
+      "text-[1.1em]",
+      "text-[length:110%]",
+      "text-[length:max(50%,0.75rem)]",
+      "text-[max(0.9em,0.75rem)]",
+      "[&_:not(pre)>code]:text-[length:max(0.9em,0.75rem)]",
+      "text-[max(0.9em,_0.75rem)]",
+      "text-[clamp(0.75rem,1vw,2rem)]",
+      "text-[1.125rem]",
+      "text-[var(--step)]",
+      "text-[length:var(--step)]",
+      "text-(--step)",
+      "min-h-[44px]",
+    ])
+      accepts(`<span className="${token}" />`);
+    accepts('<span className="text-[10px]" />', "apps/web/src/components/example.test.tsx");
+  });
+});
+
 describe("scanWebSource G9: surfaces follow the app theme", () => {
   it("rejects literal colour classes and prefers-color-scheme in app source", () => {
     for (const token of [

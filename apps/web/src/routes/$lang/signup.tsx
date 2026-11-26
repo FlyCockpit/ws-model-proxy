@@ -19,6 +19,7 @@ import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
+import { AUTH_SCREEN_CLASS } from "@/components/auth/auth-card";
 import { AuthFormSkeleton } from "@/components/auth/auth-form-skeleton";
 import { AuthRetryCard } from "@/components/auth/auth-retry-card";
 import { ResendVerification } from "@/components/auth/resend-verification";
@@ -61,7 +62,7 @@ function stripInviteRef(element: HTMLDivElement | null): void {
 
 function Frame({ children }: { children: ReactNode }) {
   return (
-    <div ref={stripInviteRef} className="flex min-h-[80vh] items-center justify-center px-4">
+    <div ref={stripInviteRef} className={AUTH_SCREEN_CLASS}>
       {children}
     </div>
   );

@@ -44,7 +44,9 @@ export function PageHeading({ page, level = 1 }: { page: StubPageKey; level?: 1 
   return (
     <div className="min-w-0 space-y-1">
       <Heading className="text-2xl font-semibold">{t(`dashboard:pages.${page}.title`)}</Heading>
-      <p className="text-sm text-muted-foreground">{t(`dashboard:pages.${page}.description`)}</p>
+      <p className="max-w-prose text-sm text-muted-foreground">
+        {t(`dashboard:pages.${page}.description`)}
+      </p>
     </div>
   );
 }

@@ -34,7 +34,7 @@ import { EditAgentAccessDialog } from "./edit-agent-access-dialog";
 let desktop = false;
 beforeEach(() => {
   vi.stubGlobal("matchMedia", (query: string) => ({
-    matches: query === "(min-width: 768px)" && desktop,
+    matches: query === "(min-width: 48rem)" && desktop,
     media: query,
     addEventListener: vi.fn(),
     removeEventListener: vi.fn(),

@@ -107,7 +107,7 @@ function FrameSkeleton({
     );
   // The settings layout (inside the app frame): its title, then a side nav (a row on phones).
   return (
-    <div className="min-w-0 max-w-4xl">
+    <div className="mx-auto w-full min-w-0 max-w-4xl">
       <Skeleton className="mb-6 h-8 w-32" />
       <div className="flex flex-col gap-6 md:flex-row md:gap-8">
         <div className="flex gap-1 md:w-48 md:shrink-0 md:flex-col">

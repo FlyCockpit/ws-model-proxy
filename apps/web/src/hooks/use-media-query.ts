@@ -1,8 +1,12 @@
 import { useSyncExternalStore } from "react";
 
-/** Matches Tailwind `md` and `useIsMobile()` (`min-width: 768px`). */
+/** Tailwind `md` in px at the browser-default 16px font size (the keyboard heuristic's fallback width). */
 export const MOBILE_BREAKPOINT_PX = 768;
-export const DESKTOP_MEDIA_QUERY = `(min-width: ${MOBILE_BREAKPOINT_PX}px)`;
+/**
+ * Tailwind `md` exactly (48rem): a rem media query follows the user's default font size, as the
+ * `md:` styles do, so JS and CSS flip at the same width when that default is larger than 16px.
+ */
+export const DESKTOP_MEDIA_QUERY = "(min-width: 48rem)";
 
 export function useMediaQuery(query: string): boolean {
   return useSyncExternalStore(

@@ -8,7 +8,7 @@ import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { AuthCard } from "@/components/auth/auth-card";
+import { AUTH_SCREEN_CLASS, AuthCard } from "@/components/auth/auth-card";
 import { EmailOnlyForm } from "@/components/auth/email-only-form";
 import { authClient } from "@/lib/auth-client";
 import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
@@ -44,7 +44,7 @@ function ForgotPasswordPage() {
 
   if (config.isPending) {
     return (
-      <div className="flex min-h-[80vh] items-center justify-center px-4">
+      <div className={AUTH_SCREEN_CLASS}>
         <div className="w-full max-w-md space-y-6">
           <div className="space-y-2 text-center">
             <Skeleton className="mx-auto h-8 w-48" />

@@ -46,7 +46,9 @@ function AdminObservability() {
     <div className="container mx-auto min-w-0 max-w-7xl space-y-6 px-4 py-8">
       <header className="space-y-1">
         <h1 className="text-2xl font-semibold tracking-tight">{t("admin:observability.title")}</h1>
-        <p className="text-sm text-muted-foreground">{t("admin:observability.description")}</p>
+        <p className="max-w-prose text-sm text-muted-foreground">
+          {t("admin:observability.description")}
+        </p>
       </header>
       <div className="flex min-w-0 flex-wrap items-end gap-3">
         <SegmentedControl

@@ -11,8 +11,8 @@ import {
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { useTranslation } from "react-i18next";
-
 import { AppFrame } from "@/components/app-frame";
+import { AUTH_SCREEN_CLASS } from "@/components/auth/auth-card";
 import { InlineRetry } from "@/components/inline-retry";
 import { PageSkeleton } from "@/components/page-skeleton";
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
@@ -106,7 +106,7 @@ function TwoFactorSetupRequired() {
   const { state } = enrollment;
 
   return (
-    <div className="flex min-h-[80vh] items-center justify-center px-4">
+    <div className={AUTH_SCREEN_CLASS}>
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
           <CardTitle className="text-2xl">{t("twoFactor.requiredTitle")}</CardTitle>

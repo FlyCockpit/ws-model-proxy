@@ -170,7 +170,9 @@ function StepCard({
             </span>
           ) : null}
         </CardTitle>
-        <CardDescription>{t(`dashboard:welcome.${current}.description`)}</CardDescription>
+        <CardDescription className="max-w-prose">
+          {t(`dashboard:welcome.${current}.description`)}
+        </CardDescription>
       </CardHeader>
       <CardContent className="min-w-0">
         <StepBody step={current} lang={lang} enrollment={enrollment} onEnrollment={onEnrollment} />

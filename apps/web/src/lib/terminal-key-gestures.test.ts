@@ -230,6 +230,91 @@ describe("holdGridLayout", () => {
     ).toMatchObject({ title: false });
   });
 
+  it("grows the cells with the root font size so the hints still fit", () => {
+    // 4K (the viewport scale's 150 %): a 24px root.
+    const scaled = holdGridLayout({
+      row: { left: 0, top: 1900, width: 900 },
+      visibleTop: 0,
+      viewportHeight: 2160,
+      keys,
+      rootPx: 24,
+    });
+    expect(scaled).toMatchObject({ cellHeight: 66, hints: true, title: true, columns: 7 });
+    expect(scaled.bottom).toBe(2160 - 1900 + 6);
+    // Room for 44px rows but not 60px ones at a 24px root: the hints go.
+    const tight = holdGridLayout({
+      row: { left: 0, top: 380, width: 420 },
+      visibleTop: 0,
+      viewportHeight: 844,
+      keys,
+      rootPx: 24,
+    });
+    expect(tight.cellHeight).toBeLessThan(60);
+    expect(tight.hints).toBe(false);
+    // A smaller root never shrinks the 44px touch rows.
+    expect(
+      holdGridLayout({
+        row: { left: 0, top: 780, width: 420 },
+        visibleTop: 0,
+        viewportHeight: 844,
+        keys,
+        rootPx: 12,
+      }),
+    ).toMatchObject({ cellHeight: 44, hints: true });
+  });
+
+  it("keeps a large default font's grid on screen: narrow columns, then smaller measures", () => {
+    // A 32px default font on a short screen: 24px-at-16px rows do not fit at the root's scale.
+    const top = 158;
+    const layout = holdGridLayout({
+      row: { left: 0, top, width: 262 },
+      visibleTop: 0,
+      viewportHeight: 600,
+      keys,
+      rootPx: 32,
+    });
+    const rows = Math.ceil(keys / layout.columns);
+    const inner = 262 - 2 * layout.padding - 2;
+    // No overlapping keys: every column is wider than its monospace key (~0.6em).
+    expect((inner - layout.gap * (layout.columns - 1)) / layout.columns).toBeGreaterThan(
+      0.6 * layout.fontSize,
+    );
+    expect(layout.fontSize).toBeGreaterThanOrEqual(12);
+    // The whole grid (padding, rows, gaps, border) sits below the visible top's margin.
+    const height = 2 * layout.padding + 2 + rows * layout.cellHeight + layout.gap * (rows - 1);
+    expect(top - layout.gap - height).toBeGreaterThanOrEqual(8);
+    expect(layout).toMatchObject({ title: false, hints: false });
+    expect(layout.gap).toBeLessThan(8);
+    // With room, the same root keeps its full measures.
+    expect(
+      holdGridLayout({
+        row: { left: 0, top: 1200, width: 900 },
+        visibleTop: 0,
+        viewportHeight: 1600,
+        keys,
+        rootPx: 32,
+      }),
+    ).toMatchObject({ gap: 8, padding: 16, fontSize: 28, cellHeight: 88, title: true });
+    // Even less room (100px above the row): 16px measures with 14px keys, every key still fits.
+    for (const roomTop of [100, 158]) {
+      const tight = holdGridLayout({
+        row: { left: 0, top: roomTop, width: 262 },
+        visibleTop: 0,
+        viewportHeight: 600,
+        keys,
+        rootPx: 32,
+      });
+      const tightRows = Math.ceil(keys / tight.columns);
+      const tightInner = 262 - 2 * tight.padding - 2;
+      const column = (tightInner - tight.gap * (tight.columns - 1)) / tight.columns;
+      expect(column).toBeGreaterThan(0.6 * tight.fontSize);
+      expect(tight.cellHeight).toBeGreaterThanOrEqual(1.25 * tight.fontSize);
+      const tightHeight =
+        2 * tight.padding + 2 + tightRows * tight.cellHeight + tight.gap * (tightRows - 1);
+      expect(roomTop - tight.gap - tightHeight).toBeGreaterThanOrEqual(8);
+    }
+  });
+
   it("measures from the visible top when the page is scrolled under the keyboard", () => {
     const shifted = holdGridLayout({
       row: { left: 0, top: 600, width: 324 },

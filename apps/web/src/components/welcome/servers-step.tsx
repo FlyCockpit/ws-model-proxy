@@ -22,7 +22,7 @@ export function ServersStep({ lang }: { lang: string }) {
       <div className="grid min-w-0 gap-3 md:grid-cols-2">
         <section className="flex min-w-0 flex-col items-start gap-2 rounded-lg border p-4">
           <h3 className="font-medium">{t("dashboard:welcome.runtime.presetTitle")}</h3>
-          <p className="text-sm text-muted-foreground">
+          <p className="max-w-prose text-sm text-muted-foreground">
             {t("dashboard:welcome.runtime.presetHint")}
           </p>
           <Link
@@ -36,10 +36,10 @@ export function ServersStep({ lang }: { lang: string }) {
         </section>
         <section className="flex min-w-0 flex-col items-start gap-2 rounded-lg border p-4">
           <h3 className="font-medium">{t("dashboard:welcome.runtime.runningTitle")}</h3>
-          <p className="text-sm text-muted-foreground">
+          <p className="max-w-prose text-sm text-muted-foreground">
             {t("dashboard:welcome.runtime.runningHint")}
           </p>
-          <p className="text-xs text-muted-foreground">
+          <p className="max-w-prose text-xs text-muted-foreground">
             {t("dashboard:welcome.runtime.noDetection")}
           </p>
           <Link

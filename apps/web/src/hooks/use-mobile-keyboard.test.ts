@@ -44,6 +44,27 @@ describe("getMobileKeyboardDecision", () => {
     ).toEqual({ isKeyboardOpen: false, nextBaselineHeight: 500 });
   });
 
+  it("follows the md media query over the px width when it is known", () => {
+    // A 20px browser default: md is 960px, so an 820px tablet still has the phone layout.
+    expect(
+      getMobileKeyboardDecision({
+        ...mobileFocused,
+        viewportWidth: 820,
+        desktopMedia: false,
+        visualViewportHeight: 500,
+        baselineHeight: 1000,
+      }).isKeyboardOpen,
+    ).toBe(true);
+    expect(
+      getMobileKeyboardDecision({
+        ...mobileFocused,
+        viewportWidth: 390,
+        desktopMedia: true,
+        visualViewportHeight: 400,
+      }),
+    ).toEqual({ isKeyboardOpen: false, nextBaselineHeight: 400 });
+  });
+
   it("recaptures the baseline on mobile when no editable is focused", () => {
     expect(
       getMobileKeyboardDecision({

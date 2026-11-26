@@ -45,7 +45,7 @@ export function MetricsChart({
             metric: label(metric),
             count: columns.length,
           })}
-          className="aspect-auto h-64 w-full min-w-[480px] sm:h-80"
+          className="aspect-auto h-64 w-full min-w-120 sm:h-80"
         >
           <LineChart
             data={[...rows]}
@@ -68,7 +68,9 @@ export function MetricsChart({
               tickFormatter={(value: number) => formatValue(metric, value)}
               tickLine={false}
               axisLine={false}
-              width={72}
+              // Measured from the rendered tick labels: their rem text grows with the viewport
+              // scale and the user's font size, so a fixed px width would clip them.
+              width="auto"
             />
             <Tooltip
               labelFormatter={(time) => (typeof time === "number" ? formatTime(time) : "")}

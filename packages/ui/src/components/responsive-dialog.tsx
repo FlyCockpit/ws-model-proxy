@@ -30,7 +30,9 @@ import { useSyncExternalStore } from "react";
  * mount — fine for an overlay, which is inherently a client interaction.
  */
 
-const DESKTOP_QUERY = "(min-width: 768px)";
+// Tailwind's `md` (48rem): rem media queries follow the browser's default font size, so the
+// switch and the `md:` styles inside the surface flip at the same width for every user.
+const DESKTOP_QUERY = "(min-width: 48rem)";
 
 function subscribe(callback: () => void): () => void {
   if (typeof window === "undefined") return () => {};
@@ -56,6 +58,12 @@ export type ResponsiveDialogProps = {
   footer?: React.ReactNode;
   /** Extra classes for the content surface (e.g. width on desktop). */
   className?: string;
+  /**
+   * Where focus goes when it closes. Needed when nothing triggers it (the phone drawer then has
+   * no trigger to return to) or when one dialog hands over to the next (an invite, then its
+   * result), so focus lands back on the control that started the flow.
+   */
+  returnFocus?: React.RefObject<HTMLElement | null>;
 };
 
 export function ResponsiveDialog({
@@ -66,6 +74,7 @@ export function ResponsiveDialog({
   children,
   footer,
   className,
+  returnFocus,
 }: ResponsiveDialogProps) {
   const isDesktop = useIsDesktop();
 
@@ -75,8 +84,9 @@ export function ResponsiveDialog({
         {/* DialogContent's body is the one scroller; DialogHeader and DialogFooter stick to its
             top and bottom, so the title and the primary action stay put. A dialog's form must be
             short enough that it never has to scroll (the dialog-fits check). */}
-        <DialogContent className={className}>
-          <DialogHeader>
+        <DialogContent className={className} finalFocus={returnFocus ?? true}>
+          {/* Titles and descriptions may carry user data (an email): long unbroken words wrap. */}
+          <DialogHeader className="min-w-0 [overflow-wrap:anywhere]">
             <DialogTitle>{title}</DialogTitle>
             {description ? <DialogDescription>{description}</DialogDescription> : null}
           </DialogHeader>
@@ -97,9 +107,18 @@ export function ResponsiveDialog({
         data-slot="dialog-content"
         className={className}
         style={{ paddingBottom: "var(--safe-area-bottom)" }}
+        onCloseAutoFocus={(event) => {
+          const target = returnFocus?.current;
+          if (!target?.isConnected) return;
+          event.preventDefault();
+          target.focus();
+        }}
       >
         {/* As on desktop: the header and the footer (the primary action) stay put. */}
-        <DrawerHeader data-slot="responsive-dialog-header" className="shrink-0">
+        <DrawerHeader
+          data-slot="responsive-dialog-header"
+          className="min-w-0 shrink-0 [overflow-wrap:anywhere]"
+        >
           <DrawerTitle>{title}</DrawerTitle>
           {description ? <DrawerDescription>{description}</DrawerDescription> : null}
         </DrawerHeader>

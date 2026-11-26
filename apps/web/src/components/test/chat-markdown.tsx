@@ -85,7 +85,7 @@ function rehypePrefixFootnoteLabel(prefix: string) {
 }
 
 const MARKDOWN_CLASS_NAME =
-  "min-w-0 max-w-full break-words text-sm leading-relaxed [&>*+*]:mt-3 [&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2 [&_blockquote]:border-s-2 [&_blockquote]:ps-3 [&_blockquote]:text-muted-foreground [&_code]:font-mono [&_:not(pre)>code]:rounded [&_:not(pre)>code]:bg-muted [&_:not(pre)>code]:px-1 [&_:not(pre)>code]:py-0.5 [&_:not(pre)>code]:text-[0.9em] [&_h3]:text-lg [&_h3]:font-semibold [&_h4]:text-base [&_h4]:font-semibold [&_h5]:font-semibold [&_h6]:font-semibold [&_hr]:border-border [&_li]:ms-5 [&_ol]:list-decimal [&_ul]:list-disc [&_table]:text-xs [&_td]:border [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:px-2 [&_th]:py-1 [&_th]:text-start";
+  "min-w-0 max-w-full break-words text-sm leading-relaxed [&>*+*]:mt-3 [&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2 [&_blockquote]:border-s-2 [&_blockquote]:ps-3 [&_blockquote]:text-muted-foreground [&_code]:font-mono [&_:not(pre)>code]:rounded [&_:not(pre)>code]:bg-muted [&_:not(pre)>code]:px-1 [&_:not(pre)>code]:py-0.5 [&_:not(pre)>code]:text-[length:max(0.9em,0.75rem)] [&_h3]:text-lg [&_h3]:font-semibold [&_h4]:text-base [&_h4]:font-semibold [&_h5]:font-semibold [&_h6]:font-semibold [&_hr]:border-border [&_li]:ms-5 [&_ol]:list-decimal [&_ul]:list-disc [&_sup]:text-xs [&_table]:text-xs [&_td]:border [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:px-2 [&_th]:py-1 [&_th]:text-start";
 
 /** A model answer as markdown; re-renders only when its text changes (while streaming). */
 export const ChatMarkdown = memo(function ChatMarkdown({ content }: { content: string }) {

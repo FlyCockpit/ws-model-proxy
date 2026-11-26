@@ -213,64 +213,102 @@ export type HoldGridLayout = {
   /** Distance from the layout viewport's bottom (CSS `bottom` of a fixed box). */
   bottom: number;
   columns: number;
-  /** Row height in px: 44 when there is room, less (never under 24) when the keyboard is up. */
+  /** Row height in px: 44 (at a 16px root) when there is room, less (never under 24) when the keyboard is up. */
   cellHeight: number;
+  /** Gap between cells, the grid's padding and the keys' font size, in px (the grid draws them from here). */
+  gap: number;
+  padding: number;
+  fontSize: number;
   /** Short rows drop the hints under the keys. */
   hints: boolean;
   /** Very short room drops the title line too. */
   title: boolean;
 };
 
-/** Gap between grid cells, and the grid's title, padding and border, in px. */
+/**
+ * The grid's measures in px at the browser-default 16px root; they scale with the root font size
+ * (the viewport scale and the user's default font size), as the grid's text does.
+ * Gap between grid cells:
+ */
 const GRID_GAP = 4;
+const GRID_PADDING = 8;
 /** Title line, padding and border. Without the title: padding and border only. */
 const GRID_CHROME = 40;
 const GRID_CHROME_COMPACT = 20;
+/** Padding and border across the grid's width. */
+const GRID_INSET = 18;
 /** Space kept between the grid and the top of the visible page. */
 const GRID_MARGIN = 8;
 const GRID_MIN_CELL = 24;
+/** The narrowest column: still a slide target with room for its one-character key (~0.6em wide). */
+const GRID_MIN_COLUMN = 10;
+/** The keys' font size (`text-sm`); in a fallback with smaller measures it shrinks with them. */
+const GRID_FONT = 14;
 const GRID_CELL = 44;
+/** The shortest row that still shows a hint under its key. */
+const GRID_HINT_CELL = 40;
+const ROOT_FONT_PX = 16;
+/** Step by which a grid that does not fit at its root's scale tries smaller measures. */
+const GRID_SCALE_STEP = 0.25;
 
 /**
  * The hold grid's layout for a key row at `row` (client px), with the visible part of the page
- * from `visibleTop` and a layout viewport `viewportHeight` tall. Columns keep every key 44px wide
- * and rows shrink when the room above the row (a phone with its keyboard up) is short. Where even
- * 24px rows do not fit, the title goes and then the grid takes more, narrower columns: every key
- * stays on screen (a slide target, highlighted under the finger, not a tap target).
+ * from `visibleTop` and a layout viewport `viewportHeight` tall, at a root font size of `rootPx`
+ * (default 16). Columns keep every key 44px wide (at 16px) and rows shrink when the room above the
+ * row (a phone with its keyboard up) is short. Where even 24px rows do not fit, the title goes and
+ * then the grid takes more, narrower columns, never so many that the gaps outgrow the row. Where
+ * that is still too tall (a large default font on a short screen), its measures and key text step
+ * down toward the 16px ones (14px keys, never under 12px) until it fits: every key stays on screen (a slide target, highlighted under the
+ * finger, not a tap target). Only a room too short even for that lets it reach above the top.
  */
 export function holdGridLayout(input: {
   row: { left: number; top: number; width: number };
   visibleTop: number;
   viewportHeight: number;
   keys: number;
+  rootPx?: number;
 }): HoldGridLayout {
-  const inner = input.row.width - 18;
-  const room = input.row.top - input.visibleTop - GRID_MARGIN - GRID_GAP;
-  const height = (rows: number, cell: number, chrome: number) =>
-    chrome + rows * cell + GRID_GAP * (rows - 1);
-  let columns = Math.min(7, Math.max(4, Math.floor((inner + GRID_GAP) / (GRID_CELL + GRID_GAP))));
-  let title = true;
-  const fits = () =>
-    height(
-      Math.ceil(input.keys / columns),
-      GRID_MIN_CELL,
-      title ? GRID_CHROME : GRID_CHROME_COMPACT,
-    ) <= room;
-  if (!fits()) title = false;
-  while (!fits() && columns < input.keys) columns += 1;
-  const rows = Math.ceil(input.keys / columns);
-  const chrome = title ? GRID_CHROME : GRID_CHROME_COMPACT;
-  const cellHeight = Math.max(
-    GRID_MIN_CELL,
-    Math.min(GRID_CELL, Math.floor((room - chrome - GRID_GAP * (rows - 1)) / rows)),
-  );
-  return {
-    left: input.row.left,
-    width: input.row.width,
-    bottom: input.viewportHeight - input.row.top + GRID_GAP,
-    columns,
-    cellHeight,
-    hints: cellHeight >= 40,
-    title,
+  const rootScale = Math.max(1, (input.rootPx ?? ROOT_FONT_PX) / ROOT_FONT_PX);
+  const at = (scale: number, titleAllowed: boolean) => {
+    const gap = GRID_GAP * scale;
+    const cell = GRID_CELL * scale;
+    const minCell = GRID_MIN_CELL * scale;
+    const inner = input.row.width - GRID_INSET * scale;
+    const room = input.row.top - input.visibleTop - GRID_MARGIN - gap;
+    const height = (rows: number, size: number, chrome: number) =>
+      chrome + rows * size + gap * (rows - 1);
+    // Past this many columns the gaps alone outgrow the row and the keys overlap.
+    const widest = Math.max(1, Math.floor((inner + gap) / (GRID_MIN_COLUMN * scale + gap)));
+    let columns = Math.min(widest, 7, Math.max(4, Math.floor((inner + gap) / (cell + gap))));
+    let title = titleAllowed;
+    const chromeOf = () => (title ? GRID_CHROME : GRID_CHROME_COMPACT) * scale;
+    const fits = () => height(Math.ceil(input.keys / columns), minCell, chromeOf()) <= room;
+    if (!fits()) title = false;
+    while (!fits() && columns < Math.min(input.keys, widest)) columns += 1;
+    const rows = Math.ceil(input.keys / columns);
+    const cellHeight = Math.max(
+      Math.floor(minCell),
+      Math.min(Math.floor(cell), Math.floor((room - chromeOf() - gap * (rows - 1)) / rows)),
+    );
+    const layout: HoldGridLayout = {
+      left: input.row.left,
+      width: input.row.width,
+      bottom: input.viewportHeight - input.row.top + gap,
+      columns,
+      cellHeight,
+      gap,
+      padding: GRID_PADDING * scale,
+      fontSize: GRID_FONT * scale,
+      // The hint text stays at the root's size: smaller measures than the root's drop it.
+      hints: scale === rootScale && cellHeight >= GRID_HINT_CELL * scale,
+      title,
+    };
+    return { layout, fits: fits() };
   };
+  let tried = at(rootScale, true);
+  // Smaller measures than the root's: the title and hints (rem text) no longer match them, so they go.
+  for (let scale = rootScale - GRID_SCALE_STEP; !tried.fits && scale > 1; scale -= GRID_SCALE_STEP)
+    tried = at(scale, false);
+  if (!tried.fits && rootScale > 1) tried = at(1, false);
+  return tried.layout;
 }

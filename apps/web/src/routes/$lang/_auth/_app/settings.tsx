@@ -23,8 +23,10 @@ function SettingsLayout() {
     exact: item.exact,
   }));
 
+  // Centred in the app frame's wider column, like the other pages (route-content-skeleton.tsx
+  // draws the same column while a settings page loads).
   return (
-    <div className="min-w-0 max-w-4xl">
+    <div className="mx-auto w-full min-w-0 max-w-4xl">
       <h1 className="text-2xl font-semibold mb-6">{t("title")}</h1>
       <div className="flex flex-col gap-6 md:flex-row md:gap-8">
         <nav className="w-full min-w-0 md:w-48 flex-shrink-0">

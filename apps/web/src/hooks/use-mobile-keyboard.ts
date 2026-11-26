@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { MOBILE_BREAKPOINT_PX } from "./use-media-query";
+import { DESKTOP_MEDIA_QUERY, MOBILE_BREAKPOINT_PX } from "./use-media-query";
 
 /** Keyboard is open only when visual viewport height falls below this share of the baseline. */
 export const MOBILE_KEYBOARD_HEIGHT_RATIO = 0.8;
@@ -74,6 +74,12 @@ type VirtualKeyboardLike = {
 
 export type MobileKeyboardSnapshot = {
   viewportWidth: number;
+  /**
+   * Whether `DESKTOP_MEDIA_QUERY` (Tailwind `md`, 48rem) matches. When given it decides "mobile"
+   * instead of `viewportWidth`, so a larger browser default font (where `md` sits past 768px)
+   * still counts as mobile wherever the BottomNav and the other below-`md` layout show.
+   */
+  desktopMedia?: boolean;
   visualViewportHeight: number;
   visualViewportScale: number;
   baselineHeight: number;
@@ -128,7 +134,8 @@ export function visualViewportGrewPastDismissThreshold(
  * recapture and close (dismiss without blur after rotate).
  */
 export function getMobileKeyboardDecision(input: MobileKeyboardSnapshot): MobileKeyboardDecision {
-  const mobile = isMobileViewport(input.viewportWidth);
+  const mobile =
+    input.desktopMedia === undefined ? isMobileViewport(input.viewportWidth) : !input.desktopMedia;
   const pinchZoomed = isPinchZoomed(input.visualViewportScale);
   const dismissedAfterRotate =
     input.previouslyKeyboardOpen === true &&
@@ -228,6 +235,7 @@ export function useMobileKeyboard(): boolean {
       const virtualKeyboard = getVirtualKeyboard();
       const decision = getMobileKeyboardDecision({
         viewportWidth: geometry.width,
+        desktopMedia: window.matchMedia?.(DESKTOP_MEDIA_QUERY).matches,
         visualViewportHeight: geometry.height,
         visualViewportScale: geometry.scale,
         baselineHeight: baselineHeightRef.current,

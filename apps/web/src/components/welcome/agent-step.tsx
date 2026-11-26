@@ -39,15 +39,21 @@ export function AgentStep() {
           <CodeSnippet code={tokens.data.mcpUrl} copyLabel={t("access:agents.copyMcpUrl")} />
         </div>
       )}
-      {mcpOff ? <p className="text-sm text-muted-foreground">{t("access:agents.mcpOff")}</p> : null}
+      {mcpOff ? (
+        <p className="max-w-prose text-sm text-muted-foreground">{t("access:agents.mcpOff")}</p>
+      ) : null}
       <div className="grid min-w-0 gap-3 md:grid-cols-2">
         <section className="min-w-0 space-y-1.5 rounded-lg border p-4">
           <h3 className="font-medium">{t("dashboard:welcome.agent.oauthTitle")}</h3>
-          <p className="text-sm text-muted-foreground">{t("dashboard:welcome.agent.oauthHint")}</p>
+          <p className="max-w-prose text-sm text-muted-foreground">
+            {t("dashboard:welcome.agent.oauthHint")}
+          </p>
         </section>
         <section className="flex min-w-0 flex-col items-start gap-2 rounded-lg border p-4">
           <h3 className="font-medium">{t("dashboard:welcome.agent.tokenTitle")}</h3>
-          <p className="text-sm text-muted-foreground">{t("dashboard:welcome.agent.tokenHint")}</p>
+          <p className="max-w-prose text-sm text-muted-foreground">
+            {t("dashboard:welcome.agent.tokenHint")}
+          </p>
           <Button
             type="button"
             size="touch"

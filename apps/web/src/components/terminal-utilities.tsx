@@ -318,7 +318,7 @@ function PasteDialog({ open, onClose, controls, returnFocus }: DialogProps) {
             autoCapitalize="off"
             autoCorrect="off"
             spellCheck={false}
-            className="max-h-60 font-mono text-sm"
+            className="max-h-60 font-mono text-base md:text-sm"
             data-utility="paste-text"
           />
           <Button

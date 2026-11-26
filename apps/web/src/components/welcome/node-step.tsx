@@ -90,7 +90,9 @@ export function NodeStep({
         />
       ) : (
         <div className="flex min-w-0 flex-col items-start gap-3">
-          <p className="text-sm text-muted-foreground">{t("dashboard:welcome.node.intro")}</p>
+          <p className="max-w-prose text-sm text-muted-foreground">
+            {t("dashboard:welcome.node.intro")}
+          </p>
           <Button
             type="button"
             size="touch"
@@ -107,7 +109,7 @@ export function NodeStep({
         </div>
       )}
 
-      <p className="text-xs text-muted-foreground">
+      <p className="max-w-prose text-xs text-muted-foreground">
         {t("dashboard:welcome.node.moreOptions")}{" "}
         <Link
           to="/$lang/nodes"

@@ -58,15 +58,16 @@ Five more rules, from the apps' passes (the template's § Edge lines has the ful
 - **A control flush with a clipping edge draws its focus ring inside its box**
   (`focus-visible:ring-inset focus-visible:ring-offset-0`), as the Sheet close does.
 - **Frame bands keep the frame line.** The header, and any banner added above the page (none ships
-  today), sit 16px inside the frame at every width; they are not re-aligned to a narrower page
-  container below them.
+  today), sit 16px inside the frame; they are not re-aligned to a narrower page container below
+  them. A band's background spans the window, but its content stops at the widest page column
+  (§ Viewport scale), as the admin sub-nav's does; the header keeps the frame line at every width.
 
 ## Shell rules
 
 Set 11-25 by the theme audit, from the template's `patterns/design-system.md` § Shell rules, adapted
 to this app's single root shell. Four rules every page meets, in both themes and at every width.
 `pnpm policy:web-conventions` (in `pnpm check:ci`) enforces what a static check can (G8 and G9 in
-`scripts/check-web-conventions.ts`); `apps/web/src/routes/-__root.dom.test.tsx` and
+`scripts/check-web-conventions.ts`; its G10 is § Viewport scale); `apps/web/src/routes/-__root.dom.test.tsx` and
 `apps/web/src/lib/theme-contrast.test.ts` pin the markup and the tokens; `pnpm check:layout`
 measures the geometry in a browser (§ Layout check).
 
@@ -113,6 +114,54 @@ measures the geometry in a browser (§ Layout check).
    when MCP is off) show the header with its language and theme controls; an unknown locale is
    redirected to the default one first (`$lang.tsx`). Do not add a route-level
    `notFoundComponent` that draws its own frame.
+
+## Viewport scale
+
+Set 11-26 by the viewport pass, from the template's `patterns/design-system.md` § Viewport scale.
+The app grows with the screen above 1920 CSS px, so a 4K monitor at 100 % OS scaling shows the same
+layout as a 1080p one instead of a small island in the middle. Phones, laptops and 1080p screens
+are unchanged.
+
+1. **One root rule scales everything.** `html` in `packages/ui/src/styles/globals.css` sets
+   `font-size: clamp(100%, calc(100% + (max(100vw, 100vh) - 1920px) / 240), 150%)`. The root is
+   the browser default (100 %, so a user's own default font size is respected) up to a 1920 CSS px
+   long side, then grows 1px per 240px, capped at 150 % of that default: 24px at 3840 with the
+   usual 16px default (20px: 28px at 3840, capped at 30px). The long side makes a portrait
+   2160×3840 screen scale like a landscape 3840×2160 one; 4K at 200 % OS scaling is 1920 CSS px,
+   so it is unchanged. Media queries use the browser default, so breakpoints don't move, and
+   browser zoom still enlarges. `apps/web/src/lib/viewport-scale.test.ts` pins the rule.
+2. **Sizes are rem, not px.** Type, control heights, padding, page widths, dialogs, sheets, cards
+   and charts use Tailwind's rem scale, so they follow rule 1. A px size does not scale: next to
+   rem siblings it ends up too small at 4K (a px switch track around a rem thumb). px stays for
+   hairlines and borders, shadows, radius offsets and touch-target floors (`min-h-[44px]` is a
+   minimum, not a size). The terminal's font size is the user's own setting, in px.
+3. **Text is at least 12px** (`text-xs`, 0.75rem) at every width, labels and badges included; 18px
+   at 3840. A BottomNav label that doesn't fit ends in an ellipsis (the tab's accessible name stays
+   whole); its tabs keep a px `min-w-[44px]` touch floor, since a rem floor grows with a large
+   browser default font and five tabs would overflow a 320px phone. G10 in
+   `scripts/check-web-conventions.ts` checks every string in web source (`className`, `cva()`
+   variants, constants, other class props). It rejects a px font size (`text-[13px]`), a rem size
+   below 0.75, an em size below 1 (em is relative: `0.9em` in 12px text is 10.8px) and any other
+   size expression without a rem floor of at least 0.75; `text-[length:max(0.9em,0.75rem)]` (the
+   test chat's inline code) passes.
+4. **Inputs are 16px on phones.** Input, Textarea and NativeSelect use `text-base` below `md` and
+   their compact desktop size from `md` up: under 16px, iOS Safari zooms the page when a field gets
+   focus.
+5. **Page widths are rem tiers.** The app frame's column (`max-w-6xl`), the admin pages
+   (`max-w-4xl`/`max-w-7xl`) and dialogs scale with rule 1. Card grids fill the column with as
+   many fixed-rem cards as fit (the pools list, `repeat(auto-fill, minmax(min(100%, 20rem), 1fr))`),
+   so a row holds the same cards at 1920 and at 3840. Dense tables scroll inside `WideContent`,
+   never the page.
+6. **Long copy gets `max-w-prose`** (45-75 characters per line): page descriptions (`PageHeading`
+   carries it), help text, setting and policy explanations, the welcome steps.
+7. **Narrow pages centre in the frame.** Settings (`max-w-4xl`) and the 404 sit in the middle of
+   the frame's column like the other pages, never at its left edge with empty space on the right.
+   The signed-out auth card centres in the page, except on a portrait screen from `md` up, where
+   it starts in the upper part (`AUTH_SCREEN_CLASS`, `components/auth/auth-card.tsx`).
+8. **Create flows are a bottom drawer on phones.** A short create dialog uses `ResponsiveDialog`
+   (a dialog from `md` up, a bottom drawer below it with the action bar at the bottom), as New
+   pool, New API key and Invite user do; a long form uses the form-surface sheet.
+9. **The header stays full width**; its row scales with rule 1.
 
 ## Layout check
 

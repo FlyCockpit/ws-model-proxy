@@ -157,7 +157,7 @@ export function PoolStep({ lang }: { lang: string }) {
           </ul>
         </div>
       ) : (
-        <p className="text-sm text-muted-foreground">
+        <p className="max-w-prose text-sm text-muted-foreground">
           {own.length > 0
             ? t("dashboard:welcome.pool.allPooled")
             : t("dashboard:welcome.pool.noModels")}

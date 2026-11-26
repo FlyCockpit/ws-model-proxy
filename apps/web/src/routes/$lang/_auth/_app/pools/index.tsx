@@ -23,6 +23,13 @@ import { type PillTone, StatusPill } from "@/components/status-pill";
 import type { PoolView } from "@/lib/pool-ui";
 import { orpc } from "@/utils/orpc";
 
+/**
+ * As many 20rem pool cards per row as the column holds (one on phones, three in the full desktop
+ * column); rem, so the same cards per row on a 4K screen (docs/ui.md § Viewport scale).
+ */
+const POOL_GRID_CLASS =
+  "grid min-w-0 grid-cols-[repeat(auto-fill,minmax(min(100%,20rem),1fr))] gap-3";
+
 export const Route = createFileRoute("/$lang/_auth/_app/pools/")({
   staticData: { pendingShape: "list" },
   component: PoolsPage,
@@ -59,7 +66,7 @@ function PoolsPage() {
         </Button>
       </div>
       {pools.isPending ? (
-        <div className="grid gap-3 md:grid-cols-2" aria-hidden="true">
+        <div className={POOL_GRID_CLASS} aria-hidden="true">
           <Skeleton className="h-40 w-full rounded-xl" />
           <Skeleton className="h-40 w-full rounded-xl" />
         </div>
@@ -75,7 +82,7 @@ function PoolsPage() {
               </CardHeader>
             </Card>
           ) : (
-            <ul className="grid min-w-0 gap-3 md:grid-cols-2">
+            <ul className={POOL_GRID_CLASS}>
               {pools.data.pools.map((pool) => {
                 const health = poolHealth(pool);
                 return (
@@ -134,7 +141,7 @@ function PoolsPage() {
           {pools.data.sharedWithMe.length > 0 ? (
             <section className="flex min-w-0 flex-col gap-3">
               <h2 className="text-lg font-semibold">{t("dashboard:pool.sharedWithMe")}</h2>
-              <ul className="grid min-w-0 gap-3 md:grid-cols-2">
+              <ul className={POOL_GRID_CLASS}>
                 {pools.data.sharedWithMe.map((shared) => (
                   <li key={shared.poolId} className="min-w-0">
                     <Card>

@@ -12,7 +12,14 @@ import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { getNavItems, moreNavIcon as MoreIcon, toLangRoute } from "@/lib/nav-items";
 
 const TAB_CLASS =
-  "flex flex-col items-center justify-center gap-0.5 px-3 py-1.5 transition-colors min-w-[64px] min-h-[44px]";
+  "flex min-h-[44px] min-w-[44px] shrink flex-col items-center justify-center gap-0.5 px-1 py-1.5 transition-colors";
+/**
+ * Labels are at least 12px. Tabs size to their label and shrink together down to the 44px touch
+ * floor (px, so a large browser font size doesn't raise it past the screen: 5 × 44px fits 320px);
+ * a label that still doesn't fit ends in an ellipsis instead of pushing the bar past the screen
+ * edge (the tab's accessible name stays whole). See docs/ui.md § Viewport scale
+ */
+const TAB_LABEL_CLASS = "max-w-full truncate text-xs font-medium leading-tight";
 
 /**
  * The one mobile nav bar: Overview · Models · Pools · Runtimes · More (sheet with the rest).
@@ -57,7 +64,7 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
             activeProps={{ className: cn(TAB_CLASS, "text-primary") }}
           >
             <item.icon className="size-5" />
-            <span className="text-[10px] font-medium leading-tight">{t(item.labelKey)}</span>
+            <span className={TAB_LABEL_CLASS}>{t(item.labelKey)}</span>
           </Link>
         ))}
         <Sheet open={moreOpen} onOpenChange={setMoreOpen}>
@@ -73,7 +80,7 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
               <MoreIcon aria-hidden="true" className="size-5" />
               <NeedsYouBadge count={moreBadge} className="absolute -end-3 -top-2" />
             </span>
-            <span className="text-[10px] font-medium leading-tight">{t("items.more")}</span>
+            <span className={TAB_LABEL_CLASS}>{t("items.more")}</span>
           </button>
           <SheetContent
             side="bottom"

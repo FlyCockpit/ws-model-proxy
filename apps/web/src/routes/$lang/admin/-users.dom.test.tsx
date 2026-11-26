@@ -9,6 +9,16 @@ const state = vi.hoisted(() => ({
   users: [] as Array<Record<string, unknown>>,
   failure: null as unknown,
   calls: [] as Array<{ name: string; input: unknown }>,
+  // ResponsiveDialog's `(min-width: 48rem)` match (Tailwind `md`, in rem so it follows the user's
+  // default font size): a dialog from md up, a bottom drawer below. Any other query never matches.
+  desktop: true,
+}));
+
+vi.stubGlobal("matchMedia", (query: string) => ({
+  matches: query === "(min-width: 48rem)" && state.desktop,
+  media: query,
+  addEventListener: () => {},
+  removeEventListener: () => {},
 }));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
@@ -144,6 +154,7 @@ afterEach(() => {
   state.users = [];
   state.failure = null;
   state.calls = [];
+  state.desktop = true;
   vi.mocked(toast.error).mockClear();
 });
 
@@ -193,5 +204,22 @@ describe("admin invite user", () => {
     const role = await screen.findByLabelText("admin:users.roleLabel");
     expect(role.textContent).toContain("admin:users.roleUser");
     expect(role.textContent?.replace("admin:users.roleUser", "")).not.toContain("user");
+  });
+
+  it("opens as a bottom drawer on phones, like the other create flows", async () => {
+    state.desktop = false;
+    state.users = [user()];
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "admin:users.invite" }));
+    const email = await screen.findByLabelText("admin:users.emailLabel");
+    const surface = email.closest("[data-slot=dialog-content]");
+    expect(surface?.hasAttribute("data-vaul-drawer")).toBe(true);
+    // The footer's submit button belongs to the form in the drawer body.
+    const submit = screen.getByRole("button", { name: "admin:users.sendInvite" });
+    expect(submit.getAttribute("form")).toBe(email.closest("form")?.id);
+    // The header (title, and a description that may hold an email) wraps long unbroken words.
+    expect(surface?.querySelector("[data-slot=responsive-dialog-header]")?.className).toContain(
+      "[overflow-wrap:anywhere]",
+    );
   });
 });

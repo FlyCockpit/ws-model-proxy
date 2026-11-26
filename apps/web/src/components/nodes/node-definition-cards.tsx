@@ -595,7 +595,7 @@ function SourceTag({ source }: { source: HardwareSource }) {
   const { t } = useTranslation(["dashboard"]);
   if (!source) return null;
   return (
-    <span className="rounded bg-muted px-1 text-[0.7rem] text-muted-foreground">
+    <span className="rounded bg-muted px-1 text-xs text-muted-foreground">
       {t(`dashboard:nodes.hardware.source.${source}`)}
     </span>
   );

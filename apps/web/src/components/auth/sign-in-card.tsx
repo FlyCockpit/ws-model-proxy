@@ -16,6 +16,7 @@ import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useTranslation } from "react-i18next";
 import z from "zod";
+import { AUTH_SCREEN_CLASS } from "@/components/auth/auth-card";
 import { AuthFormSkeleton } from "@/components/auth/auth-form-skeleton";
 import { AuthRetryCard } from "@/components/auth/auth-retry-card";
 import { useAuthSession } from "@/hooks/use-auth-session";
@@ -137,7 +138,7 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
 
   if (state.status === "pending" || config.isPending) {
     return (
-      <div className="flex min-h-[80vh] items-center justify-center px-4">
+      <div className={AUTH_SCREEN_CLASS}>
         <AuthFormSkeleton />
       </div>
     );
@@ -145,7 +146,7 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
 
   if (config.isError) {
     return (
-      <div className="flex min-h-[80vh] items-center justify-center px-4">
+      <div className={AUTH_SCREEN_CLASS}>
         <AuthRetryCard
           title={t("auth:login.unableToConnect")}
           description={t("auth:login.unableToConnectDescription")}
@@ -169,7 +170,7 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
   const signupEnabled =
     (config.data?.signupEnabled ?? true) || config.data?.adminBootstrapSignupEnabled === true;
   return (
-    <div className="flex min-h-[80vh] items-center justify-center px-4">
+    <div className={AUTH_SCREEN_CLASS}>
       <Card className="w-full max-w-md">
         <SignInHeader mode={mode} mcpDescription={mcpDescription} />
         <CardContent className="space-y-4">
@@ -323,7 +324,7 @@ function TwoFactorCard({
   const { activity, code, method } = challenge;
   const isVerifying = activity.kind === "verifying" || activity.kind === "redirecting";
   return (
-    <div className="flex min-h-[80vh] items-center justify-center px-4">
+    <div className={AUTH_SCREEN_CLASS}>
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
           <CardTitle className="text-2xl">{t("auth:twoFactor.title")}</CardTitle>

@@ -106,7 +106,7 @@ function AdminSettings() {
     <div className="container mx-auto min-w-0 max-w-4xl px-4 py-8 space-y-6">
       <div>
         <h1 className="text-2xl font-semibold">{t("admin:settings.title")}</h1>
-        <p className="mt-2 text-muted-foreground">{t("admin:settings.description")}</p>
+        <p className="mt-2 max-w-prose text-muted-foreground">{t("admin:settings.description")}</p>
       </div>
 
       {serverSettings.isPending ? (
@@ -200,15 +200,21 @@ function SecurityPolicyCard({
           <Shield className="size-5" />
           {t("settings.securityTitle")}
         </CardTitle>
-        <CardDescription>{t("settings.securityDescription")}</CardDescription>
+        <CardDescription className="max-w-prose">
+          {t("settings.securityDescription")}
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
           <div className="space-y-1">
             <p className="font-medium">{t("settings.force2faTitle")}</p>
-            <p className="text-sm text-muted-foreground">{t("settings.force2faDescription")}</p>
+            <p className="max-w-prose text-sm text-muted-foreground">
+              {t("settings.force2faDescription")}
+            </p>
             {!adminHas2FA && (
-              <p className="text-sm text-destructive">{t("settings.force2faAdminWarning")}</p>
+              <p className="max-w-prose text-sm text-destructive">
+                {t("settings.force2faAdminWarning")}
+              </p>
             )}
           </div>
           <Button
@@ -229,8 +235,10 @@ function SecurityPolicyCard({
         <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
           <div className="space-y-1">
             <p className="font-medium">{t("settings.signupTitle")}</p>
-            <p className="text-sm text-muted-foreground">{t("settings.signupDescription")}</p>
-            <p className="text-sm text-muted-foreground">
+            <p className="max-w-prose text-sm text-muted-foreground">
+              {t("settings.signupDescription")}
+            </p>
+            <p className="max-w-prose text-sm text-muted-foreground">
               {signupEnabled
                 ? t("settings.signupStatusEnabled")
                 : t("settings.signupStatusDisabled")}
@@ -301,7 +309,9 @@ function MediaPolicyCard({ data }: { data: MediaAdminStats }) {
           <HardDrive className="size-5" />
           {t("admin:settings.media.title")}
         </CardTitle>
-        <CardDescription>{t("admin:settings.media.description")}</CardDescription>
+        <CardDescription className="max-w-prose">
+          {t("admin:settings.media.description")}
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         {/* Upload capability (read-only, from deploy env) */}
@@ -369,7 +379,7 @@ function UploadStatusRow({ uploadEnabled }: { uploadEnabled: boolean }) {
     <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
       <div className="space-y-1">
         <p className="font-medium">{t("admin:settings.media.uploadStatusTitle")}</p>
-        <p className="text-sm text-muted-foreground">
+        <p className="max-w-prose text-sm text-muted-foreground">
           {uploadEnabled
             ? t("admin:settings.media.uploadStatusEnabled")
             : t("admin:settings.media.uploadStatusDisabled")}
@@ -423,17 +433,17 @@ function AttachmentLimitSection({
     <div className="space-y-3 rounded-lg border p-4">
       <div className="space-y-1">
         <p className="font-medium">{t("admin:settings.media.attachmentLimitTitle")}</p>
-        <p className="text-sm text-muted-foreground">
+        <p className="max-w-prose text-sm text-muted-foreground">
           {t("admin:settings.media.attachmentLimitDescription")}
         </p>
-        <p className="text-sm text-muted-foreground">
+        <p className="max-w-prose text-sm text-muted-foreground">
           {attachmentLimit.deploymentMaxBytes === null
             ? t("admin:settings.media.attachmentLimitNoDeploymentCap")
             : t("admin:settings.media.attachmentLimitDeploymentCap", {
                 max: formatBytes(attachmentLimit.deploymentMaxBytes),
               })}
         </p>
-        <p className="text-sm text-muted-foreground">
+        <p className="max-w-prose text-sm text-muted-foreground">
           {t("admin:settings.media.attachmentLimitEffective", {
             max: formatBytes(attachmentLimit.effectiveBytes),
           })}
@@ -511,8 +521,10 @@ function TtlSection({
     <div className="space-y-3 rounded-lg border p-4">
       <div className="space-y-1">
         <p className="font-medium">{t("admin:settings.media.ttlTitle")}</p>
-        <p className="text-sm text-muted-foreground">{t("admin:settings.media.ttlDescription")}</p>
-        <p className="text-sm text-muted-foreground">
+        <p className="max-w-prose text-sm text-muted-foreground">
+          {t("admin:settings.media.ttlDescription")}
+        </p>
+        <p className="max-w-prose text-sm text-muted-foreground">
           {t("admin:settings.media.ttlHint", { min: ttl.min, max: ttl.max })}
         </p>
       </div>
@@ -591,7 +603,7 @@ function PurgeExpiredRow({
     <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
       <div className="space-y-1">
         <p className="font-medium">{t("admin:settings.media.purgeTitle")}</p>
-        <p className="text-sm text-muted-foreground">
+        <p className="max-w-prose text-sm text-muted-foreground">
           {t("admin:settings.media.purgeDescription")}
         </p>
       </div>
@@ -617,7 +629,7 @@ function DeleteAllRow({ disabled, onDeleteAll }: { disabled: boolean; onDeleteAl
           <Trash2 className="size-4" />
           {t("admin:settings.media.deleteAllTitle")}
         </p>
-        <p className="text-sm text-muted-foreground">
+        <p className="max-w-prose text-sm text-muted-foreground">
           {t("admin:settings.media.deleteAllDescription")}
         </p>
       </div>
@@ -667,7 +679,7 @@ function SettingsSkeleton() {
           <span className="sr-only">{t("settings.securityTitle")}</span>
           <Skeleton className="h-5 w-32" />
         </CardTitle>
-        <CardDescription>
+        <CardDescription className="max-w-prose">
           <Skeleton className="h-4 w-64" />
         </CardDescription>
       </CardHeader>
@@ -703,7 +715,7 @@ function MediaPolicySkeleton() {
           <span className="sr-only">{t("settings.media.title")}</span>
           <Skeleton className="h-5 w-32" />
         </CardTitle>
-        <CardDescription>
+        <CardDescription className="max-w-prose">
           <Skeleton className="h-4 w-64" />
         </CardDescription>
       </CardHeader>

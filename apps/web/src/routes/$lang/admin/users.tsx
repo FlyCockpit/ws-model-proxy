@@ -11,14 +11,6 @@ import {
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@ws-model-proxy/ui/components/dialog";
-import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -26,12 +18,13 @@ import {
 } from "@ws-model-proxy/ui/components/dropdown-menu";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
+import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import type { TFunction } from "i18next";
 import { Archive, ArchiveRestore, Copy, MoreVertical, Plus, Shield, Trash } from "lucide-react";
-import { useState } from "react";
+import { type RefObject, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
@@ -81,6 +74,8 @@ function AdminUsers() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [search, setSearch] = useState("");
   const [inviteOpen, setInviteOpen] = useState(false);
+  /** Focus returns here when the invite flow (invite, then the temporary password) closes. */
+  const inviteButtonRef = useRef<HTMLButtonElement | null>(null);
   const [reveal, setReveal] = useState<{
     email: string;
     tempPassword: string;
@@ -169,9 +164,12 @@ function AdminUsers() {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">{t("admin:users.title")}</h1>
-          <p className="text-sm text-muted-foreground">{t("admin:users.description")}</p>
+          <p className="max-w-prose text-sm text-muted-foreground">
+            {t("admin:users.description")}
+          </p>
         </div>
         <Button
+          ref={inviteButtonRef}
           onClick={() => {
             trigger("light");
             setInviteOpen(true);
@@ -247,6 +245,7 @@ function AdminUsers() {
       <InviteUserDialog
         open={inviteOpen}
         onOpenChange={setInviteOpen}
+        returnFocus={inviteButtonRef}
         onInvited={(payload) => {
           setInviteOpen(false);
           setReveal(payload);
@@ -254,7 +253,11 @@ function AdminUsers() {
         }}
       />
 
-      <RevealInviteDialog reveal={reveal} onClose={() => setReveal(null)} />
+      <RevealInviteDialog
+        reveal={reveal}
+        onClose={() => setReveal(null)}
+        returnFocus={inviteButtonRef}
+      />
 
       <ConfirmDeleteDialog
         open={!!deleteId}
@@ -376,12 +379,14 @@ function UserListItem({
   const isArchived = !!user.banned;
   const isDeleting = Boolean(user.deletionRequestedAt);
   return (
-    <li className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-      <div className="min-w-0 flex-1">
+    <li className="flex flex-wrap items-start justify-between gap-3 px-4 py-3 sm:items-center">
+      {/* The actions stay beside the name; they drop below it only when the name column would go
+          under 12rem (a large browser font size on a phone). */}
+      <div className="min-w-0 grow basis-48">
         <p className="flex flex-wrap items-center gap-2 font-medium">
           <span className="truncate">{user.name || user.email}</span>
           {isSelf && (
-            <span className="rounded-full border bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase text-muted-foreground">
+            <span className="rounded-full border bg-muted px-1.5 py-0.5 text-xs font-medium uppercase min-w-0 [overflow-wrap:anywhere] text-muted-foreground">
               {t("admin:users.youBadge")}
             </span>
           )}
@@ -390,7 +395,7 @@ function UserListItem({
           {isArchived && !isDeleting && <ArchivedPill />}
           {!user.emailVerified && <UnverifiedPill />}
         </p>
-        <p className="mt-0.5 truncate text-xs text-muted-foreground">
+        <p className="mt-0.5 text-xs text-muted-foreground [overflow-wrap:anywhere] sm:truncate">
           {user.email} · {t("admin:users.joined")} <JoinedDate value={user.createdAt} />
           {user.banReason ? ` · ${user.banReason}` : ""}
         </p>
@@ -436,7 +441,7 @@ function UserActions({
           <Button
             variant="outline"
             size="sm"
-            className="min-h-[44px] self-end sm:self-auto"
+            className="min-h-[44px] min-w-[44px] shrink-0"
             aria-label={t("users.actionsAriaLabel", { name: user.name || user.email })}
           />
         }
@@ -490,7 +495,7 @@ function RolePill({ isAdmin }: { isAdmin: boolean }) {
   return (
     <span
       className={cn(
-        "inline-flex items-center rounded-md px-1.5 py-0.5 text-[10px] font-medium uppercase",
+        "inline-flex items-center rounded-md px-1.5 py-0.5 text-xs font-medium uppercase min-w-0 [overflow-wrap:anywhere]",
         isAdmin
           ? "bg-violet-500/10 text-violet-700 dark:text-violet-400"
           : "bg-muted text-muted-foreground",
@@ -504,7 +509,7 @@ function RolePill({ isAdmin }: { isAdmin: boolean }) {
 function ArchivedPill() {
   const { t } = useTranslation("admin");
   return (
-    <span className="inline-flex items-center rounded-md bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase text-amber-700 dark:text-amber-400">
+    <span className="inline-flex items-center rounded-md bg-amber-500/10 px-1.5 py-0.5 text-xs font-medium uppercase min-w-0 [overflow-wrap:anywhere] text-amber-700 dark:text-amber-400">
       {t("users.archivedBadge")}
     </span>
   );
@@ -513,7 +518,7 @@ function ArchivedPill() {
 function DeletingPill() {
   const { t } = useTranslation("admin");
   return (
-    <span className="inline-flex items-center rounded-md bg-red-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase text-red-700 dark:text-red-400">
+    <span className="inline-flex items-center rounded-md bg-red-500/10 px-1.5 py-0.5 text-xs font-medium uppercase min-w-0 [overflow-wrap:anywhere] text-red-700 dark:text-red-400">
       {t("users.deletingBadge")}
     </span>
   );
@@ -522,7 +527,7 @@ function DeletingPill() {
 function UnverifiedPill() {
   const { t } = useTranslation("admin");
   return (
-    <span className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase text-muted-foreground">
+    <span className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-xs font-medium uppercase min-w-0 [overflow-wrap:anywhere] text-muted-foreground">
       {t("users.unverifiedBadge")}
     </span>
   );
@@ -548,10 +553,12 @@ function InviteUserDialog({
   open,
   onOpenChange,
   onInvited,
+  returnFocus,
 }: {
   open: boolean;
   onOpenChange: (next: boolean) => void;
   onInvited: (reveal: { email: string; tempPassword: string; emailSent: boolean }) => void;
+  returnFocus: RefObject<HTMLElement | null>;
 }) {
   const { t } = useTranslation(["admin", "common"]);
   const tAdmin = useNamespaceT("admin");
@@ -571,114 +578,118 @@ function InviteUserDialog({
     },
   });
 
+  const formId = useId();
+  const close = (next: boolean) => {
+    if (!invite.isPending) {
+      if (!next) form.reset();
+      onOpenChange(next);
+    }
+  };
+
+  // A bottom drawer on phones and a dialog from md up, like the app's other create flows (New
+  // pool, New API key); the footer's submit button reaches the form through `form={formId}`.
   return (
-    <Dialog
+    <ResponsiveDialog
       open={open}
-      onOpenChange={(next) => {
-        if (!invite.isPending) {
-          if (!next) form.reset();
-          onOpenChange(next);
-        }
-      }}
+      onOpenChange={close}
+      returnFocus={returnFocus}
+      title={t("admin:users.inviteTitle")}
+      description={t("admin:users.inviteDescription")}
+      footer={
+        <div className="flex min-w-0 flex-wrap justify-end gap-2">
+          <Button
+            type="button"
+            variant="ghost"
+            className="min-h-[44px]"
+            onClick={() => close(false)}
+            disabled={invite.isPending}
+          >
+            {t("common:actions.cancel")}
+          </Button>
+          <form.Subscribe selector={(s) => [s.canSubmit, s.isSubmitting] as const}>
+            {([canSubmit, isSubmitting]) => (
+              <Button
+                type="submit"
+                form={formId}
+                className="min-h-[44px]"
+                disabled={!canSubmit || isSubmitting || invite.isPending}
+              >
+                {isSubmitting || invite.isPending
+                  ? t("admin:users.inviting")
+                  : t("admin:users.sendInvite")}
+              </Button>
+            )}
+          </form.Subscribe>
+        </div>
+      }
     >
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{t("admin:users.inviteTitle")}</DialogTitle>
-          <DialogDescription>{t("admin:users.inviteDescription")}</DialogDescription>
-        </DialogHeader>
+      <form
+        id={formId}
+        onSubmit={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          form.handleSubmit();
+        }}
+        className="space-y-3 pb-2"
+      >
+        <form.Field name="name">
+          {(field) => (
+            <div className="space-y-1.5">
+              <Label htmlFor={field.name}>{t("admin:users.nameLabel")}</Label>
+              <Input
+                id={field.name}
+                name={field.name}
+                autoComplete="name"
+                className="min-h-11"
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(e) => field.handleChange(e.target.value)}
+              />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
 
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            form.handleSubmit();
-          }}
-          className="space-y-3"
-        >
-          <form.Field name="name">
-            {(field) => (
-              <div className="space-y-1.5">
-                <Label htmlFor={field.name}>{t("admin:users.nameLabel")}</Label>
-                <Input
-                  id={field.name}
-                  name={field.name}
-                  autoComplete="name"
-                  className="min-h-11"
-                  value={field.state.value}
-                  onBlur={field.handleBlur}
-                  onChange={(e) => field.handleChange(e.target.value)}
-                />
-                <FieldErrors field={field} />
-              </div>
-            )}
-          </form.Field>
+        <form.Field name="email">
+          {(field) => (
+            <div className="space-y-1.5">
+              <Label htmlFor={field.name}>{t("admin:users.emailLabel")}</Label>
+              <Input
+                id={field.name}
+                name={field.name}
+                type="email"
+                inputMode="email"
+                autoComplete="email"
+                placeholder={t("admin:users.emailPlaceholder")}
+                className="min-h-11"
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(e) => field.handleChange(e.target.value)}
+              />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
 
-          <form.Field name="email">
-            {(field) => (
-              <div className="space-y-1.5">
-                <Label htmlFor={field.name}>{t("admin:users.emailLabel")}</Label>
-                <Input
-                  id={field.name}
-                  name={field.name}
-                  type="email"
-                  inputMode="email"
-                  autoComplete="email"
-                  placeholder={t("admin:users.emailPlaceholder")}
-                  className="min-h-11"
-                  value={field.state.value}
-                  onBlur={field.handleBlur}
-                  onChange={(e) => field.handleChange(e.target.value)}
-                />
-                <FieldErrors field={field} />
-              </div>
-            )}
-          </form.Field>
-
-          <form.Field name="role">
-            {(field) => (
-              <div className="space-y-1.5">
-                <Label htmlFor={field.name}>{t("admin:users.roleLabel")}</Label>
-                <LabelledSelect
-                  id={field.name}
-                  value={field.state.value}
-                  onValueChange={field.handleChange}
-                  options={[
-                    { value: "user", label: t("admin:users.roleUser") },
-                    { value: "admin", label: t("admin:users.roleAdmin") },
-                  ]}
-                />
-                <FieldErrors field={field} />
-              </div>
-            )}
-          </form.Field>
-
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="ghost"
-              className="min-h-[44px]"
-              onClick={() => onOpenChange(false)}
-              disabled={invite.isPending}
-            >
-              {t("common:actions.cancel")}
-            </Button>
-            <form.Subscribe selector={(s) => [s.canSubmit, s.isSubmitting] as const}>
-              {([canSubmit, isSubmitting]) => (
-                <Button
-                  type="submit"
-                  className="min-h-[44px]"
-                  disabled={!canSubmit || isSubmitting || invite.isPending}
-                >
-                  {isSubmitting || invite.isPending
-                    ? t("admin:users.inviting")
-                    : t("admin:users.sendInvite")}
-                </Button>
-              )}
-            </form.Subscribe>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+        <form.Field name="role">
+          {(field) => (
+            <div className="space-y-1.5">
+              <Label htmlFor={field.name}>{t("admin:users.roleLabel")}</Label>
+              <LabelledSelect
+                id={field.name}
+                value={field.state.value}
+                onValueChange={field.handleChange}
+                options={[
+                  { value: "user", label: t("admin:users.roleUser") },
+                  { value: "admin", label: t("admin:users.roleAdmin") },
+                ]}
+              />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
+      </form>
+    </ResponsiveDialog>
   );
 }
 
@@ -699,9 +710,11 @@ function FieldErrors({
 function RevealInviteDialog({
   reveal,
   onClose,
+  returnFocus,
 }: {
   reveal: { email: string; tempPassword: string; emailSent: boolean } | null;
   onClose: () => void;
+  returnFocus: RefObject<HTMLElement | null>;
 }) {
   const { feedback, copy } = useCopyFeedback(2_000);
   const { t } = useTranslation(["admin", "common", "errors"]);
@@ -711,51 +724,46 @@ function RevealInviteDialog({
     else toast.error(t("errors:couldNotCopy"));
   };
   return (
-    <Dialog
+    <ResponsiveDialog
       open={!!reveal}
+      returnFocus={returnFocus}
       onOpenChange={(next) => {
         if (!next) onClose();
       }}
+      title={t("admin:users.revealTitle")}
+      description={
+        reveal?.emailSent
+          ? t("admin:users.revealEmailedDescription", { email: reveal.email })
+          : t("admin:users.revealNotEmailedDescription", { email: reveal?.email ?? "" })
+      }
+      footer={
+        <Button onClick={onClose} className="min-h-[44px]">
+          {t("admin:users.savedPassword")}
+        </Button>
+      }
     >
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{t("admin:users.revealTitle")}</DialogTitle>
-          <DialogDescription>
-            {reveal?.emailSent
-              ? t("admin:users.revealEmailedDescription", { email: reveal.email })
-              : t("admin:users.revealNotEmailedDescription", { email: reveal?.email ?? "" })}
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-1.5">
-          <Label>{t("admin:users.tempPasswordLabel")}</Label>
-          <div className="flex items-center gap-2">
-            <code className="flex-1 truncate rounded-md border bg-muted px-2 py-1 font-mono text-sm">
-              {reveal?.tempPassword}
-            </code>
-            <Button
-              type="button"
-              variant="outline"
-              size="icon-sm"
-              className="min-h-[44px] min-w-[44px]"
-              onClick={onCopy}
-              aria-label={t("admin:users.copyTempPasswordAriaLabel")}
-            >
-              <Copy className="size-4" />{" "}
-              <span className="sr-only">
-                {feedback === "copied" ? t("common:actions.copied") : t("common:actions.copy")}
-              </span>
-            </Button>
-          </div>
-          <p className="text-xs text-muted-foreground">{t("admin:users.tempPasswordHint")}</p>
-        </div>
-
-        <DialogFooter>
-          <Button onClick={onClose} className="min-h-[44px]">
-            {t("admin:users.savedPassword")}
+      <div className="space-y-1.5 pb-2">
+        <Label>{t("admin:users.tempPasswordLabel")}</Label>
+        <div className="flex items-center gap-2">
+          <code className="flex-1 truncate rounded-md border bg-muted px-2 py-1 font-mono text-sm">
+            {reveal?.tempPassword}
+          </code>
+          <Button
+            type="button"
+            variant="outline"
+            size="icon-sm"
+            className="min-h-[44px] min-w-[44px]"
+            onClick={onCopy}
+            aria-label={t("admin:users.copyTempPasswordAriaLabel")}
+          >
+            <Copy className="size-4" />{" "}
+            <span className="sr-only">
+              {feedback === "copied" ? t("common:actions.copied") : t("common:actions.copy")}
+            </span>
           </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        </div>
+        <p className="text-xs text-muted-foreground">{t("admin:users.tempPasswordHint")}</p>
+      </div>
+    </ResponsiveDialog>
   );
 }

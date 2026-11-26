@@ -12,10 +12,12 @@ import { lazy, Suspense } from "react";
  */
 const QRCodeSVG = lazy(() => import("qrcode.react").then((m) => ({ default: m.QRCodeSVG })));
 
+/** `size` is px at the browser-default 16px root; the code is drawn in rem so it grows with the viewport scale. */
 export function LazyQRCode({ value, size }: { value: string; size: number }) {
+  const box = { width: `${size / 16}rem`, maxWidth: "100%", aspectRatio: "1" };
   return (
-    <Suspense fallback={<Skeleton style={{ width: size, height: size }} />}>
-      <QRCodeSVG value={value} size={size} />
+    <Suspense fallback={<Skeleton style={box} />}>
+      <QRCodeSVG value={value} size={size} style={{ ...box, height: "auto" }} />
     </Suspense>
   );
 }

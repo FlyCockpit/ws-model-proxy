@@ -5,6 +5,11 @@
  *
  *   G8: <main> reserves no scrollbar gutter, and no route renders a site <footer>.
  *   G9: no literal colour or prefers-color-scheme query outside packages/ui/src/styles/globals.css.
+ *   G10: text scales and stays at least 12px: no px font size in any class list in web source
+ *        (className, cva() variants, constants, other *ClassName props), which does not follow the
+ *        root viewport scale, no rem size below 0.75, no em size below 1, and no other size
+ *        (vw, cqi, pt, expressions) without a 0.75rem floor (max()/clamp()) or with a px term.
+ *        docs/ui.md § Viewport scale
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -457,6 +462,58 @@ function arbitraryValueColor(base: string): boolean {
 }
 const THEME_MESSAGE =
   "follows the OS or a fixed colour instead of the app theme (stored choice > OS, the `.dark` class). Fix: use the theme tokens (bg-popover, text-foreground, var(--state-*)…) and `dark:` variants; new colours become tokens in packages/ui/src/styles/globals.css (docs/ui.md, Shell rules).";
+/**
+ * G10: an arbitrary font size that is not provably at least 12px and scaling: a px size
+ * (`text-[13px]`, `text-[10px]/4`), which does not follow the root viewport scale; rem below 0.75
+ * (12px); em below 1, which drops under 12px inside 12px text; and any other expression holding a
+ * length unless it has a rem floor of at least 0.75: `max(…, 0.75rem)` or `clamp(0.75rem, …, …)`
+ * (`text-[length:max(0.9em,0.75rem)]` passes, `calc(0.9em)` doesn't). Viewport and other units
+ * (`2vw`, `cqi`, `pt`) need the same floor, and a px term anywhere in the expression is rejected:
+ * `max(24px, 0.75rem)` stays a fixed 24px through the scale. Values without a length (variables,
+ * colours) are not font sizes it can judge.
+ */
+const LENGTH =
+  /\d(?:px|r?em|[sdl]?v(?:w|h|i|b|min|max)|cq(?:w|h|i|b|min|max)|ch|ex|lh|rlh|pt|pc|cm|mm|in|q)(?![a-z])/i;
+function fixedOrTinyText(base: string): boolean {
+  const match = /^text-\[(?:length:)?(.+?)\](?:\/[\w.%[\]()-]+)?$/.exec(base);
+  const value = match?.[1]?.replaceAll("_", " ").trim();
+  // An explicitly typed percentage is a font size relative to the parent: like em, below 100 % it
+  // drops under 12px inside 12px text. (An untyped `text-[50%]` is left alone: it may be a colour.)
+  const percent = /^text-\[length:(\d*\.?\d+)%\]/.exec(base);
+  if (percent) return Number(percent[1]) < 100;
+  // A percentage inside a typed expression (`length:calc(50%)`) is judged like any other length.
+  const typedPercent = base.startsWith("text-[length:") && /\d%/.test(value ?? "");
+  if (!value || (!typedPercent && !LENGTH.test(value))) return false;
+  if (/\dpx(?![a-z])/i.test(value)) return true;
+  const plain = /^(\d*\.?\d+)([a-z]+)$/i.exec(value);
+  if (plain) {
+    const size = Number(plain[1]);
+    if (plain[2] === "rem") return size < 0.75;
+    if (plain[2] === "em") return size < 1;
+    return true;
+  }
+  const fn = /^(max|clamp)\((.*)\)$/.exec(value);
+  if (!fn?.[2]) return true;
+  const args: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const char of fn[2]) {
+    if (char === "(") depth++;
+    else if (char === ")") depth--;
+    if (char === "," && depth === 0) {
+      args.push(current.trim());
+      current = "";
+    } else current += char;
+  }
+  args.push(current.trim());
+  const floors = fn[1] === "max" ? args : args.length === 3 ? [args[0] ?? ""] : [];
+  return !floors.some((arg) => {
+    const rem = /^(\d*\.?\d+)rem$/.exec(arg);
+    return rem !== null && Number(rem[1]) >= 0.75;
+  });
+}
+const FIXED_TEXT_MESSAGE =
+  "a px size does not grow with the large-screen root scale, and no text is smaller than 12px. Fix: use the type scale, text-xs (12px) at the smallest, or give a relative size a floor (text-[max(0.9em,0.75rem)]); a label that does not fit wraps or ends in an ellipsis (docs/ui.md § Viewport scale).";
 function isThemeScanned(file: string): boolean {
   return (
     /^(apps\/web|packages\/ui)\/src\//.test(file) &&
@@ -577,6 +634,20 @@ export function scanWebSource(file: string, source: string): Finding[] {
           "G8",
           "A route renders a site footer, which follows the page content instead of sitting at the bottom of a short page and repeats per page. Fix: site footer content goes in one shared footer component that the shell renders as the last box of its `flex min-h-full flex-col` column inside <main>; a footer that belongs to an <article>, <section> or similar stays inside that element (docs/ui.md, Shell rules).",
         );
+    }
+    // G10 looks at every string in web source, not only className values: class lists also live
+    // in cva() variants, shared constants and other *ClassName props, and a text-[…] token means
+    // the same wherever it is written.
+    if (isThemeScanned(file) && (n.type === "StringLiteral" || n.type === "TemplateElement")) {
+      const text =
+        n.type === "StringLiteral" ? String(n.value) : String((n.value as { raw?: string })?.raw);
+      const fixed = text
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((token) => utility(token).base)
+        .filter(fixedOrTinyText);
+      if (fixed.length)
+        add(n, "G10", `Fixed or sub-12px text size (${fixed.join(", ")}): ${FIXED_TEXT_MESSAGE}`);
     }
     if (
       isThemeScanned(file) &&
@@ -746,6 +817,6 @@ if (import.meta.filename === process.argv[1]) {
   for (const failure of failures) console.error(`POLICY VIOLATION: ${failure}`);
   if (failures.length > 0) process.exit(1);
   console.log(
-    "web conventions passed: no page-scroller gutter, no route footer, no literal colours (G8, G9).",
+    "web conventions passed: no page-scroller gutter, no route footer, no literal colours, no px or sub-12px text (G8, G9, G10).",
   );
 }
