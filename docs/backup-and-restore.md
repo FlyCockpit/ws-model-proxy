@@ -14,6 +14,8 @@ use `compose.yaml` with `compose.backups.yaml` (see the README); it passes the
 restore, and restore-drill commands are explicit owner actions and work regardless
 of `BACKUP_ENABLED`. Provider snapshots and point-in-time recovery remain options.
 
+Back up `BETTER_AUTH_SECRET` separately from the database and retain the keys needed by older backups. Password hashes in a restored backup need the corresponding secret; see [Password pepper](./production-hardening.md#password-pepper).
+
 ## Where backups go
 
 The scripts in `scripts/backup/` write `pg_dump` custom-format archives:

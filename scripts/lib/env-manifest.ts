@@ -488,9 +488,19 @@ export const ENV_VARS: EnvVar[] = [
       "REQUIRED, minimum 32 characters. Rotating this invalidates every session",
       "and purpose-specific HMAC credentials derived from it (model API tokens,",
       "CLI tokens, device credentials, sticky-routing digests).",
+      "Rotation also requires BETTER_AUTH_SECRET_PREVIOUS; see docs/production-hardening.md.",
       "",
       "Local: filled by `pnpm setup:app`, or `pnpm generate:secret`.",
       "Production: prefer `pnpm generate:secrets`.",
+    ],
+  },
+  {
+    key: "BETTER_AUTH_SECRET_PREVIOUS",
+    group: "auth",
+    source: "manual",
+    secret: true,
+    comment: [
+      "Old BETTER_AUTH_SECRET, set only during password pepper rotation. See docs/production-hardening.md.",
     ],
   },
   {

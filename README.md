@@ -473,3 +473,5 @@ Please report vulnerabilities privately. See [SECURITY.md](SECURITY.md).
 ## License
 
 Copyright (c) 2026 FlyCockpit LLC. Licensed under the [MIT License](LICENSE).
+
+Password pepper rotation, backup keys, and lost-key recovery are documented in [production hardening](docs/production-hardening.md#password-pepper).

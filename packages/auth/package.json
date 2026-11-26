@@ -6,6 +6,9 @@
     ".": {
       "default": "./src/index.ts"
     },
+    "./password-pepper-store": {
+      "default": "./src/password-pepper-store.ts"
+    },
     "./signup-policy": {
       "default": "./src/signup-policy.ts"
     },

@@ -11,10 +11,8 @@ import { describe, expect, it } from "vitest";
 // packages/api/src/lib/writer-classes.postgres.integration.test.ts). This
 // file pins the parts only the source can show:
 //
-// 1. `acquireFences` is the only way to take an advisory lock: nothing but
-//    the fence module, the hardening SQL that defines `wsmp_acquire_fences`,
-//    and the deploy entrypoint's session lock names an advisory function or
-//    the fence setting.
+// 1. Advisory locks and the fence protocol have reviewed sites: capacity
+//    fences go through `acquireFences`; independent locks are explained below.
 // 2. Writer classes: only hot-path (H) and sweeper (S) modules write H
 //    tables, so a management (M) transaction never holds an H row.
 // 3. Every module that writes graph tables is classified (a census): a new
@@ -69,6 +67,8 @@ function productionSources(): Array<{ file: string; source: string }> {
 
 /** Files allowed to name an advisory-lock function, and why. */
 const ADVISORY_SITES: Record<string, string> = {
+  "packages/auth/src/password-pepper-store.ts":
+    "Startup sync before the listener and owner-run one-shot recovery each take the transaction-scoped pepper lock first in their own transaction, then touch only account passwords; neither holds nor later takes capacity fences. hashtext is promoted to bigint, so a collision with a hashtextextended capacity fence is possible, but creates no lock-order cycle.",
   "packages/db/src/capacity-lock-order.ts":
     "The fence module: acquireFences calls wsmp_acquire_fences (its docs name pg_advisory*).",
   "packages/db/prisma/schema-hardening.sql":
@@ -390,7 +390,7 @@ function balanced(source: string, start: number): string {
 }
 
 describe("capacity lock order (DL-1 design (d)): writer classes and fences", () => {
-  it("takes advisory locks only through acquireFences (and the deploy entrypoint)", () => {
+  it("takes advisory locks only at reviewed sites", () => {
     const sites = productionSources().flatMap(({ file, source }) =>
       findAdvisoryReferences(file, source),
     );

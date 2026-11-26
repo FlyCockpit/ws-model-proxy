@@ -30,7 +30,7 @@ Only the 1.0.x release line is supported. Versions 0.4.x and earlier are unsuppo
   `Authorization`; model and CLI credentials remain scoped to their dedicated
   API and WebSocket surfaces.
 - Tiered rate limiting for signup and auth routes.
-- Production boot guards for weak or missing `BETTER_AUTH_SECRET`.
+- Production boot guards for weak or missing `BETTER_AUTH_SECRET`. Password hashes are sealed under a key derived from it; see [password pepper rotation and recovery](docs/production-hardening.md#password-pepper).
 - MCP OAuth scope policy on top of Better Auth's provider: an authorize request
   must name its scopes (Better Auth would otherwise default to every scope the
   client registered, better-auth#12194), and consent, refresh and the agent

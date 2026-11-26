@@ -924,6 +924,10 @@ const SQL_ELSEWHERE: Record<string, [number, string]> = {
   "packages/api/src/lib/test-traffic.ts | fragment-other": [2, "Test traffic over usage tables."],
   "packages/api/src/nodes/enroll-exchange.ts | raw-other": [1, "Node enrollment row lock."],
   "packages/api/src/profiles/procedures.ts | raw-other": [2, "Profile row locks."],
+  "packages/auth/src/password-pepper-store.ts | raw-other": [
+    2,
+    "One pg_advisory_xact_lock(hashtext('password-pepper')) in each of startup sync and owner-run recovery; both read and update account passwords, never run tables.",
+  ],
   "packages/db/src/capacity-lock-order.ts | raw-other": [
     12,
     "Graph-fence and capacity locks (user/node/capacity rows), no run table.",

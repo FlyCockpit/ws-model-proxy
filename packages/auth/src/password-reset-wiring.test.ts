@@ -45,6 +45,15 @@ describe("password reset wiring", { timeout: 60_000 }, () => {
     emailConfigured.value = false;
   });
 
+  it("uses the password pepper for Better Auth hashing and verification", async () => {
+    const auth = await loadAuth(false);
+    const { passwordPepper } = await import("./index");
+    expect(auth.options.emailAndPassword?.password).toEqual({
+      hash: passwordPepper.hash,
+      verify: passwordPepper.verify,
+    });
+  });
+
   it("without SMTP there is no reset mail and the request route refuses", async () => {
     const auth = await loadAuth(false);
     const options = auth.options.emailAndPassword;

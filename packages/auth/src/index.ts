@@ -27,6 +27,7 @@ import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { refuseImpersonatedAuthWrite } from "./impersonation-read-only";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
+import { createPasswordPepper } from "./password-pepper";
 import { passwordResetOptions } from "./password-reset";
 import { recordProvedEmail } from "./proved-email";
 import { notifySessionEnded, sessionEndCause } from "./session-ended-listeners";
@@ -235,6 +236,11 @@ async function resolveUniqueUserSlug({
   return slugWithRandomSuffix("user");
 }
 
+export const passwordPepper = createPasswordPepper({
+  secret: env.BETTER_AUTH_SECRET,
+  previousSecret: env.BETTER_AUTH_SECRET_PREVIOUS,
+});
+
 export const auth = betterAuth({
   database: prismaAdapter(
     // The shared client from @ws-model-proxy/db is ALREADY wrapped by the
@@ -316,6 +322,7 @@ export const auth = betterAuth({
   },
   emailAndPassword: {
     enabled: true,
+    password: { hash: passwordPepper.hash, verify: passwordPepper.verify },
     // Product policy: keep the creation/reset minimum at eight characters.
     minPasswordLength: 8,
     // When SMTP is unset the app is fully usable without mail. When SMTP is

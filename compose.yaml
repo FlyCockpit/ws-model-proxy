@@ -23,6 +23,7 @@ services:
       NODE_ENV: production
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?set a random database password}@postgres:5432/ws-model-proxy
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set a random auth secret of at least 32 characters}
+      BETTER_AUTH_SECRET_PREVIOUS: ${BETTER_AUTH_SECRET_PREVIOUS:-}
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:?set the public app origin}
       TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:?set the actual number of reverse proxies}
       ADMIN_EMAIL: ${ADMIN_EMAIL:?set the bootstrap owner email}

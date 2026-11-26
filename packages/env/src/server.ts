@@ -41,6 +41,7 @@ export const env = createEnv({
     PORT: z.coerce.number().int().min(1).max(65_535).optional(),
     SERVER_PORT: z.coerce.number().int().min(1).max(65_535).optional(),
     BETTER_AUTH_SECRET: z.string().min(32),
+    BETTER_AUTH_SECRET_PREVIOUS: z.string().min(32).optional(),
     BETTER_AUTH_URL: originUrl("BETTER_AUTH_URL"),
     CORS_ORIGIN: originUrl("CORS_ORIGIN").optional(),
     SIGNUP_ENABLED: strictBooleanFlag(),
@@ -290,4 +291,19 @@ if (weakReason) {
     throw new EnvConfigError(msg);
   }
   console.warn(msg);
+}
+
+// Only configured while rotating the password pepper.
+if (env.BETTER_AUTH_SECRET_PREVIOUS) {
+  if (env.BETTER_AUTH_SECRET_PREVIOUS === env.BETTER_AUTH_SECRET) {
+    throw new EnvConfigError(
+      "[env] BETTER_AUTH_SECRET_PREVIOUS must differ from BETTER_AUTH_SECRET; unset it or set the old secret",
+    );
+  }
+  const previousWeakReason = isWeakSecret(env.BETTER_AUTH_SECRET_PREVIOUS);
+  if (previousWeakReason) {
+    const msg = `[env] BETTER_AUTH_SECRET_PREVIOUS is weak: ${previousWeakReason}. Use the old BETTER_AUTH_SECRET only while rotating; see docs/production-hardening.md § Password pepper.`;
+    if (env.NODE_ENV === "production") throw new EnvConfigError(msg);
+    console.warn(msg);
+  }
 }

@@ -55,6 +55,12 @@ const checks: Check[] = [
   },
   {
     kind: "contains",
+    label: "pepper recovery script must load root .env",
+    file: "scripts/auth-pepper-reset-unusable.ts",
+    needle: LOAD_DOTENV,
+  },
+  {
+    kind: "contains",
     label: "locale translation script must load root .env",
     file: "scripts/translate-locale-bundles.ts",
     needle: LOAD_DOTENV,

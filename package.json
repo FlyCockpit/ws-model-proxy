@@ -77,6 +77,7 @@
     "docker:check-copy": "tsx scripts/check-docker-copy.ts",
     "deps:check-excludes": "tsx scripts/check-release-age-excludes.ts",
     "setup:app": "tsx scripts/setup.ts",
+    "auth:pepper:reset-unusable": "tsx scripts/auth-pepper-reset-unusable.ts",
     "doctor:app": "tsx scripts/doctor.ts",
     "doctor:react": "react-doctor . --offline -y",
     "doctor:react:diff": "react-doctor . --scope changed --base origin/main --offline -y",

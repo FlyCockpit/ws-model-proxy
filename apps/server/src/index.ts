@@ -2,7 +2,8 @@
 // module, so every import below sees the final process.env.
 
 import { serve } from "@hono/node-server";
-import { auth } from "@ws-model-proxy/auth";
+import { auth, passwordPepper } from "@ws-model-proxy/auth";
+import { syncPasswordPepper } from "@ws-model-proxy/auth/password-pepper-store";
 import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { WebSocketServer } from "ws";
@@ -127,6 +128,7 @@ async function waitForDependencies() {
 
 await waitForDependencies();
 await assertDatabaseBackfilled();
+await syncPasswordPepper(prisma, passwordPepper);
 
 // ---------------------------------------------------------------------------
 // Start listening

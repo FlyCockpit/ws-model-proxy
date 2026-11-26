@@ -1,9 +1,11 @@
 /**
  * Capacity lock order, DL-1 design (d) (#78): writer classes, fences, and no
- * foreign key across the hot-path boundary. This module owns every advisory
- * lock in the application ({@link acquireFences}, the only caller of the
- * database's `wsmp_acquire_fences`, which is the only `pg_advisory*` caller
- * outside deploy scripts) and the admission store's internal row order. The
+ * foreign key across the hot-path boundary. This module owns capacity fences
+ * ({@link acquireFences} is the only caller of `wsmp_acquire_fences`) and the
+ * admission store's internal row order. Independent `pg_advisory*` sites are reviewed
+ * in the static guard; the password pepper lock is taken first in a standalone
+ * transaction that never takes a capacity fence. Its bigint key can collide
+ * with a fence hash, but cannot add a fence-order cycle. The
  * admission store (apps/server), the API writers (packages/api), the deletion
  * subsystem (./parent-deletion.ts) and the sweepers share it.
  *
@@ -115,7 +117,7 @@
  *    table (`pg_constraint`, either direction).
  * 4. The static guard (apps/server/src/model-api/capacity/lock-order.test.ts)
  *    allows H-table writes only in the H and S modules, advisory locks only
- *    here and in the deploy scripts, and `wsmp.fences` only here, in
+ *    at reviewed sites, and `wsmp.fences` only here, in
  *    schema-hardening.sql and in test fixtures.
  *
  * Why admission cannot be part of a deadlock:
