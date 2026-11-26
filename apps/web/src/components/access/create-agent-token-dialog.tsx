@@ -3,15 +3,15 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { type ReactNode, useId, useState } from "react";
+import { type ReactNode, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
-import { AgentAccessChoice } from "@/components/access/agent-access-choice";
+import { AgentAccessChoice, agentAccessSummaryText } from "@/components/access/agent-access-choice";
 import { SecretReveal } from "@/components/access/secret-reveal";
 import { CodeSnippet } from "@/components/code-snippet";
+import { FormSheet, focusFirstInvalid } from "@/components/form-surface";
 import { InlineRetry } from "@/components/inline-retry";
 import {
   agentAccessSchema,
@@ -25,7 +25,11 @@ import {
 } from "@/lib/agent-token-expiry";
 import { orpc } from "@/utils/orpc";
 
-/** Access → Agents "Create agent token": the form, then the token once with an agent config. */
+/**
+ * Access → Agents "Create agent token", a wide side sheet (too many choices for a dialog): name,
+ * access level and permissions, nodes and expiry, with what will be created summed up next to
+ * the Create button; then the token once, with an agent config and the next step.
+ */
 export function CreateAgentTokenDialog({
   open,
   onOpenChange,
@@ -63,20 +67,22 @@ export function CreateAgentTokenDialog({
         )
       : null;
   const renderDialog = (children: ReactNode, footer?: ReactNode) => (
-    <ResponsiveDialog
+    <FormSheet
       open={open}
       onOpenChange={(next) => (next ? onOpenChange(true) : close())}
       title={secret ? t("access:agents.created") : t("access:agents.createTitle")}
       description={secret ? undefined : t("access:agents.tokensDescription")}
-      className="md:max-h-[calc(100dvh-2rem)] md:grid-rows-[auto_minmax(0,1fr)_auto] [&>[data-slot=drawer-header]]:shrink-0 [&>[data-slot=drawer-footer]]:shrink-0"
       footer={footer}
     >
       {children}
-    </ResponsiveDialog>
+    </FormSheet>
   );
   return secret ? (
     renderDialog(
-      <div className="min-h-0 min-w-0 pb-4 md:overflow-x-hidden md:overflow-y-auto md:overscroll-contain">
+      <div className="min-w-0 space-y-3">
+        <p className="text-sm font-medium">
+          {config ? t("access:agents.nextStep") : t("access:agents.nextStepNoConfig")}
+        </p>
         <SecretReveal value={secret} onDone={close}>
           {config ? (
             <div className="min-w-0 space-y-1.5">
@@ -147,6 +153,7 @@ function ReadyAgentTokenForm({
   const { t } = useTranslation(["access", "common"]);
   const queryClient = useQueryClient();
   const formId = useId();
+  const formRef = useRef<HTMLFormElement>(null);
   const choices = agentTokenExpiryPresets(maxLifetimeDays);
   const createSchema = z
     .object({
@@ -177,6 +184,8 @@ function ReadyAgentTokenForm({
       customDate: "",
     },
     validators: { onSubmit: createSchema },
+    // Errors sit next to their field; focus moves to the first one (after React shows them).
+    onSubmitInvalid: () => window.setTimeout(() => focusFirstInvalid(formRef.current), 0),
     onSubmit: async ({ value }) => {
       const expiresAt = agentTokenExpiry(
         value.expiry,
@@ -199,10 +208,20 @@ function ReadyAgentTokenForm({
   const now = Date.now();
   const tomorrow = new Date(now);
   tomorrow.setDate(tomorrow.getDate() + 1);
+  const expirySummary = (expiry: string, customDate: string) => {
+    const expiresAt = agentTokenExpiry(expiry, customDate, now, maxLifetimeDays, allowNoExpiry);
+    if (expiresAt === undefined) return t("access:agents.summary.pickDate");
+    if (expiresAt === null) return t("access:agents.summary.noExpiry");
+    return t("access:agents.summary.expiresOn", {
+      date: new Date(expiresAt).toLocaleDateString(undefined, { dateStyle: "medium" }),
+    });
+  };
   return renderDialog(
     <form
       id={formId}
-      className="flex min-w-0 flex-col gap-4 pb-4 md:overflow-x-hidden md:overflow-y-auto md:overscroll-contain"
+      ref={formRef}
+      noValidate
+      className="flex min-w-0 flex-col gap-6"
       onSubmit={(event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -211,8 +230,10 @@ function ReadyAgentTokenForm({
     >
       <form.Field name="name">
         {(field) => (
-          <div className="space-y-2">
-            <Label htmlFor={field.name}>{t("access:fields.name")}</Label>
+          <div className="min-w-0 space-y-2 sm:max-w-md">
+            <Label htmlFor={field.name} className="text-base font-semibold">
+              {t("access:fields.name")}
+            </Label>
             <Input
               id={field.name}
               autoComplete="off"
@@ -238,16 +259,12 @@ function ReadyAgentTokenForm({
       </form.Field>
       <form.Field name="expiry">
         {(field) => (
-          <div className="min-w-0 space-y-2">
-            <Label>{t("access:fields.expiry")}</Label>
+          <fieldset className="@container min-w-0 space-y-2">
+            <legend className="mb-2 text-base font-semibold">{t("access:fields.expiry")}</legend>
             <p className="text-xs text-muted-foreground">
               {t("access:agents.maxLifetime", { days: maxLifetimeDays })}
             </p>
-            <div
-              role="group"
-              aria-label={t("access:fields.expiry")}
-              className="grid min-w-0 grid-cols-2 gap-2"
-            >
+            <div className="grid min-w-0 grid-cols-2 gap-2 @md:grid-cols-3">
               {[
                 ...choices.map((days) => ({
                   value: String(days),
@@ -275,7 +292,7 @@ function ReadyAgentTokenForm({
             {field.state.value === "custom" ? (
               <form.Field name="customDate">
                 {(dateField) => (
-                  <div className="space-y-2">
+                  <div className="min-w-0 space-y-2 sm:max-w-xs">
                     <Label htmlFor="agent-token-date">{t("access:agents.customDate")}</Label>
                     <Input
                       id="agent-token-date"
@@ -300,25 +317,34 @@ function ReadyAgentTokenForm({
                 {t("access:agents.expiryInvalid", { days: maxLifetimeDays })}
               </p>
             ) : null}
-          </div>
+          </fieldset>
         )}
       </form.Field>
     </form>,
-    <form.Subscribe selector={(state) => state.isSubmitting}>
-      {(isSubmitting) => (
-        <div className="flex min-w-0 flex-wrap justify-end gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="touch"
-            disabled={isSubmitting}
-            onClick={onCancel}
+    <form.Subscribe selector={(state) => state}>
+      {({ isSubmitting, values }) => (
+        <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <p
+            data-testid="agent-token-summary"
+            className="min-w-0 text-sm break-words text-muted-foreground"
           >
-            {t("common:actions.cancel")}
-          </Button>
-          <Button type="submit" form={formId} size="touch" disabled={isSubmitting}>
-            {isSubmitting ? t("access:agents.creating") : t("access:agents.create")}
-          </Button>
+            {agentAccessSummaryText(t, values.access)} ·{" "}
+            {expirySummary(values.expiry, values.customDate)}
+          </p>
+          <div className="flex min-w-0 shrink-0 flex-wrap justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="touch"
+              disabled={isSubmitting}
+              onClick={onCancel}
+            >
+              {t("common:actions.cancel")}
+            </Button>
+            <Button type="submit" form={formId} size="touch" disabled={isSubmitting}>
+              {isSubmitting ? t("access:agents.creating") : t("access:agents.create")}
+            </Button>
+          </div>
         </div>
       )}
     </form.Subscribe>,

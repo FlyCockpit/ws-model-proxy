@@ -63,10 +63,16 @@ function mount(children: ReactNode) {
   );
 }
 
-describe("Agent dialogs scroll ownership", () => {
-  it.each(["create", "edit"])(
-    "%s uses only the ResponsiveDialog body scroller on phones",
-    async (kind) => {
+describe("Agent sheets scroll ownership", () => {
+  it.each([
+    ["create", false],
+    ["edit", false],
+    ["create", true],
+    ["edit", true],
+  ] as const)(
+    "%s is a side sheet with one body scroller and a pinned footer (desktop: %s)",
+    async (kind, wide) => {
+      desktop = wide;
       const close = vi.fn();
       mount(
         kind === "create" ? (
@@ -82,19 +88,22 @@ describe("Agent dialogs scroll ownership", () => {
       );
       await screen.findByRole("button", { name: "common:actions.cancel" });
       const dialog = screen.getByRole("dialog");
-      expect(dialog.getAttribute("data-slot")).toBe("drawer-content");
+      expect(dialog.getAttribute("data-slot")).toBe("sheet-content");
+      expect(dialog.hasAttribute("data-form-sheet")).toBe(true);
       expect(dialog.classList.contains("overflow-y-auto")).toBe(false);
       const scrollers = dialog.querySelectorAll(".overflow-y-auto");
       expect(scrollers).toHaveLength(1);
+      expect(scrollers[0]?.getAttribute("data-slot")).toBe("form-sheet-body");
       expect(scrollers[0]?.classList.contains("overflow-x-hidden")).toBe(true);
-      expect(scrollers[0]?.querySelector("form")).toBeTruthy();
-      expect(scrollers[0]?.querySelector('[data-slot="drawer-header"]')).toBeNull();
-      const footer = dialog.querySelector('[data-slot="drawer-footer"]');
+      const form = scrollers[0]?.querySelector("form");
+      expect(form).toBeTruthy();
+      expect(scrollers[0]?.querySelector('[data-slot="sheet-header"]')).toBeNull();
+      const footer = dialog.querySelector('[data-slot="form-sheet-footer"]');
       const cancel = screen.getByRole("button", { name: "common:actions.cancel" });
       expect(footer?.contains(cancel)).toBe(true);
       expect(scrollers[0]?.contains(cancel)).toBe(false);
       const submit = footer?.querySelector<HTMLButtonElement>('button[type="submit"]');
-      expect(submit?.form).toBe(scrollers[0]?.querySelector("form"));
+      expect(submit?.form).toBe(form);
       fireEvent.click(screen.getByRole("radio", { name: "access:agents.onlyNodes" }));
       await screen.findByText("access:agents.noNodes");
       expect(dialog.querySelectorAll(".overflow-y-auto")).toHaveLength(1);
@@ -104,38 +113,11 @@ describe("Agent dialogs scroll ownership", () => {
     },
   );
 
-  it.each(["create", "edit"])("%s retains a bounded desktop scroller", async (kind) => {
-    desktop = true;
-    mount(
-      kind === "create" ? (
-        <CreateAgentTokenDialog open mcpUrl={null} onOpenChange={vi.fn()} />
-      ) : (
-        <EditAgentAccessDialog
-          name="Agent"
-          access={{ scopes: ["read"], nodeIds: null }}
-          onSave={vi.fn()}
-          onClose={vi.fn()}
-        />
-      ),
-    );
-    await screen.findByRole("button", { name: "common:actions.cancel" });
-    const dialog = screen.getByRole("dialog");
-    expect(dialog.getAttribute("data-slot")).toBe("dialog-content");
-    expect(dialog.classList.contains("md:overflow-y-auto")).toBe(false);
-    const scrollers = dialog.querySelectorAll(".md\\:overflow-y-auto");
-    expect(scrollers).toHaveLength(1);
-    expect(scrollers[0]?.classList.contains("md:overflow-x-hidden")).toBe(true);
-    const footer = dialog.querySelector('[data-slot="dialog-footer"]');
-    const cancel = screen.getByRole("button", { name: "common:actions.cancel" });
-    expect(footer?.contains(cancel)).toBe(true);
-    expect(scrollers[0]?.contains(cancel)).toBe(false);
-    expect(dialog.classList.contains("md:grid-rows-[auto_minmax(0,1fr)_auto]")).toBe(true);
-    expect(dialog.className).toContain("md:max-h-[calc(100dvh-2rem)]");
-  });
-
   it("keeps every expiry preset visible in a wrapping grid with touch targets", async () => {
     mount(<CreateAgentTokenDialog open mcpUrl={null} onOpenChange={vi.fn()} />);
-    const presets = await screen.findByRole("group", { name: "access:fields.expiry" });
+    const expiry = await screen.findByRole("group", { name: "access:fields.expiry" });
+    const presets = expiry.querySelector<HTMLElement>(".grid");
+    if (!presets) throw new Error("no expiry grid");
     expect(presets.classList.contains("grid")).toBe(true);
     expect(presets.classList.contains("grid-cols-2")).toBe(true);
     expect(presets.closest(".overflow-x-auto")).toBeNull();

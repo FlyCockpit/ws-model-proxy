@@ -7,6 +7,7 @@ vi.mock("react-i18next", () => ({
 }));
 
 import { useAppForm } from "@/hooks/use-app-form";
+import { pickSelectOption } from "@/lib/pick-select-option";
 import { editorValues, readSpecEditor, type SpecReading } from "@/lib/runtime-spec-draft";
 
 import { RuntimeSpecFields } from "./runtime-spec-fields";
@@ -52,16 +53,16 @@ afterEach(() => {
 });
 
 describe("RuntimeSpecFields reservations", () => {
-  it("edits a discrete reservation's GPU vendor into the spec", () => {
+  it("edits a discrete reservation's GPU vendor into the spec", async () => {
     const onRead = vi.fn<(reading: SpecReading) => void>();
     render(<Host onRead={onRead} />);
     // The rank resource is unified (no vendor), so the only vendor select is the reservation's.
     const vendor = screen.getByLabelText("dashboard:runtime.specForm.vendor");
     expect(vendor.id).toBe("t-reservation-0-vendor");
-    expect(vendor).toBeInstanceOf(HTMLSelectElement);
-    if (!(vendor instanceof HTMLSelectElement)) return;
-    expect(vendor.value).toBe("");
-    fireEvent.change(vendor, { target: { value: "amd" } });
+    // Closed, it shows the label of "any vendor", not an empty raw value.
+    expect(vendor.textContent).toContain("dashboard:runtime.specForm.anyVendor");
+    await pickSelectOption(vendor, "dashboard:runtime.specForm.vendors.amd");
+    expect(vendor.textContent).toContain("dashboard:runtime.specForm.vendors.amd");
     fireEvent.click(screen.getByRole("button", { name: "read" }));
     const reading = onRead.mock.calls[0]?.[0];
     expect(reading?.ok).toBe(true);

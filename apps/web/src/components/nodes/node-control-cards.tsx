@@ -19,13 +19,13 @@ import {
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { Switch } from "@ws-model-proxy/ui/components/switch";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { ShieldAlert } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
+import { SwitchRow } from "@/components/switch-row";
 import { TimeAgo } from "@/components/time-ago";
 import { orpc } from "@/utils/orpc";
 
@@ -342,21 +342,20 @@ export function TemporaryCard({ node }: { node: NodeDetail }) {
         <CardDescription>{t("dashboard:nodes.temporary.description")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        <label className="flex min-h-[44px] items-center justify-between gap-3">
-          <span className="text-sm font-medium">{t("dashboard:nodes.temporary.toggle")}</span>
-          <Switch
-            checked={temporary}
-            disabled={save.isPending || (!temporary && !validHours)}
-            onCheckedChange={(checked) =>
-              save.mutate({
-                nodeId: node.id,
-                removeAfterOfflineMs: checked
-                  ? Math.max(60_000, Math.round(parsedHours * HOUR_MS))
-                  : null,
-              })
-            }
-          />
-        </label>
+        <SwitchRow
+          id="node-temporary"
+          label={t("dashboard:nodes.temporary.toggle")}
+          checked={temporary}
+          disabled={save.isPending || (!temporary && !validHours)}
+          onChange={(checked) =>
+            save.mutate({
+              nodeId: node.id,
+              removeAfterOfflineMs: checked
+                ? Math.max(60_000, Math.round(parsedHours * HOUR_MS))
+                : null,
+            })
+          }
+        />
         <div className="flex min-w-0 flex-wrap items-end gap-2">
           <div className="min-w-0 flex-1 space-y-1.5">
             <Label htmlFor="temporary-hours">{t("dashboard:nodes.temporary.hours")}</Label>

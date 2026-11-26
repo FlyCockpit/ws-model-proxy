@@ -86,7 +86,36 @@
     "disconnected": "Disconnected.",
     "mcpOff": "MCP is turned off on this server, so agent tokens cannot be created.",
     "scopesTitle": "Permissions",
-    "everything": "Everything",
+    "presetsLabel": "Access level",
+    "presets": {
+      "readOnly": {
+        "name": "Read only",
+        "description": "See nodes, runtimes, pools, profiles, providers, metrics and request logs. Changes nothing."
+      },
+      "models": {
+        "name": "Run models",
+        "description": "Also create, change, start and stop pools and runtimes, apply profiles and send test requests. No commands, files or node changes."
+      },
+      "full": {
+        "name": "Full access",
+        "description": "Everything, including running commands, editing files and changing your nodes.",
+        "ceilingDescription": "Every permission this agent asked for."
+      },
+      "custom": {
+        "name": "Custom",
+        "description": "Pick permissions one by one below."
+      }
+    },
+    "scopesDetail": "Permissions one by one",
+    "summary": {
+      "custom_one": "Custom: {{count}} permission",
+      "custom_other": "Custom: {{count}} permissions",
+      "expiresOn": "expires {{date}}",
+      "noExpiry": "never expires",
+      "pickDate": "pick an expiry date"
+    },
+    "nextStep": "Next: copy this configuration into your agent's MCP settings and restart the agent. The token is shown only this once.",
+    "nextStepNoConfig": "Next: give your agent this token as its Bearer token for the MCP server. The token is shown only this once.",
     "nodesTitle": "Nodes",
     "allNodes": "All my nodes (now and later)",
     "onlyNodes": "Only these nodes",

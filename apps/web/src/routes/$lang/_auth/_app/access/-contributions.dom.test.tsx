@@ -47,14 +47,17 @@ vi.mock("@ws-model-proxy/ui/components/responsive-dialog", () => ({
     open,
     title,
     children,
+    footer,
   }: {
     open: boolean;
     title: string;
     children: ReactNode;
+    footer?: ReactNode;
   }) =>
     open ? (
       <div role="dialog" aria-label={title}>
         {children}
+        {footer}
       </div>
     ) : null,
 }));

@@ -9,19 +9,21 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
-import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
+import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
+import { FormActionBar, FormAdvanced, focusFirstInvalid } from "@/components/form-surface";
 import { InlineRetry } from "@/components/inline-retry";
 import { RuntimeSpecFields } from "@/components/runtimes/runtime-spec-fields";
 import { VersionHistory } from "@/components/runtimes/version-history";
 import { StatusPill } from "@/components/status-pill";
+import { SwitchRow } from "@/components/switch-row";
 import { useAppForm } from "@/hooks/use-app-form";
 import { rejectedDefinesWarning } from "@/lib/define-rejections";
 import { refusalText } from "@/lib/refusal-text";
@@ -112,7 +114,7 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
   const schema = z
     .object({
       spec: z.custom<SpecEditorValues>(),
-      note: z.string().max(500),
+      note: z.string().max(500, t("dashboard:runtime.form.noteTooLong")),
       restartRunning: z.boolean(),
     })
     .superRefine((value, ctx) => {
@@ -121,6 +123,7 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
         for (const issue of reading.issues)
           ctx.addIssue({ code: "custom", path: ["spec", ...issue.path], message: issue.message });
     });
+  const formRef = useRef<HTMLFormElement>(null);
   const form = useAppForm({
     defaultValues: {
       spec: editorValues(runtime.current.spec, kind),
@@ -128,6 +131,7 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
       restartRunning: false,
     },
     validators: { onSubmit: schema },
+    onSubmitInvalid: () => window.setTimeout(() => focusFirstInvalid(formRef.current), 0),
     onSubmit: async ({ value }) => {
       const reading = readSpecEditor(value.spec, kind, messages);
       if (!reading.ok) return;
@@ -158,63 +162,92 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
     },
   });
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">{t("dashboard:runtime.definition")}</CardTitle>
-        <CardDescription>{t("dashboard:runtime.definitionHint")}</CardDescription>
-      </CardHeader>
-      <CardContent>
-        <form
-          className="flex flex-col gap-4"
-          onSubmit={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            form.handleSubmit();
-          }}
-        >
-          <RuntimeSpecFields form={form} fields="spec" kind={kind} idPrefix="definition" />
-          <form.Field name="note">
-            {(field) => (
-              <div className="space-y-1.5">
-                <Label htmlFor="definition-note">{t("dashboard:runtime.form.note")}</Label>
-                <Input
-                  id="definition-note"
-                  className="h-11"
-                  value={field.state.value}
-                  onChange={(event) => field.handleChange(event.target.value)}
-                />
-              </div>
+    <form
+      ref={formRef}
+      noValidate
+      aria-labelledby="definition-title"
+      className="flex min-w-0 flex-col gap-8"
+      onSubmit={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        form.handleSubmit();
+      }}
+    >
+      <div className="min-w-0 space-y-1">
+        <h2 id="definition-title" className="text-lg font-semibold">
+          {t("dashboard:runtime.definition")}
+        </h2>
+        <p className="text-sm text-muted-foreground">{t("dashboard:runtime.definitionHint")}</p>
+      </div>
+      <RuntimeSpecFields
+        form={form}
+        fields="spec"
+        kind={kind}
+        idPrefix="definition"
+        advanced={
+          <form.Subscribe selector={(state) => state.values.note}>
+            {(note) => (
+              <FormAdvanced
+                title={t("dashboard:runtime.form.versionNote")}
+                summary={
+                  note.trim()
+                    ? t("dashboard:runtime.form.summaryNote")
+                    : t("dashboard:runtime.form.summaryNoNote")
+                }
+              >
+                <form.Field name="note">
+                  {(field) => (
+                    <div className="min-w-0 space-y-1.5">
+                      <Label htmlFor="definition-note">{t("dashboard:runtime.form.note")}</Label>
+                      <Input
+                        id="definition-note"
+                        className="h-11"
+                        maxLength={500}
+                        value={field.state.value}
+                        onChange={(event) => field.handleChange(event.target.value)}
+                        aria-invalid={field.state.meta.errors.length > 0 || undefined}
+                        aria-describedby={
+                          field.state.meta.errors.length > 0 ? "definition-note-error" : undefined
+                        }
+                      />
+                      {field.state.meta.errors.length > 0 ? (
+                        <p id="definition-note-error" className="text-sm text-destructive">
+                          {t("dashboard:runtime.form.noteTooLong")}
+                        </p>
+                      ) : null}
+                    </div>
+                  )}
+                </form.Field>
+              </FormAdvanced>
             )}
-          </form.Field>
-          {kind === "STARTABLE" ? (
-            <form.Field name="restartRunning">
-              {(field) => (
-                <div className="flex min-h-11 items-center gap-3">
-                  <Checkbox
-                    id="definition-restart"
-                    checked={field.state.value}
-                    onCheckedChange={(checked) => field.handleChange(checked === true)}
-                  />
-                  <Label htmlFor="definition-restart">
-                    {t("dashboard:runtime.restartRunning")}
-                  </Label>
-                </div>
-              )}
-            </form.Field>
-          ) : null}
-          <form.Subscribe selector={(state) => state.values.spec}>
-            {(spec) => <EditHint runtime={runtime} spec={spec} messages={messages} />}
           </form.Subscribe>
-          <form.Subscribe selector={(state) => state.isSubmitting}>
-            {(submitting) => (
-              <Button type="submit" size="touch" disabled={submitting}>
-                {submitting ? t("common:actions.saving") : t("dashboard:runtime.saveVersion")}
-              </Button>
-            )}
-          </form.Subscribe>
-        </form>
-      </CardContent>
-    </Card>
+        }
+      />
+      {kind === "STARTABLE" ? (
+        <form.Field name="restartRunning">
+          {(field) => (
+            <SwitchRow
+              id="definition-restart"
+              label={t("dashboard:runtime.restartRunning")}
+              description={t("dashboard:runtime.restartRunningHint")}
+              checked={field.state.value}
+              onChange={field.handleChange}
+            />
+          )}
+        </form.Field>
+      ) : null}
+      <form.Subscribe selector={(state) => state}>
+        {({ isSubmitting, values }) => (
+          <FormActionBar
+            summary={<EditHint runtime={runtime} spec={values.spec} messages={messages} />}
+          >
+            <Button type="submit" size="touch" disabled={isSubmitting}>
+              {isSubmitting ? t("common:actions.saving") : t("dashboard:runtime.saveVersion")}
+            </Button>
+          </FormActionBar>
+        )}
+      </form.Subscribe>
+    </form>
   );
 }
 

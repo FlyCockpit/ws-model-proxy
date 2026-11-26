@@ -232,7 +232,7 @@ describe("Access → Agents access editing", () => {
     fireEvent.click(await mount());
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getAllByRole("checkbox")).toHaveLength(2);
-    fireEvent.click(within(dialog).getByRole("button", { name: "access:agents.everything" }));
+    fireEvent.click(within(dialog).getByRole("radio", { name: "access:agents.presets.full.name" }));
     expect(within(dialog).queryByRole("alert")).toBeNull();
     fireEvent.click(within(dialog).getByRole("button", { name: "access:agents.save" }));
     await waitFor(() =>

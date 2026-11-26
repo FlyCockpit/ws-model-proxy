@@ -21,6 +21,10 @@
     "tryAgain": "Intentar de nuevo",
     "viewAll": "Ver todo"
   },
+  "switchState": {
+    "on": "Activado",
+    "off": "Desactivado"
+  },
   "loading": "Cargando…",
   "somethingWentWrong": "Algo salió mal",
   "welcome": "Bienvenido",

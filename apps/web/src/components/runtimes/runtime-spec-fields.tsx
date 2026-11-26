@@ -13,15 +13,18 @@ import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
+import type { TFunction } from "i18next";
 import { Plus, Trash2 } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { FieldErrors } from "@/components/field-errors";
-import { NativeSelect } from "@/components/native-select";
+import { FormAdvanced, FormSection, FormWide } from "@/components/form-surface";
+import { LabelledSelect } from "@/components/labelled-select";
 import { useRowKeys } from "@/components/runtimes/use-row-keys";
 import { SegmentedControl } from "@/components/segmented-control";
 import { type FieldGroupOf, withFieldGroup } from "@/hooks/use-app-form";
+import { hasToken, msToSeconds, replaceToken, secondsToMs } from "@/lib/runtime-preset-fill";
 import {
   COMMAND_FIELDS,
   type CommandField,
@@ -30,9 +33,12 @@ import {
   emptyCommandDraft,
   emptyReservationDraft,
   losslessDraft,
+  newEmbeddingDraft,
   parseBase,
+  type ResourceDraft,
   type ResourceKind,
   type RuntimeKind,
+  type SpecDraft,
   type SpecEditorValues,
   TIMEOUT_FIELDS,
 } from "@/lib/runtime-spec-draft";
@@ -45,7 +51,18 @@ type TextFieldApi = {
 };
 
 const RESOURCE_KINDS: ResourceKind[] = ["discrete", "unified", "cpu", "none"];
-const REQUIRED_COMMANDS: readonly CommandField[] = ["start", "stop"];
+/** Commands a service needs up front (its preset's `fill` is the whole command entry). */
+const SERVICE_COMMANDS: readonly CommandField[] = ["stop", "status"];
+/** Commands under "More commands" for every runtime. */
+const EXTRA_COMMANDS: readonly CommandField[] = ["prepare", "afterJoin", "health"];
+
+function firstError(errors: ErrorList): string | null {
+  for (const error of errors) {
+    const message = typeof error === "string" ? error : error?.message;
+    if (message) return message;
+  }
+  return null;
+}
 
 /** Every error message of a field (the `check` field collects the ones no input owns). */
 function AllErrors({ errors }: { errors: ErrorList }) {
@@ -58,7 +75,7 @@ function AllErrors({ errors }: { errors: ErrorList }) {
   ];
   if (messages.length === 0) return null;
   return (
-    <ul className="list-disc space-y-1 pl-5 text-sm text-destructive">
+    <ul role="alert" className="list-disc space-y-1 pl-5 text-sm text-destructive">
       {messages.map((message) => (
         <li key={message} className="break-words">
           {message}
@@ -66,6 +83,21 @@ function AllErrors({ errors }: { errors: ErrorList }) {
       ))}
     </ul>
   );
+}
+
+/** The field's first error, next to it, as the input's description. */
+function InlineError({ id, message }: { id: string; message: string | null }) {
+  if (!message) return null;
+  return (
+    <p id={id} data-inline-error="" tabIndex={-1} className="text-sm break-words text-destructive">
+      {message}
+    </p>
+  );
+}
+
+function describedBy(...ids: Array<string | false | undefined>): string | undefined {
+  const list = ids.filter((id): id is string => typeof id === "string");
+  return list.length > 0 ? list.join(" ") : undefined;
 }
 
 function TextInput({
@@ -88,6 +120,11 @@ function TextInput({
   placeholder?: string;
 }) {
   const className = mono ? "font-mono text-xs" : undefined;
+  const error = firstError(field.state.meta.errors);
+  const a11y = {
+    "aria-invalid": error ? true : undefined,
+    "aria-describedby": describedBy(hint && `${id}-hint`, error !== null && `${id}-error`),
+  } as const;
   return (
     <div className="min-w-0 space-y-1.5">
       <Label htmlFor={id}>{label}</Label>
@@ -101,11 +138,12 @@ function TextInput({
           placeholder={placeholder}
           onBlur={field.handleBlur}
           onChange={(event) => field.handleChange(event.target.value)}
+          {...a11y}
         />
       ) : (
         <Input
           id={id}
-          className={`h-11 ${className ?? ""}`}
+          className={cn("h-11", className)}
           autoCapitalize="none"
           spellCheck={false}
           inputMode={inputMode}
@@ -113,57 +151,113 @@ function TextInput({
           placeholder={placeholder}
           onBlur={field.handleBlur}
           onChange={(event) => field.handleChange(event.target.value)}
+          {...a11y}
         />
       )}
-      {hint ? <p className="text-xs text-muted-foreground">{hint}</p> : null}
-      <FieldErrors field={field} />
+      {hint ? (
+        <p id={`${id}-hint`} className="text-xs text-muted-foreground">
+          {hint}
+        </p>
+      ) : null}
+      <InlineError id={`${id}-error`} message={error} />
     </div>
   );
 }
 
-type VendorFieldApi = {
-  state: { value: "" | GpuVendor; meta: { errors: ErrorList } };
-  handleChange: (value: "" | GpuVendor) => void;
-  handleBlur: () => void;
+/**
+ * A duration the spec holds in milliseconds, typed in seconds. What was typed is kept while it
+ * still means the field's value, so "1." stays "1." until the next digit; a value set from
+ * elsewhere (a preset, the JSON view) shows as seconds. Any error reads as the allowed range.
+ */
+function SecondsInput({
+  id,
+  label,
+  field,
+  rangeError,
+}: {
+  id: string;
+  label: string;
+  field: TextFieldApi;
+  rangeError: string;
+}) {
+  const [typed, setTyped] = useState<string | null>(null);
+  const shown =
+    typed !== null && secondsToMs(typed) === field.state.value
+      ? typed
+      : msToSeconds(field.state.value);
+  const error = firstError(field.state.meta.errors) ? rangeError : null;
+  return (
+    <div className="min-w-0 space-y-1.5">
+      <Label htmlFor={id}>{label}</Label>
+      <Input
+        id={id}
+        className="h-11"
+        inputMode="decimal"
+        autoCapitalize="none"
+        spellCheck={false}
+        value={shown}
+        onBlur={field.handleBlur}
+        onChange={(event) => {
+          setTyped(event.target.value);
+          field.handleChange(secondsToMs(event.target.value));
+        }}
+        aria-invalid={error ? true : undefined}
+        aria-describedby={error ? `${id}-error` : undefined}
+      />
+      <InlineError id={`${id}-error`} message={error} />
+    </div>
+  );
+}
+
+type SelectFieldApi<T extends string> = {
+  state: { value: T; meta: { errors: ErrorList } };
+  handleChange: (value: T) => void;
 };
 
-function isGpuVendor(value: string): value is GpuVendor {
-  return (GPU_VENDORS as readonly string[]).includes(value);
+function SelectInput<T extends string>({
+  id,
+  label,
+  field,
+  options,
+}: {
+  id: string;
+  label: string;
+  field: SelectFieldApi<T>;
+  options: ReadonlyArray<{ value: T; label: string }>;
+}) {
+  const error = firstError(field.state.meta.errors);
+  return (
+    <div className="min-w-0 space-y-1.5">
+      <Label htmlFor={id}>{label}</Label>
+      <LabelledSelect
+        id={id}
+        value={field.state.value}
+        options={options}
+        onValueChange={field.handleChange}
+        invalid={error !== null}
+        describedBy={error ? `${id}-error` : undefined}
+      />
+      <InlineError id={`${id}-error`} message={error} />
+    </div>
+  );
 }
 
 /** A discrete block's GPU vendor (empty: any vendor), for rank resources and reservations. */
-function GpuVendorField({ id, field }: { id: string; field: VendorFieldApi }) {
+function GpuVendorField({ id, field }: { id: string; field: SelectFieldApi<"" | GpuVendor> }) {
   const { t } = useTranslation(["dashboard"]);
   return (
-    <div className="min-w-0 space-y-1.5">
-      <Label htmlFor={id}>{t("dashboard:runtime.specForm.vendor")}</Label>
-      <NativeSelect
-        id={id}
-        value={field.state.value}
-        onBlur={field.handleBlur}
-        onChange={(event) =>
-          field.handleChange(isGpuVendor(event.target.value) ? event.target.value : "")
-        }
-      >
-        <option value="">{t("dashboard:runtime.specForm.anyVendor")}</option>
-        {GPU_VENDORS.map((vendor) => (
-          <option key={vendor} value={vendor}>
-            {t(`dashboard:runtime.specForm.vendors.${vendor}`)}
-          </option>
-        ))}
-      </NativeSelect>
-      <FieldErrors field={field} />
-    </div>
-  );
-}
-
-function Section({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
-  return (
-    <fieldset className="flex min-w-0 flex-col gap-3 rounded-xl border p-4">
-      <legend className="px-1 text-sm font-semibold">{title}</legend>
-      {hint ? <p className="text-xs text-muted-foreground">{hint}</p> : null}
-      {children}
-    </fieldset>
+    <SelectInput
+      id={id}
+      label={t("dashboard:runtime.specForm.vendor")}
+      field={field}
+      options={[
+        { value: "", label: t("dashboard:runtime.specForm.anyVendor") },
+        ...GPU_VENDORS.map((vendor) => ({
+          value: vendor,
+          label: t(`dashboard:runtime.specForm.vendors.${vendor}`),
+        })),
+      ]}
+    />
   );
 }
 
@@ -172,31 +266,56 @@ function CheckRow({
   label,
   checked,
   onChange,
+  errorId,
 }: {
   id: string;
   label: string;
   checked: boolean;
   onChange: (checked: boolean) => void;
+  /** The id of this box's rendered error, when it has one. */
+  errorId?: string;
 }) {
   return (
-    <div className="flex min-h-11 items-center gap-3">
-      <Checkbox id={id} checked={checked} onCheckedChange={(next) => onChange(next === true)} />
-      <Label htmlFor={id}>{label}</Label>
+    <div className="flex min-h-11 min-w-0 items-center gap-3">
+      <Checkbox
+        id={id}
+        checked={checked}
+        onCheckedChange={(next) => onChange(next === true)}
+        aria-invalid={errorId ? true : undefined}
+        aria-describedby={errorId}
+      />
+      <Label htmlFor={id} className="min-w-0 break-words">
+        {label}
+      </Label>
     </div>
   );
 }
 
+/** Where the page's own parts go among the editor's sections. */
+export type RuntimeSpecSlots = {
+  /** Essential fields of the page (name, node), first. */
+  basics?: ReactNode;
+  /** The page's always-on/startable choice, inside "How it runs". */
+  howItRuns?: ReactNode;
+  /** One-line summary of `howItRuns` (the kind). */
+  howItRunsSummary?: string;
+  /** The page's own Advanced section(s), first among them (slug and note). */
+  advanced?: ReactNode;
+};
+
 /**
- * The runtime definition editor: a form over `runtimeSpecSchema` (models, address or launch,
- * resources, commands with per-command timeouts, readiness, health) and the raw JSON, under one
- * key of a form made with `useAppForm`. Switching tabs converts between them; parts the form has
- * no inputs for are kept (see `runtime-spec-draft.ts`).
+ * The runtime definition editor: a form over `runtimeSpecSchema` and the raw JSON, under one
+ * key of a form made with `useAppForm`. The form part puts the few fields a starting point
+ * leaves to the person up front (model, start command, size; address and engine for a server
+ * already running; the commands of a service) and every other part in a collapsed Advanced
+ * section that says what it holds. The JSON view is the expert escape hatch. Switching views
+ * converts between them; parts the form has no inputs for are kept (`runtime-spec-draft.ts`).
  */
 // react-doctor-disable-next-line react-doctor/only-export-components -- withFieldGroup returns the component itself (React Doctor does not take a customHOCs setting)
 export const RuntimeSpecFields = withFieldGroup({
   defaultValues: editorValues({}) as SpecEditorValues,
-  props: {} as { kind: RuntimeKind; idPrefix: string },
-  render: function RuntimeSpecFieldsRender({ group, kind, idPrefix }) {
+  props: {} as { kind: RuntimeKind; idPrefix: string } & RuntimeSpecSlots,
+  render: function RuntimeSpecFieldsRender({ group, kind, idPrefix, ...slots }) {
     const { t } = useTranslation(["dashboard"]);
     const [switchError, setSwitchError] = useState(false);
     const id = (name: string) => `${idPrefix}-${name}`;
@@ -234,10 +353,67 @@ export const RuntimeSpecFields = withFieldGroup({
     };
 
     return (
-      <div className="flex min-w-0 flex-col gap-4">
+      <div className="flex min-w-0 flex-col gap-8">
+        <group.Subscribe selector={(state) => state.values.tab}>
+          {(tab) =>
+            tab === "json" ? (
+              <>
+                {slots.basics}
+                <group.Field name="json">
+                  {(field) => (
+                    <div className="min-w-0 space-y-1.5">
+                      <Label htmlFor={id("json")}>{t("dashboard:runtime.form.spec")}</Label>
+                      <Textarea
+                        id={id("json")}
+                        rows={22}
+                        spellCheck={false}
+                        className="font-mono text-xs"
+                        value={field.state.value}
+                        onBlur={field.handleBlur}
+                        onChange={(event) => field.handleChange(event.target.value)}
+                        aria-invalid={field.state.meta.errors.length > 0 || undefined}
+                        aria-describedby={id("json-hint")}
+                      />
+                      <p id={id("json-hint")} className="text-xs text-muted-foreground">
+                        {t("dashboard:runtime.form.specHint")}
+                      </p>
+                      <AllErrors errors={field.state.meta.errors} />
+                    </div>
+                  )}
+                </group.Field>
+                {slots.advanced || slots.howItRuns ? (
+                  <div className="flex min-w-0 flex-col gap-3">
+                    {slots.advanced}
+                    {slots.howItRuns ? (
+                      <FormAdvanced
+                        title={t("dashboard:runtime.specForm.sections.howItRuns")}
+                        summary={slots.howItRunsSummary}
+                      >
+                        {slots.howItRuns}
+                      </FormAdvanced>
+                    ) : null}
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <DraftSections group={group} kind={kind} id={id} slots={slots} />
+            )
+          }
+        </group.Subscribe>
+        <group.Field name="check">
+          {(field) => <AllErrors errors={field.state.meta.errors} />}
+        </group.Field>
         <group.Subscribe selector={(state) => state.values.tab}>
           {(tab) => (
-            <>
+            <div
+              id={id("view")}
+              tabIndex={-1}
+              className="flex min-w-0 flex-col gap-2 rounded-xl border border-dashed p-4"
+            >
+              <p className="text-sm font-medium">{t("dashboard:runtime.specForm.view")}</p>
+              <p className="text-xs text-muted-foreground">
+                {t("dashboard:runtime.specForm.viewHint")}
+              </p>
               <SegmentedControl
                 ariaLabel={t("dashboard:runtime.specForm.view")}
                 value={tab}
@@ -248,520 +424,549 @@ export const RuntimeSpecFields = withFieldGroup({
                 ]}
               />
               {switchError ? (
-                <p className="text-sm text-destructive">
+                <p role="alert" className="text-sm text-destructive">
                   {t("dashboard:runtime.specForm.fixJsonFirst")}
                 </p>
               ) : null}
-              {tab === "json" ? (
-                <group.Field name="json">
-                  {(field) => (
-                    <div className="space-y-1.5">
-                      <Label htmlFor={id("json")}>{t("dashboard:runtime.form.spec")}</Label>
-                      <Textarea
-                        id={id("json")}
-                        rows={22}
-                        spellCheck={false}
-                        className="font-mono text-xs"
-                        value={field.state.value}
-                        onBlur={field.handleBlur}
-                        onChange={(event) => field.handleChange(event.target.value)}
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        {t("dashboard:runtime.form.specHint")}
-                      </p>
-                      <AllErrors errors={field.state.meta.errors} />
-                    </div>
-                  )}
-                </group.Field>
-              ) : (
-                <DraftSections group={group} kind={kind} id={id} />
-              )}
-            </>
+              {tab === "form" ? (
+                <p className="text-xs text-muted-foreground">
+                  {t("dashboard:runtime.specForm.kept")}
+                </p>
+              ) : null}
+            </div>
           )}
         </group.Subscribe>
-        <group.Field name="check">
-          {(field) => <AllErrors errors={field.state.meta.errors} />}
-        </group.Field>
       </div>
     );
   },
 });
 
 type Group = FieldGroupOf<SpecEditorValues>;
+type Ids = (name: string) => string;
+
+function groupSizeOf(value: string): number {
+  const size = Number(value);
+  return Number.isInteger(size) && size >= 1 && size <= 64 ? size : 1;
+}
 
 function DraftSections({
   group,
   kind,
   id,
+  slots,
 }: {
   group: Group;
   kind: RuntimeKind;
-  id: (name: string) => string;
+  id: Ids;
+  slots: RuntimeSpecSlots;
 }) {
   const { t } = useTranslation(["dashboard"]);
   return (
-    <group.Subscribe selector={(state) => kind === "ALWAYS_ON" || state.values.draft.serves}>
-      {(serves) => (
-        <div className="flex min-w-0 flex-col gap-4">
-          {kind === "STARTABLE" ? (
-            <group.Field name="draft.serves">
-              {(field) => (
-                <SegmentedControl
-                  ariaLabel={t("dashboard:runtime.specForm.servesLabel")}
-                  value={field.state.value ? "serves" : "service"}
-                  onChange={(next) => field.handleChange(next === "serves")}
-                  items={[
-                    { value: "serves", label: t("dashboard:runtime.specForm.serves") },
-                    { value: "service", label: t("dashboard:runtime.specForm.service") },
-                  ]}
-                />
-              )}
-            </group.Field>
-          ) : null}
-          {serves ? <ModelsSection group={group} kind={kind} id={id} /> : null}
-          {kind === "ALWAYS_ON" ? (
-            <Section
-              title={t("dashboard:runtime.specForm.address")}
-              hint={t("dashboard:runtime.specForm.addressHint")}
-            >
-              <group.Field name="draft.baseUrl">
-                {(field) => (
-                  <TextInput
-                    id={id("base-url")}
-                    label={t("dashboard:runtime.specForm.baseUrl")}
-                    field={field}
-                    mono
-                    placeholder="http://127.0.0.1:8000/v1"
+    <group.Subscribe selector={(state) => state.values.draft}>
+      {(draft) => {
+        const serves = kind === "ALWAYS_ON" || draft.serves;
+        const startable = kind === "STARTABLE";
+        const service = draft.management === "service";
+        return (
+          <>
+            <div className="flex min-w-0 flex-col gap-8">
+              {slots.basics}
+              {kind === "ALWAYS_ON" ? (
+                <FormSection
+                  id={id("server")}
+                  title={t("dashboard:runtime.specForm.sections.server")}
+                  description={t("dashboard:runtime.specForm.addressHint")}
+                  columns={2}
+                >
+                  <group.Field name="draft.baseUrl">
+                    {(field) => (
+                      <TextInput
+                        id={id("base-url")}
+                        label={t("dashboard:runtime.specForm.baseUrl")}
+                        field={field}
+                        mono
+                        placeholder="http://127.0.0.1:8000/v1"
+                      />
+                    )}
+                  </group.Field>
+                  <EngineField group={group} id={id} />
+                </FormSection>
+              ) : null}
+              {startable && serves ? (
+                <FormSection
+                  id={id("model")}
+                  title={t("dashboard:runtime.specForm.sections.model")}
+                  description={t("dashboard:runtime.specForm.sections.modelHint")}
+                >
+                  <ModelList group={group} id={id} />
+                </FormSection>
+              ) : null}
+              {startable ? (
+                <FormSection
+                  id={id("commands")}
+                  title={
+                    serves
+                      ? t("dashboard:runtime.specForm.sections.start")
+                      : t("dashboard:runtime.specForm.commands")
+                  }
+                  description={t("dashboard:runtime.specForm.commandsHint")}
+                >
+                  <CommandRows
+                    group={group}
+                    id={id}
+                    commands={draft.commands}
+                    fields={service || !serves ? ["start", ...SERVICE_COMMANDS] : ["start"]}
+                    optional={[]}
                   />
-                )}
-              </group.Field>
-            </Section>
-          ) : (
-            <LaunchSections group={group} id={id} />
-          )}
-          <p className="text-xs text-muted-foreground">{t("dashboard:runtime.specForm.kept")}</p>
-        </div>
-      )}
+                  <group.Field name="draft.commands" mode="array">
+                    {(field) => (
+                      <InlineError
+                        id={id("commands-error")}
+                        message={firstError(field.state.meta.errors)}
+                      />
+                    )}
+                  </group.Field>
+                </FormSection>
+              ) : null}
+              {startable && serves ? (
+                <FormSection
+                  id={id("size")}
+                  title={t("dashboard:runtime.specForm.sections.size")}
+                  description={t("dashboard:runtime.specForm.resourcesHint")}
+                >
+                  <ResourceRows group={group} id={id} resources={draft.resources} />
+                </FormSection>
+              ) : null}
+            </div>
+            <div className="flex min-w-0 flex-col gap-3">
+              <h2 className="text-base font-semibold">
+                {t("dashboard:runtime.specForm.sections.advanced")}
+              </h2>
+              <p className="-mt-2 text-sm text-muted-foreground">
+                {t("dashboard:runtime.specForm.sections.advancedHint")}
+              </p>
+              {slots.advanced}
+              {slots.howItRuns || startable ? (
+                <FormAdvanced
+                  title={t("dashboard:runtime.specForm.sections.howItRuns")}
+                  summary={[
+                    slots.howItRunsSummary,
+                    startable
+                      ? draft.serves
+                        ? t("dashboard:runtime.specForm.serves")
+                        : t("dashboard:runtime.specForm.service")
+                      : undefined,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                >
+                  {slots.howItRuns}
+                  {startable ? (
+                    <group.Field name="draft.serves">
+                      {(field) => (
+                        <div className="min-w-0 space-y-1.5">
+                          <p className="text-sm font-medium">
+                            {t("dashboard:runtime.specForm.servesLabel")}
+                          </p>
+                          <SegmentedControl
+                            ariaLabel={t("dashboard:runtime.specForm.servesLabel")}
+                            value={field.state.value ? "serves" : "service"}
+                            onChange={(next) => field.handleChange(next === "serves")}
+                            items={[
+                              { value: "serves", label: t("dashboard:runtime.specForm.serves") },
+                              { value: "service", label: t("dashboard:runtime.specForm.service") },
+                            ]}
+                          />
+                        </div>
+                      )}
+                    </group.Field>
+                  ) : null}
+                </FormAdvanced>
+              ) : null}
+              {serves ? <ServingDetails group={group} kind={kind} id={id} draft={draft} /> : null}
+              {startable && !serves ? (
+                <FormAdvanced
+                  title={t("dashboard:runtime.specForm.sections.size")}
+                  summary={resourceSummary(t, draft.resources)}
+                >
+                  <ResourceRows group={group} id={id} resources={draft.resources} />
+                </FormAdvanced>
+              ) : null}
+              {startable ? (
+                <MoreCommands group={group} id={id} draft={draft} upFront={service || !serves} />
+              ) : null}
+              {startable ? <LaunchDetails group={group} id={id} draft={draft} /> : null}
+              {startable ? <Reservations group={group} id={id} draft={draft} /> : null}
+              {startable ? <Readiness group={group} id={id} draft={draft} /> : null}
+              {startable ? <Health group={group} id={id} draft={draft} /> : null}
+            </div>
+          </>
+        );
+      }}
     </group.Subscribe>
   );
 }
 
-function ModelsSection({
-  group,
-  kind,
-  id,
-}: {
-  group: Group;
-  kind: RuntimeKind;
-  id: (name: string) => string;
-}) {
+function resourceSummary(
+  t: TFunction<readonly ["dashboard"]>,
+  resources: readonly ResourceDraft[],
+): string {
+  const [first] = resources;
+  if (!first) return t("dashboard:runtime.specForm.resourceKinds.none");
+  const one = (resource: ResourceDraft) => {
+    switch (resource.kind) {
+      case "discrete":
+        return t("dashboard:runtime.specForm.summary.gpus", {
+          count: Number(resource.gpuCount) || 0,
+          vram: resource.vramGb || "?",
+        });
+      case "unified":
+        return t("dashboard:runtime.specForm.summary.unified", {
+          memory: resource.memoryGb || "?",
+        });
+      case "cpu":
+        return t("dashboard:runtime.specForm.summary.cpu", { ram: resource.ramGb || "?" });
+      default:
+        return t("dashboard:runtime.specForm.resourceKinds.none");
+    }
+  };
+  return resources.length > 1
+    ? t("dashboard:runtime.specForm.summary.perNode", { count: resources.length })
+    : one(first);
+}
+
+function EngineField({ group, id }: { group: Group; id: Ids }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <group.Field name="draft.engine">
+      {(field) => (
+        <SelectInput
+          id={id("engine")}
+          label={t("dashboard:runtime.specForm.engine")}
+          field={field}
+          options={ENGINES.map((engine) => ({
+            value: engine,
+            label: t(`dashboard:runtime.specForm.engines.${engine}`),
+          }))}
+        />
+      )}
+    </group.Field>
+  );
+}
+
+/**
+ * What a model ID's rename starts from: the ID the commands and the embedding contract name, and
+ * their state then. `written` is the commands as the rename last left them, and `lastId` the ID
+ * it last wrote: a command edited by hand since starts a new rename from there.
+ */
+type RenameBase = {
+  id: string;
+  commands: SpecDraft["commands"];
+  embedding: { model: string; vectorSpace: string };
+  written: SpecDraft["commands"];
+  /** The embedding contract's model and vector space as the rename last left them. */
+  writtenEmbedding: { model: string; vectorSpace: string };
+  lastId: string;
+};
+
+function renameBaseOf(group: Group, index: number, id: string): RenameBase {
+  const embedding = group.getFieldValue(`draft.models[${index}].embedding`);
+  const commands = group.getFieldValue("draft.commands");
+  const contract = { model: embedding.model, vectorSpace: embedding.vectorSpace };
+  return {
+    id,
+    commands,
+    embedding: contract,
+    written: commands,
+    writtenEmbedding: contract,
+    lastId: id,
+  };
+}
+
+/** Whether nothing the rename keeps in step was changed by hand since it last wrote. */
+function renameStillOpen(group: Group, index: number, base: RenameBase): boolean {
+  const embedding = group.getFieldValue(`draft.models[${index}].embedding`);
+  return (
+    group.getFieldValue("draft.commands") === base.written &&
+    embedding.model === base.writtenEmbedding.model &&
+    embedding.vectorSpace === base.writtenEmbedding.vectorSpace
+  );
+}
+
+/**
+ * A model ID being renamed: the commands (a preset's start command names the model) and the
+ * model's embedding contract follow, wherever they named the ID the rename started from as a
+ * whole word. Every keystroke is applied to that starting state, never to the last keystroke's
+ * result, so an in-between value that equals another model's ID cannot capture its mentions.
+ */
+function followModelId(group: Group, index: number, base: RenameBase, to: string) {
+  const from = base.id;
+  if (base.commands.some((command) => COMMAND_FIELDS.some((name) => hasToken(command[name], from))))
+    group.setFieldValue(
+      "draft.commands",
+      base.commands.map((command) => {
+        const next = { ...command, timeouts: { ...command.timeouts } };
+        for (const name of COMMAND_FIELDS) next[name] = replaceToken(command[name], from, to);
+        return next;
+      }),
+    );
+  if (base.embedding.model === from)
+    group.setFieldValue(`draft.models[${index}].embedding.model`, to);
+  if (base.embedding.vectorSpace === from)
+    group.setFieldValue(`draft.models[${index}].embedding.vectorSpace`, to);
+}
+
+/** The served model IDs (add and remove), each with its embedding contract when it has one. */
+function ModelList({ group, id, discovered }: { group: Group; id: Ids; discovered?: boolean }) {
   const { t } = useTranslation(["dashboard"]);
   const rowKeys = useRowKeys("model-");
+  // Per row, the state a rename started from (taken at its first keystroke, dropped on blur):
+  // clearing the input and typing a new ID still updates the commands.
+  const renames = useRef<Record<number, RenameBase>>({});
   return (
-    <Section title={t("dashboard:runtime.specForm.serving")}>
-      <div className="grid min-w-0 gap-3 sm:grid-cols-3">
-        <group.Field name="draft.api">
-          {(field) => (
-            <div className="min-w-0 space-y-1.5">
-              <Label htmlFor={id("api")}>{t("dashboard:runtime.specForm.api")}</Label>
-              <NativeSelect
-                id={id("api")}
-                value={field.state.value}
-                onChange={(event) =>
-                  field.handleChange(event.target.value as (typeof RUNTIME_APIS)[number])
-                }
-              >
-                {RUNTIME_APIS.map((api) => (
-                  <option key={api} value={api}>
-                    {t(`dashboard:runtime.specForm.apis.${api}`)}
-                  </option>
-                ))}
-              </NativeSelect>
-              <FieldErrors field={field} />
-            </div>
-          )}
-        </group.Field>
-        <group.Field name="draft.engine">
-          {(field) => (
-            <div className="min-w-0 space-y-1.5">
-              <Label htmlFor={id("engine")}>{t("dashboard:runtime.specForm.engine")}</Label>
-              <NativeSelect
-                id={id("engine")}
-                value={field.state.value}
-                onChange={(event) =>
-                  field.handleChange(event.target.value as (typeof ENGINES)[number])
-                }
-              >
-                {ENGINES.map((engine) => (
-                  <option key={engine} value={engine}>
-                    {t(`dashboard:runtime.specForm.engines.${engine}`)}
-                  </option>
-                ))}
-              </NativeSelect>
-            </div>
-          )}
-        </group.Field>
-        <group.Field name="draft.modelType">
-          {(field) => (
-            <div className="min-w-0 space-y-1.5">
-              <Label htmlFor={id("model-type")}>{t("dashboard:runtime.specForm.modelType")}</Label>
-              <NativeSelect
-                id={id("model-type")}
-                value={field.state.value}
-                onChange={(event) =>
-                  field.handleChange(event.target.value as (typeof MODEL_TYPES)[number])
-                }
-              >
-                {MODEL_TYPES.map((type) => (
-                  <option key={type} value={type}>
-                    {t(`dashboard:runtime.specForm.modelTypes.${type}`)}
-                  </option>
-                ))}
-              </NativeSelect>
-              <FieldErrors field={field} />
-            </div>
-          )}
-        </group.Field>
-      </div>
-      <group.Field name="draft.models" mode="array">
-        {(models) => (
-          <div className="flex min-w-0 flex-col gap-3">
-            <p className="text-sm font-medium">{t("dashboard:runtime.specForm.models")}</p>
-            {kind === "ALWAYS_ON" ? (
-              <p className="text-xs text-muted-foreground">
-                {t("dashboard:runtime.specForm.modelsDiscovered")}
-              </p>
-            ) : null}
-            {models.state.value.map((_, index) => (
-              <div
-                key={rowKeys.key(index)}
-                className="flex min-w-0 flex-col gap-2 rounded-lg border p-3"
-              >
-                <div className="flex min-w-0 items-end gap-2">
-                  <div className="min-w-0 flex-1">
-                    <group.Field name={`draft.models[${index}].id`}>
-                      {(field) => (
-                        <TextInput
-                          id={id(`model-${index}`)}
-                          label={t("dashboard:runtime.specForm.modelId")}
-                          field={field}
-                          mono
-                        />
-                      )}
-                    </group.Field>
-                  </div>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-touch"
-                    aria-label={t("dashboard:runtime.specForm.removeModel")}
-                    onClick={() => {
-                      rowKeys.remove(models.state.value.length, index);
-                      models.removeValue(index);
-                    }}
-                  >
-                    <Trash2 aria-hidden="true" />
-                  </Button>
+    <group.Field name="draft.models" mode="array">
+      {(models) => (
+        <div className="flex min-w-0 flex-col gap-3">
+          {discovered ? (
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:runtime.specForm.modelsDiscovered")}
+            </p>
+          ) : null}
+          {models.state.value.map((model, index) => (
+            <div key={rowKeys.key(index)} className="flex min-w-0 flex-col gap-3">
+              <div className="flex min-w-0 items-end gap-2">
+                <div className="min-w-0 flex-1">
+                  <group.Field name={`draft.models[${index}].id`}>
+                    {(field) => (
+                      <group.Subscribe
+                        selector={(state) =>
+                          state.values.draft.commands.some((command) =>
+                            COMMAND_FIELDS.some((name) =>
+                              hasToken(command[name], field.state.value),
+                            ),
+                          )
+                        }
+                      >
+                        {(inCommands) => (
+                          <TextInput
+                            id={id(`model-${index}`)}
+                            label={t("dashboard:runtime.specForm.modelId")}
+                            hint={
+                              inCommands
+                                ? t("dashboard:runtime.specForm.modelIdFollows")
+                                : undefined
+                            }
+                            field={{
+                              state: field.state,
+                              handleBlur: () => {
+                                // An ID left empty keeps its rename open for the next edit.
+                                if (field.state.value.trim() !== "") delete renames.current[index];
+                                field.handleBlur();
+                              },
+                              handleChange: (next: string) => {
+                                const open = renames.current[index];
+                                const base =
+                                  open && renameStillOpen(group, index, open)
+                                    ? open
+                                    : renameBaseOf(group, index, open?.lastId ?? field.state.value);
+                                field.handleChange(next);
+                                if (next.trim() !== "") {
+                                  followModelId(group, index, base, next);
+                                  const embedding = group.getFieldValue(
+                                    `draft.models[${index}].embedding`,
+                                  );
+                                  base.written = group.getFieldValue("draft.commands");
+                                  base.writtenEmbedding = {
+                                    model: embedding.model,
+                                    vectorSpace: embedding.vectorSpace,
+                                  };
+                                  base.lastId = next;
+                                }
+                                renames.current[index] = base;
+                              },
+                            }}
+                            mono
+                          />
+                        )}
+                      </group.Subscribe>
+                    )}
+                  </group.Field>
                 </div>
-                <group.Field name={`draft.models[${index}].declareCapabilities`}>
-                  {(declare) => (
-                    <>
-                      <CheckRow
-                        id={id(`model-${index}-declare`)}
-                        label={t("dashboard:runtime.specForm.declareCapabilities")}
-                        checked={declare.state.value}
-                        onChange={declare.handleChange}
-                      />
-                      {declare.state.value ? (
-                        <group.Field name={`draft.models[${index}].capabilities`}>
-                          {(field) => (
-                            <CapabilityChecks
-                              idBase={id(`model-${index}-cap`)}
-                              value={field.state.value}
-                              onChange={field.handleChange}
-                            />
-                          )}
-                        </group.Field>
-                      ) : null}
-                    </>
-                  )}
-                </group.Field>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-touch"
+                  aria-label={t("dashboard:runtime.specForm.removeModel")}
+                  onClick={() => {
+                    rowKeys.remove(models.state.value.length, index);
+                    renames.current = {};
+                    models.removeValue(index);
+                  }}
+                >
+                  <Trash2 aria-hidden="true" />
+                </Button>
               </div>
-            ))}
-            <div>
-              <Button
-                type="button"
-                variant="outline"
-                size="touch"
-                onClick={() =>
-                  models.pushValue({
-                    id: "",
-                    declareCapabilities: false,
-                    capabilities: [],
-                    baseIndex: -1,
-                  })
-                }
-              >
-                <Plus aria-hidden="true" />
-                {t("dashboard:runtime.specForm.addModel")}
-              </Button>
+              {model.hasEmbedding ? <EmbeddingFields group={group} id={id} index={index} /> : null}
             </div>
-            <FieldErrors field={models} />
-          </div>
-        )}
-      </group.Field>
-      <group.Field name="draft.expandMedia">
-        {(field) => (
-          <div className="min-w-0 space-y-1.5">
-            <Label htmlFor={id("expand-media")}>
-              {t("dashboard:runtime.specForm.expandMedia")}
-            </Label>
-            <NativeSelect
-              id={id("expand-media")}
-              value={field.state.value}
-              onChange={(event) => field.handleChange(event.target.value as "auto" | "on" | "off")}
+          ))}
+          <div>
+            <Button
+              type="button"
+              variant="outline"
+              size="touch"
+              onClick={() =>
+                models.pushValue({
+                  id: "",
+                  hasEmbedding: false,
+                  embedding: newEmbeddingDraft(""),
+                  declareCapabilities: false,
+                  capabilities: [],
+                  baseIndex: -1,
+                })
+              }
             >
-              {(["auto", "on", "off"] as const).map((value) => (
-                <option key={value} value={value}>
-                  {t(`dashboard:runtime.specForm.expandMediaValues.${value}`)}
-                </option>
-              ))}
-            </NativeSelect>
+              <Plus aria-hidden="true" />
+              {t("dashboard:runtime.specForm.addModel")}
+            </Button>
           </div>
+          <InlineError id={id("models-error")} message={firstError(models.state.meta.errors)} />
+        </div>
+      )}
+    </group.Field>
+  );
+}
+
+/** A model's embedding contract: what its vectors mean, so clients never mix vector spaces. */
+function EmbeddingFields({ group, id, index }: { group: Group; id: Ids; index: number }) {
+  const { t } = useTranslation(["dashboard"]);
+  const base = `draft.models[${index}].embedding` as const;
+  return (
+    <fieldset className="grid min-w-0 gap-4 rounded-lg border p-3 lg:grid-cols-2">
+      <legend className="px-1 text-sm font-medium">
+        {t("dashboard:runtime.specForm.embedding.title")}
+      </legend>
+      <FormWide>
+        <p className="text-xs text-muted-foreground">
+          {t("dashboard:runtime.specForm.embedding.hint")}
+        </p>
+      </FormWide>
+      <group.Field name={`${base}.revision`}>
+        {(field) => (
+          <TextInput
+            id={id(`model-${index}-embedding-revision`)}
+            label={t("dashboard:runtime.specForm.embedding.revision")}
+            hint={t("dashboard:runtime.specForm.embedding.revisionHint")}
+            field={field}
+            mono
+          />
         )}
       </group.Field>
-    </Section>
+      <group.Field name={`${base}.dimensions`}>
+        {(field) => (
+          <TextInput
+            id={id(`model-${index}-embedding-dimensions`)}
+            label={t("dashboard:runtime.specForm.embedding.dimensions")}
+            field={field}
+            inputMode="numeric"
+          />
+        )}
+      </group.Field>
+      <group.Field name={`${base}.model`}>
+        {(field) => (
+          <TextInput
+            id={id(`model-${index}-embedding-model`)}
+            label={t("dashboard:runtime.specForm.embedding.model")}
+            field={field}
+            mono
+          />
+        )}
+      </group.Field>
+      <group.Field name={`${base}.vectorSpace`}>
+        {(field) => (
+          <TextInput
+            id={id(`model-${index}-embedding-space`)}
+            label={t("dashboard:runtime.specForm.embedding.vectorSpace")}
+            hint={t("dashboard:runtime.specForm.embedding.vectorSpaceHint")}
+            field={field}
+            mono
+          />
+        )}
+      </group.Field>
+      <group.Field name={`${base}.normalization`}>
+        {(field) => (
+          <SelectInput
+            id={id(`model-${index}-embedding-normalization`)}
+            label={t("dashboard:runtime.specForm.embedding.normalization")}
+            field={field}
+            options={(["l2", "none"] as const).map((value) => ({
+              value,
+              label: t(`dashboard:runtime.specForm.embedding.normalizations.${value}`),
+            }))}
+          />
+        )}
+      </group.Field>
+    </fieldset>
   );
 }
 
-export function CapabilityChecks({
-  idBase,
-  value,
-  onChange,
-}: {
-  idBase: string;
-  value: readonly ModelCapabilityWire[];
-  onChange: (next: ModelCapabilityWire[]) => void;
-}) {
+/** "Every node" for one entry, "Node n" when there is one per node of the group. */
+function RankTitle({ index, total }: { index: number; total: number }) {
   const { t } = useTranslation(["dashboard"]);
+  if (total === 1) return null;
   return (
-    <div className="grid min-w-0 gap-x-4 sm:grid-cols-2">
-      {MODEL_CAPABILITIES.map((capability) => (
-        <CheckRow
-          key={capability}
-          id={`${idBase}-${capability}`}
-          label={t(`dashboard:runtime.capabilities.values.${capability}`)}
-          checked={value.includes(capability)}
-          onChange={(checked) =>
-            onChange(
-              checked
-                ? MODEL_CAPABILITIES.filter((item) => item === capability || value.includes(item))
-                : value.filter((item) => item !== capability),
-            )
-          }
-        />
-      ))}
-    </div>
+    <p className="text-sm font-medium">
+      {t("dashboard:runtime.specForm.rank", { number: index + 1 })}
+    </p>
   );
 }
 
-function LaunchSections({ group, id }: { group: Group; id: (name: string) => string }) {
+function rankBox(total: number) {
+  return total > 1
+    ? "flex min-w-0 flex-col gap-4 rounded-lg border p-3"
+    : "flex min-w-0 flex-col gap-4";
+}
+
+/** Some commands of every rank entry (one shared entry, or one per node). */
+function CommandRows({
+  group,
+  id,
+  commands,
+  fields,
+  optional,
+}: {
+  group: Group;
+  id: Ids;
+  commands: SpecDraft["commands"];
+  fields: readonly CommandField[];
+  optional: readonly CommandField[];
+}) {
   const { t } = useTranslation(["dashboard"]);
   return (
     <>
-      <Section title={t("dashboard:runtime.specForm.launch")}>
-        <div className="grid min-w-0 gap-3 sm:grid-cols-2">
-          <group.Field name="draft.management">
-            {(field) => (
-              <div className="min-w-0 space-y-1.5">
-                <Label htmlFor={id("management")}>
-                  {t("dashboard:runtime.specForm.management")}
-                </Label>
-                <NativeSelect
-                  id={id("management")}
-                  value={field.state.value}
-                  onChange={(event) =>
-                    field.handleChange(event.target.value as "process" | "service")
-                  }
-                >
-                  <option value="process">{t("dashboard:runtime.specForm.process")}</option>
-                  <option value="service">{t("dashboard:runtime.specForm.serviceUnit")}</option>
-                </NativeSelect>
-                <FieldErrors field={field} />
-              </div>
-            )}
-          </group.Field>
-          <group.Field name="draft.groupSize">
-            {(field) => (
-              <TextInput
-                id={id("group-size")}
-                label={t("dashboard:runtime.specForm.groupSize")}
-                hint={t("dashboard:runtime.specForm.groupSizeHint")}
-                field={field}
-                inputMode="numeric"
-              />
-            )}
-          </group.Field>
-          <group.Field name="draft.labels">
-            {(field) => (
-              <TextInput
-                id={id("labels")}
-                label={t("dashboard:runtime.specForm.labels")}
-                hint={t("dashboard:runtime.specForm.labelsHint")}
-                field={field}
-                mono
-              />
-            )}
-          </group.Field>
-          <group.Field name="draft.fixedPort">
-            {(field) => (
-              <TextInput
-                id={id("fixed-port")}
-                label={t("dashboard:runtime.specForm.fixedPort")}
-                hint={t("dashboard:runtime.specForm.fixedPortHint")}
-                field={field}
-                inputMode="numeric"
-              />
-            )}
-          </group.Field>
-          <group.Subscribe selector={(state) => state.values.draft.groupSize.trim() !== "1"}>
-            {(multiNode) =>
-              multiNode ? (
-                <group.Field name="draft.fabric">
-                  {(field) => (
-                    <TextInput
-                      id={id("fabric")}
-                      label={t("dashboard:runtime.specForm.fabric")}
-                      hint={t("dashboard:runtime.specForm.fabricHint")}
-                      field={field}
-                      mono
-                    />
-                  )}
-                </group.Field>
-              ) : null
-            }
-          </group.Subscribe>
-        </div>
-      </Section>
-      <ResourcesSection group={group} id={id} />
-      <ReservationsSection group={group} id={id} />
-      <CommandsSection group={group} id={id} />
-      <Section title={t("dashboard:runtime.specForm.readiness")}>
-        <group.Field name="draft.readiness.enabled">
-          {(field) => (
-            <>
-              <CheckRow
-                id={id("readiness")}
-                label={t("dashboard:runtime.specForm.readinessEnabled")}
-                checked={field.state.value}
-                onChange={field.handleChange}
-              />
-              <FieldErrors field={field} />
-              {field.state.value ? (
-                <div className="grid min-w-0 gap-3 sm:grid-cols-3">
-                  <group.Field name="draft.readiness.path">
-                    {(path) => (
-                      <TextInput
-                        id={id("readiness-path")}
-                        label={t("dashboard:runtime.specForm.readinessPath")}
-                        field={path}
-                        mono
-                      />
-                    )}
-                  </group.Field>
-                  <group.Field name="draft.readiness.expectedStatus">
-                    {(status) => (
-                      <TextInput
-                        id={id("readiness-status")}
-                        label={t("dashboard:runtime.specForm.readinessStatus")}
-                        field={status}
-                        inputMode="numeric"
-                      />
-                    )}
-                  </group.Field>
-                  <group.Field name="draft.readiness.timeoutMs">
-                    {(timeout) => (
-                      <TextInput
-                        id={id("readiness-timeout")}
-                        label={t("dashboard:runtime.specForm.readinessTimeout")}
-                        field={timeout}
-                        inputMode="numeric"
-                      />
-                    )}
-                  </group.Field>
-                </div>
-              ) : null}
-            </>
-          )}
-        </group.Field>
-      </Section>
-      <Section title={t("dashboard:runtime.specForm.health")}>
-        <div className="grid min-w-0 gap-3 sm:grid-cols-3">
-          {(["intervalMs", "failureThreshold", "successThreshold"] as const).map((key) => (
-            <group.Field key={key} name={`draft.health.${key}`}>
+      {commands.map((_, index) => (
+        // Positional keys: rows are ranks (row i is rank i), never removed one by one
+        <div key={index} className={rankBox(commands.length)}>
+          <RankTitle index={index} total={commands.length} />
+          {fields.map((name) => (
+            <group.Field key={name} name={`draft.commands[${index}].${name}`}>
               {(field) => (
                 <TextInput
-                  id={id(`health-${key}`)}
-                  label={t(`dashboard:runtime.specForm.healthFields.${key}`)}
+                  id={id(`command-${index}-${name}`)}
+                  label={t(`dashboard:runtime.specForm.commandFields.${name}`)}
+                  hint={
+                    optional.includes(name) ? t("dashboard:runtime.specForm.optional") : undefined
+                  }
                   field={field}
-                  inputMode="numeric"
+                  mono
+                  multiline
                 />
               )}
             </group.Field>
           ))}
         </div>
-      </Section>
+      ))}
     </>
   );
-}
-
-/** "Every rank" for one entry, "Rank n" when there is one per rank. */
-function RankTitle({ index, total }: { index: number; total: number }) {
-  const { t } = useTranslation(["dashboard"]);
-  return (
-    <p className="text-sm font-medium">
-      {total === 1
-        ? t("dashboard:runtime.specForm.everyRank")
-        : t("dashboard:runtime.specForm.rank", { number: index + 1 })}
-    </p>
-  );
-}
-
-/** Per-rank entries: one shared entry, or one per rank once the group has several. */
-function PerRankToggle({
-  count,
-  groupSize,
-  onSplit,
-  onJoin,
-}: {
-  count: number;
-  groupSize: number;
-  onSplit: () => void;
-  onJoin: () => void;
-}) {
-  const { t } = useTranslation(["dashboard"]);
-  if (count > 1)
-    return (
-      <div>
-        <Button type="button" variant="outline" size="touch" onClick={onJoin}>
-          {t("dashboard:runtime.specForm.sameForEveryRank")}
-        </Button>
-      </div>
-    );
-  if (groupSize > 1)
-    return (
-      <div>
-        <Button type="button" variant="outline" size="touch" onClick={onSplit}>
-          {t("dashboard:runtime.specForm.perRank")}
-        </Button>
-      </div>
-    );
-  return null;
-}
-
-function groupSizeOf(value: string): number {
-  const size = Number(value);
-  return Number.isInteger(size) && size >= 1 && size <= 64 ? size : 1;
 }
 
 /** The path of one resource draft: a rank's entry, or a reservation's resource. */
@@ -779,7 +984,7 @@ function ResourceFields({
   kind,
 }: {
   group: Group;
-  id: (name: string) => string;
+  id: Ids;
   path: ResourcePath;
   idPrefix: string;
   kind: ResourceKind;
@@ -789,23 +994,15 @@ function ResourceFields({
     <>
       <group.Field name={`${path}.kind`}>
         {(field) => (
-          <div className="min-w-0 space-y-1.5">
-            <Label htmlFor={id(`${idPrefix}-kind`)}>
-              {t("dashboard:runtime.specForm.resourceKind")}
-            </Label>
-            <NativeSelect
-              id={id(`${idPrefix}-kind`)}
-              value={field.state.value}
-              onChange={(event) => field.handleChange(event.target.value as ResourceKind)}
-            >
-              {RESOURCE_KINDS.map((option) => (
-                <option key={option} value={option}>
-                  {t(`dashboard:runtime.specForm.resourceKinds.${option}`)}
-                </option>
-              ))}
-            </NativeSelect>
-            <FieldErrors field={field} />
-          </div>
+          <SelectInput
+            id={id(`${idPrefix}-kind`)}
+            label={t("dashboard:runtime.specForm.resourceKind")}
+            field={field}
+            options={RESOURCE_KINDS.map((option) => ({
+              value: option,
+              label: t(`dashboard:runtime.specForm.resourceKinds.${option}`),
+            }))}
+          />
         )}
       </group.Field>
       {kind === "unified" ? (
@@ -864,68 +1061,493 @@ function ResourceFields({
   );
 }
 
-function ResourcesSection({ group, id }: { group: Group; id: (name: string) => string }) {
-  const { t } = useTranslation(["dashboard"]);
-  // Rows are ranks (row i is rank i), never removed one by one: the keys stay positional.
-  const rowKeys = useRowKeys("resource-");
+function ResourceRows({
+  group,
+  id,
+  resources,
+}: {
+  group: Group;
+  id: Ids;
+  resources: readonly ResourceDraft[];
+}) {
   return (
-    <Section
-      title={t("dashboard:runtime.specForm.resources")}
-      hint={t("dashboard:runtime.specForm.resourcesHint")}
-    >
-      <group.Field name="draft.resources" mode="array">
-        {(resources) => (
-          <>
-            {resources.state.value.map((resource, index) => (
-              <div
-                key={rowKeys.key(index)}
-                className="flex min-w-0 flex-col gap-3 rounded-lg border p-3"
-              >
-                <RankTitle index={index} total={resources.state.value.length} />
-                <div className="grid min-w-0 gap-3 sm:grid-cols-2">
-                  <ResourceFields
-                    group={group}
-                    id={id}
-                    path={`draft.resources[${index}]`}
-                    idPrefix={`resource-${index}`}
-                    kind={resource.kind}
-                  />
-                </div>
-              </div>
-            ))}
-            <group.Subscribe selector={(state) => groupSizeOf(state.values.draft.groupSize)}>
-              {(groupSize) => (
-                <PerRankToggle
-                  count={resources.state.value.length}
-                  groupSize={groupSize}
-                  onSplit={() => {
-                    const [first] = resources.state.value;
-                    resources.handleChange(Array.from({ length: groupSize }, () => ({ ...first })));
-                  }}
-                  onJoin={() => resources.handleChange(resources.state.value.slice(0, 1))}
+    <group.Field name="draft.resources" mode="array">
+      {(field) => (
+        <>
+          {resources.map((resource, index) => (
+            // Positional keys: rows are ranks (row i is rank i), never removed one by one
+            <div key={index} className={rankBox(resources.length)}>
+              <RankTitle index={index} total={resources.length} />
+              <div className="grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <ResourceFields
+                  group={group}
+                  id={id}
+                  path={`draft.resources[${index}]`}
+                  idPrefix={`resource-${index}`}
+                  kind={resource.kind}
                 />
-              )}
-            </group.Subscribe>
-            <FieldErrors field={resources} />
-          </>
-        )}
-      </group.Field>
-    </Section>
+              </div>
+            </div>
+          ))}
+          <InlineError id={id("resources-error")} message={firstError(field.state.meta.errors)} />
+        </>
+      )}
+    </group.Field>
   );
+}
+
+function ServingDetails({
+  group,
+  kind,
+  id,
+  draft,
+}: {
+  group: Group;
+  kind: RuntimeKind;
+  id: Ids;
+  draft: SpecDraft;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const declared = draft.models.some((model) => model.declareCapabilities);
+  const summary = [
+    t(`dashboard:runtime.specForm.apis.${draft.api}`),
+    kind === "STARTABLE" ? t(`dashboard:runtime.specForm.engines.${draft.engine}`) : undefined,
+    t(`dashboard:runtime.specForm.modelTypes.${draft.modelType}`),
+    kind === "ALWAYS_ON"
+      ? draft.models.length === 0
+        ? t("dashboard:runtime.specForm.summary.modelsDiscovered")
+        : t("dashboard:runtime.specForm.summary.models", { count: draft.models.length })
+      : undefined,
+    t("dashboard:runtime.specForm.summary.media", {
+      value: t(`dashboard:runtime.specForm.expandMediaValues.${draft.expandMedia}`),
+    }),
+    declared
+      ? t("dashboard:runtime.specForm.summary.capabilitiesDeclared")
+      : t("dashboard:runtime.specForm.summary.capabilitiesDetected"),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <FormAdvanced title={t("dashboard:runtime.specForm.sections.serving")} summary={summary}>
+      <div className="grid min-w-0 gap-4 lg:grid-cols-2">
+        {kind === "STARTABLE" ? <EngineField group={group} id={id} /> : null}
+        <group.Field name="draft.api">
+          {(field) => (
+            <SelectInput
+              id={id("api")}
+              label={t("dashboard:runtime.specForm.api")}
+              field={field}
+              options={RUNTIME_APIS.map((api) => ({
+                value: api,
+                label: t(`dashboard:runtime.specForm.apis.${api}`),
+              }))}
+            />
+          )}
+        </group.Field>
+        <group.Field name="draft.modelType">
+          {(field) => (
+            <SelectInput
+              id={id("model-type")}
+              label={t("dashboard:runtime.specForm.modelType")}
+              field={field}
+              options={MODEL_TYPES.map((type) => ({
+                value: type,
+                label: t(`dashboard:runtime.specForm.modelTypes.${type}`),
+              }))}
+            />
+          )}
+        </group.Field>
+        <group.Field name="draft.expandMedia">
+          {(field) => (
+            <SelectInput
+              id={id("expand-media")}
+              label={t("dashboard:runtime.specForm.expandMedia")}
+              field={field}
+              options={(["auto", "on", "off"] as const).map((value) => ({
+                value,
+                label: t(`dashboard:runtime.specForm.expandMediaValues.${value}`),
+              }))}
+            />
+          )}
+        </group.Field>
+      </div>
+      {kind === "ALWAYS_ON" ? (
+        <div className="flex min-w-0 flex-col gap-2">
+          <p className="text-sm font-medium">{t("dashboard:runtime.specForm.models")}</p>
+          <ModelList group={group} id={id} discovered />
+        </div>
+      ) : null}
+      {draft.modelType === "embeddings" ? (
+        <EmbeddingToggles group={group} draft={draft} id={id} />
+      ) : null}
+      {draft.modelType === "transcription" ? (
+        <p
+          id={id("transcription")}
+          tabIndex={-1}
+          className="rounded-lg bg-muted/50 p-3 text-sm text-muted-foreground"
+        >
+          {t("dashboard:runtime.specForm.transcriptionKept")}
+        </p>
+      ) : null}
+      {draft.models.map((model, index) => (
+        <group.Field
+          key={`${index}-${model.baseIndex}`}
+          name={`draft.models[${index}].declareCapabilities`}
+        >
+          {(declare) => (
+            <div className="flex min-w-0 flex-col gap-1">
+              <CheckRow
+                id={id(`model-${index}-declare`)}
+                label={t("dashboard:runtime.specForm.declareCapabilitiesOf", {
+                  model:
+                    model.id || t("dashboard:runtime.specForm.modelNumber", { number: index + 1 }),
+                })}
+                checked={declare.state.value}
+                onChange={declare.handleChange}
+              />
+              {declare.state.value ? (
+                <group.Field name={`draft.models[${index}].capabilities`}>
+                  {(field) => (
+                    <CapabilityChecks
+                      idBase={id(`model-${index}-cap`)}
+                      value={field.state.value}
+                      onChange={field.handleChange}
+                    />
+                  )}
+                </group.Field>
+              ) : null}
+            </div>
+          )}
+        </group.Field>
+      ))}
+    </FormAdvanced>
+  );
+}
+
+/** Add or drop a model's embedding contract (an embeddings runtime should state one). */
+function EmbeddingToggles({ group, draft, id }: { group: Group; draft: SpecDraft; id: Ids }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <>
+      {draft.models.map((model, index) => (
+        <div
+          // Positional keys: one toggle per model row, in row order
+          key={index}
+          className="flex min-w-0 flex-wrap items-center justify-between gap-2"
+        >
+          <p className="min-w-0 text-sm break-words">
+            {model.hasEmbedding
+              ? t("dashboard:runtime.specForm.embedding.has", { model: model.id })
+              : t("dashboard:runtime.specForm.embedding.none", { model: model.id })}
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="touch"
+            id={id(`model-${index}-embedding-toggle`)}
+            onClick={() => {
+              if (!model.hasEmbedding && model.embedding.model === "")
+                group.setFieldValue(
+                  `draft.models[${index}].embedding`,
+                  newEmbeddingDraft(model.id),
+                );
+              group.setFieldValue(`draft.models[${index}].hasEmbedding`, !model.hasEmbedding);
+            }}
+          >
+            {model.hasEmbedding
+              ? t("dashboard:runtime.specForm.embedding.remove")
+              : t("dashboard:runtime.specForm.embedding.add")}
+          </Button>
+        </div>
+      ))}
+    </>
+  );
+}
+
+export function CapabilityChecks({
+  idBase,
+  value,
+  onChange,
+}: {
+  idBase: string;
+  value: readonly ModelCapabilityWire[];
+  onChange: (next: ModelCapabilityWire[]) => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <div className="grid min-w-0 gap-x-4 sm:grid-cols-2 lg:grid-cols-3">
+      {MODEL_CAPABILITIES.map((capability) => (
+        <CheckRow
+          key={capability}
+          id={`${idBase}-${capability}`}
+          label={t(`dashboard:runtime.capabilities.values.${capability}`)}
+          checked={value.includes(capability)}
+          onChange={(checked) =>
+            onChange(
+              checked
+                ? MODEL_CAPABILITIES.filter((item) => item === capability || value.includes(item))
+                : value.filter((item) => item !== capability),
+            )
+          }
+        />
+      ))}
+    </div>
+  );
+}
+
+/** Stop and status (when not up front), prepare, after-join and health, and every timeout. */
+function MoreCommands({
+  group,
+  id,
+  draft,
+  upFront,
+}: {
+  group: Group;
+  id: Ids;
+  draft: SpecDraft;
+  /** Stop and status are already shown up front (a service). */
+  upFront: boolean;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const fields: CommandField[] = [...(upFront ? [] : SERVICE_COMMANDS), ...EXTRA_COMMANDS];
+  const set = fields.filter((name) =>
+    draft.commands.some((command) => command[name].trim() !== "" && command[name] !== "true"),
+  );
+  const custom = draft.commands.some((command) =>
+    TIMEOUT_FIELDS.some((name) => command.timeouts[name].trim() !== ""),
+  );
+  const summary = [
+    set.length === 0
+      ? t("dashboard:runtime.specForm.summary.moreCommandsNone")
+      : t("dashboard:runtime.specForm.summary.moreCommandsSet", {
+          names: set
+            .map((name) => t(`dashboard:runtime.specForm.commandFields.${name}`))
+            .join(", "),
+        }),
+    custom
+      ? t("dashboard:runtime.specForm.summary.timeoutsCustom")
+      : t("dashboard:runtime.specForm.summary.timeoutsDefault"),
+  ].join(" · ");
+  return (
+    <FormAdvanced title={t("dashboard:runtime.specForm.sections.moreCommands")} summary={summary}>
+      {draft.commands.map((_, index) => (
+        // Positional keys: rows are ranks (row i is rank i), never removed one by one
+        <div key={index} className={rankBox(draft.commands.length)}>
+          <RankTitle index={index} total={draft.commands.length} />
+          <div className="grid min-w-0 gap-4 lg:grid-cols-2">
+            {fields.map((name) => (
+              <group.Field key={name} name={`draft.commands[${index}].${name}`}>
+                {(field) => (
+                  <TextInput
+                    id={id(`command-${index}-${name}`)}
+                    label={t(`dashboard:runtime.specForm.commandFields.${name}`)}
+                    hint={t(`dashboard:runtime.specForm.commandHints.${name}`)}
+                    field={field}
+                    mono
+                    multiline
+                  />
+                )}
+              </group.Field>
+            ))}
+          </div>
+          <div className="min-w-0 space-y-2">
+            <p className="text-sm font-medium">{t("dashboard:runtime.specForm.timeouts")}</p>
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:runtime.specForm.timeoutsHint")}
+            </p>
+            <div className="grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-5">
+              {TIMEOUT_FIELDS.map((name) => (
+                <group.Field key={name} name={`draft.commands[${index}].timeouts.${name}`}>
+                  {(field) => (
+                    <TextInput
+                      id={id(`command-${index}-timeout-${name}`)}
+                      label={t(`dashboard:runtime.specForm.commandFields.${name}`)}
+                      field={field}
+                      inputMode="numeric"
+                      placeholder={String(RUNTIME_TIMEOUTS_SEC[name].default)}
+                    />
+                  )}
+                </group.Field>
+              ))}
+            </div>
+          </div>
+        </div>
+      ))}
+    </FormAdvanced>
+  );
+}
+
+function LaunchDetails({ group, id, draft }: { group: Group; id: Ids; draft: SpecDraft }) {
+  const { t } = useTranslation(["dashboard"]);
+  const groupSize = groupSizeOf(draft.groupSize);
+  const labels = draft.labels.split(/[\s,]+/).filter(Boolean);
+  const summary = [
+    draft.management === "service"
+      ? t("dashboard:runtime.specForm.summary.managedService")
+      : t("dashboard:runtime.specForm.summary.managedProcess"),
+    t("dashboard:runtime.specForm.summary.groupSize", { count: groupSize }),
+    labels.length === 0
+      ? t("dashboard:runtime.specForm.summary.anyNode")
+      : t("dashboard:runtime.specForm.summary.labels", { labels: labels.join(", ") }),
+    draft.fixedPort.trim() === ""
+      ? t("dashboard:runtime.specForm.summary.freePort")
+      : t("dashboard:runtime.specForm.summary.port", { port: draft.fixedPort.trim() }),
+  ].join(" · ");
+  return (
+    <FormAdvanced title={t("dashboard:runtime.specForm.sections.launch")} summary={summary}>
+      <div className="grid min-w-0 gap-4 lg:grid-cols-2">
+        <group.Field name="draft.management">
+          {(field) => (
+            <SelectInput
+              id={id("management")}
+              label={t("dashboard:runtime.specForm.management")}
+              field={field}
+              options={[
+                { value: "process", label: t("dashboard:runtime.specForm.process") },
+                { value: "service", label: t("dashboard:runtime.specForm.serviceUnit") },
+              ]}
+            />
+          )}
+        </group.Field>
+        <group.Field name="draft.groupSize">
+          {(field) => (
+            <TextInput
+              id={id("group-size")}
+              label={t("dashboard:runtime.specForm.groupSize")}
+              hint={t("dashboard:runtime.specForm.groupSizeHint")}
+              field={field}
+              inputMode="numeric"
+            />
+          )}
+        </group.Field>
+        <group.Field name="draft.labels">
+          {(field) => (
+            <TextInput
+              id={id("labels")}
+              label={t("dashboard:runtime.specForm.labels")}
+              hint={t("dashboard:runtime.specForm.labelsHint")}
+              field={field}
+              mono
+            />
+          )}
+        </group.Field>
+        <group.Field name="draft.fixedPort">
+          {(field) => (
+            <TextInput
+              id={id("fixed-port")}
+              label={t("dashboard:runtime.specForm.fixedPort")}
+              hint={t("dashboard:runtime.specForm.fixedPortHint")}
+              field={field}
+              inputMode="numeric"
+            />
+          )}
+        </group.Field>
+        {draft.groupSize.trim() !== "1" ? (
+          <group.Field name="draft.fabric">
+            {(field) => (
+              <TextInput
+                id={id("fabric")}
+                label={t("dashboard:runtime.specForm.fabric")}
+                hint={t("dashboard:runtime.specForm.fabricHint")}
+                field={field}
+                mono
+              />
+            )}
+          </group.Field>
+        ) : null}
+      </div>
+      {groupSize > 1 || draft.resources.length > 1 || draft.commands.length > 1 ? (
+        <div className="flex min-w-0 flex-col gap-2">
+          <p className="text-sm font-medium">{t("dashboard:runtime.specForm.perRankTitle")}</p>
+          <p className="text-xs text-muted-foreground">
+            {t("dashboard:runtime.specForm.perRankHint")}
+          </p>
+          <div className="flex min-w-0 flex-wrap gap-2">
+            <PerRankToggle
+              label={t("dashboard:runtime.specForm.perRankSize")}
+              count={draft.resources.length}
+              groupSize={groupSize}
+              onSplit={() => {
+                const [first] = draft.resources;
+                if (!first) return;
+                group.setFieldValue(
+                  "draft.resources",
+                  Array.from({ length: groupSize }, () => ({ ...first })),
+                );
+              }}
+              onJoin={() => group.setFieldValue("draft.resources", draft.resources.slice(0, 1))}
+            />
+            <PerRankToggle
+              label={t("dashboard:runtime.specForm.perRankCommands")}
+              count={draft.commands.length}
+              groupSize={groupSize}
+              onSplit={() => {
+                const [first = emptyCommandDraft()] = draft.commands;
+                group.setFieldValue(
+                  "draft.commands",
+                  Array.from({ length: groupSize }, () => ({
+                    ...first,
+                    timeouts: { ...first.timeouts },
+                  })),
+                );
+              }}
+              onJoin={() => group.setFieldValue("draft.commands", draft.commands.slice(0, 1))}
+            />
+          </div>
+        </div>
+      ) : null}
+    </FormAdvanced>
+  );
+}
+
+/** Per-rank entries: one shared entry, or one per node once the group has several. */
+function PerRankToggle({
+  label,
+  count,
+  groupSize,
+  onSplit,
+  onJoin,
+}: {
+  label: string;
+  count: number;
+  groupSize: number;
+  onSplit: () => void;
+  onJoin: () => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  if (count > 1)
+    return (
+      <Button type="button" variant="outline" size="touch" onClick={onJoin}>
+        {t("dashboard:runtime.specForm.sameForEveryRankOf", { what: label })}
+      </Button>
+    );
+  if (groupSize > 1)
+    return (
+      <Button type="button" variant="outline" size="touch" onClick={onSplit}>
+        {t("dashboard:runtime.specForm.perRankOf", { what: label })}
+      </Button>
+    );
+  return null;
 }
 
 /**
  * `launch.reservations`: memory a single-node runtime holds on other nodes (its launcher starts
  * work there itself). Each names labels and what it holds; nothing runs there from wsmp.
  */
-function ReservationsSection({ group, id }: { group: Group; id: (name: string) => string }) {
+function Reservations({ group, id, draft }: { group: Group; id: Ids; draft: SpecDraft }) {
   const { t } = useTranslation(["dashboard"]);
   const rowKeys = useRowKeys("reservation-");
+  const summary =
+    draft.reservations.length === 0
+      ? t("dashboard:runtime.specForm.summary.reservationsNone")
+      : t("dashboard:runtime.specForm.summary.reservations", {
+          count: draft.reservations.length,
+        });
   return (
-    <Section
-      title={t("dashboard:runtime.specForm.reservations")}
-      hint={t("dashboard:runtime.specForm.reservationsHint")}
-    >
+    <FormAdvanced title={t("dashboard:runtime.specForm.reservations")} summary={summary}>
+      <p className="text-xs text-muted-foreground">
+        {t("dashboard:runtime.specForm.reservationsHint")}
+      </p>
       <group.Field name="draft.reservations" mode="array">
         {(reservations) => (
           <>
@@ -941,7 +1563,7 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
                   <Button
                     type="button"
                     variant="ghost"
-                    size="touch"
+                    size="icon-touch"
                     aria-label={t("dashboard:runtime.specForm.removeReservation", {
                       number: index + 1,
                     })}
@@ -953,7 +1575,7 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
                     <Trash2 aria-hidden="true" className="size-4" />
                   </Button>
                 </div>
-                <div className="grid min-w-0 gap-3 sm:grid-cols-2">
+                <div className="grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-3">
                   <group.Field name={`draft.reservations[${index}].labels`}>
                     {(field) => (
                       <TextInput
@@ -986,95 +1608,115 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
                 {t("dashboard:runtime.specForm.addReservation")}
               </Button>
             </div>
-            <FieldErrors field={reservations} />
+            <InlineError
+              id={id("reservations-error")}
+              message={firstError(reservations.state.meta.errors)}
+            />
           </>
         )}
       </group.Field>
-    </Section>
+    </FormAdvanced>
   );
 }
 
-function CommandsSection({ group, id }: { group: Group; id: (name: string) => string }) {
+function Readiness({ group, id, draft }: { group: Group; id: Ids; draft: SpecDraft }) {
   const { t } = useTranslation(["dashboard"]);
-  // Rows are ranks (row i is rank i), never removed one by one: the keys stay positional.
-  const rowKeys = useRowKeys("command-");
+  const { readiness } = draft;
+  const summary = readiness.enabled
+    ? t("dashboard:runtime.specForm.summary.readiness", {
+        path: readiness.path || "/",
+        status: readiness.expectedStatus || "200",
+        seconds: msToSeconds(readiness.timeoutMs) || "?",
+      })
+    : t("dashboard:runtime.specForm.summary.readinessOff");
   return (
-    <Section
-      title={t("dashboard:runtime.specForm.commands")}
-      hint={t("dashboard:runtime.specForm.commandsHint")}
-    >
-      <group.Field name="draft.commands" mode="array">
-        {(commands) => (
+    <FormAdvanced title={t("dashboard:runtime.specForm.readiness")} summary={summary}>
+      <group.Field name="draft.readiness.enabled">
+        {(field) => (
           <>
-            {commands.state.value.map((_, index) => (
-              <div
-                key={rowKeys.key(index)}
-                className="flex min-w-0 flex-col gap-3 rounded-lg border p-3"
-              >
-                <RankTitle index={index} total={commands.state.value.length} />
-                {COMMAND_FIELDS.map((name) => (
-                  <group.Field key={name} name={`draft.commands[${index}].${name}`}>
-                    {(field) => (
-                      <TextInput
-                        id={id(`command-${index}-${name}`)}
-                        label={t(`dashboard:runtime.specForm.commandFields.${name}`)}
-                        hint={
-                          REQUIRED_COMMANDS.includes(name)
-                            ? undefined
-                            : t("dashboard:runtime.specForm.optional")
-                        }
-                        field={field}
-                        mono
-                        multiline
-                      />
-                    )}
-                  </group.Field>
-                ))}
-                <div className="min-w-0 space-y-2">
-                  <p className="text-sm font-medium">{t("dashboard:runtime.specForm.timeouts")}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {t("dashboard:runtime.specForm.timeoutsHint")}
-                  </p>
-                  <div className="grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-5">
-                    {TIMEOUT_FIELDS.map((name) => (
-                      <group.Field key={name} name={`draft.commands[${index}].timeouts.${name}`}>
-                        {(field) => (
-                          <TextInput
-                            id={id(`command-${index}-timeout-${name}`)}
-                            label={t(`dashboard:runtime.specForm.commandFields.${name}`)}
-                            field={field}
-                            inputMode="numeric"
-                            placeholder={String(RUNTIME_TIMEOUTS_SEC[name].default)}
-                          />
-                        )}
-                      </group.Field>
-                    ))}
-                  </div>
-                </div>
+            <CheckRow
+              id={id("readiness")}
+              label={t("dashboard:runtime.specForm.readinessEnabled")}
+              checked={field.state.value}
+              onChange={field.handleChange}
+              errorId={firstError(field.state.meta.errors) ? id("readiness-error") : undefined}
+            />
+            <InlineError id={id("readiness-error")} message={firstError(field.state.meta.errors)} />
+            {field.state.value ? (
+              <div className="grid min-w-0 gap-4 sm:grid-cols-3">
+                <group.Field name="draft.readiness.path">
+                  {(path) => (
+                    <TextInput
+                      id={id("readiness-path")}
+                      label={t("dashboard:runtime.specForm.readinessPath")}
+                      field={path}
+                      mono
+                    />
+                  )}
+                </group.Field>
+                <group.Field name="draft.readiness.expectedStatus">
+                  {(status) => (
+                    <TextInput
+                      id={id("readiness-status")}
+                      label={t("dashboard:runtime.specForm.readinessStatus")}
+                      field={status}
+                      inputMode="numeric"
+                    />
+                  )}
+                </group.Field>
+                <group.Field name="draft.readiness.timeoutMs">
+                  {(timeout) => (
+                    <SecondsInput
+                      id={id("readiness-timeout")}
+                      label={t("dashboard:runtime.specForm.readinessTimeout")}
+                      field={timeout}
+                      rangeError={t("dashboard:runtime.specForm.readinessTimeoutRange")}
+                    />
+                  )}
+                </group.Field>
               </div>
-            ))}
-            <group.Subscribe selector={(state) => groupSizeOf(state.values.draft.groupSize)}>
-              {(groupSize) => (
-                <PerRankToggle
-                  count={commands.state.value.length}
-                  groupSize={groupSize}
-                  onSplit={() => {
-                    const [first = emptyCommandDraft()] = commands.state.value;
-                    commands.handleChange(
-                      Array.from({ length: groupSize }, () => ({
-                        ...first,
-                        timeouts: { ...first.timeouts },
-                      })),
-                    );
-                  }}
-                  onJoin={() => commands.handleChange(commands.state.value.slice(0, 1))}
-                />
-              )}
-            </group.Subscribe>
-            <FieldErrors field={commands} />
+            ) : null}
           </>
         )}
       </group.Field>
-    </Section>
+    </FormAdvanced>
+  );
+}
+
+function Health({ group, id, draft }: { group: Group; id: Ids; draft: SpecDraft }) {
+  const { t } = useTranslation(["dashboard"]);
+  const { health } = draft;
+  const summary = t("dashboard:runtime.specForm.summary.health", {
+    seconds: msToSeconds(health.intervalMs) || "?",
+    failures: health.failureThreshold || "?",
+    successes: health.successThreshold || "?",
+  });
+  return (
+    <FormAdvanced title={t("dashboard:runtime.specForm.health")} summary={summary}>
+      <div className="grid min-w-0 gap-4 sm:grid-cols-3">
+        <group.Field name="draft.health.intervalMs">
+          {(field) => (
+            <SecondsInput
+              id={id("health-intervalMs")}
+              label={t("dashboard:runtime.specForm.healthFields.intervalMs")}
+              field={field}
+              rangeError={t("dashboard:runtime.specForm.healthIntervalRange")}
+            />
+          )}
+        </group.Field>
+        {(["failureThreshold", "successThreshold"] as const).map((key) => (
+          <group.Field key={key} name={`draft.health.${key}`}>
+            {(field) => (
+              <TextInput
+                id={id(`health-${key}`)}
+                label={t(`dashboard:runtime.specForm.healthFields.${key}`)}
+                field={field}
+                inputMode="numeric"
+              />
+            )}
+          </group.Field>
+        ))}
+      </div>
+    </FormAdvanced>
   );
 }

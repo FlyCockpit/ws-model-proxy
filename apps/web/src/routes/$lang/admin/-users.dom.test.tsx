@@ -184,3 +184,14 @@ describe("admin users deletion conflicts", () => {
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith("t(admin:users.deleteFailed)"));
   });
 });
+
+describe("admin invite user", () => {
+  it("shows the role's label in the closed select, never the raw value", async () => {
+    state.users = [user()];
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "admin:users.invite" }));
+    const role = await screen.findByLabelText("admin:users.roleLabel");
+    expect(role.textContent).toContain("admin:users.roleUser");
+    expect(role.textContent?.replace("admin:users.roleUser", "")).not.toContain("user");
+  });
+});

@@ -22,6 +22,9 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
   return {
     ...actual,
     Outlet: Page,
+    // No route guard context in these tests: the browser session (mocked below) decides.
+    useRouterState: ({ select }: { select: (state: { matches: unknown[] }) => unknown }) =>
+      select({ matches: [] }),
     Link: ({ children, to }: { children: ReactNode; to: string }) => <a href={to}>{children}</a>,
   };
 });

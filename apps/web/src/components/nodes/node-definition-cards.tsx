@@ -24,27 +24,23 @@ import {
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@ws-model-proxy/ui/components/select";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import type { TFunction } from "i18next";
 import { Plus, RefreshCw, Trash } from "lucide-react";
+import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
+import { FormAdvanced, focusFirstInvalid } from "@/components/form-surface";
 import { Help } from "@/components/help";
+import { LabelledSelect } from "@/components/labelled-select";
 import { specIssueText } from "@/lib/spec-issue-text";
 import { orpc } from "@/utils/orpc";
 
 import { parseLabels } from "./add-node-dialog-utils";
 import { type GpuRow, KINDS, type Kind, toDeclaration } from "./declared-hardware";
-import { FieldError } from "./field-error";
+import { FieldError, invalidProps } from "./field-error";
 import { StatusPill } from "./node-badges";
 import { formatGb } from "./node-badges-utils";
 import type { NodeDetail } from "./node-types";
@@ -145,7 +141,10 @@ export function PlacementCard({ node }: { node: NodeDetail }) {
         commandMaxMs: Math.round(Number(value.commandMaxHours) * HOUR_MS),
       });
     },
+    // The limits sit in a collapsed section: a refused save opens it and focuses the field.
+    onSubmitInvalid: () => window.setTimeout(() => focusFirstInvalid(formRef.current), 0),
   });
+  const formRef = useRef<HTMLFormElement>(null);
 
   return (
     <Card className="min-w-0">
@@ -168,6 +167,8 @@ export function PlacementCard({ node }: { node: NodeDetail }) {
           </div>
         ) : (
           <form
+            ref={formRef}
+            noValidate
             className="space-y-3"
             onSubmit={(event) => {
               event.preventDefault();
@@ -185,62 +186,88 @@ export function PlacementCard({ node }: { node: NodeDetail }) {
                     autoCapitalize="none"
                     value={field.state.value}
                     onChange={(event) => field.handleChange(event.target.value)}
+                    {...invalidProps(field.state.meta.errors, "node-labels-error")}
                   />
-                  <FieldError errors={field.state.meta.errors} />
+                  <FieldError id="node-labels-error" errors={field.state.meta.errors} />
                 </div>
               )}
             </form.Field>
-            <div className="grid grid-cols-2 gap-2">
-              <form.Field name="portStart">
-                {(field) => (
-                  <div className="space-y-1.5">
-                    <Label htmlFor="node-port-start">
-                      {t("dashboard:nodes.definition.portStart")}
-                    </Label>
-                    <Input
-                      id="node-port-start"
-                      inputMode="numeric"
-                      className="min-h-[44px]"
-                      value={field.state.value}
-                      onChange={(event) => field.handleChange(event.target.value)}
-                    />
+            <form.Subscribe
+              selector={(state) =>
+                [
+                  state.values.portStart,
+                  state.values.portEnd,
+                  state.values.commandMaxHours,
+                ] as const
+              }
+            >
+              {([portStart, portEnd, commandMaxHours]) => (
+                <FormAdvanced
+                  title={t("dashboard:nodes.definition.limitsTitle")}
+                  summary={t("dashboard:nodes.definition.limitsSummary", {
+                    start: portStart,
+                    end: portEnd,
+                    hours: commandMaxHours,
+                  })}
+                >
+                  <div className="grid grid-cols-2 gap-2">
+                    <form.Field name="portStart">
+                      {(field) => (
+                        <div className="space-y-1.5">
+                          <Label htmlFor="node-port-start">
+                            {t("dashboard:nodes.definition.portStart")}
+                          </Label>
+                          <Input
+                            id="node-port-start"
+                            inputMode="numeric"
+                            className="min-h-[44px]"
+                            value={field.state.value}
+                            onChange={(event) => field.handleChange(event.target.value)}
+                          />
+                        </div>
+                      )}
+                    </form.Field>
+                    <form.Field name="portEnd">
+                      {(field) => (
+                        <div className="space-y-1.5">
+                          <Label htmlFor="node-port-end">
+                            {t("dashboard:nodes.definition.portEnd")}
+                          </Label>
+                          <Input
+                            id="node-port-end"
+                            inputMode="numeric"
+                            className="min-h-[44px]"
+                            value={field.state.value}
+                            onChange={(event) => field.handleChange(event.target.value)}
+                            {...invalidProps(field.state.meta.errors, "node-port-end-error")}
+                          />
+                          <FieldError id="node-port-end-error" errors={field.state.meta.errors} />
+                        </div>
+                      )}
+                    </form.Field>
                   </div>
-                )}
-              </form.Field>
-              <form.Field name="portEnd">
-                {(field) => (
-                  <div className="space-y-1.5">
-                    <Label htmlFor="node-port-end">{t("dashboard:nodes.definition.portEnd")}</Label>
-                    <Input
-                      id="node-port-end"
-                      inputMode="numeric"
-                      className="min-h-[44px]"
-                      value={field.state.value}
-                      onChange={(event) => field.handleChange(event.target.value)}
-                    />
-                    <FieldError errors={field.state.meta.errors} />
-                  </div>
-                )}
-              </form.Field>
-            </div>
-            <form.Field name="commandMaxHours">
-              {(field) => (
-                <div className="space-y-1.5">
-                  <Label htmlFor="node-command-max" className="flex items-center gap-1.5">
-                    {t("dashboard:nodes.definition.commandMax")}
-                    <Help>{t("dashboard:nodes.definition.commandMaxHelp")}</Help>
-                  </Label>
-                  <Input
-                    id="node-command-max"
-                    inputMode="decimal"
-                    className="min-h-[44px]"
-                    value={field.state.value}
-                    onChange={(event) => field.handleChange(event.target.value)}
-                  />
-                  <FieldError errors={field.state.meta.errors} />
-                </div>
+                  <form.Field name="commandMaxHours">
+                    {(field) => (
+                      <div className="space-y-1.5">
+                        <Label htmlFor="node-command-max" className="flex items-center gap-1.5">
+                          {t("dashboard:nodes.definition.commandMax")}
+                          <Help>{t("dashboard:nodes.definition.commandMaxHelp")}</Help>
+                        </Label>
+                        <Input
+                          id="node-command-max"
+                          inputMode="decimal"
+                          className="min-h-[44px]"
+                          value={field.state.value}
+                          onChange={(event) => field.handleChange(event.target.value)}
+                          {...invalidProps(field.state.meta.errors, "node-command-max-error")}
+                        />
+                        <FieldError id="node-command-max-error" errors={field.state.meta.errors} />
+                      </div>
+                    )}
+                  </form.Field>
+                </FormAdvanced>
               )}
-            </form.Field>
+            </form.Subscribe>
             <div className="flex flex-wrap gap-2">
               <Button type="submit" className="min-h-[44px]" disabled={update.isPending}>
                 {t("common:actions.save")}
@@ -729,116 +756,136 @@ function HardwareFacts({ hw, lang }: { hw: NodeDetail["hardware"]; lang: string 
   );
 }
 
-/** The declared hardware form (Full control only). */
+/** What the override form holds, in one line: nothing (detected values rule) or what it sets. */
+function overrideSummary(t: TFunction, values: HardwareValues): string {
+  const parts = [
+    values.kind ? t(`dashboard:nodes.hardwareKind.${values.kind}`) : null,
+    values.memoryGb.trim()
+      ? t("dashboard:nodes.hardware.overrideParts.memory", { gb: values.memoryGb.trim() })
+      : null,
+    values.reservedMemoryGb.trim()
+      ? t("dashboard:nodes.hardware.overrideParts.reserved", { gb: values.reservedMemoryGb.trim() })
+      : null,
+    values.gpus.length > 0
+      ? t("dashboard:nodes.hardware.overrideParts.gpus", { count: values.gpus.length })
+      : null,
+  ].filter((part): part is string => part !== null);
+  return parts.length === 0
+    ? t("dashboard:nodes.hardware.overrideNone")
+    : t("dashboard:nodes.hardware.overrideSet", { what: parts.join(" · ") });
+}
+
+/** The declared hardware form (Full control only), folded away: detected values usually do. */
 function HardwareDeclaration({ form, pending }: { form: HardwareForm; pending: boolean }) {
   const { t } = useTranslation(["dashboard", "common"]);
   return (
     <form
-      className="space-y-3 border-t pt-3"
+      className="space-y-3"
       onSubmit={(event) => {
         event.preventDefault();
         event.stopPropagation();
         form.handleSubmit().catch(() => undefined);
       }}
     >
-      <p className="text-sm font-medium">{t("dashboard:nodes.hardware.declare")}</p>
-      <form.Field name="kind">
-        {(field) => (
-          <div className="space-y-1.5">
-            <Label htmlFor="hw-kind">{t("dashboard:nodes.hardware.kind")}</Label>
-            <Select
-              value={field.state.value === "" ? "auto" : field.state.value}
-              onValueChange={(next) => {
-                const kind = KINDS.find((candidate) => candidate === next);
-                field.handleChange(kind ?? "");
-              }}
-            >
-              <SelectTrigger id="hw-kind" className="min-h-[44px] w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="auto">{t("dashboard:nodes.hardware.auto")}</SelectItem>
-                {KINDS.map((kind) => (
-                  <SelectItem key={kind} value={kind}>
-                    {t(`dashboard:nodes.hardwareKind.${kind}`)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        )}
-      </form.Field>
-      <div className="grid grid-cols-2 gap-2">
-        <form.Field name="memoryGb">
-          {(field) => (
-            <div className="space-y-1.5">
-              <Label htmlFor="hw-memory">{t("dashboard:nodes.hardware.memory")}</Label>
-              <Input
-                id="hw-memory"
-                inputMode="decimal"
-                className="min-h-[44px]"
-                placeholder={t("dashboard:nodes.hardware.auto")}
-                value={field.state.value}
-                onChange={(event) => field.handleChange(event.target.value)}
-              />
-              <FieldError errors={field.state.meta.errors} />
+      <form.Subscribe selector={(state) => state.values}>
+        {(values) => (
+          <FormAdvanced
+            title={t("dashboard:nodes.hardware.overrideTitle")}
+            summary={overrideSummary(t, values)}
+          >
+            <form.Field name="kind">
+              {(field) => (
+                <div className="space-y-1.5">
+                  <Label htmlFor="hw-kind">{t("dashboard:nodes.hardware.kind")}</Label>
+                  <LabelledSelect<"auto" | Kind>
+                    id="hw-kind"
+                    value={field.state.value === "" ? "auto" : field.state.value}
+                    onValueChange={(next) => field.handleChange(next === "auto" ? "" : next)}
+                    options={[
+                      { value: "auto", label: t("dashboard:nodes.hardware.auto") },
+                      ...KINDS.map((kind) => ({
+                        value: kind,
+                        label: t(`dashboard:nodes.hardwareKind.${kind}`),
+                      })),
+                    ]}
+                  />
+                </div>
+              )}
+            </form.Field>
+            <div className="grid grid-cols-2 gap-2">
+              <form.Field name="memoryGb">
+                {(field) => (
+                  <div className="space-y-1.5">
+                    <Label htmlFor="hw-memory">{t("dashboard:nodes.hardware.memory")}</Label>
+                    <Input
+                      id="hw-memory"
+                      inputMode="decimal"
+                      className="min-h-[44px]"
+                      placeholder={t("dashboard:nodes.hardware.auto")}
+                      value={field.state.value}
+                      onChange={(event) => field.handleChange(event.target.value)}
+                    />
+                    <FieldError errors={field.state.meta.errors} />
+                  </div>
+                )}
+              </form.Field>
+              <form.Field name="reservedMemoryGb">
+                {(field) => (
+                  <div className="space-y-1.5">
+                    <Label htmlFor="hw-reserved">{t("dashboard:nodes.hardware.reserved")}</Label>
+                    <Input
+                      id="hw-reserved"
+                      inputMode="decimal"
+                      className="min-h-[44px]"
+                      placeholder="0"
+                      value={field.state.value}
+                      onChange={(event) => field.handleChange(event.target.value)}
+                    />
+                  </div>
+                )}
+              </form.Field>
             </div>
-          )}
-        </form.Field>
-        <form.Field name="reservedMemoryGb">
-          {(field) => (
-            <div className="space-y-1.5">
-              <Label htmlFor="hw-reserved">{t("dashboard:nodes.hardware.reserved")}</Label>
-              <Input
-                id="hw-reserved"
-                inputMode="decimal"
-                className="min-h-[44px]"
-                placeholder="0"
-                value={field.state.value}
-                onChange={(event) => field.handleChange(event.target.value)}
-              />
-            </div>
-          )}
-        </form.Field>
-      </div>
-      <form.Field name="gpus" mode="array">
-        {(field) => (
-          <div className="space-y-2">
-            <p className="text-sm font-medium">{t("dashboard:nodes.hardware.gpus")}</p>
-            {field.state.value.map((row, index) => (
-              <GpuLine
-                key={row.key}
-                form={form}
-                index={index}
-                unified={row.unified}
-                onRemove={() => field.removeValue(index)}
-              />
-            ))}
-            <FieldError errors={field.state.meta.errors} />
-            <Button
-              type="button"
-              variant="outline"
-              className="min-h-[44px]"
-              onClick={() =>
-                field.pushValue({
-                  key: addedRowKey(),
-                  vendor: "nvidia",
-                  index: String(field.state.value.length),
-                  name: "",
-                  unified: false,
-                  vramGb: "",
-                })
-              }
-            >
-              <Plus aria-hidden="true" />
-              {t("dashboard:nodes.hardware.addGpu")}
+            <form.Field name="gpus" mode="array">
+              {(field) => (
+                <div className="space-y-2">
+                  <p className="text-sm font-medium">{t("dashboard:nodes.hardware.gpus")}</p>
+                  {field.state.value.map((row, index) => (
+                    <GpuLine
+                      key={row.key}
+                      form={form}
+                      index={index}
+                      unified={row.unified}
+                      onRemove={() => field.removeValue(index)}
+                    />
+                  ))}
+                  <FieldError errors={field.state.meta.errors} />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="min-h-[44px]"
+                    onClick={() =>
+                      field.pushValue({
+                        key: addedRowKey(),
+                        vendor: "nvidia",
+                        index: String(field.state.value.length),
+                        name: "",
+                        unified: false,
+                        vramGb: "",
+                      })
+                    }
+                  >
+                    <Plus aria-hidden="true" />
+                    {t("dashboard:nodes.hardware.addGpu")}
+                  </Button>
+                </div>
+              )}
+            </form.Field>
+            <Button type="submit" className="min-h-[44px]" disabled={pending}>
+              {t("common:actions.save")}
             </Button>
-          </div>
+          </FormAdvanced>
         )}
-      </form.Field>
-      <Button type="submit" className="min-h-[44px]" disabled={pending}>
-        {t("common:actions.save")}
-      </Button>
+      </form.Subscribe>
     </form>
   );
 }
@@ -862,24 +909,15 @@ function GpuLine({
         {(sub) => (
           <div className="w-28 space-y-1">
             <Label htmlFor={`gpu-vendor-${index}`}>{t("dashboard:nodes.hardware.gpuVendor")}</Label>
-            <Select
+            <LabelledSelect
+              id={`gpu-vendor-${index}`}
               value={sub.state.value}
-              onValueChange={(next) => {
-                const vendor = GPU_VENDORS.find((candidate) => candidate === next);
-                if (vendor) sub.handleChange(vendor);
-              }}
-            >
-              <SelectTrigger id={`gpu-vendor-${index}`} className="min-h-[44px] w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {GPU_VENDORS.map((vendor) => (
-                  <SelectItem key={vendor} value={vendor}>
-                    {vendor}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              onValueChange={sub.handleChange}
+              options={GPU_VENDORS.map((vendor) => ({
+                value: vendor,
+                label: t(`dashboard:runtime.specForm.vendors.${vendor}`),
+              }))}
+            />
           </div>
         )}
       </form.Field>

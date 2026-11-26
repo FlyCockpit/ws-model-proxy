@@ -143,4 +143,46 @@ describe("Create agent token", () => {
     expect(state.create).not.toHaveBeenCalled();
     expect(date.getAttribute("aria-invalid")).toBe("true");
   });
+
+  it("starts on Read only with the permissions folded away, and a preset sends its scopes", async () => {
+    state.create.mockResolvedValue({ secret: "new-secret" });
+    const name = await mount();
+    const readOnly = screen.getByRole<HTMLInputElement>("radio", {
+      name: "access:agents.presets.readOnly.name",
+    });
+    expect(readOnly.checked).toBe(true);
+    const files = screen.getByRole("checkbox", { name: /access:agents.scopes.files.name/ });
+    expect(files.closest("details")?.open).toBe(false);
+    fireEvent.click(screen.getByRole("radio", { name: "access:agents.presets.models.name" }));
+    fireEvent.change(name, { target: { value: "Agent" } });
+    fireEvent.click(screen.getByRole("button", { name: "access:agents.create" }));
+    await waitFor(() =>
+      expect(state.create).toHaveBeenCalledWith(
+        expect.objectContaining({ scopes: ["read", "pools", "runtimes", "models:test"] }),
+        expect.anything(),
+      ),
+    );
+  });
+
+  it("says what will be created next to the Create button", async () => {
+    await mount();
+    const summary = screen.getByTestId("agent-token-summary");
+    expect(summary.textContent).toContain("access:agents.presets.readOnly.name");
+    expect(summary.textContent).toContain("access:agents.allNodes");
+    expect(summary.textContent).toContain("access:agents.summary.expiresOn");
+    fireEvent.click(screen.getByRole("radio", { name: "access:agents.presets.full.name" }));
+    expect(summary.textContent).toContain("access:agents.presets.full.name");
+    const create = screen.getByRole("button", { name: "access:agents.create" });
+    expect(create.closest('[data-slot="form-sheet-footer"]')).toContain(summary);
+  });
+
+  it("shows the name error next to the field and moves focus there", async () => {
+    const name = await mount();
+    fireEvent.click(screen.getByRole("button", { name: "access:agents.create" }));
+    await screen.findByText("access:fields.nameRequired");
+    expect(name.getAttribute("aria-invalid")).toBe("true");
+    expect(name.getAttribute("aria-describedby")).toContain("agent-token-name-error");
+    await waitFor(() => expect(document.activeElement).toBe(name));
+    expect(state.create).not.toHaveBeenCalled();
+  });
 });

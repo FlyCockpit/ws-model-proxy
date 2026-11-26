@@ -489,3 +489,56 @@ describe("JSON the conversion cannot handle at all (R6-B-1)", () => {
       expect(losslessDraft(throughJson(spec), "STARTABLE")).not.toBeNull();
   });
 });
+
+describe("embedding contract in the form", () => {
+  const preset = RUNTIME_PRESET_LIST.find((entry) => entry.id === "vllm_embeddings");
+  if (!preset) throw new Error("no embeddings preset");
+
+  it("keeps the preset's contract exactly and edits it field by field", () => {
+    const draft = losslessDraft(preset.spec, "STARTABLE");
+    expect(draft).not.toBeNull();
+    if (!draft) return;
+    const [model] = draft.models;
+    expect(model?.hasEmbedding).toBe(true);
+    expect(model?.embedding).toEqual({
+      model: "Qwen/Qwen3-Embedding-0.6B",
+      revision: "main",
+      dimensions: "1024",
+      normalization: "l2",
+      vectorSpace: "Qwen/Qwen3-Embedding-0.6B",
+    });
+    if (model) model.embedding.revision = "0123abcd";
+    const spec = draftToSpec(draft, parseBase(JSON.stringify(preset.spec)), "STARTABLE");
+    expect(runtimeSpecSchema.safeParse(spec).success).toBe(true);
+    expect((spec.models as Array<Record<string, unknown>>)[0]?.embeddingContract).toMatchObject({
+      revision: "0123abcd",
+      dimensions: 1024,
+    });
+  });
+
+  it("drops the contract when it is turned off, and names a bad dimension's input", () => {
+    const values = editorValues(preset.spec, "STARTABLE");
+    const [model] = values.draft.models;
+    if (!model) throw new Error("no model");
+    model.embedding.dimensions = "many";
+    const reading = readSpecEditor(values, "STARTABLE", MESSAGES);
+    expect(reading.ok).toBe(false);
+    if (reading.ok) return;
+    expect(reading.issues.map((issue) => issue.path.join("."))).toContain(
+      "draft.models.0.embedding.dimensions",
+    );
+    model.hasEmbedding = false;
+    const spec = draftToSpec(values.draft, parseBase(values.base), "STARTABLE");
+    expect((spec.models as Array<Record<string, unknown>>)[0]).not.toHaveProperty(
+      "embeddingContract",
+    );
+  });
+
+  it("is not lossless when a contract has a shape the inputs cannot hold", () => {
+    const spec = structuredClone(preset.spec) as { models: Array<Record<string, unknown>> };
+    const [model] = spec.models;
+    if (model) model.embeddingContract = { ...(model.embeddingContract as object), extra: 1 };
+    // An unknown key would be dropped: stay on JSON (the schema refuses it anyway).
+    expect(losslessDraft(spec, "STARTABLE")).toBeNull();
+  });
+});

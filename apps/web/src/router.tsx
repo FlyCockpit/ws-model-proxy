@@ -5,8 +5,8 @@ import { createIsomorphicFn } from "@tanstack/react-start";
 import { getRequestHeader } from "@tanstack/react-start/server";
 
 import ErrorState from "./components/error-state";
-import Loader from "./components/loader";
 import NotFound from "./components/not-found";
+import { RoutePending } from "./components/route-pending";
 import i18n from "./i18n";
 import { MAIN_SCROLLER_SELECTOR } from "./lib/main-scroller";
 import { routeTree } from "./routeTree.gen";
@@ -54,7 +54,9 @@ export function getRouter() {
     routeTree,
     defaultPreload: "intent",
     defaultPreloadStaleTime: 0,
-    defaultPendingComponent: () => <Loader />,
+    // A page still loading shows its content area as a skeleton inside the app frame (drawn
+    // here when its layout has not rendered yet), never a bare spinner in place of the page.
+    defaultPendingComponent: RoutePending,
     defaultErrorComponent: ErrorState,
     defaultNotFoundComponent: NotFound,
     context: { orpc, queryClient },

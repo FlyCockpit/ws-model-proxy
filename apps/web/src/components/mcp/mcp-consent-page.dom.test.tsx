@@ -450,11 +450,11 @@ describe("McpConsentPage access choice", () => {
     );
   });
 
-  it("Everything selects all seven scopes, with a chosen node allowlist", async () => {
+  it("Full access selects all seven scopes, with a chosen node allowlist", async () => {
     approveResponds();
     renderPage(FULL_SEARCH);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "access:agents.everything" }));
+    await user.click(await screen.findByRole("radio", { name: "access:agents.presets.full.name" }));
     await user.click(screen.getByRole("radio", { name: "access:agents.onlyNodes" }));
     await user.click(await screen.findByRole("checkbox", { name: "my-node" }));
     await user.click(screen.getByText("auth:mcpConsent.accept"));
@@ -486,14 +486,14 @@ describe("McpConsentPage access choice", () => {
     renderPage();
     await screen.findByText("auth:mcpConsent.requestedCeiling:access:agents.scopes.read.name");
     expect(screen.getAllByRole("checkbox")).toHaveLength(1);
-    expect(screen.queryByRole("button", { name: "access:agents.everything" })).toBeNull();
+    expect(screen.queryByRole("radio", { name: "access:agents.presets.full.name" })).toBeNull();
   });
 
-  it("limits Everything and individual choices to a fine scope ceiling", async () => {
+  it("limits Full access and individual choices to a fine scope ceiling", async () => {
     approveResponds();
     renderPage({ ...FULL_SEARCH, scope: "mcp:read mcp:files mcp:models:test" });
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "access:agents.everything" }));
+    await user.click(await screen.findByRole("radio", { name: "access:agents.presets.full.name" }));
     expect(screen.getAllByRole("checkbox")).toHaveLength(3);
     await user.click(screen.getByRole("radio", { name: "access:agents.onlyNodes" }));
     await user.click(screen.getByText("auth:mcpConsent.accept"));
@@ -518,7 +518,7 @@ describe("McpConsentPage access choice", () => {
     approveResponds();
     renderPage(FULL_SEARCH);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "access:agents.everything" }));
+    await user.click(await screen.findByRole("radio", { name: "access:agents.presets.full.name" }));
     await user.click(screen.getByText("auth:mcpConsent.deny"));
     await waitFor(() => expect(consentMock).toHaveBeenCalledWith({ accept: false }));
   });

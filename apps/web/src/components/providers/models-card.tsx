@@ -15,7 +15,6 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { Switch } from "@ws-model-proxy/ui/components/switch";
 import { ChevronDown, ChevronUp, Trash } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -25,6 +24,7 @@ import { ConfirmAction } from "@/components/access/confirm-action";
 import { FieldErrors } from "@/components/field-errors";
 import { NativeSelect } from "@/components/native-select";
 import { StatusPill } from "@/components/status-pill";
+import { SwitchRow } from "@/components/switch-row";
 import { MODEL_TYPES, type ModelType } from "@/lib/pool-ui";
 import { orpc } from "@/utils/orpc";
 
@@ -106,12 +106,14 @@ function ModelRow({ model, providerType }: { model: ProviderModel; providerType:
             {t("dashboard:providers.pricing.noActive")}
           </span>
         )}
-        <Switch
-          aria-label={t("dashboard:providers.enableModel", { model: model.upstreamModelId })}
+        <SwitchRow
+          id={`provider-model-${model.id}-enabled`}
+          label={t("dashboard:providers.modelInUse")}
+          ariaLabel={t("dashboard:providers.enableModel", { model: model.upstreamModelId })}
           checked={model.enabled}
           disabled={update.isPending}
-          onCheckedChange={(checked) =>
-            action(() => update.mutateAsync({ modelId: model.id, enabled: checked === true }))
+          onChange={(checked) =>
+            action(() => update.mutateAsync({ modelId: model.id, enabled: checked }))
           }
         />
         <Button

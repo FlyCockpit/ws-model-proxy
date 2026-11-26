@@ -46,11 +46,13 @@ vi.mock("@ws-model-proxy/ui/components/responsive-dialog", () => ({
     onOpenChange,
     title,
     children,
+    footer,
   }: {
     open: boolean;
     onOpenChange: (open: boolean) => void;
     title: ReactNode;
     children: ReactNode;
+    footer?: ReactNode;
   }) =>
     open ? (
       <div role="dialog" aria-label={String(title)}>
@@ -58,6 +60,7 @@ vi.mock("@ws-model-proxy/ui/components/responsive-dialog", () => ({
           close
         </button>
         {children}
+        {footer}
       </div>
     ) : null,
 }));
@@ -249,6 +252,12 @@ describe("pools page", () => {
     ).toBe("bge-m3");
     // The type follows from the model.
     expect(within(dialog).queryByLabelText("dashboard:pool.form.type")).toBeNull();
+    // The slug follows the name, folded away with what it will be.
+    const slugSection = within(dialog)
+      .getByLabelText("dashboard:pool.form.slug")
+      .closest("details");
+    expect(slugSection?.open).toBe(false);
+    expect(slugSection?.textContent).toContain("dashboard:pool.form.slugSummary");
     fireEvent.click(within(dialog).getByRole("button", { name: "dashboard:pool.create" }));
     await waitFor(() =>
       expect(state.create).toHaveBeenCalledWith({

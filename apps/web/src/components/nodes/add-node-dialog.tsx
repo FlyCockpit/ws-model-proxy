@@ -1,30 +1,17 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@ws-model-proxy/ui/components/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@ws-model-proxy/ui/components/dialog";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@ws-model-proxy/ui/components/select";
-import { Switch } from "@ws-model-proxy/ui/components/switch";
-import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
+import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
+import { FormAdvanced, focusFirstInvalid } from "@/components/form-surface";
+import { LabelledSelect } from "@/components/labelled-select";
 import { SegmentedControl } from "@/components/segmented-control";
+import { SwitchRow } from "@/components/switch-row";
 import { orpc } from "@/utils/orpc";
 import { parseLabels } from "./add-node-dialog-utils";
 import { EnrollmentPanel } from "./enrollment-panel";
@@ -107,7 +94,10 @@ export function AddNodeDialog({ open, onOpenChange, lang, replace }: AddNodeDial
       temporary: false,
       offlineHours: "1",
     },
-    validators: { onChange: buildSchema(t) },
+    validators: { onChange: buildSchema(t), onSubmit: buildSchema(t) },
+    // The options sit in a collapsed section: a refused create opens it and focuses the field.
+    onSubmitInvalid: () =>
+      window.setTimeout(() => focusFirstInvalid(document.getElementById(formId)), 0),
     onSubmit: async ({ value }) => {
       const labels = parseLabels(value.labels);
       await create.mutateAsync(
@@ -141,34 +131,89 @@ export function AddNodeDialog({ open, onOpenChange, lang, replace }: AddNodeDial
     onOpenChange(next);
   };
 
-  return (
-    <Dialog open={open} onOpenChange={(next) => close(next)}>
-      <DialogContent className="max-h-[90dvh] overflow-x-hidden overflow-y-auto overscroll-contain sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>
-            {replace
-              ? t("dashboard:nodes.add.replaceTitle", { slug: replace.slug })
-              : t("dashboard:nodes.add.title")}
-          </DialogTitle>
-          <DialogDescription>
-            {replace
-              ? t("dashboard:nodes.add.replaceDescription")
-              : t("dashboard:nodes.add.description")}
-          </DialogDescription>
-        </DialogHeader>
+  const formId = `add-node-form${replace ? "-replace" : ""}`;
+  const ttlField = (
+    <form.Field name="ttlHours">
+      {(field) => (
+        <div className="space-y-1.5">
+          <Label htmlFor="add-node-ttl">{t("dashboard:nodes.add.ttl")}</Label>
+          <LabelledSelect
+            id="add-node-ttl"
+            value={field.state.value}
+            onValueChange={field.handleChange}
+            options={TTL_OPTIONS.map((option) => ({
+              value: option,
+              label: t(`dashboard:nodes.add.ttlOption.${option}`),
+            }))}
+          />
+        </div>
+      )}
+    </form.Field>
+  );
 
-        {result ? (
-          <EnrollmentResultView result={result} lang={lang} onDone={() => close(false, true)} />
+  return (
+    <ResponsiveDialog
+      open={open}
+      onOpenChange={(next) => close(next)}
+      title={
+        replace
+          ? t("dashboard:nodes.add.replaceTitle", { slug: replace.slug })
+          : t("dashboard:nodes.add.title")
+      }
+      description={
+        replace ? t("dashboard:nodes.add.replaceDescription") : t("dashboard:nodes.add.description")
+      }
+      className="md:max-w-lg"
+      footer={
+        result ? (
+          <div className="flex min-w-0 justify-end">
+            <Button type="button" size="touch" onClick={() => close(false, true)}>
+              {t("dashboard:nodes.add.done")}
+            </Button>
+          </div>
         ) : (
-          <form
-            className="min-w-0 space-y-4"
-            onSubmit={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              form.handleSubmit().catch(() => undefined);
-            }}
-          >
-            {replace ? null : (
+          <div className="flex min-w-0 flex-wrap justify-end gap-2">
+            <Button type="button" variant="outline" size="touch" onClick={() => close(false)}>
+              {t("common:actions.cancel")}
+            </Button>
+            {/* Enabled while invalid: a refused create shows and focuses the error, even when it
+                sits in the collapsed options. */}
+            <form.Subscribe selector={(state) => state.isSubmitting}>
+              {(isSubmitting) => (
+                <Button
+                  type="submit"
+                  form={formId}
+                  size="touch"
+                  disabled={isSubmitting || create.isPending}
+                >
+                  {create.isPending
+                    ? t("dashboard:nodes.add.creating")
+                    : t("dashboard:nodes.add.create")}
+                </Button>
+              )}
+            </form.Subscribe>
+          </div>
+        )
+      }
+    >
+      {result ? (
+        <div className="min-w-0 pb-4">
+          <EnrollmentPanel result={result} lang={lang} />
+        </div>
+      ) : (
+        <form
+          id={formId}
+          className="min-w-0 space-y-4 pb-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            form.handleSubmit().catch(() => undefined);
+          }}
+        >
+          {replace ? (
+            ttlField
+          ) : (
+            <>
               <form.Field name="mode">
                 {(field) => (
                   <div className="space-y-1.5">
@@ -185,181 +230,130 @@ export function AddNodeDialog({ open, onOpenChange, lang, replace }: AddNodeDial
                   </div>
                 )}
               </form.Field>
-            )}
-
-            <form.Subscribe selector={(state) => state.values.mode}>
-              {(mode) =>
-                mode === "many" && !replace ? (
-                  <form.Field name="maxUses">
-                    {(field) => (
-                      <div className="space-y-1.5">
-                        <Label htmlFor="add-node-max-uses">
-                          {t("dashboard:nodes.add.maxUses")}
-                        </Label>
-                        <Input
-                          id="add-node-max-uses"
-                          inputMode="numeric"
-                          className="min-h-[44px]"
-                          value={field.state.value}
-                          onBlur={field.handleBlur}
-                          onChange={(event) => field.handleChange(event.target.value)}
-                        />
-                        <FieldError errors={field.state.meta.errors} />
-                      </div>
-                    )}
-                  </form.Field>
-                ) : null
-              }
-            </form.Subscribe>
-
-            <form.Field name="ttlHours">
-              {(field) => (
-                <div className="space-y-1.5">
-                  <Label htmlFor="add-node-ttl">{t("dashboard:nodes.add.ttl")}</Label>
-                  <Select
-                    value={field.state.value}
-                    onValueChange={(next) => {
-                      const option = TTL_OPTIONS.find((candidate) => candidate === next);
-                      if (option) field.handleChange(option);
-                    }}
-                  >
-                    <SelectTrigger id="add-node-ttl" className="min-h-[44px] w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {TTL_OPTIONS.map((option) => (
-                        <SelectItem key={option} value={option}>
-                          {t(`dashboard:nodes.add.ttlOption.${option}`)}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              )}
-            </form.Field>
-
-            {replace ? null : (
-              <>
-                <form.Field name="labels">
-                  {(field) => (
-                    <div className="space-y-1.5">
-                      <Label htmlFor="add-node-labels">{t("dashboard:nodes.add.labels")}</Label>
-                      <Input
-                        id="add-node-labels"
-                        className="min-h-[44px] font-mono"
-                        placeholder="gpu lab"
-                        autoCapitalize="none"
-                        value={field.state.value}
-                        onBlur={field.handleBlur}
-                        onChange={(event) => field.handleChange(event.target.value)}
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        {t("dashboard:nodes.add.labelsHint")}
-                      </p>
-                      <FieldError errors={field.state.meta.errors} />
-                    </div>
-                  )}
-                </form.Field>
-
-                <form.Field name="temporary">
-                  {(field) => (
-                    <label className="flex min-h-[44px] items-center justify-between gap-3">
-                      <span className="min-w-0">
-                        <span className="block text-sm font-medium">
-                          {t("dashboard:nodes.add.temporary")}
-                        </span>
-                        <span className="block text-xs text-muted-foreground">
-                          {t("dashboard:nodes.add.temporaryHint")}
-                        </span>
-                      </span>
-                      <Switch
-                        checked={field.state.value}
-                        onCheckedChange={(checked) => field.handleChange(checked)}
-                      />
-                    </label>
-                  )}
-                </form.Field>
-
-                <form.Subscribe selector={(state) => state.values.temporary}>
-                  {(temporary) =>
-                    temporary ? (
-                      <form.Field name="offlineHours">
+              <form.Subscribe selector={(state) => state.values.mode}>
+                {(mode) =>
+                  mode === "many" ? (
+                    <form.Field name="maxUses">
+                      {(field) => (
+                        <div className="space-y-1.5">
+                          <Label htmlFor="add-node-max-uses">
+                            {t("dashboard:nodes.add.maxUses")}
+                          </Label>
+                          <Input
+                            id="add-node-max-uses"
+                            inputMode="numeric"
+                            className="min-h-[44px]"
+                            value={field.state.value}
+                            aria-invalid={field.state.meta.errors.length > 0 || undefined}
+                            onBlur={field.handleBlur}
+                            onChange={(event) => field.handleChange(event.target.value)}
+                          />
+                          <FieldError errors={field.state.meta.errors} />
+                        </div>
+                      )}
+                    </form.Field>
+                  ) : null
+                }
+              </form.Subscribe>
+              <form.Subscribe
+                selector={(state) =>
+                  [
+                    state.values.ttlHours,
+                    state.values.labels,
+                    state.values.temporary,
+                    state.values.offlineHours,
+                  ] as const
+                }
+              >
+                {([ttlHours, labels, temporary, offlineHours]) => {
+                  const labelList = parseLabels(labels);
+                  return (
+                    <FormAdvanced
+                      title={t("dashboard:nodes.add.options")}
+                      summary={[
+                        t("dashboard:nodes.add.summary.ttl", {
+                          ttl: t(`dashboard:nodes.add.ttlOption.${ttlHours}`),
+                        }),
+                        labelList.length > 0
+                          ? t("dashboard:nodes.add.summary.labels", { labels: labelList.join(" ") })
+                          : t("dashboard:nodes.add.summary.noLabels"),
+                        temporary
+                          ? t("dashboard:nodes.add.summary.removed", { hours: offlineHours })
+                          : t("dashboard:nodes.add.summary.kept"),
+                      ].join(" · ")}
+                    >
+                      {ttlField}
+                      <form.Field name="labels">
                         {(field) => (
                           <div className="space-y-1.5">
-                            <Label htmlFor="add-node-offline">
-                              {t("dashboard:nodes.add.offlineHours")}
+                            <Label htmlFor="add-node-labels">
+                              {t("dashboard:nodes.add.labels")}
                             </Label>
                             <Input
-                              id="add-node-offline"
-                              inputMode="decimal"
-                              className="min-h-[44px]"
+                              id="add-node-labels"
+                              className="min-h-[44px] font-mono"
+                              placeholder="gpu lab"
+                              autoCapitalize="none"
                               value={field.state.value}
+                              aria-invalid={field.state.meta.errors.length > 0 || undefined}
+                              aria-describedby="add-node-labels-hint add-node-labels-error"
                               onBlur={field.handleBlur}
                               onChange={(event) => field.handleChange(event.target.value)}
                             />
-                            <FieldError errors={field.state.meta.errors} />
+                            <p id="add-node-labels-hint" className="text-xs text-muted-foreground">
+                              {t("dashboard:nodes.add.labelsHint")}
+                            </p>
+                            <FieldError
+                              id="add-node-labels-error"
+                              errors={field.state.meta.errors}
+                            />
                           </div>
                         )}
                       </form.Field>
-                    ) : null
-                  }
-                </form.Subscribe>
-              </>
-            )}
-
-            <DialogFooter>
-              <Button
-                type="button"
-                variant="ghost"
-                className="min-h-[44px]"
-                onClick={() => close(false)}
-              >
-                {t("common:actions.cancel")}
-              </Button>
-              <form.Subscribe selector={(state) => [state.canSubmit, state.isSubmitting] as const}>
-                {([canSubmit, isSubmitting]) => (
-                  <Button
-                    type="submit"
-                    className="min-h-[44px]"
-                    disabled={!canSubmit || isSubmitting || create.isPending}
-                  >
-                    {create.isPending
-                      ? t("dashboard:nodes.add.creating")
-                      : t("dashboard:nodes.add.create")}
-                  </Button>
-                )}
+                      <form.Field name="temporary">
+                        {(field) => (
+                          <SwitchRow
+                            id="add-node-temporary"
+                            label={t("dashboard:nodes.add.temporary")}
+                            description={t("dashboard:nodes.add.temporaryHint")}
+                            checked={field.state.value}
+                            onChange={field.handleChange}
+                          />
+                        )}
+                      </form.Field>
+                      {temporary ? (
+                        <form.Field name="offlineHours">
+                          {(field) => (
+                            <div className="space-y-1.5">
+                              <Label htmlFor="add-node-offline">
+                                {t("dashboard:nodes.add.offlineHours")}
+                              </Label>
+                              <Input
+                                id="add-node-offline"
+                                inputMode="decimal"
+                                className="min-h-[44px]"
+                                value={field.state.value}
+                                aria-invalid={field.state.meta.errors.length > 0 || undefined}
+                                aria-describedby="add-node-offline-error"
+                                onBlur={field.handleBlur}
+                                onChange={(event) => field.handleChange(event.target.value)}
+                              />
+                              <FieldError
+                                id="add-node-offline-error"
+                                errors={field.state.meta.errors}
+                              />
+                            </div>
+                          )}
+                        </form.Field>
+                      ) : null}
+                    </FormAdvanced>
+                  );
+                }}
               </form.Subscribe>
-            </DialogFooter>
-          </form>
-        )}
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-/** The minted command (shared panel) with Done: the only way out once the secret is shown. */
-function EnrollmentResultView({
-  result,
-  lang,
-  onDone,
-}: {
-  result: EnrollmentResult;
-  lang: string;
-  onDone: () => void;
-}) {
-  const { t } = useTranslation(["dashboard"]);
-  return (
-    <div className="min-w-0 space-y-4">
-      <EnrollmentPanel result={result} lang={lang} />
-      <DialogFooter>
-        <button
-          type="button"
-          className={buttonVariants({ className: "min-h-[44px]" })}
-          onClick={onDone}
-        >
-          {t("dashboard:nodes.add.done")}
-        </button>
-      </DialogFooter>
-    </div>
+            </>
+          )}
+        </form>
+      )}
+    </ResponsiveDialog>
   );
 }

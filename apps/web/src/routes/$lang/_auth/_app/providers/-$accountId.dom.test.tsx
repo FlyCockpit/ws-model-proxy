@@ -173,7 +173,7 @@ vi.mock("@/utils/orpc", () => {
         credentials: {
           replace: mutation("credentials.replace"),
           revoke: mutation("credentials.revoke"),
-          test: mutation("credentials.test"),
+          test: mutation("credentials.test", { ok: false, detail: "invalid_credential" }),
         },
         spendCaps: { set: mutation("spendCaps.set"), clear: mutation("spendCaps.clear") },
         models: {
@@ -247,6 +247,8 @@ vi.mock("@/utils/orpc", () => {
     },
   };
 });
+
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 
 import { Route } from "./$accountId";
 
@@ -441,5 +443,26 @@ describe("provider page", () => {
       maxOutputTokens: 4_096,
       surfaces: ["OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES"],
     });
+  });
+  it("says what a refused key means and what to do next, also as a toast", async () => {
+    const credential = ACCOUNT.credential;
+    Object.assign(ACCOUNT, { credential: { id: "cred-1", displaySuffix: "abcd" } });
+    try {
+      await mount();
+      fireEvent.click(screen.getByRole("button", { name: "dashboard:providers.test" }));
+      const reveal = vi.fn();
+      Element.prototype.scrollIntoView = reveal;
+      const status = await screen.findByRole("status");
+      expect(status.textContent).toContain("dashboard:providers.testResult.invalid_credential");
+      // Every run brings its result into view, not only the first.
+      fireEvent.click(screen.getByRole("button", { name: "dashboard:providers.test" }));
+      await waitFor(() => expect(reveal).toHaveBeenCalledTimes(2));
+      expect(status.textContent).toContain("dashboard:providers.testNext.invalid_credential");
+      expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+        expect.stringContaining("testResult.invalid_credential"),
+      );
+    } finally {
+      Object.assign(ACCOUNT, { credential });
+    }
   });
 });

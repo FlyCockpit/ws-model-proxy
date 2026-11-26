@@ -6,8 +6,8 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { NeedsYouBadge } from "@/components/needs-you-badge";
-import { useAuthSession } from "@/hooks/use-auth-session";
 import { useNeedsYouCount } from "@/hooks/use-needs-you-count";
+import { useShellIdentity } from "@/hooks/use-shell-identity";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { getNavItems, moreNavIcon as MoreIcon, toLangRoute } from "@/lib/nav-items";
 
@@ -23,12 +23,11 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
   // redirect leaves no `lang` param). Fall back to the default locale rather than crashing.
   const params = useParams({ strict: false });
   const lang = isSupportedLocale(params.lang) ? params.lang : DEFAULT_LOCALE;
-  const { state } = useAuthSession();
-  const session = state.session;
+  const identity = useShellIdentity();
   const { t } = useTranslation("nav");
   const [moreOpen, setMoreOpen] = useState(false);
-  const needsYou = useNeedsYouCount(Boolean(session));
-  const visible = { isAuthenticated: Boolean(session), role: session?.user.role };
+  const needsYou = useNeedsYouCount(identity.signedIn);
+  const visible = { isAuthenticated: identity.signedIn, role: identity.role };
   const tabs = getNavItems({ placement: "mobile", ...visible });
   const tabIds = new Set(tabs.map((item) => item.id));
   const rest = getNavItems({ placement: "sidebar", ...visible }).filter(

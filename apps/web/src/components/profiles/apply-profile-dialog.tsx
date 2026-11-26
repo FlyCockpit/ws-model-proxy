@@ -1,13 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@ws-model-proxy/ui/components/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@ws-model-proxy/ui/components/dialog";
+import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { CircleAlert } from "lucide-react";
@@ -74,32 +67,14 @@ export function ApplyProfileDialog({
   const nodeById = new Map((nodes.data?.nodes ?? []).map((node) => [node.id, node]));
   const data = preview.data;
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="max-h-[90dvh] overflow-x-hidden overflow-y-auto overscroll-contain sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{t("dashboard:profiles.apply.title", { name: profile.name })}</DialogTitle>
-          <DialogDescription>{t("dashboard:profiles.apply.description")}</DialogDescription>
-        </DialogHeader>
-        {preview.isPending ? (
-          <div aria-hidden="true" className="space-y-2">
-            <Skeleton className="h-4 w-1/2" />
-            <Skeleton className="h-16 w-full" />
-            <Skeleton className="h-16 w-full" />
-          </div>
-        ) : preview.isError ? (
-          <InlineRetry
-            message={refusalMessage(t, preview.error)}
-            onRetry={() => preview.refetch()}
-          />
-        ) : data ? (
-          <PreviewSummary
-            preview={data}
-            profile={profile}
-            nodeById={nodeById}
-            runtimeNames={new Map((runtimes.data?.runtimes ?? []).map((r) => [r.id, r.name]))}
-          />
-        ) : null}
-        <DialogFooter>
+    <ResponsiveDialog
+      open={open}
+      onOpenChange={setOpen}
+      title={t("dashboard:profiles.apply.title", { name: profile.name })}
+      description={t("dashboard:profiles.apply.description")}
+      className="md:max-w-lg"
+      footer={
+        <div className="flex min-w-0 flex-col-reverse gap-2 sm:flex-row sm:justify-end">
           <Button
             type="button"
             variant="ghost"
@@ -125,9 +100,31 @@ export function ApplyProfileDialog({
               ? t("dashboard:profiles.apply.applying")
               : t("dashboard:profiles.apply.confirm")}
           </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        </div>
+      }
+    >
+      <div className="min-w-0 space-y-4 pb-4">
+        {preview.isPending ? (
+          <div aria-hidden="true" className="space-y-2">
+            <Skeleton className="h-4 w-1/2" />
+            <Skeleton className="h-16 w-full" />
+            <Skeleton className="h-16 w-full" />
+          </div>
+        ) : preview.isError ? (
+          <InlineRetry
+            message={refusalMessage(t, preview.error)}
+            onRetry={() => preview.refetch()}
+          />
+        ) : data ? (
+          <PreviewSummary
+            preview={data}
+            profile={profile}
+            nodeById={nodeById}
+            runtimeNames={new Map((runtimes.data?.runtimes ?? []).map((r) => [r.id, r.name]))}
+          />
+        ) : null}
+      </div>
+    </ResponsiveDialog>
   );
 }
 

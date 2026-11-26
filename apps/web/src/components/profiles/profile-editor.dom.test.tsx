@@ -34,6 +34,26 @@ vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
 vi.mock("@/components/confirm-delete-dialog", () => ({ ConfirmDeleteDialog: () => null }));
+// The apply dialog is a ResponsiveDialog: render its body and pinned footer in place.
+vi.mock("@ws-model-proxy/ui/components/responsive-dialog", () => ({
+  ResponsiveDialog: ({
+    open,
+    title,
+    children,
+    footer,
+  }: {
+    open: boolean;
+    title: ReactNode;
+    children: ReactNode;
+    footer?: ReactNode;
+  }) =>
+    open ? (
+      <div role="dialog" aria-label={String(title)}>
+        {children}
+        {footer}
+      </div>
+    ) : null,
+}));
 vi.mock("@/components/help", () => ({ Help: ({ children }: { children: ReactNode }) => children }));
 
 vi.mock("@/utils/orpc", () => {

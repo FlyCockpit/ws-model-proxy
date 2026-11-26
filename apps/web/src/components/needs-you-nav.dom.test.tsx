@@ -18,6 +18,9 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
   return {
     ...actual,
     useParams: () => ({ lang: "en-US" }),
+    // The shell's identity reads the route guard's session from the matches (none here).
+    useRouterState: ({ select }: { select: (state: { matches: unknown[] }) => unknown }) =>
+      select({ matches: [] }),
     Outlet: () => null,
     Link: ({
       children,

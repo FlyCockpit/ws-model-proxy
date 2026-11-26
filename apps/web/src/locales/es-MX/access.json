@@ -86,7 +86,36 @@
     "disconnected": "Desconectado.",
     "mcpOff": "MCP está desactivado en este servidor, así que no se pueden crear tokens de agente.",
     "scopesTitle": "Permisos",
-    "everything": "Todo",
+    "presetsLabel": "Nivel de acceso",
+    "presets": {
+      "readOnly": {
+        "name": "Solo lectura",
+        "description": "Ver nodos, runtimes, pools, perfiles, proveedores, métricas y registros de solicitudes. No cambia nada."
+      },
+      "models": {
+        "name": "Ejecutar modelos",
+        "description": "Además, crear, cambiar, iniciar y detener pools y runtimes, aplicar perfiles y enviar solicitudes de prueba. Sin comandos, archivos ni cambios en los nodos."
+      },
+      "full": {
+        "name": "Acceso total",
+        "description": "Todo, incluido ejecutar comandos, editar archivos y cambiar tus nodos.",
+        "ceilingDescription": "Todos los permisos que pidió este agente."
+      },
+      "custom": {
+        "name": "Personalizado",
+        "description": "Elige los permisos uno por uno abajo."
+      }
+    },
+    "scopesDetail": "Permisos uno por uno",
+    "summary": {
+      "custom_one": "Personalizado: {{count}} permiso",
+      "custom_other": "Personalizado: {{count}} permisos",
+      "expiresOn": "vence el {{date}}",
+      "noExpiry": "no vence",
+      "pickDate": "elige una fecha de vencimiento"
+    },
+    "nextStep": "Siguiente: copia esta configuración en los ajustes MCP de tu agente y reinicia el agente. El token se muestra solo esta vez.",
+    "nextStepNoConfig": "Siguiente: dale a tu agente este token como token Bearer para el servidor MCP. El token se muestra solo esta vez.",
     "nodesTitle": "Nodos",
     "allNodes": "Todos mis nodos (actuales y futuros)",
     "onlyNodes": "Solo estos nodos",

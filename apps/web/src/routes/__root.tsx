@@ -24,6 +24,7 @@ import BottomNav from "@/components/bottom-nav";
 import ErrorState from "@/components/error-state";
 import { FileDropGuard } from "@/components/file-drop-guard";
 import Header from "@/components/header";
+import { ShellSkeleton } from "@/components/shell-skeleton";
 import { ThemeColorSync } from "@/components/theme-color-sync";
 import { ThemeProvider } from "@/components/theme-provider";
 import { UiLabelsBridge } from "@/components/ui-labels-bridge";
@@ -66,6 +67,9 @@ export const Route = createRootRouteWithContext<RouterAppContext>()({
   // a shellComponent, the SSR response is just a Suspense fallback with no script
   // tag, and hydration never happens.
   shellComponent: RootShell,
+  // The server's HTML for an SPA route is this pending state: the shell's geometry, never a bare
+  // skeleton, so the first paint is already the app's frame.
+  pendingComponent: ShellSkeleton,
   component: RootComponent,
   errorComponent: ErrorState,
   head: () => ({

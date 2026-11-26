@@ -21,6 +21,10 @@
     "tryAgain": "Try again",
     "viewAll": "View all"
   },
+  "switchState": {
+    "on": "On",
+    "off": "Off"
+  },
   "loading": "Loading…",
   "somethingWentWrong": "Something went wrong",
   "welcome": "Welcome",

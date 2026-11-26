@@ -20,7 +20,7 @@ import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialo
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { Trash2, TriangleAlert } from "lucide-react";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
@@ -274,6 +274,7 @@ function ChangeSlugDialog({ pool, onClose }: { pool: PoolView; onClose: () => vo
     },
   });
   const owner = pool.owner.slug;
+  const formId = useId();
   return (
     <ResponsiveDialog
       open
@@ -282,9 +283,38 @@ function ChangeSlugDialog({ pool, onClose }: { pool: PoolView; onClose: () => vo
       }}
       title={t("dashboard:pool.danger.slugTitle")}
       description={t("dashboard:pool.danger.slugWarning", { id: `${owner}/${pool.slug}` })}
+      footer={
+        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+          <Button type="button" variant="outline" size="touch" onClick={onClose}>
+            {t("common:actions.cancel")}
+          </Button>
+          <form.Subscribe
+            selector={(state) =>
+              [
+                state.isSubmitting,
+                state.values.slug.trim() !== "" &&
+                  state.values.confirm.trim() === state.values.slug.trim(),
+              ] as const
+            }
+          >
+            {([submitting, typed]) => (
+              <Button
+                type="submit"
+                form={formId}
+                variant="destructive"
+                size="touch"
+                disabled={submitting || !typed}
+              >
+                {submitting ? t("common:actions.saving") : t("dashboard:pool.danger.slugButton")}
+              </Button>
+            )}
+          </form.Subscribe>
+        </div>
+      }
     >
       <form
-        className="flex flex-col gap-4 pb-4"
+        id={formId}
+        className="flex min-w-0 flex-col gap-4 pb-4"
         onSubmit={(event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -338,31 +368,6 @@ function ChangeSlugDialog({ pool, onClose }: { pool: PoolView; onClose: () => vo
             </div>
           )}
         </form.Field>
-        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
-          <Button type="button" variant="outline" size="touch" onClick={onClose}>
-            {t("common:actions.cancel")}
-          </Button>
-          <form.Subscribe
-            selector={(state) =>
-              [
-                state.isSubmitting,
-                state.values.slug.trim() !== "" &&
-                  state.values.confirm.trim() === state.values.slug.trim(),
-              ] as const
-            }
-          >
-            {([submitting, typed]) => (
-              <Button
-                type="submit"
-                variant="destructive"
-                size="touch"
-                disabled={submitting || !typed}
-              >
-                {submitting ? t("common:actions.saving") : t("dashboard:pool.danger.slugButton")}
-              </Button>
-            )}
-          </form.Subscribe>
-        </div>
       </form>
     </ResponsiveDialog>
   );

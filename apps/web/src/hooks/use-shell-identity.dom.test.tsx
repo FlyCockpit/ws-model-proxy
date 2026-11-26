@@ -1,0 +1,67 @@
+// @vitest-environment jsdom
+import { renderHook } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const state = vi.hoisted(() => ({
+  client: { status: "pending", session: null } as {
+    status: string;
+    session: null | { user: { role?: string | null } };
+  },
+  matches: [] as Array<{ context: unknown; routeId?: string }>,
+}));
+
+vi.mock("@tanstack/react-router", () => ({
+  useRouterState: ({ select }: { select: (router: { matches: unknown[] }) => unknown }) =>
+    select({ matches: state.matches }),
+}));
+vi.mock("@/hooks/use-auth-session", () => ({ useAuthSession: () => ({ state: state.client }) }));
+
+import { useShellIdentity } from "./use-shell-identity";
+
+afterEach(() => {
+  state.client = { status: "pending", session: null };
+  state.matches = [];
+});
+
+describe("useShellIdentity", () => {
+  it("uses the route guard's session while the browser session loads", () => {
+    state.matches = [{ context: {} }, { context: { session: { user: { role: "admin" } } } }];
+    expect(renderHook(() => useShellIdentity()).result.current).toEqual({
+      signedIn: true,
+      role: "admin",
+    });
+  });
+
+  it("lets the browser session decide once it is known", () => {
+    state.matches = [{ context: { session: { user: { role: "admin" } } } }];
+    state.client = { status: "authenticated", session: { user: { role: "user" } } };
+    expect(renderHook(() => useShellIdentity()).result.current).toEqual({
+      signedIn: true,
+      role: "user",
+    });
+    // Signed out in the browser: the stale route session never keeps the shell signed in.
+    state.client = { status: "anonymous", session: null };
+    expect(renderHook(() => useShellIdentity()).result.current.signedIn).toBe(false);
+  });
+
+  it("is signed out while loading on a page no guard vouched for", () => {
+    expect(renderHook(() => useShellIdentity()).result.current).toEqual({
+      signedIn: false,
+      role: null,
+    });
+  });
+  it("draws the signed-in nav while a signed-in layout's guard is still checking", () => {
+    // A reload: the `_auth` match exists but its beforeLoad has not answered yet.
+    state.matches = [
+      { routeId: "__root__", context: {} },
+      { routeId: "/$lang/_auth", context: {} },
+    ];
+    expect(renderHook(() => useShellIdentity()).result.current).toEqual({
+      signedIn: true,
+      role: null,
+    });
+    // A public page never does.
+    state.matches = [{ routeId: "/$lang/login", context: {} }];
+    expect(renderHook(() => useShellIdentity()).result.current.signedIn).toBe(false);
+  });
+});

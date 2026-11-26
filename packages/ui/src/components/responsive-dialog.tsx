@@ -16,6 +16,7 @@ import {
   DrawerHeader,
   DrawerTitle,
 } from "@ws-model-proxy/ui/components/drawer";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useSyncExternalStore } from "react";
 
 /**
@@ -72,12 +73,25 @@ export function ResponsiveDialog({
   if (isDesktop) {
     return (
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className={className}>
-          <DialogHeader>
+        {/* Header and footer stay put; only the body would scroll, and a dialog's form must be
+            short enough that it never has to (the dialog-fits check). */}
+        <DialogContent
+          className={cn(
+            "max-h-[calc(100dvh-2rem)]",
+            footer ? "grid-rows-[auto_minmax(0,1fr)_auto]" : "grid-rows-[auto_minmax(0,1fr)]",
+            className,
+          )}
+        >
+          <DialogHeader className="pe-8">
             <DialogTitle>{title}</DialogTitle>
             {description ? <DialogDescription>{description}</DialogDescription> : null}
           </DialogHeader>
-          {children}
+          <div
+            data-slot="responsive-dialog-body"
+            className="-mx-1 min-h-0 min-w-0 overflow-x-hidden overflow-y-auto overscroll-contain px-1"
+          >
+            {children}
+          </div>
           {footer ? <DialogFooter>{footer}</DialogFooter> : null}
         </DialogContent>
       </Dialog>
@@ -87,12 +101,18 @@ export function ResponsiveDialog({
   return (
     <Drawer open={open} onOpenChange={onOpenChange}>
       <DrawerContent className={className} style={{ paddingBottom: "var(--safe-area-bottom)" }}>
-        <DrawerHeader>
+        {/* As on desktop: the header and the footer (the primary action) stay put. */}
+        <DrawerHeader className="shrink-0">
           <DrawerTitle>{title}</DrawerTitle>
           {description ? <DrawerDescription>{description}</DrawerDescription> : null}
         </DrawerHeader>
-        <div className="overflow-x-hidden overflow-y-auto overscroll-contain px-4">{children}</div>
-        {footer ? <DrawerFooter>{footer}</DrawerFooter> : null}
+        <div
+          data-slot="responsive-dialog-body"
+          className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain px-4"
+        >
+          {children}
+        </div>
+        {footer ? <DrawerFooter className="shrink-0 border-t">{footer}</DrawerFooter> : null}
       </DrawerContent>
     </Drawer>
   );

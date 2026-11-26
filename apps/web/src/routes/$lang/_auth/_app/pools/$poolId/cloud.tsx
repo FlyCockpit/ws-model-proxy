@@ -12,7 +12,6 @@ import {
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { Switch } from "@ws-model-proxy/ui/components/switch";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { ArrowDown, ArrowUp, Trash2 } from "lucide-react";
 import { useState } from "react";
@@ -23,6 +22,7 @@ import { FieldErrors } from "@/components/field-errors";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
 import { StatusPill } from "@/components/status-pill";
+import { SwitchRow } from "@/components/switch-row";
 import { TimeAgo } from "@/components/time-ago";
 import { formatMs } from "@/lib/format-metrics";
 import type { PoolView } from "@/lib/pool-ui";
@@ -128,17 +128,15 @@ function CloudSettings({ pool }: { pool: PoolView }) {
             </NativeSelect>
             <p className="text-xs text-muted-foreground">{t("dashboard:pool.cloud.humanOnly")}</p>
           </div>
-          <div className="flex min-h-11 items-center gap-3">
-            <Switch
-              id="cloud-warm"
-              checked={pool.cloud.paidWarmProtection}
-              disabled={setWarm.isPending}
-              onCheckedChange={(checked) =>
-                run(() => setWarm.mutateAsync({ poolId: pool.id, enabled: checked === true }))
-              }
-            />
-            <Label htmlFor="cloud-warm">{t("dashboard:pool.cloud.paidWarm")}</Label>
-          </div>
+          <SwitchRow
+            id="cloud-warm"
+            label={t("dashboard:pool.cloud.paidWarm")}
+            checked={pool.cloud.paidWarmProtection}
+            disabled={setWarm.isPending}
+            onChange={(checked) =>
+              run(() => setWarm.mutateAsync({ poolId: pool.id, enabled: checked }))
+            }
+          />
           <ExternalNote pool={pool} />
         </CardContent>
       </Card>

@@ -10,10 +10,11 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { useTranslation } from "react-i18next";
 
+import { AppFrame } from "@/components/app-frame";
 import { InlineRetry } from "@/components/inline-retry";
+import { PageSkeleton } from "@/components/page-skeleton";
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
 import { useTotpEnrollment } from "@/hooks/use-totp-enrollment";
 import { decideProtectedRouteAccess } from "@/lib/route-session-access";
@@ -33,8 +34,22 @@ export const Route = createFileRoute("/$lang/_auth")({
     }
     return { session: decision.session };
   },
+  // While the session check runs (a client navigation into the app), the app frame is already
+  // drawn and only the page is a skeleton.
+  pendingComponent: AuthPending,
+  // At once: the default waits a second first, showing nothing where the frame belongs.
+  pendingMs: 0,
   component: AuthLayout,
 });
+
+function AuthPending() {
+  const { lang } = Route.useParams();
+  return (
+    <AppFrame lang={lang}>
+      <PageSkeleton />
+    </AppFrame>
+  );
+}
 
 function AuthLayout() {
   const { session } = Route.useRouteContext();
@@ -51,18 +66,8 @@ function AuthLayout() {
 
   if (has2FA) return <Outlet />;
 
-  if (probe.isPending) {
-    return (
-      <div className="container mx-auto max-w-4xl px-4 py-8 space-y-4">
-        <Skeleton className="h-8 w-48" />
-        <Skeleton className="h-5 w-64" />
-        <div className="mt-8 space-y-3">
-          <Skeleton className="h-32 w-full rounded-lg" />
-          <Skeleton className="h-32 w-full rounded-lg" />
-        </div>
-      </div>
-    );
-  }
+  // The same frame the app draws once the probe answers: only the page is a skeleton.
+  if (probe.isPending) return <AuthPending />;
 
   if (probe.isError) {
     if (isForbidden(probe.error)) return <TwoFactorSetupRequired />;

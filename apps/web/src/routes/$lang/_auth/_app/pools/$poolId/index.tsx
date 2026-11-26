@@ -17,7 +17,7 @@ import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Pencil, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
@@ -277,6 +277,7 @@ function CallCard({ pool }: { pool: PoolView }) {
 
 function EditDetailsDialog({ pool, onClose }: { pool: PoolView; onClose: () => void }) {
   const { t } = useTranslation(["dashboard", "common"]);
+  const formId = useId();
   const write = usePoolWrite();
   const update = useMutation({
     ...orpc.pools.update.mutationOptions(),
@@ -310,9 +311,30 @@ function EditDetailsDialog({ pool, onClose }: { pool: PoolView; onClose: () => v
         if (!next) onClose();
       }}
       title={t("dashboard:pool.details.title")}
+      footer={
+        <form.Subscribe selector={(state) => state.isSubmitting}>
+          {(submitting) => (
+            <div className="flex min-w-0 flex-wrap justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="touch"
+                disabled={submitting}
+                onClick={onClose}
+              >
+                {t("common:actions.cancel")}
+              </Button>
+              <Button type="submit" form={formId} size="touch" disabled={submitting}>
+                {submitting ? t("common:actions.saving") : t("common:actions.save")}
+              </Button>
+            </div>
+          )}
+        </form.Subscribe>
+      }
     >
       <form
-        className="flex flex-col gap-4 pb-4"
+        id={formId}
+        className="flex min-w-0 flex-col gap-4 pb-4"
         onSubmit={(event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -351,13 +373,6 @@ function EditDetailsDialog({ pool, onClose }: { pool: PoolView; onClose: () => v
             </div>
           )}
         </form.Field>
-        <form.Subscribe selector={(state) => state.isSubmitting}>
-          {(submitting) => (
-            <Button type="submit" size="touch" disabled={submitting}>
-              {submitting ? t("common:actions.saving") : t("common:actions.save")}
-            </Button>
-          )}
-        </form.Subscribe>
       </form>
     </ResponsiveDialog>
   );

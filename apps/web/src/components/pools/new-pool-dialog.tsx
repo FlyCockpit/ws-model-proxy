@@ -8,11 +8,12 @@ import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialo
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import type { TFunction } from "i18next";
-import { useRef } from "react";
+import { useId, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
 import { FieldErrors } from "@/components/field-errors";
+import { FormAdvanced, focusFirstInvalid } from "@/components/form-surface";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
 import { SegmentedControl } from "@/components/segmented-control";
@@ -52,6 +53,7 @@ function useNewPoolForm(
   t: TFunction,
   initial: NewPoolInitial | undefined,
   submit: (value: NewPoolValues) => Promise<void>,
+  formId: string,
 ) {
   const schema = newPoolSchema(t);
   const defaultValues: NewPoolValues = {
@@ -67,6 +69,9 @@ function useNewPoolForm(
   return useForm({
     defaultValues,
     validators: { onSubmit: schema },
+    // Errors sit next to their field; focus moves to the first one (opening the slug section).
+    onSubmitInvalid: () =>
+      window.setTimeout(() => focusFirstInvalid(document.getElementById(formId)), 0),
     onSubmit: ({ value }) => submit(value),
   });
 }
@@ -94,6 +99,7 @@ export function NewPoolDialog({
   onCreated?: (pool: CreatedPool) => void;
 }) {
   const { t } = useTranslation(["dashboard", "common"]);
+  const formId = useId();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   // The slug follows the name (and a picked model) until the person edits it. Only the
@@ -157,7 +163,7 @@ export function NewPoolDialog({
           : { to: "/$lang/pools/$poolId", params: { lang, poolId: pool.id } },
       );
   };
-  const form = useNewPoolForm(t, initial, submit);
+  const form = useNewPoolForm(t, initial, submit, formId);
 
   const cloud = useStore(form.store, (state) => state.values.cloud);
   const type = useStore(form.store, (state) => state.values.type);
@@ -199,9 +205,11 @@ export function NewPoolDialog({
       onOpenChange={onOpenChange}
       title={t("dashboard:pool.new")}
       description={t("dashboard:pool.newHint")}
+      footer={<SubmitButtons form={form} formId={formId} onCancel={() => onOpenChange(false)} />}
     >
       <form
-        className="flex flex-col gap-4 pb-4"
+        id={formId}
+        className="flex min-w-0 flex-col gap-4 pb-4"
         onSubmit={(event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -217,7 +225,6 @@ export function NewPoolDialog({
         />
         <TypeField form={form} />
         <NameField form={form} onName={followName} />
-        <SlugField form={form} onEdit={markSlugEdited} />
         <CloudField form={form} />
         {cloud === "cloud" ? (
           <CloudOptions
@@ -226,7 +233,7 @@ export function NewPoolDialog({
             cloudCandidates={cloudCandidates}
           />
         ) : null}
-        <SubmitButton form={form} />
+        <SlugAdvanced form={form} onEdit={markSlugEdited} />
       </form>
     </ResponsiveDialog>
   );
@@ -344,6 +351,7 @@ function NameField({ form, onName }: { form: NewPoolForm; onName: (name: string)
               onName(event.target.value);
             }}
             className="h-11"
+            aria-invalid={field.state.meta.errors.length > 0 || undefined}
           />
           <FieldErrors field={field} />
         </div>
@@ -370,6 +378,7 @@ function SlugField({ form, onEdit }: { form: NewPoolForm; onEdit: () => void }) 
             className="h-11 font-mono"
             autoCapitalize="none"
             spellCheck={false}
+            aria-invalid={field.state.meta.errors.length > 0 || undefined}
           />
           <p className="text-xs text-muted-foreground">{t("dashboard:pool.form.slugHint")}</p>
           <FieldErrors field={field} />
@@ -480,14 +489,55 @@ function CloudOptions({
   );
 }
 
-function SubmitButton({ form }: { form: NewPoolForm }) {
+/** The slug follows the name; it sits folded away with what it will be, for the few who change it. */
+function SlugAdvanced({ form, onEdit }: { form: NewPoolForm; onEdit: () => void }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <form.Subscribe selector={(state) => state.values.slug}>
+      {(slug) => (
+        <FormAdvanced
+          title={t("dashboard:pool.form.slugSection")}
+          summary={
+            slug
+              ? t("dashboard:pool.form.slugSummary", { slug })
+              : t("dashboard:pool.form.slugFollowsName")
+          }
+        >
+          <SlugField form={form} onEdit={onEdit} />
+        </FormAdvanced>
+      )}
+    </form.Subscribe>
+  );
+}
+
+/** Cancel and Create, pinned under the form so Create is always on screen. */
+function SubmitButtons({
+  form,
+  formId,
+  onCancel,
+}: {
+  form: NewPoolForm;
+  formId: string;
+  onCancel: () => void;
+}) {
   const { t } = useTranslation(["dashboard", "common"]);
   return (
     <form.Subscribe selector={(state) => state.isSubmitting}>
       {(submitting) => (
-        <Button type="submit" size="touch" disabled={submitting}>
-          {submitting ? t("common:actions.saving") : t("dashboard:pool.create")}
-        </Button>
+        <div className="flex min-w-0 flex-wrap justify-end gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="touch"
+            disabled={submitting}
+            onClick={onCancel}
+          >
+            {t("common:actions.cancel")}
+          </Button>
+          <Button type="submit" form={formId} size="touch" disabled={submitting}>
+            {submitting ? t("common:actions.saving") : t("dashboard:pool.create")}
+          </Button>
+        </div>
       )}
     </form.Subscribe>
   );

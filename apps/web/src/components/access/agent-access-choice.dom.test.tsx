@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { AGENT_SCOPES } from "@ws-model-proxy/api/contracts";
+import { AGENT_SCOPES, type AgentScope } from "@ws-model-proxy/api/contracts";
 import { createInstance } from "i18next";
 import { useState } from "react";
 import { I18nextProvider } from "react-i18next";
@@ -36,7 +36,12 @@ import { AgentAccessChoice, AgentAccessSummary } from "./agent-access-choice";
 
 afterEach(cleanup);
 
-async function mount(lang: "en-US" | "es-MX", summary?: EditableAgentAccess) {
+async function mount(
+  lang: "en-US" | "es-MX",
+  summary?: EditableAgentAccess,
+  start: EditableAgentAccess = { scopes: [...AGENT_SCOPES], nodeIds: null },
+  availableScopes: readonly AgentScope[] = AGENT_SCOPES,
+) {
   const i18n = createInstance();
   await i18n.init({
     lng: lang,
@@ -44,11 +49,10 @@ async function mount(lang: "en-US" | "es-MX", summary?: EditableAgentAccess) {
     resources: { "en-US": { access: en }, "es-MX": { access: es } },
   });
   function Choice() {
-    const [value, setValue] = useState<EditableAgentAccess>({
-      scopes: [...AGENT_SCOPES],
-      nodeIds: null,
-    });
-    return <AgentAccessChoice value={value} onChange={setValue} />;
+    const [value, setValue] = useState<EditableAgentAccess>(start);
+    return (
+      <AgentAccessChoice value={value} onChange={setValue} availableScopes={availableScopes} />
+    );
   }
   return render(
     <I18nextProvider i18n={i18n}>
@@ -167,5 +171,75 @@ describe("Agent access translations and node choices", () => {
     const count = within(container).getByText("4 nodes");
     await screen.findByTitle(`gpu-box, ${"long-slug-".repeat(30)}, node-c, node-d`);
     expect(count.classList.contains("truncate")).toBe(true);
+  });
+
+  const checked = (name: string) =>
+    screen.getByRole("checkbox", { name: new RegExp(`^${name}`) }).getAttribute("aria-checked") ===
+    "true";
+
+  it("a preset sets its permissions; the grid stays folded with a summary of them", async () => {
+    await mount("en-US");
+    const user = userEvent.setup();
+    const full = screen.getByRole<HTMLInputElement>("radio", { name: en.agents.presets.full.name });
+    expect(full.checked).toBe(true);
+    const details = screen.getByText(en.agents.scopesDetail).closest("details");
+    expect(details?.open).toBe(false);
+    await user.click(screen.getByRole("radio", { name: en.agents.presets.models.name }));
+    expect(checked(en.agents.scopes.pools.name)).toBe(true);
+    expect(checked(en.agents.scopes.runtimes.name)).toBe(true);
+    expect(checked(en.agents.scopes.models_test.name)).toBe(true);
+    expect(checked(en.agents.scopes.files.name)).toBe(false);
+    expect(checked(en.agents.scopes.commands.name)).toBe(false);
+    expect(details?.querySelector("summary")?.textContent).toContain(
+      [
+        en.agents.scopes.read.name,
+        en.agents.scopes.pools.name,
+        en.agents.scopes.runtimes.name,
+        en.agents.scopes.models_test.name,
+      ].join(", "),
+    );
+    await user.click(screen.getByRole("radio", { name: en.agents.presets.readOnly.name }));
+    expect(checked(en.agents.scopes.pools.name)).toBe(false);
+    expect(checked(en.agents.scopes.read.name)).toBe(true);
+  });
+
+  it("Custom opens the grid, and a set matching no preset reads as Custom", async () => {
+    await mount("en-US");
+    const user = userEvent.setup();
+    const details = screen.getByText(en.agents.scopesDetail).closest("details");
+    await user.click(screen.getByRole("radio", { name: en.agents.presets.custom.name }));
+    expect(details?.open).toBe(true);
+    await user.click(screen.getByRole("radio", { name: en.agents.presets.readOnly.name }));
+    await user.click(
+      screen.getByRole("checkbox", { name: new RegExp(`^${en.agents.scopes.files.name}`) }),
+    );
+    expect(
+      screen.getByRole<HTMLInputElement>("radio", { name: en.agents.presets.custom.name }).checked,
+    ).toBe(true);
+  });
+
+  it("opens the grid at once when the starting access matches no preset", async () => {
+    await mount("en-US", undefined, { scopes: ["read", "files"], nodeIds: null });
+    expect(screen.getByText(en.agents.scopesDetail).closest("details")?.open).toBe(true);
+    expect(
+      screen.getByRole<HTMLInputElement>("radio", { name: en.agents.presets.custom.name }).checked,
+    ).toBe(true);
+  });
+
+  it("offers only presets that fit the requested ceiling", async () => {
+    await mount("en-US", undefined, { scopes: ["read"], nodeIds: null }, ["read", "files"]);
+    expect(screen.queryByRole("radio", { name: en.agents.presets.models.name })).toBeNull();
+    expect(screen.getByText(en.agents.presets.full.ceilingDescription)).toBeTruthy();
+    expect(screen.getAllByRole("checkbox")).toHaveLength(2);
+    await userEvent.setup().click(screen.getByRole("radio", { name: en.agents.presets.full.name }));
+    expect(checked(en.agents.scopes.files.name)).toBe(true);
+  });
+
+  it("shows no presets when only read can be given", async () => {
+    await mount("en-US", undefined, { scopes: ["read"], nodeIds: null }, ["read"]);
+    expect(screen.queryByRole("radiogroup")).toBeNull();
+    expect(
+      screen.getByRole("checkbox", { name: new RegExp(`^${en.agents.scopes.read.name}`) }),
+    ).toBeTruthy();
   });
 });

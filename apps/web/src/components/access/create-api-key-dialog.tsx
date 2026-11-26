@@ -6,7 +6,7 @@ import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
@@ -38,7 +38,8 @@ export function CreateApiKeyDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const { t } = useTranslation(["access"]);
+  const { t } = useTranslation(["access", "common"]);
+  const formId = useId();
   const [secret, setSecret] = useState<string | null>(null);
   // Owned here so the dialog cannot close while the key is being minted (a late result would
   // otherwise reveal the secret later); `gcTime: 0` keeps it out of the mutation cache.
@@ -55,11 +56,31 @@ export function CreateApiKeyDialog({
       onOpenChange={(next) => (next ? onOpenChange(true) : close())}
       title={secret ? t("access:apiKeys.created") : t("access:apiKeys.createTitle")}
       description={secret ? undefined : t("access:apiKeys.createDescription")}
+      footer={
+        secret ? undefined : (
+          // Pinned under the form, so Create is always on screen however many pools there are.
+          <div className="flex min-w-0 flex-wrap justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="touch"
+              disabled={create.isPending}
+              onClick={close}
+            >
+              {t("common:actions.cancel")}
+            </Button>
+            <Button type="submit" form={formId} size="touch" disabled={create.isPending}>
+              {create.isPending ? t("access:apiKeys.creating") : t("access:apiKeys.create")}
+            </Button>
+          </div>
+        )
+      }
     >
       {secret ? (
         <SecretReveal value={secret} onDone={close} />
       ) : open ? (
         <CreateApiKeyForm
+          formId={formId}
           create={create.mutateAsync}
           onCreated={(value) => {
             setSecret(value);
@@ -79,9 +100,11 @@ type CreateApiKey = (input: {
 }) => Promise<{ secret: string }>;
 
 function CreateApiKeyForm({
+  formId,
   create,
   onCreated,
 }: {
+  formId: string;
   create: CreateApiKey;
   onCreated: (secret: string) => void;
 }) {
@@ -125,6 +148,7 @@ function CreateApiKeyForm({
 
   return (
     <form
+      id={formId}
       className="flex min-w-0 flex-col gap-4 pb-4"
       onSubmit={(event) => {
         event.preventDefault();
@@ -182,40 +206,46 @@ function CreateApiKeyForm({
               {(field) => (
                 <fieldset className="min-w-0 space-y-1">
                   <legend className="sr-only">{t("access:apiKeys.scopeSelected")}</legend>
-                  {pools.isPending ? (
-                    <Skeleton className="h-11 w-full" />
-                  ) : pools.isError ? (
-                    <p className="text-sm text-muted-foreground">
-                      {t("access:apiKeys.poolsUnavailable")}
-                    </p>
-                  ) : usablePools.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">{t("access:apiKeys.noPools")}</p>
-                  ) : (
-                    usablePools.map((pool) => {
-                      const checked = field.state.value.includes(pool.id);
-                      const id = `api-key-pool-${pool.id}`;
-                      return (
-                        <label
-                          key={pool.id}
-                          htmlFor={id}
-                          className="flex min-h-11 min-w-0 cursor-pointer items-center gap-3 rounded-md px-2 hover:bg-muted"
-                        >
-                          <Checkbox
-                            id={id}
-                            checked={checked}
-                            onCheckedChange={(next) =>
-                              field.handleChange(
-                                next === true
-                                  ? [...field.state.value, pool.id]
-                                  : field.state.value.filter((poolId) => poolId !== pool.id),
-                              )
-                            }
-                          />
-                          <span className="truncate font-mono text-sm">{pool.label}</span>
-                        </label>
-                      );
-                    })
-                  )}
+                  {/* A long pool list scrolls in its own bounded box; the dialog never grows. */}
+                  <div
+                    data-scroll-region=""
+                    className="max-h-56 min-w-0 overflow-x-hidden overflow-y-auto overscroll-contain rounded-md border p-1"
+                  >
+                    {pools.isPending ? (
+                      <Skeleton className="h-11 w-full" />
+                    ) : pools.isError ? (
+                      <p className="text-sm text-muted-foreground">
+                        {t("access:apiKeys.poolsUnavailable")}
+                      </p>
+                    ) : usablePools.length === 0 ? (
+                      <p className="text-sm text-muted-foreground">{t("access:apiKeys.noPools")}</p>
+                    ) : (
+                      usablePools.map((pool) => {
+                        const checked = field.state.value.includes(pool.id);
+                        const id = `api-key-pool-${pool.id}`;
+                        return (
+                          <label
+                            key={pool.id}
+                            htmlFor={id}
+                            className="flex min-h-11 min-w-0 cursor-pointer items-center gap-3 rounded-md px-2 hover:bg-muted"
+                          >
+                            <Checkbox
+                              id={id}
+                              checked={checked}
+                              onCheckedChange={(next) =>
+                                field.handleChange(
+                                  next === true
+                                    ? [...field.state.value, pool.id]
+                                    : field.state.value.filter((poolId) => poolId !== pool.id),
+                                )
+                              }
+                            />
+                            <span className="truncate font-mono text-sm">{pool.label}</span>
+                          </label>
+                        );
+                      })
+                    )}
+                  </div>
                   {field.state.meta.errors.length > 0 ? (
                     <p className="text-sm text-destructive">{t("access:apiKeys.pickPools")}</p>
                   ) : null}
@@ -241,13 +271,6 @@ function CreateApiKeyForm({
           </div>
         )}
       </form.Field>
-      <form.Subscribe selector={(state) => state.isSubmitting}>
-        {(isSubmitting) => (
-          <Button type="submit" size="touch" disabled={isSubmitting}>
-            {isSubmitting ? t("access:apiKeys.creating") : t("access:apiKeys.create")}
-          </Button>
-        )}
-      </form.Subscribe>
     </form>
   );
 }

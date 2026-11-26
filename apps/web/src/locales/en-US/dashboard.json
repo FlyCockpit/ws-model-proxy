@@ -249,6 +249,14 @@
       "temporaryHint": "Remove each node (and release everything on it) after it has been offline this long.",
       "offlineHours": "Hours offline before removal",
       "offlineHoursInvalid": "Between 1 minute (0.02) and 720 hours.",
+      "options": "Options",
+      "summary": {
+        "ttl": "Code valid for {{ttl}}",
+        "labels": "labels: {{labels}}",
+        "noLabels": "no labels",
+        "removed": "removed after {{hours}} h offline",
+        "kept": "kept when offline"
+      },
       "create": "Create command",
       "creating": "Creating…",
       "failed": "The command could not be created.",
@@ -415,6 +423,15 @@
         "detected": "detected"
       },
       "declare": "Override",
+      "overrideTitle": "Override detected hardware",
+      "overrideNone": "Not overridden: placement uses what the node detects.",
+      "overrideSet": "Overridden: {{what}}",
+      "overrideParts": {
+        "memory": "{{gb}} GB memory",
+        "reserved": "{{gb}} GB held back",
+        "gpus_one": "{{count}} GPU",
+        "gpus_other": "{{count}} GPUs"
+      },
       "auto": "Automatic",
       "invalid": "Use positive numbers in GB.",
       "saved": "Hardware saved."
@@ -434,6 +451,8 @@
       "commandMax": "Longest command (hours)",
       "commandMaxHelp": "Commands run on this node are stopped after this long at most.",
       "commandMaxInvalid": "Between 1 minute (0.02) and 24 hours.",
+      "limitsTitle": "Ports and command limit",
+      "limitsSummary": "Ports {{start}}–{{end}} · commands stop after {{hours}} h at most",
       "rescan": "Look for servers now",
       "metricCommandsTitle": "Metric commands",
       "metricCommandsDescription": "Commands the node runs on a schedule to report extra metrics.",
@@ -907,6 +926,8 @@
     "addHint": "A cloud provider account. It stays off until you turn it on.",
     "addButton": "Add account",
     "added": "Account added.",
+    "addedKeyOk": "Account added. The provider accepted the key; turn the account on when you're ready.",
+    "addedKeyFailed": "Account added, but the key test failed: {{result}} {{next}}",
     "humanOnly": "Provider keys and cloud spend are set by people only; agents can see accounts but never keys.",
     "loadFailed": "Couldn't load provider accounts.",
     "emptyTitle": "No provider accounts",
@@ -933,7 +954,10 @@
       "apiKey": "API key header",
       "key": "Key",
       "keyRequired": "Paste the key.",
-      "dataCollection": "Allow the provider to collect data (OpenRouter)"
+      "dataCollection": "Allow the provider to collect data (OpenRouter)",
+      "dataCollectionHint": "When off, OpenRouter only uses providers that do not store or train on your requests.",
+      "connection": "Connection details",
+      "connectionSummary": "{{url}} · {{auth}}. OpenRouter needs no change here."
     },
     "enabled": "Account on",
     "key": "Key",
@@ -956,6 +980,7 @@
     "modelId": "Model ID at the provider",
     "modelAdded": "Model added (off until you turn it on).",
     "enableModel": "Use {{model}}",
+    "modelInUse": "Use this model",
     "price": "{{input}} / {{output}} {{currency}} per million tokens",
     "delete": "Delete account",
     "deleteTitle": "Delete {{name}}?",
@@ -972,6 +997,16 @@
       "insufficient_permission": "Couldn't confirm: the key may not list models, but it may still work.",
       "unverified": "Couldn't confirm: this URL answers without checking keys.",
       "unexpected_status": "The provider gave an unexpected answer."
+    },
+    "testNext": {
+      "no_key": "Save a key under New key below, then test it.",
+      "egress_disabled": "An admin can turn cloud calls on in the server's settings; until then this account cannot be used.",
+      "unsupported_provider": "Send a test request from the Test page once a model is added.",
+      "unreachable": "Check the base URL and that this server can reach the internet, then test again.",
+      "invalid_credential": "Copy the key again from the provider's site (it may be mistyped, revoked or out of credit), save it under New key below and test again. Keep the account off until it passes.",
+      "insufficient_permission": "Send a test request from the Test page to be sure.",
+      "unverified": "Check that the base URL points at the provider's API (it usually ends in /v1).",
+      "unexpected_status": "Test again in a minute; if it keeps failing, check the base URL and the provider's status page."
     },
     "details": "Account",
     "addModel": "Add a model",
@@ -1134,7 +1169,10 @@
       "slugHint": "Part of the callable ID: owner/slug.",
       "slugInvalid": "Lower-case letters, digits and single dashes, starting with a letter.",
       "type": "Type",
-      "noServedModels": "No served model of this type yet. Create a runtime first."
+      "noServedModels": "No served model yet. Create a runtime first.",
+      "slugSection": "Slug",
+      "slugSummary": "{{slug}}, part of the callable ID owner/{{slug}}. It follows the name.",
+      "slugFollowsName": "Follows the name you type."
     },
     "routing": {
       "title": "Routing",
@@ -1588,7 +1626,22 @@
       "specHint": "Commands may use placeholders such as port and memory_fraction, written in double braces. Bind 127.0.0.1 on single-node runtimes.",
       "specNotJson": "This is not valid JSON.",
       "note": "Note (why, optional)",
-      "fill": "Change before creating: {{fields}}"
+      "noteTooLong": "Keep the note to 500 characters.",
+      "basics": "Basics",
+      "nameHint": "Shown in lists and pools.",
+      "slugShown": "Its short name in URLs and the API: {{slug}} (change it under Advanced).",
+      "slugHint": "Lowercase letters, digits and dashes. Filled in from the name.",
+      "nameAndNote": "Short name and note",
+      "versionNote": "Version note",
+      "summarySlug": "Short name {{slug}}",
+      "summaryNote": "with a note",
+      "summaryNoNote": "no note",
+      "summaryJson": "the definition in the JSON view",
+      "fillTitle": "Check before creating:",
+      "willCreate": "Creates {{name}}: {{kind}}, {{what}}.",
+      "unnamed": "an unnamed runtime",
+      "nextStartable": "Next, start it from its page (nothing starts when you create it).",
+      "nextAlwaysOn": "Next, its page shows whether the node reaches the server."
     },
     "create": "Create runtime",
     "created": "Runtime created.",
@@ -2003,12 +2056,11 @@
     "specForm": {
       "view": "Definition view",
       "formTab": "Form",
-      "jsonTab": "JSON",
+      "jsonTab": "JSON (experts)",
       "fixJsonFirst": "Fix the JSON before switching back to the form. The form shows only a complete definition it can keep exactly as written (no unknown fields).",
       "servesLabel": "What it runs",
       "serves": "Serves models",
       "service": "Service (no models)",
-      "serving": "Serving",
       "api": "API",
       "apis": {
         "openai": "OpenAI-compatible",
@@ -2032,19 +2084,17 @@
       "models": "Served models",
       "modelsDiscovered": "Optional: leave empty and the node lists the models the server reports.",
       "modelId": "Model ID",
+      "modelIdFollows": "The commands name this model too; they change with it.",
       "removeModel": "Remove this model",
       "addModel": "Add a model",
-      "declareCapabilities": "Declare capabilities (otherwise they are detected)",
       "expandMedia": "Media expansion",
       "expandMediaValues": {
         "auto": "Automatic",
         "on": "On",
         "off": "Off"
       },
-      "address": "Address",
       "addressHint": "Where the node reaches the server: localhost or an IP address, with the API prefix (for example /v1).",
       "baseUrl": "Base URL",
-      "launch": "Launch",
       "management": "Managed as",
       "process": "Process (the node runs and stops it)",
       "serviceUnit": "Service (start, stop and status commands)",
@@ -2085,10 +2135,7 @@
         "other": "Other"
       },
       "optional": "Optional",
-      "everyRank": "Every node",
       "rank": "Node {{number}}",
-      "perRank": "Set per node",
-      "sameForEveryRank": "Same for every node",
       "commands": "Commands",
       "commandsHint": "Commands may use placeholders such as port and memory_fraction, written in double braces. Bind 127.0.0.1 on single-node runtimes.",
       "commandFields": {
@@ -2105,14 +2152,14 @@
       "readinessEnabled": "Check an HTTP route before it counts as ready",
       "readinessPath": "Path",
       "readinessStatus": "Expected status",
-      "readinessTimeout": "Give up after (ms)",
+      "readinessTimeout": "Give up after (seconds)",
       "health": "Health checks",
       "healthFields": {
-        "intervalMs": "Every (ms)",
+        "intervalMs": "Every (seconds)",
         "failureThreshold": "Failures before unhealthy",
         "successThreshold": "Successes before healthy"
       },
-      "kept": "Address credentials, node secrets, interactive steps, embedding contracts and transcription profiles have no inputs here: they are kept as they are (edit them in JSON). The metrics reader is on Advanced.",
+      "kept": "Address credentials, node secrets, interactive steps and speech-to-text settings have no inputs here: they are kept as they are (edit them in JSON). The metrics reader is on the runtime's Advanced tab.",
       "wrongKind": {
         "ALWAYS_ON": "An always-on runtime has an address and no launch.",
         "STARTABLE": "A startable runtime has a launch and no address."
@@ -2121,6 +2168,100 @@
       "hintRestart": {
         "ALWAYS_ON": "The definition changes: the node reconnects to the server with it.",
         "STARTABLE": "The definition changes: running instances keep the old one until they restart."
+      },
+      "viewHint": "For experts: edit the whole definition as JSON. Most people never need it.",
+      "sections": {
+        "server": "Server",
+        "model": "Model",
+        "modelHint": "The model ID clients ask for. It is also passed to the start command.",
+        "start": "Start command",
+        "size": "Size",
+        "advanced": "Advanced",
+        "advancedHint": "Filled in from the starting point. Open a section only to change it.",
+        "howItRuns": "How it runs",
+        "serving": "Serving details",
+        "moreCommands": "More commands and timeouts",
+        "launch": "Launch and placement"
+      },
+      "declareCapabilitiesOf": "Declare what {{model}} can do (otherwise it is detected)",
+      "modelNumber": "model {{number}}",
+      "transcriptionKept": "The speech-to-text settings (languages, response formats, upload limit, streaming) come from the starting point and fit Whisper on vLLM. To change them, use the JSON view below.",
+      "embedding": {
+        "title": "Embedding contract",
+        "hint": "What this model's vectors mean, so vectors from different models or revisions are never mixed.",
+        "revision": "Revision",
+        "revisionHint": "Pin a commit hash (a branch such as main can move and change the vectors), and give the server the same revision in its start command (vLLM: --revision <hash>).",
+        "dimensions": "Dimensions",
+        "model": "Model it embeds with",
+        "vectorSpace": "Vector space",
+        "vectorSpaceHint": "Models that share a vector space can be compared. Usually the model ID.",
+        "normalization": "Normalization",
+        "normalizations": {
+          "l2": "L2 (unit length)",
+          "none": "None"
+        },
+        "has": "{{model}} states an embedding contract.",
+        "none": "{{model}} has no embedding contract.",
+        "add": "Add a contract",
+        "remove": "Remove the contract"
+      },
+      "commandHints": {
+        "stop": "Optional for a process: the node stops it itself.",
+        "status": "Optional: exit 0 while it runs, 3 when it is stopped.",
+        "prepare": "Optional: runs before start, for example a download.",
+        "afterJoin": "Optional: runs once every node of the group has started.",
+        "health": "Optional: exit 0 while it is healthy."
+      },
+      "perRankTitle": "Per node of the group",
+      "perRankHint": "With several nodes per instance, size and commands can differ per node.",
+      "perRankSize": "size",
+      "perRankCommands": "commands",
+      "perRankOf": "Set {{what}} per node",
+      "sameForEveryRankOf": "Same {{what}} on every node",
+      "readinessTimeoutRange": "Enter 1 to 3600 seconds.",
+      "healthIntervalRange": "Enter 5 to 300 seconds.",
+      "fillTranscription": "Speech-to-text settings",
+      "fillEmbedding": "Embedding contract",
+      "fillOther": "Other settings (JSON view)",
+      "fillCommand": {
+        "start": "Start command",
+        "stop": "Stop command",
+        "status": "Status command",
+        "prepare": "Prepare command",
+        "afterJoin": "After-join command",
+        "health": "Health command"
+      },
+      "summary": {
+        "gpus_one": "{{count}} GPU · {{vram}} GiB VRAM",
+        "gpus_other": "{{count}} GPUs · {{vram}} GiB VRAM each",
+        "unified": "{{memory}} GiB unified memory",
+        "cpu": "CPU · {{ram}} GiB RAM",
+        "perNode_one": "set per node ({{count}} node)",
+        "perNode_other": "set per node ({{count}} nodes)",
+        "modelsDiscovered": "models listed by the server",
+        "models_one": "{{count}} model",
+        "models_other": "{{count}} models",
+        "media": "media expansion: {{value}}",
+        "capabilitiesDetected": "capabilities detected",
+        "capabilitiesDeclared": "capabilities declared",
+        "moreCommandsNone": "No other commands",
+        "moreCommandsSet": "Also: {{names}}",
+        "timeoutsDefault": "default timeouts",
+        "timeoutsCustom": "custom timeouts",
+        "managedProcess": "The node runs it as a process",
+        "managedService": "Started and stopped by its commands",
+        "groupSize_one": "{{count}} node per instance",
+        "groupSize_other": "{{count}} nodes per instance",
+        "anyNode": "any node",
+        "labels": "nodes labelled {{labels}}",
+        "freePort": "a free port",
+        "port": "port {{port}}",
+        "reservationsNone": "None",
+        "reservations_one": "{{count}} reservation",
+        "reservations_other": "{{count}} reservations",
+        "readiness": "Ready when {{path}} answers {{status}}, waiting up to {{seconds}} s",
+        "readinessOff": "Off: ready as soon as it starts",
+        "health": "Every {{seconds}} s · unhealthy after {{failures}} failures · healthy after {{successes}}"
       }
     },
     "history": {
@@ -2321,7 +2462,9 @@
       "saved_other": "Saved, but {{count}} nodes refused this version. First: {{reason}}",
       "savedAt_one": "Saved, but {{count}} node refused this version: {{reason}} (at {{at}})",
       "savedAt_other": "Saved, but {{count}} nodes refused this version. First: {{reason}} (at {{at}})"
-    }
+    },
+    "pickPresetHint": "Pick the closest match. The form opens filled in; you change only what differs.",
+    "restartRunningHint": "Off: running instances keep the old definition until they restart."
   },
   "overview": {
     "range": "Time range",

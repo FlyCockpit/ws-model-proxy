@@ -7,9 +7,8 @@ import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
-import { Switch } from "@ws-model-proxy/ui/components/switch";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
@@ -17,6 +16,7 @@ import { ConfirmAction } from "@/components/access/confirm-action";
 import { SecretReveal } from "@/components/access/secret-reveal";
 import { FieldErrors } from "@/components/field-errors";
 import { SegmentedControl } from "@/components/segmented-control";
+import { SwitchRow } from "@/components/switch-row";
 import { TimeAgo } from "@/components/time-ago";
 import { useClientDateText } from "@/hooks/use-client-date-text";
 import { refusalText } from "@/lib/refusal-text";
@@ -279,21 +279,18 @@ export function ShareByMeRow({ share, showPool = true }: { share: ShareView; sho
           )
         }
       />
-      <ResponsiveDialog
-        open={editOpen}
-        onOpenChange={setEditOpen}
-        title={t("access:shares.editTitle", { email: share.granteeEmail })}
-        description={t("access:shares.editDescription")}
-      >
-        {editOpen ? <ShareSettingsForm share={share} onDone={() => setEditOpen(false)} /> : null}
-      </ResponsiveDialog>
+      {editOpen ? <ShareSettingsForm share={share} onDone={() => setEditOpen(false)} /> : null}
     </div>
   );
 }
 
-/** Priority class, warm protection and the monthly cloud cap of one share. */
+/**
+ * The "Share settings" dialog: priority class, warm protection and the monthly cloud cap of one
+ * share, with Cancel and Save pinned. Mounted only while open, so it starts from the share.
+ */
 function ShareSettingsForm({ share, onDone }: { share: ShareView; onDone: () => void }) {
-  const { t } = useTranslation(["access"]);
+  const { t } = useTranslation(["access", "common"]);
+  const formId = useId();
   const invalidate = useInvalidateShares();
   const update = useMutation({
     ...orpc.access.shares.update.mutationOptions(),
@@ -368,120 +365,126 @@ function ShareSettingsForm({ share, onDone }: { share: ShareView; onDone: () => 
     },
   });
   return (
-    <form
-      className="flex min-w-0 flex-col gap-4 pb-4"
-      onSubmit={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        void form.handleSubmit();
+    <ResponsiveDialog
+      open
+      onOpenChange={(next) => {
+        if (!next && !form.state.isSubmitting) onDone();
       }}
+      title={t("access:shares.editTitle", { email: share.granteeEmail })}
+      description={t("access:shares.editDescription")}
+      footer={
+        <form.Subscribe selector={(state) => state.isSubmitting}>
+          {(isSubmitting) => (
+            <div className="flex min-w-0 flex-wrap justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="touch"
+                disabled={isSubmitting}
+                onClick={onDone}
+              >
+                {t("common:actions.cancel")}
+              </Button>
+              <Button type="submit" form={formId} size="touch" disabled={isSubmitting}>
+                {isSubmitting ? t("access:shares.saving") : t("access:shares.save")}
+              </Button>
+            </div>
+          )}
+        </form.Subscribe>
+      }
     >
-      <form.Field name="priority">
-        {(field) => (
-          <div className="min-w-0 space-y-2">
-            <Label>{t("access:shares.priority")}</Label>
-            <SegmentedControl
-              value={field.state.value}
-              onChange={field.handleChange}
-              ariaLabel={t("access:shares.priority")}
-              items={priorityItems(t)}
-            />
-          </div>
-        )}
-      </form.Field>
-      <form.Field name="protection">
-        {(field) => (
-          <div className="space-y-1.5">
-            <Label htmlFor={`share-${share.id}-protection`}>{t("access:shares.protection")}</Label>
-            <Input
-              id={`share-${share.id}-protection`}
-              inputMode="numeric"
-              className="h-11"
-              placeholder={t("access:shares.protectionPool")}
-              value={field.state.value}
-              onBlur={field.handleBlur}
-              onChange={(event) => field.handleChange(event.target.value)}
-              aria-invalid={field.state.meta.errors.length > 0}
-              aria-describedby={`share-${share.id}-protection-hint`}
-            />
-            <p id={`share-${share.id}-protection-hint`} className="text-xs text-muted-foreground">
-              {t("access:shares.protectionHint")}
-            </p>
-            <FieldErrors field={field} />
-          </div>
-        )}
-      </form.Field>
-      <div className="flex min-w-0 gap-2">
-        <form.Field name="capLimit">
+      <form
+        id={formId}
+        className="flex min-w-0 flex-col gap-4 pb-4"
+        onSubmit={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void form.handleSubmit();
+        }}
+      >
+        <form.Field name="priority">
           {(field) => (
-            <div className="min-w-0 flex-1 space-y-1.5">
-              <Label htmlFor={`share-${share.id}-cap`}>{t("access:shares.capLimit")}</Label>
+            <div className="min-w-0 space-y-2">
+              <Label>{t("access:shares.priority")}</Label>
+              <SegmentedControl
+                value={field.state.value}
+                onChange={field.handleChange}
+                ariaLabel={t("access:shares.priority")}
+                items={priorityItems(t)}
+              />
+            </div>
+          )}
+        </form.Field>
+        <form.Field name="protection">
+          {(field) => (
+            <div className="space-y-1.5">
+              <Label htmlFor={`share-${share.id}-protection`}>
+                {t("access:shares.protection")}
+              </Label>
               <Input
-                id={`share-${share.id}-cap`}
-                inputMode="decimal"
+                id={`share-${share.id}-protection`}
+                inputMode="numeric"
                 className="h-11"
-                placeholder={t("access:shares.noCap")}
+                placeholder={t("access:shares.protectionPool")}
                 value={field.state.value}
                 onBlur={field.handleBlur}
                 onChange={(event) => field.handleChange(event.target.value)}
                 aria-invalid={field.state.meta.errors.length > 0}
-                aria-describedby={`share-${share.id}-cap-hint`}
+                aria-describedby={`share-${share.id}-protection-hint`}
               />
+              <p id={`share-${share.id}-protection-hint`} className="text-xs text-muted-foreground">
+                {t("access:shares.protectionHint")}
+              </p>
               <FieldErrors field={field} />
             </div>
           )}
         </form.Field>
-        <form.Field name="capCurrency">
-          {(field) => (
-            <div className="w-24 shrink-0 space-y-1.5">
-              <Label htmlFor={`share-${share.id}-currency`}>{t("access:shares.capCurrency")}</Label>
-              <Input
-                id={`share-${share.id}-currency`}
-                className="h-11 uppercase"
-                maxLength={3}
-                autoComplete="off"
-                value={field.state.value}
-                onBlur={field.handleBlur}
-                onChange={(event) => field.handleChange(event.target.value.toUpperCase())}
-                aria-invalid={field.state.meta.errors.length > 0}
-              />
-              <FieldErrors field={field} />
-            </div>
-          )}
-        </form.Field>
-      </div>
-      <p id={`share-${share.id}-cap-hint`} className="-mt-2 text-xs text-muted-foreground">
-        {t("access:shares.capHint")}
-      </p>
-      <form.Subscribe selector={(state) => state.isSubmitting}>
-        {(isSubmitting) => (
-          <Button type="submit" size="touch" disabled={isSubmitting}>
-            {isSubmitting ? t("access:shares.saving") : t("access:shares.save")}
-          </Button>
-        )}
-      </form.Subscribe>
-    </form>
-  );
-}
-
-function SwitchRow({
-  id,
-  label,
-  checked,
-  disabled,
-  onChange,
-}: {
-  id: string;
-  label: string;
-  checked: boolean;
-  disabled: boolean;
-  onChange: (next: boolean) => void;
-}) {
-  return (
-    <label htmlFor={id} className="flex min-h-11 cursor-pointer items-center gap-3">
-      <Switch id={id} checked={checked} disabled={disabled} onCheckedChange={onChange} />
-      <span className="text-sm">{label}</span>
-    </label>
+        <div className="flex min-w-0 gap-2">
+          <form.Field name="capLimit">
+            {(field) => (
+              <div className="min-w-0 flex-1 space-y-1.5">
+                <Label htmlFor={`share-${share.id}-cap`}>{t("access:shares.capLimit")}</Label>
+                <Input
+                  id={`share-${share.id}-cap`}
+                  inputMode="decimal"
+                  className="h-11"
+                  placeholder={t("access:shares.noCap")}
+                  value={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(event.target.value)}
+                  aria-invalid={field.state.meta.errors.length > 0}
+                  aria-describedby={`share-${share.id}-cap-hint`}
+                />
+                <FieldErrors field={field} />
+              </div>
+            )}
+          </form.Field>
+          <form.Field name="capCurrency">
+            {(field) => (
+              <div className="w-24 shrink-0 space-y-1.5">
+                <Label htmlFor={`share-${share.id}-currency`}>
+                  {t("access:shares.capCurrency")}
+                </Label>
+                <Input
+                  id={`share-${share.id}-currency`}
+                  className="h-11 uppercase"
+                  maxLength={3}
+                  autoComplete="off"
+                  value={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(event.target.value.toUpperCase())}
+                  aria-invalid={field.state.meta.errors.length > 0}
+                />
+                <FieldErrors field={field} />
+              </div>
+            )}
+          </form.Field>
+        </div>
+        <p id={`share-${share.id}-cap-hint`} className="-mt-2 text-xs text-muted-foreground">
+          {t("access:shares.capHint")}
+        </p>
+      </form>
+    </ResponsiveDialog>
   );
 }
 

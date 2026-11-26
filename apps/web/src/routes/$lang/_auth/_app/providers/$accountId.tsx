@@ -12,8 +12,11 @@ import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { Switch } from "@ws-model-proxy/ui/components/switch";
+
 import { toast } from "@ws-model-proxy/ui/lib/toast";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
+import type { TFunction } from "i18next";
+import { AlertTriangle, CheckCircle2 } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -27,6 +30,7 @@ import {
 } from "@/components/providers/provider-action";
 import { ProviderActivity } from "@/components/providers/provider-activity";
 import { StatusPill } from "@/components/status-pill";
+import { SwitchRow } from "@/components/switch-row";
 import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
@@ -81,35 +85,26 @@ function ProviderDetail({ account }: { account: Account }) {
       </div>
       <Card>
         <CardContent className="flex flex-col gap-3 pt-4">
-          <div className="flex min-h-11 items-center gap-3">
-            <Switch
-              id="account-enabled"
-              checked={account.enabled}
-              disabled={setEnabled.isPending}
-              onCheckedChange={(checked) =>
-                action(() =>
-                  setEnabled.mutateAsync({ accountId: account.id, enabled: checked === true }),
-                )
+          <SwitchRow
+            id="account-enabled"
+            label={t("dashboard:providers.enabled")}
+            checked={account.enabled}
+            disabled={setEnabled.isPending}
+            onChange={(checked) =>
+              action(() => setEnabled.mutateAsync({ accountId: account.id, enabled: checked }))
+            }
+          />
+          {account.providerType === "openrouter" ? (
+            <SwitchRow
+              id="account-collection"
+              label={t("dashboard:providers.form.dataCollection")}
+              description={t("dashboard:providers.form.dataCollectionHint")}
+              checked={account.allowDataCollection}
+              disabled={setCollection.isPending}
+              onChange={(checked) =>
+                action(() => setCollection.mutateAsync({ accountId: account.id, allow: checked }))
               }
             />
-            <Label htmlFor="account-enabled">{t("dashboard:providers.enabled")}</Label>
-          </div>
-          {account.providerType === "openrouter" ? (
-            <div className="flex min-h-11 items-center gap-3">
-              <Switch
-                id="account-collection"
-                checked={account.allowDataCollection}
-                disabled={setCollection.isPending}
-                onCheckedChange={(checked) =>
-                  action(() =>
-                    setCollection.mutateAsync({ accountId: account.id, allow: checked === true }),
-                  )
-                }
-              />
-              <Label htmlFor="account-collection">
-                {t("dashboard:providers.form.dataCollection")}
-              </Label>
-            </div>
           ) : null}
         </CardContent>
       </Card>
@@ -127,7 +122,7 @@ function KeyCard({ account }: { account: Account }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const action = useProviderAction();
   const [secret, setSecret] = useState("");
-  const [probe, setProbe] = useState<string | null>(null);
+  const [probe, setProbe] = useState<{ code: string; ok: boolean; run: number } | null>(null);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
   const replace = useMutation({
     ...orpc.providers.credentials.replace.mutationOptions(),
@@ -163,11 +158,12 @@ function KeyCard({ account }: { account: Account }) {
                 try {
                   const result = await test.mutateAsync({ accountId: account.id });
                   const code = result.ok ? "ok" : (result.detail ?? "unexpected_status");
-                  setProbe(
-                    t(`dashboard:providers.testResult.${code}`, {
-                      defaultValue: t("dashboard:providers.testResult.unexpected_status"),
-                    }),
-                  );
+                  // A new key per run: the box remounts, so each result is brought into view.
+                  setProbe((previous) => ({ code, ok: result.ok, run: (previous?.run ?? 0) + 1 }));
+                  // Also as a toast: on a phone the line below can be out of view.
+                  const text = probeText(t, code);
+                  if (result.ok) toast.success(text);
+                  else toast.error(text);
                 } catch (error) {
                   toast.error(refusalText(error));
                 }
@@ -216,9 +212,31 @@ function KeyCard({ account }: { account: Account }) {
           </ResponsiveDialog>
         ) : null}
         {probe ? (
-          <p className="text-sm" role="status">
-            {probe}
-          </p>
+          <div
+            key={probe.run}
+            role="status"
+            ref={revealResult}
+            className={cn(
+              "flex min-w-0 scroll-mb-24 items-start gap-2 rounded-md border p-3 text-sm",
+              probe.ok ? "border-primary/40" : "border-destructive/50 text-destructive",
+            )}
+          >
+            {probe.ok ? (
+              <CheckCircle2 aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+            ) : (
+              <AlertTriangle aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+            )}
+            <span className="min-w-0 break-words">
+              <span className="block font-medium">{probeText(t, probe.code)}</span>
+              {probe.ok ? null : (
+                <span className="block text-muted-foreground">
+                  {t(`dashboard:providers.testNext.${probe.code}`, {
+                    defaultValue: t("dashboard:providers.testNext.unexpected_status"),
+                  })}
+                </span>
+              )}
+            </span>
+          </div>
         ) : null}
         <form
           className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-end"
@@ -375,4 +393,19 @@ function DeleteAccount({ account }: { account: Account }) {
       </ResponsiveDialog>
     </>
   );
+}
+
+/** A key test's result in words (an unknown code reads as an unexpected answer). */
+function probeText(t: TFunction<readonly ["dashboard", ...string[]]>, code: string): string {
+  return t(`dashboard:providers.testResult.${code}`, {
+    defaultValue: t("dashboard:providers.testResult.unexpected_status"),
+  });
+}
+
+/**
+ * Brings a key test's result into view where it appears (on a phone it renders below the fold).
+ * Module-level, so it runs when the box mounts, not on every render.
+ */
+function revealResult(element: HTMLElement | null) {
+  element?.scrollIntoView?.({ block: "nearest" });
 }

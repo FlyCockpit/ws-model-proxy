@@ -249,6 +249,14 @@
       "temporaryHint": "Quita cada nodo (y libera todo lo que tenga) tras estar sin conexión este tiempo.",
       "offlineHours": "Horas sin conexión antes de quitarlo",
       "offlineHoursInvalid": "Entre 1 minuto (0.02) y 720 horas.",
+      "options": "Opciones",
+      "summary": {
+        "ttl": "Código válido por {{ttl}}",
+        "labels": "etiquetas: {{labels}}",
+        "noLabels": "sin etiquetas",
+        "removed": "se quita tras {{hours}} h sin conexión",
+        "kept": "se conserva sin conexión"
+      },
       "create": "Crear comando",
       "creating": "Creando…",
       "failed": "No se pudo crear el comando.",
@@ -415,6 +423,15 @@
         "detected": "detectado"
       },
       "declare": "Ajustar manualmente",
+      "overrideTitle": "Reemplazar el hardware detectado",
+      "overrideNone": "Sin reemplazo: la asignación usa lo que detecta el nodo.",
+      "overrideSet": "Reemplazado: {{what}}",
+      "overrideParts": {
+        "memory": "{{gb}} GB de memoria",
+        "reserved": "{{gb}} GB reservados",
+        "gpus_one": "{{count}} GPU",
+        "gpus_other": "{{count}} GPU"
+      },
       "auto": "Automático",
       "invalid": "Usa números positivos en GB.",
       "saved": "Hardware guardado."
@@ -434,6 +451,8 @@
       "commandMax": "Comando más largo (horas)",
       "commandMaxHelp": "Los comandos que se ejecutan en este nodo se detienen a más tardar tras este tiempo.",
       "commandMaxInvalid": "Entre 1 minuto (0.02) y 24 horas.",
+      "limitsTitle": "Puertos y límite de comandos",
+      "limitsSummary": "Puertos {{start}}–{{end}} · los comandos se detienen tras {{hours}} h como máximo",
       "rescan": "Buscar servidores ahora",
       "metricCommandsTitle": "Comandos de métricas",
       "metricCommandsDescription": "Comandos que el nodo ejecuta periódicamente para reportar métricas adicionales.",
@@ -907,6 +926,8 @@
     "addHint": "Una cuenta de proveedor en la nube. Queda apagada hasta que la actives.",
     "addButton": "Agregar cuenta",
     "added": "Cuenta agregada.",
+    "addedKeyOk": "Cuenta agregada. El proveedor aceptó la clave; enciende la cuenta cuando quieras.",
+    "addedKeyFailed": "Cuenta agregada, pero la prueba de la clave falló: {{result}} {{next}}",
     "humanOnly": "Las claves de proveedor y el gasto en la nube solo los definen personas; los agentes ven las cuentas pero nunca las claves.",
     "loadFailed": "No se pudieron cargar las cuentas de proveedor.",
     "emptyTitle": "Sin cuentas de proveedor",
@@ -933,7 +954,10 @@
       "apiKey": "Encabezado de clave de API",
       "key": "Clave",
       "keyRequired": "Pega la clave.",
-      "dataCollection": "Permitir que el proveedor recopile datos (OpenRouter)"
+      "dataCollection": "Permitir que el proveedor recopile datos (OpenRouter)",
+      "dataCollectionHint": "Si está desactivado, OpenRouter solo usa proveedores que no guardan tus solicitudes ni entrenan con ellas.",
+      "connection": "Detalles de conexión",
+      "connectionSummary": "{{url}} · {{auth}}. OpenRouter no necesita cambios aquí."
     },
     "enabled": "Cuenta activa",
     "key": "Clave",
@@ -956,6 +980,7 @@
     "modelId": "ID del modelo en el proveedor",
     "modelAdded": "Modelo agregado (apagado hasta que lo actives).",
     "enableModel": "Usar {{model}}",
+    "modelInUse": "Usar este modelo",
     "price": "{{input}} / {{output}} {{currency}} por millón de tokens",
     "delete": "Eliminar cuenta",
     "deleteTitle": "¿Eliminar {{name}}?",
@@ -972,6 +997,16 @@
       "insufficient_permission": "No se pudo confirmar: la clave quizá no lista modelos, pero puede funcionar.",
       "unverified": "No se pudo confirmar: esta URL responde sin revisar claves.",
       "unexpected_status": "El proveedor dio una respuesta inesperada."
+    },
+    "testNext": {
+      "no_key": "Guarda una clave en Nueva clave, abajo, y pruébala.",
+      "egress_disabled": "Un administrador puede activar las llamadas a la nube en la configuración del servidor; hasta entonces esta cuenta no se puede usar.",
+      "unsupported_provider": "Envía una solicitud de prueba desde la página Probar cuando agregues un modelo.",
+      "unreachable": "Revisa la URL base y que este servidor tenga acceso a internet, y vuelve a probar.",
+      "invalid_credential": "Vuelve a copiar la clave del sitio del proveedor (puede estar mal escrita, revocada o sin saldo), guárdala en Nueva clave, abajo, y vuelve a probar. Deja la cuenta apagada hasta que pase.",
+      "insufficient_permission": "Envía una solicitud de prueba desde la página Probar para estar seguro.",
+      "unverified": "Revisa que la URL base apunte a la API del proveedor (suele terminar en /v1).",
+      "unexpected_status": "Vuelve a probar en un minuto; si sigue fallando, revisa la URL base y la página de estado del proveedor."
     },
     "details": "Cuenta",
     "addModel": "Agregar un modelo",
@@ -1134,7 +1169,10 @@
       "slugHint": "Parte del ID invocable: dueño/identificador.",
       "slugInvalid": "Minúsculas, dígitos y guiones simples, empezando con una letra.",
       "type": "Tipo",
-      "noServedModels": "Aún no hay modelos servidos de este tipo. Crea un runtime primero."
+      "noServedModels": "Aún no hay modelos servidos de este tipo. Crea un runtime primero.",
+      "slugSection": "Slug",
+      "slugSummary": "{{slug}}, parte del ID invocable owner/{{slug}}. Sigue al nombre.",
+      "slugFollowsName": "Sigue al nombre que escribas."
     },
     "routing": {
       "title": "Enrutamiento",
@@ -1588,7 +1626,22 @@
       "specHint": "Los comandos pueden usar marcadores como port y memory_fraction, entre llaves dobles. Usa 127.0.0.1 en runtimes de un solo nodo.",
       "specNotJson": "Esto no es JSON válido.",
       "note": "Nota (por qué, opcional)",
-      "fill": "Cambia antes de crear: {{fields}}"
+      "noteTooLong": "Deja la nota en 500 caracteres como máximo.",
+      "basics": "Datos básicos",
+      "nameHint": "Se muestra en las listas y en los pools.",
+      "slugShown": "Su nombre corto en URLs y en la API: {{slug}} (cámbialo en Avanzado).",
+      "slugHint": "Minúsculas, dígitos y guiones. Se completa a partir del nombre.",
+      "nameAndNote": "Nombre corto y nota",
+      "versionNote": "Nota de la versión",
+      "summarySlug": "Nombre corto {{slug}}",
+      "summaryNote": "con nota",
+      "summaryNoNote": "sin nota",
+      "summaryJson": "la definición de la vista JSON",
+      "fillTitle": "Revisa antes de crear:",
+      "willCreate": "Crea {{name}}: {{kind}}, {{what}}.",
+      "unnamed": "un runtime sin nombre",
+      "nextStartable": "Después, arráncalo desde su página (crearlo no arranca nada).",
+      "nextAlwaysOn": "Después, su página muestra si el nodo llega al servidor."
     },
     "create": "Crear runtime",
     "created": "Runtime creado.",
@@ -2003,12 +2056,11 @@
     "specForm": {
       "view": "Vista de la definición",
       "formTab": "Formulario",
-      "jsonTab": "JSON",
+      "jsonTab": "JSON (expertos)",
       "fixJsonFirst": "Corrige el JSON antes de volver al formulario. El formulario solo muestra una definición completa que puede conservar tal como está escrita (sin campos desconocidos).",
       "servesLabel": "Qué ejecuta",
       "serves": "Sirve modelos",
       "service": "Servicio (sin modelos)",
-      "serving": "Servicio de modelos",
       "api": "API",
       "apis": {
         "openai": "Compatible con OpenAI",
@@ -2032,19 +2084,17 @@
       "models": "Modelos servidos",
       "modelsDiscovered": "Opcional: déjalo vacío y el nodo lista los modelos que informa el servidor.",
       "modelId": "ID del modelo",
+      "modelIdFollows": "Los comandos también nombran este modelo; cambian con él.",
       "removeModel": "Quitar este modelo",
       "addModel": "Agregar un modelo",
-      "declareCapabilities": "Declarar capacidades (si no, se detectan)",
       "expandMedia": "Expansión de medios",
       "expandMediaValues": {
         "auto": "Automática",
         "on": "Activada",
         "off": "Desactivada"
       },
-      "address": "Dirección",
       "addressHint": "Dónde el nodo llega al servidor: localhost o una dirección IP, con el prefijo de la API (por ejemplo /v1).",
       "baseUrl": "URL base",
-      "launch": "Lanzamiento",
       "management": "Se administra como",
       "process": "Proceso (el nodo lo ejecuta y lo detiene)",
       "serviceUnit": "Servicio (comandos de inicio, parada y estado)",
@@ -2085,10 +2135,7 @@
         "other": "Otro"
       },
       "optional": "Opcional",
-      "everyRank": "Todos los nodos",
       "rank": "Nodo {{number}}",
-      "perRank": "Definir por nodo",
-      "sameForEveryRank": "Igual para todos los nodos",
       "commands": "Comandos",
       "commandsHint": "Los comandos pueden usar marcadores como port y memory_fraction, entre llaves dobles. En runtimes de un solo nodo, escucha en 127.0.0.1.",
       "commandFields": {
@@ -2105,14 +2152,14 @@
       "readinessEnabled": "Comprobar una ruta HTTP antes de considerarlo listo",
       "readinessPath": "Ruta",
       "readinessStatus": "Estado esperado",
-      "readinessTimeout": "Rendirse después de (ms)",
+      "readinessTimeout": "Rendirse después de (segundos)",
       "health": "Comprobaciones de salud",
       "healthFields": {
-        "intervalMs": "Cada (ms)",
+        "intervalMs": "Cada (segundos)",
         "failureThreshold": "Fallos antes de no saludable",
         "successThreshold": "Éxitos antes de saludable"
       },
-      "kept": "Las credenciales de la dirección, los secretos del nodo, los pasos interactivos, los contratos de embeddings y los perfiles de transcripción no tienen campos aquí: se conservan como están (edítalos en JSON). El lector de métricas está en Avanzado.",
+      "kept": "Las credenciales de la dirección, los secretos del nodo, los pasos interactivos y los ajustes de voz a texto no tienen campos aquí: se conservan como están (edítalos en JSON). El lector de métricas está en la pestaña Avanzado del runtime.",
       "wrongKind": {
         "ALWAYS_ON": "Un runtime siempre activo tiene una dirección y no tiene lanzamiento.",
         "STARTABLE": "Un runtime iniciable tiene un lanzamiento y no tiene dirección."
@@ -2121,6 +2168,100 @@
       "hintRestart": {
         "ALWAYS_ON": "La definición cambia: el nodo se vuelve a conectar al servidor con ella.",
         "STARTABLE": "La definición cambia: las instancias en ejecución conservan la anterior hasta que se reinicien."
+      },
+      "viewHint": "Para expertos: edita toda la definición como JSON. Casi nadie lo necesita.",
+      "sections": {
+        "server": "Servidor",
+        "model": "Modelo",
+        "modelHint": "El ID de modelo que piden los clientes. También se pasa al comando de arranque.",
+        "start": "Comando de arranque",
+        "size": "Tamaño",
+        "advanced": "Avanzado",
+        "advancedHint": "Se completa a partir del punto de partida. Abre una sección solo para cambiarla.",
+        "howItRuns": "Cómo funciona",
+        "serving": "Detalles del servicio",
+        "moreCommands": "Más comandos y tiempos límite",
+        "launch": "Arranque y ubicación"
+      },
+      "declareCapabilitiesOf": "Declarar lo que puede hacer {{model}} (si no, se detecta)",
+      "modelNumber": "modelo {{number}}",
+      "transcriptionKept": "Los ajustes de voz a texto (idiomas, formatos de respuesta, límite de subida, streaming) vienen del punto de partida y sirven para Whisper en vLLM. Para cambiarlos, usa la vista JSON de abajo.",
+      "embedding": {
+        "title": "Contrato de embeddings",
+        "hint": "Qué significan los vectores de este modelo, para que nunca se mezclen vectores de modelos o revisiones distintos.",
+        "revision": "Revisión",
+        "revisionHint": "Fija un hash de commit (una rama como main puede moverse y cambiar los vectores) y pásale al servidor la misma revisión en su comando de inicio (vLLM: --revision <hash>).",
+        "dimensions": "Dimensiones",
+        "model": "Modelo con el que genera los embeddings",
+        "vectorSpace": "Espacio vectorial",
+        "vectorSpaceHint": "Los modelos que comparten espacio vectorial se pueden comparar. Normalmente es el ID del modelo.",
+        "normalization": "Normalización",
+        "normalizations": {
+          "l2": "L2 (longitud unitaria)",
+          "none": "Ninguna"
+        },
+        "has": "{{model}} declara un contrato de embeddings.",
+        "none": "{{model}} no tiene contrato de embeddings.",
+        "add": "Agregar un contrato",
+        "remove": "Quitar el contrato"
+      },
+      "commandHints": {
+        "stop": "Opcional para un proceso: el nodo lo detiene por sí mismo.",
+        "status": "Opcional: sale con 0 mientras funciona y con 3 cuando está detenido.",
+        "prepare": "Opcional: se ejecuta antes del arranque, por ejemplo una descarga.",
+        "afterJoin": "Opcional: se ejecuta cuando todos los nodos del grupo arrancaron.",
+        "health": "Opcional: sale con 0 mientras está saludable."
+      },
+      "perRankTitle": "Por nodo del grupo",
+      "perRankHint": "Con varios nodos por instancia, el tamaño y los comandos pueden ser distintos en cada nodo.",
+      "perRankSize": "el tamaño",
+      "perRankCommands": "los comandos",
+      "perRankOf": "Definir {{what}} por nodo",
+      "sameForEveryRankOf": "Mismo valor de {{what}} en todos los nodos",
+      "readinessTimeoutRange": "Escribe de 1 a 3600 segundos.",
+      "healthIntervalRange": "Escribe de 5 a 300 segundos.",
+      "fillTranscription": "Ajustes de voz a texto",
+      "fillEmbedding": "Contrato de embeddings",
+      "fillOther": "Otros ajustes (vista JSON)",
+      "fillCommand": {
+        "start": "Comando de arranque",
+        "stop": "Comando de parada",
+        "status": "Comando de estado",
+        "prepare": "Comando de preparación",
+        "afterJoin": "Comando tras la unión",
+        "health": "Comando de salud"
+      },
+      "summary": {
+        "gpus_one": "{{count}} GPU · {{vram}} GiB de VRAM",
+        "gpus_other": "{{count}} GPU · {{vram}} GiB de VRAM cada una",
+        "unified": "{{memory}} GiB de memoria unificada",
+        "cpu": "CPU · {{ram}} GiB de RAM",
+        "perNode_one": "definido por nodo ({{count}} nodo)",
+        "perNode_other": "definido por nodo ({{count}} nodos)",
+        "modelsDiscovered": "modelos que lista el servidor",
+        "models_one": "{{count}} modelo",
+        "models_other": "{{count}} modelos",
+        "media": "expansión de medios: {{value}}",
+        "capabilitiesDetected": "capacidades detectadas",
+        "capabilitiesDeclared": "capacidades declaradas",
+        "moreCommandsNone": "Sin otros comandos",
+        "moreCommandsSet": "Además: {{names}}",
+        "timeoutsDefault": "tiempos límite predeterminados",
+        "timeoutsCustom": "tiempos límite propios",
+        "managedProcess": "El nodo lo ejecuta como proceso",
+        "managedService": "Sus comandos lo arrancan y lo detienen",
+        "groupSize_one": "{{count}} nodo por instancia",
+        "groupSize_other": "{{count}} nodos por instancia",
+        "anyNode": "cualquier nodo",
+        "labels": "nodos con las etiquetas {{labels}}",
+        "freePort": "un puerto libre",
+        "port": "puerto {{port}}",
+        "reservationsNone": "Ninguna",
+        "reservations_one": "{{count}} reserva",
+        "reservations_other": "{{count}} reservas",
+        "readiness": "Lista cuando {{path}} responde {{status}}, esperando hasta {{seconds}} s",
+        "readinessOff": "Apagado: lista en cuanto arranca",
+        "health": "Cada {{seconds}} s · no saludable tras {{failures}} fallos · saludable tras {{successes}}"
       }
     },
     "history": {
@@ -2321,7 +2462,9 @@
       "saved_other": "Guardado, pero {{count}} nodos rechazaron esta versión. El primero: {{reason}}",
       "savedAt_one": "Guardado, pero {{count}} nodo rechazó esta versión: {{reason}} (en {{at}})",
       "savedAt_other": "Guardado, pero {{count}} nodos rechazaron esta versión. El primero: {{reason}} (en {{at}})"
-    }
+    },
+    "pickPresetHint": "Elige el más parecido. El formulario se abre ya completado; solo cambias lo que difiera.",
+    "restartRunningHint": "Apagado: las instancias en marcha conservan la definición anterior hasta que se reinicien."
   },
   "overview": {
     "range": "Periodo",

@@ -7,6 +7,7 @@ import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
+import { useId } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
@@ -32,19 +33,10 @@ export function ForkRuntimeDialog({
   lang: string;
   onClose: () => void;
 }) {
-  const { t } = useTranslation(["access"]);
-  return (
-    <ResponsiveDialog
-      open={definition !== null}
-      onOpenChange={(next) => (next ? undefined : onClose())}
-      title={t("access:fork.title", { name: definition?.name ?? "" })}
-      description={t("access:fork.description")}
-    >
-      {definition ? (
-        <ForkForm key={definition.runtimeId} definition={definition} lang={lang} onDone={onClose} />
-      ) : null}
-    </ResponsiveDialog>
-  );
+  // Mounted only while open, so each fork starts from the shared definition's name.
+  return definition ? (
+    <ForkForm key={definition.runtimeId} definition={definition} lang={lang} onDone={onClose} />
+  ) : null;
 }
 
 function ForkForm({
@@ -56,7 +48,8 @@ function ForkForm({
   lang: string;
   onDone: () => void;
 }) {
-  const { t } = useTranslation(["access", "dashboard"]);
+  const { t } = useTranslation(["access", "dashboard", "common"]);
+  const formId = useId();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const alwaysOn = definition.kind === "ALWAYS_ON";
@@ -97,91 +90,114 @@ function ForkForm({
     },
   });
   return (
-    <form
-      className="flex min-w-0 flex-col gap-4 pb-4"
-      onSubmit={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        void form.handleSubmit();
+    <ResponsiveDialog
+      open
+      onOpenChange={(next) => {
+        if (!next && !fork.isPending) onDone();
       }}
+      title={t("access:fork.title", { name: definition.name })}
+      description={t("access:fork.description")}
+      footer={
+        <form.Subscribe selector={(state) => state.isSubmitting}>
+          {(isSubmitting) => (
+            <div className="flex min-w-0 flex-wrap justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="touch"
+                disabled={isSubmitting}
+                onClick={onDone}
+              >
+                {t("common:actions.cancel")}
+              </Button>
+              <Button type="submit" form={formId} size="touch" disabled={isSubmitting}>
+                {isSubmitting ? t("access:fork.forking") : t("access:fork.submit")}
+              </Button>
+            </div>
+          )}
+        </form.Subscribe>
+      }
     >
-      {alwaysOn ? (
-        <form.Field name="nodeId">
+      <form
+        id={formId}
+        className="flex min-w-0 flex-col gap-4 pb-4"
+        onSubmit={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void form.handleSubmit();
+        }}
+      >
+        {alwaysOn ? (
+          <form.Field name="nodeId">
+            {(field) => (
+              <div className="min-w-0 space-y-1.5">
+                <Label htmlFor="fork-node">{t("dashboard:runtime.form.node")}</Label>
+                {nodes.isPending ? (
+                  <Skeleton className="h-11 w-full" />
+                ) : nodes.isError ? (
+                  <p className="text-sm text-muted-foreground">{t("access:fork.nodesFailed")}</p>
+                ) : nodes.data.nodes.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">{t("access:fork.noNodes")}</p>
+                ) : (
+                  <NativeSelect
+                    id="fork-node"
+                    value={field.state.value}
+                    onChange={(event) => field.handleChange(event.target.value)}
+                  >
+                    <option value="">{t("dashboard:runtime.form.pickNode")}</option>
+                    {nodes.data.nodes.map((node) => (
+                      <option key={node.id} value={node.id}>
+                        {node.name ?? node.slug}
+                      </option>
+                    ))}
+                  </NativeSelect>
+                )}
+                <FieldErrors field={field} />
+              </div>
+            )}
+          </form.Field>
+        ) : (
+          <p className="text-sm text-muted-foreground">{t("access:fork.startableHint")}</p>
+        )}
+        <form.Field name="name">
           {(field) => (
             <div className="min-w-0 space-y-1.5">
-              <Label htmlFor="fork-node">{t("dashboard:runtime.form.node")}</Label>
-              {nodes.isPending ? (
-                <Skeleton className="h-11 w-full" />
-              ) : nodes.isError ? (
-                <p className="text-sm text-muted-foreground">{t("access:fork.nodesFailed")}</p>
-              ) : nodes.data.nodes.length === 0 ? (
-                <p className="text-sm text-muted-foreground">{t("access:fork.noNodes")}</p>
-              ) : (
-                <NativeSelect
-                  id="fork-node"
-                  value={field.state.value}
-                  onChange={(event) => field.handleChange(event.target.value)}
-                >
-                  <option value="">{t("dashboard:runtime.form.pickNode")}</option>
-                  {nodes.data.nodes.map((node) => (
-                    <option key={node.id} value={node.id}>
-                      {node.name ?? node.slug}
-                    </option>
-                  ))}
-                </NativeSelect>
-              )}
+              <Label htmlFor="fork-name">{t("dashboard:runtime.form.name")}</Label>
+              <Input
+                id="fork-name"
+                className="h-11"
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => {
+                  const previous = slugify(field.state.value);
+                  field.handleChange(event.target.value);
+                  const slug = form.getFieldValue("slug");
+                  if (slug === "" || slug === previous)
+                    form.setFieldValue("slug", slugify(event.target.value));
+                }}
+              />
               <FieldErrors field={field} />
             </div>
           )}
         </form.Field>
-      ) : (
-        <p className="text-sm text-muted-foreground">{t("access:fork.startableHint")}</p>
-      )}
-      <form.Field name="name">
-        {(field) => (
-          <div className="min-w-0 space-y-1.5">
-            <Label htmlFor="fork-name">{t("dashboard:runtime.form.name")}</Label>
-            <Input
-              id="fork-name"
-              className="h-11"
-              value={field.state.value}
-              onBlur={field.handleBlur}
-              onChange={(event) => {
-                const previous = slugify(field.state.value);
-                field.handleChange(event.target.value);
-                const slug = form.getFieldValue("slug");
-                if (slug === "" || slug === previous)
-                  form.setFieldValue("slug", slugify(event.target.value));
-              }}
-            />
-            <FieldErrors field={field} />
-          </div>
-        )}
-      </form.Field>
-      <form.Field name="slug">
-        {(field) => (
-          <div className="min-w-0 space-y-1.5">
-            <Label htmlFor="fork-slug">{t("dashboard:runtime.form.slug")}</Label>
-            <Input
-              id="fork-slug"
-              className="h-11 font-mono"
-              autoCapitalize="none"
-              spellCheck={false}
-              value={field.state.value}
-              onBlur={field.handleBlur}
-              onChange={(event) => field.handleChange(event.target.value)}
-            />
-            <FieldErrors field={field} />
-          </div>
-        )}
-      </form.Field>
-      <form.Subscribe selector={(state) => state.isSubmitting}>
-        {(isSubmitting) => (
-          <Button type="submit" size="touch" disabled={isSubmitting}>
-            {isSubmitting ? t("access:fork.forking") : t("access:fork.submit")}
-          </Button>
-        )}
-      </form.Subscribe>
-    </form>
+        <form.Field name="slug">
+          {(field) => (
+            <div className="min-w-0 space-y-1.5">
+              <Label htmlFor="fork-slug">{t("dashboard:runtime.form.slug")}</Label>
+              <Input
+                id="fork-slug"
+                className="h-11 font-mono"
+                autoCapitalize="none"
+                spellCheck={false}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
+      </form>
+    </ResponsiveDialog>
   );
 }

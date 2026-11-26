@@ -17,7 +17,7 @@ import { specIssueText } from "./spec-issue-text";
  * The Definition form's model of a runtime spec (`runtimeSpecSchema`). Text inputs hold
  * strings (numbers too, so an empty input means "not set"); `draftToSpec` turns a draft back
  * into a spec and copies the parts the form does not edit (address auth and headers, launch
- * secrets, interactive steps, embedding contracts, transcription profiles, the metrics reader)
+ * secrets, interactive steps, transcription profiles, the metrics reader)
  * from the spec the draft was made from, so a round trip through the form changes nothing.
  */
 
@@ -56,12 +56,23 @@ export type CommandDraft = Record<CommandField, string> & {
   /** The base spec's command entry this one came from (its interactive steps), or -1. */
   baseIndex: number;
 };
+/** A model's `embeddingContract` (embeddings runtimes): what its vectors mean. */
+export type EmbeddingDraft = {
+  model: string;
+  revision: string;
+  dimensions: string;
+  normalization: "none" | "l2";
+  vectorSpace: string;
+};
 export type ModelDraft = {
   id: string;
+  /** Whether the model states an embedding contract (`embedding` holds it). */
+  hasEmbedding: boolean;
+  embedding: EmbeddingDraft;
   /** Off: the node detects the capabilities. */
   declareCapabilities: boolean;
   capabilities: ModelCapabilityWire[];
-  /** The base spec's model this one came from (its contract and profile), or -1. */
+  /** The base spec's model this one came from (its transcription profile), or -1. */
   baseIndex: number;
 };
 export type SpecDraft = {
@@ -207,7 +218,13 @@ type LooseSpec = Partial<{
   api: RuntimeApiWire;
   engine: EngineWire;
   modelType: ModelTypeWire;
-  models: Array<Partial<{ id: string; capabilities: ModelCapabilityWire[] }>>;
+  models: Array<
+    Partial<{
+      id: string;
+      capabilities: ModelCapabilityWire[];
+      embeddingContract: Partial<Record<keyof EmbeddingDraft, string | number>>;
+    }>
+  >;
   address: Partial<{ baseUrl: string }>;
   launch: Partial<{
     management: "process" | "service";
@@ -287,6 +304,8 @@ export function specToDraft(input: unknown): SpecDraft {
     models: (spec.models ?? []).map((model, baseIndex) => ({
       baseIndex,
       id: model.id ?? "",
+      hasEmbedding: model.embeddingContract !== undefined,
+      embedding: embeddingDraft(model.embeddingContract) ?? newEmbeddingDraft(model.id ?? ""),
       declareCapabilities: model.capabilities !== undefined,
       capabilities: [...(model.capabilities ?? [])],
     })),
@@ -328,6 +347,38 @@ function num(value: string): number | undefined {
   if (text === "") return undefined;
   // Plain decimals only: `Number` would also read 0x10, 1e3 or 0b1.
   return /^-?\d+(?:\.\d+)?$/.test(text) ? Number(text) : Number.NaN;
+}
+
+function embeddingDraft(
+  contract: Partial<Record<keyof EmbeddingDraft, string | number>> | undefined,
+): EmbeddingDraft | null {
+  if (contract === undefined) return null;
+  const value = asObject(contract);
+  const text = (member: unknown) => {
+    if (member === undefined) return "";
+    if (typeof member !== "string" && typeof member !== "number")
+      throw new TypeError("embeddingContract member is not text");
+    return String(member);
+  };
+  const normalization = value.normalization === "none" ? "none" : "l2";
+  return {
+    model: text(value.model),
+    revision: text(value.revision),
+    dimensions: text(value.dimensions),
+    normalization,
+    vectorSpace: text(value.vectorSpace),
+  };
+}
+
+/** A new embedding contract for a model: its id as model and vector space, L2-normalized. */
+export function newEmbeddingDraft(modelId: string): EmbeddingDraft {
+  return {
+    model: modelId,
+    revision: "",
+    dimensions: "",
+    normalization: "l2",
+    vectorSpace: modelId,
+  };
 }
 
 /** Drops undefined members so the spec hashes and compares like the stored one. */
@@ -418,7 +469,15 @@ export function draftToSpec(draft: SpecDraft, base: Record<string, unknown>, kin
           compact({
             id: model.id,
             capabilities: model.declareCapabilities ? [...model.capabilities] : undefined,
-            embeddingContract: baseModels[model.baseIndex]?.embeddingContract,
+            embeddingContract: model.hasEmbedding
+              ? {
+                  model: model.embedding.model,
+                  revision: model.embedding.revision,
+                  dimensions: num(model.embedding.dimensions),
+                  normalization: model.embedding.normalization,
+                  vectorSpace: model.embedding.vectorSpace,
+                }
+              : undefined,
             transcription: baseModels[model.baseIndex]?.transcription,
           }),
         )
@@ -550,6 +609,13 @@ export function draftPathOf(path: ReadonlyArray<PropertyKey>): Array<string | nu
     if (typeof index !== "number") return ["models"];
     if (field === "id") return ["models", index, "id"];
     if (field === "capabilities") return ["models", index, "capabilities"];
+    if (field === "embeddingContract") {
+      const [, , leaf] = rest;
+      return typeof leaf === "string" &&
+        ["model", "revision", "dimensions", "normalization", "vectorSpace"].includes(leaf)
+        ? ["models", index, "embedding", leaf]
+        : ["models", index, "embedding", "model"];
+    }
     return null;
   }
   if (head === "address") return rest[0] === "baseUrl" ? ["baseUrl"] : null;

@@ -3,16 +3,10 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@ws-model-proxy/ui/components/dialog";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
+import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
+import { useId } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
@@ -36,20 +30,10 @@ export function NewProfileDialog({
   nodes: readonly NodeSummary[];
   lang: string;
 }) {
-  const { t } = useTranslation(["dashboard"]);
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90dvh] overflow-x-hidden overflow-y-auto overscroll-contain">
-        <DialogHeader>
-          <DialogTitle>{t("dashboard:profiles.new.title")}</DialogTitle>
-          <DialogDescription>{t("dashboard:profiles.new.description")}</DialogDescription>
-        </DialogHeader>
-        {open ? (
-          <NewProfileForm nodes={nodes} lang={lang} onClose={() => onOpenChange(false)} />
-        ) : null}
-      </DialogContent>
-    </Dialog>
-  );
+  // Mounted only while open, so every opening starts empty.
+  return open ? (
+    <NewProfileForm nodes={nodes} lang={lang} onClose={() => onOpenChange(false)} />
+  ) : null;
 }
 
 function NewProfileForm({
@@ -62,6 +46,7 @@ function NewProfileForm({
   onClose: () => void;
 }) {
   const { t } = useTranslation(["dashboard", "common"]);
+  const formId = useId();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const create = useMutation({
@@ -100,66 +85,86 @@ function NewProfileForm({
     },
   });
   return (
-    <form
-      className="space-y-3"
-      onSubmit={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        form.handleSubmit().catch(() => undefined);
+    <ResponsiveDialog
+      open
+      onOpenChange={(next) => {
+        if (!next && !create.isPending) onClose();
       }}
+      title={t("dashboard:profiles.new.title")}
+      description={t("dashboard:profiles.new.description")}
+      footer={
+        <div className="flex min-w-0 flex-wrap justify-end gap-2">
+          <Button type="button" variant="outline" size="touch" onClick={onClose}>
+            {t("common:actions.cancel")}
+          </Button>
+          <Button type="submit" form={formId} size="touch" disabled={create.isPending}>
+            {t("dashboard:profiles.new.create")}
+          </Button>
+        </div>
+      }
     >
-      <form.Field name="name">
-        {(field) => (
-          <div className="space-y-1.5">
-            <Label htmlFor="new-profile-name">{t("dashboard:profiles.editor.name")}</Label>
-            <Input
-              id="new-profile-name"
-              className="min-h-[44px]"
-              placeholder={t("dashboard:profiles.new.namePlaceholder")}
-              value={field.state.value}
-              onChange={(event) => field.handleChange(event.target.value)}
-            />
-            <FieldError errors={field.state.meta.errors} />
-          </div>
-        )}
-      </form.Field>
-      <form.Field name="nodeIds">
-        {(field) => (
-          <fieldset className="space-y-1">
-            <legend className="text-sm font-medium">
-              {t("dashboard:profiles.editor.nodesTitle")}
-            </legend>
-            {nodes.length === 0 ? (
-              <p className="text-sm text-muted-foreground">{t("dashboard:profiles.new.noNodes")}</p>
-            ) : (
-              nodes.map((node) => (
-                <label key={node.id} className="flex min-h-[44px] items-center gap-3">
-                  <Checkbox
-                    checked={field.state.value.includes(node.id)}
-                    onCheckedChange={(checked) =>
-                      field.handleChange(
-                        checked
-                          ? [...field.state.value, node.id]
-                          : field.state.value.filter((id) => id !== node.id),
-                      )
-                    }
-                  />
-                  {node.name ?? node.slug}
-                </label>
-              ))
-            )}
-            <FieldError errors={field.state.meta.errors} />
-          </fieldset>
-        )}
-      </form.Field>
-      <DialogFooter>
-        <Button type="button" variant="ghost" className="min-h-[44px]" onClick={onClose}>
-          {t("common:actions.cancel")}
-        </Button>
-        <Button type="submit" className="min-h-[44px]" disabled={create.isPending}>
-          {t("dashboard:profiles.new.create")}
-        </Button>
-      </DialogFooter>
-    </form>
+      <form
+        id={formId}
+        className="min-w-0 space-y-3 pb-4"
+        onSubmit={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          form.handleSubmit().catch(() => undefined);
+        }}
+      >
+        <form.Field name="name">
+          {(field) => (
+            <div className="space-y-1.5">
+              <Label htmlFor="new-profile-name">{t("dashboard:profiles.editor.name")}</Label>
+              <Input
+                id="new-profile-name"
+                className="min-h-[44px]"
+                placeholder={t("dashboard:profiles.new.namePlaceholder")}
+                value={field.state.value}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+              <FieldError errors={field.state.meta.errors} />
+            </div>
+          )}
+        </form.Field>
+        <form.Field name="nodeIds">
+          {(field) => (
+            <fieldset className="space-y-1">
+              <legend className="text-sm font-medium">
+                {t("dashboard:profiles.editor.nodesTitle")}
+              </legend>
+              {nodes.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  {t("dashboard:profiles.new.noNodes")}
+                </p>
+              ) : (
+                // Many nodes scroll in their own bounded box; the dialog never grows past the screen.
+                <div
+                  data-scroll-region=""
+                  className="max-h-56 min-w-0 overflow-x-hidden overflow-y-auto overscroll-contain rounded-md border px-2"
+                >
+                  {nodes.map((node) => (
+                    <label key={node.id} className="flex min-h-[44px] items-center gap-3">
+                      <Checkbox
+                        checked={field.state.value.includes(node.id)}
+                        onCheckedChange={(checked) =>
+                          field.handleChange(
+                            checked
+                              ? [...field.state.value, node.id]
+                              : field.state.value.filter((id) => id !== node.id),
+                          )
+                        }
+                      />
+                      {node.name ?? node.slug}
+                    </label>
+                  ))}
+                </div>
+              )}
+              <FieldError errors={field.state.meta.errors} />
+            </fieldset>
+          )}
+        </form.Field>
+      </form>
+    </ResponsiveDialog>
   );
 }

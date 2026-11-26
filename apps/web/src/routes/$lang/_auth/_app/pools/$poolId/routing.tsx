@@ -13,7 +13,6 @@ import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { Switch } from "@ws-model-proxy/ui/components/switch";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { useTranslation } from "react-i18next";
 import z from "zod";
@@ -21,6 +20,7 @@ import z from "zod";
 import { FieldErrors } from "@/components/field-errors";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
+import { SwitchRow } from "@/components/switch-row";
 import type { PoolView } from "@/lib/pool-ui";
 import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
@@ -208,24 +208,22 @@ function OwnHardwareCard({ pool }: { pool: PoolView }) {
         <CardDescription>{t("dashboard:pool.routing.ownHardwareHint")}</CardDescription>
       </CardHeader>
       <CardContent>
-        <div className="flex min-h-11 items-center gap-3">
-          <Switch
-            id="own-hardware"
-            checked={pool.routing.ownHardwareOnly}
-            disabled={set.isPending}
-            onCheckedChange={async (checked) => {
-              try {
-                await set.mutateAsync({ poolId: pool.id, enabled: checked === true });
-                await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
-                await queryClient.invalidateQueries({ queryKey: orpc.models.key() });
-                toast.success(t("dashboard:pool.saved"));
-              } catch (error) {
-                toast.error(refusalText(error));
-              }
-            }}
-          />
-          <Label htmlFor="own-hardware">{t("dashboard:pool.routing.ownHardwareLabel")}</Label>
-        </div>
+        <SwitchRow
+          id="own-hardware"
+          label={t("dashboard:pool.routing.ownHardwareLabel")}
+          checked={pool.routing.ownHardwareOnly}
+          disabled={set.isPending}
+          onChange={async (checked) => {
+            try {
+              await set.mutateAsync({ poolId: pool.id, enabled: checked });
+              await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
+              await queryClient.invalidateQueries({ queryKey: orpc.models.key() });
+              toast.success(t("dashboard:pool.saved"));
+            } catch (error) {
+              toast.error(refusalText(error));
+            }
+          }}
+        />
       </CardContent>
     </Card>
   );

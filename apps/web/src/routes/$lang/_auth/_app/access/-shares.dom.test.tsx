@@ -44,14 +44,17 @@ vi.mock("@ws-model-proxy/ui/components/responsive-dialog", () => ({
     open,
     title,
     children,
+    footer,
   }: {
     open: boolean;
     title: string;
     children: ReactNode;
+    footer?: ReactNode;
   }) =>
     open ? (
       <div role="dialog" aria-label={title}>
         {children}
+        {footer}
       </div>
     ) : null,
 }));
@@ -140,6 +143,7 @@ vi.mock("@/utils/orpc", () => {
   };
 });
 
+import { pickSelectOption } from "@/lib/pick-select-option";
 import { Route } from "./shares";
 
 async function mount() {
@@ -190,7 +194,8 @@ describe("Access → Shares: runtime definitions", () => {
     fireEvent.click(screen.getByRole("button", { name: "access:shares.create" }));
     const dialog = await screen.findByRole("dialog", { name: "access:shares.createTitle" });
     fireEvent.click(within(dialog).getByRole("button", { name: "access:shares.whatRuntime" }));
-    fireEvent.click(await within(dialog).findByRole("radio", { name: "Qwen" }));
+    // A select (a long list never grows the dialog) that shows the runtime's name.
+    await pickSelectOption(await within(dialog).findByLabelText("access:shares.runtime"), "Qwen");
     // The pool-only settings are gone for a runtime definition.
     expect(within(dialog).queryByText("access:shares.canContribute")).toBeNull();
     fireEvent.change(within(dialog).getByLabelText("access:shares.email"), {

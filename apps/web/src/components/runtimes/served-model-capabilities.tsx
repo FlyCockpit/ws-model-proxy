@@ -5,7 +5,7 @@ import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
@@ -80,14 +80,7 @@ export function ServedModelCapabilities({ model }: { model: ServedModel }) {
       <Button type="button" variant="ghost" size="touch" onClick={() => setOpen(true)}>
         {t("dashboard:runtime.capabilities.change")}
       </Button>
-      <ResponsiveDialog
-        open={open}
-        onOpenChange={setOpen}
-        title={t("dashboard:runtime.capabilities.dialogTitle", { model: model.upstreamModelId })}
-        description={t("dashboard:runtime.capabilities.dialogHint")}
-      >
-        {open ? <CapabilityForm model={model} onDone={() => setOpen(false)} /> : null}
-      </ResponsiveDialog>
+      {open ? <CapabilityForm model={model} onDone={() => setOpen(false)} /> : null}
     </div>
   );
 }
@@ -98,8 +91,10 @@ const schema = z.object({
   reasoning: z.enum(DECLARATIONS),
 });
 
+/** The "Capabilities" dialog, mounted only while open; its actions stay pinned at the bottom. */
 function CapabilityForm({ model, onDone }: { model: ServedModel; onDone: () => void }) {
   const { t } = useTranslation(["dashboard", "common"]);
+  const formId = useId();
   const queryClient = useQueryClient();
   const set = useMutation({
     ...orpc.runtimes.models.setCapabilities.mutationOptions(),
@@ -142,78 +137,107 @@ function CapabilityForm({ model, onDone }: { model: ServedModel; onDone: () => v
     label: t(`dashboard:runtime.capabilities.declaration.${value}`),
   }));
   return (
-    <form
-      className="flex min-w-0 flex-col gap-4 pb-4"
-      onSubmit={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        form.handleSubmit();
+    <ResponsiveDialog
+      open
+      onOpenChange={(next) => {
+        if (!next && !set.isPending) onDone();
       }}
-    >
-      <p className="text-sm text-muted-foreground">
-        {t("dashboard:runtime.capabilities.detectedList", {
-          list:
-            model.detectedCapabilities
-              .map((capability) => t(`dashboard:runtime.capabilities.values.${toWire(capability)}`))
-              .join(", ") || t("dashboard:runtime.capabilities.none"),
-        })}
-      </p>
-      <form.Field name="capabilities">
-        {(field) => (
-          <CapabilityChecks
-            idBase={`capability-${model.id}`}
-            value={field.state.value}
-            onChange={field.handleChange}
-          />
-        )}
-      </form.Field>
-      {(["tools", "reasoning"] as const).map((name) => (
-        <form.Field key={name} name={name}>
-          {(field) => (
-            <div className="flex min-w-0 flex-col gap-1">
-              <span className="text-sm font-medium">
-                {t(`dashboard:runtime.capabilities.${name}.label`)}
-              </span>
-              <span className="text-sm text-muted-foreground">
-                {t(`dashboard:runtime.capabilities.${name}.hint`)}
-              </span>
-              <SegmentedControl
-                value={field.state.value}
-                onChange={field.handleChange}
-                items={declarationItems}
-                ariaLabel={t(`dashboard:runtime.capabilities.${name}.label`)}
-              />
-            </div>
-          )}
-        </form.Field>
-      ))}
-      <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
-        {model.capabilitiesOverridden ? (
-          <Button
-            type="button"
-            variant="outline"
-            size="touch"
-            disabled={set.isPending}
-            onClick={() =>
-              // Keep any Tools / Reasoning edits made in this dialog.
-              save({
-                capabilities: null,
-                tools: fromDeclaration(form.state.values.tools),
-                reasoning: fromDeclaration(form.state.values.reasoning),
-              })
-            }
-          >
-            {t("dashboard:runtime.capabilities.useDetected")}
-          </Button>
-        ) : null}
-        <form.Subscribe selector={(state) => state.isSubmitting}>
-          {(submitting) => (
-            <Button type="submit" size="touch" disabled={submitting || set.isPending}>
-              {submitting ? t("common:actions.saving") : t("common:actions.save")}
+      title={t("dashboard:runtime.capabilities.dialogTitle", { model: model.upstreamModelId })}
+      description={t("dashboard:runtime.capabilities.dialogHint")}
+      footer={
+        <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:justify-end">
+          {model.capabilitiesOverridden ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="touch"
+              disabled={set.isPending}
+              onClick={() =>
+                // Keep any Tools / Reasoning edits made in this dialog.
+                save({
+                  capabilities: null,
+                  tools: fromDeclaration(form.state.values.tools),
+                  reasoning: fromDeclaration(form.state.values.reasoning),
+                })
+              }
+            >
+              {t("dashboard:runtime.capabilities.useDetected")}
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              variant="outline"
+              size="touch"
+              disabled={set.isPending}
+              onClick={onDone}
+            >
+              {t("common:actions.cancel")}
             </Button>
           )}
-        </form.Subscribe>
-      </div>
-    </form>
+          <form.Subscribe selector={(state) => state.isSubmitting}>
+            {(submitting) => (
+              <Button
+                type="submit"
+                form={formId}
+                size="touch"
+                disabled={submitting || set.isPending}
+              >
+                {submitting ? t("common:actions.saving") : t("common:actions.save")}
+              </Button>
+            )}
+          </form.Subscribe>
+        </div>
+      }
+    >
+      <form
+        id={formId}
+        className="flex min-w-0 flex-col gap-4 pb-4"
+        onSubmit={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          form.handleSubmit();
+        }}
+      >
+        <p className="text-sm text-muted-foreground">
+          {t("dashboard:runtime.capabilities.detectedList", {
+            list:
+              model.detectedCapabilities
+                .map((capability) =>
+                  t(`dashboard:runtime.capabilities.values.${toWire(capability)}`),
+                )
+                .join(", ") || t("dashboard:runtime.capabilities.none"),
+          })}
+        </p>
+        <form.Field name="capabilities">
+          {(field) => (
+            <CapabilityChecks
+              idBase={`capability-${model.id}`}
+              value={field.state.value}
+              onChange={field.handleChange}
+            />
+          )}
+        </form.Field>
+        {(["tools", "reasoning"] as const).map((name) => (
+          <form.Field key={name} name={name}>
+            {(field) => (
+              <div className="flex min-w-0 flex-col gap-1">
+                <span className="text-sm font-medium">
+                  {t(`dashboard:runtime.capabilities.${name}.label`)}
+                </span>
+                <span className="text-sm text-muted-foreground">
+                  {t(`dashboard:runtime.capabilities.${name}.hint`)}
+                </span>
+                <SegmentedControl
+                  value={field.state.value}
+                  onChange={field.handleChange}
+                  items={declarationItems}
+                  ariaLabel={t(`dashboard:runtime.capabilities.${name}.label`)}
+                />
+              </div>
+            )}
+          </form.Field>
+        ))}
+      </form>
+    </ResponsiveDialog>
   );
 }

@@ -26,13 +26,6 @@ import {
 } from "@ws-model-proxy/ui/components/dropdown-menu";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@ws-model-proxy/ui/components/select";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
@@ -43,6 +36,7 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
+import { LabelledSelect } from "@/components/labelled-select";
 import { SegmentedControl } from "@/components/segmented-control";
 import { useClientDateText } from "@/hooks/use-client-date-text";
 import { useCopyFeedback } from "@/hooks/use-copy-feedback";
@@ -608,6 +602,7 @@ function InviteUserDialog({
                   id={field.name}
                   name={field.name}
                   autoComplete="name"
+                  className="min-h-11"
                   value={field.state.value}
                   onBlur={field.handleBlur}
                   onChange={(e) => field.handleChange(e.target.value)}
@@ -628,6 +623,7 @@ function InviteUserDialog({
                   inputMode="email"
                   autoComplete="email"
                   placeholder={t("admin:users.emailPlaceholder")}
+                  className="min-h-11"
                   value={field.state.value}
                   onBlur={field.handleBlur}
                   onChange={(e) => field.handleChange(e.target.value)}
@@ -641,18 +637,15 @@ function InviteUserDialog({
             {(field) => (
               <div className="space-y-1.5">
                 <Label htmlFor={field.name}>{t("admin:users.roleLabel")}</Label>
-                <Select
+                <LabelledSelect
+                  id={field.name}
                   value={field.state.value}
-                  onValueChange={(v) => field.handleChange(v as "user" | "admin")}
-                >
-                  <SelectTrigger id={field.name} className="w-full min-h-[44px]">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="user">{t("admin:users.roleUser")}</SelectItem>
-                    <SelectItem value="admin">{t("admin:users.roleAdmin")}</SelectItem>
-                  </SelectContent>
-                </Select>
+                  onValueChange={field.handleChange}
+                  options={[
+                    { value: "user", label: t("admin:users.roleUser") },
+                    { value: "admin", label: t("admin:users.roleAdmin") },
+                  ]}
+                />
                 <FieldErrors field={field} />
               </div>
             )}

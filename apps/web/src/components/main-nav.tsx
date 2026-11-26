@@ -2,20 +2,19 @@ import { Link, useParams } from "@tanstack/react-router";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useTranslation } from "react-i18next";
 
-import { useAuthSession } from "@/hooks/use-auth-session";
+import { useShellIdentity } from "@/hooks/use-shell-identity";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { getNavItems, toLangRoute } from "@/lib/nav-items";
 
 export function MainNav() {
   const params = useParams({ strict: false });
   const lang = isSupportedLocale(params.lang) ? params.lang : DEFAULT_LOCALE;
-  const { state } = useAuthSession();
-  const session = state.session;
+  const identity = useShellIdentity();
   const { t } = useTranslation("nav");
   const items = getNavItems({
     placement: "desktop",
-    isAuthenticated: Boolean(session),
-    role: session?.user.role,
+    isAuthenticated: identity.signedIn,
+    role: identity.role,
   });
 
   return (

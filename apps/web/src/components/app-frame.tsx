@@ -3,11 +3,12 @@ import { Button } from "@ws-model-proxy/ui/components/button";
 import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { PanelLeft } from "lucide-react";
+import { createContext, type ReactNode, useContext } from "react";
 import { useTranslation } from "react-i18next";
 
 import { NeedsYouBadge } from "@/components/needs-you-badge";
-import { useAuthSession } from "@/hooks/use-auth-session";
 import { useNeedsYouCount } from "@/hooks/use-needs-you-count";
+import { useShellIdentity } from "@/hooks/use-shell-identity";
 import { type AppNavItem, getNavItems, toLangRoute } from "@/lib/nav-items";
 import { useAppChrome } from "@/stores/app-chrome";
 import { useUiPreferences } from "@/stores/ui-preferences";
@@ -18,18 +19,29 @@ import { useUiPreferences } from "@/stores/ui-preferences";
  * More sheet are the only navigation. The root shell owns safe areas and page scroll. Terminals
  * carries the Needs-you badge (spec §7.4).
  */
-export function AppFrame({ lang }: { lang: string }) {
+/**
+ * `children` stand in for the page (a loading skeleton while the layout above checks something),
+ * so the sidebar and page frame are on screen from the first frame either way.
+ */
+const InAppFrame = createContext(false);
+
+/** Whether this renders inside the app frame (a page's own pending state must not draw another). */
+export function useInAppFrame(): boolean {
+  return useContext(InAppFrame);
+}
+
+export function AppFrame({ lang, children }: { lang: string; children?: ReactNode }) {
   const { t } = useTranslation(["dashboard"]);
-  const { state } = useAuthSession();
+  const identity = useShellIdentity();
   const sidebarCollapsed = useUiPreferences((prefs) => prefs.sidebarCollapsed);
   const toggleSidebar = useUiPreferences((prefs) => prefs.toggleSidebar);
   // A page that took the whole viewport (the maximized terminal): no sidebar and no page padding.
   const chromeHidden = useAppChrome((state) => state.hidden);
-  const needsYou = useNeedsYouCount(Boolean(state.session));
+  const needsYou = useNeedsYouCount(identity.signedIn);
   const items = getNavItems({
     placement: "sidebar",
-    isAuthenticated: Boolean(state.session),
-    role: state.session?.user.role,
+    isAuthenticated: identity.signedIn,
+    role: identity.role,
   });
   const groups = (["main", "footer"] as const).map((id) => ({
     id,
@@ -40,74 +52,76 @@ export function AppFrame({ lang }: { lang: string }) {
     : t("dashboard:nav.collapseSidebar");
 
   return (
-    <div className="flex min-h-full min-w-0 flex-col md:flex-row">
-      <aside
-        aria-label={t("dashboard:nav.ariaLabel")}
-        data-app-nav="sidebar"
-        data-collapsed={sidebarCollapsed ? "true" : "false"}
-        className={cn(
-          "hidden overflow-x-hidden overflow-y-auto overscroll-contain border-sidebar-border bg-sidebar md:sticky md:top-0 md:h-[100cqh] md:max-h-[100cqh] md:shrink-0 md:flex-col md:self-start md:border-e",
-          !chromeHidden && "md:flex",
-          sidebarCollapsed ? "w-16" : "w-60",
-        )}
-      >
-        <div className={cn("flex p-2", sidebarCollapsed ? "justify-center" : "justify-end")}>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-touch"
-            aria-pressed={sidebarCollapsed}
-            aria-label={sidebarLabel}
-            onClick={toggleSidebar}
-          >
-            <PanelLeft aria-hidden="true" />
-          </Button>
-        </div>
-        <nav
-          className="flex flex-1 flex-col gap-1 px-2 pb-4"
+    <InAppFrame.Provider value={true}>
+      <div className="flex min-h-full min-w-0 flex-col md:flex-row">
+        <aside
           aria-label={t("dashboard:nav.ariaLabel")}
+          data-app-nav="sidebar"
+          data-collapsed={sidebarCollapsed ? "true" : "false"}
+          className={cn(
+            "hidden overflow-x-hidden overflow-y-auto overscroll-contain border-sidebar-border bg-sidebar md:sticky md:top-0 md:h-[100cqh] md:max-h-[100cqh] md:shrink-0 md:flex-col md:self-start md:border-e",
+            !chromeHidden && "md:flex",
+            sidebarCollapsed ? "w-16" : "w-60",
+          )}
         >
-          {groups.map((group) => (
-            <div
-              key={group.id}
-              className={cn(
-                "flex flex-col gap-1",
-                // Collapsed: the 44px links centre on the rail, the line the toggle above sits on.
-                sidebarCollapsed && "items-center",
-                group.id === "footer" && "mt-auto border-t pt-2",
-              )}
+          <div className={cn("flex p-2", sidebarCollapsed ? "justify-center" : "justify-end")}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-touch"
+              aria-pressed={sidebarCollapsed}
+              aria-label={sidebarLabel}
+              onClick={toggleSidebar}
             >
-              {group.items.map((item) => (
-                <SidebarLink
-                  key={item.id}
-                  item={item}
-                  lang={lang}
-                  collapsed={sidebarCollapsed}
-                  badge={item.id === "terminals" ? needsYou : 0}
-                />
-              ))}
-            </div>
-          ))}
-        </nav>
-      </aside>
+              <PanelLeft aria-hidden="true" />
+            </Button>
+          </div>
+          <nav
+            className="flex flex-1 flex-col gap-1 px-2 pb-4"
+            aria-label={t("dashboard:nav.ariaLabel")}
+          >
+            {groups.map((group) => (
+              <div
+                key={group.id}
+                className={cn(
+                  "flex flex-col gap-1",
+                  // Collapsed: the 44px links centre on the rail, the line the toggle above sits on.
+                  sidebarCollapsed && "items-center",
+                  group.id === "footer" && "mt-auto border-t pt-2",
+                )}
+              >
+                {group.items.map((item) => (
+                  <SidebarLink
+                    key={item.id}
+                    item={item}
+                    lang={lang}
+                    collapsed={sidebarCollapsed}
+                    badge={item.id === "terminals" ? needsYou : 0}
+                  />
+                ))}
+              </div>
+            ))}
+          </nav>
+        </aside>
 
-      <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
-        {/* The frame owns the page's geometry. --app-page-height is the height a page sees at
+        <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
+          {/* The frame owns the page's geometry. --app-page-height is the height a page sees at
             once: main (a size container) less this padding and whatever the software keyboard
             covers. A page that must fit the screen (Terminals) sizes to it and lets flex divide
             it, rather than copying these numbers. */}
-        <div
-          className={cn(
-            "flex min-h-0 min-w-0 flex-col py-(--app-page-pad-y) [--app-page-height:calc(100cqh-2*var(--app-page-pad-y)-var(--keyboard-inset,0px))]",
-            chromeHidden
-              ? "w-full px-0 [--app-page-pad-y:0px]"
-              : "container mx-auto max-w-6xl px-4 [--app-page-pad-y:1rem] md:[--app-page-pad-y:1.5rem]",
-          )}
-        >
-          <Outlet />
+          <div
+            className={cn(
+              "flex min-h-0 min-w-0 flex-col py-(--app-page-pad-y) [--app-page-height:calc(100cqh-2*var(--app-page-pad-y)-var(--keyboard-inset,0px))]",
+              chromeHidden
+                ? "w-full px-0 [--app-page-pad-y:0px]"
+                : "container mx-auto max-w-6xl px-4 [--app-page-pad-y:1rem] md:[--app-page-pad-y:1.5rem]",
+            )}
+          >
+            {children ?? <Outlet />}
+          </div>
         </div>
       </div>
-    </div>
+    </InAppFrame.Provider>
   );
 }
 
