@@ -159,9 +159,15 @@ runner; `prisma migrate resolve` only in the documented recovery steps, run by t
 - Use lucide icons where an existing icon fits.
 - The root shell grid has one explicit `grid-cols-[minmax(0,1fr)]` column, so
   header or page min-content can never widen the viewport. Shell `<main>` keeps
-  `overscroll-contain` and `[scrollbar-gutter:stable]` (no gutter while a
-  terminal is maximized), `id="main-content"`, `tabIndex={-1}`, and a localized
-  skip-to-content link before the grid.
+  `overscroll-contain`, `id="main-content"`, `tabIndex={-1}`, and a localized
+  skip-to-content link before the grid. It reserves no scrollbar gutter, so
+  sticky sub-navs and banners inside it reach the viewport edge
+  (docs/ui.md § Shell rules; `pnpm policy:web-conventions` G8).
+- Every surface follows the app theme (the stored choice, else the OS, as the
+  `.dark` class): theme tokens and `dark:` variants, never a literal colour or a
+  `prefers-color-scheme` query outside `packages/ui/src/styles/globals.css`.
+  A deliberate fixed colour carries a `theme-exempt: <reason>` comment
+  (docs/ui.md § Shell rules; G9). Toasts are a popover surface.
 - Do not add page view transitions (`defaultViewTransition`, `viewTransitionName`):
   the old and new page must never be on screen together.
 - A confirmed change or loss of the signed-in identity does a full document load

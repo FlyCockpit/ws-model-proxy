@@ -131,6 +131,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         // Select text: the live terminal takes no focus, keys, or mouse until it ends.
         inert={selectionText !== null}
         className={cn(
+          // theme-exempt: the terminal is dark in both site themes (lib/terminal-theme.ts)
           "h-full min-h-0 w-full min-w-0 [&_.xterm-viewport]:[scrollbar-color:#3a414b_transparent]",
           // Following: the PTY-sized terminal sits top-left in a two-axis
           // scroll box, and the area it does not cover is shaded. This box cannot be split into

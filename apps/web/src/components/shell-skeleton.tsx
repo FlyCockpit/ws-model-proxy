@@ -74,7 +74,7 @@ export function ShellSkeleton() {
           id="main-content"
           tabIndex={-1}
           aria-busy="true"
-          className="relative min-h-0 min-w-0 overflow-x-clip overflow-y-auto overscroll-contain outline-none [container-type:size] [scrollbar-gutter:stable]"
+          className="relative min-h-0 min-w-0 overflow-x-clip overflow-y-auto overscroll-contain outline-none [container-type:size]"
         >
           <div className="flex min-h-full min-w-0 flex-col md:flex-row">
             {parts.sidebar ? (

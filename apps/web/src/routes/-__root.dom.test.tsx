@@ -65,14 +65,11 @@ describe("root shell", () => {
     render(<Component />);
     const main = screen.getByRole("main");
     expect(main.parentElement?.classList.contains("grid-cols-[minmax(0,1fr)]")).toBe(true);
-    for (const token of [
-      "overflow-y-auto",
-      "overflow-x-clip",
-      "overscroll-contain",
-      "[scrollbar-gutter:stable]",
-    ]) {
+    for (const token of ["overflow-y-auto", "overflow-x-clip", "overscroll-contain"]) {
       expect(main.classList.contains(token)).toBe(true);
     }
+    // No reserved gutter: full-bleed rules inside main reach the viewport edge (docs/ui.md § Shell rules).
+    expect(main.className).not.toContain("scrollbar-gutter");
     expect(shell.identityHook).toHaveBeenCalledOnce();
   });
   it("puts an accessible skip link before the grid and makes main focusable", () => {
@@ -89,7 +86,7 @@ describe("root shell", () => {
     shell.hidden = true;
     render(<Component />);
     const main = screen.getByRole("main");
-    expect(main.classList.contains("[scrollbar-gutter:stable]")).toBe(false);
+    expect(main.className).not.toContain("scrollbar-gutter");
     expect(main.parentElement?.classList.contains("grid-rows-[1fr]")).toBe(true);
     expect(screen.queryByText("Header")).toBeNull();
   });

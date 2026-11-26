@@ -60,3 +60,79 @@ Five more rules, from the apps' passes (the template's § Edge lines has the ful
 - **Frame bands keep the frame line.** The header, and any banner added above the page (none ships
   today), sit 16px inside the frame at every width; they are not re-aligned to a narrower page
   container below them.
+
+## Shell rules
+
+Set 11-25 by the theme audit, from the template's `patterns/design-system.md` § Shell rules, adapted
+to this app's single root shell. Four rules every page meets, in both themes and at every width.
+`pnpm policy:web-conventions` (in `pnpm check:ci`) enforces what a static check can (G8 and G9 in
+`scripts/check-web-conventions.ts`); `apps/web/src/routes/-__root.dom.test.tsx` and
+`apps/web/src/lib/theme-contrast.test.ts` pin the markup and the tokens; `pnpm check:layout`
+measures the geometry in a browser (§ Layout check).
+
+1. **Footers sit at the bottom of a short page.** This app has no site footer: the root shell
+   (`apps/web/src/routes/__root.tsx`) is a `h-svh` grid whose `<main>` always reaches the viewport
+   bottom, and phones get the BottomNav. No route renders a site `<footer>` (G8); a `<footer>` that
+   belongs to an `<article>`, `<section>` or similar sectioning element stays inside it. If the app
+   ever gets a footer, it is one shared component that the shell renders inside `<main>`, as the
+   last box of a `flex min-h-full flex-col` column whose content grows (`flex-1`): no
+   `position: fixed`, no second scroller.
+2. **Full-bleed dividers span the viewport.** The header's `<hr>`, sticky sub-navs (the admin
+   section nav) and full-width banners reach from 0 to the viewport's right edge at every width. On
+   a page that scrolls, rules inside `<main>` meet its visible scrollbar, which sits at that edge, as
+   on any scrolling page. That is why `<main>` (and the pending `ShellSkeleton`'s copy of it)
+   reserves no scrollbar gutter (G8 flags one in its className, its inline style, or any CSS rule
+   that styles it, through `:is()`/`:where()` and nesting): with classic scrollbars (Windows, Linux) a stable gutter is an
+   empty 15px strip that every rule inside the scroller stops short of, even when nothing scrolls.
+   The cost is that centred content moves by half a scrollbar when a page grows past the viewport
+   on those platforms; overlays don't cause it, because they lock the document (vaul, Base UI), not
+   `<main>`. Nested panes may still reserve a gutter.
+3. **No surface ignores the theme.** The theme is the stored choice, else the OS, applied as the
+   `.dark` class before first paint (`packages/config/src/theme-init.ts`). Every surface (toasts,
+   banners, popovers, menus) uses the tokens in `packages/ui/src/styles/globals.css` and `dark:`
+   variants, never a `prefers-color-scheme` query or a literal colour (G9: hex, `rgb()`, `oklch()`
+   and the like anywhere in CSS, inline styles and Tailwind arbitrary values or properties such as
+   `shadow-[0_0_4px_#fff]` or `[scrollbar-color:#3a414b_transparent]`, and the CSS named colours
+   like `white` in a colour property or colour utility); a
+   new colour becomes a token there. Tailwind palette utilities paired with a `dark:` variant
+   (`text-amber-700 dark:text-amber-300`) follow the theme and are not flagged. A state's
+   `-foreground` ink is the text on its solid `bg-state-*` fill only; text on a page or card uses
+   the state ink itself (`text-state-warning`). A colour that must stay fixed (a QR code that has to scan dark on white, a mask
+   gradient's opacity) carries a `theme-exempt: <reason>` comment on the line above it, on its
+   line, or inside the flagged class or style value; the reason is required and the comment
+   silences that G9 finding only. `url(#id)` references are not colours. Toasts are a popover
+   surface: `globals.css` fills sileo's pill with `--popover`, writes the title and description in
+   `--popover-foreground` and maps sileo's state colours to `--state-*`, `--destructive` and
+   `--primary`, and the Toaster (`packages/ui/src/components/sileo.tsx`) gets no `theme` prop
+   (sileo's themes invert the page). Text and state colours reach 4.5:1 on the surface they sit on
+   in both themes. The inline `html` background the init script paints on the first frame gives way
+   to `--background` once the stylesheet applies, so an in-app toggle repaints it.
+4. **Every route renders inside the shell, the 404 included.** The root route renders the shell
+   (header, `<main>`, BottomNav) around every match, so the router's `defaultNotFoundComponent`
+   (`components/not-found.tsx`) and a `notFound()` thrown by a route (the admin gate, the MCP pages
+   when MCP is off) show the header with its language and theme controls; an unknown locale is
+   redirected to the default one first (`$lang.tsx`). Do not add a route-level
+   `notFoundComponent` that draws its own frame.
+
+## Layout check
+
+`pnpm check:layout --url <dev server>` measures § Shell rules in a real browser through
+`agent-browser` (session `check-layout`; pass `--no-sandbox` on headless Ubuntu). With
+`CHECK_LAYOUT_PASSWORD` set and `--admin <email>` (an admin without 2FA) it also signs in. At
+390×844, 1280×800, 1440×1600 and a 390×300 viewport where every page scrolls it opens the sign-in
+page, a 404 and, signed in, a 404 and the admin users page, and fails when:
+
+- the document scrolls (only `<main id="main-content">` may), or a page has no shell header;
+- `<main>` gives up width to a scrollbar on a page that does not scroll (a reserved gutter), or a
+  full-width rule (the header `<hr>`, the admin sub-nav's `border-b`) stops short of either
+  viewport edge (inside a scrolling `<main>`, of its visible scrollbar);
+- a toast (a failed sign-in; signed in, also a failed query's toast with its Retry action, at rest
+  and hovered, produced by aborting every oRPC call), with the stored theme light and then dark and
+  the OS set to the other one, renders in the OS theme, is not filled with the theme's popover
+  colour, or its title, badge or action label (on its own tint) is below 4.5:1 on it.
+
+Run it after changing the root shell, the header, page-level chrome or the toast styling. Headless
+Chromium on Linux draws classic scrollbars, which is what exposes a reserved gutter (overlay
+scrollbars on macOS hide it). It is not part of CI: it needs a browser and a running app. The
+structure it measures is pinned in CI by the root shell test and G8/G9; the judging logic has unit
+tests (`pnpm check:layout:test`, in `pnpm check:ci`).

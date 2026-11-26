@@ -78,7 +78,7 @@ export function NodeCard({
           </dd>
         </dl>
         {node.needsYou > 0 ? (
-          <p className="text-xs font-medium text-state-warning-foreground dark:text-state-warning">
+          <p className="text-xs font-medium text-state-warning">
             {t("dashboard:nodes.card.needsYou", { count: node.needsYou })}
           </p>
         ) : null}

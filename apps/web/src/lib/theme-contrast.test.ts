@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -21,12 +21,33 @@ function block(selector: string): string {
   return css.slice(start, css.indexOf("\n}", start));
 }
 
-function token(scope: string, name: string): Rgb {
-  const match = new RegExp(`--${name}:\\s*oklch\\(([\\d.]+) ([\\d.]+) ([\\d.]+)\\)`).exec(
-    block(scope),
-  );
+function token(scope: string, name: string, seen: string[] = []): Rgb {
+  const source = block(scope);
+  // An alias to another token of the same scope (`--state-loading: var(--muted-foreground)`).
+  const aliased = new RegExp(`--${name}:\\s*var\\(--([\\w-]+)\\);`).exec(source);
+  if (aliased?.[1] && !seen.includes(name)) return token(scope, aliased[1], [...seen, name]);
+  const match = new RegExp(`--${name}:\\s*oklch\\(([\\d.]+) ([\\d.]+) ([\\d.]+)\\)`).exec(source);
   if (!match) throw new Error(`--${name} is not an oklch() literal in ${scope}`);
   return oklchToSrgb(Number(match[1]), Number(match[2]), Number(match[3]));
+}
+
+/** The declarations of the unlayered rule whose selector is exactly `selector`. */
+function declarations(selector: string): Map<string, string> {
+  const start = css.indexOf(`\n${selector} {\n`);
+  if (start === -1) throw new Error(`Missing rule ${selector}`);
+  const body = css.slice(css.indexOf("{", start) + 1, css.indexOf("\n}", start));
+  const withoutComments = body.replace(/\/\*[\s\S]*?\*\//g, "");
+  return new Map(
+    [...withoutComments.matchAll(/([-\w]+)\s*:\s*([^;]+);/g)].map((m) => [
+      m[1] ?? "",
+      (m[2] ?? "").trim(),
+    ]),
+  );
+}
+
+/** The token a `var(--name)` value names. */
+function alias(value: string | undefined): string | undefined {
+  return /^var\(--([\w-]+)\)$/.exec(value ?? "")?.[1];
 }
 
 function oklchToSrgb(l: number, c: number, hue: number): Rgb {
@@ -135,6 +156,94 @@ describe("theme token contrast (WCAG AA)", () => {
     }
   });
 
+  it.each([":root", ".dark"])(
+    "%s state inks reach 4.5:1 on background, card and popover",
+    (scope) => {
+      // Badges, alerts and toasts write in these colours.
+      for (const ink of ["state-success", "state-warning", "state-info", "state-loading"]) {
+        for (const surface of ["background", "card", "popover"]) {
+          expect(
+            contrast(token(scope, ink), token(scope, surface)),
+            `${scope} ${ink} on ${surface}`,
+          ).toBeGreaterThanOrEqual(AA);
+        }
+      }
+    },
+  );
+
+  it.each([":root", ".dark"])("%s toasts are a popover surface with 4.5:1 inks", (scope) => {
+    // sileo's own palette inverts the theme; globals.css repaints it from the
+    // tokens. Every state ink it maps and its text colour must hold up on the
+    // fill it maps. See docs/ui.md § Shell rules
+    const fill = alias(
+      declarations(":root [data-sileo-viewport] :is([data-sileo-pill], [data-sileo-body])").get(
+        "fill",
+      ),
+    );
+    expect(fill).toBe("popover");
+    const surface = token(scope, "popover");
+    const viewport = declarations(":root [data-sileo-viewport]");
+    for (const state of ["success", "loading", "error", "warning", "info", "action"]) {
+      const ink = alias(viewport.get(`--sileo-state-${state}`));
+      expect(ink, `--sileo-state-${state} maps to a token`).toBeDefined();
+      expect(
+        contrast(token(scope, ink ?? ""), surface),
+        `${scope} toast ${state} (${ink}) on popover`,
+      ).toBeGreaterThanOrEqual(AA);
+    }
+    // The badge ink sits on the pill itself (contrast above), not on a tint.
+    expect(
+      declarations(":root [data-sileo-viewport] [data-sileo-badge][data-state]").get(
+        "--sileo-tone-bg",
+      ),
+    ).toBe("transparent");
+    for (const selector of [
+      ":root [data-sileo-viewport] [data-sileo-title][data-state]",
+      ":root [data-sileo-viewport] [data-sileo-description]",
+    ]) {
+      expect(alias(declarations(selector).get("color")), selector).toBe("popover-foreground");
+    }
+    expect(contrast(token(scope, "popover-foreground"), surface)).toBeGreaterThanOrEqual(AA);
+    // The action button: its label on its own tint of that label colour, at rest and hovered.
+    const button = declarations(":root [data-sileo-viewport] [data-sileo-button][data-state]");
+    expect(alias(button.get("--sileo-btn-color"))).toBe("popover-foreground");
+    for (const property of ["--sileo-btn-bg", "--sileo-btn-bg-hover"]) {
+      const tint = /^color-mix\(in oklch, var\(--([\w-]+)\) (\d+)%, transparent\)$/.exec(
+        button.get(property) ?? "",
+      );
+      expect(tint?.[1], property).toBe("popover-foreground");
+      const label = token(scope, "popover-foreground");
+      const fill = over(label, Number(tint?.[2]) / 100, surface);
+      expect(contrast(label, fill), `${scope} action label on ${property}`).toBeGreaterThanOrEqual(
+        AA,
+      );
+    }
+  });
+
+  it("writes a state -foreground ink only on its own solid state fill", () => {
+    // `--state-*-foreground` is the text colour ON a solid `bg-state-*` (white on the light
+    // warning since its retune), so as plain text on a page or card it would vanish. Text on a
+    // surface uses the state ink itself (`text-state-warning`), which the test above holds to 4.5:1.
+    const offenders: string[] = [];
+    for (const dir of ["apps/web/src", "packages/ui/src"]) {
+      const root = resolve(import.meta.dirname, "../../../..", dir);
+      for (const entry of readdirSync(root, { recursive: true, withFileTypes: true })) {
+        if (!entry.isFile() || !/\.tsx?$/.test(entry.name) || /\.test\.tsx?$/.test(entry.name))
+          continue;
+        const file = join(entry.parentPath, entry.name);
+        readFileSync(file, "utf8")
+          .split("\n")
+          .forEach((line, index) => {
+            for (const match of line.matchAll(/text-state-([a-z]+)-foreground/g)) {
+              if (!new RegExp(`(?<![\\w-])bg-state-${match[1]}(?![\\w/-])`).test(line))
+                offenders.push(`${file}:${index + 1}`);
+            }
+          });
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
   it("measures the old tokens as failing, so the check discriminates", () => {
     const oldLight = oklchToSrgb(0.577, 0.245, 27.325);
     expect(contrast(oldLight, token(":root", "muted"))).toBeLessThan(AA);
@@ -144,5 +253,8 @@ describe("theme token contrast (WCAG AA)", () => {
     const darkPrimary = token(".dark", "primary");
     const darkHover = over(darkPrimary, 0.8, token(".dark", "background"));
     expect(contrast(token(".dark", "primary-foreground"), darkHover)).toBeLessThan(AA);
+    // The old light warning and info inks (2.2:1 and 4.3:1 on white).
+    expect(contrast(oklchToSrgb(0.75, 0.18, 85), token(":root", "popover"))).toBeLessThan(AA);
+    expect(contrast(oklchToSrgb(0.58, 0.16, 250), token(":root", "popover"))).toBeLessThan(AA);
   });
 });

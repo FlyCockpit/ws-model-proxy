@@ -75,7 +75,7 @@ export function SlotMeter({
         </span>
       ) : null}
       {waiting > 0 ? (
-        <span className="shrink-0 text-xs font-medium whitespace-nowrap text-state-warning-foreground dark:text-state-warning">
+        <span className="shrink-0 text-xs font-medium whitespace-nowrap text-state-warning">
           {t("dashboard:slots.waiting", { count: waiting })}
         </span>
       ) : null}

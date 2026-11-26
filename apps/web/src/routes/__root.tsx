@@ -212,15 +212,14 @@ function RootComponent() {
                 absolutely positioned page content (sr-only labels and live regions), so it scrolls
                 and clips with the page instead of extending the document below the viewport. The
                 router saves and restores its scroll per history entry under this id and resets it
-                to the top on new navigations (router.tsx `scrollToTopSelectors`). */}
+                to the top on new navigations (router.tsx `scrollToTopSelectors`). No
+                `scrollbar-gutter: stable`: the sticky sub-navs and banners inside it are full-bleed.
+                There is no footer: phones get the BottomNav. See docs/ui.md § Shell rules */}
               <main
                 id="main-content"
                 tabIndex={-1}
                 data-scroll-restoration-id={MAIN_SCROLLER_ID}
-                className={cn(
-                  "relative min-h-0 min-w-0 overflow-y-auto overflow-x-clip overscroll-contain outline-none [container-type:size]",
-                  !chromeHidden && "[scrollbar-gutter:stable]",
-                )}
+                className="relative min-h-0 min-w-0 overflow-y-auto overflow-x-clip overscroll-contain outline-none [container-type:size]"
               >
                 <Outlet />
               </main>
