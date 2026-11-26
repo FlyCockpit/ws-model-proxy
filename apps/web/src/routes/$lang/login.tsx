@@ -1,8 +1,8 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 import { SignInCard } from "@/components/auth/sign-in-card";
+import { resolveRouteSession } from "@/lib/route-session";
 import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
 import { stripInviteFromAddressBar } from "@/lib/signup-search";
-import { getRouteSession } from "@/server/auth-session";
 import { safeRedirectTo } from "@/utils/safe-redirect";
 
 export const Route = createFileRoute("/$lang/login")({
@@ -10,7 +10,7 @@ export const Route = createFileRoute("/$lang/login")({
     redirectTo: typeof search.redirectTo === "string" ? search.redirectTo : undefined,
   }),
   beforeLoad: async ({ params, search }) => {
-    const decision = decideAnonymousOnlyRouteAccess(await getRouteSession());
+    const decision = decideAnonymousOnlyRouteAccess(await resolveRouteSession());
     if (decision.kind === "error") throw new Error("Route session unavailable");
     if (decision.kind === "redirect-authenticated") {
       throw redirect({ href: safeRedirectTo(search.redirectTo, params.lang) });

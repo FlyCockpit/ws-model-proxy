@@ -5,8 +5,8 @@ import { useTranslation } from "react-i18next";
 
 import { WideContent } from "@/components/wide-content";
 import { useActiveTabScroll } from "@/hooks/use-active-tab-scroll";
+import { resolveRouteSession } from "@/lib/route-session";
 import { decideAdminRouteAccess } from "@/lib/route-session-access";
-import { getRouteSession } from "@/server/auth-session";
 
 export const Route = createFileRoute("/$lang/admin")({
   staticData: { pendingFrame: "admin" },
@@ -14,7 +14,7 @@ export const Route = createFileRoute("/$lang/admin")({
     // 404-hide the entire admin tree from non-admins. Throwing notFound()
     // (instead of redirect) means an unauthorized visitor can't tell whether
     // /admin exists at all — same response as a route that doesn't exist.
-    const decision = decideAdminRouteAccess(await getRouteSession());
+    const decision = decideAdminRouteAccess(await resolveRouteSession());
     if (decision.kind === "error") throw new Error("Route session unavailable");
     if (decision.kind === "not-found") throw notFound();
     return { session: decision.session };

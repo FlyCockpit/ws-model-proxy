@@ -8,10 +8,15 @@ const boundary = vi.hoisted(() => ({
   signOut: vi.fn(),
   mark: vi.fn(),
   undo: vi.fn(),
-  assign: vi.fn(),
+  leave: vi.fn(),
+  toastError: vi.fn(),
 }));
 vi.mock("@/lib/auth-client", () => ({ authClient: { signOut: boundary.signOut } }));
-vi.mock("@/hooks/use-reload-on-identity-change", () => ({ markExplicitSignOut: boundary.mark }));
+vi.mock("@/lib/document-identity", () => ({
+  markExplicitSignOut: boundary.mark,
+  leaveDocument: boundary.leave,
+}));
+vi.mock("@ws-model-proxy/ui/lib/toast", () => ({ toast: { error: boundary.toastError } }));
 vi.mock("@/hooks/use-auth-session", () => ({
   useAuthSession: () => ({
     state: { session: { user: { id: "u1", name: "User", email: "user@example.test" } } },
@@ -72,17 +77,13 @@ import UserMenuContent from "./user-menu-content";
 
 beforeEach(() => {
   boundary.mark.mockReturnValue(boundary.undo);
-  Object.defineProperty(window, "location", {
-    configurable: true,
-    value: { assign: boundary.assign },
-  });
 });
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
 });
 describe("UserMenuContent sign-out", () => {
-  it("marks explicit sign-out before the request and fully loads the localized login", async () => {
+  it("marks explicit sign-out before the request and leaves for the localized login", async () => {
     boundary.signOut.mockImplementationOnce(
       async ({ fetchOptions }: { fetchOptions: { onSuccess: () => void } }) => {
         expect(boundary.mark).toHaveBeenCalledOnce();
@@ -92,27 +93,26 @@ describe("UserMenuContent sign-out", () => {
     );
     render(<UserMenuContent />);
     fireEvent.click(screen.getByRole("button", { name: "userMenu.signOut" }));
-    await waitFor(() => expect(boundary.assign).toHaveBeenCalledWith("/es-MX/login"));
+    // A quarantined full load (lib/document-identity.ts), not a client navigate.
+    await waitFor(() => expect(boundary.leave).toHaveBeenCalledWith("/es-MX/login"));
     expect(boundary.undo).not.toHaveBeenCalled();
+    expect(boundary.toastError).not.toHaveBeenCalled();
   });
-  it("undoes the reload suppression on an auth error without navigating", async () => {
-    boundary.signOut.mockImplementationOnce(
-      async ({ fetchOptions }: { fetchOptions: { onError: () => void } }) => {
-        fetchOptions.onError();
-        return { error: { code: "FAILED" } };
-      },
-    );
+  it("undoes the mark and says so on an auth error, without leaving", async () => {
+    boundary.signOut.mockResolvedValueOnce({ error: { code: "FAILED" } });
     render(<UserMenuContent />);
     fireEvent.click(screen.getByRole("button", { name: "userMenu.signOut" }));
-    await waitFor(() => expect(boundary.undo).toHaveBeenCalled());
-    expect(boundary.assign).not.toHaveBeenCalled();
+    await waitFor(() => expect(boundary.toastError).toHaveBeenCalledOnce());
+    expect(boundary.undo).toHaveBeenCalledOnce();
+    expect(boundary.leave).not.toHaveBeenCalled();
   });
-  it("undoes the reload suppression when sign-out throws", async () => {
+  it("undoes the mark and says so when sign-out throws", async () => {
     boundary.signOut.mockRejectedValueOnce(new Error("offline"));
     render(<UserMenuContent />);
     fireEvent.click(screen.getByRole("button", { name: "userMenu.signOut" }));
-    await waitFor(() => expect(boundary.undo).toHaveBeenCalledOnce());
-    expect(boundary.assign).not.toHaveBeenCalled();
+    await waitFor(() => expect(boundary.toastError).toHaveBeenCalledOnce());
+    expect(boundary.undo).toHaveBeenCalledOnce();
+    expect(boundary.leave).not.toHaveBeenCalled();
   });
 });
 describe("UserMenuContent layout", () => {

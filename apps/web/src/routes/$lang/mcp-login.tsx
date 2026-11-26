@@ -38,9 +38,11 @@ import { getMcpWebAvailability } from "@/server/mcp-availability";
  *                          plus the shared sign-in flow in "mcp" mode.
  *  - authenticated + tombstoned generation → "Sign in again to reauthorize"
  *                          card; confirming signs out with
- *                          `disableRedirect: true` WITHOUT navigating (the
- *                          signed query stays in this URL) and the anonymous
- *                          branch takes over in place. A genuinely new
+ *                          `disableRedirect: true`, quarantines this
+ *                          document (page hidden, query cache sealed) and
+ *                          reloads this exact URL (the signed query stays
+ *                          in it), where the anonymous branch takes over.
+ *                          A genuinely new
  *                          session creates a NEW generation —
  *                          `oauth2.continue({ postLogin: true })` is never
  *                          used as proof of reauthentication.

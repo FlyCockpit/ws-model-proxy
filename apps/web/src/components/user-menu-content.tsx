@@ -9,12 +9,14 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@ws-model-proxy/ui/components/dropdown-menu";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { User } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useAuthSession } from "@/hooks/use-auth-session";
-import { markExplicitSignOut } from "@/hooks/use-reload-on-identity-change";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
+import { signOutAndLeave } from "@/lib/explicit-sign-out";
 import { getNavItems, toLangRoute } from "@/lib/nav-items";
+import { friendly } from "@/utils/friendly-error";
 
 /**
  * The real Base UI account menu. Lazy-loaded by `user-menu.tsx` on first
@@ -88,23 +90,14 @@ export default function UserMenuContent() {
             variant="destructive"
             inset
             onClick={async () => {
-              // Dynamic import so the better-auth client chunk stays off the
-              // eager bundle (UserMenu renders in the root on every page). By
-              // the time a signed-in user opens this menu, the session adapter
-              // has already loaded the chunk, so this resolves from cache.
-              const { authClient } = await import("@/lib/auth-client");
-              const undoSignOutMark = markExplicitSignOut();
-              try {
-                const result = await authClient.signOut({
-                  fetchOptions: {
-                    onSuccess: () => window.location.assign(`/${lang}/login`),
-                    onError: undoSignOutMark,
-                  },
-                });
-                if (result.error) undoSignOutMark();
-              } catch {
-                undoSignOutMark();
-              }
+              // A full page load, not a client-side navigate: it is the one
+              // reset that drops every byte of the old user's cached data
+              // without leaving mounted queries refetching (and 401-toasting)
+              // or stuck pending on a cleared cache. Still signed in after a
+              // failure: say so. (signOutAndLeave imports the auth client
+              // dynamically, keeping it off the eager bundle.)
+              const result = await signOutAndLeave(`/${lang}/login`);
+              if (!result.ok) toast.error(friendly(result.error, t("userMenu.signOutFailed")));
             }}
           >
             {t("userMenu.signOut")}

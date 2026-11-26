@@ -11,8 +11,8 @@ import { useTranslation } from "react-i18next";
 import { AUTH_SCREEN_CLASS, AuthCard } from "@/components/auth/auth-card";
 import { EmailOnlyForm } from "@/components/auth/email-only-form";
 import { authClient } from "@/lib/auth-client";
+import { resolveRouteSession } from "@/lib/route-session";
 import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
-import { getRouteSession } from "@/server/auth-session";
 import { friendly, isRateLimit } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
@@ -27,7 +27,7 @@ import { orpc } from "@/utils/orpc";
  */
 export const Route = createFileRoute("/$lang/forgot-password")({
   beforeLoad: async ({ params }) => {
-    const decision = decideAnonymousOnlyRouteAccess(await getRouteSession());
+    const decision = decideAnonymousOnlyRouteAccess(await resolveRouteSession());
     if (decision.kind === "error") throw new Error("Route session unavailable");
     if (decision.kind === "redirect-authenticated") {
       throw redirect({ to: "/$lang/overview", params: { lang: params.lang } });

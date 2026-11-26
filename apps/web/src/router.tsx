@@ -8,6 +8,7 @@ import ErrorState from "./components/error-state";
 import NotFound from "./components/not-found";
 import { RoutePending } from "./components/route-pending";
 import i18n from "./i18n";
+import { onDocumentReplaced, sealQueryClient, watchDocumentRestore } from "./lib/document-identity";
 import { MAIN_SCROLLER_SELECTOR } from "./lib/main-scroller";
 import { routeTree } from "./routeTree.gen";
 import { type DeletionEntity } from "./utils/friendly-error";
@@ -49,6 +50,15 @@ export function getRouter() {
     // deletion CONFLICT shows its specific copy (utils/mutation-error-toast).
     mutationCache: createAppMutationCache((key) => i18n.t(key)),
   });
+
+  // A signed-in copy of this document restored from the back/forward cache
+  // reloads instead of showing a page nobody re-checked; and when another
+  // identity is confirmed, this client's data is dropped before the reload
+  // (lib/document-identity.ts). Client only; no-ops during SSR.
+  watchDocumentRestore();
+  if (typeof window !== "undefined") {
+    onDocumentReplaced(() => sealQueryClient(queryClient));
+  }
 
   const router = createRouter({
     routeTree,

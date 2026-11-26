@@ -1,8 +1,8 @@
 import { createFileRoute, notFound, redirect } from "@tanstack/react-router";
 import { McpConsentPage } from "@/components/mcp/mcp-consent-page";
 import { mcpPageHref } from "@/lib/mcp-oauth-search";
+import { resolveRouteSession } from "@/lib/route-session";
 import { decideMcpConsentRouteAccess } from "@/lib/route-session-access";
-import { getRouteSession } from "@/server/auth-session";
 import { getMcpWebAvailability } from "@/server/mcp-availability";
 import { getRawRequestSearch } from "@/server/raw-request-search";
 
@@ -23,7 +23,7 @@ export const Route = createFileRoute("/$lang/mcp-consent")({
   beforeLoad: async ({ params }) => {
     const availability = await getMcpWebAvailability();
     if (!availability.enabled) throw notFound();
-    const decision = decideMcpConsentRouteAccess(await getRouteSession());
+    const decision = decideMcpConsentRouteAccess(await resolveRouteSession());
     if (decision.kind === "error") throw new Error("Route session unavailable");
     if (decision.kind === "redirect-to-mcp-login") {
       // The signed OAuth query must survive this transition BYTE-IDENTICALLY.

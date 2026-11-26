@@ -1,6 +1,8 @@
 import { type Mutation, MutationCache } from "@tanstack/react-query";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 
+import { skipErrorToastForIdentity } from "@/lib/document-identity";
+
 import { deletionConflictMessageKey, friendly } from "./friendly-error";
 
 type Translate = (key: string) => string;
@@ -28,11 +30,15 @@ export function mutationErrorMessage(
 /**
  * The app's MutationCache: surfaces mutation failures by default so no action
  * ever fails silently. Mutations that handle their own errors (e.g. inline
- * form errors) opt out with `meta: { skipGlobalErrorToast: true }`.
+ * form errors) opt out with `meta: { skipGlobalErrorToast: true }`. Before
+ * that opt-out, a 401 still checks the session (the action itself still
+ * toasts), and nothing toasts once the document is being replaced
+ * (lib/document-identity.ts).
  */
 export function createAppMutationCache(translate: Translate): MutationCache {
   return new MutationCache({
     onError: (error, _vars, _ctx, mutation) => {
+      if (skipErrorToastForIdentity(error, "mutation")) return;
       if (mutation.meta?.skipGlobalErrorToast) return;
       toast.error(mutationErrorMessage(error, mutation.meta, translate));
     },

@@ -163,6 +163,63 @@ are unchanged.
    pool, New API key and Invite user do; a long form uses the form-surface sheet.
 9. **The header stays full width**; its row scales with rule 1.
 
+## Query cache follows identity
+
+The TanStack Query cache, Zustand stores, module state and every in-flight request callback belong
+to one identity: the one the document was used by. `apps/web/src/lib/document-identity.ts` keeps
+that identity at module scope for the whole life of the document (never in a component, which an
+error reset would unmount and make forget). When a confirmed identity differs from it, the document
+is replaced with a full load. A page load is asynchronous, so every replacement first quarantines
+the document synchronously: the page is hidden and the QueryClient sealed (emptied, and anything a
+late callback adds is removed again), so nothing of the previous identity stays on screen while the
+new page loads.
+
+| Transition | What happens |
+|---|---|
+| Explicit sign-out (the account menu; the MCP login page's "sign in again to reauthorize") | `signOutAndLeave()` (`apps/web/src/lib/explicit-sign-out.ts`): marks the sign-out, then on success `leaveDocument()`: the account menu loads the sign-in page, the MCP page reloads its own URL (the signed OAuth query kept byte for byte). A failure, returned or thrown, undoes the mark and is shown. Add any new sign-out button through it. |
+| Signed out elsewhere (another tab, expiry, revocation) | The document reloads in place; the guards send the visitor to the sign-in page. |
+| Another account, impersonation starting or stopping (same tab or another tab) | The document reloads in place; the guards admit the new account and its queries load fresh. |
+| Anonymous → signed in | Nothing: an anonymous cache holds only public data, so password sign-in keeps its client-side navigate. |
+| `pending` / `error` | Never acted on: a flaky session check must not reload a signed-in page. |
+
+Three observers feed it, and none can be skipped:
+
+- **Every session guard** (`_auth`, `admin`, `login`, `signup`, `forgot-password`, `mcp-consent`,
+  the `/$lang/` redirect) calls `resolveRouteSession()` (`apps/web/src/lib/route-session.ts`):
+  `getRouteSession()`, then the identity check. A different identity replaces the document and the
+  guard never settles, so no page renders the previous identity's cached data.
+  `pnpm policy:web-conventions` (G11) rejects any route-file reference to `getRouteSession` or
+  `@/server/auth-session`.
+- **The root shell's watcher**, `useReloadOnIdentityChange()` (`routes/__root.tsx`), for a change
+  while any page is open, the guard-less ones included (MCP login, verify-email, reset-password).
+  It runs in a layout effect, before a frame pairs the new chrome with the old data. It also
+  connects the open tabs: Better Auth tells other tabs about a sign-out but not a sign-in, so the
+  auth client announces every session change made in the tab (`$sessionSignal`), and the watcher
+  and the guards announce each newly confirmed identity on the document's `BroadcastChannel`; every
+  other tab then re-checks its session.
+- **The global error toasts** (`utils/query-error-toast.ts`, `utils/mutation-error-toast.ts`):
+  before any toast opt-out, a query rejected with 401 asks Better Auth to check the session (one
+  check in flight at a time) instead of toasting; a mutation still toasts. Nothing toasts once the
+  document is being replaced.
+
+The router also covers the back/forward cache: a document that ever held a signed-in user's state
+is hidden as it enters the cache and reloaded when restored, so Back never shows a frozen page
+nobody re-checked. Anonymous pages are cached as usual.
+
+Why a full load, not `queryClient.clear()` or a fresh `QueryClient`: clearing the cache while
+observers are mounted cancels their fetches silently and can leave a page stuck on a skeleton,
+`resetQueries()` refetches active queries as the wrong identity (a 401 toast each), and neither
+stops an in-flight mutation whose late `onSuccess` writes the old identity's data back. A swapped
+client still leaves Zustand stores, the node live-updates stream, open terminal sockets and module
+state behind. A full load drops all of it, and a late callback can only write into the document
+being discarded.
+
+What is kept across identities on purpose, because it is the device's, not the account's: the
+`ui-preferences` store (sidebar and terminal settings) and the locale in `localStorage`, the
+browser's terminal identity key and the CLI identity pins in IndexedDB, and the per-tab welcome
+offer flag in `sessionStorage`. None holds account data; anything that does belongs in the query
+cache, or needs its own identity scoping.
+
 ## Layout check
 
 `pnpm check:layout --url <dev server>` measures § Shell rules in a real browser through

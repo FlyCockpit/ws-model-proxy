@@ -10,11 +10,15 @@
  *        root viewport scale, no rem size below 0.75, no em size below 1, and no other size
  *        (vw, cqi, pt, expressions) without a 0.75rem floor (max()/clamp()) or with a px term.
  *        docs/ui.md § Viewport scale
+ *   G11: route files reach the session only through resolveRouteSession() (lib/route-session.ts),
+ *        which checks the document's identity: no reference to getRouteSession or to the
+ *        server/auth-session module (an import under any name, a namespace or dynamic import, a
+ *        re-export). docs/ui.md § Query cache follows identity
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 
 const { parse } = createRequire(import.meta.url)("@babel/parser") as typeof import("@babel/parser");
 
@@ -539,6 +543,23 @@ function withoutThemeExemptions(
       .some((text) => THEME_EXEMPT.test(text));
   return findings.filter((finding) => finding.rule !== "G9" || !exempt(finding));
 }
+/** G11 scans non-test route files (the route test files mock the session modules). */
+function isRouteScanned(file: string): boolean {
+  return file.startsWith("apps/web/src/routes/") && !/\.test\.[cm]?[jt]sx?$/.test(file);
+}
+const ROUTE_SESSION_MODULE = "apps/web/src/server/auth-session";
+/** A module specifier that names apps/web/src/server/auth-session (alias or relative, any extension). */
+function isRouteSessionModule(file: string, specifier: string): boolean {
+  const path = specifier.startsWith("@/")
+    ? `apps/web/src/${specifier.slice(2)}`
+    : specifier.startsWith(".")
+      ? posix.join(posix.dirname(file), specifier)
+      : specifier;
+  return path.replace(/\.[cm]?[jt]sx?$/, "").replace(/\/index$/, "") === ROUTE_SESSION_MODULE;
+}
+const ROUTE_SESSION_MESSAGE =
+  "A route file reaches the session without the document identity check, so a page could render the previous account's cached data after a sign-out or an account switch. Fix: call resolveRouteSession() from @/lib/route-session (docs/ui.md § Query cache follows identity).";
+
 export function scanWebSource(file: string, source: string): Finding[] {
   const findings: Finding[] = [];
   // Where each finding's flagged node ends, so a theme-exempt comment inside a multiline
@@ -569,6 +590,7 @@ export function scanWebSource(file: string, source: string): Finding[] {
     ];
   }
   const context = bindings(ast);
+  const routeSessionLines = new Set<number>();
   walk(ast, [], (n, ancestors) => {
     if (n.type === "JSXOpeningElement") {
       const attrs = children(n.attributes);
@@ -634,6 +656,28 @@ export function scanWebSource(file: string, source: string): Finding[] {
           "G8",
           "A route renders a site footer, which follows the page content instead of sitting at the bottom of a short page and repeats per page. Fix: site footer content goes in one shared footer component that the shell renders as the last box of its `flex min-h-full flex-col` column inside <main>; a footer that belongs to an <article>, <section> or similar stays inside that element (docs/ui.md, Shell rules).",
         );
+    }
+    // G11: any code reference (a call, an import under any name, a member access) to
+    // getRouteSession, and any string naming its module (static, dynamic, type or re-export
+    // import). Comments and other strings are not code, so they pass.
+    if (isRouteScanned(file) && !routeSessionLines.has(line(n))) {
+      if (
+        (n.type === "Identifier" && n.name === "getRouteSession") ||
+        (n.type === "StringLiteral" &&
+          (isRouteSessionModule(file, String(n.value)) ||
+            (ancestors.at(-1)?.type.startsWith("Import") === true &&
+              n.value === "getRouteSession"))) ||
+        (n.type === "TemplateLiteral" &&
+          children(n.expressions).length === 0 &&
+          isRouteSessionModule(
+            file,
+            String((children(n.quasis)[0]?.value as { cooked?: string } | undefined)?.cooked),
+          ))
+      ) {
+        // One finding per line: an import names the function and its module together.
+        routeSessionLines.add(line(n));
+        add(n, "G11", ROUTE_SESSION_MESSAGE);
+      }
     }
     // G10 looks at every string in web source, not only className values: class lists also live
     // in cva() variants, shared constants and other *ClassName props, and a text-[…] token means
@@ -817,6 +861,6 @@ if (import.meta.filename === process.argv[1]) {
   for (const failure of failures) console.error(`POLICY VIOLATION: ${failure}`);
   if (failures.length > 0) process.exit(1);
   console.log(
-    "web conventions passed: no page-scroller gutter, no route footer, no literal colours, no px or sub-12px text (G8, G9, G10).",
+    "web conventions passed: no page-scroller gutter, no route footer, no literal colours, no px or sub-12px text, route guards check the document identity (G8, G9, G10, G11).",
   );
 }

@@ -6,6 +6,7 @@ import { adminClient, inferAdditionalFields, twoFactorClient } from "better-auth
 import { createAuthClient } from "better-auth/react";
 
 import i18n from "@/i18n";
+import { announceSessionChange } from "@/lib/document-identity";
 
 export const authClient = createAuthClient({
   baseURL: env.VITE_SERVER_URL,
@@ -35,3 +36,10 @@ export const authClient = createAuthClient({
     oauthProviderClient(),
   ],
 });
+
+// A session change made in this tab (sign-in, 2FA, sign-up, …: Better Auth's
+// session signal) is announced to the other open tabs before the flow
+// navigates anywhere, so they re-check whose session the shared cookie holds
+// now, whatever page this tab lands on. docs/ui.md § Query cache follows
+// identity.
+authClient.$store.atoms.$sessionSignal?.listen(() => announceSessionChange());

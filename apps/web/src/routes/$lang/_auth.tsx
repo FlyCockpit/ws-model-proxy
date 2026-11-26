@@ -17,13 +17,13 @@ import { InlineRetry } from "@/components/inline-retry";
 import { PageSkeleton } from "@/components/page-skeleton";
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
 import { useTotpEnrollment } from "@/hooks/use-totp-enrollment";
+import { resolveRouteSession } from "@/lib/route-session";
 import { decideProtectedRouteAccess } from "@/lib/route-session-access";
-import { getRouteSession } from "@/server/auth-session";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth")({
   beforeLoad: async ({ location, params }) => {
-    const decision = decideProtectedRouteAccess(await getRouteSession());
+    const decision = decideProtectedRouteAccess(await resolveRouteSession());
     if (decision.kind === "error") throw new Error("Route session unavailable");
     if (decision.kind === "redirect-to-login") {
       throw redirect({

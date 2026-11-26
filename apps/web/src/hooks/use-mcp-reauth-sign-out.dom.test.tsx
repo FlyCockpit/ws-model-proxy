@@ -6,9 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * MCP tombstone-reauth sign-out hook (Phase 6, Part H pass 2):
- * exact signOut args, no navigation, failure surfacing (R83/R84 F4),
- * single-flight re-entry guard (R83/R84 F8), and tombstone-probe cache
- * invalidation on sign-out (R83/R84 F5).
+ * exact signOut args, a quarantined reload of the exact signed URL, failure
+ * surfacing (R83/R84 F4), single-flight re-entry guard (R83/R84 F8), and the
+ * tombstone-probe cache dropped on sign-out (R83/R84 F5: the sealed cache).
  */
 
 type SignOutResult = { data: object | null; error: object | null };
@@ -21,16 +21,26 @@ vi.mock("@/lib/auth-client", () => ({
 }));
 
 const reload = vi.fn();
+const assign = vi.fn();
 const undoSignOutMark = vi.hoisted(() => vi.fn());
 const markSignOut = vi.hoisted(() => vi.fn(() => undoSignOutMark));
-vi.mock("./use-reload-on-identity-change", () => ({ markExplicitSignOut: markSignOut }));
+vi.mock("@/lib/document-identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/document-identity")>()),
+  markExplicitSignOut: markSignOut,
+}));
 beforeEach(() => {
+  document.documentElement.style.removeProperty("display");
   Object.defineProperty(window, "location", {
     configurable: true,
-    value: { href: "https://example.test/en-US/mcp-login?oauth_query=signed", reload },
+    value: { href: "https://example.test/en-US/mcp-login?oauth_query=signed", reload, assign },
   });
 });
 
+import {
+  onDocumentReplaced,
+  resetDocumentIdentityForTests,
+  sealQueryClient,
+} from "@/lib/document-identity";
 import { MCP_REAUTH_STATUS_QUERY_KEY } from "@/lib/mcp-oauth-search";
 import { useMcpReauthSignOut } from "./use-mcp-reauth-sign-out";
 
@@ -39,6 +49,8 @@ function renderHookWithClient() {
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+  resetDocumentIdentityForTests(() => undefined);
+  onDocumentReplaced(() => sealQueryClient(client));
   const view = renderHook(() => useMcpReauthSignOut(), {
     wrapper: ({ children }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -53,8 +65,15 @@ describe("useMcpReauthSignOut", () => {
     vi.clearAllMocks();
   });
 
-  it("signs out with disableRedirect, invalidates the probe cache, and reloads the exact signed URL", async () => {
-    const { result, invalidateSpy } = renderHookWithClient();
+  it("signs out with disableRedirect, seals the cache, and reloads the exact signed URL", async () => {
+    signOutMock.mockImplementationOnce((async (options: {
+      fetchOptions: { onSuccess: () => void };
+    }) => {
+      options.fetchOptions.onSuccess();
+      return { data: {}, error: null };
+    }) as never);
+    const { result, client } = renderHookWithClient();
+    client.setQueryData([MCP_REAUTH_STATUS_QUERY_KEY, "s1", "c", "f"], { status: "continue" });
     expect(result.current.isSigningOut).toBe(false);
     expect(result.current.signOutFailed).toBe(false);
 
@@ -65,17 +84,21 @@ describe("useMcpReauthSignOut", () => {
     // disableRedirect: true and NO callbackURL — the signed oauth_query stays
     // in the current URL; nothing may navigate away from it.
     expect(signOutMock).toHaveBeenCalledTimes(1);
-    expect(signOutMock).toHaveBeenCalledWith({ disableRedirect: true });
+    expect(signOutMock).toHaveBeenCalledWith({
+      disableRedirect: true,
+      fetchOptions: { onSuccess: expect.any(Function) },
+    });
     expect(result.current.isSigningOut).toBe(false);
     expect(result.current.signOutFailed).toBe(false);
     expect(markSignOut).toHaveBeenCalledOnce();
     expect(reload).toHaveBeenCalledOnce();
+    expect(assign).not.toHaveBeenCalled();
     expect(window.location.href).toBe("https://example.test/en-US/mcp-login?oauth_query=signed");
-    // The probe cache is invalidated by its prefix key so the NEXT session
-    // can never reuse this session's cached reauth/continue decision.
-    expect(invalidateSpy).toHaveBeenCalledWith({
-      queryKey: [MCP_REAUTH_STATUS_QUERY_KEY],
-    });
+    // The document is quarantined before the reload: the cache is sealed, so
+    // the NEXT session can never reuse this session's cached reauth/continue
+    // decision.
+    expect(client.getQueryCache().getAll()).toHaveLength(0);
+    expect(document.documentElement.style.display).toBe("none");
   });
 
   it("surfaces a resolved { error } sign-out as a localized-failure state (R83/R84 F4)", async () => {
@@ -88,7 +111,7 @@ describe("useMcpReauthSignOut", () => {
     expect(result.current.isSigningOut).toBe(false);
     expect(undoSignOutMark).toHaveBeenCalledOnce();
     expect(reload).not.toHaveBeenCalled();
-    // A failed sign-out keeps the session: no cache invalidation.
+    // A failed sign-out keeps the session (and its cache).
     expect(invalidateSpy).not.toHaveBeenCalled();
   });
 
@@ -131,8 +154,10 @@ describe("useMcpReauthSignOut", () => {
 
     const first = result.current.signOutForReauth();
     const second = result.current.signOutForReauth(); // re-entry before settle
-    expect(signOutMock).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(signOutMock).toHaveBeenCalledTimes(1));
 
+    // The auth client is imported dynamically: the request starts a few ticks later.
+    await waitFor(() => expect(release).not.toBeNull());
     await act(async () => {
       release?.();
       await Promise.all([first, second]);
@@ -174,6 +199,8 @@ describe("useMcpReauthSignOut status", () => {
     expect(result.current.status).toBe("signing");
     expect(result.current.isSigningOut).toBe(true);
     expect(result.current.signOutFailed).toBe(false);
+    // The auth client is imported dynamically: the request starts a few ticks later.
+    await waitFor(() => expect(release).not.toBeNull());
     await act(async () => {
       release?.();
       await flight;
@@ -204,6 +231,8 @@ describe("useMcpReauthSignOut status", () => {
     });
     expect(result.current.status).toBe("signing");
     expect(result.current.signOutFailed).toBe(false);
+    // The auth client is imported dynamically: the request starts a few ticks later.
+    await waitFor(() => expect(release).not.toBeNull());
     await act(async () => {
       release?.();
       await flight;
@@ -234,7 +263,7 @@ describe("tombstone-probe query scoping (R83/R84 F5, QueryClient level)", () => 
     await client.fetchQuery({ queryKey: keyA, queryFn: probe, staleTime: 0 });
     expect(probe).toHaveBeenCalledTimes(3);
 
-    // …and the sign-out prefix invalidation marks every generation stale:
+    // …and a prefix invalidation marks every generation stale:
     // the next fetch of the SAME key re-runs the probe.
     await client.invalidateQueries({ queryKey: [MCP_REAUTH_STATUS_QUERY_KEY] });
     await client.fetchQuery({ queryKey: keyA, queryFn: probe, staleTime: 0 });

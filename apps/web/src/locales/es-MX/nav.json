@@ -31,6 +31,7 @@
     "open": "Abrir menú de usuario",
     "signIn": "Iniciar sesión",
     "signOut": "Cerrar sesión",
+    "signOutFailed": "No se pudo cerrar la sesión. Sigues con la sesión iniciada; inténtalo de nuevo.",
     "signUp": "Registrarse"
   },
   "hints": {

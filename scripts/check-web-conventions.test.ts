@@ -216,6 +216,51 @@ describe("scanWebSource G9: surfaces follow the app theme", () => {
   });
 });
 
+describe("scanWebSource G11: route guards check the document identity", () => {
+  const ROUTE = "apps/web/src/routes/$lang/_auth.tsx";
+  it("rejects every way a route file reaches getRouteSession or its module", () => {
+    for (const source of [
+      "const decision = decideProtectedRouteAccess(await getRouteSession());",
+      'import { getRouteSession } from "@/server/auth-session";',
+      'import { getRouteSession as probe } from "@/lib/route-session";',
+      'import { "getRouteSession" as probe } from "./elsewhere";',
+      "const [s, c] = await Promise.all([getRouteSession(), load()]);",
+      "/* guard */ const decision = await getRouteSession();",
+      'import * as session from "@/server/auth-session";',
+      "const m = await import('@/server/auth-session');",
+      "const m = await import(`@/server/auth-session`);",
+      'import("@/server/auth-session.ts").then((m) => m.probe());',
+      'import type { X } from "../../server/auth-session";',
+      'export { getRouteSession as probe } from "@/server/auth-session";',
+      "const r = /\\/\\//; const s = await sessions.getRouteSession();",
+    ])
+      rejects("G11", source, ROUTE);
+    rejects("G11", 'import { x } from "../server/auth-session";', "apps/web/src/routes/index.tsx");
+  });
+  it("accepts resolveRouteSession, comments, strings and code outside route files", () => {
+    for (const source of [
+      'import { resolveRouteSession } from "@/lib/route-session";',
+      "const decision = decideProtectedRouteAccess(await resolveRouteSession());",
+      "// resolveRouteSession() wraps getRouteSession() with the identity check.\nconst a = 1;",
+      "const session = await resolveRouteSession(); // replaces getRouteSession()",
+      "/**\n * getRouteSession() alone would skip it.\n */\nconst done = 1;",
+      'const label = "getRouteSession()";',
+      "const myGetRouteSessionLike = 1;",
+      'import { getMcpWebAvailability } from "@/server/mcp-availability";',
+      'import { x } from "../server/auth-session-helpers";',
+    ])
+      assert.ok(!rules(source, ROUTE).includes("G11"), source);
+    for (const file of [
+      "apps/web/src/lib/route-session.ts",
+      "apps/web/src/routes/$lang/-_auth.dom.test.tsx",
+    ])
+      assert.ok(
+        !rules('import { getRouteSession } from "@/server/auth-session";', file).includes("G11"),
+        file,
+      );
+  });
+});
+
 describe("scanWebCss", () => {
   it("keeps literal colours and color-scheme queries in the theme's token file (G9)", () => {
     const app = "apps/web/src/index.css";

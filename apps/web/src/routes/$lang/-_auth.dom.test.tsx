@@ -58,7 +58,7 @@ vi.mock("@/hooks/use-auth-session", () => ({
 }));
 vi.mock("@/hooks/use-needs-you-count", () => ({ useNeedsYouCount: () => 0 }));
 vi.mock("@/hooks/use-totp-enrollment", () => ({ useTotpEnrollment: () => ({ state: {} }) }));
-vi.mock("@/server/auth-session", () => ({ getRouteSession: async () => null }));
+vi.mock("@/lib/route-session", () => ({ resolveRouteSession: async () => null }));
 vi.mock("@/utils/orpc", () => ({
   orpc: {
     settings: {

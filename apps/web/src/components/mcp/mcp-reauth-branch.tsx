@@ -60,8 +60,9 @@ export function McpReauthBranch({ session, clientId, fingerprint, lang }: McpRea
     // a replaced session (same user) or a different transaction can never
     // reuse another generation's cached "continue"/"reauth" decision. Cheap
     // probe — NO retained data (gcTime 0): every mount waits for a fresh
-    // decision, which also covers same-session revocation re-entry. The
-    // sign-out hook additionally invalidates the key prefix.
+    // decision, which also covers same-session revocation re-entry. A
+    // successful sign-out also seals the whole query cache before it reloads
+    // the page (lib/document-identity.ts).
     queryKey: mcpReauthStatusQueryKey(session.id, clientId ?? "", fingerprint),
     enabled: clientId !== null,
     retry: false,

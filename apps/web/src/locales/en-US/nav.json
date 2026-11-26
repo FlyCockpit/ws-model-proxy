@@ -31,7 +31,8 @@
     "open": "Open user menu",
     "signIn": "Sign In",
     "signUp": "Sign Up",
-    "signOut": "Sign Out"
+    "signOut": "Sign Out",
+    "signOutFailed": "Could not sign out. You are still signed in; try again."
   },
   "hints": {
     "overview": "What is happening and what needs you",

@@ -25,9 +25,9 @@ import { AuthRetryCard } from "@/components/auth/auth-retry-card";
 import { ResendVerification } from "@/components/auth/resend-verification";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { authClient } from "@/lib/auth-client";
+import { resolveRouteSession } from "@/lib/route-session";
 import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
 import { parseSignupSearch, stripInviteFromAddressBar } from "@/lib/signup-search";
-import { getRouteSession } from "@/server/auth-session";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 import { inviteSignupPath, safeRedirectTo } from "@/utils/safe-redirect";
@@ -35,7 +35,7 @@ import { inviteSignupPath, safeRedirectTo } from "@/utils/safe-redirect";
 export const Route = createFileRoute("/$lang/signup")({
   validateSearch: parseSignupSearch,
   beforeLoad: async ({ context, params, search }) => {
-    const decision = decideAnonymousOnlyRouteAccess(await getRouteSession());
+    const decision = decideAnonymousOnlyRouteAccess(await resolveRouteSession());
     if (decision.kind === "error") throw new Error("Route session unavailable");
     // A signed-in person with an invite link stays: the page offers to accept it.
     if (decision.kind === "redirect-authenticated" && !search.invite) {

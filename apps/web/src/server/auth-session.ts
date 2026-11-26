@@ -32,17 +32,23 @@ type GetBetterAuthSession = (context: {
  * bearer tokens cannot mint a browser route session.
  */
 export const getRouteSession = createServerFn({ method: "GET" }).handler(
-  async (): Promise<RouteSessionResolution> => {
-    const [{ auth }, { cookieSessionHeaders }] = await Promise.all([
-      import("@ws-model-proxy/auth"),
-      import("@ws-model-proxy/auth/cookie-session"),
-    ]);
-    return resolveRouteSessionFromAuth(
-      cookieSessionHeaders(getRequestHeaders()),
-      auth.api.getSession,
-    );
-  },
+  async (): Promise<RouteSessionResolution> => routeSessionFromRequestHeaders(getRequestHeaders()),
 );
+
+/**
+ * The probe behind {@link getRouteSession}, for a request's headers: only the
+ * session cookie is passed on. Route guards call `resolveRouteSession()`
+ * (`lib/route-session.ts`), which adds the document identity check.
+ */
+export async function routeSessionFromRequestHeaders(
+  headers: Headers,
+): Promise<RouteSessionResolution> {
+  const [{ auth }, { cookieSessionHeaders }] = await Promise.all([
+    import("@ws-model-proxy/auth"),
+    import("@ws-model-proxy/auth/cookie-session"),
+  ]);
+  return resolveRouteSessionFromAuth(cookieSessionHeaders(headers), auth.api.getSession);
+}
 
 export async function resolveRouteSessionFromAuth(
   headers: Headers,
@@ -54,22 +60,6 @@ export async function resolveRouteSessionFromAuth(
   } catch {
     return failedRouteSessionResolution();
   }
-}
-
-/** @deprecated Prefer resolveRouteSessionFromAuth; kept for tests that assert projection. */
-export async function resolveRouteSession(headers: Headers): Promise<RouteSession | null> {
-  const [{ auth }, { cookieSessionHeaders }] = await Promise.all([
-    import("@ws-model-proxy/auth"),
-    import("@ws-model-proxy/auth/cookie-session"),
-  ]);
-  const resolution = await resolveRouteSessionFromAuth(
-    cookieSessionHeaders(headers),
-    auth.api.getSession,
-  );
-  if (resolution.status === "error") {
-    throw new Error("Route session unavailable");
-  }
-  return resolution.session;
 }
 
 export function toRouteSession(session: BetterAuthRouteSession | null): RouteSession | null {

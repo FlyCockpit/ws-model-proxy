@@ -1,9 +1,9 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
-import { getRouteSession } from "@/server/auth-session";
+import { resolveRouteSession } from "@/lib/route-session";
 
 export const Route = createFileRoute("/$lang/")({
   beforeLoad: async ({ params }) => {
-    const resolution = await getRouteSession();
+    const resolution = await resolveRouteSession();
     if (resolution.status === "error") throw new Error("Route session unavailable");
     throw redirect({
       to: resolution.session ? "/$lang/overview" : "/$lang/login",

@@ -126,9 +126,10 @@ runner; `prisma migrate resolve` only in the documented recovery steps, run by t
 - Browser session state goes through `apps/web/src/hooks/use-auth-session.ts`.
   Do not call `.useSession()` anywhere else in production code, and do not
   mirror Better Auth session data into Zustand.
-- Route auth checks use `apps/web/src/server/auth-session.ts` plus pure
-  decisions from `apps/web/src/lib/route-session-access.ts`. Do not call
-  `authClient.getSession()` from route files.
+- Route auth checks use `resolveRouteSession()` (`apps/web/src/lib/route-session.ts`: the
+  server-backed `getRouteSession()` plus the document identity check) and pure decisions from
+  `apps/web/src/lib/route-session-access.ts`. Route files never call `authClient.getSession()`
+  or reach `getRouteSession()` / `@/server/auth-session` directly (`pnpm policy:web-conventions` G11).
 - Content loading states use layout-matching `Skeleton` components. A route's pending state is
   drawn inside the app frame and shaped by its `staticData.pendingShape` (list, detail, form,
   dashboard; `apps/web/src/lib/pending-layout.ts`): the header, sidebar and bottom nav are on
@@ -176,11 +177,12 @@ runner; `prisma migrate resolve` only in the documented recovery steps, run by t
   (docs/ui.md § Shell rules; G9). Toasts are a popover surface.
 - Do not add page view transitions (`defaultViewTransition`, `viewTransitionName`):
   the old and new page must never be on screen together.
-- A confirmed change or loss of the signed-in identity does a full document load
-  (`useReloadOnIdentityChange`); explicit sign-out marks itself with
-  `markExplicitSignOut()` and then `window.location.assign`s the login page, so no
-  query cache from the previous account survives. Every other navigation is a
-  router navigation; do not add internal `<a href>` links or `location` reloads.
+- The query cache follows the signed-in identity (docs/ui.md § Query cache follows identity): a
+  confirmed change or loss of it replaces the document (`apps/web/src/lib/document-identity.ts`:
+  page hidden and QueryClient sealed, then a full load), seen by every route guard and the root
+  `useReloadOnIdentityChange`; every sign-out button goes through `signOutAndLeave()`
+  (`apps/web/src/lib/explicit-sign-out.ts`). Every other navigation is a router navigation; do
+  not add internal `<a href>` links or `location` reloads.
 - The root `FileDropGuard` stops a stray file drop from navigating the tab. A
   component that accepts dropped files registers with `useFileDropTarget`.
 - Section tab strips reveal their active tab by setting the strip's `scrollLeft`

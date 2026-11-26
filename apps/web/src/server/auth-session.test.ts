@@ -11,11 +11,10 @@ vi.mock("@ws-model-proxy/auth", () => ({
   },
 }));
 
-const { resolveRouteSession, resolveRouteSessionFromAuth, toRouteSession } = await import(
-  "./auth-session"
-);
+const { routeSessionFromRequestHeaders, resolveRouteSessionFromAuth, toRouteSession } =
+  await import("./auth-session");
 
-describe("resolveRouteSession", () => {
+describe("routeSessionFromRequestHeaders", () => {
   beforeEach(() => {
     getSession.mockReset();
   });
@@ -42,14 +41,17 @@ describe("resolveRouteSession", () => {
       },
     });
 
-    await expect(resolveRouteSession(headers())).resolves.toEqual({
-      user: {
-        id: "u1",
-        name: "User One",
-        email: "u1@example.com",
-        emailVerified: true,
-        role: "admin",
-        twoFactorEnabled: true,
+    await expect(routeSessionFromRequestHeaders(headers())).resolves.toEqual({
+      status: "resolved",
+      session: {
+        user: {
+          id: "u1",
+          name: "User One",
+          email: "u1@example.com",
+          emailVerified: true,
+          role: "admin",
+          twoFactorEnabled: true,
+        },
       },
     });
     const call = getSession.mock.calls[0]?.[0] as { headers: Headers };
@@ -59,13 +61,16 @@ describe("resolveRouteSession", () => {
   it("returns null when there is no session", async () => {
     getSession.mockResolvedValue(null);
 
-    await expect(resolveRouteSession(headers())).resolves.toBeNull();
+    await expect(routeSessionFromRequestHeaders(headers())).resolves.toEqual({
+      status: "resolved",
+      session: null,
+    });
   });
 
-  it("turns lookup failures into thrown errors for the legacy helper", async () => {
+  it("turns a lookup failure into an error resolution", async () => {
     getSession.mockRejectedValue(new Error("database unavailable"));
 
-    await expect(resolveRouteSession(headers())).rejects.toThrow("Route session unavailable");
+    await expect(routeSessionFromRequestHeaders(headers())).resolves.toEqual({ status: "error" });
   });
 });
 
