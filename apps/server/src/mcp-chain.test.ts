@@ -235,6 +235,34 @@ describe("createApp /mcp chain — order pins (flag on)", () => {
     expect(res.headers.get("retry-after")).toBeTruthy();
   });
 
+  it("POST legacy 2025-06-18 initialize without a credential → upstream 401 challenge with RFC 9728 resource_metadata", async () => {
+    const app = await buildApp(true);
+    const res = await app.request(MCP, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...HOST,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "codex", version: "0.172.0" },
+        },
+      }),
+    });
+    expect(res.status).toBe(401);
+    const challenge = res.headers.get("www-authenticate") ?? "";
+    expect(challenge).toContain("Bearer");
+    expect(challenge).toContain(
+      'resource_metadata="https://proxy.example.com/.well-known/oauth-protected-resource/mcp"',
+    );
+  });
+
   it("POST without a credential → upstream 401 challenge with RFC 9728 resource_metadata", async () => {
     const app = await buildApp(true);
     const res = await app.request(MCP, {

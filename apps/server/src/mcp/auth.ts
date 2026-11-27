@@ -335,8 +335,31 @@ export function createMcpRequestHandler(options: CreateMcpRequestHandlerOptions)
       signal: owned.signal,
     });
     let abortWon = false;
+    let handedOffToStream = false;
     try {
-      return await Promise.race([admitted, abortRace]);
+      const response = await Promise.race([admitted, abortRace]);
+      if (isSseResponse(response)) {
+        if (owned.signal.aborted) {
+          void response.body?.cancel().catch(() => undefined);
+          return finalizeMcpEarlyExitResponse(c, mcpRequestAbortedResponse());
+        }
+        // Legacy stateless SSE responses return while the tool is still
+        // executing on the stream: keep the admission permit and client-abort
+        // bridge alive until the stream finishes, cancels, or aborts.
+        handedOffToStream = true;
+        return releaseWhenBodyEnds(
+          response,
+          () => {
+            requestSignal.removeEventListener("abort", onClientAbort);
+            admission.release();
+          },
+          {
+            endOn: owned.signal,
+            onCancel: () => owned.abort(),
+          },
+        );
+      }
+      return response;
     } catch (error) {
       if (error instanceof McpAdmissionAbortedError) {
         abortWon = true;
@@ -354,26 +377,129 @@ export function createMcpRequestHandler(options: CreateMcpRequestHandlerOptions)
       return finalizeMcpEarlyExitResponse(c, mcpInternalErrorResponse({ requestId }));
     } finally {
       detachAbortRace();
-      requestSignal.removeEventListener("abort", onClientAbort);
-      if (!abortWon) {
-        // Normal path: the race resolved through `admitted`, so it has
-        // already settled — release immediately (no permit leak).
-        admission.release();
-      } else {
-        // Abort path (F8 pass 5): the handler has answered 499, but the
-        // admitted promise may still be pending (un-cancellable verifier
-        // continuation). Hold the permit until it settles — bounded by the
-        // shadow-await cap so close() can never hang on an uncancellable
-        // upstream fetch. The DB-seam fence guarantees the residual
-        // continuation cannot touch the database; the factory fence
-        // guarantees it cannot create servers.
-        releaseAfterStrayContinuations(admitted, admission, {
-          requestId,
-          capMs: abortShadowAwaitMs,
-        });
+      if (!handedOffToStream) {
+        requestSignal.removeEventListener("abort", onClientAbort);
+        if (!abortWon) {
+          // Normal path: the race resolved through `admitted` with a
+          // non-streaming response, so it has already settled — release
+          // immediately (no permit leak).
+          admission.release();
+        } else {
+          // Abort path (F8 pass 5): the handler has answered 499, but the
+          // admitted promise may still be pending (un-cancellable verifier
+          // continuation). Hold the permit until it settles — bounded by the
+          // shadow-await cap so close() can never hang on an uncancellable
+          // upstream fetch. The DB-seam fence guarantees the residual
+          // continuation cannot touch the database; the factory fence
+          // guarantees it cannot create servers.
+          releaseAfterStrayContinuations(admitted, admission, {
+            requestId,
+            capMs: abortShadowAwaitMs,
+          });
+        }
       }
     }
   };
+}
+
+function isSseResponse(response: Response): boolean {
+  const contentType = response.headers.get("content-type");
+  if (contentType === null) return false;
+  const essence = contentType.split(";", 1)[0]?.trim().toLowerCase();
+  return essence === "text/event-stream" && response.body !== null;
+}
+
+/**
+ * Wrap a live streaming response (legacy stateless SSE) so `onDone` runs once
+ * its body finishes, errors, or is cancelled. When `endOn` aborts (client
+ * disconnect or `mcpAdmissionGate.close()`), the stream errors immediately,
+ * cancels the upstream reader (tearing down the SDK server/keep-alive timer),
+ * and calls `onDone`. When the consumer cancels the body directly, `onCancel`
+ * aborts the owned exchange signal before cancelling upstream and releasing.
+ */
+export function releaseWhenBodyEnds(
+  response: Response,
+  onDone: () => void,
+  options: {
+    endOn?: AbortSignal;
+    onCancel?: () => void;
+  } = {},
+): Response {
+  if (response.body === null) {
+    onDone();
+    return response;
+  }
+  const { endOn, onCancel } = options;
+  const reader = response.body.getReader();
+  let done = false;
+  let end = () => {};
+  const releaseOnce = () => {
+    if (done) return;
+    done = true;
+    endOn?.removeEventListener("abort", end);
+    onDone();
+  };
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      end = () => {
+        if (done) return;
+        done = true;
+        endOn?.removeEventListener("abort", end);
+        try {
+          controller.error(endOn?.reason ?? new Error("MCP exchange ended"));
+        } catch {
+          // Already closed or errored.
+        }
+        void reader.cancel(endOn?.reason).catch(() => undefined);
+        onDone();
+      };
+      if (endOn?.aborted) end();
+      else endOn?.addEventListener("abort", end, { once: true });
+    },
+    async pull(controller) {
+      if (done) return;
+      try {
+        const chunk = await reader.read();
+        if (done) return;
+        if (chunk.done) {
+          try {
+            controller.close();
+          } catch {
+            // Already closed or errored.
+          }
+          releaseOnce();
+          return;
+        }
+        controller.enqueue(chunk.value);
+      } catch (error) {
+        if (done) return;
+        try {
+          controller.error(error);
+        } catch {
+          // Already closed or errored.
+        }
+        releaseOnce();
+      }
+    },
+    async cancel(reason) {
+      if (done) return;
+      done = true;
+      endOn?.removeEventListener("abort", end);
+      onCancel?.();
+      try {
+        await reader.cancel(reason);
+      } catch {
+        // Best-effort upstream cancel.
+      } finally {
+        onDone();
+      }
+    },
+  });
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
 }
 
 /**
@@ -580,8 +706,12 @@ async function handleAdmittedRequest(
       response = await wrapped(canonicalRequest);
     }
     // Fence after the verifier/factory/dispatch await (F8): an abort that
-    // landed mid-exchange skips response augmentation entirely.
-    if (signal.aborted) return mcpRequestAbortedResponse();
+    // landed mid-exchange cancels any streaming body (stopping legacy SSE
+    // keep-alive timers / teardown) and skips response augmentation entirely.
+    if (signal.aborted) {
+      void response.body?.cancel().catch(() => undefined);
+      return mcpRequestAbortedResponse();
+    }
     // F9: the installed SDK CATCHES factory/dispatch failures internally
     // and RETURNS its own HTTP 500 JSON-RPC -32603 ("Internal server
     // error") — the catch below only sees THROWN errors, so without this
@@ -596,7 +726,10 @@ async function handleAdmittedRequest(
     // the losing continuation's c.newResponse merge below would otherwise
     // publish the 500's headers (including its Content-Length) onto the
     // shared prepared headers after the 499 already won.
-    if (signal.aborted) return await finalizeMcpEarlyExitResponse(c, mcpRequestAbortedResponse());
+    if (signal.aborted) {
+      void correlated.body?.cancel().catch(() => undefined);
+      return await finalizeMcpEarlyExitResponse(c, mcpRequestAbortedResponse());
+    }
     // Merge through Hono (c.newResponse) so headers set by EARLIER
     // middleware on the chain (the mcp:ip: limiter's X-RateLimit-* set)
     // survive the raw upstream Response — returning it directly would

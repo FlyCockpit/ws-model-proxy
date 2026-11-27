@@ -166,6 +166,42 @@ describe("secret canary", () => {
         expect(bodies.every((body) => body.includes('"jsonrpc"'))).toBe(true);
         expect(leaked(bodies)).toBe(false);
       });
+
+      it("the legacy 2025-06-18 SSE wire body of a call never carries it", async () => {
+        const authInfo: AuthInfo = {
+          token: "t",
+          clientId: "c",
+          scopes: ["mcp:read", "mcp:nodes:manage"],
+        };
+        bindMcpToolDispatch(authInfo, dispatch());
+        const bodies: string[] = [];
+        for (const args of [valid, { ...valid, extra: CANARY }, { ...valid, name: CANARY }]) {
+          const response = await createMcpTransport().fetch(
+            new Request("http://proxy.example.com/mcp", {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                accept: "application/json, text/event-stream",
+                "mcp-protocol-version": "2025-06-18",
+              },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "tools/call",
+                params: {
+                  name: contract.name,
+                  arguments: args,
+                },
+              }),
+            }),
+            { authInfo },
+          );
+          expect(response.headers.get("content-type")).toContain("text/event-stream");
+          bodies.push(await response.text());
+        }
+        expect(bodies.every((body) => body.includes('"jsonrpc"'))).toBe(true);
+        expect(leaked(bodies)).toBe(false);
+      });
     });
   }
 });

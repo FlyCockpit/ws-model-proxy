@@ -888,24 +888,34 @@ separate policy change.
 
 ## Protocol and transport
 
-- Endpoint: `POST /mcp` only. Other methods get `405` with `Allow: POST`
-  before authentication.
-- Built on the official MCP SDK v2 server with `legacy: "reject"` (legacy
-  protocol negotiation is rejected), JSON response mode, and
-  `maxSubscriptions: 0` — no subscriptions, no SSE, no notifications.
-- Stateless: there is no MCP session ID, session header, or sticky routing. A
-  fresh SDK server instance is created per request and torn down by the SDK.
-- Request bodies are capped at 1 MB.
+- Endpoint: `POST /mcp` only. Other methods (`GET`, `DELETE`, etc.) get `405`
+  with `Allow: POST` before authentication.
+- Built on the official MCP SDK v2 server (`@modelcontextprotocol/server`) with
+  `2026-07-28` as the primary protocol (`responseMode: "json"`,
+  `maxSubscriptions: 0` — no subscriptions, no mid-call notifications) and
+  stateless `2025-06-18` Streamable HTTP compatibility (`legacy: "stateless"`,
+  15 s SSE keep-alive for long tool calls, tested with Claude Code 2.1.332 and
+  Codex 0.172.0).
+- Single JSON-RPC message per request: JSON-RPC batch arrays are rejected with
+  HTTP 400 (`-32600`) on both protocols so every HTTP request maps to at most
+  one call under the IP and identity rate limits.
+- Stateless on both protocols: there is no MCP session ID, session header, or
+  sticky routing. A fresh SDK server instance is created per request and torn
+  down by the SDK when the exchange completes (or when a legacy SSE stream
+  finishes, cancels, or aborts).
+- Request bodies are capped at 1 MB (enforced at both the route body-limit
+  middleware and the transport's `maxRequestBodySize`).
 - Only `Authorization: Bearer` and `Authorization: DPoP` authenticate `/mcp`;
   browser cookies never do.
 - Shutdown is bounded and ordered: on SIGTERM/SIGINT, periodic jobs stop and
   in-flight HTTP requests **drain first** (ordinary work may continue during
   the drain); the MCP admission gate then closes — new `/mcp` admissions get
-  503 from that moment and outstanding admitted exchanges are aborted — and
-  gate closure is what arms the database shutdown fence (new DB work through
-  the shared client is rejected from that point, before Prisma disconnects).
-  Explicitly permitted durable cleanup (capacity-lease release and waiter
-  terminalization) is exempt from the fence and still runs after fencing.
+  503 from that moment and outstanding admitted exchanges (including in-flight
+  legacy SSE streams) are aborted — and gate closure is what arms the database
+  shutdown fence (new DB work through the shared client is rejected from that
+  point, before Prisma disconnects). Explicitly permitted durable cleanup
+  (capacity-lease release and waiter terminalization) is exempt from the fence
+  and still runs after fencing.
 
 ## Scopes
 
@@ -1378,12 +1388,13 @@ Let `ISSUER` = `<BETTER_AUTH_URL>/api/auth` and `RESOURCE` =
    delivery only — that access token fails at `/mcp`), while presenting the
    revoked **current** token fails and deletes the whole refresh family
    (see [Grants and revocation](#grants-and-revocation)).
-4. **Tool call** — `POST /mcp` (JSON, one JSON-RPC message per request). The
-   `2026-07-28` wire requires header/body agreement: `MCP-Protocol-Version`
-   must repeat the `_meta` protocol version, `Mcp-Method` must repeat the body
-   `method`, and `Mcp-Name` must repeat `params.name` when present (a missing
-   or mismatched header fails with `-32020`). `params._meta` carries the protocol
-   version, client info, and capabilities:
+4. **Tool call** — `POST /mcp` (one JSON-RPC message per request; JSON-RPC
+   batch arrays are rejected with HTTP 400 `-32600`). The primary `2026-07-28`
+   wire requires header/body agreement: `MCP-Protocol-Version` must repeat the
+   `_meta` protocol version, `Mcp-Method` must repeat the body `method`, and
+   `Mcp-Name` must repeat `params.name` when present (a missing or mismatched
+   header fails with `-32020`). `params._meta` carries the protocol version,
+   client info, and capabilities:
 
    ```
    POST /mcp HTTP/1.1
@@ -1410,6 +1421,13 @@ Let `ISSUER` = `<BETTER_AUTH_URL>/api/auth` and `RESOURCE` =
      }
    }
    ```
+
+   Stateless `2025-06-18` clients (tested with Claude Code 2.1.332 and Codex
+   0.172.0) also work over `POST /mcp` with
+   `Accept: application/json, text/event-stream` (`initialize` →
+   `notifications/initialized` → `tools/list` / `tools/call`), with no session
+   headers and the same authentication, scope, node-allowlist, rate-limit, and
+   single-message (no batching) rules.
 
 ### DPoP-preferred client (sender-constrained tokens)
 
@@ -1458,8 +1476,9 @@ When bumping the Better Auth family (`better-auth`, `@better-auth/mcp`,
    (the schema suite derives expected fields from the installed plugins and
    pins the deviation set, including `OauthResource.allowedScopes Json?`).
 3. **SDK protocol version** — the MCP server SDK v2 package and its
-   `legacy: "reject"` / JSON / `maxSubscriptions: 0` options; handler-owned
-   teardown.
+   `legacy: "stateless"` / `responseMode: "json"` / `maxSubscriptions: 0` /
+   `maxRequestBodySize` (1 MiB) / `keepAliveMs` (15 s) options, JSON-RPC batch
+   rejection, handler-owned teardown, and SSE streaming admission-gate lifetime.
 4. **Discovery aliases** — the four well-known paths still served natively by
    the plugins; the RFC 7591 `registration_endpoint` still advertised.
 5. **`oauthProviderClient` signed state** — `oauth_query` still carries the

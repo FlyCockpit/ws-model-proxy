@@ -102,6 +102,7 @@ vi.mock("@better-auth/mcp", async (importOriginal) => {
   };
 });
 
+import { MCP_READ_TOOLS } from "@ws-model-proxy/api/contracts";
 import { createMcpAdmissionGate } from "./admission";
 import type { AgentTokenIdentity } from "./agent-token-access";
 import {
@@ -115,6 +116,7 @@ import {
 } from "./auth";
 import { MCP_SYNTHETIC_SESSION_TOKEN, type McpSessionUser } from "./context";
 import { createMcpTransport } from "./handler";
+import { bindMcpToolDispatch } from "./tool-dispatch";
 
 const BASE = "https://proxy.example.com";
 const RESOURCE = `${BASE}/mcp`;
@@ -2074,5 +2076,466 @@ describe("createMcpRequestHandler — agent token admission", () => {
       access: { scopes: ALL_AGENT_SCOPES, nodeIds: null },
       expiresAt,
     });
+  });
+});
+
+function legacyWireRequest(
+  payload: unknown,
+  {
+    authorization,
+    protocolVersion,
+    signal,
+  }: { authorization?: string; protocolVersion?: string; signal?: AbortSignal } = {},
+) {
+  const h = new Headers({
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+    host: "proxy.example.com",
+  });
+  if (authorization) h.set("authorization", authorization);
+  if (protocolVersion) h.set("mcp-protocol-version", protocolVersion);
+  return new Request(RESOURCE, {
+    method: "POST",
+    headers: h,
+    body: typeof payload === "string" ? payload : JSON.stringify(payload),
+    ...(signal ? { signal } : {}),
+  });
+}
+
+function parseSseMessages(body: string): unknown[] {
+  const messages: unknown[] = [];
+  for (const frame of body.split("\n\n")) {
+    const data = frame
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice("data:".length).trimStart())
+      .join("\n");
+    if (data.length > 0) messages.push(JSON.parse(data));
+  }
+  return messages;
+}
+
+describe("createMcpRequestHandler — stateless legacy 2025-06-18 parity & SSE admission lifetime", () => {
+  const PAT = `wsmp_agent_${"b".repeat(43)}`;
+  const PAT_ID = "token-legacy-1";
+  const PAT_CLIENT_ID = `pat:${PAT_ID}`;
+
+  it("serves full 2025-06-18 sequence for OAuth token AND agent token with scoped tools and zero token leakage", async () => {
+    const gate = createMcpAdmissionGate();
+    const transport = createMcpTransport({ isShuttingDown: () => gate.closed });
+    const verified: McpVerifiedRequest[] = [];
+    const bind = (v: McpVerifiedRequest) => {
+      verified.push(v);
+      bindMcpToolDispatch(v.authInfo, {
+        orpcContext: v.orpcContext,
+        requestId: v.requestId,
+        signal: v.signal,
+        credential: v.credential,
+      });
+    };
+
+    const oauthHandler = createMcpRequestHandler({
+      authInstance: { options: {}, $context: Promise.resolve({}) } as never,
+      transport,
+      prisma: buildPrisma({
+        grant: { id: GRANT_ID, userId: SUB, clientId: CLIENT_ID, revokedAt: null },
+      }),
+      isForceTwoFactorRequired: async () => false,
+      consumeIdentityQuota: async () => ({ ok: true }),
+      now: () => new Date("2026-06-01T00:00:00Z"),
+      admissionGate: gate,
+      onVerified: bind,
+    });
+
+    const patHandler = createMcpRequestHandler({
+      authInstance: { options: {}, $context: Promise.resolve({}) } as never,
+      transport,
+      prisma: buildPrisma({
+        grant: {
+          id: GRANT_ID,
+          userId: SUB,
+          clientId: PAT_CLIENT_ID,
+          revokedAt: null,
+          scopes: ["READ"],
+          allNodes: false,
+          Nodes: [{ nodeId: "node-allowed" }],
+        },
+      }),
+      authenticateAgentToken: async () => ({
+        id: PAT_ID,
+        userId: SUB,
+        grantId: GRANT_ID,
+        access: { scopes: ["read"], nodeIds: ["node-allowed"] },
+        accessReadAt: performance.now(),
+        expiresAt: null,
+      }),
+      isForceTwoFactorRequired: async () => false,
+      consumeIdentityQuota: async () => ({ ok: true }),
+      now: () => new Date("2026-06-01T00:00:00Z"),
+      admissionGate: gate,
+      onVerified: bind,
+    });
+
+    for (const [label, handler, secret] of [
+      ["oauth", oauthHandler, TOKEN],
+      ["agent_token", patHandler, PAT],
+    ] as const) {
+      const auth = `Bearer ${secret}`;
+      const initRes = await callHandler(
+        handler,
+        legacyWireRequest(
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              clientInfo: { name: label, version: "1.0.0" },
+            },
+          },
+          { authorization: auth },
+        ),
+      );
+      expect(initRes.status, label).toBe(200);
+      expect(initRes.headers.get("content-type")).toContain("text/event-stream");
+      expect(initRes.headers.get("x-ratelimit-limit")).toBe("120");
+      expect(initRes.headers.get("mcp-session-id")).toBeNull();
+      expect(initRes.headers.get("set-cookie")).toBeNull();
+      const initBody = await initRes.text();
+      expect(initBody).not.toContain(secret);
+      const initMsg = parseSseMessages(initBody)[0] as { result?: { protocolVersion?: string } };
+      expect(initMsg?.result?.protocolVersion).toBe("2025-06-18");
+      expect(gate.outstanding).toBe(0);
+
+      const notifRes = await callHandler(
+        handler,
+        legacyWireRequest(
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          { authorization: auth, protocolVersion: "2025-06-18" },
+        ),
+      );
+      expect(notifRes.status, label).toBe(202);
+      expect(gate.outstanding).toBe(0);
+
+      const listRes = await callHandler(
+        handler,
+        legacyWireRequest(
+          { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+          { authorization: auth, protocolVersion: "2025-06-18" },
+        ),
+      );
+      expect(listRes.status, label).toBe(200);
+      const listMsg = parseSseMessages(await listRes.text())[0] as {
+        result?: { tools?: Array<{ name: string }> };
+      };
+      expect(listMsg?.result?.tools?.map((t) => t.name).sort()).toEqual([...MCP_READ_TOOLS].sort());
+      expect(gate.outstanding).toBe(0);
+
+      // Out-of-scope write tool is hidden & refused on legacy just like modern.
+      const deniedCallRes = await callHandler(
+        handler,
+        legacyWireRequest(
+          {
+            jsonrpc: "2.0",
+            id: 3,
+            method: "tools/call",
+            params: { name: "pool_create", arguments: { slug: "p" } },
+          },
+          { authorization: auth, protocolVersion: "2025-06-18" },
+        ),
+      );
+      expect(deniedCallRes.status, label).toBe(200);
+      const deniedBody = await deniedCallRes.text();
+      expect(deniedBody).toContain("Tool pool_create not found");
+      expect(deniedBody).not.toContain(secret);
+      expect(gate.outstanding).toBe(0);
+    }
+
+    // Node allowlist snapshot reached the verified context for the restricted agent token.
+    const patVerified = verified.find((v) => v.credential.kind === "agent_token");
+    expect(patVerified?.credential.access.nodeIds).toEqual(["node-allowed"]);
+    expect(JSON.stringify(patVerified?.orpcContext)).not.toContain(PAT);
+    await transport.close();
+  });
+
+  it("enforces revoked grant (403), invalid agent token (401), quota (429), and batch rejection (400 -32600) on legacy requests", async () => {
+    const transport = createMcpTransport();
+
+    const revoked = buildHandler({
+      transport,
+      prisma: buildPrisma({
+        grant: { id: GRANT_ID, userId: SUB, clientId: CLIENT_ID, revokedAt: new Date() },
+      }),
+    });
+    const revokedRes = await callHandler(
+      revoked.handler,
+      legacyWireRequest(
+        { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+        { authorization: `Bearer ${TOKEN}`, protocolVersion: "2025-06-18" },
+      ),
+    );
+    expect(revokedRes.status).toBe(403);
+    expect(revokedRes.headers.get("www-authenticate")).toBeNull();
+
+    const badPat = buildHandler({
+      transport,
+      authenticateAgentToken: async () => null,
+    });
+    const badPatRes = await callHandler(
+      badPat.handler,
+      legacyWireRequest(
+        { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+        { authorization: `Bearer ${PAT}`, protocolVersion: "2025-06-18" },
+      ),
+    );
+    expect(badPatRes.status).toBe(401);
+    expect(badPatRes.headers.get("www-authenticate") ?? "").toContain("invalid_token");
+
+    const throttled = buildHandler({
+      transport,
+      consumeIdentityQuota: async () => ({ ok: false, retryAfterSeconds: 19 }),
+    });
+    const throttledRes = await callHandler(
+      throttled.handler,
+      legacyWireRequest(
+        { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+        { authorization: `Bearer ${TOKEN}`, protocolVersion: "2025-06-18" },
+      ),
+    );
+    expect(throttledRes.status).toBe(429);
+    expect(throttledRes.headers.get("retry-after")).toBe("19");
+
+    const batch = buildHandler({ transport });
+    const batchRes = await callHandler(
+      batch.handler,
+      legacyWireRequest(
+        [
+          { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+          { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+        ],
+        { authorization: `Bearer ${TOKEN}`, protocolVersion: "2025-06-18" },
+      ),
+    );
+    expect(batchRes.status).toBe(400);
+    expect(batchRes.headers.get("x-ratelimit-limit")).toBe("120");
+    expect(await batchRes.json()).toEqual({
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: -32600,
+        message: "Invalid Request: JSON-RPC batching is not supported",
+      },
+    });
+    await transport.close();
+  });
+
+  it("redacts unexpected factory errors on legacy requests and preserves sanitized logging", async () => {
+    const transport = createMcpTransport({
+      registerTools: () => {
+        throw new Error("legacy-secret-boom");
+      },
+    });
+    const { handler } = buildHandler({ transport });
+    const res = await callHandler(
+      handler,
+      legacyWireRequest(
+        { jsonrpc: "2.0", id: 7, method: "tools/list", params: {} },
+        { authorization: `Bearer ${TOKEN}`, protocolVersion: "2025-06-18" },
+      ),
+    );
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as {
+      error?: { code?: number; data?: { requestId?: string } };
+    };
+    expect(body.error?.code).toBe(-32603);
+    expect(body.error?.data?.requestId).toBe("req-test");
+    expect(JSON.stringify(body)).not.toContain("legacy-secret-boom");
+    for (const line of errorSpy.mock.calls.flat().map(String)) {
+      expect(line).not.toContain("legacy-secret-boom");
+    }
+    await transport.close();
+  });
+
+  it("SSE STREAM LIFETIME (normal completion): holds admission permit until stream completes and removes abort listener", async () => {
+    const gate = createMcpAdmissionGate();
+    let finishTool!: () => void;
+    let toolStarted = false;
+    const transport = createMcpTransport({
+      isShuttingDown: () => gate.closed,
+      registerTools: (server) => {
+        server.registerTool("deferred_tool", { description: "deferred" }, () => {
+          toolStarted = true;
+          return new Promise((resolve) => {
+            finishTool = () =>
+              resolve({ content: [{ type: "text" as const, text: "stream-done" }] });
+          });
+        });
+      },
+    });
+    const { handler } = buildHandler({ admissionGate: gate, transport });
+    const controller = new AbortController();
+    const request = legacyWireRequest(
+      {
+        jsonrpc: "2.0",
+        id: 21,
+        method: "tools/call",
+        params: { name: "deferred_tool", arguments: {} },
+      },
+      {
+        authorization: `Bearer ${TOKEN}`,
+        protocolVersion: "2025-06-18",
+        signal: controller.signal,
+      },
+    );
+    let added = 0;
+    let removed = 0;
+    const rawSignal = request.signal;
+    const origAdd = rawSignal.addEventListener.bind(rawSignal);
+    const origRemove = rawSignal.removeEventListener.bind(rawSignal);
+    Object.defineProperty(rawSignal, "addEventListener", {
+      value: (...args: Parameters<typeof origAdd>) => {
+        if (args[0] === "abort") added += 1;
+        return origAdd(...args);
+      },
+    });
+    Object.defineProperty(rawSignal, "removeEventListener", {
+      value: (...args: Parameters<typeof origRemove>) => {
+        if (args[0] === "abort") removed += 1;
+        return origRemove(...args);
+      },
+    });
+
+    const res = await callHandler(handler, request);
+    await vi.waitFor(() => expect(toolStarted).toBe(true));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    expect(res.headers.get("x-ratelimit-limit")).toBe("120");
+    // Permit and abort listener stay held while the SSE tool call is still executing!
+    expect(gate.outstanding).toBe(1);
+    expect(added).toBe(1);
+    expect(removed).toBe(0);
+
+    finishTool();
+    const body = await res.text();
+    const messages = parseSseMessages(body) as Array<{ result?: { content?: unknown[] } }>;
+    expect(messages[0]?.result?.content).toEqual([{ type: "text", text: "stream-done" }]);
+    expect(gate.outstanding).toBe(0);
+    expect(removed).toBe(1);
+    await Promise.all([gate.close(), transport.close()]);
+  });
+
+  it("SSE STREAM LIFETIME (gate.close()): aborts owned signal, ends SSE stream, and releases permit cleanly", async () => {
+    const gate = createMcpAdmissionGate();
+    let observedSignal: AbortSignal | undefined;
+    let toolStarted = false;
+    const transport = createMcpTransport({
+      isShuttingDown: () => gate.closed,
+      registerTools: (server, ctx) => {
+        server.registerTool("hanging_tool", { description: "hanging" }, () => {
+          toolStarted = true;
+          observedSignal = ctx.requestInfo?.signal;
+          return new Promise(() => {});
+        });
+      },
+    });
+    const { handler } = buildHandler({ admissionGate: gate, transport });
+    const res = await callHandler(
+      handler,
+      legacyWireRequest(
+        {
+          jsonrpc: "2.0",
+          id: 22,
+          method: "tools/call",
+          params: { name: "hanging_tool", arguments: {} },
+        },
+        { authorization: `Bearer ${TOKEN}`, protocolVersion: "2025-06-18" },
+      ),
+    );
+    await vi.waitFor(() => expect(toolStarted).toBe(true));
+    expect(gate.outstanding).toBe(1);
+    expect(observedSignal?.aborted).toBe(false);
+
+    const closing = gate.close();
+    expect(observedSignal?.aborted).toBe(true);
+    await closing;
+    expect(gate.outstanding).toBe(0);
+    // Reading the aborted SSE stream terminates with an error rather than hanging.
+    await expect(res.text()).rejects.toThrow();
+    await transport.close();
+  });
+
+  it("SSE STREAM LIFETIME (client abort): propagates to owned signal, ends SSE stream, and releases permit", async () => {
+    const gate = createMcpAdmissionGate();
+    let observedSignal: AbortSignal | undefined;
+    let toolStarted = false;
+    const transport = createMcpTransport({
+      isShuttingDown: () => gate.closed,
+      registerTools: (server, ctx) => {
+        server.registerTool("hanging_tool", { description: "hanging" }, () => {
+          toolStarted = true;
+          observedSignal = ctx.requestInfo?.signal;
+          return new Promise(() => {});
+        });
+      },
+    });
+    const { handler } = buildHandler({ admissionGate: gate, transport });
+    const client = new AbortController();
+    const res = await callHandler(
+      handler,
+      legacyWireRequest(
+        {
+          jsonrpc: "2.0",
+          id: 23,
+          method: "tools/call",
+          params: { name: "hanging_tool", arguments: {} },
+        },
+        { authorization: `Bearer ${TOKEN}`, protocolVersion: "2025-06-18", signal: client.signal },
+      ),
+    );
+    await vi.waitFor(() => expect(toolStarted).toBe(true));
+    expect(gate.outstanding).toBe(1);
+
+    client.abort();
+    expect(observedSignal?.aborted).toBe(true);
+    expect(gate.outstanding).toBe(0);
+    await expect(res.text()).rejects.toThrow();
+    await Promise.all([gate.close(), transport.close()]);
+  });
+
+  it("SSE STREAM LIFETIME (body cancel): cancelling the response body aborts owned signal and releases permit", async () => {
+    const gate = createMcpAdmissionGate();
+    let observedSignal: AbortSignal | undefined;
+    let toolStarted = false;
+    const transport = createMcpTransport({
+      isShuttingDown: () => gate.closed,
+      registerTools: (server, ctx) => {
+        server.registerTool("hanging_tool", { description: "hanging" }, () => {
+          toolStarted = true;
+          observedSignal = ctx.requestInfo?.signal;
+          return new Promise(() => {});
+        });
+      },
+    });
+    const { handler } = buildHandler({ admissionGate: gate, transport });
+    const res = await callHandler(
+      handler,
+      legacyWireRequest(
+        {
+          jsonrpc: "2.0",
+          id: 24,
+          method: "tools/call",
+          params: { name: "hanging_tool", arguments: {} },
+        },
+        { authorization: `Bearer ${TOKEN}`, protocolVersion: "2025-06-18" },
+      ),
+    );
+    await vi.waitFor(() => expect(toolStarted).toBe(true));
+    expect(gate.outstanding).toBe(1);
+
+    await res.body?.cancel();
+    expect(observedSignal?.aborted).toBe(true);
+    expect(gate.outstanding).toBe(0);
+    await Promise.all([gate.close(), transport.close()]);
   });
 });

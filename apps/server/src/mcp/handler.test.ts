@@ -28,6 +28,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createMcpTransport,
   MCP_SERVER_INFO,
+  MCP_SSE_KEEP_ALIVE_MS,
+  MCP_TRANSPORT_MAX_REQUEST_BODY_BYTES,
   MCP_TRANSPORT_OPTIONS,
   mcpToolManifestHash,
 } from "./handler";
@@ -141,11 +143,15 @@ afterEach(() => {
 });
 
 describe("createMcpTransport — pinned configuration", () => {
-  it("configures exactly legacy reject, json response mode, zero subscriptions", () => {
+  it("configures stateless legacy, json response mode, zero subscriptions, 1 MiB body bound, and 15 s keep-alive", () => {
+    expect(MCP_TRANSPORT_MAX_REQUEST_BODY_BYTES).toBe(1_048_576);
+    expect(MCP_SSE_KEEP_ALIVE_MS).toBe(15_000);
     expect(MCP_TRANSPORT_OPTIONS).toEqual({
-      legacy: "reject",
+      legacy: "stateless",
       responseMode: "json",
       maxSubscriptions: 0,
+      maxRequestBodySize: 1_048_576,
+      keepAliveMs: 15_000,
     });
   });
 
@@ -282,45 +288,328 @@ describe("createMcpTransport — modern POST exchanges", () => {
   });
 });
 
-describe("createMcpTransport — legacy rejection and subscription refusal", () => {
-  it("a 2025-era initialize (no envelope) is REJECTED with the unsupported-protocol-version error", async () => {
-    const handler = createMcpTransport();
-    const res = await handler.fetch(
-      new Request("http://proxy.example.com/mcp", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 10,
-          method: "initialize",
-          params: {
-            protocolVersion: "2025-06-18",
-            capabilities: {},
-            clientInfo: { name: "c", version: "1" },
-          },
-        }),
-      }),
-    );
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as {
-      error?: { code?: number; data?: { supported?: string[] } };
+function legacyRequest(
+  payload: unknown,
+  headers: Record<string, string> = {},
+  signal?: AbortSignal,
+) {
+  return new Request("http://proxy.example.com/mcp", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      ...headers,
+    },
+    body: typeof payload === "string" ? payload : JSON.stringify(payload),
+    ...(signal ? { signal } : {}),
+  });
+}
+
+function parseSseJsonEvents(body: string): unknown[] {
+  const events: unknown[] = [];
+  for (const frame of body.split("\n\n")) {
+    const dataLines = frame
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice("data:".length).trimStart());
+    if (dataLines.length === 0) continue;
+    const joined = dataLines.join("\n");
+    if (joined.length > 0) events.push(JSON.parse(joined));
+  }
+  return events;
+}
+
+describe("createMcpTransport — stateless legacy 2025-06-18, batch rejection, and subscription refusal", () => {
+  it("serves a full stateless 2025-06-18 sequence (initialize → notifications/initialized → tools/list → tools/call) without session headers", async () => {
+    const seenAuth: (AuthInfo | undefined)[] = [];
+    const teardowns: string[] = [];
+    const handler = createMcpTransport({
+      registerTools: (server, ctx) => {
+        seenAuth.push(ctx.authInfo);
+        server.registerTool("probe", { description: "probe tool" }, async () => ({
+          content: [{ type: "text" as const, text: "legacy-ok" }],
+        }));
+        server.server.onclose = () => teardowns.push("closed");
+      },
+    });
+    const authInfo: AuthInfo = {
+      token: "presented-token",
+      clientId: "client-legacy",
+      scopes: ["mcp:read"],
+      expiresAt: 1_900_000_000,
+      resource: new URL("https://proxy.example.com/mcp"),
+      extra: { sub: "user-legacy" },
     };
-    expect(body.error?.code).toBe(-32022);
-    expect(body.error?.data?.supported).toEqual(["2026-07-28"]);
+
+    const initRes = await handler.fetch(
+      legacyRequest({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "codex-cli", version: "0.172.0" },
+        },
+      }),
+      { authInfo },
+    );
+    expect(initRes.status).toBe(200);
+    expect(initRes.headers.get("content-type")).toContain("text/event-stream");
+    expect(initRes.headers.get("mcp-session-id")).toBeNull();
+    expect(initRes.headers.get("set-cookie")).toBeNull();
+    const initEvents = parseSseJsonEvents(await initRes.text()) as Array<{
+      id?: number;
+      result?: {
+        protocolVersion?: string;
+        serverInfo?: { name?: string; version?: string };
+        capabilities?: { tools?: { listChanged?: boolean } };
+      };
+    }>;
+    expect(initEvents).toHaveLength(1);
+    expect(initEvents[0]?.id).toBe(1);
+    expect(initEvents[0]?.result?.protocolVersion).toBe("2025-06-18");
+    expect(initEvents[0]?.result?.serverInfo).toEqual(MCP_SERVER_INFO);
+    expect(initEvents[0]?.result?.capabilities?.tools).toEqual({ listChanged: false });
+
+    const notifiedRes = await handler.fetch(
+      legacyRequest(
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { "mcp-protocol-version": "2025-06-18" },
+      ),
+      { authInfo },
+    );
+    expect(notifiedRes.status).toBe(202);
+    expect(notifiedRes.headers.get("mcp-session-id")).toBeNull();
+    expect(await notifiedRes.text()).toBe("");
+
+    const listRes = await handler.fetch(
+      legacyRequest(
+        { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+        { "mcp-protocol-version": "2025-06-18" },
+      ),
+      { authInfo },
+    );
+    expect(listRes.status).toBe(200);
+    expect(listRes.headers.get("mcp-session-id")).toBeNull();
+    const listEvents = parseSseJsonEvents(await listRes.text()) as Array<{
+      result?: { tools?: Array<{ name: string }> };
+    }>;
+    expect(listEvents[0]?.result?.tools?.map((tool) => tool.name)).toEqual(["probe"]);
+
+    const callRes = await handler.fetch(
+      legacyRequest(
+        { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "probe", arguments: {} } },
+        { "mcp-protocol-version": "2025-06-18" },
+      ),
+      { authInfo },
+    );
+    expect(callRes.status).toBe(200);
+    expect(callRes.headers.get("mcp-session-id")).toBeNull();
+    const callEvents = parseSseJsonEvents(await callRes.text()) as Array<{
+      result?: { content?: unknown[] };
+    }>;
+    expect(callEvents[0]?.result?.content).toEqual([{ type: "text", text: "legacy-ok" }]);
+    expect(seenAuth).toEqual([authInfo, authInfo, authInfo, authInfo]);
+    expect(teardowns.length).toBeGreaterThanOrEqual(4);
   });
 
-  it("an envelope-less ping is rejected as modern-only (no 2025 serving exists)", async () => {
-    const handler = createMcpTransport();
+  it("emits SSE keep-alive comments during a long legacy tool call", async () => {
+    let finishTool!: () => void;
+    const handler = createMcpTransport({
+      keepAliveMs: 25,
+      registerTools: (server) => {
+        server.registerTool(
+          "slow_probe",
+          { description: "slow probe" },
+          () =>
+            new Promise((resolve) => {
+              finishTool = () => resolve({ content: [{ type: "text" as const, text: "done" }] });
+            }),
+        );
+      },
+    });
     const res = await handler.fetch(
+      legacyRequest(
+        {
+          jsonrpc: "2.0",
+          id: 9,
+          method: "tools/call",
+          params: { name: "slow_probe", arguments: {} },
+        },
+        { "mcp-protocol-version": "2025-06-18" },
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const reader = res.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+    let seen = "";
+    const readAll = (async () => {
+      if (!reader) return;
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        seen += decoder.decode(chunk.value, { stream: true });
+      }
+    })();
+    await vi.waitFor(() => expect(seen).toContain(":"));
+    finishTool();
+    await readAll;
+    const events = parseSseJsonEvents(seen) as Array<{ result?: { content?: unknown[] } }>;
+    expect(events[0]?.result?.content).toEqual([{ type: "text", text: "done" }]);
+  });
+
+  it.each([
+    [
+      "multi-item batch",
+      JSON.stringify([
+        { jsonrpc: "2.0", id: 1, method: "ping" },
+        { jsonrpc: "2.0", id: 2, method: "ping" },
+      ]),
+    ],
+    ["single-item batch", JSON.stringify([{ jsonrpc: "2.0", id: 1, method: "ping" }])],
+    ["empty batch", "[]"],
+    [
+      "UTF-8 BOM prefixed batch",
+      `\uFEFF${JSON.stringify([{ jsonrpc: "2.0", id: 1, method: "ping" }])}`,
+    ],
+  ])("rejects JSON-RPC %s with HTTP 400 -32600 without invoking factory", async (_label, body) => {
+    const factorySpy = vi.fn();
+    const handler = createMcpTransport({ registerTools: factorySpy });
+    const res = await handler.fetch(legacyRequest(body));
+    expect(res.status).toBe(400);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(res.headers.get("cache-control")).toBe("private, no-store");
+    expect(await res.json()).toEqual({
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: -32600,
+        message: "Invalid Request: JSON-RPC batching is not supported",
+      },
+    });
+    expect(factorySpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects pre-parsed JSON-RPC batch arrays passed via parsedBody with HTTP 400 -32600", async () => {
+    const factorySpy = vi.fn();
+    const handler = createMcpTransport({ registerTools: factorySpy });
+    const res = await handler.fetch(legacyRequest("{}"), {
+      parsedBody: [{ jsonrpc: "2.0", id: 1, method: "ping" }],
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: -32600,
+        message: "Invalid Request: JSON-RPC batching is not supported",
+      },
+    });
+    expect(factorySpy).not.toHaveBeenCalled();
+  });
+
+  it("enforces maxRequestBodySize on both declared Content-Length and streamed bodies (413)", async () => {
+    const factorySpy = vi.fn();
+    const handler = createMcpTransport({ registerTools: factorySpy, maxRequestBodySize: 64 });
+
+    const declared = await handler.fetch(
+      legacyRequest(
+        { jsonrpc: "2.0", id: 1, method: "ping", params: { pad: "x".repeat(128) } },
+        { "content-length": "256" },
+      ),
+    );
+    expect(declared.status).toBe(413);
+    const declaredBody = (await declared.json()) as { error?: { code?: number } };
+    expect(declaredBody.error?.code).toBe(-32000);
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("x".repeat(100)));
+        controller.close();
+      },
+    });
+    const streamed = await handler.fetch(
       new Request("http://proxy.example.com/mcp", {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 11, method: "ping", params: {} }),
-      }),
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: stream,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" }),
     );
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error?: { code?: number } };
-    expect(body.error?.code).toBe(-32022);
+    expect(streamed.status).toBe(413);
+    expect(factorySpy).not.toHaveBeenCalled();
+  });
+
+  it("handles fragmented streams with empty chunks, rejects fragmented batches, and enforces exact byte cap", async () => {
+    const factorySpy = vi.fn((server: McpServer) => {
+      server.registerTool("probe", { description: "probe" }, async () => ({
+        content: [{ type: "text" as const, text: "frag-ok" }],
+      }));
+    });
+    const handler = createMcpTransport({ registerTools: factorySpy, maxRequestBodySize: 120 });
+
+    const makeFragmentedRequest = (payload: string) => {
+      const encoded = new TextEncoder().encode(payload);
+      let index = 0;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (index >= encoded.byteLength) {
+            controller.enqueue(new Uint8Array(0));
+            controller.close();
+            return;
+          }
+          controller.enqueue(new Uint8Array(0));
+          controller.enqueue(encoded.subarray(index, index + 1));
+          index += 1;
+        },
+      });
+      return new Request("http://proxy.example.com/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          "mcp-protocol-version": "2025-06-18",
+        },
+        body: stream,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" });
+    };
+
+    // Valid single request delivered 1 byte at a time with empty chunks succeeds.
+    const okRes = await handler.fetch(
+      makeFragmentedRequest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "probe", arguments: {} },
+        }),
+      ),
+    );
+    expect(okRes.status).toBe(200);
+    const okEvents = parseSseJsonEvents(await okRes.text()) as Array<{
+      result?: { content?: unknown[] };
+    }>;
+    expect(okEvents[0]?.result?.content).toEqual([{ type: "text", text: "frag-ok" }]);
+    expect(factorySpy).toHaveBeenCalledTimes(1);
+
+    // Fragmented batch is rejected with 400 -32600 without invoking factory again.
+    const batchRes = await handler.fetch(
+      makeFragmentedRequest(JSON.stringify([{ jsonrpc: "2.0", id: 2, method: "ping" }])),
+    );
+    expect(batchRes.status).toBe(400);
+    expect(factorySpy).toHaveBeenCalledTimes(1);
+
+    // Fragmented body exceeding maxRequestBodySize by 1 byte is rejected with 413.
+    const tooLargeRes = await handler.fetch(makeFragmentedRequest("x".repeat(121)));
+    expect(tooLargeRes.status).toBe(413);
+    expect(factorySpy).toHaveBeenCalledTimes(1);
   });
 
   it("maxSubscriptions 0: subscriptions/listen is refused in-band (-32603), never an SSE stream", async () => {
