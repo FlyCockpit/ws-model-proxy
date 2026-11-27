@@ -12,6 +12,7 @@ import {
   agentScopeToDb,
   MCP_FINE_SCOPES,
 } from "@ws-model-proxy/auth/agent-scopes";
+import prisma from "@ws-model-proxy/db";
 import { betterAuth } from "better-auth";
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -2232,6 +2233,58 @@ describe("createMcpRequestHandler — stateless legacy 2025-06-18 parity & SSE a
       expect(listMsg?.result?.tools?.map((t) => t.name).sort()).toEqual([...MCP_READ_TOOLS].sort());
       expect(gate.outstanding).toBe(0);
 
+      // Exercise the production SDK → dispatch binding → oRPC router path.
+      // Only persistence is mocked; an injected smoke tool would miss this seam.
+      vi.mocked(prisma.node.findMany).mockResolvedValue([]);
+      const callRes = await callHandler(
+        handler,
+        legacyWireRequest(
+          {
+            jsonrpc: "2.0",
+            id: 3,
+            method: "tools/call",
+            params: { name: "nodes_get", arguments: {} },
+          },
+          { authorization: auth, protocolVersion: "2025-06-18" },
+        ),
+      );
+      expect(callRes.status, label).toBe(200);
+      const callMsg = parseSseMessages(await callRes.text())[0] as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      };
+      expect(callMsg.result?.isError, label).not.toBe(true);
+      expect(JSON.parse(callMsg.result?.content?.[0]?.text ?? "null")).toEqual({});
+      expect(prisma.node.findMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          where: {
+            userId: SUB,
+            ...(label === "agent_token" ? { id: { in: ["node-allowed"] } } : {}),
+          },
+        }),
+      );
+      expect(gate.outstanding).toBe(0);
+
+      if (label === "agent_token") {
+        vi.mocked(prisma.node.findFirst).mockClear();
+        const outsideGrant = await callHandler(
+          handler,
+          legacyWireRequest(
+            {
+              jsonrpc: "2.0",
+              id: 4,
+              method: "tools/call",
+              params: { name: "nodes_get", arguments: { nodeId: "node-forbidden" } },
+            },
+            { authorization: auth, protocolVersion: "2025-06-18" },
+          ),
+        );
+        const denied = parseSseMessages(await outsideGrant.text())[0] as {
+          result?: { isError?: boolean };
+        };
+        expect(denied.result?.isError).toBe(true);
+        expect(prisma.node.findFirst).not.toHaveBeenCalled();
+      }
+
       // Out-of-scope write tool is hidden & refused on legacy just like modern.
       const deniedCallRes = await callHandler(
         handler,
@@ -2329,6 +2382,49 @@ describe("createMcpRequestHandler — stateless legacy 2025-06-18 parity & SSE a
     });
     await transport.close();
   });
+
+  it.each(["revoked", "missing"] as const)(
+    "refuses every legacy sequence step for a %s grant before server creation",
+    async (state) => {
+      const registerTools = vi.fn();
+      const transport = createMcpTransport({ registerTools });
+      const { handler, verified } = buildHandler({
+        transport,
+        prisma: buildPrisma({
+          grant:
+            state === "missing"
+              ? null
+              : { id: GRANT_ID, userId: SUB, clientId: CLIENT_ID, revokedAt: new Date() },
+        }),
+      });
+      for (const [id, method, params] of [
+        [
+          1,
+          "initialize",
+          {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "codex", version: "0.172.0" },
+          },
+        ],
+        [2, "tools/list", {}],
+        [3, "tools/call", { name: "nodes_get", arguments: {} }],
+      ] as const) {
+        const response = await callHandler(
+          handler,
+          legacyWireRequest(
+            { jsonrpc: "2.0", id, method, params },
+            { authorization: `Bearer ${TOKEN}`, protocolVersion: "2025-06-18" },
+          ),
+        );
+        expect(response.status, method).toBe(403);
+        expect(await response.text()).not.toContain(TOKEN);
+      }
+      expect(verified).toEqual([]);
+      expect(registerTools).not.toHaveBeenCalled();
+      await transport.close();
+    },
+  );
 
   it("redacts unexpected factory errors on legacy requests and preserves sanitized logging", async () => {
     const transport = createMcpTransport({

@@ -46,7 +46,7 @@ exact vector-space contract. See [external fallback](docs/external-fallback.md).
 
 One Docker service (Hono server, React web app, oRPC API, MCP server and websocket relay) runs on a VPS with Postgres. Each node runs `wsmp`, which logs in once with `wsmp login` and a one-time enrollment code from the **Nodes** page, then holds one outbound websocket to the server. The server routes `/v1/*` requests for a pool to a runtime on a connected node, and the node proxies them to its local inference server. One node can hold many runtimes, and a multi-node runtime spans several nodes. Request media passes through the proxy.
 
-An MCP (Model Context Protocol) server (`2026-07-28` primary, plus stateless `2025-06-18` compatibility tested with Claude Code 2.1.332 and Codex 0.172.0) exposes dashboard operations to OAuth-authenticated and agent-token clients. It is on by default; set `WMP_MCP_ENABLED=false` to close it — see [docs/mcp.md](docs/mcp.md).
+An MCP (Model Context Protocol) server (`2026-07-28` primary, plus stateless `2025-06-18` compatibility covered by protocol and security integration tests) exposes dashboard operations to OAuth-authenticated and agent-token clients. It is on by default; set `WMP_MCP_ENABLED=false` to close it — see [docs/mcp.md](docs/mcp.md).
 
 ## Quick start
 

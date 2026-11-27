@@ -894,8 +894,8 @@ separate policy change.
   `2026-07-28` as the primary protocol (`responseMode: "json"`,
   `maxSubscriptions: 0` — no subscriptions, no mid-call notifications) and
   stateless `2025-06-18` Streamable HTTP compatibility (`legacy: "stateless"`,
-  15 s SSE keep-alive for long tool calls, tested with Claude Code 2.1.332 and
-  Codex 0.172.0).
+  15 s SSE keep-alive for long tool calls). Protocol and security integration
+  tests cover the legacy request path.
 - Single JSON-RPC message per request: JSON-RPC batch arrays are rejected with
   HTTP 400 (`-32600`) on both protocols so every HTTP request maps to at most
   one call under the IP and identity rate limits.
@@ -916,6 +916,12 @@ separate policy change.
   point, before Prisma disconnects). Explicitly permitted durable cleanup
   (capacity-lease release and waiter terminalization) is exempt from the fence
   and still runs after fencing.
+
+Installed-client transport smoke tests with Claude Code 2.1.332 and Codex
+0.172.0 use fixture-backed tools. They verify request negotiation and transport,
+but do not verify an OAuth login or retrieval of persisted application data.
+Full live client verification is pending; the setup instructions above describe
+the supported connection flow.
 
 ## Scopes
 
@@ -1422,8 +1428,7 @@ Let `ISSUER` = `<BETTER_AUTH_URL>/api/auth` and `RESOURCE` =
    }
    ```
 
-   Stateless `2025-06-18` clients (tested with Claude Code 2.1.332 and Codex
-   0.172.0) also work over `POST /mcp` with
+   Stateless `2025-06-18` requests are also accepted over `POST /mcp` with
    `Accept: application/json, text/event-stream` (`initialize` →
    `notifications/initialized` → `tools/list` / `tools/call`), with no session
    headers and the same authentication, scope, node-allowlist, rate-limit, and
