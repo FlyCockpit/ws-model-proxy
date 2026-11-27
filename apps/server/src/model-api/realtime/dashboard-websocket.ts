@@ -1,5 +1,9 @@
 import type { Session } from "@ws-model-proxy/auth";
 import type { Context, MiddlewareHandler } from "hono";
+import {
+  hasExpectedBrowserIdentity,
+  rejectBrowserIdentity,
+} from "../../browser-socket-identity.js";
 import { resolveClientIp } from "../../client-ip.js";
 import { createRateLimiterMiddleware, realtimeUpgradeLimiter } from "../../rate-limit.js";
 import { sessionMiddleware } from "../../session-middleware.js";
@@ -119,7 +123,11 @@ export function createDashboardRealtimeMiddleware(
         "Cross-site request blocked.",
       );
     }
-    const query = readRealtimeQuery(c.req.url);
+    // The owner is a dashboard-only consistency field. Keep the bearer API's
+    // strict query parser and credential handling unchanged.
+    const queryUrl = new URL(c.req.url);
+    queryUrl.searchParams.delete("expectedUser");
+    const query = readRealtimeQuery(queryUrl.toString());
     if (!query.ok) return errorResponse(c, 400, "invalid_request_error", query.code, query.message);
     const session = await readSession(c);
     const userId = session?.user?.id;
@@ -133,6 +141,7 @@ export function createDashboardRealtimeMiddleware(
         "Sign in to the dashboard first.",
       );
     }
+    if (!hasExpectedBrowserIdentity(c, userId)) return rejectBrowserIdentity(c, next);
     // An admin's impersonation session is read-only: no live session as the person.
     if (session?.session?.impersonatedBy) {
       return errorResponse(

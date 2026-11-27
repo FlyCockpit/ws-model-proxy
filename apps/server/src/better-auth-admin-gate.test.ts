@@ -42,6 +42,7 @@ describe("betterAuthAdminGate", () => {
     app.all("/api/auth/admin/set-role", downstream);
     app.all("/api/auth/admin/stop-impersonating", downstream);
     app.all("/api/auth/admin/impersonate-user", downstream);
+    app.all("/api/auth/admin/*", downstream);
   });
 
   it("rejects unauthenticated callers with 401", async () => {
@@ -89,11 +90,11 @@ describe("betterAuthAdminGate", () => {
     expect(downstream).not.toHaveBeenCalled();
   });
 
-  it("admits verified admins when force2fa is disabled", async () => {
+  it("admits verified admins to supported operations when force2fa is disabled", async () => {
     getSession.mockResolvedValue({
       user: { id: "a1", role: "admin", emailVerified: true, twoFactorEnabled: false },
     });
-    const res = await app.request("/api/auth/admin/set-role", {
+    const res = await app.request("/api/auth/admin/impersonate-user", {
       method: "POST",
       headers: {
         Authorization: "Bearer wsmp_model_secret",
@@ -157,5 +158,34 @@ describe("betterAuthAdminGate", () => {
     const res = await app.request(path, { method });
     expect(res.status).toBe(403);
     expect(downstream).not.toHaveBeenCalled();
+  });
+});
+
+describe("Better Auth parallel access writes", () => {
+  it.each([
+    ["set-role", {}],
+    ["ban-user", {}],
+    ["unban-user", {}],
+    ["remove-user", {}],
+    ["update-user", { data: { role: "admin" } }],
+    ["update-user", { data: { banned: false } }],
+    ["update-user", { data: { banExpires: null } }],
+    ["update-user", { data: { emailVerified: true } }],
+  ])("blocks %s before the endpoint writes", async (path, body) => {
+    getSession.mockResolvedValue({ user: { id: "a", role: "admin", emailVerified: true } });
+    invalidateForceTwoFactorPolicyCache();
+    db.appSetting.findUnique.mockResolvedValue(null);
+    const endpoint = vi.fn((c: Context) => c.json({ wrote: true }));
+    const server = new Hono();
+    server.use("*", betterAuthAdminGate);
+    server.all("*", endpoint);
+    const response = await server.request(`/api/auth/admin/${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ error: "USE_ORPC_USER_MANAGEMENT" });
+    expect(endpoint).not.toHaveBeenCalled();
   });
 });

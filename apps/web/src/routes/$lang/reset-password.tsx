@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
-
 import { ResetPasswordCard } from "@/components/auth/reset-password-card";
+import { markAnonymousOnlyRoute } from "@/lib/document-identity";
 import { parseResetPasswordSearch } from "@/lib/reset-password-search";
 
 /**
@@ -21,6 +21,7 @@ export const Route = createFileRoute("/$lang/reset-password")({
 });
 
 function ResetPasswordPage() {
+  markAnonymousOnlyRoute();
   const { lang } = Route.useParams();
   const { token, error, invite } = Route.useSearch();
   return <ResetPasswordCard lang={lang} token={token} error={error} invite={invite === 1} />;

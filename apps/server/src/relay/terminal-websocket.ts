@@ -16,6 +16,7 @@ import { env } from "@ws-model-proxy/env/server";
 import type { Context, MiddlewareHandler } from "hono";
 import type { WSContext, WSEvents } from "hono/ws";
 import { z } from "zod";
+import { hasExpectedBrowserIdentity, rejectBrowserIdentity } from "../browser-socket-identity.js";
 import { resolveClientIp } from "../client-ip.js";
 import { createRateLimiterMiddleware, rpcLimiter } from "../rate-limit.js";
 import { sessionMiddleware } from "../session-middleware.js";
@@ -1510,6 +1511,7 @@ export function createTerminalWebsocketMiddleware(): MiddlewareHandler<{
     if (!normalized || !terminalAllowedOrigins().has(normalized)) {
       return c.json({ error: "Cross-site request blocked." }, 403);
     }
+    if (!hasExpectedBrowserIdentity(c, session.user.id)) return rejectBrowserIdentity(c, next);
     // Same decision as protected dashboard procedures: an unenrolled user
     // under the force-2FA policy gets no shell.
     if ((await isForceTwoFactorRequired()) && !session.user.twoFactorEnabled) {

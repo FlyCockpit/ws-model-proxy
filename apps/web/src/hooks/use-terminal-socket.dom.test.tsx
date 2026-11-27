@@ -9,6 +9,11 @@ import {
 import { createRef, type Ref, useImperativeHandle } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import {
+  isDocumentReplaced,
+  observeDocumentIdentity,
+  resetDocumentIdentityForTests,
+} from "@/lib/document-identity";
 import type { TerminalClientMessage } from "@/lib/terminal-protocol";
 
 import { type TerminalSendResult, useTerminalSocket } from "./use-terminal-socket";
@@ -116,10 +121,45 @@ function renderSend() {
 afterEach(() => {
   cleanup();
   MockWebSocket.instances = [];
+  resetDocumentIdentityForTests(() => undefined);
+  document.documentElement.style.removeProperty("display");
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("useTerminalSocket", () => {
+  it("keeps A's owner on reconnect and replaces the document on an identity close", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    observeDocumentIdentity("a");
+    const ref = createRef<SendHandle>();
+    render(<SendProbe ref={ref} />);
+    const first = MockWebSocket.instances[0];
+    act(() => {
+      first?.open();
+      first?.close(1006);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750);
+    });
+    const second = MockWebSocket.instances[1];
+    expect(second).toBeDefined();
+    expect(new URL(second?.url ?? "").searchParams.get("expectedUser")).toBe("a");
+    act(() => {
+      second?.open();
+      second?.close(4409);
+    });
+    expect(isDocumentReplaced()).toBe(true);
+    expect(
+      ref.current?.send({ type: "close", terminalId: "b-terminal", requestId: "close_1" }),
+    ).toBe("closed");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(MockWebSocket.instances).toHaveLength(2);
+    vi.useRealTimers();
+  });
+
   it("lists on open and does not send close when the page unmounts", async () => {
     vi.stubGlobal("WebSocket", MockWebSocket);
     const view = render(<SocketProbe />);

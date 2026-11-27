@@ -392,12 +392,12 @@ describe("other tabs", () => {
     announceDocumentIdentity("a");
     announceDocumentIdentity("a");
     expect(channel.postMessage).toHaveBeenCalledTimes(2);
-    channel.onmessage?.({} as MessageEvent);
+    channel.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
     expect(check).toHaveBeenCalledTimes(1);
     // Without a watcher, a peer's announcement or a 401 checks nothing here: it leaves the
     // identity unverified, for the watcher to check once it mounts.
     disconnect();
-    channel.onmessage?.({} as MessageEvent);
+    channel.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
     reportSessionRejected();
     expect(check).toHaveBeenCalledTimes(1);
     expect(isDocumentIdentityUnverified()).toBe(true);
@@ -410,7 +410,7 @@ describe("other tabs", () => {
     subscribeIdentityVerification(changed);
     observeDocumentIdentity("a");
     announceDocumentIdentity("a");
-    channel.onmessage?.({} as MessageEvent);
+    channel.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
     expect(isDocumentIdentityUnverified()).toBe(true);
     expect(changed).toHaveBeenCalledTimes(1);
     // A guard's server answer for the same account confirms it.
@@ -420,12 +420,14 @@ describe("other tabs", () => {
     expect(isDocumentIdentityUnverified()).toBe(true);
   });
 
-  it("with a watcher connected, a peer's announcement or a 401 is checked, not left unverified", () => {
+  it("with a watcher connected, a peer hint is checked and masked until confirmed", () => {
     const channel = fakeChannel();
     resetDocumentIdentityForTests(() => channel);
     connectIdentityPeers(vi.fn());
-    channel.onmessage?.({} as MessageEvent);
+    channel.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
     reportSessionRejected();
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    confirmDocumentIdentityFresh(identityVerificationGeneration());
     expect(isDocumentIdentityUnverified()).toBe(false);
   });
 
@@ -434,10 +436,10 @@ describe("other tabs", () => {
     resetDocumentIdentityForTests(() => channel);
     observeDocumentIdentity("a");
     announceDocumentIdentity("a");
-    channel.onmessage?.({} as MessageEvent);
+    channel.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
     // A guard's probe starts, then another tab announces again mid-probe.
     const since = identityVerificationGeneration();
-    channel.onmessage?.({} as MessageEvent);
+    channel.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
     await admitRouteIdentity(resolved("a"), since);
     expect(isDocumentIdentityUnverified()).toBe(true);
     confirmDocumentIdentityFresh(since);

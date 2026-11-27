@@ -2,6 +2,12 @@ import { env } from "@ws-model-proxy/env/web";
 import { useCallback, useEffect, useReducer, useRef } from "react";
 
 import {
+  IDENTITY_CHANGED_CLOSE_CODE,
+  isDocumentReplaced,
+  replaceDocument,
+  withExpectedIdentityUrl,
+} from "@/lib/document-identity";
+import {
   initialRealtimeState,
   micProblem,
   pcm16Base64,
@@ -22,11 +28,12 @@ type Resources = {
   node: AudioWorkletNode | null;
   /** The person asked to stop: the close that follows is not a failure. */
   stopping: boolean;
+  cancelAdmission: (() => void) | null;
 };
 
 export type RealtimeTranscription = {
   state: RealtimeState;
-  /** Opens the microphone, then the session (signed in by the dashboard cookie). */
+  /** Admits the owner-bound session before opening the microphone. */
   start(input: { model: string }): Promise<void>;
   /** Ends the current turn: the audio captured so far is sent, then committed. */
   commit(): void;
@@ -40,7 +47,9 @@ function openSessionSocket(
   handlers: { onEvent(event: unknown): void; onClose(code: number): void },
 ): WebSocket {
   const socket = new WebSocket(
-    realtimeSocketUrl(model, new URL(env.VITE_SERVER_URL, window.location.href)),
+    withExpectedIdentityUrl(
+      new URL(realtimeSocketUrl(model, new URL(env.VITE_SERVER_URL, window.location.href))),
+    ).toString(),
   );
   socket.onmessage = (message) => {
     if (typeof message.data !== "string") return;
@@ -97,6 +106,7 @@ export function useRealtimeTranscription(): RealtimeTranscription {
     current.current = null;
     if (!resources) return;
     resources.stopping = true;
+    resources.cancelAdmission?.();
     release(resources);
     const socket = resources.socket;
     if (socket && socket.readyState <= WebSocket.OPEN) socket.close(1000, "client_stop");
@@ -107,6 +117,7 @@ export function useRealtimeTranscription(): RealtimeTranscription {
   const start = useCallback(
     async ({ model }: { model: string }) => {
       stop();
+      if (isDocumentReplaced()) return;
       const attempt = ++generation.current;
       dispatch({ type: "starting" });
       if (
@@ -123,16 +134,53 @@ export function useRealtimeTranscription(): RealtimeTranscription {
         context: null,
         node: null,
         stopping: false,
+        cancelAdmission: null,
       };
       current.current = resources;
+      let finishAdmission!: (admitted: boolean) => void;
+      const admission = new Promise<boolean>((resolve) => {
+        finishAdmission = resolve;
+      });
+      resources.cancelAdmission = () => finishAdmission(false);
+      // Owner refusal arrives as 4409 before the server creates a live session.
+      const socket = openSessionSocket(model, {
+        onEvent: (event) => {
+          if (generation.current !== attempt) return;
+          if (
+            event &&
+            typeof event === "object" &&
+            "type" in event &&
+            event.type === "session.created"
+          )
+            finishAdmission(true);
+          dispatch({ type: "event", event });
+        },
+        onClose: (code) => {
+          finishAdmission(false);
+          if (resources.socket !== socket || generation.current !== attempt) return;
+          release(resources);
+          if (current.current === resources) current.current = null;
+          if (code === IDENTITY_CHANGED_CLOSE_CODE) {
+            replaceDocument();
+            return;
+          }
+          dispatch({ type: "closed", code, requested: resources.stopping });
+        },
+      });
+      resources.socket = socket;
       try {
+        const admitted = await admission;
+        resources.cancelAdmission = null;
+        if (!admitted || generation.current !== attempt || current.current !== resources) return;
         resources.stream = await navigator.mediaDevices.getUserMedia({
           audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
         });
-        if (generation.current !== attempt) return release(resources);
+        if (generation.current !== attempt || current.current !== resources)
+          return release(resources);
         resources.context = new AudioContext();
         await resources.context.audioWorklet.addModule(REALTIME_WORKLET_URL);
-        if (generation.current !== attempt) return release(resources);
+        if (generation.current !== attempt || current.current !== resources)
+          return release(resources);
         const source = resources.context.createMediaStreamSource(resources.stream);
         resources.node = new AudioWorkletNode(resources.context, REALTIME_WORKLET_NAME);
         // A silent sink keeps the graph rendering without playing the microphone back.
@@ -143,25 +191,14 @@ export function useRealtimeTranscription(): RealtimeTranscription {
         sink.connect(resources.context.destination);
       } catch (error) {
         release(resources);
-        if (generation.current !== attempt) return;
+        if (generation.current !== attempt || current.current !== resources) return;
         current.current = null;
+        resources.socket = null;
+        socket.close(1000, "mic_failed");
         dispatch({ type: "failed", problem: micProblem(error) });
         return;
       }
 
-      // Owned by `resources`: `stop` (and the unmount cleanup) closes it.
-      const socket = openSessionSocket(model, {
-        onEvent: (event) => {
-          if (generation.current === attempt) dispatch({ type: "event", event });
-        },
-        onClose: (code) => {
-          if (resources.socket !== socket || generation.current !== attempt) return;
-          release(resources);
-          if (current.current === resources) current.current = null;
-          dispatch({ type: "closed", code, requested: resources.stopping });
-        },
-      });
-      resources.socket = socket;
       pipeWorkletToSocket(resources.node, socket);
     },
     [release, stop],

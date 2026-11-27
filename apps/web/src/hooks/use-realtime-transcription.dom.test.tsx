@@ -8,6 +8,11 @@ vi.mock("@ws-model-proxy/env/web", () => ({
   env: { VITE_SERVER_URL: "https://api.example.test" },
 }));
 
+import {
+  isDocumentReplaced,
+  observeDocumentIdentity,
+  resetDocumentIdentityForTests,
+} from "@/lib/document-identity";
 import { useRealtimeTranscription } from "./use-realtime-transcription";
 
 class FakePort {
@@ -97,6 +102,10 @@ const track = { stop: vi.fn() };
 const getUserMedia = vi.fn();
 
 beforeEach(() => {
+  resetDocumentIdentityForTests(() => undefined);
+  observeDocumentIdentity("a");
+  FakeSocket.last = null;
+  FakeNode.last = null;
   track.stop.mockClear();
   getUserMedia.mockReset().mockResolvedValue({ getTracks: () => [track] });
   Object.defineProperty(navigator, "mediaDevices", {
@@ -110,12 +119,15 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  document.documentElement.style.removeProperty("display");
 });
 
 async function started() {
   const hook = renderHook(() => useRealtimeTranscription());
   await act(async () => {
-    await hook.result.current.start({ model: "owner/asr" });
+    const starting = hook.result.current.start({ model: "owner/asr" });
+    FakeSocket.last?.serverEvent({ type: "session.created" });
+    await starting;
   });
   const socket = FakeSocket.last;
   if (!socket) throw new Error("no socket");
@@ -123,7 +135,60 @@ async function started() {
 }
 
 describe("useRealtimeTranscription", () => {
-  it("opens the mic, then the dashboard-signed Test page socket with no token or subprotocol", async () => {
+  it("stops a microphone grant arriving after the admitted socket closed", async () => {
+    let grant!: (stream: { getTracks(): { stop(): void }[] }) => void;
+    getUserMedia.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          grant = resolve;
+        }),
+    );
+    const hook = renderHook(() => useRealtimeTranscription());
+    let starting: Promise<void> | undefined;
+    await act(async () => {
+      starting = hook.result.current.start({ model: "owner/asr" });
+      FakeSocket.last?.serverEvent({ type: "session.created" });
+    });
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    act(() => FakeSocket.last?.serverClose(1011));
+    await act(async () => {
+      grant({ getTracks: () => [track] });
+      await starting;
+    });
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(FakeNode.last).toBeNull();
+  });
+
+  it("stopping before admission releases the pending start without opening the mic", async () => {
+    const hook = renderHook(() => useRealtimeTranscription());
+    await act(async () => {
+      const starting = hook.result.current.start({ model: "owner/asr" });
+      hook.result.current.stop();
+      await starting;
+    });
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(FakeSocket.last?.closedWith).toBe(1000);
+  });
+
+  it("carries A's owner and replaces on mismatch before requesting microphone access", async () => {
+    const hook = renderHook(() => useRealtimeTranscription());
+    let starting: Promise<void> | undefined;
+    act(() => {
+      starting = hook.result.current.start({ model: "owner/asr" });
+    });
+    expect(FakeSocket.last).not.toBeNull();
+    expect(new URL(FakeSocket.last?.url ?? "").searchParams.get("expectedUser")).toBe("a");
+    expect(getUserMedia).not.toHaveBeenCalled();
+    await act(async () => {
+      FakeSocket.last?.serverClose(4409);
+      await starting;
+    });
+    expect(isDocumentReplaced()).toBe(true);
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(FakeNode.last).toBeNull();
+  });
+
+  it("admits the owner-bound Test page socket before opening the mic", async () => {
     const { hook, socket } = await started();
     expect(getUserMedia).toHaveBeenCalledWith({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
@@ -132,10 +197,10 @@ describe("useRealtimeTranscription", () => {
       "/realtime-pcm-worklet.js",
     );
     expect(socket.url).toBe(
-      "wss://api.example.test/api/internal/chat-test/realtime?intent=transcription&model=owner%2Fasr",
+      "wss://api.example.test/api/internal/chat-test/realtime?intent=transcription&model=owner%2Fasr&expectedUser=a",
     );
     expect(socket.protocols).toBeUndefined();
-    expect(hook.result.current.state.phase).toBe("starting");
+    expect(hook.result.current.state.phase).toBe("live");
     act(() => socket.serverEvent({ type: "session.created" }));
     expect(hook.result.current.state.phase).toBe("live");
   });
@@ -156,20 +221,21 @@ describe("useRealtimeTranscription", () => {
     ]);
   });
 
-  it("reports a denied microphone without opening a socket", async () => {
-    FakeSocket.last = null;
+  it("reports a denied microphone and closes the admitted socket", async () => {
     getUserMedia.mockRejectedValueOnce(
       Object.assign(new Error("denied"), { name: "NotAllowedError" }),
     );
     const hook = renderHook(() => useRealtimeTranscription());
     await act(async () => {
-      await hook.result.current.start({ model: "owner/asr" });
+      const starting = hook.result.current.start({ model: "owner/asr" });
+      FakeSocket.last?.serverEvent({ type: "session.created" });
+      await starting;
     });
     expect(hook.result.current.state).toMatchObject({
       phase: "failed",
       problem: { kind: "mic", reason: "denied" },
     });
-    expect(FakeSocket.last).toBeNull();
+    expect(FakeSocket.last?.closedWith).toBe(1000);
   });
 
   it("reports an unsupported browser", async () => {

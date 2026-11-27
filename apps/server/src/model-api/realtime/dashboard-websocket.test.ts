@@ -1,7 +1,28 @@
 import type { WebSocketLike } from "@hono/node-server";
 import type { Session } from "@ws-model-proxy/auth";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
+import type { WSEvents } from "hono/ws";
 import { describe, expect, it, vi } from "vitest";
+
+const identityRejections = vi.hoisted(() => ({
+  closes: [] as { code?: number; reason?: string }[],
+}));
+vi.mock("@hono/node-server", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@hono/node-server")>()),
+  upgradeWebSocket: (factory: (c: Context) => WSEvents<WebSocketLike>) => (c: Context) => {
+    const events = factory(c);
+    const ws = new WSContext<WebSocketLike>({
+      readyState: 1,
+      send: () => {},
+      close: (code, reason) => {
+        identityRejections.closes.push({ code, reason });
+      },
+    });
+    events.onOpen?.(new Event("open"), ws);
+    events.onMessage?.(new MessageEvent("message", { data: '{"type":"list"}' }), ws);
+    return c.text("identity_rejected");
+  },
+}));
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
@@ -103,9 +124,45 @@ function upgrade(headers: Record<string, string> = { Origin: APP }) {
   return { method: "GET", headers: { Upgrade: "websocket", ...headers } };
 }
 
-const PATH = `${DASHBOARD_REALTIME_PATH}?intent=transcription&model=owner%2Fasr`;
+const PATH = `${DASHBOARD_REALTIME_PATH}?intent=transcription&model=owner%2Fasr&expectedUser=user-1`;
 
 describe("Chat Test realtime upgrade (dashboard login)", () => {
+  it.each(["a", "user-1&expectedUser=a"])(
+    "rejects a mismatched document owner (%s) before audio admission",
+    async (expected) => {
+      identityRejections.closes = [];
+      const t = deps();
+      const { hono, seen, checkSession } = app(t.deps);
+      const response = await hono.request(
+        PATH.replace("expectedUser=user-1", `expectedUser=${expected}`),
+        upgrade(),
+      );
+      expect(identityRejections.closes).toEqual([{ code: 4409, reason: "identity_changed" }]);
+      expect(await response.text()).toBe("identity_rejected");
+      expect(seen).toEqual([]);
+      expect(checkSession).not.toHaveBeenCalled();
+      expect(t.counters.count("server")).toBe(0);
+    },
+  );
+
+  it.each([
+    "",
+    "&expectedUser=",
+    "&expectedUser=user-1",
+    "&expectedUser=user-1&expectedUser=user-1",
+  ])("admits a cookie client with no mismatched owner (%s)", async (ownerQuery) => {
+    const t = deps();
+    const { hono, seen, checkSession } = app(t.deps);
+    const response = await hono.request(
+      `${DASHBOARD_REALTIME_PATH}?intent=transcription${ownerQuery}`,
+      upgrade(),
+    );
+    expect(await response.text()).toBe("upgraded");
+    expect(checkSession).toHaveBeenCalledWith({ sessionId: "sess-1", userId: "user-1" });
+    expect(seen[0]?.requester.userId).toBe("user-1");
+    expect(t.counters.count("server")).toBe(1);
+  });
+
   it("refuses an admin's impersonation session (read-only) before the session check", async () => {
     const t = deps();
     const current = {

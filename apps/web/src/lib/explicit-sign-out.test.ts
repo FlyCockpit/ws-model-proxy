@@ -15,7 +15,7 @@ vi.mock("@/lib/document-identity", () => ({
   leaveDocument: auth.leave,
 }));
 
-const { signOutAndLeave } = await import("./explicit-sign-out");
+const { signOutAndLeave, signOutFailureKey } = await import("./explicit-sign-out");
 
 beforeEach(() => {
   for (const fn of Object.values(auth)) fn.mockReset();
@@ -59,4 +59,17 @@ describe("signOutAndLeave", () => {
     expect(await signOutAndLeave("/en-US/login")).toEqual({ ok: false, error });
     expect(auth.undo).toHaveBeenCalledTimes(1);
   });
+});
+
+it("offline sign-out says the session is still active in both shipped locales", async () => {
+  vi.stubGlobal("navigator", { onLine: false });
+  try {
+    expect(signOutFailureKey(new Error("network"))).toBe("userMenu.signOutOffline");
+    const en = await import("@/locales/en-US/nav.json");
+    const es = await import("@/locales/es-MX/nav.json");
+    expect(en.userMenu.signOutOffline).toContain("still signed in");
+    expect(es.userMenu.signOutOffline).toContain("sesión sigue abierta");
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

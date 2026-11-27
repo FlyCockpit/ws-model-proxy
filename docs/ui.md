@@ -191,7 +191,7 @@ replaced document reloads once, however many changes follow.
 | Explicit sign-out (the account menu; the MCP login page's "sign in again to reauthorize") | `signOutAndLeave()` (`apps/web/src/lib/explicit-sign-out.ts`): marks the sign-out, then on success `leaveDocument()`: the account menu loads the sign-in page, the MCP page reloads its own URL (the signed OAuth query kept byte for byte). A failure, returned or thrown, undoes the mark and is shown. Add any new sign-out button through it. |
 | Signed out elsewhere (another tab, expiry, revocation) | The document reloads in place; the guards send the visitor to the sign-in page. |
 | Another account, impersonation starting or stopping (same tab or another tab) | The document reloads in place; the guards admit the new account and its queries load fresh. |
-| Anonymous → signed in | Nothing: an anonymous cache holds only public data, so password sign-in keeps its client-side navigate. |
+| Anonymous → signed in | Public pages update normally. A confirmed peer sign-in replaces an anonymous-only form; a local sign-in keeps its router navigation. |
 | `pending` / `error` | Never acted on: a flaky session check must not reload a signed-in page. |
 
 Three observers feed it, and none can be skipped:
@@ -208,7 +208,7 @@ Three observers feed it, and none can be skipped:
   connects the open tabs: Better Auth tells other tabs about a sign-out but not a sign-in, so the
   auth client announces every session change made in the tab (`$sessionSignal`), and the watcher
   and the guards announce each newly confirmed identity on the document's `BroadcastChannel`; every
-  other tab then re-checks its session.
+  matching peers do no work, while conflicting identities and session-change hints share one session check.
   While the watcher is not mounted (the root's pending or error state, a route loader's query
   before the shell mounts), a peer's announcement or a 401 cannot be checked: it marks the
   document's identity unverified instead (generation-counted). Until a fresh check confirms the
@@ -218,7 +218,7 @@ Three observers feed it, and none can be skipped:
   (an error reset re-renders retained matches without their guards; the watcher stays mounted
   outside that gate). A fresh check is a guard's
   server answer, or a refetch the watcher itself starts once it mounts (retried on focus,
-  visibility and reconnect; one superseded by another session fetch is followed up at most 3
+  visibility and reconnect through the document retry scheduler; one superseded by another session fetch is followed up at most 3
   times, 250 ms apart; all dropped on unmount). An answer asked for before a newer invalidation
   never counts, and only a settled successful answer (or a 401) is read as one. The watcher alone
   reads the session unmasked (`useAuthSession({ unmasked: true })`). The template's
@@ -228,6 +228,27 @@ Three observers feed it, and none can be skipped:
   before any toast opt-out, a query rejected with 401 asks Better Auth to check the session (one
   check in flight at a time) instead of toasting; a mutation still toasts. Nothing toasts once the
   document is being replaced.
+
+Document-owned requests send `X-Expected-User` from the document baseline: oRPC, Better Auth
+except get-session/sign-out, and `fetchWithExpectedIdentity` for media and Chat Test. The server
+compares the raw cookie owner before policy filtering. `409 {code: "IDENTITY_CHANGED"}` replaces
+the document before response callbacks, toasts or form errors. Session lookup failures remain
+unavailable, never confirmed anonymity. No session cookie cache is enabled.
+
+`session-retry.ts` coordinates session checks across all mounted consumers: 2–60 second backoff,
+Retry-After, and pause while hidden/offline. Better Auth's duplicate focus refresh is disabled;
+native reconnect/storage refreshes share its cooldown and in-flight check. Non-401 session errors
+show Account unavailable with Retry and Sign out, retaining that control while a retry runs.
+Cached app configuration that fails to refetch keeps auth forms mounted (`isLoadingError` gates
+only initial failures). Route probes discard superseded answers and retry at most three times.
+
+Admin promotions and demotions name the target in a confirmation dialog. Role changes, archive,
+and durable deletion's mark transaction share the last-active-verified-admin check under
+Serializable isolation. Pending deletions and current bans do not count; an expiry equal to now
+still counts as banned. Role changes write `users.role_changed` to `AuditEvent` in the same
+transaction, including actor, target and before/after roles; same-role requests write nothing.
+Better Auth's parallel role, ban, restore, remove and access-update endpoints are refused at the
+HTTP gate. The app uses oRPC for these actions and keeps its durable deletion cleanup phases.
 
 The router also covers the back/forward cache: a document that ever held a signed-in user's state
 is hidden as it enters the cache and reloaded when restored, so Back never shows a frozen page

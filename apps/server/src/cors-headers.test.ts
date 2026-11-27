@@ -137,6 +137,9 @@ describe("createApp CORS preflight (CORS_ALLOW_HEADERS wiring)", () => {
     expect(simple.headers.get("access-control-expose-headers")?.toLowerCase()).toContain(
       "x-wsmp-keepalive",
     );
+    expect(simple.headers.get("access-control-expose-headers")?.toLowerCase()).toContain(
+      "retry-after",
+    );
   });
 
   it("allows the invite header the sign-up page sets on an invite sign-up", async () => {

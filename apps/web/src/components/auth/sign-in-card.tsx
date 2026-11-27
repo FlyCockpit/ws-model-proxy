@@ -14,6 +14,7 @@ import { Label } from "@ws-model-proxy/ui/components/label";
 import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
 import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 import { AUTH_SCREEN_CLASS } from "@/components/auth/auth-card";
@@ -125,8 +126,11 @@ type ResolveOutcome = (data: Record<string, unknown> | undefined) => SignInOutco
 export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCardProps) {
   const twoFactor = useTwoFactorChallenge();
   const { state } = useAuthSession();
+  const [sessionLoaded, setSessionLoaded] = useState(false);
   const config = useQuery(orpc.app.config.queryOptions());
   const { t } = useTranslation(["auth", "common"]);
+
+  if (!sessionLoaded && state.status !== "pending") setSessionLoaded(true);
 
   const emailEnabled = config.data?.emailEnabled ?? false;
   const postAuthRedirect = safeRedirectTo(redirectTo, lang);
@@ -136,7 +140,8 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
   // In mcp mode the SSO callback returns to THIS page (signed query kept in
   // the URL) so the authenticated branch can continue the transaction.
 
-  if (state.status === "pending" || config.isPending) {
+  // Peer verification masks the session again; keep the mounted form and its input state.
+  if ((!sessionLoaded && state.status === "pending") || config.isPending) {
     return (
       <div className={AUTH_SCREEN_CLASS}>
         <AuthFormSkeleton />
@@ -144,7 +149,7 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
     );
   }
 
-  if (config.isError) {
+  if (config.isLoadingError) {
     return (
       <div className={AUTH_SCREEN_CLASS}>
         <AuthRetryCard

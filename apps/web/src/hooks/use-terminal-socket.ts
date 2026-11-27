@@ -5,6 +5,12 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useLatestRef } from "@/hooks/use-latest-ref";
+import {
+  IDENTITY_CHANGED_CLOSE_CODE,
+  isDocumentReplaced,
+  replaceDocument,
+  withExpectedIdentityUrl,
+} from "@/lib/document-identity";
 import { INITIAL_RECONNECT_BACKOFF, planReconnect } from "@/lib/reconnect-backoff";
 import {
   decodeSealedFrame,
@@ -17,7 +23,8 @@ import {
 /**
  * `unauthorized`: the relay closed the socket with 4401 (the session ended,
  * two-factor became mandatory, or the account is being deleted). Final:
- * no reconnect is attempted; only a reload (and sign-in) recovers.
+ * no reconnect is attempted; only a reload (and sign-in) recovers. A document
+ * owner mismatch (4409) also stops reconnecting and replaces the document.
  */
 export type TerminalSocketStatus = "connecting" | "open" | "closed" | "unauthorized";
 
@@ -36,7 +43,7 @@ export type TerminalSocketHandlers = {
 function terminalSocketUrl(): string {
   const url = new URL(SOCKET_PATH, window.location.href);
   url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return url.toString();
+  return withExpectedIdentityUrl(url).toString();
 }
 
 function openTerminalSocket(): WebSocket {
@@ -282,6 +289,7 @@ export function useTerminalSocket(
     };
 
     const connect = () => {
+      if (isDocumentReplaced()) return;
       const ws = openTerminalSocket();
       const outbox = newOutbox(ws);
       moveTo({ kind: "connecting", socket: ws, outbox });
@@ -317,6 +325,12 @@ export function useTerminalSocket(
         const connection = connectionRef.current;
         // The cleanup (or a newer socket) took over: nothing to report.
         if (connectionSocket(connection) !== ws) return;
+        if (event.code === IDENTITY_CHANGED_CLOSE_CODE) {
+          moveTo({ kind: "unauthorized" });
+          replaceDocument();
+          handlersRef.current.onDisconnect?.();
+          return;
+        }
         if (event.code === TERMINAL_UNAUTHORIZED_CLOSE_CODE) {
           // Retrying cannot succeed with this session; stop here.
           moveTo({ kind: "unauthorized" });

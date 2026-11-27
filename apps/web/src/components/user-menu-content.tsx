@@ -14,9 +14,8 @@ import { User } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
-import { signOutAndLeave } from "@/lib/explicit-sign-out";
+import { signOutAndLeave, signOutFailureKey } from "@/lib/explicit-sign-out";
 import { getNavItems, toLangRoute } from "@/lib/nav-items";
-import { friendly } from "@/utils/friendly-error";
 
 /**
  * The real Base UI account menu. Lazy-loaded by `user-menu.tsx` on first
@@ -97,7 +96,7 @@ export default function UserMenuContent() {
               // failure: say so. (signOutAndLeave imports the auth client
               // dynamically, keeping it off the eager bundle.)
               const result = await signOutAndLeave(`/${lang}/login`);
-              if (!result.ok) toast.error(friendly(result.error, t("userMenu.signOutFailed")));
+              if (!result.ok) toast.error(t(signOutFailureKey(result.error)));
             }}
           >
             {t("userMenu.signOut")}

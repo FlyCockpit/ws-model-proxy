@@ -56,6 +56,7 @@ import {
   SIGNUP_MEDIA_TYPES,
   SIGNUP_RECIPIENT_PATH,
 } from "./email-recipient-limit.js";
+import { expectedIdentity } from "./expected-identity.js";
 import { consumeInviteAccept } from "./invite-accept-limit.js";
 import { createMcpAdmissionGate } from "./mcp/admission.js";
 import { createMcpRequestHandler, type McpAuthInstance } from "./mcp/auth.js";
@@ -515,6 +516,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.use("/api/internal/media", sessionMiddleware);
   app.use("/api/internal/media", impersonationReadOnly);
   app.use("/api/internal/media", createRateLimiterMiddleware(rpcLimiter));
+  app.use("/api/internal/media", expectedIdentity);
   app.use("/api/internal/media", mediaCsrfGuard);
   app.use(
     "/api/internal/media",
@@ -962,6 +964,9 @@ export async function createApp(options: CreateAppOptions = {}) {
   // limit applies) and answers the same padded 200 whatever the account work
   // did. Falls through only for what Better Auth refuses before any account
   // work (reset disabled without SMTP, no body, non-JSON).
+  // This wrapper deliberately neutralizes account-work errors. Fence the document first
+  // so an identity conflict remains a 409 instead of becoming its uniform 200.
+  app.use(PASSWORD_RESET_REQUEST_PATH, expectedIdentity);
   const passwordResetRequest = createPasswordResetRequestHandler(
     options.passwordResetAuth ?? defaultAuth,
   );
@@ -1001,6 +1006,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   // cookie-bearing non-browser callers without an Origin header are rejected.
   app.use("/api/internal/chat-test/*", mediaCsrfGuard);
   app.use("/api/internal/chat-test/*", createRateLimiterMiddleware(rpcLimiter));
+  app.use("/api/internal/chat-test/*", expectedIdentity);
   // Chat Test live transcription (chunk 10): the `/v1/realtime` session behind
   // the dashboard cookie, attributed as HTTP Chat Test. The CSRF guard above
   // passes the GET upgrade; the socket's own Origin check refuses cross-site
@@ -1018,6 +1024,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.use("/api/internal/pools/*", impersonationReadOnly);
   app.use("/api/internal/pools/*", mediaCsrfGuard);
   app.use("/api/internal/pools/*", createRateLimiterMiddleware(rpcLimiter));
+  app.use("/api/internal/pools/*", expectedIdentity);
   app.route("/api/internal/pools", createPoolMemberTestRoutes());
 
   // Mint fresh short-lived signed media URLs (session-authenticated, owner-
@@ -1027,6 +1034,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.use("/api/internal/media/sign", sessionMiddleware);
   app.use("/api/internal/media/sign", impersonationReadOnly);
   app.use("/api/internal/media/sign", createRateLimiterMiddleware(rpcLimiter));
+  app.use("/api/internal/media/sign", expectedIdentity);
   app.use("/api/internal/media/sign", mediaCsrfGuard);
   app.post("/api/internal/media/sign", createMediaSignHandler());
 
@@ -1035,6 +1043,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   // and the hard per-upload byte cap so the client can pick upload vs base64.
   app.use("/api/internal/media/config", sessionMiddleware);
   app.use("/api/internal/media/config", createRateLimiterMiddleware(rpcLimiter));
+  app.use("/api/internal/media/config", expectedIdentity);
   app.get("/api/internal/media/config", createMediaConfigHandler());
 
   // Admin media policy surface (verified-admin only). Small JSON bodies, so these
@@ -1046,6 +1055,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.use("/api/internal/media/admin/*", sessionMiddleware);
   app.use("/api/internal/media/admin/*", impersonationReadOnly);
   app.use("/api/internal/media/admin/*", createRateLimiterMiddleware(rpcLimiter));
+  app.use("/api/internal/media/admin/*", expectedIdentity);
   app.use("/api/internal/media/admin/*", mediaCsrfGuard);
   app.use("/api/internal/media/admin/*", mediaAdminGate);
   app.get("/api/internal/media/admin/stats", createMediaAdminStatsHandler());
@@ -1060,7 +1070,9 @@ export async function createApp(options: CreateAppOptions = {}) {
 
   // Rate limit RPC endpoint — general API traffic.
   app.use("/rpc/*", createRateLimiterMiddleware(rpcLimiter));
+  app.use("/rpc/*", expectedIdentity);
   app.use("/api-reference/*", createRateLimiterMiddleware(rpcLimiter));
+  app.use("/api-reference/*", expectedIdentity);
 
   // Cookie-authenticated oRPC and OpenAPI mutations refuse a browser request
   // that proves it is cross-site (a foreign Origin, or Sec-Fetch-Site

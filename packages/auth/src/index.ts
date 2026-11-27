@@ -27,6 +27,7 @@ import { getAdminInviteLocale } from "./admin-invite-locale";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { passwordChangeRevocationTarget, revokeUserCredentials } from "./credential-revocation";
+import { refuseUnexpectedIdentity } from "./expected-identity";
 import { refuseImpersonatedAuthWrite } from "./impersonation-read-only";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
@@ -495,6 +496,7 @@ export const auth = betterAuth({
     // (./user-deletion-access-guard.ts); consumers enforce the marker.
     // An admin's impersonation session is read-only (./impersonation-read-only.ts).
     before: createAuthMiddleware(async (ctx) => {
+      await refuseUnexpectedIdentity(ctx);
       await refuseImpersonatedAuthWrite(ctx);
       await refuseAdminRestoreOfDeletingUser(ctx);
       // A reset link the admin was shown (not mailed) is spendable only while the account is a

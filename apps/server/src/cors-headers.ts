@@ -26,6 +26,7 @@ import { SHARE_INVITE_HEADER } from "@ws-model-proxy/config/share-invite";
  * asserts the preflight actually echoes each one.
  */
 export const CORS_ALLOW_HEADERS = [
+  "X-Expected-User",
   "Content-Type",
   "Authorization",
   // The model API also takes the key as x-api-key (Anthropic SDKs) or api-key (Azure style).
@@ -40,6 +41,7 @@ export const CORS_ALLOW_HEADERS = [
 
 /** Response headers a cross-origin browser client may read. */
 export const CORS_EXPOSE_HEADERS = [
+  "Retry-After",
   // Marks a committed 200 whose body may carry an in-body error (commit-keepalive.ts).
   "x-wsmp-keepalive",
 ] as const;

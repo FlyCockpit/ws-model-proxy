@@ -404,6 +404,31 @@ export const DIALOGS: DialogCase[] = [
     ready: LOADED,
     steps: [{ clickText: "Invite user" }],
   },
+  {
+    name: "Promote user",
+    path: "/en-US/admin/users",
+    role: "admin",
+    ready: LOADED,
+    steps: [
+      { click: 'li[data-user-role="user"] button[aria-label^="Actions for"]' },
+      { clickText: "Promote to admin" },
+    ],
+    needs: "a non-admin user in the list",
+  },
+  {
+    name: "Demote admin",
+    path: "/en-US/admin/users",
+    role: "admin",
+    ready: LOADED,
+    steps: [
+      {
+        click:
+          'li[data-user-role="admin"]:not([data-current-user]) button[aria-label^="Actions for"]',
+      },
+      { clickText: "Demote to user" },
+    ],
+    needs: "another admin in the list (self-demotion is unavailable)",
+  },
   onRecord("Start runtime", "runtimeId", (id) => `/en-US/runtimes/${id}`, "Start"),
   onRecord("Delete runtime", "runtimeId", (id) => `/en-US/runtimes/${id}`, "Delete runtime"),
   onRecord("Pool name and description", "poolId", (id) => `/en-US/pools/${id}`, "Edit"),

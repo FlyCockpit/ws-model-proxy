@@ -7,13 +7,34 @@ import {
   TERMINAL_BROWSER_JSON_WINDOW_MS,
   TERMINAL_BROWSER_TEXT_PENDING_LIMIT,
 } from "@ws-model-proxy/config/terminal-socket-policy";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
+import type { WSEvents } from "hono/ws";
 import { WSContext } from "hono/ws";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { generateTestHelloIdentity } from "./hello-identity.js";
 import type { NodeIdentity } from "./node-credential-auth.js";
 import { encodeRelayBinaryFrame, RELAY_PROTOCOL_VERSION } from "./protocol.js";
+
+const identityRejections = vi.hoisted(() => ({
+  closes: [] as { code?: number; reason?: string }[],
+}));
+vi.mock("@hono/node-server", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@hono/node-server")>()),
+  upgradeWebSocket: (factory: (c: Context) => WSEvents<WebSocketLike>) => (c: Context) => {
+    const events = factory(c);
+    const ws = new WSContext<WebSocketLike>({
+      readyState: 1,
+      send: () => {},
+      close: (code, reason) => {
+        identityRejections.closes.push({ code, reason });
+      },
+    });
+    events.onOpen?.(new Event("open"), ws);
+    events.onMessage?.(new MessageEvent("message", { data: '{"type":"list"}' }), ws);
+    return c.text("identity_rejected");
+  },
+}));
 
 const limiterState = vi.hoisted(() => ({ fail: false }));
 const twoFactorPolicy = vi.hoisted(() => ({ required: vi.fn(async () => false) }));
@@ -335,6 +356,47 @@ async function connectCli(slug: string, kind: CliKind = "current", features?: Cl
 }
 
 describe("terminal websocket admission", () => {
+  it.each(["a", "user-id&expectedUser=a"])(
+    "rejects a mismatched document owner (%s) before admission",
+    async (expected) => {
+      identityRejections.closes = [];
+      sessions.getSession.mockResolvedValue(browserSession());
+      db.session.findUnique.mockClear();
+      db.node.findMany.mockClear();
+      const response = await middlewareApp().request(
+        `/api/dashboard/terminal/ws?expectedUser=${expected}`,
+        {
+          headers: {
+            upgrade: "websocket",
+            cookie: "session=ok",
+            origin: "https://proxy.example.com",
+          },
+        },
+      );
+      expect(identityRejections.closes).toEqual([{ code: 4409, reason: "identity_changed" }]);
+      expect(await response.text()).toBe("identity_rejected");
+      expect(db.session.findUnique).not.toHaveBeenCalled();
+      expect(db.node.findMany).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    "",
+    "?expectedUser=",
+    "?expectedUser=user-id",
+    "?expectedUser=user-id&expectedUser=user-id",
+  ])("admits a cookie client with no mismatched owner (%s)", async (ownerQuery) => {
+    sessions.getSession.mockResolvedValue(browserSession());
+    const response = await middlewareApp().request(`/api/dashboard/terminal/ws${ownerQuery}`, {
+      headers: {
+        upgrade: "websocket",
+        cookie: "session=ok",
+        origin: "https://proxy.example.com",
+      },
+    });
+    expect(await response.text()).toBe("upgraded");
+  });
+
   beforeEach(() => {
     limiterState.fail = false;
     sessions.getSession.mockReset();
@@ -357,7 +419,9 @@ describe("terminal websocket admission", () => {
       cookie: "session=ok",
       origin: "https://proxy.example.com",
     };
-    const rejected = await app.request("/api/dashboard/terminal/ws", { headers });
+    const rejected = await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", {
+      headers,
+    });
     expect(rejected.status).toBe(403);
     await expect(rejected.json()).resolves.toEqual({
       error: "Two-factor authentication setup is required.",
@@ -365,7 +429,9 @@ describe("terminal websocket admission", () => {
     expect(continued).toBe(false);
 
     sessions.getSession.mockResolvedValue(browserSession("user-id", true));
-    expect((await app.request("/api/dashboard/terminal/ws", { headers })).status).toBe(200);
+    expect(
+      (await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", { headers })).status,
+    ).toBe(200);
     expect(continued).toBe(true);
   });
 
@@ -375,9 +441,16 @@ describe("terminal websocket admission", () => {
       ...impersonated,
       session: { ...impersonated.session, impersonatedBy: "admin-id" },
     });
-    const response = await middlewareApp().request("/api/dashboard/terminal/ws", {
-      headers: { upgrade: "websocket", cookie: "session=ok", origin: "https://proxy.example.com" },
-    });
+    const response = await middlewareApp().request(
+      "/api/dashboard/terminal/ws?expectedUser=user-id",
+      {
+        headers: {
+          upgrade: "websocket",
+          cookie: "session=ok",
+          origin: "https://proxy.example.com",
+        },
+      },
+    );
     expect(response.status).toBe(403);
     await expect(response.json()).resolves.toEqual({
       error: "Terminals are not available while impersonating a user.",
@@ -386,9 +459,16 @@ describe("terminal websocket admission", () => {
 
   it("admits an unenrolled user when two-factor is not mandatory", async () => {
     sessions.getSession.mockResolvedValue(browserSession("user-id", false));
-    const response = await middlewareApp().request("/api/dashboard/terminal/ws", {
-      headers: { upgrade: "websocket", cookie: "session=ok", origin: "https://proxy.example.com" },
-    });
+    const response = await middlewareApp().request(
+      "/api/dashboard/terminal/ws?expectedUser=user-id",
+      {
+        headers: {
+          upgrade: "websocket",
+          cookie: "session=ok",
+          origin: "https://proxy.example.com",
+        },
+      },
+    );
     expect(response.status).toBe(200);
   });
 
@@ -400,17 +480,17 @@ describe("terminal websocket admission", () => {
       return null;
     });
     const app = middlewareApp();
-    const upgrade = await app.request("/api/dashboard/terminal/ws", {
+    const upgrade = await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", {
       headers: { cookie: "session=ok", origin: "https://proxy.example.com" },
     });
     expect(upgrade.status).toBe(426);
 
-    const anonymous = await app.request("/api/dashboard/terminal/ws", {
+    const anonymous = await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", {
       headers: { upgrade: "websocket", origin: "https://proxy.example.com" },
     });
     expect(anonymous.status).toBe(401);
 
-    const bearer = await app.request("/api/dashboard/terminal/ws", {
+    const bearer = await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", {
       headers: {
         upgrade: "websocket",
         authorization: "Bearer secret",
@@ -425,24 +505,26 @@ describe("terminal websocket admission", () => {
     sessions.getSession.mockResolvedValue(browserSession());
     const app = middlewareApp();
     const headers = { upgrade: "websocket", cookie: "session=ok" };
-    expect((await app.request("/api/dashboard/terminal/ws", { headers })).status).toBe(403);
+    expect(
+      (await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", { headers })).status,
+    ).toBe(403);
     expect(
       (
-        await app.request("/api/dashboard/terminal/ws", {
+        await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", {
           headers: { ...headers, origin: "https://evil.example" },
         })
       ).status,
     ).toBe(403);
     expect(
       (
-        await app.request("/api/dashboard/terminal/ws", {
+        await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", {
           headers: { ...headers, origin: "https://proxy.example.com" },
         })
       ).status,
     ).toBe(200);
     expect(
       (
-        await app.request("/api/dashboard/terminal/ws", {
+        await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", {
           headers: { ...headers, origin: "http://localhost:3001" },
         })
       ).status,
@@ -459,13 +541,17 @@ describe("terminal websocket admission", () => {
       cookie: "session=ok",
       origin: "https://proxy.example.com",
     };
-    expect((await app.request("/api/dashboard/terminal/ws", { headers })).status).toBe(200);
+    expect(
+      (await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", { headers })).status,
+    ).toBe(200);
     expect(relaySessionManager.isDraining()).toBe(false);
     sessions.getSession.mockClear();
     relaySessionManager.beginDrain();
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        const refused = await app.request("/api/dashboard/terminal/ws", { headers });
+        const refused = await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", {
+          headers,
+        });
         expect(refused.status).toBe(503);
         await expect(refused.json()).resolves.toEqual({ error: "Server is shutting down." });
       }
@@ -488,7 +574,7 @@ describe("terminal websocket admission", () => {
       continued = true;
       return c.text("upgraded");
     });
-    const response = await app.request("/api/dashboard/terminal/ws", {
+    const response = await app.request("/api/dashboard/terminal/ws?expectedUser=user-id", {
       headers: { upgrade: "websocket", cookie: "session=ok", origin: "https://proxy.example.com" },
     });
     expect(response.status).toBe(429);
@@ -1403,7 +1489,7 @@ describe("terminal browser hub", () => {
         releaseSession = resolve;
       }),
     );
-    const upgrade = middlewareApp().request("/api/dashboard/terminal/ws", {
+    const upgrade = middlewareApp().request("/api/dashboard/terminal/ws?expectedUser=user-id", {
       headers: { upgrade: "websocket", cookie: "session=ok", origin: "https://proxy.example.com" },
     });
     // The middleware passed the drain check and waits on the session lookup.

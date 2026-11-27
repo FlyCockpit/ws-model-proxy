@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState, useSyncExternalStore } from "react";
+import { useCallback, useLayoutEffect, useMemo, useState, useSyncExternalStore } from "react";
 
 import { authClient } from "@/lib/auth-client";
 import {
@@ -8,9 +8,15 @@ import {
   rememberConfirmedAnonymous,
 } from "@/lib/auth-session-state";
 import {
+  announceDocumentIdentity,
+  confirmDocumentIdentityFresh,
+  identityVerificationGeneration,
   isDocumentIdentityUnverified,
+  observeDocumentIdentity,
+  replaceDocument,
   subscribeIdentityVerification,
 } from "@/lib/document-identity";
+import { connectSessionRetry, observeSessionRetry } from "@/lib/session-retry";
 import { useNetworkStatus } from "./use-network-status";
 
 /**
@@ -21,6 +27,7 @@ import { useNetworkStatus } from "./use-network-status";
  * A sign-in turns it off; a sign-out replaces the document (`signOutAndLeave`), which resets it.
  */
 let confirmedAnonymous = false;
+let unavailableError: unknown | null = null;
 
 /**
  * True while another tab's identity change (or a 401) is unchecked in this document
@@ -46,6 +53,12 @@ export function useAuthSession({ unmasked = false }: { unmasked?: boolean } = {}
   const session = authClient.useSession();
   const isOnline = useNetworkStatus();
   const unverified = useIdentityUnverified();
+  if (typeof window !== "undefined") {
+    if (session.error) unavailableError = session.error;
+    else if (!session.isPending && !session.isRefetching) unavailableError = null;
+  }
+  const error =
+    session.error ?? (session.isPending || session.isRefetching ? unavailableError : null);
   const data = session.data as AuthSessionData | null | undefined;
 
   // The last session the server confirmed, kept through a refetch or a transient error. It is
@@ -64,19 +77,43 @@ export function useAuthSession({ unmasked = false }: { unmasked?: boolean } = {}
   // every change. Keyed by the function, so the watcher's checks (keyed by `refetch`) are not
   // restarted, and their answers dropped, by the very refetch they start.
   const { refetch: refetchSession } = session;
-  const refetch = useCallback(() => refetchSession(), [refetchSession]);
+  const refetch = useCallback(async () => {
+    const since = identityVerificationGeneration();
+    const result = await refetchSession();
+    const checked = readSessionIdentity();
+    if (since === identityVerificationGeneration() && checked !== undefined) {
+      if (observeDocumentIdentity(checked)) replaceDocument();
+      else {
+        confirmDocumentIdentityFresh(since);
+        announceDocumentIdentity(checked);
+      }
+    }
+    return result;
+  }, [refetchSession]);
+  useLayoutEffect(() => connectSessionRetry(refetch), [refetch]);
+  useLayoutEffect(() => {
+    observeSessionRetry(session.error, session.isPending || session.isRefetching);
+  }, [session.error, session.isPending, session.isRefetching]);
   const actions = useMemo(() => ({ refetch, retry: refetch }), [refetch]);
 
   if (!unmasked && unverified) {
-    return classifyAuthSession({ data: null, isPending: true, isOffline: !isOnline, actions });
+    return classifyAuthSession({
+      data: null,
+      error,
+      isPending: error == null,
+      isRefetching: session.isRefetching,
+      isOffline: !isOnline,
+      actions,
+    });
   }
 
   const result = classifyAuthSession({
     data,
     confirmedSession: nextConfirmed,
     confirmedAnonymous,
+    isRefetching: session.isRefetching,
     isPending: session.isPending,
-    error: session.error,
+    error,
     isOffline: !isOnline,
     actions,
   });
@@ -114,4 +151,5 @@ export function isSessionFetchInFlight(): boolean {
 /** Forget the settled state, as a new document would. Tests only. */
 export function resetAuthSessionMemoryForTests(): void {
   confirmedAnonymous = false;
+  unavailableError = null;
 }

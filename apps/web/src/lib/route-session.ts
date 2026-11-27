@@ -22,10 +22,18 @@ export async function resolveRouteSession(): Promise<RouteSessionResolution> {
   // failed probe (a transport error) also waits before it reaches the router.
   // Taken before the probe: an identity change announced while it runs is
   // newer than its answer.
-  const since = identityVerificationGeneration();
-  const [probe] = await Promise.allSettled([getRouteSession(), appShellHydrated()]);
-  if (probe.status === "rejected") throw probe.reason;
-  const resolution = probe.value;
-  await admitRouteIdentity(resolution, since);
-  return resolution;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const since = identityVerificationGeneration();
+    const [probe] = await Promise.allSettled([getRouteSession(), appShellHydrated()]);
+    if (since !== identityVerificationGeneration()) continue;
+    if (probe.status === "rejected") throw probe.reason;
+    const resolution = probe.value;
+    await admitRouteIdentity(resolution, since);
+    // Admission awaits too: an invalidation in that gap must not let an old
+    // profile reach route context (and a form's default values).
+    if (since === identityVerificationGeneration()) return resolution;
+  }
+  // A continually changing cookie cannot be safely consumed by this route.
+  // Use the existing unavailable/retry surface, never the last stale answer.
+  return { status: "error" };
 }

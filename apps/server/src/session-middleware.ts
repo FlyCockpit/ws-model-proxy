@@ -1,5 +1,6 @@
 import { auth, type Session } from "@ws-model-proxy/auth";
 import { cookieSessionHeaders } from "@ws-model-proxy/auth/cookie-session";
+import { isUserBanned } from "@ws-model-proxy/auth/is-user-banned";
 import type { Context, Next } from "hono";
 
 // Resolves the Better-Auth session once per request and stashes it on the
@@ -12,10 +13,14 @@ import type { Context, Next } from "hono";
 // return 401 if a real session was needed.
 export async function sessionMiddleware(c: Context, next: Next) {
   let session: Session | null = null;
+  c.set("sessionLookupFailed", false);
+  c.set("sessionCookieOwner", null);
   try {
     session = (await auth.api.getSession({
       headers: cookieSessionHeaders(c.req.raw.headers),
     })) as Session | null;
+    c.set("sessionCookieOwner", session?.user?.id ?? null);
+    if (session?.user && isUserBanned(session.user, new Date())) session = null;
   } catch (err) {
     // Constructor name only — better-auth/Prisma rejections embed SQL,
     // tokens, and credential material in messages and stacks. Never log
@@ -26,6 +31,7 @@ export async function sessionMiddleware(c: Context, next: Next) {
       err instanceof Error ? `(Error: ${err.constructor.name})` : typeof err,
     );
     session = null;
+    c.set("sessionLookupFailed", true);
   }
   c.set("session", session ?? null);
   await next();

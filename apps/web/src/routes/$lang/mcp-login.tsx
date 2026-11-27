@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, notFound } from "@tanstack/react-router";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { SignInCard } from "@/components/auth/sign-in-card";
 import { McpInvalidRequestCard } from "@/components/mcp/mcp-invalid-request-card";
@@ -66,12 +66,21 @@ function McpLoginPage() {
   const info = useMemo(() => parseMcpOAuthSearch(search), [search]);
   const fingerprint = useMemo(() => mcpSearchFingerprint(search), [search]);
   const { state } = useAuthSession();
+  const [signInShown, setSignInShown] = useState(false);
+  if (
+    !signInShown &&
+    info.usable &&
+    (state.status === "anonymous" || (state.status === "error" && state.session === null))
+  ) {
+    setSignInShown(true);
+  }
 
   if (!info.usable) {
     return <McpInvalidRequestCard />;
   }
 
-  if (state.status === "pending") {
+  // Once shown, the anonymous form survives session masking during peer verification.
+  if (state.status === "pending" && !signInShown) {
     return <McpPageSkeleton />;
   }
 

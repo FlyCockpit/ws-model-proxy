@@ -18,7 +18,7 @@ import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
 import { env } from "@ws-model-proxy/env/web";
 import { Toaster } from "@ws-model-proxy/ui/components/sileo";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { type ReactNode } from "react";
+import { Activity, type ReactNode } from "react";
 import { I18nextProvider, useTranslation } from "react-i18next";
 import BottomNav from "@/components/bottom-nav";
 import ErrorState from "@/components/error-state";
@@ -169,10 +169,10 @@ function RootComponent() {
   // A page that took the whole viewport (the maximized terminal) hides the chrome; safe areas and
   // the keyboard inset still apply.
   const chromeHidden = useAppChrome((state) => state.hidden);
-  // Another tab's identity change is unchecked here (the watcher was not connected: the root's
-  // pending or error state). The matched page may be the previous account's (an error reset
-  // re-renders retained matches without their guards), so it waits as a skeleton until the
-  // watcher's check (above, outside this gate) confirms the account or replaces the document.
+  // Another tab's identity change is unchecked here. The matched page may be the previous
+  // account's (an error reset re-renders retained matches without their guards), so show a
+  // skeleton until the watcher confirms the account or replaces the document. Activity preserves
+  // route state (including a reset token removed from the URL) while hiding UI and pausing effects.
   const identityUnverified = useIdentityUnverified();
 
   return (
@@ -232,7 +232,10 @@ function RootComponent() {
                 data-scroll-restoration-id={MAIN_SCROLLER_ID}
                 className="relative min-h-0 min-w-0 overflow-y-auto overflow-x-clip overscroll-contain outline-none [container-type:size]"
               >
-                {identityUnverified ? <PageSkeleton /> : <Outlet />}
+                <Activity mode={identityUnverified ? "hidden" : "visible"}>
+                  <Outlet />
+                </Activity>
+                {identityUnverified && <PageSkeleton />}
               </main>
               <BottomNav hidden={mobileKeyboardOpen || chromeHidden} />
             </div>

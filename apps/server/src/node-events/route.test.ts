@@ -72,6 +72,16 @@ async function firstChunk(response: Response): Promise<string> {
 }
 
 describe("GET /api/dashboard/events", () => {
+  it("rejects another cookie owner before reserving a stream", async () => {
+    const { request, hub, checkSession } = setup({ current: session("b") });
+    const reserve = vi.spyOn(hub, "reserve");
+    const response = await request({ "X-Expected-User": "a" });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ code: "IDENTITY_CHANGED" });
+    expect(reserve).not.toHaveBeenCalled();
+    expect(checkSession).not.toHaveBeenCalled();
+  });
+
   it("streams events for a signed-in same-origin request", async () => {
     const { request, hub } = setup();
     const response = await request({ "sec-fetch-site": "same-origin" });

@@ -181,6 +181,19 @@
     "revealVerifyHint": "They confirm their email address when they first sign in: we email them a link then.",
     "inviteFailed": "Could not send the invite. Try again.",
     "inviteIncomplete": "The account was created, but the invite could not be finished. Remove this user, then invite them again.",
-    "inviteNotPending": "This user has already set up their account or signs in another way, so there is no invite to resend."
+    "inviteNotPending": "This user has already set up their account or signs in another way, so there is no invite to resend.",
+    "promoteTitle": "Make this user an admin?",
+    "demoteTitle": "Remove admin access?",
+    "promoteDescription": "{{name}} ({{email}}) will be able to manage users, roles, and app settings, and use the other admin features in this app.",
+    "demoteDescription": "{{name}} ({{email}}) will lose access to the admin dashboard and its user, role, and app settings controls.",
+    "roleUpdating": "Updating role…",
+    "confirmPromote": "Make {{name}} an admin",
+    "confirmDemote": "Remove admin access",
+    "roleErrors": {
+      "selfDemotion": "You cannot remove your own admin role.",
+      "lastActiveAdmin": "You cannot remove the last active admin. Make another verified, active user an admin first.",
+      "userNotFound": "This user was not found. Refresh the list and try again.",
+      "conflict": "Another user change happened at the same time. Review the users and try again."
+    }
   }
 }

@@ -60,6 +60,7 @@ export type ClassifyAuthSessionInput = {
   data: AuthSessionData | null | undefined;
   confirmedSession?: AuthSessionData | null;
   isPending?: boolean;
+  isRefetching?: boolean;
   error?: unknown;
   isOffline?: boolean;
   /**
@@ -108,11 +109,12 @@ export function classifyAuthSession(input: ClassifyAuthSessionInput): AuthSessio
   const isOffline = input.isOffline === true;
   const explicitNoSession = isExplicitNoSessionResult(input);
   const confirmedSession = input.data ?? input.confirmedSession ?? null;
-  const isRefetching = isPending && Boolean(input.confirmedSession);
+  const isRefetching =
+    input.isRefetching === true || (isPending && Boolean(input.confirmedSession));
   const baseMeta = {
     isRefetching,
     isOffline,
-    isDegraded: false,
+    isDegraded: Boolean(input.error) && errorStatus(input.error) !== 401,
   };
 
   if (input.data) {

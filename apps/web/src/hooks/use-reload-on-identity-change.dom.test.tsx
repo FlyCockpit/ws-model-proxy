@@ -17,6 +17,7 @@ vi.mock("@/hooks/use-auth-session", () => ({
     // every identity test below would fail.
     state: options?.unmasked === true ? boundary.state : { status: "pending", session: null },
     actions: { refetch: boundary.refetch },
+    meta: { isDegraded: false, isRefetching: false },
   }),
   readSessionIdentity: () => boundary.checked,
   isSessionFetchInFlight: () => boundary.inFlight,
@@ -30,6 +31,7 @@ import {
   reportSessionRejected,
   resetDocumentIdentityForTests,
 } from "@/lib/document-identity";
+import { resetSessionRetryForTests } from "@/lib/session-retry";
 import { sessionIdentity, useReloadOnIdentityChange } from "./use-reload-on-identity-change";
 
 const reload = vi.fn();
@@ -52,6 +54,7 @@ class FakeChannel {
 }
 
 beforeEach(() => {
+  resetSessionRetryForTests();
   FakeChannel.open = [];
   resetDocumentIdentityForTests(() => new FakeChannel());
   boundary.state = { status: "pending", session: null };
@@ -68,7 +71,7 @@ afterEach(() => {
 });
 
 const settle = async () => {
-  for (let i = 0; i < 4; i++) await Promise.resolve();
+  for (let i = 0; i < 24; i++) await Promise.resolve();
 };
 const fire = (target: EventTarget, type: string) => target.dispatchEvent(new Event(type));
 
@@ -78,7 +81,7 @@ function announcedWhileUnmounted() {
   update(user("a"));
   const [channel] = FakeChannel.open;
   update.unmount();
-  channel?.onmessage?.({} as MessageEvent);
+  channel?.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
   expect(isDocumentIdentityUnverified()).toBe(true);
   return channel;
 }
@@ -169,30 +172,86 @@ describe("useReloadOnIdentityChange", () => {
     undo();
     expect(reload).toHaveBeenCalledTimes(1);
   });
-  it("tells the other tabs about a sign-in, and checks the session on theirs", () => {
+  it("tells the other tabs about a sign-in, and checks the session on theirs", async () => {
     const update = setup();
+    boundary.checked = null;
     update(anonymous);
     const [channel] = FakeChannel.open;
     expect(channel?.posted).toBe(1);
+    boundary.checked = "a";
     update(user("a"));
     expect(channel?.posted).toBe(2);
     update(user("a"));
     expect(channel?.posted).toBe(2);
-    channel?.onmessage?.({} as MessageEvent);
+    channel?.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
+    await settle();
     expect(boundary.refetch).toHaveBeenCalledTimes(1);
     // The channel is the document's, not the component's: it stays the one.
     update.unmount();
-    channel?.onmessage?.({} as MessageEvent);
+    channel?.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
     expect(boundary.refetch).toHaveBeenCalledTimes(1);
     expect(FakeChannel.open).toHaveLength(1);
   });
 });
 
 describe("unverified identity", () => {
+  it("coalesces a burst announced before the reserved probe starts, including focus", async () => {
+    vi.useFakeTimers();
+    const update = setup();
+    update(user("a"));
+    const answers: (() => void)[] = [];
+    boundary.refetch.mockImplementation(
+      () => new Promise<void>((resolve) => answers.push(resolve)),
+    );
+    const peer = FakeChannel.open[0];
+    peer?.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
+    peer?.onmessage?.({ data: { kind: "identity", id: "b" } } as MessageEvent);
+    await settle();
+    fire(window, "focus");
+    boundary.checked = "a";
+    answers[0]?.();
+    await settle();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(boundary.refetch).toHaveBeenCalledTimes(1);
+    expect(isDocumentIdentityUnverified()).toBe(false);
+  });
+
+  it.each(["a", "b"])(
+    "drops pre-announcement A answers and coalesces one fresh probe for %s",
+    async (freshIdentity) => {
+      vi.useFakeTimers();
+      const update = setup();
+      update(user("a"));
+      const answers: (() => void)[] = [];
+      boundary.refetch.mockImplementation(
+        () => new Promise<void>((resolve) => answers.push(resolve)),
+      );
+      const peer = FakeChannel.open[0];
+      peer?.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
+      await settle();
+      peer?.onmessage?.({ data: { kind: "identity", id: "b" } } as MessageEvent);
+      boundary.checked = "a";
+      answers[0]?.();
+      await settle();
+      expect(isDocumentIdentityUnverified()).toBe(true);
+      expect(reload).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(answers).toHaveLength(2);
+      boundary.checked = freshIdentity;
+      answers[1]?.();
+      await settle();
+      expect(reload).toHaveBeenCalledTimes(freshIdentity === "b" ? 1 : 0);
+      if (freshIdentity === "a") expect(isDocumentIdentityUnverified()).toBe(false);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(boundary.refetch).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it("re-checks on mount after a peer's announcement with no watcher, and replaces for another account", async () => {
     announcedWhileUnmounted();
     boundary.checked = "b";
     setup();
+    await settle();
     expect(boundary.refetch).toHaveBeenCalledTimes(1);
     await settle();
     expect(reload).toHaveBeenCalledTimes(1);
@@ -231,10 +290,10 @@ describe("unverified identity", () => {
     await settle();
     expect(isDocumentIdentityUnverified()).toBe(false);
     expect(reload).not.toHaveBeenCalled();
-    // Settled: further events check nothing more.
+    // Settled: visibility still performs a fresh session check.
     fire(document, "visibilitychange");
     await settle();
-    expect(boundary.refetch).toHaveBeenCalledTimes(3);
+    expect(boundary.refetch).toHaveBeenCalledTimes(4);
   });
   it("a retried check that answers another account replaces the document", async () => {
     announcedWhileUnmounted();
@@ -255,15 +314,18 @@ describe("unverified identity", () => {
     );
     const channel = announcedWhileUnmounted();
     // Check 1 starts; the watcher unmounts before it answers; another tab announces again.
-    setup().unmount();
-    channel?.onmessage?.({} as MessageEvent);
-    // The watcher remounts while check 1 is still in flight: check 2 starts.
+    const firstWatcher = setup();
+    await settle();
+    firstWatcher.unmount();
+    channel?.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
+    // The watcher remounts: its new-generation check waits for check 1 to finish.
     setup();
-    expect(answers).toHaveLength(2);
+    expect(answers).toHaveLength(1);
     boundary.checked = "a";
     answers[0]?.();
     await settle();
     expect(isDocumentIdentityUnverified()).toBe(true);
+    expect(answers).toHaveLength(2);
     answers[1]?.();
     await settle();
     expect(isDocumentIdentityUnverified()).toBe(false);
@@ -300,10 +362,10 @@ describe("unverified identity", () => {
     // The mount check and a focus retry are both superseded: each would schedule a follow-up.
     fire(window, "focus");
     await settle();
-    expect(boundary.refetch).toHaveBeenCalledTimes(2);
+    expect(boundary.refetch).toHaveBeenCalledTimes(1);
     update.unmount();
     await vi.advanceTimersByTimeAsync(2000);
-    expect(boundary.refetch).toHaveBeenCalledTimes(2);
+    expect(boundary.refetch).toHaveBeenCalledTimes(1);
   });
   it("unmounting drops a pending follow-up and the retry listeners", async () => {
     vi.useFakeTimers();

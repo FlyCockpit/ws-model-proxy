@@ -14,6 +14,9 @@ vi.mock("@/utils/orpc", () => {
   return { orpc: at([]) };
 });
 
+const { observeDocumentIdentity, resetDocumentIdentityForTests, isDocumentReplaced } = await import(
+  "@/lib/document-identity"
+);
 const { useNodeLive } = await import("@/stores/node-live");
 const { nodeLiveQueryKeys } = await import("@/lib/node-live-updates");
 const { useNodeLiveUpdates } = await import("./use-node-live-updates");
@@ -91,6 +94,8 @@ const flushes = () => invalidate.mock.calls.length / KEYS;
 const status = () => useNodeLive.getState().status;
 
 beforeEach(() => {
+  resetDocumentIdentityForTests(() => undefined);
+  observeDocumentIdentity("a");
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance", "Date"] });
   streams = [];
   responses = [];
@@ -108,6 +113,18 @@ afterEach(() => {
 });
 
 describe("useNodeLiveUpdates", () => {
+  it("binds reconnects to the document owner and replaces on a mismatch", async () => {
+    mount();
+    await advance();
+    streams[0]?.end();
+    fetchMock.mockResolvedValueOnce(Response.json({ code: "IDENTITY_CHANGED" }, { status: 409 }));
+    await advance(750);
+    expect(new Headers(fetchMock.mock.calls[1]?.[1]?.headers).get("X-Expected-User")).toBe("a");
+    expect(isDocumentReplaced()).toBe(true);
+    await advance(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("opens no stream while signed out", async () => {
     mount(null);
     await advance(60_000);

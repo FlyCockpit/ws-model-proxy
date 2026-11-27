@@ -8,6 +8,7 @@ import {
 import { createTanstackQueryUtils } from "@orpc/tanstack-query";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { env } from "@ws-model-proxy/env/web";
+import { fetchWithExpectedIdentity } from "@/lib/document-identity";
 import { createRpcBatchLinkPlugin } from "./rpc-batch-link";
 
 const link = new RPCLink({
@@ -23,7 +24,7 @@ const link = new RPCLink({
     new ClientRetryPlugin(),
   ],
   fetch(url, options) {
-    return fetch(url, {
+    return fetchWithExpectedIdentity(url, {
       ...options,
       credentials: "include",
     });

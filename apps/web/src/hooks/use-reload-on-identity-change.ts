@@ -12,10 +12,13 @@ import {
   connectIdentityPeers,
   identityVerificationGeneration,
   isDocumentIdentityUnverified,
+  isDocumentReplaced,
   observeDocumentIdentity,
   replaceDocument,
   type SessionIdentity,
 } from "@/lib/document-identity";
+
+import { runSessionCheck } from "@/lib/session-retry";
 
 /**
  * `undefined` (session pending or errored) is never acted on: a flaky session
@@ -30,42 +33,68 @@ export function sessionIdentity(state: AuthSessionState["state"]): SessionIdenti
 /**
  * The watcher's session checks while it is mounted: for a peer tab's
  * announcement, a 401, and an unverified identity (another tab announced a
- * change, or a request got a 401, while no watcher was mounted: the chrome
- * shows no account until a check settles it). Only a check started here can
- * settle that state: Better Auth's refetch cancels any fetch already in
- * flight, so the answer it settles with was asked for after `since`, never
- * inherited from before a newer invalidation. A failed check is retried when
- * the tab regains focus, visibility or the network; one superseded by another
- * fetch still running is followed up (at most 3 times, 250 ms apart). `stop()`
- * drops every pending completion, timer and listener.
+ * change while no watcher was mounted: the chrome shows no account until a
+ * check settles it). Checks share the document's retry coordinator and must
+ * start after the invalidation they verify (`since`). The adapter's stable
+ * refetch wrapper also verifies retries started by the header or scheduler.
+ * A failed check is retried with backoff and when the tab regains focus,
+ * visibility or the network; one superseded by another fetch still running is
+ * followed up (at most 3 times, 250 ms apart), with one timer shared by all
+ * callers. A current-generation confirmation makes its queued follow-up
+ * unnecessary. Peer checks also run while hidden or offline; availability
+ * gates only focus/visibility/reconnect checks and scheduled failure retries.
+ * `stop()` drops every pending completion, deferred probe, timer and listener.
  */
 function startIdentityChecks(refetch: () => unknown): { stop: () => void } {
   let connected = true;
   let followUp: ReturnType<typeof setTimeout> | undefined;
-  const check = (superseded = 0): Promise<void> => {
-    // A disconnected watcher starts nothing: its refetch would cancel the next watcher's check.
-    if (!connected) return Promise.resolve();
-    const since = identityVerificationGeneration();
-    return Promise.resolve(refetch()).then(() => {
-      if (!connected || !isDocumentIdentityUnverified()) return;
-      const checked = readSessionIdentity();
-      if (checked === undefined) {
-        if (isSessionFetchInFlight() && superseded < 3) {
-          // One follow-up at a time: overlapping checks share it, so `stop()` clears them all.
-          clearTimeout(followUp);
-          followUp = setTimeout(() => void check(superseded + 1), 250);
-        }
+  const queueFollowUp = (superseded: number) => {
+    if (superseded >= 3 || followUp !== undefined) return;
+    const unverifiedOnly = isDocumentIdentityUnverified();
+    followUp = setTimeout(() => {
+      followUp = undefined;
+      void check(superseded + 1, unverifiedOnly).catch(() => {});
+    }, 250);
+  };
+  const check = (superseded = 0, unverifiedOnly = false): Promise<void> => {
+    const cancelled = () =>
+      !connected || isDocumentReplaced() || (unverifiedOnly && !isDocumentIdentityUnverified());
+    if (cancelled()) return Promise.resolve();
+    let since = identityVerificationGeneration();
+    return runSessionCheck(
+      () => {
+        // The coordinator may wait for an older native refresh before starting
+        // this fresh probe. Verify the generation it actually starts in.
+        since = identityVerificationGeneration();
+        return refetch();
+      },
+      { automatic: true, cancelled },
+    ).then((ran) => {
+      if (!ran || !connected || isDocumentReplaced()) return;
+      if (since !== identityVerificationGeneration()) {
+        if (isDocumentIdentityUnverified()) queueFollowUp(superseded);
         return;
       }
+      const checked = readSessionIdentity();
+      if (checked === undefined) {
+        if (isSessionFetchInFlight()) queueFollowUp(superseded);
+        return;
+      }
+      clearTimeout(followUp);
+      followUp = undefined;
       if (observeDocumentIdentity(checked)) replaceDocument();
-      else confirmDocumentIdentityFresh(since);
+      else {
+        confirmDocumentIdentityFresh(since);
+        announceDocumentIdentity(checked);
+      }
     });
   };
   const retry = () => {
-    if (isDocumentIdentityUnverified() && document.visibilityState !== "hidden") void check();
+    if (document.visibilityState !== "hidden" && navigator.onLine !== false)
+      void check().catch(() => {});
   };
   const disconnectPeers = connectIdentityPeers(() => check());
-  if (isDocumentIdentityUnverified()) void check();
+  if (isDocumentIdentityUnverified()) void check().catch(() => {});
   window.addEventListener("focus", retry);
   window.addEventListener("online", retry);
   document.addEventListener("visibilitychange", retry);
@@ -84,23 +113,23 @@ function startIdentityChecks(refetch: () => unknown): { stop: () => void } {
 /**
  * Replaces the document when the signed-in user goes away while a page is
  * open (sign-out in another tab, session expiry or revocation, another account
- * signing in, impersonation starting or stopping). The identity the document
- * belongs to lives in `lib/document-identity.ts`, not here, so it never
- * depends on this component's lifetime; the route guards check the same
- * baseline before anything renders. Mounted once, by the root shell
- * (`routes/__root.tsx`), so it also covers the pages without a session guard
- * (MCP login, verify-email, reset-password).
+ * signing in). The identity the document belongs to lives in
+ * `lib/document-identity.ts`, not here, so it survives this shell unmounting;
+ * the route guards check the same baseline before anything renders, which
+ * covers a change made while no `_app` page was open. Mounted once, by the root shell, including unguarded auth pages.
  *
  * It also connects the other open tabs: an identity this tab confirms (a
- * sign-in included, which Better Auth does not broadcast) makes them check
- * their session, and a request rejected for having no session
- * (`reportSessionRejected`) checks it here.
+ * sign-in included, which Better Auth does not broadcast) asks conflicting
+ * peers to verify their session here, alongside change hints and requests
+ * rejected for having no session (`reportSessionRejected`).
  */
 export function useReloadOnIdentityChange(): void {
   // Raw, never masked: the identity effect below must see the session even
-  // while the chrome is held neutral (an unverified identity).
+  // while the chrome is held neutral.
   const authSession = useAuthSession({ unmasked: true });
   const identity = sessionIdentity(authSession.state);
+  const since = identityVerificationGeneration();
+  const { isDegraded, isRefetching } = authSession.meta;
   const { refetch } = authSession.actions;
 
   // Connected first (effects run in order), so the first identity below is
@@ -113,11 +142,22 @@ export function useReloadOnIdentityChange(): void {
   // Layout effect: replace the document before the browser paints a frame
   // that pairs the new identity's chrome with the old identity's cached data.
   useLayoutEffect(() => {
-    if (identity === undefined) return;
+    // Retained presentation data is not a new confirmation. In particular a
+    // remount after a peer invalidation must wait for its own current probe.
+    if (
+      identity === undefined ||
+      isDegraded ||
+      isRefetching ||
+      isDocumentIdentityUnverified() ||
+      since !== identityVerificationGeneration()
+    )
+      return;
     if (observeDocumentIdentity(identity)) {
       replaceDocument();
       return;
     }
-    announceDocumentIdentity(identity);
-  }, [identity]);
+    // Only the settled, successful atom answer can be broadcast. The
+    // presentation adapter may retain an identity through a failed check.
+    if (readSessionIdentity() === identity) announceDocumentIdentity(identity);
+  }, [identity, isDegraded, isRefetching, since]);
 }

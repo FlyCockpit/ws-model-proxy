@@ -24,7 +24,13 @@ import {
 import { isEmailConfigured, renderInviteUser, sendEmail } from "@ws-model-proxy/mailer";
 import { contractProcedure } from "../contract-procedure";
 import { usersContract as c } from "../contracts/account";
+import {
+  assertAdminRemovalAllowed,
+  throwUserChangeError,
+  withAdminRemovalGuard,
+} from "../lib/admin-presence";
 import { deletionConflict } from "../lib/deletion-conflict";
+import { retryableSerializableTransactionCode } from "../lib/serializable-transaction";
 import {
   createSetPasswordLink,
   INVITE_LINK_TTL_DAYS,
@@ -348,18 +354,29 @@ export const usersRouter = {
     if (input.userId === context.session.user.id && input.role !== "admin") {
       throw new ORPCError("FORBIDDEN", {
         message: "You cannot remove your own admin role.",
+        data: { reason: "SELF_DEMOTION" },
       });
     }
-    const target = await prisma.user.findUnique({
-      where: { id: input.userId },
-      select: { id: true },
-    });
-    if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
-
-    await prisma.user.update({
-      where: { id: input.userId },
-      data: { role: input.role },
-    });
+    await withAdminRemovalGuard(
+      input.userId,
+      async (tx, target) => {
+        if (target.role === input.role) return;
+        await tx.user.update({ where: { id: input.userId }, data: { role: input.role } });
+        await tx.auditEvent.create({
+          data: {
+            userId: input.userId,
+            actor: "USER",
+            actorUserId: context.session.user.id,
+            action: "users.role_changed",
+            resourceType: "user",
+            resourceId: input.userId,
+            before: { role: target.role },
+            after: { role: input.role },
+          },
+        });
+      },
+      input.role,
+    );
     return { success: true as const };
   }),
 
@@ -369,27 +386,13 @@ export const usersRouter = {
         message: "You cannot archive your own account.",
       });
     }
-    const target = await prisma.user.findUnique({
-      where: { id: input.userId },
-      select: { id: true },
-    });
-    if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
-
-    // Set banned=true so better-auth treats the user as locked, and revoke
-    // every active session so the next page-load signs them out. We mirror
-    // what the admin plugin's banUser endpoint does internally — no expiry
-    // (banExpires=null), no auto-unban.
-    await prisma.$transaction([
-      prisma.user.update({
+    await withAdminRemovalGuard(input.userId, async (tx) => {
+      await tx.user.update({
         where: { id: input.userId },
-        data: {
-          banned: true,
-          banReason: input.reason ?? null,
-          banExpires: null,
-        },
-      }),
-      prisma.session.deleteMany({ where: { userId: input.userId } }),
-    ]);
+        data: { banned: true, banReason: input.reason ?? null, banExpires: null },
+      });
+      await tx.session.deleteMany({ where: { userId: input.userId } });
+    });
     // Post-commit: end the user's in-flight relay file ops and commands
     // (#159). A listener failure is logged, never thrown: the ban stands.
     await notifyUserBanned(input.userId);
@@ -427,7 +430,11 @@ export const usersRouter = {
       where: { id: input.userId },
       select: { id: true },
     });
-    if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
+    if (!target)
+      throw new ORPCError("NOT_FOUND", {
+        message: "User not found",
+        data: { reason: "USER_NOT_FOUND" },
+      });
 
     // The delete is durable and bounded (packages/db/src/parent-deletion.ts): the user is
     // marked for deletion (banned, sessions revoked), their history is drained in short
@@ -442,6 +449,7 @@ export const usersRouter = {
     let result: DurableUserDeletionResult;
     try {
       result = await deleteUserDurably(prisma, input.userId, {
+        beforeMark: (tx) => assertAdminRemovalAllowed(tx, input.userId),
         onMarked: notifyUserDeletionMarked,
         onTransientFailure: (err) =>
           console.error(
@@ -449,6 +457,8 @@ export const usersRouter = {
           ),
       });
     } catch (err) {
+      if (err instanceof ORPCError) throw err;
+      if (retryableSerializableTransactionCode(err)) throwUserChangeError(err);
       // Classified by error class and SQLSTATE / Prisma code
       // (RETAINED_HISTORY, P2003, P2014, 23503, 23514), and for 55000 by the
       // hardening trigger's message: a permanent refusal only when it matches
@@ -465,7 +475,11 @@ export const usersRouter = {
           "Couldn't delete that account. Try again, or contact an admin if it keeps happening.",
       });
     }
-    if (result === "missing") throw new ORPCError("NOT_FOUND", { message: "User not found" });
+    if (result === "missing")
+      throw new ORPCError("NOT_FOUND", {
+        message: "User not found",
+        data: { reason: "USER_NOT_FOUND" },
+      });
     if (result === "pending") return { success: true as const, pending: true };
     if (result === "abandoned") {
       // A permanent refusal archived the user before this call finished.

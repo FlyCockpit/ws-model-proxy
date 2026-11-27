@@ -3,13 +3,15 @@ import { Link, useParams } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { buttonVariants } from "@ws-model-proxy/ui/lib/button-variants";
+import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { LogIn, User, UserPlus } from "lucide-react";
+import { LogIn, LogOut, RefreshCw, User, UserPlus } from "lucide-react";
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
-
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
+import { signOutAndLeave, signOutFailureKey } from "@/lib/explicit-sign-out";
+import { runSessionCheck } from "@/lib/session-retry";
 import { orpc } from "@/utils/orpc";
 
 // Lazy so the shared Base UI overlay chunk (Menu/Dialog/focus-guards) leaves the
@@ -29,23 +31,43 @@ export default function UserMenu() {
   // top-level `/` redirect route without throwing.
   const params = useParams({ strict: false });
   const lang = isSupportedLocale(params.lang) ? params.lang : DEFAULT_LOCALE;
-  const { state } = useAuthSession();
+  const authSession = useAuthSession();
+  const { state } = authSession;
   const config = useQuery(orpc.app.config.queryOptions());
   const { t } = useTranslation("nav");
   const [mountedForUser, setMountedForUser] = useState<string | null>(null);
-  const [hadIdentity, setHadIdentity] = useState(false);
-  if (state.session && !hadIdentity) setHadIdentity(true);
+
+  if (state.status === "error" || authSession.meta.isDegraded) {
+    return (
+      <div className="flex items-center gap-2">
+        <Button
+          variant="outline"
+          size="touch"
+          aria-label={t("userMenu.accountUnavailable")}
+          className="w-11 px-0 sm:w-auto sm:px-3.5"
+          disabled={authSession.meta.isRefetching}
+          onClick={() => void runSessionCheck(authSession.actions.retry).catch(() => {})}
+        >
+          <RefreshCw className="size-4" aria-hidden="true" />
+          <span className="hidden sm:inline">{t("userMenu.accountUnavailable")}</span>
+        </Button>
+        <Button
+          variant="outline"
+          size="icon-touch"
+          aria-label={t("userMenu.signOut")}
+          onClick={async () => {
+            const result = await signOutAndLeave(`/${lang}/login`);
+            if (!result.ok) toast.error(t(signOutFailureKey(result.error)));
+          }}
+        >
+          <LogOut className="size-4" aria-hidden="true" />
+        </Button>
+      </div>
+    );
+  }
 
   if (state.status === "pending") {
     return <Skeleton className="h-11 w-24" />;
-  }
-
-  if (state.status === "error" && (hadIdentity || state.session)) {
-    return (
-      <Button variant="outline" size="icon-touch" disabled aria-label={t("userMenu.open")}>
-        <User className="size-4" aria-hidden="true" />
-      </Button>
-    );
   }
 
   if (state.status !== "authenticated") {

@@ -181,6 +181,19 @@
     "revealVerifyHint": "Confirman su dirección de correo la primera vez que inician sesión: entonces les enviamos un enlace.",
     "inviteFailed": "No se pudo enviar la invitación. Inténtalo de nuevo.",
     "inviteIncomplete": "Se creó la cuenta, pero no se pudo terminar la invitación. Elimina a este usuario y vuelve a invitarlo.",
-    "inviteNotPending": "Este usuario ya configuró su cuenta o inicia sesión de otra forma, así que no hay invitación que reenviar."
+    "inviteNotPending": "Este usuario ya configuró su cuenta o inicia sesión de otra forma, así que no hay invitación que reenviar.",
+    "promoteTitle": "¿Convertir a esta persona en administradora?",
+    "demoteTitle": "¿Quitar el acceso de administrador?",
+    "promoteDescription": "{{name}} ({{email}}) podrá gestionar usuarios, roles y la configuración de la aplicación, y usar las demás funciones de administración.",
+    "demoteDescription": "{{name}} ({{email}}) perderá el acceso al panel de administración y a sus controles de usuarios, roles y configuración de la aplicación.",
+    "roleUpdating": "Actualizando rol…",
+    "confirmPromote": "Dar acceso de administrador a {{name}}",
+    "confirmDemote": "Quitar el acceso de administrador",
+    "roleErrors": {
+      "selfDemotion": "No puedes quitarte tu propio acceso de administrador.",
+      "lastActiveAdmin": "No puedes quitar al último administrador activo. Primero dale acceso de administrador a otra persona con correo verificado y cuenta activa.",
+      "userNotFound": "No se encontró a esta persona. Actualiza la lista e intenta de nuevo.",
+      "conflict": "Otra persona modificó una cuenta al mismo tiempo. Revisa la lista e intenta de nuevo."
+    }
   }
 }

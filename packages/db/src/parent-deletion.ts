@@ -860,11 +860,15 @@ export type UserDeletionMark = {
 export async function requestUserDeletion(
   db: Db,
   userId: string,
+  // Access-removal policy runs under the owner fence, in this mark transaction.
+  beforeMark?: (tx: Prisma.TransactionClient) => Promise<unknown>,
 ): Promise<UserDeletionMark | null> {
   const candidate = randomUUID();
-  const rows = await db.$transaction(async (tx) => {
-    await fenceOwners(tx, [userId]);
-    const marked = await tx.$queryRaw<Array<{ generation: string }>>`
+  const rows = await db.$transaction(
+    async (tx) => {
+      await fenceOwners(tx, [userId]);
+      await beforeMark?.(tx);
+      const marked = await tx.$queryRaw<Array<{ generation: string }>>`
       UPDATE "user"
          SET "deletionRequestedAt" = COALESCE("deletionRequestedAt", now()),
              "deletionGeneration" = CASE
@@ -882,11 +886,13 @@ export async function requestUserDeletion(
              "updatedAt" = now()
        WHERE id = ${userId}
        RETURNING "deletionGeneration" AS generation`;
-    // Every session the user acts through: their own and the ones they
-    // impersonate another user with (Better Auth `impersonatedBy`, no FK).
-    await tx.session.deleteMany({ where: { OR: [{ userId }, { impersonatedBy: userId }] } });
-    return marked;
-  });
+      // Every session the user acts through: their own and the ones they
+      // impersonate another user with (Better Auth `impersonatedBy`, no FK).
+      await tx.session.deleteMany({ where: { OR: [{ userId }, { impersonatedBy: userId }] } });
+      return marked;
+    },
+    beforeMark ? { isolationLevel: "Serializable" } : undefined,
+  );
   const generation = rows[0]?.generation;
   if (!generation) return null;
   return { generation, created: generation === candidate };
@@ -989,13 +995,14 @@ export async function deleteUserDurably(
   userId: string,
   options: {
     batch?: number;
+    beforeMark?: (tx: Prisma.TransactionClient) => Promise<unknown>;
     onTransientFailure?: (error: unknown) => void;
     onMarked?: (userId: string) => void | Promise<void>;
   } = {},
 ): Promise<DurableUserDeletionResult> {
   const existing = await db.user.findUnique({ where: { id: userId }, select: { id: true } });
   if (!existing) return "missing";
-  const mark = await requestUserDeletion(db, userId);
+  const mark = await requestUserDeletion(db, userId, options.beforeMark);
   if (!mark) return "missing";
   if (mark.created) await options.onMarked?.(userId);
   let failure: unknown;

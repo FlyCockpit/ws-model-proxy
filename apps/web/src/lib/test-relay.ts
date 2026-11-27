@@ -1,5 +1,6 @@
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { env } from "@ws-model-proxy/env/web";
+import { fetchWithExpectedIdentity } from "@/lib/document-identity";
 
 import type { AttachmentModalities, AttachmentModality } from "@/lib/image-attachments";
 import {
@@ -356,7 +357,7 @@ export async function streamTestChat({
   emptyMessage: string;
 }): Promise<ChatMetrics> {
   const startedAt = performance.now();
-  const response = await fetch(testUrl(request.path), {
+  const response = await fetchWithExpectedIdentity(testUrl(request.path), {
     method: "POST",
     credentials: "include",
     headers: { "content-type": "application/json", ...request.headers },
@@ -505,7 +506,7 @@ export async function sendTestEmbeddings({
   signal?: AbortSignal;
 }): Promise<EmbeddingSummary> {
   const startedAt = performance.now();
-  const response = await fetch(testUrl("/embeddings"), {
+  const response = await fetchWithExpectedIdentity(testUrl("/embeddings"), {
     method: "POST",
     credentials: "include",
     headers: { "content-type": "application/json" },
@@ -538,7 +539,7 @@ export async function sendTestTranscription({
   form.set("file", file, file.name);
   form.set("response_format", "json");
   if (language) form.set("language", language);
-  const response = await fetch(testUrl("/audio/transcriptions"), {
+  const response = await fetchWithExpectedIdentity(testUrl("/audio/transcriptions"), {
     method: "POST",
     credentials: "include",
     body: form,

@@ -7,10 +7,10 @@ import { toast } from "@ws-model-proxy/ui/lib/toast";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-
 import { AUTH_SCREEN_CLASS, AuthCard } from "@/components/auth/auth-card";
 import { EmailOnlyForm } from "@/components/auth/email-only-form";
 import { authClient } from "@/lib/auth-client";
+import { markAnonymousOnlyRoute } from "@/lib/document-identity";
 import { resolveRouteSession } from "@/lib/route-session";
 import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
 import { friendly, isRateLimit } from "@/utils/friendly-error";
@@ -37,6 +37,7 @@ export const Route = createFileRoute("/$lang/forgot-password")({
 });
 
 function ForgotPasswordPage() {
+  markAnonymousOnlyRoute();
   const { lang } = Route.useParams();
   const config = useQuery(orpc.app.config.queryOptions());
   const { t } = useTranslation(["auth", "common"]);
@@ -72,7 +73,7 @@ function ForgotPasswordPage() {
     </div>
   );
 
-  if (config.isError) {
+  if (config.isLoadingError) {
     return (
       <AuthCard
         title={t("auth:login.unableToConnect")}

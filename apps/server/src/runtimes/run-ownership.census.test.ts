@@ -899,6 +899,11 @@ const SQL_ELSEWHERE: Record<string, [number, string]> = {
   ],
   "apps/server/src/relay/node-metrics-rollup.ts | fragment-other": [4, "node_metrics_minute."],
   "apps/server/src/relay/runtime-load-rollup.ts | fragment-other": [2, "runtime_load_minute."],
+  // Reviewed 2026-11-27: the last-admin guard adds one SELECT, with no run-table access.
+  "packages/api/src/lib/admin-presence.ts | raw-other": [
+    1,
+    "Read-only active-admin count over user role, verification, deletion and ban fields inside the admin-removal transaction; no run, claim or step writes.",
+  ],
   "packages/api/src/lib/agent-updates.ts | raw-other": [
     2,
     "Self-update authority locks: the node row (policy, trust, stored connection) and the claimed node_agent_update row.",

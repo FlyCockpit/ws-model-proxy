@@ -1,6 +1,7 @@
 import type { Session } from "@ws-model-proxy/auth";
 import type { Context, Handler } from "hono";
 import { resolveClientIp } from "../client-ip.js";
+import { expectedIdentity } from "../expected-identity.js";
 import { checkDashboardSession } from "../model-api/realtime/dashboard-session.js";
 import {
   createRateLimiterMiddleware,
@@ -98,6 +99,8 @@ export function createNodeEventsHandler(options: NodeEventsRouteOptions): Handle
     const sessionId = session?.session?.id;
     if (!session || !userId || !sessionId) return refuse(c, 401, "session_required");
     c.set("session", session);
+    const mismatch = await expectedIdentity(c, async () => {});
+    if (mismatch instanceof Response) return mismatch;
     const userLimited = await userLimit(c, async () => undefined);
     if (userLimited instanceof Response) return userLimited;
 

@@ -9,7 +9,13 @@ import type { AuthSessionState } from "@/lib/auth-session-state";
 const boundary = vi.hoisted(() => ({
   state: { status: "anonymous", session: null } as AuthSessionState["state"],
 }));
-vi.mock("@/hooks/use-auth-session", () => ({ useAuthSession: () => ({ state: boundary.state }) }));
+vi.mock("@/hooks/use-auth-session", () => ({
+  useAuthSession: () => ({
+    state: boundary.state,
+    meta: { isDegraded: false, isRefetching: false },
+    actions: { retry: vi.fn() },
+  }),
+}));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock("@tanstack/react-router", () => ({
   useParams: () => ({ lang: "en-US" }),
@@ -81,31 +87,20 @@ describe("UserMenu", () => {
     expect(text?.classList.contains("hidden")).toBe(true);
     expect(text?.classList.contains("sm:inline")).toBe(true);
   });
-  it("shows a neutral disabled account button during an error carrying a known session", () => {
-    boundary.state = { status: "error", session: signedIn("u1").session, error: new Error("429") };
-    setup();
-    expect(screen.getByRole("button", { name: "userMenu.open" }).hasAttribute("disabled")).toBe(
-      true,
-    );
-    expect(screen.queryByRole("link", { name: "userMenu.signUp" })).toBeNull();
-  });
-  it("shows signed-out actions for a session error with no known identity", () => {
-    boundary.state = { status: "error", session: null, error: new Error("offline") };
-    setup();
-    expect(screen.getByRole("link", { name: "userMenu.signIn" })).toBeTruthy();
-    expect(screen.getByRole("link", { name: "userMenu.signUp" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "userMenu.open" })).toBeNull();
-  });
-  it("keeps a neutral account button when an error follows a known signed-in identity", () => {
-    boundary.state = signedIn("u1");
-    const view = setup();
-    boundary.state = { status: "error", session: null, error: new Error("offline") };
-    view.rerender(<UserMenu />);
-    expect(screen.getByRole("button", { name: "userMenu.open" }).hasAttribute("disabled")).toBe(
-      true,
-    );
-    expect(screen.queryByRole("link", { name: "userMenu.signIn" })).toBeNull();
-  });
+  it.each([null, signedIn("u1").session])(
+    "shows Retry and Sign out on session failure (%s)",
+    (session) => {
+      boundary.state = { status: "error", session, error: { status: 429 } };
+      setup();
+      expect(
+        screen
+          .getByRole("button", { name: "userMenu.accountUnavailable" })
+          .hasAttribute("disabled"),
+      ).toBe(false);
+      expect(screen.getByRole("button", { name: "userMenu.signOut" })).toBeTruthy();
+      expect(screen.queryByRole("link", { name: "userMenu.signIn" })).toBeNull();
+    },
+  );
   it("caps and truncates the eager trigger's name at md+, with the full name in its title", () => {
     boundary.state = signedIn("a-very-long-display-name");
     setup();

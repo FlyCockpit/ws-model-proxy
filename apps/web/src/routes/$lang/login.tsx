@@ -1,5 +1,6 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 import { SignInCard } from "@/components/auth/sign-in-card";
+import { markAnonymousOnlyRoute } from "@/lib/document-identity";
 import { resolveRouteSession } from "@/lib/route-session";
 import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
 import { stripInviteFromAddressBar } from "@/lib/signup-search";
@@ -28,6 +29,7 @@ function stripInviteRef(element: HTMLDivElement | null): void {
 }
 
 function LoginPage() {
+  markAnonymousOnlyRoute();
   const { lang } = Route.useParams();
   const { redirectTo } = Route.useSearch();
 

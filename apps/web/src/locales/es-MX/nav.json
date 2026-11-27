@@ -32,7 +32,9 @@
     "signIn": "Iniciar sesión",
     "signOut": "Cerrar sesión",
     "signOutFailed": "No se pudo cerrar la sesión. Sigues con la sesión iniciada; inténtalo de nuevo.",
-    "signUp": "Registrarse"
+    "signUp": "Registrarse",
+    "accountUnavailable": "Cuenta no disponible — Reintentar",
+    "signOutOffline": "No tienes conexión. Tu sesión sigue abierta. Vuelve a cerrarla cuando tengas conexión."
   },
   "hints": {
     "overview": "Qué pasa y qué te necesita",

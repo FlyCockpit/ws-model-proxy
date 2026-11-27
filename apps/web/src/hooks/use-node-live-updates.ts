@@ -1,6 +1,7 @@
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 
+import { fetchWithExpectedIdentity } from "@/lib/document-identity";
 import {
   invalidateNodeLiveQueries,
   NODE_EVENTS_PATH,
@@ -140,7 +141,7 @@ function openNodeEventStream(queryClient: QueryClient): () => void {
     // Also bounds a response whose headers never arrive (a buffering proxy).
     armWatchdog(streaming);
     try {
-      const response = await fetch(NODE_EVENTS_PATH, {
+      const response = await fetchWithExpectedIdentity(NODE_EVENTS_PATH, {
         credentials: "same-origin",
         cache: "no-store",
         headers: { Accept: "text/event-stream" },

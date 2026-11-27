@@ -25,6 +25,7 @@ import { AuthRetryCard } from "@/components/auth/auth-retry-card";
 import { ResendVerification } from "@/components/auth/resend-verification";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { authClient } from "@/lib/auth-client";
+import { markAnonymousOnlyRoute } from "@/lib/document-identity";
 import { resolveRouteSession } from "@/lib/route-session";
 import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
 import { parseSignupSearch, stripInviteFromAddressBar } from "@/lib/signup-search";
@@ -69,12 +70,16 @@ function Frame({ children }: { children: ReactNode }) {
 }
 
 function SignupPage() {
+  markAnonymousOnlyRoute();
   const { lang } = Route.useParams();
   const search = Route.useSearch();
   const { redirectTo } = search;
   // Read once: the address bar loses the token right after this render.
   const [invite] = useState(search.invite);
   const { state } = useAuthSession();
+  // Keep the rendered branch while the root hides it for peer verification. Chrome still
+  // reads the masked session; this local status only preserves the form beneath Activity.
+  const [settledStatus, setSettledStatus] = useState(state.status);
   const config = useQuery(orpc.app.config.queryOptions());
   const inviteInfo = useQuery({
     ...orpc.auth.inviteInfo.queryOptions({ input: { token: invite ?? "" } }),
@@ -83,16 +88,18 @@ function SignupPage() {
   const { t } = useTranslation(["auth", "common"]);
   const [pendingEmail, setPendingEmail] = useState<string | null>(null);
 
+  if (state.status !== "pending" && state.status !== settledStatus) setSettledStatus(state.status);
+
   const emailEnabled = config.data?.emailEnabled === true;
   const validInvite = validInviteOf(invite, inviteInfo.data);
   const view = pickSignupView({
     pendingEmail,
-    sessionStatus: state.status,
+    sessionStatus: state.status === "pending" ? settledStatus : state.status,
     configPending: config.isPending,
-    configError: config.isError,
+    configError: config.isLoadingError,
     invite,
     invitePending: inviteInfo.isPending,
-    inviteError: inviteInfo.isError,
+    inviteError: inviteInfo.isLoadingError,
     validInvite,
   });
 
@@ -502,37 +509,41 @@ function SignUpForm({
   const form = useForm({
     defaultValues: { name: "", slug: "", email: invite?.email ?? "", password: "" },
     onSubmit: async ({ value }) => {
-      const result = await authClient.signUp.email({
-        email: value.email,
-        password: value.password,
-        name: value.name,
-        slug: value.slug.trim(),
-        // The token travels in a header, never in a (logged) URL; the server lets an invite
-        // sign-up through with open sign-up off and turns the invite into a share.
-        ...(invite ? { fetchOptions: { headers: { [SHARE_INVITE_HEADER]: invite.token } } } : {}),
-      });
-      if (result.error) {
-        console.error("[signup.signUp]", result.error);
-        toast.error(
-          result.error?.code === INVITE_IN_USE_CODE
-            ? t("auth:invite.inUse")
-            : result.error?.status === 409
-              ? t("auth:errors.accountAlreadyRegistered")
-              : friendly(result.error, t("auth:errors.couldNotCreateAccount")),
-        );
-        return;
-      }
-      toast.success(t("auth:accountCreatedSuccess"));
-      // When email is configured, requireEmailVerification means signUp returns
-      // no session — stay here and show the verify-email pending UI.
-      if (emailEnabled) {
-        onAccountCreatedNeedingVerification(value.email);
-        return;
-      }
-      if (redirectTo === `/${lang}/overview`) {
-        navigate({ to: "/$lang/overview", params: { lang } });
-      } else {
-        window.location.assign(redirectTo);
+      try {
+        const result = await authClient.signUp.email({
+          email: value.email,
+          password: value.password,
+          name: value.name,
+          slug: value.slug.trim(),
+          // The token travels in a header, never in a (logged) URL; the server lets an invite
+          // sign-up through with open sign-up off and turns the invite into a share.
+          ...(invite ? { fetchOptions: { headers: { [SHARE_INVITE_HEADER]: invite.token } } } : {}),
+        });
+        if (result.error) {
+          console.error("[signup.signUp]", result.error);
+          toast.error(
+            result.error?.code === INVITE_IN_USE_CODE
+              ? t("auth:invite.inUse")
+              : result.error?.status === 409
+                ? t("auth:errors.accountAlreadyRegistered")
+                : friendly(result.error, t("auth:errors.couldNotCreateAccount")),
+          );
+          return;
+        }
+        toast.success(t("auth:accountCreatedSuccess"));
+        // When email is configured, requireEmailVerification means signUp returns
+        // no session — stay here and show the verify-email pending UI.
+        if (emailEnabled) {
+          onAccountCreatedNeedingVerification(value.email);
+          return;
+        }
+        if (redirectTo === `/${lang}/overview`) {
+          navigate({ to: "/$lang/overview", params: { lang } });
+        } else {
+          window.location.assign(redirectTo);
+        }
+      } catch (error) {
+        toast.error(friendly(error, t("auth:errors.couldNotCreateAccount")));
       }
     },
     validators: {

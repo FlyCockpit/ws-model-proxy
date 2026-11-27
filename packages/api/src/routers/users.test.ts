@@ -101,6 +101,8 @@ const db = prisma as unknown as {
   appSetting: { findUnique: MockInstance };
   verification: { findMany: MockInstance };
   $transaction: MockInstance;
+  $queryRaw: MockInstance;
+  auditEvent: { create: MockInstance };
 };
 
 const authApi = auth as unknown as {
@@ -186,6 +188,11 @@ async function captureConsoleDuring(fn: () => Promise<unknown>): Promise<string>
 describe("usersRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.$transaction
+      .mockReset()
+      .mockImplementation(async (run: (tx: typeof prisma) => Promise<unknown>) => run(prisma));
+    db.$queryRaw.mockReset().mockResolvedValue([{ count: 2 }]);
+    db.auditEvent.create.mockReset().mockResolvedValue({});
     vi.mocked(isEmailConfigured).mockReturnValue(true);
     for (const mock of [
       db.user.findUnique,
@@ -670,7 +677,7 @@ describe("usersRouter", () => {
     it("allows promoting yourself to admin (no-op safety net)", async () => {
       // Even though the admin is already admin, the schema allows the call.
       // We only block demotion of self — promoting yourself is harmless.
-      db.user.findUnique.mockResolvedValue({ id: "admin-user-id" });
+      db.user.findUnique.mockResolvedValue({ id: "admin-user-id", role: "admin" });
       db.user.update.mockResolvedValue({});
 
       const client = createRouterClient(usersRouter, { context: buildContext() });
@@ -693,7 +700,6 @@ describe("usersRouter", () => {
   describe("archive", () => {
     it("bans the user and revokes their sessions in a transaction", async () => {
       db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
-      db.$transaction.mockResolvedValue([]);
 
       const client = createRouterClient(usersRouter, { context: buildContext() });
       const res = await client.archive({
@@ -712,9 +718,10 @@ describe("usersRouter", () => {
       });
       try {
         db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
-        db.$transaction.mockImplementation(async () => {
+        db.$transaction.mockImplementation(async (run: (tx: typeof prisma) => Promise<unknown>) => {
+          const result = await run(prisma);
           order.push("committed");
-          return [];
+          return result;
         });
         const client = createRouterClient(usersRouter, { context: buildContext() });
         await client.archive({ userId: "other-user-id" });
@@ -741,7 +748,7 @@ describe("usersRouter", () => {
       });
       try {
         db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
-        db.$transaction.mockResolvedValue([]);
+
         const client = createRouterClient(usersRouter, { context: buildContext() });
         await expect(client.archive({ userId: "other-user-id" })).resolves.toEqual({
           success: true,
@@ -1049,4 +1056,130 @@ describe("usersRouter", () => {
       expect(output).not.toContain("SELECT");
     });
   });
+});
+
+describe("user access removal guard and role auditing", () => {
+  const target = {
+    id: "other-user-id",
+    role: "admin",
+    emailVerified: true,
+    banned: false,
+    banExpires: null,
+    deletionRequestedAt: null,
+  };
+  const client = () => createRouterClient(usersRouter, { context: buildContext() });
+  beforeEach(() => {
+    vi.clearAllMocks();
+    db.user.findUnique.mockReset().mockResolvedValue(target);
+    db.$queryRaw.mockReset().mockResolvedValue([{ count: 2 }]);
+    db.$transaction
+      .mockReset()
+      .mockImplementation(async (run: (tx: typeof prisma) => Promise<unknown>) => run(prisma));
+    db.auditEvent.create.mockReset().mockResolvedValue({});
+    invalidateForceTwoFactorPolicyCache();
+    db.appSetting.findUnique.mockResolvedValue(null);
+  });
+  it.each(["setRole", "archive", "remove"] as const)(
+    "%s refuses the last verified active admin inside its write transaction",
+    async (operation) => {
+      db.$queryRaw.mockResolvedValue([{ count: 1 }]);
+      if (operation === "remove") {
+        // The real deletion entry point invokes this callback inside its mark transaction.
+        vi.mocked(deleteUserDurably).mockImplementationOnce(async (_db, _id, options) => {
+          await prisma.$transaction(
+            async (tx) => {
+              await options?.beforeMark?.(tx);
+            },
+            { isolationLevel: "Serializable" },
+          );
+          return "deleted";
+        });
+      }
+      const action =
+        operation === "setRole"
+          ? client().setRole({ userId: target.id, role: "user" })
+          : client()[operation]({ userId: target.id });
+      await expect(action).rejects.toMatchObject({
+        code: "FORBIDDEN",
+        data: { reason: "LAST_ACTIVE_ADMIN" },
+      });
+      expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+        isolationLevel: "Serializable",
+      });
+      expect(db.user.update).not.toHaveBeenCalled();
+      expect(db.user.delete).not.toHaveBeenCalled();
+      expect(db.session.deleteMany).not.toHaveBeenCalled();
+      expect(db.auditEvent.create).not.toHaveBeenCalled();
+    },
+  );
+  it.each(["user", "admin", "user, Admin"])(
+    "audits a committed change from %s inside the same transaction",
+    async (role) => {
+      db.user.findUnique.mockResolvedValue({ ...target, role });
+      const next = role === "user" ? "admin" : "user";
+      await client().setRole({ userId: target.id, role: next });
+      expect(db.auditEvent.create).toHaveBeenCalledExactlyOnceWith({
+        data: {
+          userId: target.id,
+          actor: "USER",
+          actorUserId: "admin-user-id",
+          action: "users.role_changed",
+          resourceType: "user",
+          resourceId: target.id,
+          before: { role },
+          after: { role: next },
+        },
+      });
+      expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+        isolationLevel: "Serializable",
+      });
+    },
+  );
+  it.each(["user", "admin"] as const)(
+    "same-role %s requests write and audit nothing",
+    async (role) => {
+      db.user.findUnique.mockResolvedValue({ ...target, role });
+      await client().setRole({ userId: target.id, role });
+      expect(db.user.update).not.toHaveBeenCalled();
+      expect(db.auditEvent.create).not.toHaveBeenCalled();
+    },
+  );
+  it("recounts on every demotion and includes an expired temporary ban", async () => {
+    db.user.findUnique.mockResolvedValue({ ...target, banned: true, banExpires: new Date(0) });
+    db.$queryRaw.mockResolvedValueOnce([{ count: 2 }]).mockResolvedValueOnce([{ count: 1 }]);
+    await client().setRole({ userId: target.id, role: "user" });
+    await expect(client().setRole({ userId: target.id, role: "user" })).rejects.toMatchObject({
+      data: { reason: "LAST_ACTIVE_ADMIN" },
+    });
+    expect(db.user.update).toHaveBeenCalledOnce();
+    expect(db.auditEvent.create).toHaveBeenCalledOnce();
+  });
+  it.each(["setRole", "archive", "remove"] as const)(
+    "%s translates serialization conflicts",
+    async (operation) => {
+      if (operation === "remove")
+        vi.mocked(deleteUserDurably).mockRejectedValueOnce({ code: "P2034" });
+      else db.$transaction.mockRejectedValueOnce({ code: "P2034" });
+      const action =
+        operation === "setRole"
+          ? client().setRole({ userId: target.id, role: "user" })
+          : client()[operation]({ userId: target.id });
+      await expect(action).rejects.toMatchObject({
+        code: "CONFLICT",
+        data: { reason: "USER_CHANGE_CONFLICT" },
+      });
+      expect(db.auditEvent.create).not.toHaveBeenCalled();
+    },
+  );
+  it.each([{ emailVerified: false }, { banned: true }, { deletionRequestedAt: new Date() }])(
+    "does not count unusable admins as active: %s",
+    async (change) => {
+      db.user.findUnique.mockResolvedValue({ ...target, ...change });
+      db.$queryRaw.mockResolvedValue([{ count: 0 }]);
+      await expect(client().setRole({ userId: target.id, role: "user" })).resolves.toEqual({
+        success: true,
+      });
+      expect(db.$queryRaw).not.toHaveBeenCalled();
+    },
+  );
 });

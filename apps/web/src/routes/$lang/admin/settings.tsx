@@ -23,9 +23,9 @@ import { HardDrive, Shield, Trash2 } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
-
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
+import { fetchWithExpectedIdentity } from "@/lib/document-identity";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/admin/settings")({
@@ -51,10 +51,13 @@ type MediaAdminStats = {
 const MEDIA_STATS_QUERY_KEY = ["admin", "media-stats"] as const;
 
 async function fetchMediaAdminStats(signal: AbortSignal): Promise<MediaAdminStats> {
-  const response = await fetch(`${env.VITE_SERVER_URL}/api/internal/media/admin/stats`, {
-    credentials: "include",
-    signal,
-  });
+  const response = await fetchWithExpectedIdentity(
+    `${env.VITE_SERVER_URL}/api/internal/media/admin/stats`,
+    {
+      credentials: "include",
+      signal,
+    },
+  );
   if (!response.ok) throw new Error(`media stats request failed: ${response.status}`);
   return (await response.json()) as MediaAdminStats;
 }
@@ -64,10 +67,13 @@ type MediaActionResult = { removed: number; bytes?: number };
 async function postMediaAdminAction(
   path: "purge-expired" | "delete-all",
 ): Promise<MediaActionResult> {
-  const response = await fetch(`${env.VITE_SERVER_URL}/api/internal/media/admin/${path}`, {
-    method: "POST",
-    credentials: "include",
-  });
+  const response = await fetchWithExpectedIdentity(
+    `${env.VITE_SERVER_URL}/api/internal/media/admin/${path}`,
+    {
+      method: "POST",
+      credentials: "include",
+    },
+  );
   if (!response.ok) throw new Error(`media action failed: ${response.status}`);
   return (await response.json()) as MediaActionResult;
 }

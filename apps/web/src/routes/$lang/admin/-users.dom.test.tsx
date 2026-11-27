@@ -184,8 +184,9 @@ describe("admin users deletion conflicts", () => {
     await mount();
     fireEvent.click(screen.getByRole("button", { name: "users.deleteAction" }));
     fireEvent.click(screen.getByRole("button", { name: "confirm delete" }));
+    // Remove handles its own errors now, so copy uses the component's translator.
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("t(errors:deletionConflict.retainedHistory.user)"),
+      expect(toast.error).toHaveBeenCalledWith("errors:deletionConflict.retainedHistory.user"),
     );
     expect(toast.error).toHaveBeenCalledTimes(1);
     expect(state.calls).toEqual([{ name: "remove", input: { userId: "user-1" } }]);
@@ -209,7 +210,9 @@ describe("admin users deletion conflicts", () => {
     await mount();
     fireEvent.click(screen.getByRole("button", { name: "users.deleteAction" }));
     fireEvent.click(screen.getByRole("button", { name: "confirm delete" }));
-    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("t(admin:users.deleteFailed)"));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("admin:users.deleteFailed"));
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(state.calls).toEqual([{ name: "remove", input: { userId: "user-1" } }]);
   });
 });
 

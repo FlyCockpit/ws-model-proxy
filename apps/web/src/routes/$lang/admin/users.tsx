@@ -32,6 +32,8 @@ import { Archive, ArchiveRestore, Copy, MoreVertical, Plus, Shield, Trash } from
 import { type RefObject, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
+import { RoleChangeDialog, type RoleChangeTarget } from "@/components/admin/role-change-dialog";
+import { userChangeErrorKey } from "@/components/admin/user-change-error";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { LabelledSelect } from "@/components/labelled-select";
@@ -42,6 +44,8 @@ import { useCopyFeedback } from "@/hooks/use-copy-feedback";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { useHaptics } from "@/hooks/use-haptics";
 import { useNamespaceT } from "@/i18n/use-namespace-t";
+import { friendly } from "@/utils/friendly-error";
+import { mutationErrorMessage } from "@/utils/mutation-error-toast";
 import { orpc } from "@/utils/orpc";
 
 type StatusFilter = "all" | "active" | "archived";
@@ -88,6 +92,7 @@ function AdminUsers() {
     email: string;
     setPasswordUrl: string;
   } | null>(null);
+  const [roleTarget, setRoleTarget] = useState<RoleChangeTarget | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const debouncedSearch = useDebouncedValue(search.trim(), 300);
 
@@ -103,12 +108,13 @@ function AdminUsers() {
         queryClient.invalidateQueries({ queryKey: orpc.users.key() });
         trigger("success");
         toast.success(t("admin:users.roleUpdated"));
+        setRoleTarget(null);
       },
       onError: () => {
         trigger("error");
       },
     }),
-    meta: { errorFallbackKey: "admin:users.roleUpdateFailed" },
+    meta: { skipGlobalErrorToast: true },
   });
 
   const archive = useMutation({
@@ -122,11 +128,21 @@ function AdminUsers() {
           onUndo: () => unarchive.mutate({ userId: input.userId }),
         });
       },
-      onError: () => {
+      onError: (error) => {
         trigger("error");
+        const key = userChangeErrorKey(error);
+        toast.error(
+          key
+            ? t(key)
+            : mutationErrorMessage(
+                error,
+                { errorFallbackKey: "admin:users.archiveFailed", deletionEntity: "user" },
+                t,
+              ),
+        );
       },
     }),
-    meta: { errorFallbackKey: "admin:users.archiveFailed" },
+    meta: { skipGlobalErrorToast: true },
   });
 
   const unarchive = useMutation({
@@ -176,11 +192,21 @@ function AdminUsers() {
         }
         setDeleteId(null);
       },
-      onError: () => {
+      onError: (error) => {
         trigger("error");
+        const key = userChangeErrorKey(error);
+        toast.error(
+          key
+            ? t(key)
+            : mutationErrorMessage(
+                error,
+                { errorFallbackKey: "admin:users.deleteFailed", deletionEntity: "user" },
+                t,
+              ),
+        );
       },
     }),
-    meta: { errorFallbackKey: "admin:users.deleteFailed", deletionEntity: "user" },
+    meta: { skipGlobalErrorToast: true },
   });
 
   const allUsers = (list.data?.users ?? []) as UserRow[];
@@ -189,6 +215,7 @@ function AdminUsers() {
     if (statusFilter === "archived") return !!u.banned;
     return true;
   });
+  const roleErrorKey = userChangeErrorKey(setRole.error);
   const deleteTarget = allUsers.find((u) => u.id === deleteId) ?? null;
 
   return (
@@ -256,7 +283,8 @@ function AdminUsers() {
             selfId={session.user.id}
             onSetRole={(user, role) => {
               trigger("light");
-              setRole.mutate({ userId: user.id, role });
+              setRole.reset();
+              setRoleTarget({ id: user.id, name: user.name, email: user.email, role });
             }}
             onArchive={(user) => {
               trigger("warning");
@@ -291,6 +319,25 @@ function AdminUsers() {
         reveal={reveal}
         onClose={() => setReveal(null)}
         returnFocus={inviteButtonRef}
+      />
+
+      <RoleChangeDialog
+        target={roleTarget}
+        isPending={setRole.isPending}
+        error={
+          setRole.error
+            ? roleErrorKey
+              ? t(roleErrorKey)
+              : friendly(setRole.error, t("admin:users.roleUpdateFailed"))
+            : undefined
+        }
+        onClose={() => {
+          if (!setRole.isPending) setRoleTarget(null);
+        }}
+        onConfirm={() => {
+          if (roleTarget && !setRole.isPending)
+            setRole.mutate({ userId: roleTarget.id, role: roleTarget.role });
+        }}
       />
 
       <ConfirmDeleteDialog
@@ -415,7 +462,11 @@ function UserListItem({
   const isArchived = !!user.banned;
   const isDeleting = Boolean(user.deletionRequestedAt);
   return (
-    <li className="flex flex-wrap items-start justify-between gap-3 px-4 py-3 sm:items-center">
+    <li
+      data-user-role={isAdmin ? "admin" : "user"}
+      data-current-user={isSelf || undefined}
+      className="flex flex-wrap items-start justify-between gap-3 px-4 py-3 sm:items-center"
+    >
       {/* The actions stay beside the name; they drop below it only when the name column would go
           under 12rem (a large browser font size on a phone). */}
       <div className="min-w-0 grow basis-48">
