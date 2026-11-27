@@ -62,8 +62,12 @@ let peer: {
   onmessage: ((event: MessageEvent) => void) | null;
   postMessage: (message: unknown) => void;
 };
+function receivePeer(data: unknown): void {
+  peer.onmessage?.({ data } as MessageEvent);
+}
 let nativeClock = Date.UTC(2030, 0, 1);
 beforeEach(async () => {
+  vi.useFakeTimers();
   resetSessionRetryForTests();
   messages = [];
   peer = {
@@ -88,14 +92,25 @@ beforeEach(async () => {
   mounted.readIdentity.mockReset().mockReturnValue("a");
   useReloadOnIdentityChange();
 });
-afterEach(() => {
+afterEach(async () => {
   for (const cleanup of mounted.cleanups) cleanup();
-  vi.unstubAllGlobals();
   resetSessionRetryForTests();
+  // Nanostores defers unmount by one second. Close the REAL atom manager
+  // while this test's window/document and clock still exist.
+  vi.useFakeTimers();
+  authClient.$store.atoms.session?.off();
+  await vi.advanceTimersByTimeAsync(1_000);
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 async function settle() {
-  for (let i = 0; i < 30; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  if (vi.isFakeTimers()) {
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+  } else {
+    for (let i = 0; i < 30; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  }
 }
 function headers(): Headers {
   const [input, init] = fetchMock.mock.calls.at(-1) ?? [];
@@ -318,5 +333,528 @@ describe("authClient identity transport", () => {
     const result = await authClient.updateUser({ name: "name" });
     expect(result.error?.code).toBe("OTHER_CONFLICT");
     expect(reload).not.toHaveBeenCalled();
+  });
+});
+
+describe("follow-up session reconciliation", () => {
+  it.each(["/en-US/", "/en-US/missing"])(
+    "a fresh public document at %s listens without an initial probe and lazily reconciles a peer sign-in",
+    async (pathname) => {
+      for (const cleanup of mounted.cleanups.splice(0)) cleanup();
+      resetDocumentIdentityForTests(() => peer);
+      peer.onmessage = null; // A fresh document has no retained receiver.
+      Object.assign(window.location, { pathname });
+      const { watchDocumentRestore } = await import("./document-identity");
+      watchDocumentRestore();
+      expect(peer.onmessage).toBeTypeOf("function");
+      expect(fetchMock).not.toHaveBeenCalled();
+      fetchMock.mockResolvedValue(
+        Response.json({ user: { id: "b" }, session: { expiresAt: "2099-01-01T00:00:00.000Z" } }),
+      );
+      receivePeer({ kind: "session-changed" });
+      await settle();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/get-session");
+      expect(reload).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("a retained A document on a public page reconciles B after its app watcher unmounts", async () => {
+    for (const cleanup of mounted.cleanups.splice(0)) cleanup();
+    Object.assign(window.location, { pathname: "/en-US/" });
+    fetchMock.mockResolvedValue(
+      Response.json({ user: { id: "b" }, session: { expiresAt: "2099-01-01T00:00:00.000Z" } }),
+    );
+    peer.onmessage?.({ data: { kind: "identity", id: "b" } } as MessageEvent);
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("a private401 bypasses a revoked cookie cache once; ordinary refreshes keep the cache", async () => {
+    const { reportSessionRejected, needsAuthoritativeSessionCheck } = await import(
+      "./document-identity"
+    );
+    const urls: URL[] = [];
+    fetchMock.mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      urls.push(url);
+      // Mirrors Better Auth's get-session shouldUseCookieCache decision:
+      // the cached A session survives revocation until authoritative lookup.
+      return Response.json(
+        url.searchParams.get("disableCookieCache") === "true"
+          ? null
+          : { user: { id: "a" }, session: { expiresAt: "2099-01-01T00:00:00.000Z" } },
+      );
+    });
+    const ordinary = await authClient.getSession();
+    expect(ordinary.data?.user.id).toBe("a");
+    expect(urls[0]?.searchParams.has("disableCookieCache")).toBe(false);
+    mounted.refetch.mockImplementation(async () => {
+      const answer = await authClient.getSession();
+      mounted.readIdentity.mockReturnValue(answer.data?.user.id ?? null);
+    });
+    reportSessionRejected();
+    reportSessionRejected();
+    await settle();
+    expect(urls).toHaveLength(2);
+    expect(urls[1]?.searchParams.get("disableCookieCache")).toBe("true");
+    expect(needsAuthoritativeSessionCheck()).toBe(false);
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("a401 cannot share a pre-rejection A answer, even while a peer probe is pending", async () => {
+    const { reportSessionRejected } = await import("./document-identity");
+    let finish!: () => void;
+    mounted.refetch
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finish = resolve;
+          }),
+      )
+      .mockImplementationOnce(async () => {
+        const answer = await authClient.getSession();
+        mounted.readIdentity.mockReturnValue(answer.data?.user.id ?? null);
+      });
+    peer.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
+    await settle();
+    reportSessionRejected();
+    mounted.readIdentity.mockReturnValue("a");
+    fetchMock.mockResolvedValue(Response.json(null));
+    finish();
+    await settle();
+    // Existing bounded follow-up timer, not a second rejection scheduler.
+    await vi.advanceTimersByTimeAsync(260);
+    await settle();
+    expect(mounted.refetch).toHaveBeenCalledTimes(2);
+    expect(
+      new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get("disableCookieCache"),
+    ).toBe("true");
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("failed authoritative checks retain the bypass and Retry-After coalescing", async () => {
+    const { reportSessionRejected, needsAuthoritativeSessionCheck } = await import(
+      "./document-identity"
+    );
+    const { recordSessionRetryAfter } = await import("./session-retry");
+    mounted.refetch.mockImplementation(async () => {
+      const answer = await authClient.getSession();
+      mounted.readIdentity.mockReturnValue(answer.error ? undefined : "a");
+    });
+    fetchMock.mockResolvedValue(
+      Response.json({ message: "busy" }, { status: 429, headers: { "Retry-After": "60" } }),
+    );
+    reportSessionRejected();
+    await settle();
+    expect(needsAuthoritativeSessionCheck()).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    recordSessionRetryAfter(new Response(null, { status: 429, headers: { "Retry-After": "60" } }));
+    reportSessionRejected();
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(reload).not.toHaveBeenCalled();
+  });
+});
+
+describe("lazy verifier lifecycle", () => {
+  it("recovers a public429 using the scheduler without recursively waiting on itself", async () => {
+    for (const cleanup of mounted.cleanups.splice(0)) cleanup();
+    vi.useFakeTimers();
+    fetchMock
+      .mockResolvedValueOnce(
+        Response.json({ message: "busy" }, { status: 429, headers: { "Retry-After": "2" } }),
+      )
+      .mockResolvedValue(
+        Response.json({ user: { id: "b" }, session: { expiresAt: "2099-01-01T00:00:00.000Z" } }),
+      );
+    try {
+      peer.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(2_001); // scheduler backoff and Retry-After
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(reload).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an app mounting during a public probe joins the updated atom instead of accepting old A", async () => {
+    for (const cleanup of mounted.cleanups.splice(0)) cleanup();
+    let answer!: (response: Response) => void;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    peer.onmessage?.({ data: { kind: "identity", id: "b" } } as MessageEvent);
+    await settle();
+    mounted.readIdentity.mockImplementation(
+      () => authClient.$store.atoms.session?.value.data?.user.id ?? null,
+    );
+    useReloadOnIdentityChange();
+    answer(
+      Response.json({ user: { id: "b" }, session: { expiresAt: "2099-01-01T00:00:00.000Z" } }),
+    );
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(isDocumentReplaced()).toBe(true);
+  });
+
+  it("a valid authoritative same-A answer does not log out and subsequent probes keep normal cookie caching", async () => {
+    const { reportSessionRejected } = await import("./document-identity");
+    fetchMock.mockImplementation(async () =>
+      Response.json({ user: { id: "a" }, session: { expiresAt: "2099-01-01T00:00:00.000Z" } }),
+    );
+    mounted.refetch.mockImplementation(async () => {
+      const answer = await authClient.getSession();
+      mounted.readIdentity.mockReturnValue(answer.data?.user.id ?? null);
+    });
+    reportSessionRejected();
+    await settle();
+    expect(
+      new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get("disableCookieCache"),
+    ).toBe("true");
+    expect(reload).not.toHaveBeenCalled();
+    await authClient.getSession();
+    expect(
+      new URL(String(fetchMock.mock.calls[1]?.[0])).searchParams.has("disableCookieCache"),
+    ).toBe(false);
+  });
+});
+
+describe("production decoded RPC401 and QueryCache path", () => {
+  it.each([false, true])(
+    "reconciles first401 before retries (batched=%s), deduplicating final cache callbacks and burst errors",
+    async (batched) => {
+      const { ORPCError, os } = await import("@orpc/server");
+      const { RPCHandler } = await import("@orpc/server/fetch");
+      const { BatchHandlerPlugin } = await import("@orpc/server/plugins");
+      const { QueryCache } = await import("@tanstack/react-query");
+      const { identityVerificationGeneration } = await import("./document-identity");
+      const { shouldRetryQuery } = await import("../utils/query-retry");
+      const procedure = vi.fn(() => {
+        throw new ORPCError("UNAUTHORIZED");
+      });
+      const handler = new RPCHandler(
+        { settings: { get: os.handler(procedure) }, nodes: { list: os.handler(procedure) } },
+        {
+          plugins: [new BatchHandlerPlugin()],
+        },
+      );
+      let finishOld!: () => void;
+      mounted.refetch
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((resolve) => {
+              finishOld = resolve;
+            }),
+        )
+        .mockImplementation(async () => {
+          const result = await authClient.getSession();
+          mounted.readIdentity.mockReturnValue(result.data?.user.id ?? null);
+        });
+      // An A check predates the private rejection and cannot certify it.
+      window.dispatchEvent(new Event("focus"));
+      await settle();
+      expect(mounted.refetch).toHaveBeenCalledTimes(1);
+      const since = identityVerificationGeneration();
+      const rpcUrls: string[] = [];
+      const sessionUrls: URL[] = [];
+      fetchMock.mockImplementation(async (input, init) => {
+        const request = new Request(input, init);
+        if (request.url.includes("/get-session")) {
+          sessionUrls.push(new URL(request.url));
+          return Response.json(null);
+        }
+        rpcUrls.push(request.url);
+        const result = await handler.handle(request, { prefix: "/rpc" });
+        if (!result.response) throw new Error("Unmatched fixture RPC");
+        return result.response;
+      });
+      const errors = vi.fn((error: unknown) => skipErrorToastForIdentity(error, "query"));
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: shouldRetryQuery } },
+        queryCache: new QueryCache({ onError: errors }),
+      });
+      const first = client.fetchQuery({
+        ...orpc.settings.get.queryOptions(),
+        meta: { skipGlobalErrorToast: true },
+      });
+      const requests = batched
+        ? [first, client.fetchQuery(orpc.nodes.list.queryOptions())]
+        : [first];
+      const settled = Promise.allSettled(requests);
+      await vi.advanceTimersByTimeAsync(0);
+      await settled;
+      expect(procedure).toHaveBeenCalledTimes(batched ? 2 : 1);
+      expect(errors).toHaveBeenCalledTimes(batched ? 2 : 1);
+      expect(rpcUrls).toHaveLength(1);
+      expect(rpcUrls[0]?.includes("/__batch__")).toBe(batched);
+      expect(identityVerificationGeneration()).toBe(since + 1);
+      finishOld();
+      await settle();
+      expect(mounted.refetch).toHaveBeenCalledTimes(2);
+      expect(sessionUrls).toHaveLength(1);
+      expect(sessionUrls[0]?.searchParams.get("disableCookieCache")).toBe("true");
+      expect(reload).toHaveBeenCalledTimes(1);
+      client.clear();
+    },
+  );
+
+  it("preserves normal non401 query retries", async () => {
+    const { shouldRetryQuery } = await import("../utils/query-retry");
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: shouldRetryQuery, retryDelay: 0 } },
+    });
+    const fetchData = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("temporary network failure"))
+      .mockResolvedValue("ok");
+    const result = client.fetchQuery({ queryKey: ["retry-network"], queryFn: fetchData });
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(result).resolves.toBe("ok");
+    expect(fetchData).toHaveBeenCalledTimes(2);
+    client.clear();
+  });
+});
+
+describe("public failure retry retained across app mount", () => {
+  it("reconciles a scheduled B answer and seals A's cache after a successful app A check and a later failed peer check", async () => {
+    for (const cleanup of mounted.cleanups.splice(0)) cleanup();
+    let answer = "public-failure";
+    fetchMock.mockImplementation(async () => {
+      if (answer.endsWith("failure"))
+        return Response.json({ message: "unavailable" }, { status: 503 });
+      return Response.json({
+        user: { id: answer },
+        session: { expiresAt: "2099-01-01T00:00:00.000Z" },
+      });
+    });
+    peer.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(isDocumentIdentityUnverified()).toBe(true);
+
+    mounted.readIdentity.mockImplementation(() => {
+      const snapshot = authClient.$store.atoms.session?.value;
+      return !snapshot || snapshot.error || snapshot.isRefetching
+        ? undefined
+        : (snapshot.data?.user.id ?? null);
+    });
+    mounted.refetch.mockImplementation(async () => {
+      await authClient.$store.atoms.session?.value.refetch();
+      const snapshot = authClient.$store.atoms.session?.value;
+      observeSessionRetry(snapshot?.error, snapshot?.isPending || snapshot?.isRefetching || false);
+    });
+    answer = "a";
+    useReloadOnIdentityChange();
+    await settle();
+    expect(mounted.refetch).toHaveBeenCalledTimes(1);
+    expect(isDocumentIdentityUnverified()).toBe(false);
+    expect(reload).not.toHaveBeenCalled();
+
+    const client = new QueryClient();
+    onDocumentReplaced(() => sealQueryClient(client));
+    client.setQueryData(["private-profile"], "A private data");
+    answer = "watcher-failure";
+    peer.onmessage?.({ data: { kind: "identity", id: "b" } } as MessageEvent);
+    await settle();
+    expect(mounted.refetch).toHaveBeenCalledTimes(2);
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    answer = "b";
+    await vi.advanceTimersByTimeAsync(4_000);
+    await settle();
+    // The retained raw public callback owns this scheduled slot. It must
+    // reconcile even though an app watcher now exists, with no extra event.
+    expect(mounted.refetch).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(client.getQueryData(["private-profile"])).toBeUndefined();
+    client.setQueryData(["late-A-callback"], "A private data");
+    expect(client.getQueryData(["late-A-callback"])).toBeUndefined();
+  });
+});
+
+describe("authorization failure isolation", () => {
+  it("keeps a decoded private403 ordinary without a session check or identity invalidation", async () => {
+    const { ORPCError, os } = await import("@orpc/server");
+    const { RPCHandler } = await import("@orpc/server/fetch");
+    const { QueryCache } = await import("@tanstack/react-query");
+    const { identityVerificationGeneration } = await import("./document-identity");
+    const { shouldRetryQuery } = await import("../utils/query-retry");
+    const procedure = vi.fn(() => {
+      throw new ORPCError("FORBIDDEN");
+    });
+    const handler = new RPCHandler({ settings: { get: os.handler(procedure) } });
+    fetchMock.mockImplementation(async (input, init) => {
+      const result = await handler.handle(new Request(input, init), { prefix: "/rpc" });
+      if (!result.response) throw new Error("Unmatched fixture RPC");
+      return result.response;
+    });
+    const since = identityVerificationGeneration();
+    const toast = vi.fn();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: shouldRetryQuery } },
+      queryCache: new QueryCache({
+        onError(error) {
+          if (!skipErrorToastForIdentity(error, "query")) toast(error);
+        },
+      }),
+    });
+    const failed = expect(
+      client.fetchQuery(orpc.settings.get.queryOptions()),
+    ).rejects.toMatchObject({ status: 403 });
+    await vi.advanceTimersByTimeAsync(0);
+    await failed;
+    expect(procedure).toHaveBeenCalledTimes(1);
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(identityVerificationGeneration()).toBe(since);
+    expect(mounted.refetch).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(reload).not.toHaveBeenCalled();
+    client.clear();
+  });
+});
+
+describe("delayed batch401 during an authoritative failure retry", () => {
+  it.each(["a", "b", null])(
+    "joins the scheduled %s probe without invalidating it or spending a third probe",
+    async (freshIdentity) => {
+      const { ORPCError, os } = await import("@orpc/server");
+      const { RPCHandler } = await import("@orpc/server/fetch");
+      const { BatchHandlerPlugin } = await import("@orpc/server/plugins");
+      const { QueryCache } = await import("@tanstack/react-query");
+      const { identityVerificationGeneration } = await import("./document-identity");
+      const { shouldRetryQuery } = await import("../utils/query-retry");
+      let deliverSecond401!: () => void;
+      const laterItem = new Promise<void>((resolve) => {
+        deliverSecond401 = resolve;
+      });
+      const handler = new RPCHandler(
+        {
+          settings: {
+            get: os.handler(() => {
+              throw new ORPCError("UNAUTHORIZED");
+            }),
+          },
+          nodes: {
+            list: os.handler(async () => {
+              await laterItem;
+              throw new ORPCError("UNAUTHORIZED");
+            }),
+          },
+        },
+        { plugins: [new BatchHandlerPlugin()] },
+      );
+      let completeRetry!: (response: Response) => void;
+      const retryResponse = new Promise<Response>((resolve) => {
+        completeRetry = resolve;
+      });
+      let probes = 0;
+      fetchMock.mockImplementation(async (input, init) => {
+        const request = new Request(input, init);
+        if (request.url.includes("/get-session")) {
+          probes++;
+          expect(new URL(request.url).searchParams.get("disableCookieCache")).toBe("true");
+          return probes === 1
+            ? Response.json({ message: "temporary" }, { status: 503 })
+            : retryResponse;
+        }
+        const result = await handler.handle(request, { prefix: "/rpc" });
+        if (!result.response) throw new Error("Unmatched fixture RPC");
+        return result.response;
+      });
+      mounted.refetch.mockImplementation(async () => {
+        const result = await authClient.getSession();
+        mounted.readIdentity.mockReturnValue(
+          result.error ? undefined : (result.data?.user.id ?? null),
+        );
+        observeSessionRetry(result.error, false);
+      });
+      mounted.cleanups.push(connectSessionRetry(mounted.refetch));
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: shouldRetryQuery } },
+        queryCache: new QueryCache({
+          onError: (error) => {
+            skipErrorToastForIdentity(error, "query");
+          },
+        }),
+      });
+      const first = client.fetchQuery(orpc.settings.get.queryOptions());
+      const second = client.fetchQuery(orpc.nodes.list.queryOptions());
+      const both = Promise.allSettled([first, second]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(probes).toBe(1);
+      const since = identityVerificationGeneration();
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(probes).toBe(2);
+      // The document-level hint callback has finished after its503, but the
+      // coordinator's scheduled retry is in flight when the second item fails.
+      deliverSecond401();
+      await vi.advanceTimersByTimeAsync(0);
+      await both;
+      expect(identityVerificationGeneration()).toBe(since);
+      completeRetry(
+        Response.json(
+          freshIdentity === null
+            ? null
+            : { user: { id: freshIdentity }, session: { expiresAt: "2099-01-01T00:00:00.000Z" } },
+        ),
+      );
+      await settle();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(probes).toBe(2);
+      expect(reload).toHaveBeenCalledTimes(freshIdentity === "a" ? 0 : 1);
+      if (freshIdentity === "a") expect(isDocumentIdentityUnverified()).toBe(false);
+      client.clear();
+    },
+  );
+});
+
+describe("first decoded rejection before a consumer callback", () => {
+  it("starts reconciliation for an imperative RPC with no QueryCache", async () => {
+    const { ORPCError, os } = await import("@orpc/server");
+    const { RPCHandler } = await import("@orpc/server/fetch");
+    const { identityVerificationGeneration } = await import("./document-identity");
+    const handler = new RPCHandler({
+      settings: {
+        get: os.handler(() => {
+          throw new ORPCError("UNAUTHORIZED");
+        }),
+      },
+    });
+    fetchMock.mockImplementation(async (input, init) => {
+      const result = await handler.handle(new Request(input, init), { prefix: "/rpc" });
+      if (!result.response) throw new Error("Unmatched fixture RPC");
+      return result.response;
+    });
+    let finish!: () => void;
+    mounted.refetch.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const since = identityVerificationGeneration();
+    const consumer = vi.fn((error: unknown) => {
+      expect(identityVerificationGeneration()).toBe(since + 1);
+      expect(isDocumentIdentityUnverified()).toBe(true);
+      return error;
+    });
+    const request = orpc.settings.get.call().catch(consumer);
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(request).resolves.toMatchObject({ status: 401 });
+    expect(consumer).toHaveBeenCalledTimes(1);
+    expect(mounted.refetch).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    finish();
+    await settle();
   });
 });

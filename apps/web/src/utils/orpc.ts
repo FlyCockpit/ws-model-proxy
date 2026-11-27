@@ -1,4 +1,4 @@
-import { createORPCClient } from "@orpc/client";
+import { createORPCClient, onError } from "@orpc/client";
 import { RPCLink } from "@orpc/client/fetch";
 import {
   ClientRetryPlugin,
@@ -8,11 +8,24 @@ import {
 import { createTanstackQueryUtils } from "@orpc/tanstack-query";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { env } from "@ws-model-proxy/env/web";
-import { fetchWithExpectedIdentity } from "@/lib/document-identity";
+import { fetchWithExpectedIdentity, reportSessionRejected } from "@/lib/document-identity";
 import { createRpcBatchLinkPlugin } from "./rpc-batch-link";
 
 const link = new RPCLink({
   url: `${env.VITE_SERVER_URL}/rpc`,
+  // Runs after individual RPC decoding, including streaming batch items, and
+  // before Query retry/final-error callbacks. No HTTP-envelope assumptions.
+  interceptors: [
+    onError((error) => {
+      if (
+        error &&
+        typeof error === "object" &&
+        (("code" in error && error.code === "UNAUTHORIZED") ||
+          ("status" in error && error.status === 401))
+      )
+        reportSessionRejected(error);
+    }),
+  ],
   plugins: [
     new SimpleCsrfProtectionLinkPlugin(),
     createRpcBatchLinkPlugin(),

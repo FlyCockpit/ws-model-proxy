@@ -194,7 +194,7 @@ replaced document reloads once, however many changes follow.
 | Anonymous → signed in | Public pages update normally. A confirmed peer sign-in replaces an anonymous-only form; a local sign-in keeps its router navigation. |
 | `pending` / `error` | Never acted on: a flaky session check must not reload a signed-in page. |
 
-Three observers feed it, and none can be skipped:
+The following observers feed it, and none can be skipped:
 
 - **Every session guard** (`_auth`, `admin`, `login`, `signup`, `forgot-password`, `mcp-consent`,
   the `/$lang/` redirect) calls `resolveRouteSession()` (`apps/web/src/lib/route-session.ts`):
@@ -209,14 +209,16 @@ Three observers feed it, and none can be skipped:
   auth client announces every session change made in the tab (`$sessionSignal`), and the watcher
   and the guards announce each newly confirmed identity on the document's `BroadcastChannel`; every
   matching peers do no work, while conflicting identities and session-change hints share one session check.
-  While the watcher is not mounted (the root's pending or error state, a route loader's query
-  before the shell mounts), a peer's announcement or a 401 cannot be checked: it marks the
-  document's identity unverified instead (generation-counted). Until a fresh check confirms the
+  The router opens the peer receiver even before the root mounts, including public/404 loads,
+  without a session probe or eager auth import. If the watcher is absent (root pending/error),
+  a peer event lazily loads the same session verifier and retry coordinator. Every peer hint
+  invalidates older answers; a private 401 also requires a post-event authoritative answer. Until a fresh check confirms the
   document's identity or replaces the document, `useAuthSession()` reports `pending` everywhere,
   so no chrome shows an account Better Auth's atom may hold stale; the shell's nav ignores the
   guards' route context (`useShellIdentity`), and the root holds the matched page as a skeleton
-  (an error reset re-renders retained matches without their guards; the watcher stays mounted
-  outside that gate). A fresh check is a guard's
+  (React Activity preserves route state while hidden; the watcher stays mounted outside it).
+  Generic error Retry invalidates the router with `forcePending: true`, so guarded ancestors
+  settle before successful child matches can recover. A fresh check is a guard's
   server answer, or a refetch the watcher itself starts once it mounts (retried on focus,
   visibility and reconnect through the document retry scheduler; one superseded by another session fetch is followed up at most 3
   times, 250 ms apart; all dropped on unmount). An answer asked for before a newer invalidation
@@ -224,6 +226,13 @@ Three observers feed it, and none can be skipped:
   reads the session unmasked (`useAuthSession({ unmasked: true })`). The template's
   `SessionUnconfirmed` for its `_app` pending shell is not needed here: the chrome lives in the
   root component next to the watcher, so whenever it paints, the watcher is connected.
+- **The decoded oRPC interceptor** checks the first individual failure, including batch items,
+  before query retries. A private 401 invalidates pre-event answers and requests one coalesced
+  fresh session check. The interceptor and final QueryCache callback deduplicate the same error;
+  bursts share one post-event check. A targeted `disableCookieCache` parameter lasts only until
+  that check succeeds; this app still has no global session cookie cache. Guards await required
+  reconciliation. 403 remains an ordinary authorization failure; transient query retries retain
+  the existing app policy.
 - **The global error toasts** (`utils/query-error-toast.ts`, `utils/mutation-error-toast.ts`):
   before any toast opt-out, a query rejected with 401 asks Better Auth to check the session (one
   check in flight at a time) instead of toasting; a mutation still toasts. Nothing toasts once the
