@@ -14,6 +14,7 @@ const state = vi.hoisted(() => ({
   desktop: true,
   locale: "en-US",
   inviteResult: { userId: "new-id", emailSent: true } as Record<string, unknown>,
+  emailEnabled: false,
 }));
 
 vi.stubGlobal("matchMedia", (query: string) => ({
@@ -93,6 +94,14 @@ vi.mock("@/utils/orpc", () => {
   });
   return {
     orpc: {
+      app: {
+        config: {
+          queryOptions: () => ({
+            queryKey: ["app", "config"],
+            queryFn: async () => ({ emailEnabled: state.emailEnabled }),
+          }),
+        },
+      },
       users: {
         key: () => ["users"],
         list: {
@@ -161,6 +170,7 @@ afterEach(() => {
   state.desktop = true;
   state.locale = "en-US";
   state.inviteResult = { userId: "new-id", emailSent: true };
+  state.emailEnabled = false;
   vi.mocked(toast.success).mockClear();
   vi.mocked(toast.error).mockClear();
 });
@@ -281,6 +291,22 @@ describe("admin invite links and archive Undo", () => {
     await fillInvite();
     expect(await screen.findByText("https://app.example.test/reset-password/INVITE")).toBeTruthy();
     expect(screen.queryByText("admin:users.tempPasswordLabel")).toBeNull();
+    // No email set up: nothing is mailed at sign-in either.
+    expect(screen.queryByText("admin:users.revealVerifyHint")).toBeNull();
+  });
+
+  it("says a shown link's invitee confirms the address by mail when email is set up", async () => {
+    state.users = [user()];
+    state.emailEnabled = true;
+    state.inviteResult = {
+      userId: "new-id",
+      emailSent: false,
+      setPasswordUrl: "https://app.example.test/reset-password/INVITE",
+      expiresAt: "2026-12-01T00:00:00.000Z",
+    };
+    await mount();
+    await fillInvite();
+    expect(await screen.findByText("admin:users.revealVerifyHint")).toBeTruthy();
   });
 
   it("tells the admin to remove a half-created invite, and shows that account", async () => {

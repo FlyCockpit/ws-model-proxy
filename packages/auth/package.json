@@ -71,6 +71,9 @@
     },
     "./credential-setup-lock": {
       "default": "./src/credential-setup-lock.ts"
+    },
+    "./password-reset-links": {
+      "default": "./src/password-reset-links.ts"
     }
   },
   "scripts": {

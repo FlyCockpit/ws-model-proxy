@@ -803,6 +803,9 @@ function RevealInviteDialog({
 }) {
   const { feedback, copy } = useCopyFeedback(2_000);
   const { t } = useTranslation(["admin", "common", "errors"]);
+  // With email set up, a shown link sets the password but proves nothing: the invitee confirms
+  // the address by mail at first sign-in (packages/auth password-reset-links.ts).
+  const config = useQuery(orpc.app.config.queryOptions());
   const onCopy = async () => {
     if (!reveal) return;
     if (await copy(reveal.setPasswordUrl)) toast.success(t("admin:users.linkCopied"));
@@ -844,6 +847,9 @@ function RevealInviteDialog({
           </Button>
         </div>
         <p className="text-xs text-muted-foreground">{t("admin:users.inviteLinkHint")}</p>
+        {config.data?.emailEnabled === true && (
+          <p className="text-xs text-muted-foreground">{t("admin:users.revealVerifyHint")}</p>
+        )}
       </div>
     </ResponsiveDialog>
   );

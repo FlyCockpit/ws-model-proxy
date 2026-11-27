@@ -4,6 +4,11 @@ import { auth } from "@ws-model-proxy/auth";
 import { runWithAdminInviteLocale } from "@ws-model-proxy/auth/admin-invite-locale";
 import { ADMIN_INVITED_PREFIX } from "@ws-model-proxy/auth/credential-setup-lock";
 import { isUserBanned } from "@ws-model-proxy/auth/is-user-banned";
+import {
+  inviteStateSelect,
+  isInvitePending,
+  recordResetLinkMailed,
+} from "@ws-model-proxy/auth/password-reset-links";
 import { SIGNUP_DISABLED_CODE } from "@ws-model-proxy/auth/signup-policy";
 import { notifyUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import {
@@ -21,7 +26,6 @@ import { contractProcedure } from "../contract-procedure";
 import { usersContract as c } from "../contracts/account";
 import { deletionConflict } from "../lib/deletion-conflict";
 import {
-  CREDENTIAL_PROVIDER_ID,
   createSetPasswordLink,
   INVITE_LINK_TTL_DAYS,
   markAdminInvited,
@@ -31,45 +35,6 @@ import {
 
 function generateUnusablePassword(): string {
   return randomBytes(48).toString("base64url");
-}
-
-function inviteStateSelect(now: Date) {
-  return {
-    emailVerified: true,
-    accounts: { select: { providerId: true }, take: 2 },
-    sessions: { where: { expiresAt: { gt: now } }, select: { id: true }, take: 1 },
-  } satisfies Prisma.UserSelect;
-}
-
-/**
- * Pending invite = an account nobody has started using: email not verified,
- * exactly one Account row and it is the email/password ("credential") one, and
- * no live session.
- *
- * `emailVerified === false` alone is NOT enough. Better-Auth's genericOAuth
- * copies the IdP's `email_verified ?? false`, so an active SSO user can be
- * unverified; minting a set-password link for them would let whoever holds it
- * add a password next to the SSO identity — an account takeover that also
- * skips the IdP's MFA. The non-credential account rule covers that, and the
- * live-session rule covers an account in use by any other route. And only an
- * account `users.invite` created is an invite (`adminInvited`, the permanent
- * admin-invited mark): an unverified public sign-up looks the same otherwise,
- * and a resend would turn it into an invite whose reset verifies it without
- * mailbox proof.
- */
-function isInvitePending(row: {
-  adminInvited: boolean;
-  emailVerified: boolean;
-  accounts: { providerId: string }[];
-  sessions: { id: string }[];
-}): boolean {
-  return (
-    row.adminInvited &&
-    !row.emailVerified &&
-    row.accounts.length === 1 &&
-    row.accounts[0]?.providerId === CREDENTIAL_PROVIDER_ID &&
-    row.sessions.length === 0
-  );
 }
 
 /** The users among `userIds` that `users.invite` created (credential-setup-lock.ts). */
@@ -127,7 +92,7 @@ async function deliverInvite(args: {
   email: string;
   locale: string;
 }): Promise<InviteDelivery> {
-  let link: { url: string; expiresAt: Date };
+  let link: { url: string; token: string; expiresAt: Date };
   try {
     link = await createSetPasswordLink({ userId: args.userId, locale: args.locale });
   } catch (err) {
@@ -157,16 +122,37 @@ async function deliverInvite(args: {
         locale: args.locale,
       });
       await sendEmail({ to: args.email, subject, html });
-      return { userId: args.userId, emailSent: true };
     } catch (err) {
       // Never log the link: it is a credential until it is spent.
       console.warn(
         `[users.invite] failed to send invite email: ${err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err}`,
       );
+      return revealed(args.userId, link);
     }
+    // The link went only to the mailbox, so spending it verifies and proves the address
+    // (packages/auth password-reset-links.ts). The mail is out: a failed record is logged and
+    // the invite stays "emailed" (a mailed link is never revealed). The link then counts as
+    // shown: it still works while the invite is pending and verifies nothing, so the invitee
+    // confirms the address at first sign-in.
+    try {
+      await recordResetLinkMailed({ token: link.token, userId: args.userId, email: args.email });
+    } catch (err) {
+      console.error(
+        `[users.invite] failed to record the mailed invite link: ${err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err}`,
+      );
+    }
+    return { userId: args.userId, emailSent: true };
   }
+  return revealed(args.userId, link);
+}
+
+/**
+ * The link the admin passes on themselves. It sets the password while the invite is pending but
+ * proves nothing: with SMTP on, the invitee confirms the address by mail at first sign-in.
+ */
+function revealed(userId: string, link: { url: string; expiresAt: Date }): InviteDelivery {
   return {
-    userId: args.userId,
+    userId,
     emailSent: false,
     setPasswordUrl: link.url,
     expiresAt: link.expiresAt.toISOString(),

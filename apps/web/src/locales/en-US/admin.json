@@ -178,6 +178,7 @@
     "copyInviteLinkAriaLabel": "Copy invite link",
     "savedLink": "Done",
     "inviteLinkHint": "This link works once and expires in 7 days. Share it privately.",
+    "revealVerifyHint": "They confirm their email address when they first sign in: we email them a link then.",
     "inviteFailed": "Could not send the invite. Try again.",
     "inviteIncomplete": "The account was created, but the invite could not be finished. Remove this user, then invite them again.",
     "inviteNotPending": "This user has already set up their account or signs in another way, so there is no invite to resend."

@@ -39,9 +39,15 @@ const {
 const db = prisma as unknown as {
   $transaction: MockInstance;
   $queryRaw: MockInstance;
-  account: { count: MockInstance };
   user: { findUnique: MockInstance };
   verification: { deleteMany: MockInstance; create: MockInstance; findFirst: MockInstance };
+};
+
+/** A pending invite's state (packages/auth password-reset-links.ts `isInvitePending`). */
+const PENDING = {
+  emailVerified: false,
+  accounts: [{ providerId: "credential" }],
+  sessions: [] as { id: string }[],
 };
 
 beforeEach(() => {
@@ -52,8 +58,7 @@ beforeEach(() => {
   // The interactive transaction runs its callback against the same mock.
   db.$transaction.mockImplementation(async (operation: (tx: unknown) => unknown) => operation(db));
   db.$queryRaw.mockResolvedValue([{ acquired: true }]);
-  db.account.count.mockResolvedValue(0);
-  db.user.findUnique.mockResolvedValue({ emailVerified: false });
+  db.user.findUnique.mockResolvedValue(PENDING);
   db.verification.deleteMany.mockResolvedValue({ count: 0 });
   db.verification.create.mockResolvedValue({ id: "v1" });
   // An account users.invite created and marked.
@@ -74,7 +79,11 @@ describe("createSetPasswordLink", () => {
   // `internalAdapter.createVerificationValue`, and `resetPassword` looks up
   // `reset-password:<token>` and reads the user id from `value`.
   it("writes a Better-Auth reset-password row that expires after the invite TTL", async () => {
-    const { url, expiresAt } = await createSetPasswordLink({
+    const {
+      url,
+      token: returned,
+      expiresAt,
+    } = await createSetPasswordLink({
       userId: "u1",
       locale: "es-MX",
       now,
@@ -91,6 +100,8 @@ describe("createSetPasswordLink", () => {
     // The link is Better-Auth's own token callback, redirecting to the web
     // reset page in the invitee's locale, flagged as an invite.
     const token = written.identifier.slice("reset-password:".length);
+    // Returned for the mailed-link record (users.invite, after a successful send).
+    expect(returned).toBe(token);
     const parsed = new URL(url);
     expect(`${parsed.origin}${parsed.pathname}`).toBe(
       `https://api.example.com/api/auth/reset-password/${token}`,
@@ -129,14 +140,14 @@ describe("createSetPasswordLink", () => {
   // An SSO-linked user given a set-password link could gain a password that
   // bypasses the IdP and its MFA.
   it("refuses a user with a non-credential account and writes nothing", async () => {
-    db.account.count.mockResolvedValue(1);
+    db.user.findUnique.mockResolvedValue({
+      ...PENDING,
+      accounts: [{ providerId: "credential" }, { providerId: "oidc" }],
+    });
 
     await expect(createSetPasswordLink({ userId: "u1", locale: "en-US", now })).rejects.toThrow(
       SetPasswordLinkRefusedError,
     );
-    expect(db.account.count).toHaveBeenCalledWith({
-      where: { userId: "u1", providerId: { not: "credential" } },
-    });
     expect(db.verification.deleteMany).not.toHaveBeenCalled();
     expect(db.verification.create).not.toHaveBeenCalled();
   });
@@ -145,7 +156,8 @@ describe("createSetPasswordLink", () => {
   // reset marks the account verified under the same lock (packages/auth onPasswordReset), so the
   // writer, re-checking after taking the lock, mints nothing for the activated account.
   it.each([
-    ["verified", { emailVerified: true }],
+    ["verified", { ...PENDING, emailVerified: true }],
+    ["signed in", { ...PENDING, sessions: [{ id: "s1" }] }],
     ["gone", null],
   ])(
     "refuses once the account is %s, checked under the lock, and writes nothing",
@@ -157,7 +169,11 @@ describe("createSetPasswordLink", () => {
       );
       expect(db.user.findUnique).toHaveBeenCalledWith({
         where: { id: "u1" },
-        select: { emailVerified: true },
+        select: {
+          emailVerified: true,
+          accounts: { select: { providerId: true }, take: 2 },
+          sessions: { where: { expiresAt: { gt: now } }, select: { id: true }, take: 1 },
+        },
       });
       const order = (mock: MockInstance) => mock.mock.invocationCallOrder[0] ?? 0;
       expect(order(db.$queryRaw)).toBeLessThan(order(db.user.findUnique));

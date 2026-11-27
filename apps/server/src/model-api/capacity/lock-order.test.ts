@@ -269,7 +269,9 @@ const GRAPH_WRITERS: Record<string, string> = {
     "H status: the needs-you e-mail marker and failure count on an instance (unfenced status columns), one compare-and-set statement per row",
   "packages/auth/src/proved-email.ts": "user mailbox proof after verify-email (unfenced column)",
   "packages/auth/src/password-reset.ts":
-    "user emailVerified after a spent reset or invite link (unfenced column), under the user's owner fence (credential-setup-lock.ts)",
+    "user emailVerified after a spent invite link without SMTP (unfenced column), under the user's owner fence (credential-setup-lock.ts)",
+  "packages/auth/src/password-reset-links.ts":
+    "user emailVerified and provedEmail after a spent mailed reset or invite link (unfenced columns), under the user's owner fence (credential-setup-lock.ts)",
   "packages/db/src/capacity-lock-order.ts": "M: the user delete under owner fences",
   "apps/server/src/model-api/public-overflow.ts":
     "H status: the E0 send claim's credential lastUsedAt, after its owner fences and the credential row FOR UPDATE",

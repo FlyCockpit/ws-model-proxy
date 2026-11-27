@@ -2,10 +2,11 @@
  * Proof of mailbox ownership (`User.provedEmail`), apart from Better Auth's `emailVerified`.
  *
  * `emailVerified` is what lets an account sign in: it is forced true when SMTP is off (anyone can
- * register any address). Admin invites verify on password setup (password-reset.ts), and the
- * admin may hold that link, so it proves nothing. Only the real verify-email flow — a link that
- * went to the mailbox — records the proved address, and the proof holds only while it is still
- * the account's address (an e-mail changed any other way is unproved).
+ * register any address), and spending an admin invite's link then activates the account without
+ * proving anything. Only a link that went to the mailbox records the proved address: the
+ * verify-email flow, or a spent reset/invite link recorded as mailed (password-reset-links.ts; a
+ * link shown to the admin proves nothing). The proof holds only while it is still the account's
+ * address (an e-mail changed any other way is unproved).
  */
 import prisma from "@ws-model-proxy/db";
 

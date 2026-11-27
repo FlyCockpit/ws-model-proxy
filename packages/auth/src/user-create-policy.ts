@@ -1,3 +1,5 @@
+import { APIError } from "better-auth/api";
+import { getAdminInviteLocale } from "./admin-invite-locale";
 import { SignupDisabledError } from "./signup-policy";
 
 const DEFAULT_ROLE = "user";
@@ -67,6 +69,38 @@ export function toUserCreatePolicyInput(input: UserCreateHookMappingInput): User
     requestedRole: "role" in input.user ? input.user.role : undefined,
     contextPath: typeof input.context?.path === "string" ? input.context.path : undefined,
   };
+}
+
+/**
+ * Two rules for every user row Better Auth creates (`databaseHooks.user.create.before`, first):
+ *
+ * - `/admin/create-user` runs only inside `users.invite` (packages/api), which creates the
+ *   account under `runWithAdminInviteLocale` (./admin-invite-locale.ts) with a random unusable
+ *   password and sends a set-password link. An HTTP call to Better Auth's own route (an admin
+ *   session reaches `/api/auth/admin/*`) could choose the password, so it is refused: the
+ *   AsyncLocalStorage scope can never come from a request.
+ * - No caller creates a user verified: `emailVerified: true` in the incoming row (an admin's
+ *   `data`) is refused. WMP has no identity-provider sign-in whose claim it would trust. The
+ *   no-SMTP verification of public sign-ups ({@link resolveUserCreatePolicy}) is the policy's own
+ *   decision, applied after this check.
+ */
+export function refuseUnprovedUserCreation(
+  user: { emailVerified?: unknown },
+  context: { path?: unknown } | null | undefined,
+): void {
+  const path = typeof context?.path === "string" ? context.path : null;
+  if (isAdminCreateUserPath(path) && getAdminInviteLocale() === undefined) {
+    throw new APIError("FORBIDDEN", {
+      message: "Invite users from the admin dashboard.",
+      code: "ADMIN_CREATE_USER_UNSUPPORTED",
+    });
+  }
+  if (user.emailVerified === true) {
+    throw new APIError("BAD_REQUEST", {
+      message: "An e-mail address is verified only through the link mailed to it.",
+      code: "EMAIL_VERIFICATION_BY_MAIL_ONLY",
+    });
+  }
 }
 
 export function resolveUserCreatePolicy(input: UserCreatePolicyInput): UserCreatePolicyResult {

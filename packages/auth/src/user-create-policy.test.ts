@@ -13,9 +13,48 @@ vi.mock("@ws-model-proxy/db", () => ({
 }));
 
 const { SIGNUP_DISABLED_MESSAGE } = await import("./signup-policy");
-const { isAdminCreateUserPath, resolveUserCreatePolicy, toUserCreatePolicyInput } = await import(
-  "./user-create-policy"
-);
+const { runWithAdminInviteLocale } = await import("./admin-invite-locale");
+const {
+  isAdminCreateUserPath,
+  refuseUnprovedUserCreation,
+  resolveUserCreatePolicy,
+  toUserCreatePolicyInput,
+} = await import("./user-create-policy");
+
+describe("refuseUnprovedUserCreation", () => {
+  const adminCreate = { path: "/admin/create-user" };
+
+  it("refuses /admin/create-user outside users.invite's scope (every HTTP call)", () => {
+    expect(() => refuseUnprovedUserCreation({}, adminCreate)).toThrow(
+      expect.objectContaining({
+        body: expect.objectContaining({ code: "ADMIN_CREATE_USER_UNSUPPORTED" }),
+      }),
+    );
+    expect(() =>
+      runWithAdminInviteLocale("en-US", () => refuseUnprovedUserCreation({}, adminCreate)),
+    ).not.toThrow();
+    expect(() => refuseUnprovedUserCreation({}, { path: "/sign-up/email" })).not.toThrow();
+  });
+
+  it("refuses a new user the caller marked verified, on every route", () => {
+    for (const context of [adminCreate, { path: "/sign-up/email" }, null]) {
+      expect(() =>
+        runWithAdminInviteLocale("en-US", () =>
+          refuseUnprovedUserCreation({ emailVerified: true }, context),
+        ),
+      ).toThrow(
+        expect.objectContaining({
+          body: expect.objectContaining({ code: "EMAIL_VERIFICATION_BY_MAIL_ONLY" }),
+        }),
+      );
+    }
+    expect(() =>
+      runWithAdminInviteLocale("en-US", () =>
+        refuseUnprovedUserCreation({ emailVerified: false }, adminCreate),
+      ),
+    ).not.toThrow();
+  });
+});
 
 describe("isAdminCreateUserPath", () => {
   it("accepts the canonical admin create-user path after benign query/hash/slash strip", () => {

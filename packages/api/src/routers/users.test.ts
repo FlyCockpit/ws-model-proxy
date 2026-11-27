@@ -59,9 +59,17 @@ vi.mock("../lib/set-password-link", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../lib/set-password-link")>()),
   createSetPasswordLink: vi.fn(async () => ({
     url: "https://app.example.test/api/auth/reset-password/INVITE?callbackURL=x",
+    token: "INVITE",
     expiresAt: new Date("2026-12-01T00:00:00Z"),
   })),
   markAdminInvited: vi.fn(async () => {}),
+}));
+
+// The mailed-link record (packages/auth password-reset-links.ts); the shared pending rule stays
+// real.
+vi.mock("@ws-model-proxy/auth/password-reset-links", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@ws-model-proxy/auth/password-reset-links")>()),
+  recordResetLinkMailed: vi.fn(async () => true),
 }));
 
 vi.mock("@ws-model-proxy/mailer", () => ({
@@ -369,6 +377,55 @@ describe("usersRouter", () => {
       expect(sendEmailMock).toHaveBeenCalledWith(
         expect.objectContaining({ to: "new@example.com" }),
       );
+    });
+
+    it("records the link as mailed only after the send, and a revealed one never", async () => {
+      const { recordResetLinkMailed } = await import("@ws-model-proxy/auth/password-reset-links");
+      authApi.api.createUser.mockResolvedValue({ user: { id: "new-user-id" } });
+      sendEmailMock.mockResolvedValue(undefined);
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await client.invite({ locale: "en-US", email: "new@example.com", name: "New" });
+      expect(recordResetLinkMailed).toHaveBeenCalledWith({
+        token: "INVITE",
+        userId: "new-user-id",
+        email: "new@example.com",
+      });
+      expect(vi.mocked(recordResetLinkMailed).mock.invocationCallOrder[0]).toBeGreaterThan(
+        sendEmailMock.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+      );
+
+      // The send failed (shown to the admin) or SMTP is off: spending it proves nothing.
+      vi.mocked(recordResetLinkMailed).mockClear();
+      sendEmailMock.mockRejectedValueOnce(new Error("smtp down"));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      expect(
+        (await client.invite({ locale: "en-US", email: "b@example.com", name: "B" })).emailSent,
+      ).toBe(false);
+      vi.mocked(isEmailConfigured).mockReturnValueOnce(false);
+      expect(
+        (await client.invite({ locale: "en-US", email: "c@example.com", name: "C" })).emailSent,
+      ).toBe(false);
+      expect(recordResetLinkMailed).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it("keeps an invite emailed when the mailed record fails, and never logs the link", async () => {
+      const { recordResetLinkMailed } = await import("@ws-model-proxy/auth/password-reset-links");
+      vi.mocked(recordResetLinkMailed).mockRejectedValueOnce(
+        new TypeError("db down reset-password/INVITE"),
+      );
+      authApi.api.createUser.mockResolvedValue({ user: { id: "new-user-id" } });
+      sendEmailMock.mockResolvedValue(undefined);
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await expect(
+        client.invite({ locale: "en-US", email: "new@example.com", name: "New" }),
+      ).resolves.toEqual({ userId: "new-user-id", emailSent: true });
+      expect(error).toHaveBeenCalledWith(
+        "[users.invite] failed to record the mailed invite link: TypeError",
+      );
+      expect(JSON.stringify(error.mock.calls)).not.toContain("INVITE");
+      error.mockRestore();
     });
 
     it("returns emailSent=false when SMTP throws but the user was still created", async () => {

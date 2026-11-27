@@ -6,6 +6,7 @@ import {
   lockCredentialSetup,
   RESET_PASSWORD_IDENTIFIER_PREFIX,
 } from "./credential-setup-lock";
+import { recordResetLinkMailed } from "./password-reset-links";
 
 /** A reset link is good for one hour (and one use). The mail copy says so. */
 export const RESET_PASSWORD_TOKEN_EXPIRES_IN_SECONDS = 60 * 60;
@@ -91,13 +92,26 @@ function absolutize(path: string, appOrigin?: string): string {
  * so neither the locale lookup nor SMTP latency or failure shows in the
  * response. It never rejects: a failure is logged by error class only (never
  * the address or the link).
+ *
+ * First it records that `token` goes to the mailbox (password-reset-links.ts
+ * `recordResetLinkMailed`): a forgot-password link is never shown to anyone,
+ * so recording before the send leaves no moment where the delivered link is
+ * not yet known as mailed. Spending it then verifies (and proves) the address
+ * and works for an active account. Without the record the link would be
+ * refused for any account but a pending invite, so no mail is sent then; the
+ * person asks again.
  */
 export async function deliverResetPasswordEmail(
   user: { id: string; email: string },
   url: string,
+  token: string,
   appOrigin: string | undefined,
 ): Promise<void> {
   try {
+    if (!(await recordResetLinkMailed({ token, userId: user.id, email: user.email }))) {
+      console.error("[auth] password reset mail skipped: the link is already gone");
+      return;
+    }
     const row = await prisma.user.findUnique({
       where: { id: user.id },
       select: { locale: true },
@@ -118,6 +132,7 @@ export async function deliverResetPasswordEmail(
 type SendResetPassword = (data: {
   user: { id: string; email: string };
   url: string;
+  token: string;
 }) => Promise<void>;
 
 /**
@@ -137,21 +152,29 @@ export function passwordResetOptions(
 } {
   const base = {
     revokeSessionsOnPasswordReset: true as const,
-    // Spending a reset link of an admin-invited account verifies its address
-    // (credential-setup-lock.ts ADMIN_INVITED_PREFIX: an invite starts unverified
-    // and its link is the only way in). Reset links carry no address, so Better
-    // Auth's update routes refuse an email change (index.ts
-    // `databaseHooks.user.update`). Never WMP's mailbox proof: only verify-email
-    // records that. Under the per-user credential-setup lock, every other reset
-    // link of the user is deleted, so an invite resend racing this reset never
-    // leaves a working link behind.
+    // Under the per-user credential-setup lock, every other reset link of the
+    // user is deleted, so an invite resend racing this reset never leaves a
+    // working link behind.
+    //
+    // With SMTP, whether the reset also verifies the address is decided by the
+    // `/reset-password` after-hook (index.ts), which knows the spent token: only
+    // a link that was mailed verifies and proves it (password-reset-links.ts);
+    // this callback is told only the user. Without SMTP nothing is mailed,
+    // verified by mail or proved: every public sign-up is created verified
+    // (user-create-policy.ts), and spending an admin invite's link (the only way
+    // in, credential-setup-lock.ts ADMIN_INVITED_PREFIX) activates it the same
+    // way, so it is marked verified here. Reset links carry no address, so
+    // Better Auth's update routes refuse an email change (index.ts
+    // `databaseHooks.user.update`).
     onPasswordReset: async ({ user }: { user: { id: string; email: string } }) => {
       await prisma.$transaction(async (tx) => {
         await lockCredentialSetup(tx, user.id);
-        const invited = await tx.verification.findFirst({
-          where: { identifier: `${ADMIN_INVITED_PREFIX}${user.id}` },
-          select: { id: true },
-        });
+        const invited =
+          !emailConfigured &&
+          (await tx.verification.findFirst({
+            where: { identifier: `${ADMIN_INVITED_PREFIX}${user.id}` },
+            select: { id: true },
+          }));
         if (invited) {
           await tx.user.updateMany({
             where: { id: user.id, email: user.email },
@@ -170,9 +193,9 @@ export function passwordResetOptions(
     ...base,
     // Not awaited (Better Auth's advice): SMTP latency stays out of the response. The
     // delivery never rejects (it logs by error class); the extra catch guards a sync throw.
-    sendResetPassword: async ({ user, url }) => {
+    sendResetPassword: async ({ user, url, token }) => {
       void Promise.resolve()
-        .then(() => deliverResetPasswordEmail(user, url, appOrigin))
+        .then(() => deliverResetPasswordEmail(user, url, token, appOrigin))
         .catch((error: unknown) => {
           console.error(
             "[auth] password reset mail failed:",

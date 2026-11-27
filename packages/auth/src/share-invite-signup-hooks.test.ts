@@ -52,6 +52,7 @@ const { registerShareInviteAcceptor, registerShareInviteLinkAcceptor } = await i
 );
 const { SIGNUP_DISABLED_MESSAGE } = await import("./signup-policy");
 const { auth } = await import("./index");
+const { runWithAdminInviteLocale } = await import("./admin-invite-locale");
 
 const TOKEN = "wsmp_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const CLAIM_WINDOW_MS = 10 * 60_000;
@@ -94,7 +95,7 @@ const release = vi.fn(async () => {});
 const row = (id = "new-user", email = `${id}@example.test`) => ({
   id,
   email,
-  emailVerified: true,
+  emailVerified: false,
   name: "New",
   createdAt: new Date(),
   updatedAt: new Date(),
@@ -227,7 +228,12 @@ describe("invite-link sign-up with open sign-up off", () => {
 
   it("leaves admin create-user as it was: requested role kept, no claim, no link acceptance", async () => {
     const context = withToken("/admin/create-user");
-    await expect(hooks()?.before?.({ ...row(), role: "admin" }, context)).resolves.toMatchObject({
+    // Inside users.invite's scope, the only place /admin/create-user runs (user-create-policy.ts).
+    await expect(
+      runWithAdminInviteLocale("en-US", () =>
+        hooks()?.before?.({ ...row(), role: "admin" }, context),
+      ),
+    ).resolves.toMatchObject({
       data: { role: "admin" },
     });
     await hooks()?.after?.(row(), context);

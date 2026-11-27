@@ -178,6 +178,7 @@
     "copyInviteLinkAriaLabel": "Copiar enlace de invitación",
     "savedLink": "Listo",
     "inviteLinkHint": "Este enlace funciona una vez y vence en 7 días. Compártelo de forma privada.",
+    "revealVerifyHint": "Confirman su dirección de correo la primera vez que inician sesión: entonces les enviamos un enlace.",
     "inviteFailed": "No se pudo enviar la invitación. Inténtalo de nuevo.",
     "inviteIncomplete": "Se creó la cuenta, pero no se pudo terminar la invitación. Elimina a este usuario y vuelve a invitarlo.",
     "inviteNotPending": "Este usuario ya configuró su cuenta o inicia sesión de otra forma, así que no hay invitación que reenviar."

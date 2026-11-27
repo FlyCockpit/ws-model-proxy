@@ -11,6 +11,8 @@ const renderResetPassword = vi.hoisted(() =>
 
 vi.mock("@ws-model-proxy/db", () => ({ default: { user: { findUnique } } }));
 vi.mock("@ws-model-proxy/mailer", () => ({ renderResetPassword, sendEmail }));
+const recordResetLinkMailed = vi.hoisted(() => vi.fn(async (_input: unknown) => true));
+vi.mock("./password-reset-links", () => ({ recordResetLinkMailed }));
 
 const {
   deliverResetPasswordEmail,
@@ -102,6 +104,8 @@ describe("passwordResetOptions", () => {
     findUnique.mockReset();
     sendEmail.mockReset();
     renderResetPassword.mockClear();
+    recordResetLinkMailed.mockReset();
+    recordResetLinkMailed.mockResolvedValue(true);
   });
 
   it("offers no reset mail without SMTP but still revokes sessions on reset", () => {
@@ -127,9 +131,19 @@ describe("passwordResetOptions", () => {
     await options.sendResetPassword?.({
       user: { id: "u1", email: "person@example.com" },
       url: withCallback("/en-US/reset-password"),
+      token: "TOKEN123",
     });
     await vi.waitFor(() => expect(sendEmail).toHaveBeenCalledTimes(1));
     releaseSend();
+    // Recorded as mailed before the send: spending it verifies (and proves) the address.
+    expect(recordResetLinkMailed).toHaveBeenCalledWith({
+      token: "TOKEN123",
+      userId: "u1",
+      email: "person@example.com",
+    });
+    expect(recordResetLinkMailed.mock.invocationCallOrder[0]).toBeLessThan(
+      sendEmail.mock.invocationCallOrder[0] ?? 0,
+    );
 
     expect(findUnique).toHaveBeenCalledWith({ where: { id: "u1" }, select: { locale: true } });
     const rendered = renderResetPassword.mock.calls[0]?.[0];
@@ -151,6 +165,7 @@ describe("passwordResetOptions", () => {
       deliverResetPasswordEmail(
         { id: "u1", email: "person@example.com" },
         `${API}?callbackURL=`,
+        "TOKEN123",
         undefined,
       ),
     ).resolves.toBeUndefined();
@@ -160,10 +175,31 @@ describe("passwordResetOptions", () => {
     expect(JSON.stringify(error.mock.calls)).not.toContain("person@example.com");
     error.mockRestore();
   });
+
+  it("sends nothing when the link cannot be recorded as mailed (it would be refused)", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    for (const outcome of ["gone", "failed"] as const) {
+      sendEmail.mockReset();
+      if (outcome === "gone") recordResetLinkMailed.mockResolvedValueOnce(false);
+      else recordResetLinkMailed.mockRejectedValueOnce(new TypeError("db down"));
+      await expect(
+        deliverResetPasswordEmail(
+          { id: "u1", email: "person@example.com" },
+          `${API}?callbackURL=`,
+          "TOKEN123",
+          undefined,
+        ),
+      ).resolves.toBeUndefined();
+      expect(sendEmail).not.toHaveBeenCalled();
+    }
+    expect(JSON.stringify(error.mock.calls)).not.toContain("TOKEN123");
+    expect(JSON.stringify(error.mock.calls)).not.toContain("person@example.com");
+    error.mockRestore();
+  });
 });
 
-describe("password reset verifies an admin invite", () => {
-  async function spend({ invited }: { invited: boolean }) {
+describe("a finished password reset", () => {
+  async function spend({ invited, smtp = false }: { invited: boolean; smtp?: boolean }) {
     const { default: prisma } = await import("@ws-model-proxy/db");
     const calls: string[] = [];
     const tx = {
@@ -190,7 +226,7 @@ describe("password reset verifies an admin invite", () => {
     };
     const transaction = vi.fn(async (operation: (client: typeof tx) => unknown) => operation(tx));
     Object.assign(prisma, { $transaction: transaction });
-    await passwordResetOptions(true, undefined).onPasswordReset({
+    await passwordResetOptions(smtp, undefined).onPasswordReset({
       user: { id: "u1", email: "invitee@example.test" },
     });
     expect(transaction).toHaveBeenCalledTimes(1);
@@ -200,7 +236,7 @@ describe("password reset verifies an admin invite", () => {
   const mark = `mark? ${JSON.stringify({ where: { identifier: "admin-invited:u1" }, select: { id: true } })}`;
   const deleteLinks = `delete ${JSON.stringify({ where: { value: "u1", identifier: { startsWith: "reset-password:" } } })}`;
 
-  it("verifies an invited account and deletes every other reset link, under the owner fence", async () => {
+  it("without SMTP activates an invited account and deletes every other reset link, under the owner fence", async () => {
     // The same per-user lock the invite link writer takes (packages/api set-password-link.ts),
     // first: a resend racing this reset either sees the account verified, or its link is deleted.
     expect(await spend({ invited: true })).toEqual([
@@ -211,7 +247,13 @@ describe("password reset verifies an admin invite", () => {
     ]);
   });
 
-  it("leaves a public sign-up's verification to verify-email (which also proves the mailbox)", async () => {
+  it("without SMTP leaves a public sign-up alone (it was created verified)", async () => {
     expect(await spend({ invited: false })).toEqual([lock, mark, deleteLinks]);
+  });
+
+  it("with SMTP verifies nothing itself: only a mailed link does, in the after-hook", async () => {
+    // A link shown to the admin may have been spent: this callback cannot tell which.
+    expect(await spend({ invited: true, smtp: true })).toEqual([lock, deleteLinks]);
+    expect(await spend({ invited: false, smtp: true })).toEqual([lock, deleteLinks]);
   });
 });

@@ -8,12 +8,11 @@ export const RESET_PASSWORD_IDENTIFIER_PREFIX = "reset-password:";
  * Marks an account an admin invited: identifier `admin-invited:<userId>`, value the user id,
  * written once by `users.invite` right after it created the account, before its first link
  * (packages/api lib/set-password-link.ts markAdminInvited), and never deleted. Every link,
- * resends included, requires it, so an unverified public sign-up never becomes an invite. Spending a reset link verifies the email only on such an account (`onPasswordReset`):
- * an invite is created unverified and its link is the only way in. A reset never records WMP's
- * mailbox proof (`provedEmail`, pool-share acceptance): only verify-email does, because Better
- * Auth does not tell `onPasswordReset` which link was spent and an invite link may have been
- * shown to the admin. A public sign-up's forgot-password reset leaves `emailVerified` alone, so
- * it still verifies (and proves) its address through verify-email.
+ * resends included, requires it, so an unverified public sign-up never becomes an invite, and a
+ * link shown to the admin is spendable only while the marked account is a pending invite
+ * (password-reset-links.ts `isInvitePending`, checked at redemption). Spending a link verifies
+ * and proves the address only when that link was mailed (password-reset-links.ts); without SMTP,
+ * spending a marked account's link activates it (`onPasswordReset`) and proves nothing.
  *
  * A verification row because the schema has no column for it (a column is the better home once
  * a migration is due); it expires never ({@link ADMIN_INVITED_EXPIRES_AT}), so Better Auth's
@@ -27,11 +26,14 @@ export const ADMIN_INVITED_EXPIRES_AT = new Date("9999-12-31T00:00:00.000Z");
 /**
  * Serializes, per user (through the user's `owner` fence: the app's one advisory-lock protocol,
  * packages/db capacity-lock-order.ts; taken first and alone, as M writers do), everything that
- * mints a set-password link or finishes a password reset, until the calling transaction ends. Minting (packages/api lib/set-password-link.ts) re-checks
- * under it that the invite is still pending; a finished reset (`onPasswordReset`) marks an
- * invited account's email verified and deletes every other reset link under it. So a resend racing the invitee's own
- * password setup either sees the account verified and refuses, or mints a link the reset then
- * deletes: no working link to an activated account is ever left behind.
+ * mints a set-password link, records one as mailed, checks a shown one at redemption, finishes a
+ * password reset or cleans up after an activation, until the calling transaction ends. Minting
+ * (packages/api lib/set-password-link.ts) re-checks under it that the invite is still pending; a
+ * finished reset (`onPasswordReset`, the mailed-link after-hook) and an activation
+ * (account-activation.ts) delete every other reset link under it. So a resend racing the
+ * invitee's own password setup either sees the account active and refuses, or mints a link the
+ * reset or activation then deletes; and a shown link that outlived the activation anyway is
+ * refused when spent (password-reset-links.ts `isResetLinkRedeemable`).
  *
  * A known residual: Better Auth spends a reset token (and writes the password) before
  * `onPasswordReset` takes this lock, so a resend landing in that gap can mint one more link that

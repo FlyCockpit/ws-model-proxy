@@ -17,11 +17,12 @@ import {
   renderVerifyEmail,
   sendEmail,
 } from "@ws-model-proxy/mailer";
-import { betterAuth } from "better-auth";
+import { BASE_ERROR_CODES, betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { admin, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
+import { afterUserUpdate, noteVerificationWrite } from "./account-activation";
 import { getAdminInviteLocale } from "./admin-invite-locale";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
@@ -30,6 +31,12 @@ import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { createPasswordPepper } from "./password-pepper";
 import { passwordResetOptions } from "./password-reset";
+import {
+  isResetLinkRedeemable,
+  resetTokenOf,
+  spentResetToken,
+  verifyEmailIfResetLinkWasMailed,
+} from "./password-reset-links";
 import { recordProvedEmail } from "./proved-email";
 import { notifySessionEnded, sessionEndCause } from "./session-ended-listeners";
 import {
@@ -56,6 +63,7 @@ import { notifyUserBanned } from "./user-ban-listeners";
 import {
   isAdminCreateUserPath,
   isPublicSignupPath,
+  refuseUnprovedUserCreation,
   resolveUserCreatePolicy,
   toUserCreatePolicyInput,
 } from "./user-create-policy";
@@ -136,6 +144,35 @@ function emailChangeRefused(): APIError {
     message: "This app does not change account e-mail addresses.",
     code: "EMAIL_CHANGE_UNSUPPORTED",
   });
+}
+
+/** An admin asserting an address is verified (see `databaseHooks.user.update`). */
+function adminVerificationRefused(): APIError {
+  return new APIError("BAD_REQUEST", {
+    message: "An e-mail address is verified only through the link mailed to it.",
+    code: "EMAIL_VERIFICATION_BY_MAIL_ONLY",
+  });
+}
+
+/** Better Auth's admin route that writes arbitrary user fields. */
+const ADMIN_UPDATE_USER_PATH = "/admin/update-user";
+
+/**
+ * A spent reset link verifies the address only if it was mailed (password-reset-links.ts); then
+ * it is proved too, so the share invites sent to it are accepted. The password is already set, so
+ * a failure is logged, never surfaced: the person can still verify through verify-email, which a
+ * sign-in offers.
+ */
+async function verifyMailedResetQuietly(token: string): Promise<void> {
+  try {
+    const verified = await verifyEmailIfResetLinkWasMailed(token);
+    if (verified) await acceptInvitesQuietly({ ...verified, emailVerified: true });
+  } catch (error) {
+    console.error(
+      "[auth] verifying the e-mail of a mailed reset link failed:",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+  }
 }
 
 /** A second sign-up with an invite link another e-mail's sign-up holds right now. */
@@ -454,11 +491,26 @@ export const auth = betterAuth({
     before: createAuthMiddleware(async (ctx) => {
       await refuseImpersonatedAuthWrite(ctx);
       await refuseAdminRestoreOfDeletingUser(ctx);
+      // A reset link the admin was shown (not mailed) is spendable only while the account is a
+      // pending invite, so one left over after activation is dead here even if the activation's
+      // tidy-up failed. Refused exactly like an expired token, which the reset page already
+      // handles (password-reset-links.ts `isResetLinkRedeemable`).
+      const resetToken = resetTokenOf({ path: ctx.path, body: ctx.body, query: ctx.query });
+      if (resetToken && !(await isResetLinkRedeemable(resetToken))) {
+        throw APIError.from("BAD_REQUEST", BASE_ERROR_CODES.INVALID_TOKEN);
+      }
       // Sign-up answers the same for a free and a registered address, so it is no
       // account-existence oracle (./signup-response.ts).
       await refuseSignUpInputBeforeLookup(ctx);
     }),
     after: createAuthMiddleware(async (ctx) => {
+      const spentToken = spentResetToken({
+        path: ctx.path,
+        body: ctx.body,
+        query: ctx.query,
+        returned: ctx.context.returned,
+      });
+      if (spentToken) await verifyMailedResetQuietly(spentToken);
       await releaseClaimOfFailedSignUp(ctx);
       return neutralizeSignUpResponse(ctx, { requireEmailVerification: emailConfigured });
     }),
@@ -501,6 +553,10 @@ export const auth = betterAuth({
     user: {
       create: {
         before: async (user, context) => {
+          // Only users.invite reaches /admin/create-user, and no caller makes a user verified
+          // (./user-create-policy.ts). Refused before the sign-up bookkeeping: neither refusal
+          // can come from the public sign-up route.
+          refuseUnprovedUserCreation(user, context);
           // Before anything here can refuse: a sign-up refused past this point answers like a
           // registered address does (./signup-response.ts).
           noteUserCreateAttempt(context);
@@ -567,9 +623,9 @@ export const auth = betterAuth({
         // The invite link the person signed up through becomes a share (the token is the
         // proof); pending share invites to this e-mail become shares once the e-mail is proven.
         after: async (user, context) => {
-          // An admin-created account has no mailbox proof (spending its set-password link
-          // activates it but proves nothing: the admin may hold the link); its pool invites
-          // wait for verify-email or the share link.
+          // An admin-created account has no mailbox proof yet: its pool invites wait for the
+          // mailed set-password link being spent (./password-reset-links.ts), verify-email, or
+          // the share link. A link shown to the admin proves nothing.
           if (isAdminCreateUserPath(typeof context?.path === "string" ? context.path : null)) {
             return;
           }
@@ -587,12 +643,23 @@ export const auth = betterAuth({
         // person's own aliases under their owner fence (packages/api lib/model-names.ts).
         // Better Auth's update routes (`/update-user`, `/admin/update-user`) cannot take it.
         // The e-mail address cannot change there either: reset and invite links carry only the
-        // user id, and spending one marks the account's current address verified
-        // (password-reset.ts), so a link mailed to the old address would verify the new one. An
-        // address change needs its own flow that also deletes the user's reset links.
-        before: async (data) => {
+        // user id, so a link mailed to the old address would still set the password of the
+        // account now under the new one. An address change needs its own flow that also deletes
+        // the user's reset links and leaves the new address unverified and unproved until it is.
+        // And `/admin/update-user` may not set `emailVerified`: an admin saying an address is
+        // verified proves nothing about the mailbox (Better Auth's verify-email route sets it on
+        // another path). A write that verifies the address activates the account: its leftover
+        // set-password links die once it is committed (./account-activation.ts).
+        before: async (data, context) => {
           if ((data as { slug?: unknown }).slug !== undefined) throw slugChangeRefused();
           if ((data as { email?: unknown }).email !== undefined) throw emailChangeRefused();
+          if (
+            context?.path === ADMIN_UPDATE_USER_PATH &&
+            (data as { emailVerified?: unknown }).emailVerified !== undefined
+          ) {
+            throw adminVerificationRefused();
+          }
+          noteVerificationWrite(data, context);
         },
         // A user row that now carries an ACTIVE ban (`/admin/ban-user`, or an
         // `/admin/update-user` that sets `banned`) ends the user's in-flight
@@ -601,9 +668,10 @@ export const auth = betterAuth({
         // the cancel is idempotent. An unban or an expired ban notifies nothing.
         after: async (user, context) => {
           if (!user) return;
+          await afterUserUpdate(user, context);
           // Verifying the e-mail proves it (for direct shares) and accepts the invites sent to
-          // it — only on the verification routes: an admin invite may verify via a
-          // fallback set-password link held by the admin, without mailbox proof.
+          // it — only on the verification routes (a mailed reset link proves it in the
+          // `/reset-password` after-hook): no other user update proves anything.
           if (isEmailVerificationPath(context?.path)) {
             await recordProvedEmailQuietly(user);
             await acceptInvitesQuietly(user);

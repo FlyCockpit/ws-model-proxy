@@ -55,29 +55,48 @@ describe("account slug through Better Auth", () => {
   // sync); it looks only at the data.
   it("refuses a slug in any update", async () => {
     if (!updateBefore) throw new Error("user update before hook missing");
-    await expect(updateBefore({ slug: "new-slug" })).rejects.toMatchObject({
+    await expect(updateBefore({ slug: "new-slug" }, null)).rejects.toMatchObject({
       body: { code: "SLUG_CHANGE_UNSUPPORTED" },
     });
-    await expect(updateBefore({ name: "New", slug: "new-slug" })).rejects.toMatchObject({
+    await expect(updateBefore({ name: "New", slug: "new-slug" }, null)).rejects.toMatchObject({
       body: { code: "SLUG_CHANGE_UNSUPPORTED" },
     });
   });
 
-  // Reset and invite links carry only the user id, and spending one verifies the account's
-  // current address: a link mailed to the old address must never verify a new one.
+  // Reset and invite links carry only the user id: a link mailed to the old address must never
+  // set the password of the account under a new one.
   it("refuses an e-mail change in any update", async () => {
     if (!updateBefore) throw new Error("user update before hook missing");
-    await expect(updateBefore({ email: "new@example.test" })).rejects.toMatchObject({
+    await expect(updateBefore({ email: "new@example.test" }, null)).rejects.toMatchObject({
       body: { code: "EMAIL_CHANGE_UNSUPPORTED" },
     });
-    await expect(updateBefore({ name: "New", email: "new@example.test" })).rejects.toMatchObject({
+    await expect(
+      updateBefore({ name: "New", email: "new@example.test" }, null),
+    ).rejects.toMatchObject({
       body: { code: "EMAIL_CHANGE_UNSUPPORTED" },
     });
+  });
+
+  // An admin saying an address is verified proves nothing about the mailbox.
+  it("refuses emailVerified from /admin/update-user", async () => {
+    if (!updateBefore) throw new Error("user update before hook missing");
+    for (const emailVerified of [true, false]) {
+      await expect(
+        updateBefore({ emailVerified }, { path: "/admin/update-user" } as never),
+      ).rejects.toMatchObject({ body: { code: "EMAIL_VERIFICATION_BY_MAIL_ONLY" } });
+    }
+    await expect(
+      updateBefore({ name: "New" }, { path: "/admin/update-user" } as never),
+    ).resolves.toBeUndefined();
+    // Better Auth's own verify-email route writes it on another path.
+    await expect(
+      updateBefore({ emailVerified: true }, { path: "/verify-email" } as never),
+    ).resolves.toBeUndefined();
   });
 
   it("lets every other update through", async () => {
     if (!updateBefore) throw new Error("user update before hook missing");
-    await expect(updateBefore({ name: "New", emailVerified: true })).resolves.toBeUndefined();
+    await expect(updateBefore({ name: "New", emailVerified: true }, null)).resolves.toBeUndefined();
     expect(updateMany).not.toHaveBeenCalled();
   });
 });

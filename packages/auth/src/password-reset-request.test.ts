@@ -10,12 +10,14 @@ vi.mock("@ws-model-proxy/db", () => {
     findUnique: vi.fn(async () => ({ locale: "en-US" })),
     updateMany: vi.fn(async () => ({ count: 1 })),
   };
-  // onPasswordReset's transaction (lock, admin-invited check, delete other links): a no-op here.
+  // The mailed-link record (password-reset-links.ts: the link is live, so it is recorded) and
+  // onPasswordReset's transaction (lock, delete other links): no-ops here.
   const tx = {
     $queryRaw: vi.fn(async () => [{ acquired: true }]),
     user,
     verification: {
-      findFirst: vi.fn(async () => null),
+      findFirst: vi.fn(async () => ({ expiresAt: new Date(Date.now() + 3_600_000) })),
+      create: vi.fn(async () => ({ id: "mailed" })),
       deleteMany: vi.fn(async () => ({ count: 0 })),
     },
   };

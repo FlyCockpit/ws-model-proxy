@@ -6,6 +6,11 @@ import {
   lockCredentialSetup,
   RESET_PASSWORD_IDENTIFIER_PREFIX,
 } from "@ws-model-proxy/auth/credential-setup-lock";
+import {
+  CREDENTIAL_PROVIDER_ID,
+  isInvitePending,
+  readInviteState,
+} from "@ws-model-proxy/auth/password-reset-links";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@ws-model-proxy/config/locales";
 import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
@@ -18,9 +23,6 @@ import { env } from "@ws-model-proxy/env/server";
  */
 export const INVITE_LINK_TTL_SECONDS = 7 * 24 * 60 * 60;
 export const INVITE_LINK_TTL_DAYS = INVITE_LINK_TTL_SECONDS / (24 * 60 * 60);
-
-/** Better-Auth's id for an email/password account (`Account.providerId`). */
-export const CREDENTIAL_PROVIDER_ID = "credential";
 
 /**
  * The user signs in through another provider (an SSO/OIDC account is linked).
@@ -35,10 +37,11 @@ export class SetPasswordLinkRefusedError extends Error {
 }
 
 /**
- * The account finished its setup (its email is verified: the invitee spent a link, or reset the
- * password) by the time the link would be written, so none is minted. Checked under the same
- * per-user lock `onPasswordReset` takes, so a resend that raced the setup cannot leave a working
- * link to an activated account.
+ * The account is no longer a pending invite (packages/auth password-reset-links.ts
+ * `isInvitePending`: verified, signed in, or not an admin invite at all) by the time the link
+ * would be written, so none is minted. Checked under the same per-user lock a finished reset and
+ * an activation take, so a resend that raced the setup cannot leave a working link to an
+ * activated account.
  */
 export class SetPasswordLinkNotPendingError extends Error {
   constructor() {
@@ -56,7 +59,7 @@ export class SetPasswordLinkNotPendingError extends Error {
  * `GET /api/auth/reset-password/:token` validation and redirect, and the web
  * `/$lang/reset-password` page spends it with `authClient.resetPassword`. That
  * keeps every reset-side guarantee — single use, session revocation, the
- * `onPasswordReset` email verification — with no
+ * mailed-link email verification — with no
  * second password-setting path.
  *
  * Minting directly (instead of calling `auth.api.requestPasswordReset`) is what
@@ -89,7 +92,7 @@ export async function createSetPasswordLink({
   userId: string;
   locale: unknown;
   now?: Date;
-}): Promise<{ url: string; expiresAt: Date }> {
+}): Promise<{ url: string; token: string; expiresAt: Date }> {
   const authContext = await auth.$context;
   // Widened on purpose: today's config sets neither key, so the inferred
   // options type has no such properties; this keeps the runtime guard for the
@@ -113,23 +116,14 @@ export async function createSetPasswordLink({
   await prisma.$transaction(async (tx) => {
     // Serializes link minting and finished resets per user until this transaction ends.
     await lockCredentialSetup(tx, userId);
-    const user = await tx.user.findUnique({
-      where: { id: userId },
-      select: { emailVerified: true },
-    });
-    if (!user || user.emailVerified) throw new SetPasswordLinkNotPendingError();
-    const linkedElsewhere = await tx.account.count({
-      where: { userId, providerId: { not: CREDENTIAL_PROVIDER_ID } },
-    });
-    if (linkedElsewhere > 0) throw new SetPasswordLinkRefusedError();
-    // Only an account `users.invite` created and marked (markAdminInvited) is an invite: an
-    // unverified public sign-up looks the same otherwise, and spending a link verifies only a
-    // marked account (credential-setup-lock.ts ADMIN_INVITED_PREFIX).
-    const marked = await tx.verification.findFirst({
-      where: { identifier: `${ADMIN_INVITED_PREFIX}${userId}` },
-      select: { id: true },
-    });
-    if (!marked) throw new SetPasswordLinkNotPendingError();
+    // Still a pending invite, read under the lock: verified, signed in, not created by
+    // `users.invite` (markAdminInvited: an unverified public sign-up looks the same otherwise)
+    // or gone refuses.
+    const state = await readInviteState(tx, userId, now);
+    if (state?.accounts.some((account) => account.providerId !== CREDENTIAL_PROVIDER_ID)) {
+      throw new SetPasswordLinkRefusedError();
+    }
+    if (!state || !isInvitePending(state)) throw new SetPasswordLinkNotPendingError();
     await tx.verification.deleteMany({
       where: { value: userId, identifier: { startsWith: RESET_PASSWORD_IDENTIFIER_PREFIX } },
     });
@@ -145,7 +139,7 @@ export async function createSetPasswordLink({
 
   const callbackURL = inviteCallbackUrl(locale);
   const url = `${authContext.baseURL}/reset-password/${token}?callbackURL=${encodeURIComponent(callbackURL)}`;
-  return { url, expiresAt };
+  return { url, token, expiresAt };
 }
 
 /**

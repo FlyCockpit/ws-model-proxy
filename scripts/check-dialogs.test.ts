@@ -169,7 +169,9 @@ function fakeBrowser(answer: (script: string) => string | Error = () => "true") 
 }
 
 /** A stack whose sign-in ends in a full page load: the first poll after the submit is cut off. */
-function stack(options: { secondFactor?: boolean; landsOn?: string } = {}) {
+function stack(
+  options: { secondFactor?: boolean; landsOn?: string; clickNavigates?: boolean } = {},
+) {
   let submitted = false;
   let verified = false;
   let cutOff = false;
@@ -180,8 +182,11 @@ function stack(options: { secondFactor?: boolean; landsOn?: string } = {}) {
       return "true";
     }
     if (script.includes("button.click()")) {
+      // Once verified, the page is the landing page: no code field, no button.
+      if (verified) return script.includes("if (location.pathname ===") ? '"app"' : "null";
       verified = true;
-      return '"clicked"';
+      // The navigation the click starts can cut off the clicking evaluation itself.
+      return options.clickNavigates ? navigated() : '"clicked"';
     }
     if (script === "location.pathname") return JSON.stringify(options.landsOn ?? "/en-US/login");
     if (script.startsWith("location.pathname ===")) {
@@ -241,6 +246,16 @@ describe("formSignIn", () => {
     assert.ok(commands.some((command) => command.input?.includes('"123456"')));
   });
 
+  it("accepts a Verify click whose own evaluation the navigation cut off", async () => {
+    const { browser } = fakeBrowser(stack({ secondFactor: true, clickNavigates: true }));
+    await formSignIn(
+      { base, browser, args: [] },
+      { ...account, totp: () => "123456" },
+      "/en-US/settings",
+      noPause,
+    );
+  });
+
   it("says what is wrong when the account has a second factor and no code", async () => {
     const { browser } = fakeBrowser(stack({ secondFactor: true }));
     await assert.rejects(
@@ -281,15 +296,22 @@ describe("sign-in page scripts", () => {
     assert.equal(readForm(doc), "ready");
     let clicks = 0;
     const button = { disabled: true, click: () => clicks++ };
-    const readVerify = new Function("document", `return ${verify}`) as (doc: unknown) => unknown;
+    const runVerify = new Function("document", "location", `return ${verify}`) as (
+      doc: unknown,
+      loc: unknown,
+    ) => unknown;
     const challenge = {
       getElementById: (id: string) =>
         id === "totp-code" ? { closest: () => ({ nextElementSibling: button }) } : null,
     };
+    const readVerify = (doc: unknown) => runVerify(doc, { pathname: "/en-US/login" });
     assert.equal(readVerify(challenge), null);
     assert.equal(clicks, 0);
     button.disabled = false;
     assert.equal(readVerify(challenge), "clicked");
+    assert.equal(clicks, 1);
+    // Already on the landing page: the click went through, nothing is clicked again.
+    assert.equal(runVerify(challenge, { pathname: "/en-US/settings" }), "app");
     assert.equal(clicks, 1);
     assert.equal(verify.includes("setTimeout"), false);
   });
