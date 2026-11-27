@@ -34,6 +34,7 @@
     "signOutFailed": "No se pudo cerrar la sesión. Sigues con la sesión iniciada; inténtalo de nuevo.",
     "signUp": "Registrarse",
     "accountUnavailable": "Cuenta no disponible — Reintentar",
+    "retryQueued": "Reintento en espera — espera un momento",
     "signOutOffline": "No tienes conexión. Tu sesión sigue abierta. Vuelve a cerrarla cuando tengas conexión."
   },
   "hints": {

@@ -1,6 +1,14 @@
 // @vitest-environment jsdom
-import { act, renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { ORPCError, os } from "@orpc/server";
+import { RPCHandler } from "@orpc/server/fetch";
+import { BatchHandlerPlugin } from "@orpc/server/plugins";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const fetchMock = vi.hoisted(() => vi.fn<typeof fetch>());
+vi.mock("@ws-model-proxy/env/web", () => ({ env: { VITE_SERVER_URL: "https://app.test" } }));
 
 const state = vi.hoisted(() => ({
   client: { status: "pending", session: null } as {
@@ -39,16 +47,26 @@ vi.mock("@/hooks/use-auth-session", async () => {
 
 import {
   confirmDocumentIdentityFresh,
+  connectIdentityPeers,
   identityVerificationGeneration,
+  needsAuthoritativeSessionCheck,
   reportSessionRejected,
   resetDocumentIdentityForTests,
 } from "@/lib/document-identity";
+import { useNeedsYouCount } from "./use-needs-you-count";
 import { useShellIdentity } from "./use-shell-identity";
 
+beforeEach(() => {
+  vi.stubGlobal("fetch", fetchMock);
+  fetchMock.mockReset();
+});
 afterEach(() => {
+  cleanup();
   resetDocumentIdentityForTests(() => undefined);
   state.client = { status: "pending", session: null };
   state.matches = [];
+  state.pathname = undefined;
+  vi.unstubAllGlobals();
 });
 
 describe("useShellIdentity", () => {
@@ -110,5 +128,80 @@ describe("useShellIdentity", () => {
     // A public page never does.
     state.matches = [{ routeId: "/$lang/login", context: {} }];
     expect(renderHook(() => useShellIdentity()).result.current.signedIn).toBe(false);
+  });
+
+  it.each([
+    { pathname: "/en-US/missing", matches: [] },
+    {
+      pathname: "/en-US/missing",
+      matches: [
+        { routeId: "__root__", context: {} },
+        { routeId: "/$lang", context: {} },
+      ],
+    },
+    { pathname: "/es-MX/future-public/child", matches: [] },
+  ])("keeps cold unknown $pathname public with $matches", async ({ pathname, matches }) => {
+    const count = vi.fn(() => {
+      throw new ORPCError("UNAUTHORIZED");
+    });
+    const handler = new RPCHandler(
+      { activity: { needsYou: { count: os.handler(count) } } },
+      { plugins: [new BatchHandlerPlugin()] },
+    );
+    const sessionProbe = vi.fn();
+    fetchMock.mockImplementation(async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url.includes("/get-session")) {
+        sessionProbe();
+        return Response.json(null);
+      }
+      const result = await handler.handle(request, { prefix: "/rpc" });
+      if (!result.response) throw new Error("Unmatched fixture RPC");
+      return result.response;
+    });
+    const disconnect = connectIdentityPeers(() =>
+      fetch("https://app.test/api/auth/get-session?disableCookieCache=true"),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    state.pathname = pathname;
+    state.matches = matches;
+    const view = renderHook(() => useNeedsYouCount(useShellIdentity().signedIn), { wrapper });
+    try {
+      // Drain the same transport batch queue used below for the positive control.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(view.result.current).toBe(0);
+      expect(count).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(sessionProbe).not.toHaveBeenCalled();
+      expect(needsAuthoritativeSessionCheck()).toBe(false);
+
+      // A real private pending route still enables the actual consumer. The fixture's 401
+      // proves the extra authoritative probe would have been observed on the unknown path.
+      state.pathname = "/en-US/pools";
+      view.rerender();
+      await waitFor(() => expect(count).toHaveBeenCalledOnce());
+      await waitFor(() => expect(sessionProbe).toHaveBeenCalledOnce());
+      expect(needsAuthoritativeSessionCheck()).toBe(true);
+    } finally {
+      view.unmount();
+      disconnect();
+      client.clear();
+    }
+  });
+
+  it("keeps anonymous private routes signed out and trusts a settled session on unknown paths", () => {
+    state.pathname = "/en-US/pools";
+    state.client = { status: "anonymous", session: null };
+    const view = renderHook(() => useShellIdentity());
+    expect(view.result.current.signedIn).toBe(false);
+    state.pathname = "/en-US/missing";
+    state.client = { status: "authenticated", session: { user: { role: "user" } } };
+    view.rerender();
+    expect(view.result.current).toEqual({ signedIn: true, role: "user" });
   });
 });

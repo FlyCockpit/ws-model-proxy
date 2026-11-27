@@ -42,7 +42,8 @@ export function useShellIdentity(): ShellIdentity {
       // signed in (a signed-out visit redirects to the login page), so the nav is too, role
       // unknown until the guard answers.
       if (router.matches.some((match) => SIGNED_IN_ROUTES.has(match.routeId))) return "";
-      // Before the matches exist (the first render of a reload), the path says the same.
+      // Before the matches exist (the first render of a reload), only a known signed-in
+      // segment says the same. An unknown/public 404 must not enable private nav queries.
       const pathname = router.location?.pathname;
       return pathname && shellPartsOf(pathname).bottomNav ? "" : null;
     },

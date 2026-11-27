@@ -218,7 +218,12 @@ The following observers feed it, and none can be skipped:
   guards' route context (`useShellIdentity`), and the root holds the matched page as a skeleton
   (React Activity preserves route state while hidden; the watcher stays mounted outside it).
   Generic error Retry invalidates the router with `forcePending: true`, so guarded ancestors
-  settle before successful child matches can recover. A fresh check is a guard's
+  settle before successful child matches can recover. After private use, Retry first marks the
+  document identity unconfirmed, masking the root header and open account menu while guards
+  wait. A successful guard settles it without an extra probe. An unguarded public recovery
+  explicitly verifies a remaining mask through the existing lazy coalesced checker after
+  invalidation; fresh anonymous public recovery adds no mask or session probe.
+  A fresh check is a guard's
   server answer, or a refetch the watcher itself starts once it mounts (retried on focus,
   visibility and reconnect through the document retry scheduler; one superseded by another session fetch is followed up at most 3
   times, 250 ms apart; all dropped on unmount). An answer asked for before a newer invalidation
@@ -248,6 +253,11 @@ unavailable, never confirmed anonymity. No session cookie cache is enabled.
 Retry-After, and pause while hidden/offline. Better Auth's duplicate focus refresh is disabled;
 native reconnect/storage refreshes share its cooldown and in-flight check. Non-401 session errors
 show Account unavailable with Retry and Sign out, retaining that control while a retry runs.
+Clicking Retry immediately disables it and shows “Retry queued — please wait”, with an accessible
+busy label and a reduced-motion-aware mobile icon. It joins one shared request and still honors
+Retry-After and hidden/offline deferral. Settled anonymous tabs skip watcher focus/visibility
+probes absent an identity obligation; pending, failed and signed-in checks still run, as do peer
+checks. Better Auth's native reconnect transport retains its existing behavior.
 Cached app configuration that fails to refetch keeps auth forms mounted (`isLoadingError` gates
 only initial failures). Route probes discard superseded answers and retry at most three times.
 
@@ -302,6 +312,10 @@ cache, or needs its own identity scoping.
   its probe, for `appShellHydrated()` (`lib/app-shell-hydration.ts`): the skeleton carries
   `data-app-shell` and reports from its first effect (the loaded root reports too), with a 5 s
   cap; a failed probe is rethrown only after the wait. Server and client navigations do not wait.
+  Before matches settle, only the known signed-in top-level segments in `shellPartsOf` imply
+  private pending geometry or enable the shell's needs-you query. Keep that set aligned with
+  the `_auth` and `admin` route trees. Unknown localized paths stay public while pending;
+  a confirmed browser session or an admitted guarded match still decides the loaded identity.
 
 ## Layout check
 

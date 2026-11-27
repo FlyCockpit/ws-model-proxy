@@ -23,6 +23,9 @@ describe("shellPartsOf", () => {
       "/en-US/mcp-consent",
       "/",
       "/xx/nodes",
+      "/en-US/missing",
+      "/es-MX/new-public-page/child",
+      "/en-US/nodes-missing",
     ])
       expect(shellPartsOf(path)).toEqual({ sidebar: false, bottomNav: false });
   });

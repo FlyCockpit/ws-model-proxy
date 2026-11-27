@@ -8,6 +8,7 @@ const { fetchMock, mounted } = vi.hoisted(() => {
     fetchMock,
     mounted: {
       cleanups: [] as (() => void)[],
+      anonymous: false,
       refetch: vi.fn(),
       readIdentity: vi.fn<() => string | null | undefined>(),
     },
@@ -24,7 +25,9 @@ vi.mock("react", async (original) => ({
 }));
 vi.mock("@/hooks/use-auth-session", () => ({
   useAuthSession: () => ({
-    state: { status: "authenticated", session: { user: { id: "a" } } },
+    state: mounted.anonymous
+      ? { status: "anonymous" }
+      : { status: "authenticated", session: { user: { id: "a" } } },
     actions: { refetch: mounted.refetch },
     meta: {},
   }),
@@ -88,6 +91,7 @@ beforeEach(async () => {
   fetchMock.mockReset().mockResolvedValue(Response.json({ success: true }));
   await admitRouteIdentity({ status: "resolved", session: { user: { id: "a" } } });
   mounted.cleanups = [];
+  mounted.anonymous = false;
   mounted.refetch.mockReset();
   mounted.readIdentity.mockReset().mockReturnValue("a");
   useReloadOnIdentityChange();
@@ -197,6 +201,51 @@ describe("authClient identity transport", () => {
       }
     },
   );
+  it.each(["focus", "visibilitychange"])(
+    "a real settled anonymous atom spends no transport request on %s, but explicit Retry still works",
+    async (event) => {
+      nativeClock += 120_000;
+      vi.setSystemTime(nativeClock);
+      vi.stubGlobal("navigator", { onLine: true });
+      Object.assign(document, { visibilityState: "visible" });
+      for (const cleanup of mounted.cleanups) cleanup();
+      mounted.cleanups = [];
+      resetDocumentIdentityForTests(() => peer);
+      await admitRouteIdentity({ status: "resolved", session: null });
+      mounted.anonymous = true;
+      fetchMock.mockResolvedValue(Response.json(null));
+      const session = authClient.$store.atoms.session;
+      if (!session) throw new Error("Missing Better Auth session atom");
+      mounted.refetch.mockImplementation(() => session.get().refetch());
+      mounted.readIdentity.mockImplementation(() => {
+        const snapshot = session.get();
+        return snapshot.isPending || snapshot.isRefetching || snapshot.error
+          ? undefined
+          : (snapshot.data?.user.id ?? null);
+      });
+      const unsubscribe = session.subscribe((snapshot) => {
+        observeSessionRetry(snapshot.error, snapshot.isPending || snapshot.isRefetching);
+      });
+      useReloadOnIdentityChange();
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(session.get().data).toBeNull();
+        await vi.advanceTimersByTimeAsync(6_000);
+        for (let i = 0; i < 3; i++) {
+          (event === "focus" ? window : document).dispatchEvent(new Event(event));
+          await vi.advanceTimersByTimeAsync(6_000);
+        }
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        const { runSessionCheck } = await import("./session-retry");
+        await runSessionCheck(mounted.refetch);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      } finally {
+        unsubscribe();
+      }
+    },
+  );
+
   it.each(["visibilitychange", "online"])(
     "real Better Auth %s refresh honors a 60-second Retry-After",
     async (event) => {

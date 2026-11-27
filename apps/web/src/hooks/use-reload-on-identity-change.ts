@@ -90,6 +90,9 @@ function startIdentityChecks(refetch: () => unknown): { stop: () => void } {
     });
   };
   const retry = () => {
+    // Settled anonymous forms/public tabs have no private owner to reconcile.
+    // Peer hints and failed/pending checks still carry an explicit obligation.
+    if (readSessionIdentity() === null && !isDocumentIdentityUnverified()) return;
     if (document.visibilityState !== "hidden" && navigator.onLine !== false)
       void check().catch(() => {});
   };

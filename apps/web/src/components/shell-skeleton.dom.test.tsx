@@ -87,4 +87,13 @@ describe("ShellSkeleton", () => {
     expect(login.container.querySelector(".w-60")).toBeNull();
     expect(login.container.querySelector(".fixed.bottom-0")).toBeNull();
   });
+
+  it("keeps an unknown localized 404 in the public pending frame", () => {
+    state.pathname = "/en-US/missing";
+    const { container } = render(<ShellSkeleton />);
+    expect(container.querySelector("[data-app-header]")).toBeTruthy();
+    expect(container.querySelector(".w-60")).toBeNull();
+    expect(container.querySelector("[data-bottom-nav]")).toBeNull();
+    expect(screen.getByRole("main").querySelector("[data-route-skeleton]")).toBeTruthy();
+  });
 });

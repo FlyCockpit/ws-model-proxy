@@ -34,6 +34,7 @@
     "signOut": "Sign Out",
     "signOutFailed": "Could not sign out. You are still signed in; try again.",
     "accountUnavailable": "Account unavailable — Retry",
+    "retryQueued": "Retry queued — please wait",
     "signOutOffline": "You're offline. You're still signed in — sign out again when you're back online."
   },
   "hints": {

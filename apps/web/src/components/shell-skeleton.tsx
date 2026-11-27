@@ -17,8 +17,25 @@ const AUTH_PAGES = new Set([
   "reset-password",
   "verify-email",
 ]);
+
+/** Top-level segments under `/$lang/_auth` and `/$lang/admin` in routeTree.gen.ts. */
+const SIGNED_IN_PAGES = new Set([
+  "access",
+  "activity",
+  "admin",
+  "models",
+  "nodes",
+  "overview",
+  "pools",
+  "profiles",
+  "providers",
+  "runtimes",
+  "settings",
+  "terminals",
+  "test",
+  "welcome",
+]);
 const MCP_PAGES = new Set(["mcp-login", "mcp-consent"]);
-const PUBLIC_PAGES = new Set(["", ...AUTH_PAGES, ...MCP_PAGES]);
 
 /**
  * The parts of the app frame a path is drawn in once it loads: signed-in pages have the bottom
@@ -26,7 +43,7 @@ const PUBLIC_PAGES = new Set(["", ...AUTH_PAGES, ...MCP_PAGES]);
  */
 export function shellPartsOf(pathname: string): { sidebar: boolean; bottomNav: boolean } {
   const [, lang = "", page = ""] = pathname.split("/");
-  const signedIn = isSupportedLocale(lang) && !PUBLIC_PAGES.has(page);
+  const signedIn = isSupportedLocale(lang) && SIGNED_IN_PAGES.has(page);
   return { sidebar: signedIn && page !== "admin", bottomNav: signedIn };
 }
 

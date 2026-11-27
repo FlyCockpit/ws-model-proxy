@@ -3,13 +3,21 @@ import { Button } from "@ws-model-proxy/ui/components/button";
 import { AlertTriangle } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { markRouteIdentityUnconfirmed } from "@/lib/document-identity";
+
 import { friendly } from "../utils/friendly-error";
 
 export default function ErrorState({ error }: ErrorComponentProps) {
   const { t } = useTranslation(["common", "errors"]);
   const router = useRouter();
   // Guarded ancestors must settle before successful child matches can recover.
-  const retry = () => void router.invalidate({ forcePending: true }).catch(() => {});
+  const retry = () => {
+    const confirmRecovery = markRouteIdentityUnconfirmed();
+    void router
+      .invalidate({ forcePending: true })
+      .then(confirmRecovery)
+      .catch(() => {});
+  };
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 px-6 py-8 text-center">
       <AlertTriangle className="size-8 text-destructive" />

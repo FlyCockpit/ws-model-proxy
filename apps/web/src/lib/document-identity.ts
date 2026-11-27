@@ -366,6 +366,36 @@ function markIdentityUnverified(): void {
   setIdentityUnverified(true);
 }
 
+/**
+ * Error recovery must re-admit the cookie's owner before any account chrome
+ * is shown, including the root header outside the pending route subtree.
+ * This invalidates old answers before recovery. Run the returned completion
+ * after invalidation: a guard settles the mask first, or an unguarded recovery
+ * explicitly verifies it through the existing lazy coordinator.
+ */
+export function markRouteIdentityUnconfirmed(): () => Promise<void> {
+  // Public/anonymous documents have no private owner to hide. Preserve any
+  // existing peer/rejection obligation without creating a new one here.
+  let since: number | undefined;
+  if (typeof window !== "undefined" && documentIdentity.heldPrivateState) {
+    markIdentityUnverified();
+    since = verificationGeneration;
+  }
+  return async () => {
+    if (
+      since === undefined ||
+      since !== verificationGeneration ||
+      !identityUnverified ||
+      documentIdentity.replaced
+    )
+      return;
+    // A guard normally settles the mask during invalidation. An unguarded
+    // public recovery after private use has no guard or watcher; only this
+    // explicit recovery needs the existing lazy, coalesced authority check.
+    await (await import("./auth-client")).checkDocumentSession();
+  };
+}
+
 /** Taken before a check starts; pass it to `confirmDocumentIdentityFresh`. */
 export function identityVerificationGeneration(): number {
   return verificationGeneration;

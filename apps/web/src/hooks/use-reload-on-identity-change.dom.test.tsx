@@ -104,6 +104,32 @@ describe("sessionIdentity", () => {
 });
 
 describe("useReloadOnIdentityChange", () => {
+  it.each(["focus", "visibilitychange", "online"])(
+    "settled anonymous ignores watcher %s until a peer invalidates its identity",
+    async (event) => {
+      await admitRouteIdentity({ status: "resolved", session: null });
+      boundary.checked = null;
+      setup()(anonymous);
+      const target = event === "visibilitychange" ? document : window;
+      fire(target, event);
+      await settle();
+      expect(boundary.refetch).not.toHaveBeenCalled();
+      const [channel] = FakeChannel.open;
+      boundary.checked = undefined;
+      channel?.onmessage?.({ data: { kind: "session-changed" } } as MessageEvent);
+      await settle();
+      expect(boundary.refetch).toHaveBeenCalledTimes(1);
+      boundary.checked = null;
+      fire(target, event);
+      await settle();
+      expect(boundary.refetch).toHaveBeenCalledTimes(2);
+      expect(isDocumentIdentityUnverified()).toBe(false);
+      fire(target, event);
+      await settle();
+      expect(boundary.refetch).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it("does not reload initial sessions or anonymous sign-in", () => {
     const update = setup();
     update(anonymous);

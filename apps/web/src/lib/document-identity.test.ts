@@ -12,6 +12,7 @@ import {
   isDocumentReplaced,
   leaveDocument,
   markExplicitSignOut,
+  markRouteIdentityUnconfirmed,
   observeDocumentIdentity,
   onDocumentReplaced,
   replaceDocument,
@@ -75,6 +76,29 @@ async function settles(promise: Promise<unknown>): Promise<boolean> {
 
 const unauthorized = () =>
   Object.assign(new Error("no session"), { code: "UNAUTHORIZED", status: 401 });
+
+describe("route recovery identity mask", () => {
+  it("invalidates old answers until a new guard confirms the same owner", async () => {
+    await admitRouteIdentity(resolved("a"));
+    const before = identityVerificationGeneration();
+    markRouteIdentityUnconfirmed();
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    await admitRouteIdentity(resolved("a"), before);
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    await admitRouteIdentity(resolved("a"));
+    expect(isDocumentIdentityUnverified()).toBe(false);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("never changes process-global verification state during SSR recovery", async () => {
+    await admitRouteIdentity(resolved("a"));
+    vi.stubGlobal("window", undefined);
+    const before = identityVerificationGeneration();
+    markRouteIdentityUnconfirmed();
+    expect(identityVerificationGeneration()).toBe(before);
+    expect(isDocumentIdentityUnverified()).toBe(false);
+  });
+});
 
 describe("shouldReloadForIdentity", () => {
   it("only reloads when a signed-in user goes away", () => {
