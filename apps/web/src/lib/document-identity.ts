@@ -412,6 +412,7 @@ export function confirmAuthoritativeSessionCheck(since: number): void {
 let reportedRejections = new WeakSet<object>();
 
 export function reportSessionRejected(error?: unknown): void {
+  if (typeof window === "undefined") return;
   // The RPC interceptor and QueryCache receive the same decoded error. That
   // final callback must not invalidate the authoritative probe it just started.
   if (error && typeof error === "object") {
