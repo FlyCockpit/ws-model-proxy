@@ -57,6 +57,7 @@ export const Route = createFileRoute("/$lang/mcp-login")({
     const availability = await getMcpWebAvailability();
     if (!availability.enabled) throw notFound();
   },
+  pendingComponent: McpPageSkeleton,
   component: McpLoginPage,
 });
 

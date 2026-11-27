@@ -210,8 +210,11 @@ export function createPasswordPepper({
   };
 }
 
+const PASSWORD_PEPPER_KEY_ERROR = Symbol.for("ws-model-proxy.password-pepper-key-error");
+
 /** Thrown at startup when stored values name a key no configured secret provides. */
 export class PasswordPepperKeyError extends Error {
+  readonly [PASSWORD_PEPPER_KEY_ERROR] = true;
   constructor(
     readonly count: number,
     readonly fingerprints: readonly string[],

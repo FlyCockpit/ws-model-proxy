@@ -1,5 +1,7 @@
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 
+import { AUTH_SCREEN_CLASS } from "./auth-card";
+
 /** Loading placeholder shaped like the sign-in and sign-up cards (title, description, 3 rows). */
 export function AuthFormSkeleton() {
   return (
@@ -13,6 +15,15 @@ export function AuthFormSkeleton() {
         <Skeleton className="h-11 w-full md:h-8" />
         <Skeleton className="h-11 w-full md:h-8" />
       </div>
+    </div>
+  );
+}
+
+/** Centered full-screen placeholder for signed-out auth routes and their SSR shell skeleton. */
+export function AuthScreenSkeleton() {
+  return (
+    <div className={AUTH_SCREEN_CLASS}>
+      <AuthFormSkeleton />
     </div>
   );
 }

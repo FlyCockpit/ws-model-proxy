@@ -340,7 +340,6 @@ function RuntimeForm({ preset }: { preset: Preset }) {
                   <Input
                     id="runtime-note"
                     className="h-11"
-                    maxLength={500}
                     value={field.state.value}
                     onChange={(event) => field.handleChange(event.target.value)}
                     aria-invalid={field.state.meta.errors.length > 0 || undefined}

@@ -1,4 +1,5 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
+import { AuthScreenSkeleton } from "@/components/auth/auth-form-skeleton";
 import { SignInCard } from "@/components/auth/sign-in-card";
 import { markAnonymousOnlyRoute } from "@/lib/document-identity";
 import { resolveRouteSession } from "@/lib/route-session";
@@ -17,6 +18,7 @@ export const Route = createFileRoute("/$lang/login")({
       throw redirect({ href: safeRedirectTo(search.redirectTo, params.lang) });
     }
   },
+  pendingComponent: AuthScreenSkeleton,
   component: LoginPage,
 });
 

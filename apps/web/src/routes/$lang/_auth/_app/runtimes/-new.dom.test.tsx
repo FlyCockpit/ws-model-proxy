@@ -477,9 +477,10 @@ describe("new runtime: the quick path first", { timeout: 20_000 }, () => {
       target: { value: "Qwen" },
     });
     const note = document.getElementById("runtime-note") as HTMLInputElement;
-    expect(note.maxLength).toBe(500);
+    expect(note.hasAttribute("maxlength")).toBe(false);
     const section = note.closest("details") as HTMLDetailsElement;
     fireEvent.change(note, { target: { value: "x".repeat(501) } });
+    expect(note.value).toHaveLength(501);
     section.open = false;
     fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.create" }));
     await waitFor(() => expect(document.activeElement).toBe(note));

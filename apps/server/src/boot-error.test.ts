@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EnvConfigError } from "@ws-model-proxy/env/config-error";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { PasswordPepperKeyError } from "../../../packages/auth/src/password-pepper.js";
 import { reportBootError } from "./boot-error.js";
 
 const SERVER_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -57,6 +58,35 @@ describe("reportBootError", () => {
     reportBootError(new EnvConfigError("[env] fix BETTER_AUTH_URL"), output);
     expect(printed).toEqual(["[server] FATAL: [env] fix BETTER_AUTH_URL"]);
     expect(codes).toEqual([1]);
+  });
+
+  it("prints the password pepper remediation and exits 1", () => {
+    const { printed, codes, output } = capture();
+    const error = new PasswordPepperKeyError(1, ["0123456789abcdef"], ["fedcba9876543210"]);
+    reportBootError(error, output);
+    expect(printed).toEqual([`[server] FATAL: ${error.message}`]);
+    expect(codes).toEqual([1]);
+  });
+
+  it("preserves the password pepper message with the console shim installed", async () => {
+    const originals = { error: console.error, warn: console.warn, log: console.log };
+    const printed = vi.fn();
+    console.error = printed;
+    try {
+      vi.resetModules();
+      const { installBetterCallErrorLogShim } = await import("./better-call-error-log-shim.js");
+      installBetterCallErrorLogShim();
+      const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+      const error = new PasswordPepperKeyError(1, ["0123456789abcdef"], ["fedcba9876543210"]);
+      reportBootError(error);
+      expect(printed).toHaveBeenCalledWith(`[server] FATAL: ${error.message}`);
+      expect(printed.mock.calls[0]?.[0]).toContain("sealed under key");
+      expect(printed.mock.calls[0]?.[0]).not.toContain("error (sanitized):");
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      vi.restoreAllMocks();
+      Object.assign(console, originals);
+    }
   });
 
   it("prints any other error whole, stack included, and exits 1", () => {

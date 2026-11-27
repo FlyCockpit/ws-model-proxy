@@ -20,7 +20,7 @@ import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 import { AUTH_SCREEN_CLASS } from "@/components/auth/auth-card";
-import { AuthFormSkeleton } from "@/components/auth/auth-form-skeleton";
+import { AuthFormSkeleton, AuthScreenSkeleton } from "@/components/auth/auth-form-skeleton";
 import { AuthRetryCard } from "@/components/auth/auth-retry-card";
 import { ResendVerification } from "@/components/auth/resend-verification";
 import { useAuthSession } from "@/hooks/use-auth-session";
@@ -53,6 +53,7 @@ export const Route = createFileRoute("/$lang/signup")({
       });
     }
   },
+  pendingComponent: AuthScreenSkeleton,
   component: SignupPage,
 });
 

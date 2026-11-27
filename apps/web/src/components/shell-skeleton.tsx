@@ -1,24 +1,24 @@
 import { useRouterState } from "@tanstack/react-router";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { useTranslation } from "react-i18next";
-
 import { AppNameLink } from "@/components/app-name-link";
+import { AuthScreenSkeleton } from "@/components/auth/auth-form-skeleton";
+import { McpPageSkeleton } from "@/components/mcp/mcp-page-skeleton";
 import { PageSkeleton } from "@/components/page-skeleton";
 import { useMountEffect } from "@/hooks/use-mount-effect";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { markAppShellHydrated } from "@/lib/app-shell-hydration";
 
 /** `/$lang/<page>` pages a signed-out person sees: no app frame around them. */
-const PUBLIC_PAGES = new Set([
-  "",
+const AUTH_PAGES = new Set([
   "login",
   "signup",
   "forgot-password",
   "reset-password",
   "verify-email",
-  "mcp-login",
-  "mcp-consent",
 ]);
+const MCP_PAGES = new Set(["mcp-login", "mcp-consent"]);
+const PUBLIC_PAGES = new Set(["", ...AUTH_PAGES, ...MCP_PAGES]);
 
 /**
  * The parts of the app frame a path is drawn in once it loads: signed-in pages have the bottom
@@ -43,6 +43,9 @@ export function ShellSkeleton() {
   const segment = pathname.split("/")[1];
   const lang = isSupportedLocale(segment) ? segment : DEFAULT_LOCALE;
   const parts = shellPartsOf(pathname);
+  const page = pathname.split("/")[2] ?? "";
+  const authPage = isSupportedLocale(segment) && AUTH_PAGES.has(page);
+  const mcpPage = isSupportedLocale(segment) && MCP_PAGES.has(page);
   // The first effect of the hydrated (or client-rendered) skeleton: from here on a route guard
   // may change the URL (lib/app-shell-hydration.ts).
   useMountEffect(markAppShellHydrated);
@@ -119,8 +122,12 @@ export function ShellSkeleton() {
                 <div className="container mx-auto flex min-w-0 max-w-6xl flex-col px-4 py-4 md:py-6">
                   <PageSkeleton />
                 </div>
+              ) : authPage ? (
+                <AuthScreenSkeleton />
+              ) : mcpPage ? (
+                <McpPageSkeleton />
               ) : (
-                // Admin and public pages draw their own containers: so does their skeleton.
+                // Admin and other public pages draw their own containers.
                 <PageSkeleton pageContainer />
               )}
             </div>

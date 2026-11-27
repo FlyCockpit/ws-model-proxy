@@ -7,6 +7,7 @@ import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useTranslation } from "react-i18next";
 
 import { AuthCard } from "@/components/auth/auth-card";
+import { AuthScreenSkeleton } from "@/components/auth/auth-form-skeleton";
 import { ResendVerification } from "@/components/auth/resend-verification";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { parseVerifyEmailSearch } from "@/lib/verify-email-search";
@@ -26,6 +27,7 @@ import { orpc } from "@/utils/orpc";
  */
 export const Route = createFileRoute("/$lang/verify-email")({
   validateSearch: parseVerifyEmailSearch,
+  pendingComponent: AuthScreenSkeleton,
   component: VerifyEmailPage,
 });
 

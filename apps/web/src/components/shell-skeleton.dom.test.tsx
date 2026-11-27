@@ -17,6 +17,7 @@ vi.mock("@tanstack/react-router", () => ({
 }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 
+import { AUTH_SCREEN_CLASS } from "@/components/auth/auth-card";
 import { ShellSkeleton } from "./shell-skeleton";
 
 afterEach(() => {
@@ -43,6 +44,37 @@ describe("ShellSkeleton", () => {
     const logo = document.querySelector("[data-app-header] a > img");
     expect(logo?.getAttribute("src")).toBe("/pwa-32x32.png");
     expect(logo?.getAttribute("width")).toBe("32");
+  });
+
+  it.each(["login", "signup", "forgot-password", "reset-password", "verify-email"])(
+    "draws the auth screen skeleton for %s",
+    (page) => {
+      state.pathname = `/en-US/${page}`;
+      render(<ShellSkeleton />);
+      const main = screen.getByRole("main");
+      const frame = Array.from(main.querySelectorAll("div")).find(
+        (element) => element.className === AUTH_SCREEN_CLASS,
+      );
+      expect(frame?.querySelector(".max-w-md .space-y-4")).toBeTruthy();
+      expect(main.querySelector("[data-route-skeleton]")).toBeNull();
+    },
+  );
+
+  it.each(["mcp-login", "mcp-consent"])("draws the MCP page skeleton for %s", (page) => {
+    state.pathname = `/en-US/${page}`;
+    render(<ShellSkeleton />);
+    const main = screen.getByRole("main");
+    const frame = Array.from(main.querySelectorAll("div")).find((element) =>
+      element.className.includes("py-10"),
+    );
+    expect(frame?.querySelector(".max-w-md .space-y-4")).toBeTruthy();
+    expect(main.querySelector("[data-route-skeleton]")).toBeNull();
+  });
+
+  it("keeps the page skeleton for admin", () => {
+    state.pathname = "/en-US/admin";
+    render(<ShellSkeleton />);
+    expect(screen.getByRole("main").querySelector("[data-route-skeleton]")).toBeTruthy();
   });
 
   it("draws the sidebar column and the bottom bar only where the loaded page has them", () => {

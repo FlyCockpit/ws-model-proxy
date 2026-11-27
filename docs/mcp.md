@@ -917,11 +917,10 @@ separate policy change.
   (capacity-lease release and waiter terminalization) is exempt from the fence
   and still runs after fencing.
 
-Installed-client transport smoke tests with Claude Code 2.1.332 and Codex
-0.172.0 use fixture-backed tools. They verify request negotiation and transport,
-but do not verify an OAuth login or retrieval of persisted application data.
-Full live client verification is pending; the setup instructions above describe
-the supported connection flow.
+Live installed-client verification passed with Codex 0.172.0 (MCP protocol
+2025-06-18) and Claude Code 2.1.332 (MCP protocol 2026-07-28): OAuth consent
+and exchange, persisted `nodes_get` retrieval, allowlist narrowing, grant
+revocation (403), and unauthenticated rejection (401/405).
 
 ## Scopes
 

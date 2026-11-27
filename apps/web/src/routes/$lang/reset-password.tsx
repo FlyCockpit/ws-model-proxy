@@ -1,4 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { AuthScreenSkeleton } from "@/components/auth/auth-form-skeleton";
 import { ResetPasswordCard } from "@/components/auth/reset-password-card";
 import { markAnonymousOnlyRoute } from "@/lib/document-identity";
 import { parseResetPasswordSearch } from "@/lib/reset-password-search";
@@ -17,6 +18,7 @@ export const Route = createFileRoute("/$lang/reset-password")({
     ...parseResetPasswordSearch(search),
     invite: search.invite === "1" || search.invite === 1 ? (1 as const) : undefined,
   }),
+  pendingComponent: AuthScreenSkeleton,
   component: ResetPasswordPage,
 });
 

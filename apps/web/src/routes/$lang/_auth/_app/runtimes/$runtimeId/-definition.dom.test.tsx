@@ -170,6 +170,17 @@ describe("runtime definition page", { timeout: 20_000 }, () => {
     state.origin = "SERVER";
   });
 
+  it("shows validation for a note longer than 500 characters", async () => {
+    mount();
+    const note = await waitFor(() => byId<HTMLInputElement>("definition-note"));
+    expect(note.hasAttribute("maxlength")).toBe(false);
+    fireEvent.change(note, { target: { value: "x".repeat(501) } });
+    expect(note.value).toHaveLength(501);
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.saveVersion" }));
+    expect(await screen.findByText("dashboard:runtime.form.noteTooLong")).toBeTruthy();
+    expect(state.update).not.toHaveBeenCalled();
+  });
+
   it("edits the definition in the form and in JSON, and saves the same spec either way", async () => {
     mount();
     const modelId = await waitFor(() => byId<HTMLInputElement>("definition-model-0"));

@@ -1,5 +1,6 @@
 import { createFileRoute, notFound, redirect } from "@tanstack/react-router";
 import { McpConsentPage } from "@/components/mcp/mcp-consent-page";
+import { McpPageSkeleton } from "@/components/mcp/mcp-page-skeleton";
 import { mcpPageHref } from "@/lib/mcp-oauth-search";
 import { resolveRouteSession } from "@/lib/route-session";
 import { decideMcpConsentRouteAccess } from "@/lib/route-session-access";
@@ -46,6 +47,7 @@ export const Route = createFileRoute("/$lang/mcp-consent")({
       });
     }
   },
+  pendingComponent: McpPageSkeleton,
   component: ConsentRouteComponent,
 });
 

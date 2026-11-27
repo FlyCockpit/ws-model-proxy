@@ -8,6 +8,7 @@ import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AUTH_SCREEN_CLASS, AuthCard } from "@/components/auth/auth-card";
+import { AuthScreenSkeleton } from "@/components/auth/auth-form-skeleton";
 import { EmailOnlyForm } from "@/components/auth/email-only-form";
 import { authClient } from "@/lib/auth-client";
 import { markAnonymousOnlyRoute } from "@/lib/document-identity";
@@ -33,6 +34,7 @@ export const Route = createFileRoute("/$lang/forgot-password")({
       throw redirect({ to: "/$lang/overview", params: { lang: params.lang } });
     }
   },
+  pendingComponent: AuthScreenSkeleton,
   component: ForgotPasswordPage,
 });
 
