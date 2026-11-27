@@ -202,13 +202,7 @@ function VerificationPendingCard({
           >
             {t("auth:verifyEmail.signIn")}
           </Link>
-          {canResend ? (
-            <ResendVerification email={email} />
-          ) : (
-            <p className="text-center text-sm text-muted-foreground">
-              {t("auth:verifyEmail.emailUnavailable")}
-            </p>
-          )}
+          {canResend ? <ResendVerification email={email} /> : null}
         </CardContent>
       </Card>
     </Frame>

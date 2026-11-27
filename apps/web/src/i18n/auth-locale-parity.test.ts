@@ -19,9 +19,29 @@ describe("auth locale key parity (en-US / es-MX)", () => {
   // bundle lacks es-MX's top-level "accountCreatedSuccess" key). This test
   // pins parity for the Phase 6 MCP additions, where BOTH bundles were
   // authored together; widening it to the whole file is a separate cleanup.
-  it("has identical key trees for the MCP login/consent sections", () => {
+  it("has identical key trees for the MCP login/consent and verifyEmail sections", () => {
     expect(keyTree(esAuth.mcpLogin)).toEqual(keyTree(enAuth.mcpLogin));
     expect(keyTree(esAuth.mcpConsent)).toEqual(keyTree(enAuth.mcpConsent));
+    expect(keyTree(esAuth.verifyEmail).sort()).toEqual(keyTree(enAuth.verifyEmail).sort());
+  });
+
+  it("keeps no-resend verifyEmail copy free of email-input prompts while preserving admin-verification copy", () => {
+    expect(enAuth.verifyEmail.pendingDescriptionNoResend).not.toMatch(/enter your email/i);
+    expect(enAuth.verifyEmail.invalidDescriptionNoResend).not.toMatch(/enter your email/i);
+    expect(esAuth.verifyEmail.pendingDescriptionNoResend).not.toMatch(/ingresa tu correo/i);
+    expect(esAuth.verifyEmail.invalidDescriptionNoResend).not.toMatch(/ingresa tu correo/i);
+    expect(enAuth.verifyEmail.emailUnavailable).toMatch(
+      /ask an administrator to verify your account/i,
+    );
+    expect(enAuth.verifyEmail.accountCreatedNoEmail).toMatch(
+      /ask an administrator to verify your account/i,
+    );
+    expect(esAuth.verifyEmail.emailUnavailable).toMatch(
+      /pide a un administrador que verifique tu cuenta/i,
+    );
+    expect(esAuth.verifyEmail.accountCreatedNoEmail).toMatch(
+      /pide a un administrador que verifique tu cuenta/i,
+    );
   });
 
   it("ties the narrowing warning to authorization in every locale", () => {

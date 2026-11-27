@@ -1,4 +1,7 @@
+import { createElement, Fragment } from "react";
 import { sileo } from "sileo";
+
+import { clearToastActions, registerToastAction, ToastAction } from "../components/toast-action";
 
 type ToastOptions = {
   duration?: number;
@@ -7,6 +10,12 @@ type ToastOptions = {
     onClick: () => void;
   };
 };
+
+// sileo keys toasts by `id` and defaults every one to "sileo-default", so a
+// second toast replaces (morphs into) the first: two messages merge into one
+// blob and the first is lost. Each toast gets its own id, so they stack.
+let toastCount = 0;
+const nextToastId = () => `toast-${++toastCount}`;
 
 // The pill is one line inside sileo's fixed 350px SVG (`--sileo-width`).
 // globals.css caps the title row and ends a longer title with an ellipsis, so
@@ -53,15 +62,36 @@ export function titleOverflowsPill(message: string, measure: TitleMeasure = meas
 }
 
 function createToastMethod(method: "success" | "error" | "info" | "warning") {
-  return (message: string, options?: ToastOptions) => {
-    return sileo[method]({
+  return (message: string, options?: ToastOptions): string => {
+    const id = nextToastId();
+    const overflowing = titleOverflowsPill(message);
+    const action = options?.action;
+    if (action && typeof window !== "undefined") {
+      registerToastAction(id, action.onClick);
+    }
+    const actionElement = action
+      ? createElement(ToastAction, {
+          id,
+          state: method,
+          title: message,
+          label: action.label,
+          onClick: action.onClick,
+        })
+      : null;
+    const description = actionElement
+      ? overflowing
+        ? createElement(Fragment, null, message, actionElement)
+        : actionElement
+      : overflowing
+        ? message
+        : undefined;
+    sileo[method]({
+      id,
       title: message,
-      ...(titleOverflowsPill(message) ? { description: message } : {}),
+      ...(description !== undefined ? { description } : {}),
       ...(options?.duration != null ? { duration: options.duration } : {}),
-      ...(options?.action
-        ? { button: { title: options.action.label, onClick: options.action.onClick } }
-        : {}),
-    });
+    } as Parameters<typeof sileo.show>[0]);
+    return id;
   };
 }
 
@@ -71,5 +101,8 @@ export const toast = {
   info: createToastMethod("info"),
   warning: createToastMethod("warning"),
   dismiss: sileo.dismiss,
-  clear: sileo.clear,
+  clear: (position?: Parameters<typeof sileo.clear>[0]) => {
+    clearToastActions();
+    sileo.clear(position);
+  },
 };

@@ -403,3 +403,69 @@ it.each(["returned", "thrown"])(
     expect(toast.success).not.toHaveBeenCalled();
   },
 );
+
+describe("verify-email copy when resend is unavailable", () => {
+  it("does not prompt to enter email on pending or invalid states when emailEnabled is false", () => {
+    config.emailEnabled = false;
+    store.set(ANONYMOUS);
+
+    renderPage(<VerifyPage />);
+    expect(screen.getByText("auth:verifyEmail.pendingDescriptionNoResend")).toBeTruthy();
+    expect(screen.getByText("auth:verifyEmail.emailUnavailable")).toBeTruthy();
+    expect(screen.queryByText("auth:verifyEmail.pendingDescription")).toBeNull();
+    cleanup();
+
+    routeSearch.value = { error: "INVALID_TOKEN" };
+    renderPage(<VerifyPage />);
+    expect(screen.getByText("auth:verifyEmail.invalidDescriptionNoResend")).toBeTruthy();
+    expect(screen.getByText("auth:verifyEmail.emailUnavailable")).toBeTruthy();
+    expect(screen.queryByText("auth:verifyEmail.invalidDescription")).toBeNull();
+  });
+
+  it("shows the resend prompt description when emailEnabled is true", () => {
+    config.emailEnabled = true;
+    store.set(ANONYMOUS);
+
+    renderPage(<VerifyPage />);
+    expect(screen.getByText("auth:verifyEmail.pendingDescription")).toBeTruthy();
+    expect(screen.queryByText("auth:verifyEmail.emailUnavailable")).toBeNull();
+    cleanup();
+
+    routeSearch.value = { error: "INVALID_TOKEN" };
+    renderPage(<VerifyPage />);
+    expect(screen.getByText("auth:verifyEmail.invalidDescription")).toBeTruthy();
+    expect(screen.queryByText("auth:verifyEmail.emailUnavailable")).toBeNull();
+  });
+});
+
+describe("signup confirmation card without resend", () => {
+  it("does not repeat emailUnavailable below accountCreatedNoEmail when mail becomes unavailable", async () => {
+    const { authClient } = await import("@/lib/auth-client");
+    vi.mocked(authClient.signUp.email).mockResolvedValueOnce({
+      data: { user: { id: "u1", email: "user@example.com", name: "Test Person" }, token: null },
+      error: null,
+    });
+    config.emailEnabled = true;
+    store.set(ANONYMOUS);
+    const view = renderPage(<SignupPage />);
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText("auth:fields.name"), "Test Person");
+    await user.type(screen.getByLabelText("auth:fields.slug"), "testperson");
+    await user.type(screen.getByLabelText("auth:fields.email"), "user@example.com");
+    await user.type(screen.getByLabelText("auth:fields.password"), "longpassword123");
+    await user.click(screen.getByRole("button", { name: "auth:login.signUp" }));
+
+    await waitFor(() => expect(screen.getByText("auth:verifyEmail.sentTitle")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "auth:verifyEmail.resend" })).toBeTruthy();
+
+    await act(async () => {
+      view.client.setQueryData(["appConfig"], { ...config, emailEnabled: false });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText("auth:verifyEmail.accountCreatedNoEmail")).toBeTruthy(),
+    );
+    expect(screen.queryByText("auth:verifyEmail.emailUnavailable")).toBeNull();
+    expect(screen.queryByRole("button", { name: "auth:verifyEmail.resend" })).toBeNull();
+  });
+});

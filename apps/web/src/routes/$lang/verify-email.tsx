@@ -52,8 +52,16 @@ function VerifyEmailPage() {
         title={error ? t("auth:verifyEmail.invalidTitle") : t("auth:verifyEmail.pendingTitle")}
         description={
           error
-            ? t("auth:verifyEmail.invalidDescription")
-            : t("auth:verifyEmail.pendingDescription")
+            ? t(
+                canResend
+                  ? "auth:verifyEmail.invalidDescription"
+                  : "auth:verifyEmail.invalidDescriptionNoResend",
+              )
+            : t(
+                canResend
+                  ? "auth:verifyEmail.pendingDescription"
+                  : "auth:verifyEmail.pendingDescriptionNoResend",
+              )
         }
       >
         <ResendSection

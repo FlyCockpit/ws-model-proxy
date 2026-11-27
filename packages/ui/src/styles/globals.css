@@ -465,3 +465,9 @@
   --sileo-btn-bg: color-mix(in oklch, var(--popover-foreground) 8%, transparent);
   --sileo-btn-bg-hover: color-mix(in oklch, var(--popover-foreground) 14%, transparent);
 }
+:root
+  [data-sileo-viewport]
+  [data-sileo-toast]:has([data-sileo-button]):is(:hover, :focus-visible)
+  [data-sileo-button] {
+  background-color: var(--sileo-btn-bg-hover, transparent);
+}

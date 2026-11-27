@@ -12,30 +12,58 @@ const backend = vi.hoisted(() => ({
 }));
 vi.mock("sileo", () => ({ sileo: backend }));
 
+import { invokeToastAction } from "@ws-model-proxy/ui/components/toast-action";
 import { pillTitleBudget, titleOverflowsPill, toast } from "@ws-model-proxy/ui/lib/toast";
 
 beforeEach(() => {
   for (const fn of Object.values(backend)) fn.mockReset();
+  toast.clear();
+  backend.clear.mockReset();
 });
 
 describe("toast", () => {
-  it("passes a short message as the title only", () => {
-    toast.success("Saved");
-    expect(backend.success).toHaveBeenCalledWith({ title: "Saved" });
+  it("passes a short message as the title only with a unique id", () => {
+    const id = toast.success("Saved");
+    expect(backend.success).toHaveBeenCalledWith({ id, title: "Saved" });
+    expect(backend.success.mock.calls[0]?.[0]).not.toHaveProperty("description");
+    expect(backend.success.mock.calls[0]?.[0]).not.toHaveProperty("button");
   });
 
-  it("repeats a long message in the description so the capped title row loses nothing", () => {
+  it("gives every toast its own id so two toasts stack instead of merging", () => {
+    const first = toast.error("That wasn't found.");
+    const second = toast.error("That wasn't found.");
+    expect(first).not.toBe(second);
+    expect(backend.error.mock.calls.map(([options]) => options.id)).toEqual([first, second]);
+  });
+
+  it("repeats a long message and renders ToastAction in description instead of sileo's nested button", () => {
     // The provider page's warning after a refused key (D4 of e2e5-wmp): one line ran off both screen edges.
     const long =
       "Account added, but the key test failed: The provider refused the key. Copy the key again from the provider's site.";
     const onClick = vi.fn();
-    toast.warning(long, { duration: 8000, action: { label: "Retry", onClick } });
-    expect(backend.warning).toHaveBeenCalledWith({
+    const id = toast.warning(long, { duration: 8000, action: { label: "Retry", onClick } });
+    const call = backend.warning.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(call).toMatchObject({
+      id,
       title: long,
-      description: long,
       duration: 8000,
-      button: { title: "Retry", onClick },
     });
+    expect(call).not.toHaveProperty("button");
+    expect(call).toHaveProperty("description");
+  });
+
+  it("clears stored toast actions when toast.clear() is called", () => {
+    vi.stubGlobal("window", {});
+    const onClick = vi.fn();
+    const id = toast.error("Failed", { action: { label: "Retry", onClick } });
+    invokeToastAction(id);
+    expect(onClick).toHaveBeenCalledTimes(1);
+
+    toast.clear();
+    expect(backend.clear).toHaveBeenCalledTimes(1);
+    invokeToastAction(id);
+    expect(onClick).toHaveBeenCalledTimes(1);
+    vi.unstubAllGlobals();
   });
 
   it("measures the title against the pill when it can", () => {
@@ -70,5 +98,11 @@ describe("toast title row (globals.css)", () => {
 
   it("shows titles as written, not in sileo's Title Case", () => {
     expect(css).toMatch(/\[data-sileo-viewport\] \[data-sileo-title\] \{\s*text-transform: none;/);
+  });
+
+  it("highlights the action pill when the enclosing toast button is hovered or focused", () => {
+    expect(css).toMatch(
+      /\[data-sileo-viewport\]\s*\[data-sileo-toast\]:has\(\[data-sileo-button\]\):is\(:hover, :focus-visible\)\s*\[data-sileo-button\]/,
+    );
   });
 });
