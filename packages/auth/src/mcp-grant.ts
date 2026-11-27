@@ -1,6 +1,9 @@
 import { createHmac } from "node:crypto";
 import { getOAuthProviderState } from "@better-auth/oauth-provider";
-import prisma from "@ws-model-proxy/db";
+import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { fenceOwners, runCapacityOrderedTransaction } from "@ws-model-proxy/db/capacity-lock-order";
+import { APIError } from "better-auth/api";
+import { hasLiveCredentialSession } from "./credential-session";
 
 /**
  * Application-owned MCP grant generation integration (Phase 2).
@@ -180,9 +183,10 @@ async function findGrantByReference(
   userId: string,
   clientId: string,
   referenceId: string,
+  db: Pick<Prisma.TransactionClient, "mcpGrant"> = prisma,
 ): Promise<McpGrantRecord | null> {
   const row = await sanitizedGrantStorage("findGrantByReference", () =>
-    prisma.mcpGrant.findUnique({
+    db.mcpGrant.findUnique({
       where: { userId_clientId_referenceId: { userId, clientId, referenceId } },
       select: GRANT_SELECT,
     }),
@@ -249,33 +253,42 @@ export async function issueMcpGrantClaims({
   }
 
   if (grantType === "authorization_code" || grantType === "refresh_token") {
-    const existing = await findGrantByReference(userId, clientId, reference);
-    const decision = resolveMcpGrantDecision({
-      grantType,
-      userId,
-      referenceId: reference,
-      existing,
-    });
-    if (decision.action === "reject") {
-      throw new McpGrantError(
-        decision.reason,
-        `MCP grant decision rejected token issuance: ${decision.reason}`,
+    const issue = async (db: Pick<Prisma.TransactionClient, "mcpGrant">) => {
+      const existing = await findGrantByReference(userId, clientId, reference, db);
+      const decision = resolveMcpGrantDecision({
+        grantType,
+        userId,
+        referenceId: reference,
+        existing,
+      });
+      if (decision.action === "reject") {
+        throw new McpGrantError(
+          decision.reason,
+          `MCP grant decision rejected token issuance: ${decision.reason}`,
+        );
+      }
+      if (decision.action === "reuse") {
+        return { [MCP_GRANT_ID_CLAIM]: decision.grant.id };
+      }
+      // create: NEVER writes revokedAt — only Phase 7 revocation sets it.
+      const created = await sanitizedGrantStorage("createMcpGrant", () =>
+        db.mcpGrant.create({
+          data: { userId, clientId, referenceId: reference },
+          select: GRANT_SELECT,
+        }),
       );
-    }
-    if (decision.action === "reuse") {
-      return { [MCP_GRANT_ID_CLAIM]: decision.grant.id };
-    }
-    // create: NEVER writes revokedAt — only Phase 7 revocation sets it.
-    const created = await sanitizedGrantStorage("createMcpGrant", () =>
-      prisma.mcpGrant.create({
-        data: { userId, clientId, referenceId: reference },
-        select: GRANT_SELECT,
-      }),
-    );
-    if (!isMcpGrantRecord(created)) {
-      throw new McpGrantError("inactive-on-refresh", "MCP grant create returned an invalid row");
-    }
-    return { [MCP_GRANT_ID_CLAIM]: created.id };
+      if (!isMcpGrantRecord(created)) {
+        throw new McpGrantError("inactive-on-refresh", "MCP grant create returned an invalid row");
+      }
+      return { [MCP_GRANT_ID_CLAIM]: created.id };
+    };
+    if (grantType === "refresh_token") return issue(prisma);
+    return runCapacityOrderedTransaction(prisma, async (tx) => {
+      await fenceOwners(tx, [userId]);
+      if (!(await hasLiveCredentialSession(tx, userId, sessionId)))
+        throw new APIError("UNAUTHORIZED", { message: "A live session is required." });
+      return issue(tx);
+    });
   }
 
   // Read-only path (introspection, grantType undefined): exact reference,

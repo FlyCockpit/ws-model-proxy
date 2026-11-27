@@ -46,7 +46,11 @@ type GrantRow = {
   revokedAt: Date | null;
 };
 type GrantKey = { userId: string; clientId: string; referenceId: string };
-const store = vi.hoisted(() => ({ rows: [] as GrantRow[], audits: [] as unknown[] }));
+const store = vi.hoisted(() => ({
+  rows: [] as GrantRow[],
+  audits: [] as unknown[],
+  memory: {} as Record<string, Record<string, unknown>[]>,
+}));
 const grants = vi.hoisted(() => ({
   findUnique: vi.fn(),
   findFirst: vi.fn(),
@@ -65,6 +69,20 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 }));
 vi.mock("@ws-model-proxy/db", () => {
   const tx = {
+    $executeRaw: vi.fn(async () => 1),
+    $queryRaw: vi.fn(async () => [{ acquired: true }]),
+    session: {
+      findFirst: vi.fn(
+        async ({ where }: { where: { id: string; userId: string; expiresAt: { gt: Date } } }) =>
+          store.memory.session?.find(
+            (row) =>
+              row.id === where.id &&
+              row.userId === where.userId &&
+              row.expiresAt instanceof Date &&
+              row.expiresAt > where.expiresAt.gt,
+          ) ?? null,
+      ),
+    },
     mcpGrant: grants,
     auditEvent: audits,
     mcpGrantNode: {
@@ -247,6 +265,9 @@ function buildApp({
       },
     ],
   };
+  // Production auth and the mint fence use the same durable session table.
+  // Reuse the rows created by real sign-up instead of inventing a live session.
+  store.memory = memory;
   const auth = betterAuth({
     baseURL: BASE,
     secret: "parity-test-secret-at-least-thirty-two-characters",
@@ -515,6 +536,63 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     // A skip-consent client never saw the page: its grant is Read-only.
     expect(store.rows[0]?.scopes).toEqual(["READ"]);
   });
+
+  it.each([
+    ["deleted", 400],
+    ["expired", 400],
+    ["another owner", 401],
+  ] as const)(
+    "refuses code exchange when the authorizing session is %s, even if another session is live",
+    async (state, status) => {
+      const { app, auth, memory } = buildApp();
+      const signup = await auth.api.signUpEmail({
+        body: {
+          name: "Parity",
+          email: "parity@example.test",
+          password: "parity-test-password-123",
+        },
+        asResponse: true,
+      });
+      expect(signup.status).toBe(200);
+      const cookie = signup.headers
+        .getSetCookie()
+        .map((value) => value.split(";")[0])
+        .join("; ");
+      const authorize = await app.request(`${BASE}${AUTHORIZE}`, {
+        method: "POST",
+        headers: { "content-type": FORM, cookie, origin: BASE },
+        body: formBody({ scope: "mcp:read offline_access", resource: CANONICAL }),
+      });
+      expect(authorize.status).toBe(302);
+      const code = new URL(authorize.headers.get("location")!, BASE).searchParams.get("code");
+      expect(code).toBeTruthy();
+      const sessions = memory.session;
+      const session = sessions?.[0];
+      if (!sessions || !session) throw new Error("Sign-up did not persist a session");
+      // A sibling session must never authorize a code issued to this session.
+      sessions.push({ ...session, id: "other-session", token: "other-session-token" });
+      if (state === "deleted") memory.session = sessions.filter((row) => row !== session);
+      else if (state === "expired") session.expiresAt = new Date(0);
+      else session.userId = "another-owner";
+
+      const token = await app.request(`${BASE}/api/auth/oauth2/token`, {
+        method: "POST",
+        headers: { "content-type": FORM },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: CLIENT,
+          code: code!,
+          code_verifier: VERIFIER,
+          redirect_uri: CALLBACK,
+        }),
+      });
+      // The provider rejects absent/expired sessions; the mint fence also checks ownership.
+      expect(token.status).toBe(status);
+      expect(await token.json()).not.toHaveProperty("access_token");
+      expect(grants.create).not.toHaveBeenCalled();
+      expect(store.rows).toHaveLength(0);
+    },
+  );
 
   it("FULL FLOW hazard closed: BOM-prefixed resource authorize is locally rejected — no guard-passing shape reaches token issuance without the hook", async () => {
     const { app, auth } = buildApp();

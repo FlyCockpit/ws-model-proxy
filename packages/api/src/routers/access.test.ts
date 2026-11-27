@@ -169,6 +169,7 @@ beforeEach(() => {
   envMock.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = false;
   envMock.env.WMP_AGENT_TOKEN_MAX_LIFETIME_DAYS = 90;
   inTransaction();
+  db.session.findFirst.mockResolvedValue({ id: "s" } as never);
   // The fence protocol: requireOwnerFences reads back what acquireFences took.
   db.$queryRaw.mockImplementation((async (query: TemplateStringsArray) =>
     query.join("").includes("current_setting('wsmp.fences'")
@@ -1632,4 +1633,124 @@ describe("auth.inviteInfo (public)", () => {
       revokedAt: null,
     });
   });
+});
+
+describe("credential minting session fence", () => {
+  beforeEach(() => {
+    db.verification.findMany.mockResolvedValue([]);
+    db.apiKey.count.mockResolvedValue(0);
+    db.agentToken.count.mockResolvedValue(0);
+    db.apiKey.create.mockResolvedValue(keyRow);
+    db.agentToken.create.mockResolvedValue(tokenRow);
+    db.mcpGrant.create.mockResolvedValue({ id: "g1" } as never);
+  });
+  const mint = (kind: "apiKey" | "agentToken") =>
+    kind === "apiKey"
+      ? client().apiKeys.create({ name: "key", scope: "ALL_POOLS", poolIds: [], expiresAt: null })
+      : client().agentTokens.create({
+          name: "agent",
+          scopes: ["read"],
+          nodeIds: null,
+          expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+        });
+
+  it.each(["apiKey", "agentToken"] as const)(
+    "a %s mint winning the fence is swept by the waiting revocation",
+    async (kind) => {
+      const { revokeUserCredentials } = await vi.importActual<{
+        revokeUserCredentials: (userId: string) => Promise<void>;
+      }>("../../../auth/src/credential-revocation");
+      let releaseMint = () => {};
+      const mintCanFinish = new Promise<void>((resolve) => {
+        releaseMint = resolve;
+      });
+      let reachedCreate = () => {};
+      const creating = new Promise<void>((resolve) => {
+        reachedCreate = resolve;
+      });
+      let fenceTail = Promise.resolve();
+      const query = db.$queryRaw.getMockImplementation()!;
+      db.$transaction.mockImplementation(async (work: unknown) => {
+        if (typeof work !== "function") throw new Error("Expected interactive transaction");
+        let unlock = () => {};
+        const lockedQuery = async (...args: Parameters<typeof query>) => {
+          if (Array.isArray(args[1]) && args[1].includes("00:owner:owner")) {
+            const previous = fenceTail;
+            fenceTail = new Promise<void>((resolve) => {
+              unlock = resolve;
+            });
+            await previous;
+          }
+          return query(...args);
+        };
+        const tx = new Proxy(db, {
+          get(target, property) {
+            return property === "$queryRaw" ? lockedQuery : Reflect.get(target, property);
+          },
+        });
+        try {
+          return await (work as (client: typeof db) => Promise<unknown>)(tx);
+        } finally {
+          unlock();
+        }
+      });
+      let revoked = false;
+      db[kind].updateMany.mockImplementation(async () => {
+        revoked = true;
+        return { count: 1 };
+      });
+      const createRow = async () => {
+        reachedCreate();
+        await mintCanFinish;
+        return (kind === "apiKey" ? keyRow : tokenRow) as never;
+      };
+      db[kind].create.mockImplementation(createRow);
+      db[kind].count.mockResolvedValue(0);
+      db.mcpGrant.create.mockResolvedValue({ id: "g1" } as never);
+      const minting = mint(kind);
+      await creating;
+      const revoking = revokeUserCredentials("owner");
+      // The revocation is queued behind the mint's transaction, so it cannot sweep early.
+      await Promise.resolve();
+      expect(revoked).toBe(false);
+      releaseMint();
+      await minting;
+      await revoking;
+      expect(revoked).toBe(true);
+      expect(db[kind].updateMany).toHaveBeenCalledWith({
+        where: { userId: "owner", revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+    },
+  );
+
+  it.each(["apiKey", "agentToken"] as const)(
+    "refuses %s from a stale cookie context after its live session is gone",
+    async (kind) => {
+      db.session.findFirst.mockResolvedValue(null);
+      await expect(mint(kind)).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+      expect(db[kind].create).not.toHaveBeenCalled();
+      expect(db.session.findFirst).toHaveBeenCalledWith({
+        where: { id: "s", userId: "owner", expiresAt: { gt: expect.any(Date) } },
+        select: { id: true },
+      });
+    },
+  );
+
+  it.each(["apiKey", "agentToken"] as const)(
+    "rechecks the %s session only after the owner fence has been acquired",
+    async (kind) => {
+      // A reset deletes the session while this request is waiting for its owner fence.
+      const query = db.$queryRaw.getMockImplementation()!;
+      db.$queryRaw.mockImplementation((async (...args: Parameters<typeof query>) => {
+        if (Array.isArray(args[1]) && args[1].includes("00:owner:owner")) {
+          db.session.findFirst.mockResolvedValue(null);
+        }
+        return query(...args);
+      }) as typeof query);
+      await expect(mint(kind)).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+      expect(heldFences()).toContain("00:owner:owner");
+      expect(db[kind].create).not.toHaveBeenCalled();
+    },
+  );
 });

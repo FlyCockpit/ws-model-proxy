@@ -113,12 +113,19 @@ function ResetPasswordForm({
 }) {
   const { t } = useTranslation(["auth"]);
   const navigate = useNavigate();
+  const [retryableFailure, setRetryableFailure] = useState(false);
 
   const form = useForm({
     defaultValues: { password: "", confirmPassword: "" },
     onSubmit: async ({ value }) => {
+      setRetryableFailure(false);
       const result = await authClient.resetPassword({ newPassword: value.password, token });
       if (result.error) {
+        // The pre-sweep refused before changing the password or consuming the link.
+        if (result.error.status === 503) {
+          setRetryableFailure(true);
+          return;
+        }
         if (typeof result.error.code === "string" && REJECTED_TOKEN_CODES.has(result.error.code)) {
           onTokenRejected();
           return;
@@ -156,6 +163,11 @@ function ResetPasswordForm({
       }}
       className="space-y-4"
     >
+      {retryableFailure && (
+        <p role="alert" className="text-sm text-destructive">
+          {t("auth:resetPassword.retryableFailed")}
+        </p>
+      )}
       <form.Field name="password">
         {(field) => (
           <div className="space-y-2">
@@ -211,7 +223,9 @@ function ResetPasswordForm({
             className="min-h-[44px] w-full"
             disabled={!canSubmit || isSubmitting}
           >
-            {isSubmitting ? t("auth:resetPassword.submitting") : t("auth:resetPassword.submit")}
+            {isSubmitting
+              ? t("auth:resetPassword.submitting")
+              : t(retryableFailure ? "auth:resetPassword.retry" : "auth:resetPassword.submit")}
           </Button>
         )}
       </form.Subscribe>

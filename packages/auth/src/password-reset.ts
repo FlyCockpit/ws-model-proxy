@@ -1,6 +1,8 @@
 import { DEFAULT_LOCALE, isSupportedLocale } from "@ws-model-proxy/config/locales";
 import prisma from "@ws-model-proxy/db";
 import { renderResetPassword, sendEmail } from "@ws-model-proxy/mailer";
+import type { BetterAuthOptions } from "better-auth";
+import { revokeUserCredentials } from "./credential-revocation";
 import {
   ADMIN_INVITED_PREFIX,
   lockCredentialSetup,
@@ -135,11 +137,45 @@ type SendResetPassword = (data: {
   token: string;
 }) => Promise<void>;
 
+/** Only onPasswordReset, called after the password/token commit, may record this evidence. */
+const committedResetFailures = new WeakMap<object, { error: unknown }>();
+
+/** Before-hook: defer callback errors to the matching after-hook, on this call's options only. */
+export function preparePasswordResetFinalization(context: { options: BetterAuthOptions }): void {
+  const options = context.options.emailAndPassword;
+  const onPasswordReset = options?.onPasswordReset;
+  if (!options || !onPasswordReset) return;
+  // Better Auth gives each dispatch its own context. Clone options rather than changing
+  // the shared configuration; concurrent resets and server-side calls stay independent.
+  context.options = {
+    ...context.options,
+    emailAndPassword: {
+      ...options,
+      onPasswordReset: async (data, request) => {
+        try {
+          await onPasswordReset(data, request);
+        } catch (error) {
+          // An ordinary error here would bypass the after-hook entirely.
+          committedResetFailures.set(context, { error });
+        }
+      },
+    },
+  };
+}
+
+/** The after-hook takes the failure once, finishes mailed-link verification, then reports it. */
+export function takeCommittedResetFailure(context: object) {
+  const failure = committedResetFailures.get(context);
+  committedResetFailures.delete(context);
+  return failure;
+}
+
 /**
  * The `emailAndPassword` reset options. Reset by email exists only with SMTP:
  * without `sendResetPassword` Better Auth refuses `/request-password-reset`
  * (RESET_PASSWORD_DISABLED) and the web app hides the "Forgot password?" link.
- * A successful reset signs the account out everywhere.
+ * A successful reset revokes all sessions (effective on the next request) and
+ * the user's CLI/API credentials.
  */
 export function passwordResetOptions(
   emailConfigured: boolean,
@@ -167,24 +203,32 @@ export function passwordResetOptions(
     // Better Auth's update routes refuse an email change (index.ts
     // `databaseHooks.user.update`).
     onPasswordReset: async ({ user }: { user: { id: string; email: string } }) => {
-      await prisma.$transaction(async (tx) => {
-        await lockCredentialSetup(tx, user.id);
-        const invited =
-          !emailConfigured &&
-          (await tx.verification.findFirst({
-            where: { identifier: `${ADMIN_INVITED_PREFIX}${user.id}` },
-            select: { id: true },
-          }));
-        if (invited) {
-          await tx.user.updateMany({
-            where: { id: user.id, email: user.email },
-            data: { emailVerified: true },
+      // Defense in depth: the before hook already revoked credentials and all sessions together.
+      try {
+        await revokeUserCredentials(user.id);
+      } finally {
+        // Better Auth already committed the password and consumed this link. Finish
+        // setup and kill other links even if the post-sweep failed; its error still
+        // propagates after finalization (and the revoker reports it).
+        await prisma.$transaction(async (tx) => {
+          await lockCredentialSetup(tx, user.id);
+          const invited =
+            !emailConfigured &&
+            (await tx.verification.findFirst({
+              where: { identifier: `${ADMIN_INVITED_PREFIX}${user.id}` },
+              select: { id: true },
+            }));
+          if (invited) {
+            await tx.user.updateMany({
+              where: { id: user.id, email: user.email },
+              data: { emailVerified: true },
+            });
+          }
+          await tx.verification.deleteMany({
+            where: { value: user.id, identifier: { startsWith: RESET_PASSWORD_IDENTIFIER_PREFIX } },
           });
-        }
-        await tx.verification.deleteMany({
-          where: { value: user.id, identifier: { startsWith: RESET_PASSWORD_IDENTIFIER_PREFIX } },
         });
-      });
+      }
     },
     resetPasswordTokenExpiresIn: RESET_PASSWORD_TOKEN_EXPIRES_IN_SECONDS,
   };

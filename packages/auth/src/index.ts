@@ -26,11 +26,17 @@ import { afterUserUpdate, noteVerificationWrite } from "./account-activation";
 import { getAdminInviteLocale } from "./admin-invite-locale";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
+import { passwordChangeRevocationTarget, revokeUserCredentials } from "./credential-revocation";
 import { refuseImpersonatedAuthWrite } from "./impersonation-read-only";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { createPasswordPepper } from "./password-pepper";
-import { passwordResetOptions } from "./password-reset";
+import {
+  passwordResetOptions,
+  preparePasswordResetFinalization,
+  takeCommittedResetFailure,
+} from "./password-reset";
+import { secureAccountBeforePasswordReset } from "./password-reset-before";
 import {
   isResetLinkRedeemable,
   resetTokenOf,
@@ -502,15 +508,28 @@ export const auth = betterAuth({
       // Sign-up answers the same for a free and a registered address, so it is no
       // account-existence oracle (./signup-response.ts).
       await refuseSignUpInputBeforeLookup(ctx);
+      await secureAccountBeforePasswordReset(ctx);
+      if (resetToken) preparePasswordResetFinalization(ctx.context);
     }),
     after: createAuthMiddleware(async (ctx) => {
-      const spentToken = spentResetToken({
+      const resetFailure = takeCommittedResetFailure(ctx.context);
+      const resetContext = {
         path: ctx.path,
         body: ctx.body,
         query: ctx.query,
         returned: ctx.context.returned,
-      });
+      };
+      // A deferred callback failure is evidence the password and token committed;
+      // an arbitrary failed reset request is never evidence of a spent mailed link.
+      const spentToken = resetFailure ? resetTokenOf(resetContext) : spentResetToken(resetContext);
       if (spentToken) await verifyMailedResetQuietly(spentToken);
+      if (resetFailure) throw resetFailure.error;
+      const userId = passwordChangeRevocationTarget({
+        path: ctx.path,
+        body: ctx.body,
+        returned: ctx.context.returned,
+      });
+      if (userId) await revokeUserCredentials(userId);
       await releaseClaimOfFailedSignUp(ctx);
       return neutralizeSignUpResponse(ctx, { requireEmailVerification: emailConfigured });
     }),

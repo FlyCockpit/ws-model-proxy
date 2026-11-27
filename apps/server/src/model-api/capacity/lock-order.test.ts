@@ -268,6 +268,8 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/lib/needs-you-mail.ts":
     "H status: the needs-you e-mail marker and failure count on an instance (unfenced status columns), one compare-and-set statement per row",
   "packages/auth/src/proved-email.ts": "user mailbox proof after verify-email (unfenced column)",
+  "packages/auth/src/credential-revocation.ts":
+    "M: standing credential revocation (including API keys) under the user's owner fence, before session and credential writes; no later fence or hot-path row",
   "packages/auth/src/password-reset.ts":
     "user emailVerified after a spent invite link without SMTP (unfenced column), under the user's owner fence (credential-setup-lock.ts)",
   "packages/auth/src/password-reset-links.ts":

@@ -6,6 +6,11 @@ import { getAdminInviteLocale, runWithAdminInviteLocale } from "./admin-invite-l
 
 type Row = Record<string, unknown>;
 const state = vi.hoisted(() => ({ db: {} as Record<string, Row[]> }));
+const revokeUserCredentials = vi.hoisted(() => vi.fn(async (_userId: string) => {}));
+vi.mock("./credential-revocation", async (original) => ({
+  ...(await original<typeof import("./credential-revocation")>()),
+  revokeUserCredentials,
+}));
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     NODE_ENV: "test",
@@ -234,6 +239,9 @@ describe("admin invite on real Better Auth with production hooks", { timeout: 30
     await t.link(userId, "raced-resend");
 
     await t.reset("one-time-invite", "chosen-password-1");
+    expect(revokeUserCredentials).toHaveBeenNthCalledWith(1, userId, { revokeSessions: true });
+    expect(revokeUserCredentials).toHaveBeenNthCalledWith(2, userId);
+    expect(revokeUserCredentials).toHaveBeenCalledTimes(2);
     expect(t.user("invitee@example.test")).toMatchObject({
       emailVerified: true,
       provedEmail: "invitee@example.test",
@@ -298,11 +306,14 @@ describe("admin invite on real Better Auth with production hooks", { timeout: 30
     expect(t.user("active@example.test")).toMatchObject({ emailVerified: true });
     // A shown link the activation's tidy-up never deleted (as if it had failed).
     await t.link(userId, "leftover");
+    const revocationsBeforeRefusal = revokeUserCredentials.mock.calls.length;
     await expect(t.reset("leftover", "attacker-pass-1")).rejects.toMatchObject({
       body: { code: "INVALID_TOKEN" },
     });
     expect(t.verifications().filter(isResetRow)).toHaveLength(0);
     await expect(t.signIn("active@example.test", "chosen-password-1")).resolves.toBeTruthy();
+
+    expect(revokeUserCredentials).toHaveBeenCalledTimes(revocationsBeforeRefusal);
 
     // Forgot-password mails a link and records it before the send: it works for the active
     // account.
@@ -376,5 +387,148 @@ describe("admin invite on real Better Auth with production hooks", { timeout: 30
     });
     expect(t.user("signup@example.test")).toMatchObject({ locale: "es-MX", emailVerified: false });
     expect(t.verificationMail).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses revoked sessions on the next request after reset", async () => {
+    const t = setup();
+    const { db, auth } = t;
+    await auth.api.signUpEmail({
+      body: { name: "Person", email: "person@example.test", password: "old-password-1" },
+    });
+
+    const userId = String(t.user("person@example.test").id);
+    const context = await auth.$context;
+    await context.internalAdapter.updateUser(userId, { emailVerified: true });
+    const cookies: Headers[] = [];
+    for (let i = 0; i < 2; i++) {
+      const response = await auth.api.signInEmail({
+        body: { email: "person@example.test", password: "old-password-1" },
+        asResponse: true,
+      });
+      const headers = new Headers({
+        cookie: response.headers
+          .getSetCookie()
+          .map((cookie) => cookie.split(";")[0])
+          .join("; "),
+      });
+      expect(await auth.api.getSession({ headers })).toBeTruthy();
+      cookies.push(headers);
+    }
+    await context.internalAdapter.createVerificationValue({
+      identifier: "reset-password:recover",
+      value: userId,
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    await recordResetLinkMailed({
+      token: "recover",
+      userId,
+      email: "person@example.test",
+    });
+    await auth.api.resetPassword({ body: { token: "recover", newPassword: "new-password-1" } });
+    expect(revokeUserCredentials).toHaveBeenNthCalledWith(1, userId, {
+      revokeSessions: true,
+    });
+    expect(revokeUserCredentials).toHaveBeenNthCalledWith(2, userId);
+    expect(revokeUserCredentials).toHaveBeenCalledTimes(2);
+    expect(db.session).toHaveLength(0);
+    for (const headers of cookies) expect(await auth.api.getSession({ headers })).toBeNull();
+  });
+
+  it("refuses reset before any password/session/token mutation when preflight revocation fails; the same link succeeds on retry", async () => {
+    const t = setup();
+    const { auth, db } = t;
+    await auth.api.signUpEmail({
+      body: { name: "Person", email: "retry@example.test", password: "old-password-1" },
+    });
+
+    const userId = String(t.user("retry@example.test").id);
+    const context = await auth.$context;
+    await context.internalAdapter.createVerificationValue({
+      identifier: "reset-password:retry",
+      value: userId,
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    await recordResetLinkMailed({
+      token: "retry",
+      userId,
+      email: "retry@example.test",
+    });
+    await context.internalAdapter.createSession(userId);
+    const password = db.account?.[0]?.password;
+    const sessions = [...(db.session ?? [])];
+    revokeUserCredentials.mockRejectedValueOnce(new TypeError("private database details"));
+    const response = await auth.handler(
+      new Request("https://proxy.example.test/api/auth/reset-password", {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: "https://proxy.example.test" },
+        body: JSON.stringify({ token: "retry", newPassword: "new-password-1" }),
+      }),
+    );
+    expect(db.account?.[0]?.password).toBe(password);
+    expect(db.session).toEqual(sessions);
+    expect(
+      await context.internalAdapter.findVerificationValue("reset-password:retry"),
+    ).toBeTruthy();
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      message:
+        "We couldn't finish securing your account. Nothing was changed — try the link again.",
+    });
+    await auth.api.resetPassword({ body: { token: "retry", newPassword: "new-password-1" } });
+    expect(db.account?.[0]?.password).not.toBe(password);
+    expect(db.session).toHaveLength(0);
+    expect(await context.internalAdapter.findVerificationValue("reset-password:retry")).toBeNull();
+    expect(revokeUserCredentials).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(["missing", "expired"])(
+    "leaves a %s reset token to Better Auth without revoking credentials",
+    async (kind) => {
+      const { auth } = setup();
+      const context = await auth.$context;
+      if (kind === "expired")
+        await context.internalAdapter.createVerificationValue({
+          identifier: "reset-password:invalid",
+          value: "u1",
+          expiresAt: new Date(Date.now() - 60_000),
+        });
+      const response = await auth.api.resetPassword({
+        body: { token: "invalid", newPassword: "new-password-1" },
+        asResponse: true,
+      });
+      expect(response.status).toBe(400);
+      expect(revokeUserCredentials).not.toHaveBeenCalled();
+    },
+  );
+
+  it("uses the same credential revocation for a successful password change with sign-out", async () => {
+    const t = setup();
+    const { auth } = t;
+    await auth.api.signUpEmail({
+      body: { name: "Person", email: "person@example.test", password: "old-password-1" },
+    });
+
+    const userId = String(t.user("person@example.test").id);
+    const context = await auth.$context;
+    await context.internalAdapter.updateUser(userId, { emailVerified: true });
+    const response = await auth.api.signInEmail({
+      body: { email: "person@example.test", password: "old-password-1" },
+      asResponse: true,
+    });
+    const headers = new Headers({
+      cookie: response.headers
+        .getSetCookie()
+        .map((cookie) => cookie.split(";")[0])
+        .join("; "),
+    });
+    await auth.api.changePassword({
+      headers,
+      body: {
+        currentPassword: "old-password-1",
+        newPassword: "new-password-1",
+        revokeOtherSessions: true,
+      },
+    });
+    expect(revokeUserCredentials).toHaveBeenCalledExactlyOnceWith(userId);
   });
 });

@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const tx = vi.hoisted(() => ({
+  $executeRaw: vi.fn(),
+  $queryRaw: vi.fn(),
+  session: { findFirst: vi.fn() },
   mcpGrant: { findFirst: vi.fn(), findUnique: vi.fn(), createMany: vi.fn(), updateMany: vi.fn() },
   mcpGrantNode: { deleteMany: vi.fn(), createMany: vi.fn() },
   node: { findMany: vi.fn() },
@@ -35,7 +38,12 @@ import {
   setActiveMcpGrantAccess,
 } from "./mcp-grant-access";
 
-const KEY = { userId: "u1", clientId: "https://client.example/meta", referenceId: "r".repeat(64) };
+const KEY = {
+  sessionId: "s1",
+  userId: "u1",
+  clientId: "https://client.example/meta",
+  referenceId: "r".repeat(64),
+};
 const read = { scopes: ["read"] as const, nodeIds: null };
 const full = { scopes: ALL_AGENT_SCOPES, nodeIds: null };
 const stored = (access = full) => ({
@@ -47,6 +55,8 @@ const stored = (access = full) => ({
 });
 beforeEach(() => {
   vi.resetAllMocks();
+  tx.session.findFirst.mockResolvedValue({ id: "s1" });
+  tx.$queryRaw.mockResolvedValue([{ acquired: true }]);
   tx.mcpGrant.updateMany.mockResolvedValue({ count: 1 });
   tx.mcpGrant.createMany.mockResolvedValue({ count: 0 });
   tx.mcpGrant.findUnique.mockResolvedValue(stored());
@@ -92,6 +102,21 @@ describe("consent access and OAuth ceilings", () => {
   });
 });
 describe("grant access storage", () => {
+  it("refuses browser consent from a session deleted before the owner fence was acquired", async () => {
+    tx.$queryRaw.mockImplementationOnce(async () => {
+      tx.session.findFirst.mockResolvedValueOnce(null);
+      return [{ acquired: true }];
+    });
+    await expect(recordConsentedMcpGrantAccess({ ...KEY, ...read })).rejects.toMatchObject({
+      status: "UNAUTHORIZED",
+    });
+    expect(tx.mcpGrant.createMany).not.toHaveBeenCalled();
+    expect(tx.$queryRaw.mock.calls[0]?.slice(1)).toEqual([["00:owner:u1"], true]);
+    expect(tx.session.findFirst).toHaveBeenCalledWith({
+      where: { id: "s1", userId: "u1", expiresAt: { gt: expect.any(Date) } },
+      select: { id: true },
+    });
+  });
   it("creates and audits the exact consent generation with its selected nodes", async () => {
     tx.mcpGrant.createMany.mockResolvedValue({ count: 1 });
     const change = await recordConsentedMcpGrantAccess({
@@ -108,7 +133,11 @@ describe("grant access storage", () => {
       data: [{ grantId: "g1", userId: "u1", nodeId: "n1" }],
     });
     expect(tx.mcpGrant.findUnique.mock.calls[0]?.[0].where).toEqual({
-      userId_clientId_referenceId: KEY,
+      userId_clientId_referenceId: {
+        userId: KEY.userId,
+        clientId: KEY.clientId,
+        referenceId: KEY.referenceId,
+      },
     });
     expect(tx.auditEvent.create.mock.calls[0]?.[0].data).toMatchObject({
       actor: "USER",

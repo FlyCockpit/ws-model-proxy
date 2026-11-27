@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const findUnique = vi.hoisted(() => vi.fn());
+const revokeUserCredentials = vi.hoisted(() => vi.fn(async (_userId: string) => {}));
+vi.mock("./credential-revocation", () => ({ revokeUserCredentials }));
 const sendEmail = vi.hoisted(() => vi.fn());
 const renderResetPassword = vi.hoisted(() =>
   vi.fn((args: { url: string; locale: string }) => ({
@@ -199,8 +201,10 @@ describe("passwordResetOptions", () => {
 });
 
 describe("a finished password reset", () => {
+  beforeEach(() => revokeUserCredentials.mockReset());
   async function spend({ invited, smtp = false }: { invited: boolean; smtp?: boolean }) {
     const { default: prisma } = await import("@ws-model-proxy/db");
+    const revocationsBefore = revokeUserCredentials.mock.calls.length;
     const calls: string[] = [];
     const tx = {
       $queryRaw: vi.fn(async (strings: TemplateStringsArray, held: string[], wait: boolean) => {
@@ -229,6 +233,8 @@ describe("a finished password reset", () => {
     await passwordResetOptions(smtp, undefined).onPasswordReset({
       user: { id: "u1", email: "invitee@example.test" },
     });
+    expect(revokeUserCredentials).toHaveBeenLastCalledWith("u1");
+    expect(revokeUserCredentials).toHaveBeenCalledTimes(revocationsBefore + 1);
     expect(transaction).toHaveBeenCalledTimes(1);
     return calls;
   }
@@ -255,5 +261,25 @@ describe("a finished password reset", () => {
     // A link shown to the admin may have been spent: this callback cannot tell which.
     expect(await spend({ invited: true, smtp: true })).toEqual([lock, deleteLinks]);
     expect(await spend({ invited: false, smtp: true })).toEqual([lock, deleteLinks]);
+  });
+
+  it("propagates a credential revocation failure after completing invite setup", async () => {
+    const failure = new Error("revocation failed");
+    revokeUserCredentials.mockRejectedValueOnce(failure);
+    await expect(spend({ invited: true })).rejects.toBe(failure);
+    const { default: prisma } = await import("@ws-model-proxy/db");
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps invite finalization failures visible after revoking credentials", async () => {
+    const { default: prisma } = await import("@ws-model-proxy/db");
+    const failure = new Error("invite finalization failed");
+    Object.assign(prisma, { $transaction: vi.fn().mockRejectedValueOnce(failure) });
+    await expect(
+      passwordResetOptions(false, undefined).onPasswordReset({
+        user: { id: "u2", email: "invitee@example.test" },
+      }),
+    ).rejects.toBe(failure);
+    expect(revokeUserCredentials).toHaveBeenCalledExactlyOnceWith("u2");
   });
 });

@@ -13,6 +13,7 @@ import {
   agentScopeToDb,
   oauthScopeCeiling,
 } from "@ws-model-proxy/auth/agent-scopes";
+import { hasLiveCredentialSession } from "@ws-model-proxy/auth/credential-session";
 import {
   canonicalMcpResource,
   isMcpPatClientId,
@@ -200,6 +201,8 @@ const apiKeys = {
         : [];
     const owners = [userId, ...poolOwners.map((pool) => pool.userId)];
     const row = await runAccessTransaction({ owners }, async (tx) => {
+      if (!(await hasLiveCredentialSession(tx, userId, context.session.session.id)))
+        throw new ORPCError("UNAUTHORIZED");
       const active = await tx.apiKey.count({ where: { userId, ...activeWhere(now) } });
       if (active >= API_KEY_MAX_ACTIVE_PER_USER) {
         throw new ORPCError("CONFLICT", {
@@ -302,7 +305,9 @@ const agentTokens = {
     }
     const tokenId = newAgentTokenId();
     const secret = generateProductCredentialSecret("agentToken");
-    const row = await runSerializableTransaction(async (tx) => {
+    const row = await runAccessTransaction({ owners: [userId] }, async (tx) => {
+      if (!(await hasLiveCredentialSession(tx, userId, context.session.session.id)))
+        throw new ORPCError("UNAUTHORIZED");
       await validateAgentNodes(tx, userId, input.nodeIds);
       const active = await tx.agentToken.count({ where: { userId, ...activeWhere(now) } });
       if (active >= MCP_PAT_MAX_ACTIVE_PER_USER) {

@@ -140,6 +140,7 @@ export function mcpConsentLevel({ secret }: { secret: string }) {
             try {
               await recordConsentedMcpGrantAccess({
                 userId: session.user.id,
+                sessionId: session.session.id,
                 clientId,
                 referenceId,
                 scopes: access.scopes,
@@ -170,6 +171,7 @@ export function mcpConsentLevel({ secret }: { secret: string }) {
                     : typeof forgetError,
                 );
               }
+              if (error instanceof APIError && error.status === "UNAUTHORIZED") throw error;
               throw new APIError("INTERNAL_SERVER_ERROR", { error: "server_error" });
             }
           }),

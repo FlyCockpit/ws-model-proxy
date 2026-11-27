@@ -52,6 +52,14 @@ integration("OAuth grant levels on PostgreSQL with the schema hardening", () => 
       },
       select: { id: true, email: true, name: true },
     });
+    await modules.fixtures.session.create({
+      data: {
+        id: `s-${suffix}`,
+        userId: user.id,
+        token: `grant-session-${suffix}`,
+        expiresAt: new Date(Date.now() + 600_000),
+      },
+    });
   });
 
   afterAll(async () => {
@@ -91,6 +99,7 @@ integration("OAuth grant levels on PostgreSQL with the schema hardening", () => 
 
     // Consent: absent grant created at Full, audited as the person.
     const created = await modules.grantAccess.recordConsentedMcpGrantAccess({
+      sessionId: `s-${suffix}`,
       userId: user.id,
       clientId,
       referenceId,
@@ -105,6 +114,7 @@ integration("OAuth grant levels on PostgreSQL with the schema hardening", () => 
     const grantId = created?.grantId ?? "";
     // Re-approval at the same level writes nothing.
     await modules.grantAccess.recordConsentedMcpGrantAccess({
+      sessionId: `s-${suffix}`,
       userId: user.id,
       clientId,
       referenceId,
@@ -183,6 +193,7 @@ integration("OAuth grant levels on PostgreSQL with the schema hardening", () => 
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(
       await modules.grantAccess.recordConsentedMcpGrantAccess({
+        sessionId: `s-${suffix}`,
         userId: user.id,
         clientId,
         referenceId,
@@ -195,6 +206,7 @@ integration("OAuth grant levels on PostgreSQL with the schema hardening", () => 
     const raced = await Promise.all(
       ([["read"], ["read", "commands"]] as const).map((scopes) =>
         modules?.grantAccess.recordConsentedMcpGrantAccess({
+          sessionId: `s-${suffix}`,
           userId: user.id,
           clientId,
           referenceId: racingReference,

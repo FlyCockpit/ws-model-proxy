@@ -38,7 +38,7 @@
     "couldNotDisable": "Couldn't disable 2FA. Try again.",
     "disabledSuccess": "Two-factor authentication disabled",
     "changePasswordTitle": "Password",
-    "changePasswordDescription": "Change your password and sign out other active sessions.",
+    "changePasswordDescription": "Change your password and sign out other devices. This also revokes all API keys, agent tokens, and MCP/OAuth connections. Integrations using them will stop working; create new credentials and reconnect afterward.",
     "newPassword": "New password",
     "confirmNewPassword": "Confirm new password",
     "changePassword": "Change password",

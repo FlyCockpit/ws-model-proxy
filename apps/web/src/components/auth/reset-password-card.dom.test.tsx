@@ -19,10 +19,24 @@ import { afterEach, describe, expect, it, vi } from "vitest";
  */
 
 const resetPasswordMock = vi.hoisted(() => vi.fn());
+const copyLocale = vi.hoisted(() => ({ language: "en-US" as "en-US" | "es-MX" }));
 
-vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en-US" } }),
-}));
+vi.mock("react-i18next", async () => {
+  const en = (await import("../../locales/en-US/auth.json")).default;
+  const es = (await import("../../locales/es-MX/auth.json")).default;
+  return {
+    useTranslation: () => ({
+      t: (key: string) => {
+        const copy = (copyLocale.language === "en-US" ? en : es).resetPassword;
+        const field = key.replace("auth:resetPassword.", "");
+        return ["description", "retryableFailed", "retry", "invalidDescription"].includes(field)
+          ? copy[field as keyof typeof copy]
+          : key;
+      },
+      i18n: { language: copyLocale.language },
+    }),
+  };
+});
 vi.mock("@ws-model-proxy/ui/lib/toast", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
@@ -73,8 +87,35 @@ function setup(url: string) {
 describe("ResetPasswordCard under the real router", () => {
   afterEach(() => {
     cleanup();
+    copyLocale.language = "en-US";
     vi.clearAllMocks();
   });
+
+  it.each([
+    ["en-US", /agent tokens/, /will stop working/],
+    ["es-MX", /tokens de agente/, /dejarán de funcionar/],
+  ] as const)(
+    "warns about destroyed credentials before resetting in %s",
+    async (locale, agents, integrations) => {
+      copyLocale.language = locale;
+      setup(`/${locale}/reset-password?token=${TOKEN}`);
+      await screen.findByLabelText("auth:resetPassword.newPassword");
+      const warning = screen.getByText(integrations);
+      expect(warning.textContent).toMatch(/API/);
+      expect(warning.textContent).toMatch(/MCP\/OAuth/);
+      expect(warning.textContent).toMatch(agents);
+      expect(resetPasswordMock).not.toHaveBeenCalled();
+      const settings =
+        locale === "en-US"
+          ? await import("../../locales/en-US/settings.json")
+          : await import("../../locales/es-MX/settings.json");
+      const changeWarning = settings.default.security.changePasswordDescription;
+      expect(changeWarning).toMatch(/API/);
+      expect(changeWarning).toMatch(/MCP\/OAuth/);
+      expect(changeWarning).toMatch(agents);
+      expect(changeWarning).toMatch(integrations);
+    },
+  );
 
   it("keeps a valid link's form after the token leaves the address bar, and submits that token", async () => {
     const router = setup(`/en-US/reset-password?token=${TOKEN}`);
@@ -129,22 +170,76 @@ describe("ResetPasswordCard under the real router", () => {
     expect(screen.getByText("auth:resetPassword.requestNew")).toBeTruthy();
   });
 
-  it("switches to the invalid-link page when the server refuses the token", async () => {
-    setup(`/en-US/reset-password?token=${TOKEN}`);
-    resetPasswordMock.mockResolvedValueOnce({
-      data: null,
-      error: { status: 400, code: "INVALID_TOKEN", message: "Invalid token" },
-    });
-    const user = userEvent.setup();
-    await user.type(
-      await screen.findByLabelText("auth:resetPassword.newPassword"),
-      "new-password-1",
-    );
-    await user.type(screen.getByLabelText("auth:resetPassword.confirmPassword"), "new-password-1");
-    await user.click(screen.getByRole("button", { name: "auth:resetPassword.submit" }));
+  it.each([
+    [
+      "en-US",
+      "We couldn't finish securing your account. Your password hasn't changed. Try again.",
+      "Try again",
+    ],
+    [
+      "es-MX",
+      "No pudimos terminar de proteger tu cuenta. Tu contraseña no ha cambiado. Inténtalo de nuevo.",
+      "Intentar de nuevo",
+    ],
+  ] as const)(
+    "keeps the password and link for a retry after a pre-sweep 503 in %s",
+    async (locale, message, retry) => {
+      copyLocale.language = locale;
+      const router = setup(`/${locale}/reset-password?token=${TOKEN}`);
+      resetPasswordMock.mockResolvedValueOnce({
+        data: null,
+        error: { status: 503, message: "Service unavailable" },
+      });
+      const user = userEvent.setup();
+      const password = await screen.findByLabelText("auth:resetPassword.newPassword");
+      const confirmation = screen.getByLabelText("auth:resetPassword.confirmPassword");
+      await user.type(password, "new-password-1");
+      await user.type(confirmation, "new-password-1");
+      await user.click(screen.getByRole("button", { name: "auth:resetPassword.submit" }));
 
-    expect(await screen.findByText("auth:resetPassword.invalidTitle")).toBeTruthy();
-  });
+      expect((await screen.findByRole("alert")).textContent).toBe(message);
+      expect((password as HTMLInputElement).value).toBe("new-password-1");
+      expect((confirmation as HTMLInputElement).value).toBe("new-password-1");
+      expect(screen.queryByText("auth:resetPassword.invalidTitle")).toBeNull();
+      expect(window.location.search).not.toContain("token");
+      resetPasswordMock.mockResolvedValueOnce({ data: { status: true }, error: null });
+      await user.click(screen.getByRole("button", { name: retry }));
+      await waitFor(() => expect(router.state.location.pathname).toBe(`/${locale}/login`));
+      expect(resetPasswordMock).toHaveBeenCalledTimes(2);
+      expect(resetPasswordMock).toHaveBeenNthCalledWith(2, {
+        newPassword: "new-password-1",
+        token: TOKEN,
+      });
+    },
+  );
+
+  it.each(["en-US", "es-MX"] as const)(
+    "switches to the invalid-link page when the server refuses the token in %s",
+    async (locale) => {
+      copyLocale.language = locale;
+      setup(`/${locale}/reset-password?token=${TOKEN}`);
+      resetPasswordMock.mockResolvedValueOnce({
+        data: null,
+        error: { status: 400, code: "INVALID_TOKEN", message: "Invalid token" },
+      });
+      const user = userEvent.setup();
+      await user.type(
+        await screen.findByLabelText("auth:resetPassword.newPassword"),
+        "new-password-1",
+      );
+      await user.type(
+        screen.getByLabelText("auth:resetPassword.confirmPassword"),
+        "new-password-1",
+      );
+      await user.click(screen.getByRole("button", { name: "auth:resetPassword.submit" }));
+
+      expect(await screen.findByText("auth:resetPassword.invalidTitle")).toBeTruthy();
+      const copy = (await import(`../../locales/${locale}/auth.json`)).default.resetPassword;
+      expect(screen.getByText(copy.invalidDescription)).toBeTruthy();
+      expect(screen.queryByLabelText("auth:resetPassword.newPassword")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+    },
+  );
 });
 
 describe("reset and invite visible headings", () => {

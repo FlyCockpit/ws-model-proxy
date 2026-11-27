@@ -1,6 +1,9 @@
 /** Grant access is shared by OAuth and personal tokens; only a person changes it. */
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { fenceOwners, runCapacityOrderedTransaction } from "@ws-model-proxy/db/capacity-lock-order";
+import { APIError } from "better-auth/api";
 import { type AgentAccess, accessNarrowed, agentScopeFromDb, agentScopeToDb } from "./agent-scopes";
+import { hasLiveCredentialSession } from "./credential-session";
 
 export const MCP_GRANT_ACCESS_AUDIT = {
   consent: "mcp_grant.consent",
@@ -28,7 +31,7 @@ export async function readMcpGrantAccess(
   });
   return row ? mcpGrantAccessOf(row) : null;
 }
-/** This check runs in the same serializable transaction as the access write. */
+/** This check runs in the same transaction as the access write. */
 export async function assertOwnedAgentNodes(
   tx: Prisma.TransactionClient,
   userId: string,
@@ -163,6 +166,7 @@ export async function notifyMcpGrantAccessNarrowed(event: AgentAccessNarrowedEve
 }
 export async function recordConsentedMcpGrantAccess(input: {
   userId: string;
+  sessionId: string;
   clientId: string;
   referenceId: string;
   scopes: AgentAccess["scopes"];
@@ -171,8 +175,12 @@ export async function recordConsentedMcpGrantAccess(input: {
   const access: AgentAccess = { scopes: input.scopes, nodeIds: input.nodeIds };
   if (!access.scopes.includes("read")) throw new Error("Agent access requires read.");
   const attempt = () =>
-    prisma.$transaction(
+    runCapacityOrderedTransaction(
+      prisma,
       async (tx): Promise<McpGrantAccessChange | "tombstone" | "conflict"> => {
+        await fenceOwners(tx, [input.userId]);
+        if (!(await hasLiveCredentialSession(tx, input.userId, input.sessionId)))
+          throw new APIError("UNAUTHORIZED", { message: "A live session is required." });
         await assertOwnedAgentNodes(tx, input.userId, access.nodeIds);
         const inserted = await tx.mcpGrant.createMany({
           data: [
@@ -226,23 +234,9 @@ export async function recordConsentedMcpGrantAccess(input: {
           })) ?? "conflict"
         );
       },
-      { isolationLevel: "Serializable" },
     );
   for (let attemptNo = 0; attemptNo < 3; attemptNo++) {
-    let result: Awaited<ReturnType<typeof attempt>>;
-    try {
-      result = await attempt();
-    } catch (error) {
-      if (
-        attemptNo < 2 &&
-        typeof error === "object" &&
-        error !== null &&
-        "code" in error &&
-        error.code === "P2034"
-      )
-        continue;
-      throw error;
-    }
+    const result = await attempt();
     if (result === "conflict") continue;
     if (result === "tombstone") return null;
     if (result.narrowed && result.before)

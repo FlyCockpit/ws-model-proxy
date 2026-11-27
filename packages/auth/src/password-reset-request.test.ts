@@ -3,6 +3,7 @@ import { memoryAdapter } from "better-auth/adapters/memory";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const sendEmail = vi.hoisted(() => vi.fn(async (_mail: { to: string; html: string }) => {}));
+vi.mock("./credential-revocation", () => ({ revokeUserCredentials: vi.fn(async () => {}) }));
 
 // The reset mail looks up the recipient's locale through the shared Prisma client.
 vi.mock("@ws-model-proxy/db", () => {

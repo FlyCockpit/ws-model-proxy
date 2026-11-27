@@ -3,6 +3,9 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./credential-session": {
+      "default": "./src/credential-session.ts"
+    },
     ".": {
       "default": "./src/index.ts"
     },

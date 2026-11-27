@@ -425,6 +425,22 @@ tuning comments, or `--out <file>` to write a gitignored file.
 Email is optional: without SMTP, signup/login work and verification is off.
 With SMTP configured, email verification is required and verification mail,
 password-reset mail (when used), and email 2FA OTP are available.
+Password reset first revokes every session and all model API keys, agent tokens, and
+MCP/OAuth grants and tokens together under the user's credential lock, then replaces the
+password and repeats the credential sweep. Both sweeps also delete pending two-factor sign-in
+challenges, their OTP and attempt records, and trusted-device records. Revoked sessions stop
+working on their next request.
+Changing a password with “sign out other devices” revokes
+the same credentials while keeping the new current session. Machine enrollments and credentials
+remain unchanged pending an owner decision.
+
+Requests already authenticated and in flight when a reset commits can finish afterward: a
+password sign-in verifying the old hash, a change-password request that already verified the old
+password, an admin impersonation request, or a token refresh. Better Auth core verifies before
+it writes, without a password-generation check. The proposed follow-up is a password-generation
+check under the credential lock at session insertion and password writes. Change-password's
+credential sweep runs after the password commits (as in the template); a failure there is logged
+SECURITY and rethrown.
 
 Useful checks:
 

@@ -37,7 +37,7 @@
     "disabledSuccess": "Autenticación de dos factores deshabilitada",
     "scanQrPrompt": "Escanea esto con tu aplicación de autenticación",
     "changePasswordTitle": "Contraseña",
-    "changePasswordDescription": "Cambia tu contraseña y cierra otras sesiones activas.",
+    "changePasswordDescription": "Cambia tu contraseña y cierra las sesiones en otros dispositivos. También se revocarán todas las claves de API, los tokens de agente y las conexiones MCP/OAuth. Las integraciones que los usan dejarán de funcionar; después tendrás que crear credenciales nuevas y volver a conectarlas.",
     "newPassword": "Nueva contraseña",
     "confirmNewPassword": "Confirmar nueva contraseña",
     "changePassword": "Cambiar contraseña",

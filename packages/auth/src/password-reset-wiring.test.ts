@@ -59,6 +59,8 @@ describe("password reset wiring", { timeout: 60_000 }, () => {
     const options = auth.options.emailAndPassword;
     expect(options?.sendResetPassword).toBeUndefined();
     expect(options?.revokeSessionsOnPasswordReset).toBe(true);
+    expect(auth.options.session).not.toHaveProperty("cookieCache.enabled", true);
+    expect(auth.options).not.toHaveProperty("secondaryStorage");
 
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const response = await auth.handler(

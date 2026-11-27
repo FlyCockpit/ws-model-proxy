@@ -8,8 +8,14 @@ const mcpGrantTable = vi.hoisted(() => ({
   create: vi.fn(),
 }));
 
+const tx = vi.hoisted(() => ({
+  mcpGrant: mcpGrantTable,
+  $executeRaw: vi.fn(async () => 1),
+  $queryRaw: vi.fn(async () => [{ acquired: true }]),
+  session: { findFirst: vi.fn(async (): Promise<{ id: string } | null> => ({ id: "session_1" })) },
+}));
 vi.mock("@ws-model-proxy/db", () => ({
-  default: { mcpGrant: mcpGrantTable },
+  default: { ...tx, $transaction: (work: (client: typeof tx) => Promise<unknown>) => work(tx) },
 }));
 
 // mcp-grant reads no env at module load (the secret is always an explicit
@@ -56,6 +62,7 @@ function grantRow(overrides: Partial<{ id: string; revokedAt: Date | null }> = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  tx.session.findFirst.mockResolvedValue({ id: SESSION });
 });
 
 describe("deriveMcpConsentReferenceId", () => {
@@ -198,6 +205,30 @@ describe("issueMcpGrantClaims (Prisma-backed)", () => {
     sessionId: SESSION,
     secret: SECRET,
   };
+
+  it("refuses authorization-code grant creation after its authorizing session was deleted", async () => {
+    tx.session.findFirst.mockResolvedValueOnce(null);
+    mcpGrantTable.findUnique.mockResolvedValue(null);
+    mcpGrantTable.create.mockResolvedValue(grantRow());
+    await expect(issueMcpGrantClaims(codeInput)).rejects.toMatchObject({ status: "UNAUTHORIZED" });
+    expect(mcpGrantTable.create).not.toHaveBeenCalled();
+    expect(tx.session.findFirst).toHaveBeenCalledWith({
+      where: { id: SESSION, userId: USER, expiresAt: { gt: expect.any(Date) } },
+      select: { id: true },
+    });
+  });
+
+  it("rechecks an authorization-code session after waiting for the revocation fence", async () => {
+    mcpGrantTable.findUnique.mockResolvedValue(null);
+    mcpGrantTable.create.mockResolvedValue(grantRow());
+    tx.$queryRaw.mockImplementationOnce(async () => {
+      tx.session.findFirst.mockResolvedValueOnce(null);
+      return [{ acquired: true }];
+    });
+    await expect(issueMcpGrantClaims(codeInput)).rejects.toMatchObject({ status: "UNAUTHORIZED" });
+    expect(mcpGrantTable.create).not.toHaveBeenCalled();
+    expect(tx.$queryRaw.mock.calls[0]?.slice(1)).toEqual([[`00:owner:${USER}`], true]);
+  });
 
   it("creates the grant when absent and stamps mcp_grant_id; create data never touches revokedAt", async () => {
     mcpGrantTable.findUnique.mockResolvedValue(null);
