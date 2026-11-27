@@ -1,8 +1,40 @@
+import {
+  TRANSCRIPTION_MAX_MULTIPART_BYTES_DEFAULT,
+  TRANSCRIPTION_MAX_UPLOAD_BYTES_DEFAULT,
+} from "@ws-model-proxy/env/transcription-limits";
 import { Hono } from "hono";
 import { describe, expect, it, vi } from "vitest";
 import { transcriptionContentLengthGuard } from "./transcription-body-guard.js";
 
 describe("transcription content-length guard", () => {
+  it.each([-1, 0, 1])("enforces the default request boundary at offset %i", async (offset) => {
+    const app = new Hono();
+    const route = vi.fn(() => new Response("accepted"));
+    app.use(
+      "/upload",
+      transcriptionContentLengthGuard({
+        maxMultipartBytes: TRANSCRIPTION_MAX_MULTIPART_BYTES_DEFAULT,
+        maxFileBytes: TRANSCRIPTION_MAX_UPLOAD_BYTES_DEFAULT,
+      }),
+    );
+    app.post("/upload", route);
+    const response = await app.request("/upload", {
+      method: "POST",
+      headers: { "content-length": String(TRANSCRIPTION_MAX_MULTIPART_BYTES_DEFAULT + offset) },
+    });
+    expect(TRANSCRIPTION_MAX_MULTIPART_BYTES_DEFAULT + offset).toBeLessThan(100_000_000);
+    expect(response.status).toBe(offset > 0 ? 413 : 200);
+    expect(route).toHaveBeenCalledTimes(offset > 0 ? 0 : 1);
+    if (offset > 0) {
+      await expect(response.json()).resolves.toMatchObject({
+        error: {
+          code: "request_too_large",
+          message: expect.stringContaining("Split or compress the audio"),
+        },
+      });
+    }
+  });
+
   it("does not consume a chunked body before the route reads it incrementally", async () => {
     const app = new Hono();
     const observed: number[] = [];

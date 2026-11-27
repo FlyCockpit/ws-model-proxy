@@ -85,18 +85,21 @@ describe("multipart ingress adversarial matrix", () => {
     }
   });
 
-  it("accepts a file exactly at the configured streaming limit", async () => {
-    const form = new FormData();
-    form.set("model", "m");
-    form.set("file", new File([new Uint8Array(1024)], "voice.wav"));
-    const request = new Request("https://proxy.test/v1/audio/transcriptions", {
-      method: "POST",
-      body: form,
-    });
-    const parsed = await parseMultipartToSpool(request, request.headers.get("content-type")!);
-    disposables.push(parsed);
-    expect(parsed.parts.find((part) => part.kind === "file")?.size).toBe(1024);
-  });
+  it.each([1023, 1024])(
+    "accepts a %i-byte file at or just under the streaming limit",
+    async (size) => {
+      const form = new FormData();
+      form.set("model", "m");
+      form.set("file", new File([new Uint8Array(size)], "voice.wav"));
+      const request = new Request("https://proxy.test/v1/audio/transcriptions", {
+        method: "POST",
+        body: form,
+      });
+      const parsed = await parseMultipartToSpool(request, request.headers.get("content-type")!);
+      disposables.push(parsed);
+      expect(parsed.parts.find((part) => part.kind === "file")?.size).toBe(size);
+    },
+  );
 
   it("accepts a quoted boundary parameter", async () => {
     const body = multipartBody("quoted-boundary", "m");

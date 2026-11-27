@@ -208,6 +208,12 @@ Cloudflare limits that matter to this app:
   tunnel, or uploads between the two get the edge's HTML 413 instead of the server's answer. Split longer audio (OpenAI's own API takes
   25 MB per file, so OpenAI clients already do). Other bodies are smaller: model API JSON 32 MiB,
   `/v1/files` 25 MiB by default (`MEDIA_MAX_UPLOAD_BYTES`).
+  The default multipart ceiling is derived from the file ceiling plus 1 MiB for fields and
+  framing: 94,371,840 file bytes / 95,420,416 request bytes. Both environment overrides remain
+  independent; when overriding them, allow overhead above the file cap and keep the whole
+  request below the proxy's limit. The dashboard's **Test** page has a separate, smaller
+  9.5 MiB file pre-check to fit its session route's 10 MiB request limit. The CLI relay has no
+  separate deployment upload cap; server admission and optional runtime/model limits apply.
 - **524 after about 100 s without a response byte.** Slow model API answers are kept alive after
   30 s (see [Slow answers and the keepalive](#slow-answers-and-the-keepalive)). Text, `srt` and
   `vtt` transcriptions, streaming transcriptions and `/v1/audio/speech` are not, so use a JSON

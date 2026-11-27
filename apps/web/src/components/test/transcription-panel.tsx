@@ -13,7 +13,7 @@ import { LiveTranscriptionPanel } from "@/components/test/live-transcription-pan
 import { TestErrorNotice } from "@/components/test/test-error";
 import { sendTestTranscription, type TestTarget, testErrorOf } from "@/lib/test-relay";
 
-/** The session Test routes take at most 10 MB per request (the server's global body limit). */
+/** The session Test routes take at most 10 MiB per request (the server's global body limit). */
 const MAX_FILE_BYTES = 9.5 * 1024 * 1024;
 
 /**
@@ -41,7 +41,9 @@ export function TranscriptionPanel({ target }: { target: TestTarget }) {
           .refine((file) => file !== null, t("dashboard:test.transcription.fileRequired"))
           .refine(
             (file) => file === null || file.size <= MAX_FILE_BYTES,
-            t("dashboard:test.transcription.fileTooLarge"),
+            t("dashboard:test.transcription.fileTooLarge", {
+              maxMiB: MAX_FILE_BYTES / (1024 * 1024),
+            }),
           ),
         language: z
           .string()

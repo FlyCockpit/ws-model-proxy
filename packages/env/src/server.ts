@@ -3,6 +3,10 @@ import { z } from "zod";
 import { EnvConfigError } from "./config-error.js";
 import { mcpOriginProblem } from "./mcp-origin.js";
 import { env as sharedEnv, strictBooleanFlag } from "./shared.js";
+import {
+  TRANSCRIPTION_MAX_MULTIPART_BYTES_DEFAULT,
+  TRANSCRIPTION_MAX_UPLOAD_BYTES_DEFAULT,
+} from "./transcription-limits.js";
 import { originUrl } from "./url.js";
 
 // ---------------------------------------------------------------------------
@@ -109,13 +113,13 @@ export const env = createEnv({
       .int()
       .positive()
       .max(1024 * 1024 * 1024)
-      .default(90 * 1024 * 1024),
+      .default(TRANSCRIPTION_MAX_UPLOAD_BYTES_DEFAULT),
     MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: z.coerce
       .number()
       .int()
       .positive()
       .max(1025 * 1024 * 1024)
-      .default(91 * 1024 * 1024),
+      .default(TRANSCRIPTION_MAX_MULTIPART_BYTES_DEFAULT),
     MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES: z.coerce
       .number()
       .int()

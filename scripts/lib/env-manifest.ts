@@ -15,6 +15,11 @@
  * VAPID/push variables.
  */
 
+import {
+  TRANSCRIPTION_MAX_MULTIPART_BYTES_DEFAULT,
+  TRANSCRIPTION_MAX_UPLOAD_BYTES_DEFAULT,
+} from "@ws-model-proxy/env/transcription-limits";
+
 // ---------------------------------------------------------------------------
 // Deploy targets
 // ---------------------------------------------------------------------------
@@ -316,9 +321,9 @@ export const ENV_VARS: EnvVar[] = [
     key: "MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES",
     group: "runtime",
     source: "default",
-    default: "94371840",
+    default: String(TRANSCRIPTION_MAX_UPLOAD_BYTES_DEFAULT),
     comment: [
-      "Deployment ceiling for one transcription/translation audio file (90 MiB); the admin",
+      `Deployment ceiling for one transcription/translation audio file (${TRANSCRIPTION_MAX_UPLOAD_BYTES_DEFAULT / (1024 * 1024)} MiB); the admin`,
       "attachment limit (25 MiB by default) and pool/model limits can only narrow it.",
       "The defaults keep the whole request under the 100 MB body cap of Cloudflare's",
       "Free and Pro plans; raise both caps only when no such proxy sits in front.",
@@ -328,9 +333,10 @@ export const ENV_VARS: EnvVar[] = [
     key: "MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES",
     group: "runtime",
     source: "default",
-    default: "95420416",
+    default: String(TRANSCRIPTION_MAX_MULTIPART_BYTES_DEFAULT),
     comment: [
       "Raw multipart cap including file data, fields, boundaries, and headers; immutable hard cap 1074790400.",
+      `Default: the file cap plus 1 MiB of overhead (${TRANSCRIPTION_MAX_MULTIPART_BYTES_DEFAULT / (1024 * 1024)} MiB total, ${TRANSCRIPTION_MAX_MULTIPART_BYTES_DEFAULT} bytes).`,
     ],
   },
   {

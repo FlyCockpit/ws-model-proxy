@@ -26,7 +26,11 @@ vi.mock("@tanstack/react-router", () => ({
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
     t: (key: string, opts?: Record<string, unknown>) =>
-      opts && "count" in opts ? `${key}:${String(opts.count)}` : key,
+      opts && "count" in opts
+        ? `${key}:${String(opts.count)}`
+        : opts && "maxMiB" in opts
+          ? `${key}:${String(opts.maxMiB)}`
+          : key,
     i18n: { language: "en-US" },
   }),
 }));
@@ -323,6 +327,37 @@ describe("Test page", () => {
     expect(form.get("model")).toBe("me/stt");
     expect((form.get("file") as File).name).toBe("clip.wav");
   });
+
+  it.each([-1, 0, 1])(
+    "checks the Test file boundary at offset %i before uploading",
+    async (offset) => {
+      state.targets = [
+        target({ model: "me/stt", label: "me/stt", type: "TRANSCRIPTION", surfaces: [] }),
+      ];
+      fetchMock.mockResolvedValue(
+        new Response(JSON.stringify({ text: "boundary accepted" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+      renderPage();
+      const input = await screen.findByLabelText("dashboard:test.transcription.file");
+      const file = new File(["RIFF"], "boundary.wav", { type: "audio/wav" });
+      // Only the pre-check needs a large size; do not allocate a large audio fixture.
+      Object.defineProperty(file, "size", { value: 9.5 * 1024 * 1024 + offset });
+      fireEvent.change(input, { target: { files: [file] } });
+      fireEvent.click(screen.getByRole("button", { name: "dashboard:test.transcription.send" }));
+      if (offset > 0) {
+        expect(
+          await screen.findByText("dashboard:test.transcription.fileTooLarge:9.5"),
+        ).toBeTruthy();
+        expect(fetchMock).not.toHaveBeenCalled();
+      } else {
+        expect(await screen.findByText("boundary accepted")).toBeTruthy();
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      }
+    },
+  );
 
   it("asks for a file before transcribing and explains when live is unavailable", async () => {
     state.targets = [

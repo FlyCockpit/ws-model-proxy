@@ -10,6 +10,7 @@
     "./load-dotenv": "./src/load-dotenv.ts",
     "./root-dotenv": "./src/root-dotenv.ts",
     "./config-error": "./src/config-error.ts",
+    "./transcription-limits": "./src/transcription-limits.ts",
     "./mcp-origin": "./src/mcp-origin.ts"
   },
   "dependencies": {

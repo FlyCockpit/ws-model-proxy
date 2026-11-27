@@ -2735,7 +2735,7 @@
     },
     "transcription": {
       "fileRequired": "Choose an audio file.",
-      "fileTooLarge": "Test files can be at most 9.5 MB.",
+      "fileTooLarge": "Test files can be at most {{maxMiB}} MiB. Split or compress the audio and try again.",
       "badLanguage": "Use a language code like en or es-MX.",
       "file": "Audio file",
       "language": "Language (optional)",

@@ -2735,7 +2735,7 @@
     },
     "transcription": {
       "fileRequired": "Elige un archivo de audio.",
-      "fileTooLarge": "Los archivos de prueba pueden pesar como máximo 9.5 MB.",
+      "fileTooLarge": "Los archivos de prueba pueden pesar como máximo {{maxMiB}} MiB. Divide o comprime el audio e inténtalo de nuevo.",
       "badLanguage": "Usa un código de idioma como en o es-MX.",
       "file": "Archivo de audio",
       "language": "Idioma (opcional)",
