@@ -14,7 +14,10 @@ vi.mock("@prisma/adapter-pg", () => ({
 }));
 vi.mock("../prisma/generated/client", () => ({ PrismaClient: class {} }));
 vi.mock("@ws-model-proxy/env/shared", () => ({
-  env: { DATABASE_URL: "postgresql://localhost/test?options=-c%20TimeZone=Asia%2FTokyo" },
+  env: {
+    DATABASE_POOL_MAX: 10,
+    DATABASE_URL: "postgresql://localhost/test?options=-c%20TimeZone=Asia%2FTokyo",
+  },
 }));
 
 // index.ts constructs the shared client through the same factory. No socket

@@ -21,7 +21,7 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep(), Prisma: actual.Prisma };
 });
 vi.mock("@ws-model-proxy/env/shared", () => ({
-  env: { DATABASE_URL: "postgresql://usage-rollup-test", NODE_ENV: "test" },
+  env: { DATABASE_URL: "postgresql://usage-rollup-test", NODE_ENV: "test", DATABASE_POOL_MAX: 3 },
 }));
 
 const startedAt = new Date("2026-09-24T10:15:00.000Z");

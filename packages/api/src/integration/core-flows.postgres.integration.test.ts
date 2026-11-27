@@ -82,6 +82,14 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
       },
       select: { id: true, email: true, name: true },
     });
+    await modules.fixtures.session.create({
+      data: {
+        id: `s-${suffix}`,
+        token: `core-session-${suffix}`,
+        userId: user.id,
+        expiresAt: new Date(Date.now() + 600_000),
+      },
+    });
   });
 
   afterAll(async () => {

@@ -7,7 +7,11 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep(), Prisma: actual.Prisma };
 });
 vi.mock("@ws-model-proxy/env/shared", () => ({
-  env: { DATABASE_URL: "postgresql://usage-retention-test", NODE_ENV: "test" },
+  env: {
+    DATABASE_URL: "postgresql://usage-retention-test",
+    NODE_ENV: "test",
+    DATABASE_POOL_MAX: 3,
+  },
 }));
 // The hot-path history sweeps have their own PostgreSQL suites; here only
 // their wiring into the retention run is under test.

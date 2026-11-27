@@ -29,7 +29,17 @@ vi.mock("@ws-model-proxy/db", () => {
     const [[key, value] = []] = Object.entries(where);
     return memory.tables.user?.find((row) => key !== undefined && row[key] === value) ?? null;
   };
-  return { default: { user: { findUnique } } };
+  return {
+    default: {
+      user: { findUnique },
+      account: {
+        findFirst: async ({ where }: { where: Record<string, unknown> }) =>
+          memory.tables.account?.find((row) =>
+            Object.entries(where).every(([key, value]) => row[key] === value),
+          ) ?? null,
+      },
+    },
+  };
 });
 
 const emailConfigured = vi.hoisted(() => ({ value: true }));
@@ -68,10 +78,12 @@ async function postgresLikeMemoryAdapter() {
     typeof value === "object" &&
     value !== null &&
     Object.values(value).some((field) => typeof field === "string" && field.includes("\u0000"));
-  // Also wraps the adapter a transaction callback receives: sign-up writes through it.
-  const refusingNul = <A extends object>(adapter: A): A =>
-    new Proxy(adapter, {
+  // Like the production Prisma adapter, writes commit individually. The
+  // fingerprint's Prisma view must see the credential before the session mint.
+  const refusingNul = <A extends object>(adapter: A): A => {
+    const wrapped = new Proxy(adapter, {
       get(target, key, receiver) {
+        if (key === "transaction") return (work: (trx: A) => unknown) => work(wrapped);
         const value = Reflect.get(target, key, receiver);
         if (typeof value !== "function") return value;
         return (...args: unknown[]) => {
@@ -85,13 +97,12 @@ async function postgresLikeMemoryAdapter() {
               return Promise.reject(new Error("the database refused the insert"));
             }
           }
-          if (key === "transaction" && typeof first === "function") {
-            args[0] = (trx: object) => first(refusingNul(trx));
-          }
           return Reflect.apply(value, target, args);
         };
       },
     });
+    return wrapped;
+  };
   return ((options: Parameters<typeof memoryFactory>[0]) =>
     refusingNul(memoryFactory(options))) as typeof memoryFactory;
 }

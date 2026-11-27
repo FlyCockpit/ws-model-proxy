@@ -24,6 +24,7 @@ import {
 import { isEmailConfigured, renderInviteUser, sendEmail } from "@ws-model-proxy/mailer";
 import { contractProcedure } from "../contract-procedure";
 import { usersContract as c } from "../contracts/account";
+import { adminMailBudget } from "../lib/admin-mail-budget";
 import {
   assertAdminRemovalAllowed,
   throwUserChangeError,
@@ -254,7 +255,8 @@ export const usersRouter = {
     };
   }),
 
-  invite: contractProcedure(c.invite).handler(async ({ input }) => {
+  invite: contractProcedure(c.invite).handler(async ({ input, context }) => {
+    adminMailBudget.charge(context.session.user.id);
     const unusablePassword = generateUnusablePassword();
     const createUserBody = {
       email: input.email,
@@ -323,7 +325,8 @@ export const usersRouter = {
     });
   }),
 
-  resendInvite: contractProcedure(c.resendInvite).handler(async ({ input }) => {
+  resendInvite: contractProcedure(c.resendInvite).handler(async ({ input, context }) => {
+    adminMailBudget.charge(context.session.user.id, input.userId);
     const target = await prisma.user.findUnique({
       where: { id: input.userId },
       select: {

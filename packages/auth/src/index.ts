@@ -24,6 +24,7 @@ import { admin, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { afterUserUpdate, noteVerificationWrite } from "./account-activation";
 import { getAdminInviteLocale } from "./admin-invite-locale";
+import { finishAdminPasswordReset, secureAdminPasswordReset } from "./admin-password-reset";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { passwordChangeRevocationTarget, revokeUserCredentials } from "./credential-revocation";
@@ -44,6 +45,17 @@ import {
   spentResetToken,
   verifyEmailIfResetLinkWasMailed,
 } from "./password-reset-links";
+import {
+  fencePasswordSessionAfter,
+  fencePasswordSessionBefore,
+  recordSignUpCredential,
+  recordTwoFactorChallenge,
+} from "./password-sign-in-fence";
+import {
+  confirmPasswordWriteLocked,
+  guardPasswordAccountCreate,
+  guardPasswordAccountUpdate,
+} from "./password-write-lock";
 import { recordProvedEmail } from "./proved-email";
 import { notifySessionEnded, sessionEndCause } from "./session-ended-listeners";
 import {
@@ -311,6 +323,11 @@ export const auth = betterAuth({
     prisma,
     {
       provider: "postgresql",
+      // Keep Better Auth's default adapter transactions off. Verification mail is
+      // scheduled independently and reads the user's locale through the shared
+      // client, which cannot see a still-uncommitted sign-up row. SMTP also has
+      // bounded connection, greeting and socket waits with retries; it is not a
+      // suitable part of an interactive database transaction.
     },
   ),
 
@@ -531,7 +548,8 @@ export const auth = betterAuth({
         body: ctx.body,
         returned: ctx.context.returned,
       });
-      if (userId) await revokeUserCredentials(userId);
+      if (userId)
+        await revokeUserCredentials(userId.userId, { keepSessionToken: userId.keepSessionToken });
       await releaseClaimOfFailedSignUp(ctx);
       return neutralizeSignUpResponse(ctx, { requireEmailVerification: emailConfigured });
     }),
@@ -545,8 +563,12 @@ export const auth = betterAuth({
       // A pending deletion refuses every new session whatever the ban fields
       // hold (./user-deletion-access-guard.ts).
       create: {
-        before: async (session) => {
+        before: async (session, context) => {
           await refuseSessionForDeletingUser(session);
+          await fencePasswordSessionBefore(session, context);
+        },
+        after: async (session, context) => {
+          await fencePasswordSessionAfter(session, context);
         },
       },
       delete: {
@@ -564,7 +586,35 @@ export const auth = betterAuth({
         },
       },
     },
+    verification: {
+      create: {
+        after: async (verification) => {
+          await recordTwoFactorChallenge(verification);
+        },
+      },
+    },
     account: {
+      create: {
+        before: async (account, context) => {
+          guardPasswordAccountCreate(account, context);
+          recordSignUpCredential(account, context);
+          if (account.password) await secureAdminPasswordReset(context, account.userId);
+        },
+        after: async (_account, context) => {
+          await confirmPasswordWriteLocked({ hash: passwordPepper.hash });
+          await finishAdminPasswordReset(context);
+        },
+      },
+      update: {
+        before: async (data, context) => {
+          guardPasswordAccountUpdate(data);
+          if (data.password !== undefined) await secureAdminPasswordReset(context);
+        },
+        after: async (_account, context) => {
+          await confirmPasswordWriteLocked({ hash: passwordPepper.hash });
+          await finishAdminPasswordReset(context);
+        },
+      },
       delete: {
         before: async (account, context) => {
           await refuseUndeletableUserBeforeCredentialDelete(account, context);

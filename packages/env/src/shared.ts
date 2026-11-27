@@ -23,6 +23,7 @@ export const strictBooleanFlag = (defaultValue: boolean = false) =>
 export const env = createEnv({
   server: {
     DATABASE_URL: z.string().min(1),
+    DATABASE_POOL_MAX: z.coerce.number().int().min(3).default(10),
     NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
     // ---- Translation provider (optional). Kept for locale-bundle translation
     // tooling. The validator keeps both API keys optional so the rest of the

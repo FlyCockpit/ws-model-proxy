@@ -127,7 +127,7 @@ describe("user deletion listeners", () => {
       expiresAt: new Date(Date.now() + 3_600_000),
       token: "token",
     };
-    await expect(before?.(sessionRow)).rejects.toMatchObject({
+    await expect(before?.(sessionRow, null)).rejects.toMatchObject({
       status: "FORBIDDEN",
     });
     expect(refuse).toHaveBeenCalledWith(sessionRow);

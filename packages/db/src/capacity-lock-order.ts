@@ -196,8 +196,10 @@
  *   of the code's user first, then that user's row FOR SHARE: the same order as every
  *   M writer.
  */
+
 import type { PrismaClient } from "../prisma/generated/client";
 import { Prisma } from "../prisma/generated/client";
+import { withLockSlot } from "./lock-slots";
 import {
   type DeletedParents,
   ParentDeletionOwnerRequiredError,
@@ -816,12 +818,14 @@ export async function runCapacityOrderedTransaction<T>(
 ): Promise<T> {
   for (let attempt = 1; ; attempt += 1) {
     try {
-      return await db.$transaction(
-        async (tx) => {
-          await tx.$executeRaw`SELECT set_config('lock_timeout', ${`${CAPACITY_ORDERED_LOCK_TIMEOUT_MS}ms`}, true), set_config('statement_timeout', ${`${CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS}ms`}, true)`;
-          return work(tx);
-        },
-        { isolationLevel: "ReadCommitted", timeout: 15_000 },
+      return await withLockSlot(() =>
+        db.$transaction(
+          async (tx) => {
+            await tx.$executeRaw`SELECT set_config('lock_timeout', ${`${CAPACITY_ORDERED_LOCK_TIMEOUT_MS}ms`}, true), set_config('statement_timeout', ${`${CAPACITY_ORDERED_STATEMENT_TIMEOUT_MS}ms`}, true)`;
+            return work(tx);
+          },
+          { isolationLevel: "ReadCommitted", timeout: 15_000 },
+        ),
       );
     } catch (error) {
       const timeout = serverTimeoutSqlState(error);

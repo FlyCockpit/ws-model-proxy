@@ -67,6 +67,8 @@ function productionSources(): Array<{ file: string; source: string }> {
 
 /** Files allowed to name an advisory-lock function, and why. */
 const ADVISORY_SITES: Record<string, string> = {
+  "packages/auth/src/password-write-lock.ts":
+    "Standalone password-write lock taken before the handler, hence before every nested owner/setup fence; no owner holder waits for this outer lock. Account hooks only assert/probe the already-held lock. Shared slots reserve one nested owner transaction before checkout.",
   "packages/auth/src/password-pepper-store.ts":
     "Startup sync before the listener and owner-run one-shot recovery each take the transaction-scoped pepper lock first in their own transaction, then touch only account passwords; neither holds nor later takes capacity fences. hashtext is promoted to bigint, so a collision with a hashtextextended capacity fence is possible, but creates no lock-order cycle.",
   "packages/db/src/capacity-lock-order.ts":
@@ -572,4 +574,16 @@ describe("capacity lock order (DL-1 design (d)): writer classes and fences", () 
     ).toEqual([".update("]);
     expect(tail).toContain("tx.providerCredential.update(");
   });
+});
+
+it("password-write is standalone and acquired before the handler can enter any owner fence", () => {
+  const source = readFileSync(join(repoRoot, "packages/auth/src/password-write-lock.ts"), "utf8");
+  expect(source).not.toMatch(/import[^;]*(?:fenceOwners|acquireFences|lockCredentialSetup)/s);
+  const transaction = source.indexOf("return await prisma.$transaction(");
+  const acquire = source.indexOf("pg_try_advisory_xact_lock", transaction);
+  const handler = source.indexOf("heldFor.run(lock, run)", acquire);
+  expect(transaction).toBeGreaterThan(0);
+  expect(acquire).toBeGreaterThan(transaction);
+  expect(handler).toBeGreaterThan(acquire);
+  expect(source).toContain("{ nested: 1, deadline }");
 });

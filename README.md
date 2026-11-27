@@ -425,22 +425,23 @@ tuning comments, or `--out <file>` to write a gitignored file.
 Email is optional: without SMTP, signup/login work and verification is off.
 With SMTP configured, email verification is required and verification mail,
 password-reset mail (when used), and email 2FA OTP are available.
-Password reset first revokes every session and all model API keys, agent tokens, and
-MCP/OAuth grants and tokens together under the user's credential lock, then replaces the
-password and repeats the credential sweep. Both sweeps also delete pending two-factor sign-in
-challenges, their OTP and attempt records, and trusted-device records. Revoked sessions stop
-working on their next request.
-Changing a password with “sign out other devices” revokes
-the same credentials while keeping the new current session. Machine enrollments and credentials
-remain unchanged pending an owner decision.
+Password recovery (mailed reset or the authorized admin password-setting API) first revokes every
+session, pending two-factor challenge, model API key, agent token, MCP/OAuth grant/token, node
+credential and enrollment code under the user's owner fence, and sweeps again after the password
+write. Partly used enrollment codes are revoked too. Node records and configuration remain; sign in
+with the new password and reconnect existing nodes using fresh Replace enrollment codes.
+Changing a password with “sign out other devices” revokes standing API/MCP credentials and other
+browser sessions while keeping its returned session. Node credentials and enrollment codes stay
+usable on that change.
 
-Requests already authenticated and in flight when a reset commits can finish afterward: a
-password sign-in verifying the old hash, a change-password request that already verified the old
-password, an admin impersonation request, or a token refresh. Better Auth core verifies before
-it writes, without a password-generation check. The proposed follow-up is a password-generation
-check under the credential lock at session insertion and password writes. Change-password's
-credential sweep runs after the password commits (as in the template); a failure there is logged
-SECURITY and rethrown.
+Password sign-in and initial no-SMTP signup compare their credential fingerprint before/after
+session insertion; pending two-factor challenges carry the same proof. Rotated/impersonated
+sessions require a live parent before/after insertion. Password writes serialize before the owner
+fence and recheck the changing session; expired writes are quarantined. The shared pool uses
+`DATABASE_POOL_MAX` (at least 3), with one slot counter and a reserved nested slot. See
+[production hardening](docs/production-hardening.md) for lock order and remaining limits.
+The shown-versus-mailed invite-link decision is tracked as a separate template follow-up; no
+identity-provider sign-in is currently configured in this app.
 
 Useful checks:
 

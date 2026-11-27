@@ -35,11 +35,9 @@ export const ADMIN_INVITED_EXPIRES_AT = new Date("9999-12-31T00:00:00.000Z");
  * reset or activation then deletes; and a shown link that outlived the activation anyway is
  * refused when spent (password-reset-links.ts `isResetLinkRedeemable`).
  *
- * A known residual: Better Auth spends a reset token (and writes the password) before
- * `onPasswordReset` takes this lock, so a resend landing in that gap can mint one more link that
- * the callback deletes a moment later. That link reaches only the invitee's own mailbox or, when
- * it cannot be mailed, the human admin who asked for it, and an admin can already set any user's
- * password (`/api/auth/admin/set-user-password`): the gap grants nobody anything new.
+ * The HTTP password-write lock now surrounds reset token consumption, the
+ * password write, and finalization. It precedes this owner fence. This IS
+ * the credential fence too: no second per-user setup advisory lock exists.
  */
 export async function lockCredentialSetup(
   tx: Prisma.TransactionClient,

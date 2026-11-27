@@ -9,7 +9,11 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   env: { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false, WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: false },
 }));
 vi.mock("@ws-model-proxy/env/shared", () => ({
-  env: { DATABASE_URL: "postgresql://relay-usage-facts-test", NODE_ENV: "test" },
+  env: {
+    DATABASE_URL: "postgresql://relay-usage-facts-test",
+    NODE_ENV: "test",
+    DATABASE_POOL_MAX: 3,
+  },
 }));
 
 const { ResponseUsageRecorder, USAGE_SAMPLE_TAIL_BYTES } = await import(

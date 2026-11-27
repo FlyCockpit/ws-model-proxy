@@ -36,7 +36,7 @@ const db = vi.hoisted(() => {
       return row[key] === value;
     });
   const tx = {
-    $queryRaw: vi.fn(async () => [{ acquired: true }]),
+    $queryRaw: vi.fn(async () => [{ acquired: true, locked: true }]),
     verification: {
       findFirst: vi.fn(
         async ({ where }: { where: Row }) =>
@@ -75,6 +75,8 @@ vi.mock("./credential-revocation", async (importOriginal) => ({
 }));
 
 import { auth as productionAuth } from "./index";
+import { handlePasswordAuthRequest } from "./password-auth-handler";
+import { withPasswordWriteLock } from "./password-write-lock";
 import { provedEmailKey } from "./proved-email";
 import { registerShareInviteAcceptor } from "./share-invite-acceptance";
 
@@ -165,8 +167,17 @@ describe("production password reset finalization with SMTP", () => {
         body: JSON.stringify(body),
       });
       const outcome = await (transport === "http"
-        ? auth.handler(request)
-        : auth.api.resetPassword({ body })
+        ? handlePasswordAuthRequest(auth, request)
+        : // Operational server calls must explicitly own the same lock scope too.
+          withPasswordWriteLock(
+            "/reset-password",
+            request,
+            async () => {
+              await auth.api.resetPassword({ body });
+              return new Response();
+            },
+            { getSession: async () => null },
+          )
       ).then(
         (result) => {
           db.events.push("reported error");
@@ -177,7 +188,7 @@ describe("production password reset finalization with SMTP", () => {
           return error;
         },
       );
-      expect(db.revoke).toHaveBeenNthCalledWith(1, userId, { revokeSessions: true });
+      expect(db.revoke).toHaveBeenNthCalledWith(1, userId);
       expect(db.revoke).toHaveBeenNthCalledWith(2, userId);
       expect(db.memory.account?.[0]?.password).toBe("hashed:new-password");
       expect(
@@ -218,7 +229,7 @@ describe("production password reset finalization with SMTP", () => {
       }),
     );
     expect(response.status).toBe(400);
-    expect(db.revoke).toHaveBeenCalledExactlyOnceWith(userId, { revokeSessions: true });
+    expect(db.revoke).toHaveBeenCalledExactlyOnceWith(userId);
     expect(db.memory.account?.[0]?.password).toBe("hashed:old-password");
     expect(db.memory.user?.[0]).toMatchObject({ emailVerified: false });
     expect(db.memory.user?.[0]?.provedEmail).toBeFalsy();

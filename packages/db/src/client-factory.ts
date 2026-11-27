@@ -23,6 +23,8 @@ import {
 } from "./shutdown-fence";
 
 export type SharedClientOptions = {
+  /** Actual request pool ceiling, shared with advisory-lock slot accounting. */
+  maxConnections?: number;
   /**
    * Test seam only (default false): keep a client-side read timeout
    * (`query_timeout`) that the connection string sets, instead of switching
@@ -45,7 +47,7 @@ export type SharedClientOptions = {
  */
 export function createPrismaClient(
   connectionString: string,
-  { keepClientReadTimeoutForTest = false }: SharedClientOptions = {},
+  { keepClientReadTimeoutForTest = false, maxConnections }: SharedClientOptions = {},
 ) {
   const pool = new ReleaseGuardedPoolState({
     normalizeReadTimeout: !keepClientReadTimeoutForTest,
@@ -62,6 +64,7 @@ export function createPrismaClient(
   return new PrismaClient({
     adapter: new PrismaPg({
       connectionString,
+      ...(maxConnections === undefined ? {} : { max: maxConnections }),
       onConnect: enforceSessionSettings,
       Client: PoolConnection,
     }),

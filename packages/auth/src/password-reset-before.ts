@@ -25,7 +25,7 @@ export async function secureAccountBeforePasswordReset(ctx: {
     if (!verification || verification.expiresAt < new Date()) return;
     // If reset later fails before replacing the password, the password is unchanged
     // but the user is signed out everywhere and credentials are revoked: the safe direction.
-    await revokeUserCredentials(verification.value, { revokeSessions: true });
+    await revokeUserCredentials(verification.value);
   } catch {
     throw new APIError("SERVICE_UNAVAILABLE", {
       message:

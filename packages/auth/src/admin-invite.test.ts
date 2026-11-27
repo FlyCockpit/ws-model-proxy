@@ -239,7 +239,7 @@ describe("admin invite on real Better Auth with production hooks", { timeout: 30
     await t.link(userId, "raced-resend");
 
     await t.reset("one-time-invite", "chosen-password-1");
-    expect(revokeUserCredentials).toHaveBeenNthCalledWith(1, userId, { revokeSessions: true });
+    expect(revokeUserCredentials).toHaveBeenNthCalledWith(1, userId);
     expect(revokeUserCredentials).toHaveBeenNthCalledWith(2, userId);
     expect(revokeUserCredentials).toHaveBeenCalledTimes(2);
     expect(t.user("invitee@example.test")).toMatchObject({
@@ -425,9 +425,7 @@ describe("admin invite on real Better Auth with production hooks", { timeout: 30
       email: "person@example.test",
     });
     await auth.api.resetPassword({ body: { token: "recover", newPassword: "new-password-1" } });
-    expect(revokeUserCredentials).toHaveBeenNthCalledWith(1, userId, {
-      revokeSessions: true,
-    });
+    expect(revokeUserCredentials).toHaveBeenNthCalledWith(1, userId);
     expect(revokeUserCredentials).toHaveBeenNthCalledWith(2, userId);
     expect(revokeUserCredentials).toHaveBeenCalledTimes(2);
     expect(db.session).toHaveLength(0);
@@ -529,6 +527,8 @@ describe("admin invite on real Better Auth with production hooks", { timeout: 30
         revokeOtherSessions: true,
       },
     });
-    expect(revokeUserCredentials).toHaveBeenCalledExactlyOnceWith(userId);
+    expect(revokeUserCredentials).toHaveBeenCalledExactlyOnceWith(userId, {
+      keepSessionToken: expect.any(String),
+    });
   });
 });

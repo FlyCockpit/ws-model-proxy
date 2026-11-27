@@ -77,6 +77,12 @@
     },
     "./password-reset-links": {
       "default": "./src/password-reset-links.ts"
+    },
+    "./password-auth-handler": {
+      "default": "./src/password-auth-handler.ts"
+    },
+    "./machine-credential-listeners": {
+      "default": "./src/machine-credential-listeners.ts"
     }
   },
   "scripts": {

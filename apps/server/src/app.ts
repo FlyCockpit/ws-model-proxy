@@ -20,10 +20,12 @@ import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
 import { armAuthDbShutdownFence } from "@ws-model-proxy/auth/auth-db-shutdown-fence";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
+import { onMachineCredentialsRevoked } from "@ws-model-proxy/auth/machine-credential-listeners";
 import {
   type AgentAccessNarrowedEvent,
   onMcpGrantAccessNarrowed,
 } from "@ws-model-proxy/auth/mcp-grant-access";
+import { handlePasswordAuthRequest } from "@ws-model-proxy/auth/password-auth-handler";
 import {
   createPasswordResetRequestHandler,
   createPasswordResetRequestValidator,
@@ -293,6 +295,7 @@ const closeRelaySessionsForDeletedUser = async (userId: string): Promise<void> =
   realtimeSessionRegistry.terminateForUser(userId);
   await relaySessionManager.closeSessionsForUser(userId);
 };
+onMachineCredentialsRevoked((userId) => relaySessionManager.closeSessionsForUser(userId));
 onUserDeleted(closeRelaySessionsForDeletedUser);
 onUserDeletionMarked(closeRelaySessionsForDeletedUser);
 
@@ -995,7 +998,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   // Better Auth sees only the client IP resolved from TRUST_PROXY_HOPS, never
   // a raw client-supplied X-Forwarded-For (it keys its own limiter on it).
   app.on(["POST", "GET"], "/api/auth/*", (c) =>
-    auth.handler(withResolvedClientIp(c.req.raw, resolveClientIp(c))),
+    handlePasswordAuthRequest(auth, withResolvedClientIp(c.req.raw, resolveClientIp(c))),
   );
 
   app.use("/api/internal/chat-test/*", sessionMiddleware);

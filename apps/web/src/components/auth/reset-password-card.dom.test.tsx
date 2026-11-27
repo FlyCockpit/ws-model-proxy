@@ -29,7 +29,13 @@ vi.mock("react-i18next", async () => {
       t: (key: string) => {
         const copy = (copyLocale.language === "en-US" ? en : es).resetPassword;
         const field = key.replace("auth:resetPassword.", "");
-        return ["description", "retryableFailed", "retry", "invalidDescription"].includes(field)
+        return [
+          "success",
+          "description",
+          "retryableFailed",
+          "retry",
+          "invalidDescription",
+        ].includes(field)
           ? copy[field as keyof typeof copy]
           : key;
       },
@@ -104,6 +110,30 @@ describe("ResetPasswordCard under the real router", () => {
       expect(warning.textContent).toMatch(/API/);
       expect(warning.textContent).toMatch(/MCP\/OAuth/);
       expect(warning.textContent).toMatch(agents);
+      expect(warning.textContent).toMatch(
+        locale === "en-US"
+          ? /Node logins and enrollment codes/
+          : /accesos de nodos y los códigos de inscripción/,
+      );
+      expect(warning.textContent).toMatch(
+        locale === "en-US"
+          ? /fresh enrollment code or a Replace code/
+          : /inscripción nuevo o un código de reemplazo/,
+      );
+      const resetCopy =
+        locale === "en-US"
+          ? await import("../../locales/en-US/auth.json")
+          : await import("../../locales/es-MX/auth.json");
+      expect(resetCopy.default.resetPassword.success).toMatch(
+        locale === "en-US"
+          ? /node logins, and enrollment codes were revoked/
+          : /accesos de nodos y los códigos de inscripción/,
+      );
+      expect(resetCopy.default.resetPassword.success).toMatch(
+        locale === "en-US"
+          ? /fresh enrollment or Replace code/
+          : /inscripción nuevo o de reemplazo/,
+      );
       expect(resetPasswordMock).not.toHaveBeenCalled();
       const settings =
         locale === "en-US"

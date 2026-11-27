@@ -5,8 +5,9 @@ import { onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import { onUserDeleted } from "@ws-model-proxy/auth/user-deletion-listeners";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
 import type { Context } from "../context";
+import { adminMailBudget } from "../lib/admin-mail-budget";
+import { createSetPasswordLink } from "../lib/set-password-link";
 import { usersRouter } from "./users";
 
 // Mock @ws-model-proxy/db before importing the module so the router pulls the deep-
@@ -187,6 +188,7 @@ async function captureConsoleDuring(fn: () => Promise<unknown>): Promise<string>
 
 describe("usersRouter", () => {
   beforeEach(() => {
+    vi.spyOn(adminMailBudget, "charge").mockImplementation(() => {});
     vi.clearAllMocks();
     db.$transaction
       .mockReset()
@@ -1180,6 +1182,38 @@ describe("user access removal guard and role auditing", () => {
         success: true,
       });
       expect(db.$queryRaw).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe("invite procedure budget boundary", () => {
+  it.each(["invite", "resendInvite"] as const)(
+    "charges %s before any write or mail and preserves the API error",
+    async (procedure) => {
+      vi.spyOn(adminMailBudget, "charge").mockImplementation(() => {
+        throw new ORPCError("TOO_MANY_REQUESTS");
+      });
+      vi.mocked(auth.api.createUser).mockClear();
+      vi.mocked(createSetPasswordLink).mockClear();
+      vi.mocked(sendEmail).mockClear();
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      const result =
+        procedure === "invite"
+          ? client.invite({
+              email: "budget@example.test",
+              name: "Budget",
+              role: "user",
+              locale: "en-US",
+            })
+          : client.resendInvite({ userId: "pending" });
+      await expect(result).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
+      expect(auth.api.createUser).not.toHaveBeenCalled();
+      expect(createSetPasswordLink).not.toHaveBeenCalled();
+      expect(sendEmail).not.toHaveBeenCalled();
+      expect(adminMailBudget.charge).toHaveBeenCalledWith(
+        buildContext().session!.user.id,
+        ...(procedure === "resendInvite" ? ["pending"] : []),
+      );
     },
   );
 });

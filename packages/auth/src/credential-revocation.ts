@@ -1,9 +1,13 @@
+import { randomBytes } from "node:crypto";
 import prisma from "@ws-model-proxy/db";
 import { fenceOwners, runCapacityOrderedTransaction } from "@ws-model-proxy/db/capacity-lock-order";
+import { hashPassword } from "better-auth/crypto";
+import { notifyMachineCredentialsRevoked } from "./machine-credential-listeners";
 import { notifyUserBanned } from "./user-ban-listeners";
 
 /**
- * Password recovery and a password change with sign-out revoke the same standing access.
+ * Password recovery and a password change with sign-out revoke standing access.
+ * Recovery additionally revokes machine credentials/codes; password change preserves them.
  * Keep tombstones: issued OAuth JWTs and cached refresh replies are refused by the live
  * grant check on every MCP request. API keys and agent tokens likewise
  * read revokedAt on admission; there is no credential-authority cache to invalidate.
@@ -16,7 +20,7 @@ import { notifyUserBanned } from "./user-ban-listeners";
  */
 export async function revokeUserCredentials(
   userId: string,
-  { revokeSessions = false }: { revokeSessions?: boolean } = {},
+  { keepSessionToken }: { keepSessionToken?: string } = {},
 ): Promise<void> {
   try {
     await runCapacityOrderedTransaction(prisma, async (tx) => {
@@ -28,9 +32,9 @@ export async function revokeUserCredentials(
       // admin must revoke those too. Repeat that deletion in the post-sweep and on a
       // password change with sign-out, while keeping its newly created current session.
       await tx.session.deleteMany({
-        where: revokeSessions
-          ? { OR: [{ userId }, { impersonatedBy: userId }] }
-          : { impersonatedBy: userId },
+        where: keepSessionToken
+          ? { OR: [{ userId, token: { not: keepSessionToken } }, { impersonatedBy: userId }] }
+          : { OR: [{ userId }, { impersonatedBy: userId }] },
       });
       // Better Auth 1.7.18 two-factor stores the user id only on the 2fa-* login
       // challenge and trust-device-* rows. OTP values are `${hashedCode}:${attempts}`
@@ -64,7 +68,12 @@ export async function revokeUserCredentials(
       await tx.apiKey.updateMany({ where: standing, data: revoked });
       await tx.agentToken.updateMany({ where: standing, data: revoked });
       await tx.mcpGrant.updateMany({ where: standing, data: revoked });
-      // Machine enrollments/credentials are deliberately not revoked here pending the owner's decision.
+      // Password change keeps machines; recovery/quarantine revoke every unrevoked
+      // code (including partly used multi-use codes) and credential, never Nodes.
+      if (!keepSessionToken) {
+        await tx.nodeCredential.updateMany({ where: standing, data: revoked });
+        await tx.nodeEnrollmentCode.updateMany({ where: standing, data: revoked });
+      }
       await tx.oauthRefreshToken.updateMany({
         where: { userId, revoked: null },
         data: { revoked: now },
@@ -76,7 +85,8 @@ export async function revokeUserCredentials(
       await tx.oauthConsent.deleteMany({ where: { userId } });
     });
     // Reuse the ban announcement to end this user's open streams and relay work.
-    // This announces lost access only; it does not ban the user or revoke machine enrollments.
+    // This announces lost access only; it does not ban the user.
+    if (!keepSessionToken) await notifyMachineCredentialsRevoked(userId);
     await notifyUserBanned(userId);
   } catch (error) {
     console.error(
@@ -93,14 +103,42 @@ export function passwordChangeRevocationTarget(ctx: {
   path?: string;
   body?: unknown;
   returned?: unknown;
-}): string | null {
+}): { userId: string; keepSessionToken: string } | null {
   if (ctx.path !== "/change-password") return null;
   if (!isRecord(ctx.body) || ctx.body.revokeOtherSessions !== true) return null;
   if (!isRecord(ctx.returned) || !isRecord(ctx.returned.user)) return null;
   const id = ctx.returned.user.id;
-  return typeof id === "string" && id.length > 0 ? id : null;
+  const token = ctx.returned.token;
+  return typeof id === "string" && id.length > 0 && typeof token === "string" && token.length > 0
+    ? { userId: id, keepSessionToken: token }
+    : null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/** An unconfirmed password cannot remain usable after a lock lapse. */
+export async function quarantineUntrustedPasswordWrite(
+  userId: string,
+  { hash = hashPassword }: { hash?: (password: string) => Promise<string> } = {},
+): Promise<void> {
+  try {
+    const unusable = await hash(randomBytes(32).toString("base64url"));
+    await runCapacityOrderedTransaction(prisma, async (tx) => {
+      await fenceOwners(tx, [userId]);
+      await tx.account.updateMany({
+        where: { userId, providerId: "credential" },
+        data: { password: unusable },
+      });
+    });
+    await revokeUserCredentials(userId);
+  } catch (error) {
+    console.error(
+      "[auth] SECURITY: password quarantine failed",
+      `user=${userId}`,
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+    throw error;
+  }
 }

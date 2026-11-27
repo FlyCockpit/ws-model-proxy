@@ -1,6 +1,7 @@
 import { env } from "@ws-model-proxy/env/shared";
 
 import { createPrismaClient } from "./client-factory";
+import { configureLockSlots, withTransactionSlot } from "./lock-slots";
 import { withDbShutdownFence } from "./shutdown-fence";
 
 export { Prisma } from "../prisma/generated/client";
@@ -13,6 +14,20 @@ export { Prisma } from "../prisma/generated/client";
 // (apps/server/src/app.ts wires armDbShutdownFence into the gate's
 // onClosed), any NEW database operation started by any continuation of any
 // consumer rejects immediately. See ./shutdown-fence.ts for the rationale.
-const prisma = withDbShutdownFence(createPrismaClient(env.DATABASE_URL));
+configureLockSlots(env.DATABASE_POOL_MAX);
+const client = createPrismaClient(env.DATABASE_URL, { maxConnections: env.DATABASE_POOL_MAX });
+// Raw auth/setup transactions use this boundary too. Accounting begins before
+// checkout, never from inside lockCredentialSetup after a connection is pinned.
+const prisma = withDbShutdownFence(
+  new Proxy(withDbShutdownFence(client), {
+    get(target, key, receiver) {
+      if (key === "$transaction") {
+        return (...args: Parameters<typeof client.$transaction>) =>
+          withTransactionSlot(() => Reflect.apply(target.$transaction, target, args));
+      }
+      return Reflect.get(target, key, receiver);
+    },
+  }),
+);
 
 export default prisma;

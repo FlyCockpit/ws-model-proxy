@@ -7,7 +7,11 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep(), Prisma: actual.Prisma };
 });
 vi.mock("@ws-model-proxy/env/shared", () => ({
-  env: { DATABASE_URL: "postgresql://relay-telemetry-recovery-test", NODE_ENV: "test" },
+  env: {
+    DATABASE_URL: "postgresql://relay-telemetry-recovery-test",
+    NODE_ENV: "test",
+    DATABASE_POOL_MAX: 3,
+  },
 }));
 
 const { default: prisma, Prisma } = await import("@ws-model-proxy/db");

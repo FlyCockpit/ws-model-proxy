@@ -4,7 +4,9 @@
  * itself is plain HTTP in `apps/server` (`POST /api/node/enroll`).
  */
 import { ORPCError } from "@orpc/server";
+import { hasLiveCredentialSession } from "@ws-model-proxy/auth/credential-session";
 import prisma from "@ws-model-proxy/db";
+import { fenceOwners, runCapacityOrderedTransaction } from "@ws-model-proxy/db/capacity-lock-order";
 import { credentialDigest } from "@ws-model-proxy/db/node-security";
 import { env } from "@ws-model-proxy/env/server";
 import type { z } from "zod";
@@ -133,7 +135,10 @@ export const enrollmentProcedures = {
     const now = new Date();
     const secret = generateEnrollmentCode();
     const row = await mintCode(async () =>
-      prisma.$transaction(async (tx) => {
+      runCapacityOrderedTransaction(prisma, async (tx) => {
+        await fenceOwners(tx, [userId]);
+        if (!(await hasLiveCredentialSession(tx, userId, context.session.session.id)))
+          throw new ORPCError("UNAUTHORIZED");
         if (input.replaceNodeId) {
           const node = await tx.node.findFirst({
             where: { id: input.replaceNodeId, userId },

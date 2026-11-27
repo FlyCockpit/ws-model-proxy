@@ -217,6 +217,17 @@ export const ENV_VARS: EnvVar[] = [
     exampleSet: true,
   },
 
+  {
+    key: "DATABASE_POOL_MAX",
+    group: "core",
+    source: "default",
+    default: "10",
+    example: "10",
+    comment: [
+      "Request pool size (minimum 3); reserves room for password writes and nested revocation.",
+    ],
+  },
+
   // --- runtime -------------------------------------------------------------
   {
     key: "NODE_ENV",

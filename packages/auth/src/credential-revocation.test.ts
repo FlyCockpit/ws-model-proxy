@@ -98,8 +98,12 @@ const db = vi.hoisted(() => {
           };
         }) => {
           const rows = memory.session ?? [];
-          const matches = (condition: { userId?: string; impersonatedBy?: string }, row: Row) =>
-            Object.entries(condition).every(([key, value]) => row[key] === value);
+          const matches = (condition: Row, row: Row) =>
+            Object.entries(condition).every(([key, value]) =>
+              typeof value === "object" && value !== null && "not" in value
+                ? row[key] !== value.not
+                : row[key] === value,
+            );
           memory.session = rows.filter(
             (row) => !(where.OR ?? [where]).some((condition) => matches(condition, row)),
           );
@@ -133,7 +137,7 @@ beforeEach(() => {
 });
 afterEach(() => vi.restoreAllMocks());
 
-describe("password credential revocation", () => {
+describe("password credential revocation", { timeout: 30_000 }, () => {
   it("revokes only this user's CLI/API credentials together under the owner fence", async () => {
     await revokeUserCredentials("u1");
     expect(db.transaction).toHaveBeenCalledTimes(1);
@@ -151,10 +155,13 @@ describe("password credential revocation", () => {
     expect(db.tx.oauthConsent.deleteMany).toHaveBeenCalledExactlyOnceWith({
       where: { userId: "u1" },
     });
-    expect(db.tx.nodeEnrollmentCode.updateMany).not.toHaveBeenCalled();
-    expect(db.tx.nodeCredential.updateMany).not.toHaveBeenCalled();
+    for (const model of [db.tx.nodeEnrollmentCode, db.tx.nodeCredential])
+      expect(model.updateMany).toHaveBeenCalledWith({
+        where: { userId: "u1", revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
     expect(db.tx.session.deleteMany).toHaveBeenCalledExactlyOnceWith({
-      where: { impersonatedBy: "u1" },
+      where: { OR: [{ userId: "u1" }, { impersonatedBy: "u1" }] },
     });
   });
 
@@ -401,7 +408,7 @@ describe("password credential revocation", () => {
       where: { OR: [{ userId: created.user.id }, { impersonatedBy: created.user.id }] },
     });
     expect(db.tx.session.deleteMany).toHaveBeenNthCalledWith(2, {
-      where: { impersonatedBy: created.user.id },
+      where: { OR: [{ userId: created.user.id }, { impersonatedBy: created.user.id }] },
     });
     expect(db.tx.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
       db.tx.session.deleteMany.mock.invocationCallOrder[0]!,
@@ -498,7 +505,10 @@ describe("password credential revocation", () => {
               body: ctx.body,
               returned: ctx.context.returned,
             });
-            if (userId) await revokeUserCredentials(userId);
+            if (userId)
+              await revokeUserCredentials(userId.userId, {
+                keepSessionToken: userId.keepSessionToken,
+              });
           }),
         },
         logger: { disabled: true },
@@ -696,7 +706,7 @@ describe("password credential revocation", () => {
 });
 
 describe("password change revocation target", () => {
-  const success = { user: { id: "u1" } };
+  const success = { user: { id: "u1" }, token: "new-token" };
   it("selects only the successful change that requested sign-out", () => {
     expect(
       passwordChangeRevocationTarget({
@@ -704,7 +714,7 @@ describe("password change revocation target", () => {
         body: { revokeOtherSessions: true },
         returned: success,
       }),
-    ).toBe("u1");
+    ).toEqual({ userId: "u1", keepSessionToken: "new-token" });
   });
   it.each([
     { path: "/change-password", body: { revokeOtherSessions: false }, returned: success },

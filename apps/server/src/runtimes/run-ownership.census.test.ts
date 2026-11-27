@@ -933,6 +933,10 @@ const SQL_ELSEWHERE: Record<string, [number, string]> = {
     2,
     "One pg_advisory_xact_lock(hashtext('password-pepper')) in each of startup sync and owner-run recovery; both read and update account passwords, never run tables.",
   ],
+  "packages/auth/src/password-write-lock.ts | raw-other": [
+    2,
+    "Per-user password-write advisory lock acquisition and liveness probe; account recovery serialization, no run table.",
+  ],
   "packages/db/src/capacity-lock-order.ts | raw-other": [
     12,
     "Graph-fence and capacity locks (user/node/capacity rows), no run table.",
