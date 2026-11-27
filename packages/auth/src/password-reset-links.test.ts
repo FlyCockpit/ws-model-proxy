@@ -41,8 +41,7 @@ const {
   isResetLinkRedeemable,
   recordResetLinkMailed,
   resetTokenOf,
-  spentResetToken,
-  verifyEmailIfResetLinkWasMailed,
+  admitResetSpend,
 } = await import("./password-reset-links");
 
 const NOW = new Date("2026-11-27T12:00:00.000Z");
@@ -191,56 +190,71 @@ describe("isResetLinkRedeemable", () => {
   });
 });
 
-describe("verifyEmailIfResetLinkWasMailed", () => {
-  it("consumes the record, verifies and proves the mailed address, and deletes the other links, under the lock", async () => {
-    verificationRows({
-      [mailedId("tok")]: { value: JSON.stringify({ userId: "u1", email: "A@example.test" }) },
+describe("admitResetSpend", () => {
+  const spend = (activatePrivateInvite = false) =>
+    admitResetSpend(stub.client as unknown as Parameters<typeof admitResetSpend>[0], "tok", NOW, {
+      activatePrivateInvite,
     });
+  const setup = (mailed: string | null, marked = true) => {
+    verificationRows({
+      "reset-password:tok": { value: "u1" },
+      "admin-invited:u1": marked ? { value: "u1" } : undefined,
+      ...(mailed === null ? {} : { [mailedId("tok")]: { value: mailed } }),
+    });
+    stub.answers["user.findUnique"] = () => ({ ...pendingState, email: "A@example.test" });
     stub.answers["verification.deleteMany"] = () => ({ count: 1 });
     stub.answers["user.updateMany"] = () => ({ count: 1 });
-    expect(await verifyEmailIfResetLinkWasMailed("tok")).toEqual({
-      id: "u1",
-      email: "A@example.test",
-    });
-    expect(stub.calls.slice(2)).toEqual([
-      LOCK,
-      `verification.deleteMany ${JSON.stringify({ where: { identifier: mailedId("tok") } })}`,
-      `user.updateMany ${JSON.stringify({
-        where: { id: "u1", email: "A@example.test" },
-        data: { emailVerified: true, provedEmail: "a@example.test" },
-      })}`,
-      `verification.deleteMany ${JSON.stringify({ where: { value: "u1", identifier: { startsWith: "reset-password:" } } })}`,
-      "commit",
-    ]);
-  });
-
-  it("verifies nothing for a link that was not mailed", async () => {
-    verificationRows({});
-    expect(await verifyEmailIfResetLinkWasMailed("tok")).toBeNull();
-    expect(stub.calls.some((call) => call.startsWith("user.updateMany"))).toBe(false);
-  });
-
-  it("verifies nothing once the address changed, and counts a record once", async () => {
-    verificationRows({
-      [mailedId("tok")]: { value: JSON.stringify({ userId: "u1", email: "a@example.test" }) },
-    });
-    stub.answers["verification.deleteMany"] = () => ({ count: 1 });
-    stub.answers["user.updateMany"] = () => ({ count: 0 });
-    expect(await verifyEmailIfResetLinkWasMailed("tok")).toBeNull();
-    stub.calls.length = 0;
-    stub.answers["verification.deleteMany"] = () => ({ count: 0 });
-    expect(await verifyEmailIfResetLinkWasMailed("tok")).toBeNull();
-    expect(stub.calls.some((call) => call.startsWith("user.updateMany"))).toBe(false);
-  });
-
-  it("drops a malformed record", async () => {
-    verificationRows({ [mailedId("tok")]: { value: "not json" } });
-    expect(await verifyEmailIfResetLinkWasMailed("tok")).toBeNull();
+  };
+  it("stages mailed proof and competing link deletion on the supplied transaction", async () => {
+    setup(JSON.stringify({ userId: "u1", email: "A@example.test" }));
+    expect(await spend()).toBe(true);
+    expect(stub.calls).toContain(LOCK);
     expect(stub.calls).toContain(
-      `verification.deleteMany ${JSON.stringify({ where: { identifier: mailedId("tok") } })}`,
+      `user.updateMany ${JSON.stringify({ where: { id: "u1", email: "A@example.test" }, data: { emailVerified: true, provedEmail: "a@example.test" } })}`,
     );
-    expect(stub.calls).not.toContain(LOCK);
+    expect(stub.calls.some((x) => x.includes('"not":"reset-password:tok"'))).toBe(true);
+    expect(stub.calls).not.toContain("begin");
   });
+  it("admits a marked shown invite without proof in SMTP mode", async () => {
+    setup(null);
+    expect(await spend()).toBe(true);
+    expect(stub.calls.some((x) => x.startsWith("user.updateMany"))).toBe(false);
+  });
+  it.each([
+    { ...pendingState, emailVerified: true },
+    { ...pendingState, accounts: [{ providerId: "credential" }, { providerId: "other" }] },
+    { ...pendingState, sessions: [{ id: "session" }] },
+  ])("rejects a shown link after activation", async (state) => {
+    setup(null);
+    stub.answers["user.findUnique"] = () => ({ ...state, email: "A@example.test" });
+    expect(await spend()).toBe(false);
+  });
+  it("rejects a link that disappears while waiting for the owner fence", async () => {
+    setup(null);
+    let reads = 0;
+    stub.answers["verification.findFirst"] = () => (++reads === 1 ? { value: "u1" } : null);
+    expect(await spend()).toBe(false);
+    expect(stub.calls.some((x) => x.startsWith("verification.deleteMany"))).toBe(false);
+  });
+  it("activates a private invite without proving the mailbox", async () => {
+    setup(null);
+    expect(await spend(true)).toBe(true);
+    expect(stub.calls).toContain(
+      `user.updateMany ${JSON.stringify({ where: { id: "u1" }, data: { emailVerified: true } })}`,
+    );
+  });
+  it.each([null, "invalid", JSON.stringify({ userId: "u1", email: "other@example.test" })])(
+    "rejects unmarked unproved links",
+    async (mailed) => {
+      setup(mailed, false);
+      expect(await spend()).toBe(false);
+      expect(
+        stub.calls.some(
+          (x) => x.startsWith("user.updateMany") || x.startsWith("verification.deleteMany"),
+        ),
+      ).toBe(false);
+    },
+  );
 });
 
 describe("isInvitePending", () => {
@@ -256,13 +270,5 @@ describe("reset tokens of a request", () => {
     expect(resetTokenOf({ path: "/reset-password", body: {}, query: { token: "q" } })).toBe("q");
     expect(resetTokenOf({ path: "/reset-password", body: { token: "" } })).toBeNull();
     expect(resetTokenOf({ path: "/reset-password/tok", body: { token: "b" } })).toBeNull();
-  });
-
-  it("counts a token spent only on success", () => {
-    const ctx = { path: "/reset-password", body: { token: "b" } };
-    expect(spentResetToken({ ...ctx, returned: { status: true } })).toBe("b");
-    expect(spentResetToken({ ...ctx, returned: new Error("INVALID_TOKEN") })).toBeNull();
-    expect(spentResetToken({ ...ctx, returned: { status: false } })).toBeNull();
-    expect(spentResetToken({ ...ctx, returned: undefined })).toBeNull();
   });
 });

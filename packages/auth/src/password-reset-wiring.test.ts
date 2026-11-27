@@ -22,7 +22,15 @@ function makePrismaStub(): unknown {
     },
   });
 }
-vi.mock("@ws-model-proxy/db", () => ({ default: makePrismaStub() }));
+const currentUser = vi.hoisted(() => vi.fn());
+vi.mock("@ws-model-proxy/db", () => ({
+  default: new Proxy(makePrismaStub() as object, {
+    get(target, key, receiver) {
+      if (key === "user") return { findUnique: currentUser };
+      return Reflect.get(target, key, receiver);
+    },
+  }),
+}));
 
 const emailConfigured = vi.hoisted(() => ({ value: false }));
 vi.mock("@ws-model-proxy/mailer", () => ({
@@ -43,6 +51,7 @@ async function loadAuth(smtp: boolean) {
 describe("password reset wiring", { timeout: 60_000 }, () => {
   beforeEach(() => {
     emailConfigured.value = false;
+    currentUser.mockReset();
   });
 
   it("uses the password pepper for Better Auth hashing and verification", async () => {
@@ -83,4 +92,78 @@ describe("password reset wiring", { timeout: 60_000 }, () => {
     expect(options?.resetPasswordTokenExpiresIn).toBe(3600);
     expect(options?.minPasswordLength).toBe(8);
   });
+  it("without SMTP never accepts reset shares even if old durable proof exists", async () => {
+    const auth = await loadAuth(false);
+    const { preparePasswordResetFinalization } = await import("./password-reset");
+    const { registerShareInviteAcceptor } = await import("./share-invite-acceptance");
+    const accept = vi.fn(async () => 1);
+    registerShareInviteAcceptor(accept);
+    currentUser.mockResolvedValue({
+      id: "u",
+      email: "u@example.test",
+      emailVerified: true,
+      provedEmail: "u@example.test",
+    });
+    const context: { options: import("better-auth").BetterAuthOptions } = {
+      options: { emailAndPassword: { enabled: true, onPasswordReset: async () => {} } },
+    };
+    preparePasswordResetFinalization(context);
+    await context.options.emailAndPassword!.onPasswordReset!(
+      {
+        user: {
+          id: "u",
+          email: "u@example.test",
+          name: "U",
+          emailVerified: true,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      },
+      undefined,
+    );
+    await auth.options.hooks!.after!({ path: "/reset-password", context } as never);
+    expect(accept).not.toHaveBeenCalled();
+    expect(currentUser).not.toHaveBeenCalled();
+  });
+  it.each(["missing-callback", "id", "email", "verified", "proof", "missing-user"] as const)(
+    "committed reset evidence cannot accept shares with %s",
+    async (mismatch) => {
+      const auth = await loadAuth(true);
+      const { preparePasswordResetFinalization } = await import("./password-reset");
+      const { registerShareInviteAcceptor } = await import("./share-invite-acceptance");
+      const accept = vi.fn(async () => 1);
+      registerShareInviteAcceptor(accept);
+      currentUser.mockResolvedValue(
+        mismatch === "missing-user"
+          ? null
+          : {
+              id: mismatch === "id" ? "other" : "u",
+              email: mismatch === "email" ? "changed@example.test" : "u@example.test",
+              emailVerified: mismatch !== "verified",
+              provedEmail: mismatch === "proof" ? null : "u@example.test",
+            },
+      );
+      const context: { options: import("better-auth").BetterAuthOptions } = {
+        options: { emailAndPassword: { enabled: true, onPasswordReset: async () => {} } },
+      };
+      preparePasswordResetFinalization(context);
+      if (mismatch !== "missing-callback")
+        await context.options.emailAndPassword!.onPasswordReset!(
+          {
+            user: {
+              id: "u",
+              email: "u@example.test",
+              name: "U",
+              emailVerified: false,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            },
+          },
+          undefined,
+        );
+      await auth.options.hooks!.after!({ path: "/reset-password", context } as never);
+      expect(accept).not.toHaveBeenCalled();
+      if (mismatch === "missing-callback") expect(currentUser).not.toHaveBeenCalled();
+    },
+  );
 });

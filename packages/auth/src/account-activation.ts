@@ -3,24 +3,9 @@ import { lockCredentialSetup } from "./credential-setup-lock";
 import { deleteResetLinks } from "./password-reset-links";
 
 /**
- * An invited account becomes active when its email is verified. Reset links minted while it was
- * a pending invite (set-password links an admin was shown, or a resend's) must die at that
- * moment, whatever route verified it: an ordinary `/verify-email`, or a mailed reset link (whose
- * after-hook does the same itself, password-reset-links.ts `verifyEmailIfResetLinkWasMailed`).
- * WMP links no other identity provider to an account, so verification is the only activation.
- *
- * This is tidy-up, not the guarantee. What stops the holder of a leftover shown link from
- * replacing the active account's password is the `/reset-password` before-hook
- * (password-reset-links.ts `isResetLinkRedeemable`): a link that was not mailed is spendable only
- * while the account is a pending invite. So a failed cleanup is logged, never surfaced: the
- * activation is already committed, and failing the request would only report a verification
- * that worked as failed (a retry returns early, so it would not re-run the cleanup either).
- *
- * Runs as a Better Auth database after-hook, which fires once the write is committed, and takes
- * the per-user credential-setup lock minting takes (packages/api lib/set-password-link.ts). A
- * mint racing the activation therefore either re-reads the user under the lock after the
- * activation committed and refuses (no longer a pending invite), or committed its link before
- * this took the lock, and this deletes it.
+ * Activation and reset admission serialize in the adapter transaction under the owner fence.
+ * Competing links are deleted atomically with verification; reset admission rechecks eligibility
+ * with the password write. This after-hook retries cleanup as defense in depth.
  */
 
 /** Endpoint contexts whose user update set `emailVerified: true`. */

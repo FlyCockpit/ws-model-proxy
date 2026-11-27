@@ -18,7 +18,6 @@ import {
   sendEmail,
 } from "@ws-model-proxy/mailer";
 import { BASE_ERROR_CODES, betterAuth } from "better-auth";
-import { prismaAdapter } from "better-auth/adapters/prisma";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { admin, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
@@ -28,6 +27,7 @@ import { finishAdminPasswordReset, secureAdminPasswordReset } from "./admin-pass
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { passwordChangeRevocationTarget, revokeUserCredentials } from "./credential-revocation";
+import { createCredentialSetupAdapter } from "./credential-setup-adapter";
 import { refuseUnexpectedIdentity } from "./expected-identity";
 import { refuseImpersonatedAuthWrite } from "./impersonation-read-only";
 import { isUserBanned } from "./is-user-banned";
@@ -36,15 +36,10 @@ import { createPasswordPepper } from "./password-pepper";
 import {
   passwordResetOptions,
   preparePasswordResetFinalization,
-  takeCommittedResetFailure,
+  takeCommittedPasswordReset,
 } from "./password-reset";
 import { secureAccountBeforePasswordReset } from "./password-reset-before";
-import {
-  isResetLinkRedeemable,
-  resetTokenOf,
-  spentResetToken,
-  verifyEmailIfResetLinkWasMailed,
-} from "./password-reset-links";
+import { isResetLinkRedeemable, resetTokenOf } from "./password-reset-links";
 import {
   fencePasswordSessionAfter,
   fencePasswordSessionBefore,
@@ -56,7 +51,7 @@ import {
   guardPasswordAccountCreate,
   guardPasswordAccountUpdate,
 } from "./password-write-lock";
-import { recordProvedEmail } from "./proved-email";
+import { hasProvedEmail, recordProvedEmail } from "./proved-email";
 import { notifySessionEnded, sessionEndCause } from "./session-ended-listeners";
 import {
   acceptClaimedShareInviteToken,
@@ -113,6 +108,33 @@ async function acceptInvitesQuietly(user: unknown): Promise<void> {
     });
   } catch (error) {
     console.error("share invite acceptance failed", error instanceof Error ? error.name : "error");
+  }
+}
+
+/** A reset callback proves commit; only the matching current durable mailbox proof admits shares. */
+async function acceptCommittedResetInvitesQuietly(user: {
+  id: string;
+  email: string;
+}): Promise<void> {
+  if (!emailConfigured) return;
+  try {
+    const current = await prisma.user.findUnique({
+      where: { id: user.id },
+      select: { id: true, email: true, emailVerified: true, provedEmail: true },
+    });
+    if (
+      current?.id === user.id &&
+      current.email === user.email &&
+      current.emailVerified === true &&
+      hasProvedEmail(current)
+    ) {
+      await acceptInvitesQuietly(current);
+    }
+  } catch (error) {
+    console.error(
+      "reset share invite acceptance failed",
+      error instanceof Error ? error.name : "error",
+    );
   }
 }
 
@@ -175,24 +197,6 @@ function adminVerificationRefused(): APIError {
 
 /** Better Auth's admin route that writes arbitrary user fields. */
 const ADMIN_UPDATE_USER_PATH = "/admin/update-user";
-
-/**
- * A spent reset link verifies the address only if it was mailed (password-reset-links.ts); then
- * it is proved too, so the share invites sent to it are accepted. The password is already set, so
- * a failure is logged, never surfaced: the person can still verify through verify-email, which a
- * sign-in offers.
- */
-async function verifyMailedResetQuietly(token: string): Promise<void> {
-  try {
-    const verified = await verifyEmailIfResetLinkWasMailed(token);
-    if (verified) await acceptInvitesQuietly({ ...verified, emailVerified: true });
-  } catch (error) {
-    console.error(
-      "[auth] verifying the e-mail of a mailed reset link failed:",
-      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-    );
-  }
-}
 
 /** A second sign-up with an invite link another e-mail's sign-up holds right now. */
 function inviteInUseError(): APIError {
@@ -307,29 +311,20 @@ export const passwordPepper = createPasswordPepper({
 });
 
 export const auth = betterAuth({
-  database: prismaAdapter(
-    // The shared client from @ws-model-proxy/db is ALREADY wrapped by the
-    // db-seam shutdown fence (Part G pass 2, G1): the fence now covers BOTH
-    // better-auth's adapter operations AND the direct procedure/diagnostic
-    // calls every other consumer of the ONE shared client makes. Once the
-    // MCP shutdown gate closes (apps/server/src/app.ts wires the gate's
-    // onClosed into armAuthDbShutdownFence — a thin delegation to
-    // armDbShutdownFence), any NEW database operation initiated by any
-    // continuation of this auth instance (including the un-cancellable
-    // requireMcpAuth verifier continuations doing DPoP replay
-    // reservations) rejects immediately. See
-    // @ws-model-proxy/db/shutdown-fence for the full rationale. There is
-    // deliberately NO second wrapper here (no double-wrapping).
-    prisma,
-    {
-      provider: "postgresql",
-      // Keep Better Auth's default adapter transactions off. Verification mail is
-      // scheduled independently and reads the user's locale through the shared
-      // client, which cannot see a still-uncommitted sign-up row. SMTP also has
-      // bounded connection, greeting and socket waits with retries; it is not a
-      // suitable part of an interactive database transaction.
-    },
-  ),
+  // The shared client from @ws-model-proxy/db is ALREADY wrapped by the
+  // db-seam shutdown fence (Part G pass 2, G1): the fence now covers BOTH
+  // better-auth's adapter operations AND the direct procedure/diagnostic
+  // calls every other consumer of the ONE shared client makes. Once the
+  // MCP shutdown gate closes (apps/server/src/app.ts wires the gate's
+  // onClosed into armAuthDbShutdownFence — a thin delegation to
+  // armDbShutdownFence), any NEW database operation initiated by any
+  // continuation of this auth instance (including the un-cancellable
+  // requireMcpAuth verifier continuations doing DPoP replay
+  // reservations) rejects immediately. See
+  // @ws-model-proxy/db/shutdown-fence for the full rationale. There is
+  // deliberately NO second wrapper here (no double-wrapping).
+  // Global transactions remain off; reset spends use a selective transaction.
+  database: createCredentialSetupAdapter(),
 
   logger: {
     // Sanitizing bridge choke point (invariant 10 / L19, pass 9 —
@@ -531,18 +526,11 @@ export const auth = betterAuth({
       if (resetToken) preparePasswordResetFinalization(ctx.context);
     }),
     after: createAuthMiddleware(async (ctx) => {
-      const resetFailure = takeCommittedResetFailure(ctx.context);
-      const resetContext = {
-        path: ctx.path,
-        body: ctx.body,
-        query: ctx.query,
-        returned: ctx.context.returned,
-      };
-      // A deferred callback failure is evidence the password and token committed;
-      // an arbitrary failed reset request is never evidence of a spent mailed link.
-      const spentToken = resetFailure ? resetTokenOf(resetContext) : spentResetToken(resetContext);
-      if (spentToken) await verifyMailedResetQuietly(spentToken);
-      if (resetFailure) throw resetFailure.error;
+      const reset = takeCommittedPasswordReset(ctx.context);
+      if (reset) {
+        await acceptCommittedResetInvitesQuietly(reset.user);
+        if (reset.failure) throw reset.failure.error;
+      }
       const userId = passwordChangeRevocationTarget({
         path: ctx.path,
         body: ctx.body,
@@ -741,8 +729,8 @@ export const auth = betterAuth({
           if (!user) return;
           await afterUserUpdate(user, context);
           // Verifying the e-mail proves it (for direct shares) and accepts the invites sent to
-          // it — only on the verification routes (a mailed reset link proves it in the
-          // `/reset-password` after-hook): no other user update proves anything.
+          // it — only on the verification routes. A mailed reset stages its proof
+          // atomically in the selective adapter; no other user update proves anything.
           if (isEmailVerificationPath(context?.path)) {
             await recordProvedEmailQuietly(user);
             await acceptInvitesQuietly(user);

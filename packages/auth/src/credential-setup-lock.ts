@@ -12,7 +12,7 @@ export const RESET_PASSWORD_IDENTIFIER_PREFIX = "reset-password:";
  * link shown to the admin is spendable only while the marked account is a pending invite
  * (password-reset-links.ts `isInvitePending`, checked at redemption). Spending a link verifies
  * and proves the address only when that link was mailed (password-reset-links.ts); without SMTP,
- * spending a marked account's link activates it (`onPasswordReset`) and proves nothing.
+ * spending a marked account's link activates it in the reset transaction and proves nothing.
  *
  * A verification row because the schema has no column for it (a column is the better home once
  * a migration is due); it expires never ({@link ADMIN_INVITED_EXPIRES_AT}), so Better Auth's
@@ -29,7 +29,7 @@ export const ADMIN_INVITED_EXPIRES_AT = new Date("9999-12-31T00:00:00.000Z");
  * mints a set-password link, records one as mailed, checks a shown one at redemption, finishes a
  * password reset or cleans up after an activation, until the calling transaction ends. Minting
  * (packages/api lib/set-password-link.ts) re-checks under it that the invite is still pending; a
- * finished reset (`onPasswordReset`, the mailed-link after-hook) and an activation
+ * finished reset (the selective adapter, with callback cleanup as defense) and an activation
  * (account-activation.ts) delete every other reset link under it. So a resend racing the
  * invitee's own password setup either sees the account active and refuses, or mints a link the
  * reset or activation then deletes; and a shown link that outlived the activation anyway is

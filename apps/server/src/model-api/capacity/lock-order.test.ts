@@ -67,6 +67,8 @@ function productionSources(): Array<{ file: string; source: string }> {
 
 /** Files allowed to name an advisory-lock function, and why. */
 const ADVISORY_SITES: Record<string, string> = {
+  "packages/auth/src/credential-setup-adapter.ts":
+    "Standalone mailbox verification takes password-write then the existing owner/setup fence on one transaction/client before writes. Selective reset spends inherit the outer password-write lock and acquire owner once at consumption; bound verification only asserts that owner fence after writes. Shared slots reserve before checkout.",
   "packages/auth/src/password-write-lock.ts":
     "Standalone password-write lock taken before the handler, hence before every nested owner/setup fence; no owner holder waits for this outer lock. Account hooks only assert/probe the already-held lock. Shared slots reserve one nested owner transaction before checkout.",
   "packages/auth/src/password-pepper-store.ts":
@@ -272,8 +274,6 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/auth/src/proved-email.ts": "user mailbox proof after verify-email (unfenced column)",
   "packages/auth/src/credential-revocation.ts":
     "M: standing credential revocation (including API keys) under the user's owner fence, before session and credential writes; no later fence or hot-path row",
-  "packages/auth/src/password-reset.ts":
-    "user emailVerified after a spent invite link without SMTP (unfenced column), under the user's owner fence (credential-setup-lock.ts)",
   "packages/auth/src/password-reset-links.ts":
     "user emailVerified and provedEmail after a spent mailed reset or invite link (unfenced columns), under the user's owner fence (credential-setup-lock.ts)",
   "packages/db/src/capacity-lock-order.ts": "M: the user delete under owner fences",

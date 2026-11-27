@@ -74,6 +74,7 @@ export const PASSWORD_WRITE_WAIT_MS = 10_000;
 const POLL_MS = 50;
 
 type HeldLock = {
+  path: string;
   userId: string;
   held: boolean;
   expiresAt: number;
@@ -153,6 +154,7 @@ export async function withPasswordWriteLock(
   return withLockSlot(
     async () => {
       const lock: HeldLock = {
+        path,
         userId: target.userId,
         held: false,
         expiresAt: performance.now() + HELD_FOR_MS,
@@ -306,4 +308,9 @@ export async function confirmPasswordWriteLocked({
     message:
       "This password change could not be confirmed, so the account's password was disabled for safety. Use Forgot password to set a new one.",
   });
+}
+
+/** Whether this request is a reset, even if its password lock has lapsed. */
+export function isResetPasswordWrite(): boolean {
+  return heldFor.getStore()?.path === RESET_PASSWORD_PATH;
 }

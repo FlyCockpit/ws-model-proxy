@@ -1,5 +1,4 @@
 import { betterAuth } from "better-auth";
-import { memoryAdapter } from "better-auth/adapters/memory";
 import { admin } from "better-auth/plugins";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getAdminInviteLocale, runWithAdminInviteLocale } from "./admin-invite-locale";
@@ -25,87 +24,153 @@ vi.mock("./signup-policy", async (original) => ({
   getSignupAccessState: async () => ({ signupEnabled: true, userCount: 2 }),
 }));
 vi.mock("@ws-model-proxy/db", () => {
-  // The Prisma calls the production hooks make, run against the memory adapter's own tables
-  // (always read through `state.db`: the memory adapter may replace a table array).
-  type Where = Record<string, unknown>;
-  const table = (name: string) => {
-    state.db[name] ??= [];
-    return state.db[name] as Row[];
-  };
-  const time = (value: unknown) => new Date(value as string | number | Date).getTime();
-  const matches = (row: Row, where: Where = {}) =>
-    Object.entries(where).every(([key, wanted]) => {
-      if (wanted && typeof wanted === "object" && !(wanted instanceof Date)) {
-        const condition = wanted as Record<string, unknown>;
-        if ("startsWith" in condition)
-          return String(row[key]).startsWith(String(condition.startsWith));
-        if ("gt" in condition) return time(row[key]) > time(condition.gt);
-        if ("in" in condition) return (condition.in as unknown[]).includes(row[key]);
-        return false;
+  type Transaction = { staged?: Record<string, Row[]>; xid: boolean; owners: string[] };
+  const make = (transaction?: Transaction) => {
+    const table = (name: string) => {
+      const store = transaction?.staged ?? state.db;
+      store[name] ??= [];
+      return store[name]!;
+    };
+    const write = () => {
+      if (transaction) {
+        transaction.xid = true;
+        transaction.staged ??= structuredClone(state.db);
       }
-      return row[key] === wanted;
-    });
-  const project = (row: Row, select: Record<string, unknown> | undefined) => {
-    if (!select) return { ...row };
-    const out: Row = {};
-    for (const [key, spec] of Object.entries(select)) {
-      if (key === "accounts" || key === "sessions") {
-        const relation = spec as { where?: Where; select: Record<string, unknown>; take?: number };
-        out[key] = table(key === "accounts" ? "account" : "session")
-          .filter((child) => child.userId === row.id && matches(child, relation.where))
-          .slice(0, relation.take)
-          .map((child) => project(child, relation.select));
-      } else out[key] = row[key] ?? null;
-    }
-    return out;
-  };
-  const model = (name: string) => ({
-    findUnique: vi.fn(async ({ where, select }: { where: Where; select?: Row }) => {
-      const row = table(name).find((candidate) => matches(candidate, where));
-      return row ? project(row, select) : null;
-    }),
-    findFirst: vi.fn(async ({ where, select }: { where: Where; select?: Row }) => {
-      const row = table(name).find((candidate) => matches(candidate, where));
-      return row ? project(row, select) : null;
-    }),
-    findMany: vi.fn(async ({ where, select }: { where: Where; select?: Row }) =>
-      table(name)
-        .filter((row) => matches(row, where))
-        .map((row) => project(row, select)),
-    ),
-    create: vi.fn(async ({ data, select }: { data: Row; select?: Row }) => {
-      const row = {
-        id: `${name}-${Math.random().toString(36).slice(2)}`,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        ...data,
+    };
+    const matches = (row: Row, where: Row = {}): boolean =>
+      Object.entries(where).every(([key, wanted]) => {
+        if (key === "AND") return (wanted as Row[]).every((part) => matches(row, part));
+        if (key === "OR") return (wanted as Row[]).some((part) => matches(row, part));
+        if (wanted && typeof wanted === "object" && !(wanted instanceof Date)) {
+          const filter = wanted as Row;
+          if ("equals" in filter && row[key] !== filter.equals) return false;
+          if ("startsWith" in filter && !String(row[key]).startsWith(String(filter.startsWith)))
+            return false;
+          if ("not" in filter && row[key] === filter.not) return false;
+          if (
+            "gt" in filter &&
+            !(row[key] instanceof Date && filter.gt instanceof Date && row[key] > filter.gt)
+          )
+            return false;
+          if (
+            "lt" in filter &&
+            !(row[key] instanceof Date && filter.lt instanceof Date && row[key] < filter.lt)
+          )
+            return false;
+          if ("in" in filter && !(filter.in as unknown[]).includes(row[key])) return false;
+          return true;
+        }
+        return row[key] === wanted;
+      });
+    const project = (row: Row, select?: Row): Row => {
+      if (!select) return { ...row };
+      const result: Row = {};
+      for (const [key, spec] of Object.entries(select)) {
+        if (key === "accounts" || key === "sessions") {
+          const relation = spec as { where?: Row; select?: Row; take?: number };
+          result[key] = table(key === "accounts" ? "account" : "session")
+            .filter((child) => child.userId === row.id && matches(child, relation.where))
+            .slice(0, relation.take)
+            .map((child) => project(child, relation.select));
+        } else result[key] = row[key] ?? null;
+      }
+      return result;
+    };
+    const model = (name: string) => {
+      const findMany = async ({
+        where,
+        select,
+        take,
+      }: {
+        where?: Row;
+        select?: Row;
+        take?: number;
+      }) =>
+        table(name)
+          .filter((row) => matches(row, where))
+          .slice(0, take)
+          .map((row) => project(row, select));
+      return {
+        findMany,
+        findFirst: async (args: Parameters<typeof findMany>[0]) =>
+          (await findMany(args))[0] ?? null,
+        findUnique: async (args: Parameters<typeof findMany>[0]) =>
+          (await findMany(args))[0] ?? null,
+        count: async (args: Parameters<typeof findMany>[0]) => (await findMany(args)).length,
+        create: async ({ data, select }: { data: Row; select?: Row }) => {
+          write();
+          const row = {
+            id: crypto.randomUUID(),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            ...data,
+          };
+          table(name).push(row);
+          return project(row, select);
+        },
+        update: async ({ where, data }: { where: Row; data: Row }) => {
+          write();
+          const row = table(name).find((row) => matches(row, where));
+          if (!row) throw Object.assign(new Error("missing row"), { code: "P2025" });
+          Object.assign(row, data);
+          return { ...row };
+        },
+        updateMany: async ({ where, data }: { where: Row; data: Row }) => {
+          write();
+          const rows = table(name).filter((row) => matches(row, where));
+          for (const row of rows) Object.assign(row, data);
+          return { count: rows.length };
+        },
+        deleteMany: async ({ where }: { where: Row }) => {
+          write();
+          const rows = table(name);
+          const store = transaction?.staged ?? state.db;
+          store[name] = rows.filter((row) => !matches(row, where));
+          return { count: rows.length - store[name].length };
+        },
+        delete: async ({ where }: { where: Row }) => {
+          write();
+          const rows = table(name);
+          const row = rows.find((row) => matches(row, where));
+          if (!row) throw Object.assign(new Error("missing row"), { code: "P2025" });
+          const store = transaction?.staged ?? state.db;
+          store[name] = rows.filter((item) => item !== row);
+          return { ...row };
+        },
       };
-      table(name).push(row);
-      return project(row, select);
-    }),
-    updateMany: vi.fn(async ({ where, data }: { where: Where; data: Row }) => {
-      const rows = table(name).filter((row) => matches(row, where));
-      for (const row of rows) Object.assign(row, data);
-      return { count: rows.length };
-    }),
-    deleteMany: vi.fn(async ({ where }: { where: Where }) => {
-      const rows = table(name);
-      const keep = rows.filter((row) => !matches(row, where));
-      state.db[name] = keep;
-      return { count: rows.length - keep.length };
-    }),
-  });
-  const client = {
-    // The owner fence (credential-setup-lock.ts): always granted here.
-    $queryRaw: vi.fn(async () => [{ acquired: true }]),
-    user: model("user"),
-    verification: model("verification"),
-    $transaction: vi.fn(),
+    };
+    return {
+      $executeRaw: async () => 1,
+      $queryRaw: async (sql: TemplateStringsArray, owners: string[]) => {
+        if (sql.join("").includes("wsmp_acquire_fences") && transaction) {
+          if (transaction.xid) throw new Error("WMPF1: owner fence after write");
+          transaction.owners.push(...owners);
+        }
+        return [{ acquired: true, locked: true, held: `,${transaction?.owners.join(",") ?? ""},` }];
+      },
+      user: model("user"),
+      account: model("account"),
+      session: model("session"),
+      verification: model("verification"),
+    };
   };
-  client.$transaction.mockImplementation(async (operation: (tx: typeof client) => unknown) =>
-    operation(client),
-  );
-  return { default: client };
+  return {
+    default: {
+      ...make(),
+      $transaction: async (operation: (tx: ReturnType<typeof make>) => Promise<unknown>) => {
+        const slots = await import("./lock-slots");
+        return slots.withTransactionSlot(async () => {
+          const transaction: Transaction = { xid: false, owners: [] };
+          const result = await operation(make(transaction));
+          if (transaction.staged) {
+            for (const key of Object.keys(state.db)) delete state.db[key];
+            Object.assign(state.db, transaction.staged);
+          }
+          return result;
+        });
+      },
+    },
+  };
 });
 const mail = vi.hoisted(() => ({ sendEmail: vi.fn(async (_mail: unknown) => {}) }));
 vi.mock("@ws-model-proxy/mailer", () => ({
@@ -126,6 +191,8 @@ vi.mock("./share-invite-acceptance", async (original) => ({
 }));
 const { auth: production } = await import("./index");
 const { recordResetLinkMailed } = await import("./password-reset-links");
+const { withPasswordWriteLock } = await import("./password-write-lock");
+const { configureLockSlots } = await import("./lock-slots");
 
 const INVITED_MARK_EXPIRES = new Date("9999-12-31T00:00:00.000Z");
 
@@ -134,7 +201,7 @@ function setup() {
   state.db = db;
   const verificationMail = vi.fn(async (_data: { token: string }) => {});
   const auth = betterAuth({
-    database: memoryAdapter(db),
+    database: production.options.database,
     baseURL: "https://proxy.example.test",
     secret: "admin-invite-test-secret-at-least-32-characters",
     user: production.options.user,
@@ -184,8 +251,24 @@ function setup() {
     });
     return created.user.id;
   };
-  const reset = (token: string, newPassword: string) =>
-    auth.api.resetPassword({ body: { token, newPassword } });
+  const reset = async (token: string, newPassword: string) => {
+    let result: unknown;
+    const request = new Request("https://proxy.example.test/api/auth/reset-password", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token, newPassword }),
+    });
+    await withPasswordWriteLock(
+      "/reset-password",
+      request,
+      async () => {
+        result = await auth.api.resetPassword({ body: { token, newPassword } });
+        return new Response();
+      },
+      { getSession: async () => null },
+    );
+    return result;
+  };
   const signIn = (email: string, password: string) =>
     auth.api.signInEmail({ body: { email, password } });
   /** Forgot-password through Better Auth; resolves the token once it is recorded as mailed. */
@@ -212,7 +295,10 @@ const isMailedRow = (row: Row) => String(row.identifier).startsWith("reset-passw
 const isResetRow = (row: Row) => String(row.identifier).startsWith("reset-password:");
 
 describe("admin invite on real Better Auth with production hooks", { timeout: 30_000 }, () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    configureLockSlots(3);
+  });
 
   it("a mailed invite link verifies and proves the address, accepts its share invites, and kills a raced resend link", async () => {
     const t = setup();
@@ -424,7 +510,7 @@ describe("admin invite on real Better Auth with production hooks", { timeout: 30
       userId,
       email: "person@example.test",
     });
-    await auth.api.resetPassword({ body: { token: "recover", newPassword: "new-password-1" } });
+    await t.reset("recover", "new-password-1");
     expect(revokeUserCredentials).toHaveBeenNthCalledWith(1, userId);
     expect(revokeUserCredentials).toHaveBeenNthCalledWith(2, userId);
     expect(revokeUserCredentials).toHaveBeenCalledTimes(2);
@@ -455,7 +541,9 @@ describe("admin invite on real Better Auth with production hooks", { timeout: 30
     const password = db.account?.[0]?.password;
     const sessions = [...(db.session ?? [])];
     revokeUserCredentials.mockRejectedValueOnce(new TypeError("private database details"));
-    const response = await auth.handler(
+    const { handlePasswordAuthRequest } = await import("./password-auth-handler");
+    const response = await handlePasswordAuthRequest(
+      auth,
       new Request("https://proxy.example.test/api/auth/reset-password", {
         method: "POST",
         headers: { "content-type": "application/json", origin: "https://proxy.example.test" },
@@ -472,7 +560,7 @@ describe("admin invite on real Better Auth with production hooks", { timeout: 30
       message:
         "We couldn't finish securing your account. Nothing was changed — try the link again.",
     });
-    await auth.api.resetPassword({ body: { token: "retry", newPassword: "new-password-1" } });
+    await t.reset("retry", "new-password-1");
     expect(db.account?.[0]?.password).not.toBe(password);
     expect(db.session).toHaveLength(0);
     expect(await context.internalAdapter.findVerificationValue("reset-password:retry")).toBeNull();

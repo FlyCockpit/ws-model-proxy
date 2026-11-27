@@ -24,10 +24,26 @@ const db = vi.hoisted(() => {
     Object.entries(where).every(([key, value]) => {
       if (key === "OR" && Array.isArray(value))
         return value.some((condition: Row) => matches(row, condition));
-      if (typeof value === "object" && value !== null) {
-        if ("startsWith" in value)
-          return typeof row[key] === "string" && row[key].startsWith(String(value.startsWith));
-        if ("in" in value && Array.isArray(value.in)) return value.in.includes(row[key]);
+      if (key === "AND" && Array.isArray(value))
+        return value.every((condition: Row) => matches(row, condition));
+      if (typeof value === "object" && value !== null && !(value instanceof Date)) {
+        const filter = value as Row;
+        if ("equals" in filter && row[key] !== filter.equals) return false;
+        if ("startsWith" in filter && !String(row[key]).startsWith(String(filter.startsWith)))
+          return false;
+        if ("not" in filter && row[key] === filter.not) return false;
+        if ("in" in filter && !(filter.in as unknown[]).includes(row[key])) return false;
+        if (
+          "gt" in filter &&
+          !(row[key] instanceof Date && filter.gt instanceof Date && row[key] > filter.gt)
+        )
+          return false;
+        if (
+          "lt" in filter &&
+          !(row[key] instanceof Date && filter.lt instanceof Date && row[key] < filter.lt)
+        )
+          return false;
+        return true;
       }
       return row[key] === value;
     });
@@ -67,14 +83,11 @@ const db = vi.hoisted(() => {
       }),
     },
     user: {
-      updateMany: vi.fn(
-        async ({ where, data }: { where: { id: string; email: string }; data: Row }) => {
-          const rows =
-            memory.user?.filter((row) => row.id === where.id && row.email === where.email) ?? [];
-          for (const row of rows) Object.assign(row, data);
-          return { count: rows.length };
-        },
-      ),
+      updateMany: vi.fn(async ({ where, data }: { where: Row; data: Row }) => {
+        const rows = memory.user?.filter((row) => matches(row, where)) ?? [];
+        for (const row of rows) Object.assign(row, data);
+        return { count: rows.length };
+      }),
     },
     session: {
       findFirst: vi.fn(
@@ -114,6 +127,7 @@ const db = vi.hoisted(() => {
   };
   return {
     memory,
+    matches,
     tx,
     transaction: vi.fn(async (work: (client: typeof tx) => unknown) => work(tx)),
   };
@@ -128,6 +142,86 @@ import { issueMcpGrantClaims } from "./mcp-grant";
 import { passwordResetOptions } from "./password-reset";
 import { secureAccountBeforePasswordReset } from "./password-reset-before";
 import { onUserBanned } from "./user-ban-listeners";
+
+/** SQL delegates for the atomic private-invite case, retaining the real selective adapter. */
+function resetSqlFixture() {
+  const delegate = (name: string) => {
+    const rows = () => db.memory[name] ?? [];
+    const findMany = async ({ where = {}, select }: { where?: Row; select?: Row }) => {
+      const found = rows().filter((row) => db.matches(row, where));
+      return found.map((row) => ({
+        ...row,
+        ...(name === "user" && select?.accounts
+          ? {
+              accounts: (db.memory.account ?? [])
+                .filter((account) => account.userId === row.id)
+                .slice(0, 2),
+              sessions: (db.memory.session ?? [])
+                .filter(
+                  (session) =>
+                    session.userId === row.id &&
+                    session.expiresAt instanceof Date &&
+                    session.expiresAt > new Date(),
+                )
+                .slice(0, 1),
+            }
+          : {}),
+      }));
+    };
+    return {
+      findMany,
+      findFirst: async (args: Parameters<typeof findMany>[0]) => (await findMany(args))[0] ?? null,
+      findUnique: async (args: Parameters<typeof findMany>[0]) => (await findMany(args))[0] ?? null,
+      create: async ({ data }: { data: Row }) => {
+        const row = { id: crypto.randomUUID(), ...data };
+        db.memory[name] ??= [];
+        db.memory[name]!.push(row);
+        return { ...row };
+      },
+      updateMany: async ({ where, data }: { where: Row; data: Row }) => {
+        if (name === "user") return db.tx.user.updateMany({ where, data });
+        const found = rows().filter((row) => db.matches(row, where));
+        for (const row of found) Object.assign(row, data);
+        return { count: found.length };
+      },
+      deleteMany: async ({ where }: { where: Row }) => {
+        const before = rows();
+        db.memory[name] = before.filter((row) => !db.matches(row, where));
+        return { count: before.length - db.memory[name]!.length };
+      },
+      delete: async ({ where }: { where: Row }) => {
+        const row = rows().find((row) => db.matches(row, where));
+        if (!row) throw Object.assign(new Error("missing row"), { code: "P2025" });
+        db.memory[name] = rows().filter((item) => item !== row);
+        return { ...row };
+      },
+    };
+  };
+  const tx = {
+    $queryRaw: db.tx.$queryRaw,
+    $executeRaw: db.tx.$executeRaw,
+    user: delegate("user"),
+    account: delegate("account"),
+    verification: delegate("verification"),
+    session: delegate("session"),
+  };
+  return {
+    ...tx,
+    $transaction: async (work: (transaction: typeof tx) => Promise<unknown>) => {
+      const { withTransactionSlot } = await import("./lock-slots");
+      return withTransactionSlot(async () => {
+        const snapshot = structuredClone(db.memory);
+        try {
+          return await work(tx);
+        } catch (error) {
+          for (const key of Object.keys(db.memory)) delete db.memory[key];
+          Object.assign(db.memory, snapshot);
+          throw error;
+        }
+      });
+    },
+  };
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -418,11 +512,23 @@ describe("password credential revocation", { timeout: 30_000 }, () => {
 
   it("finalizes the invite and kills the second link after post-sweep retries fail, while reporting the error", async () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { createCredentialSetupAdapter } = await import("./credential-setup-adapter");
+    const { handlePasswordAuthRequest } = await import("./password-auth-handler");
+    const { configureLockSlots } = await import("./lock-slots");
+    configureLockSlots(3);
+    db.tx.$queryRaw.mockImplementation(async () => [{ acquired: true, locked: true }]);
+    const sql = resetSqlFixture();
     const auth = betterAuth({
       baseURL: "https://reset.example.test",
       secret: "reset-test-secret-at-least-thirty-two-characters",
-      database: memoryAdapter(db.memory),
-      emailAndPassword: { enabled: true, ...passwordResetOptions(false, undefined) },
+      database: createCredentialSetupAdapter(
+        sql as unknown as Parameters<typeof createCredentialSetupAdapter>[0],
+      ),
+      emailAndPassword: {
+        enabled: true,
+        requireEmailVerification: false,
+        ...passwordResetOptions(false, undefined),
+      },
       hooks: { before: createAuthMiddleware(secureAccountBeforePasswordReset) },
       logger: { disabled: true },
     });
@@ -446,7 +552,8 @@ describe("password credential revocation", { timeout: 30_000 }, () => {
     db.tx.apiKey.updateMany.mockResolvedValueOnce({ count: 1 });
     for (let attempt = 0; attempt < 5; attempt++)
       db.tx.apiKey.updateMany.mockRejectedValueOnce(failure);
-    const response = await auth.handler(
+    const response = await handlePasswordAuthRequest(
+      auth,
       new Request("https://reset.example.test/api/auth/reset-password", {
         method: "POST",
         headers: { "content-type": "application/json", origin: "https://reset.example.test" },
@@ -465,12 +572,14 @@ describe("password credential revocation", { timeout: 30_000 }, () => {
     expect(db.memory.user?.[0]?.emailVerified).toBe(true);
     expect(await context.internalAdapter.findVerificationValue("reset-password:second")).toBeNull();
     expect(db.tx.user.updateMany).toHaveBeenCalledExactlyOnceWith({
-      where: { id: created.user.id, email: created.user.email },
+      where: { id: created.user.id },
       data: { emailVerified: true },
     });
-    expect(db.tx.apiKey.updateMany.mock.invocationCallOrder[5]).toBeLessThan(
-      db.tx.user.updateMany.mock.invocationCallOrder[0]!,
+    // Private activation is part of the password commit, before the failing post-sweep.
+    expect(db.tx.user.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+      db.tx.apiKey.updateMany.mock.invocationCallOrder[1]!,
     );
+    expect(db.memory.user?.[0]?.provedEmail ?? null).toBeNull();
   });
 
   it.each(["reset", "change-with-sign-out", "change-without-sign-out"] as const)(

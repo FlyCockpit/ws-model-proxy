@@ -18,7 +18,7 @@ import { provedEmailKey } from "./proved-email";
  * spending it leaves the account unverified, and the person verifies through verify-email (a
  * sign-in mails them a link). Otherwise an admin, or anyone the link was passed to, could make an
  * address nobody controls "verified". (Without SMTP nothing is ever mailed or proved, and
- * spending an invite link only activates the account: password-reset.ts `onPasswordReset`.)
+ * spending an invite link only activates the account in the reset transaction.)
  *
  * The "mailed" fact is a verification row next to the token ({@link recordResetLinkMailed}): no
  * schema change, and it expires with the link.
@@ -171,10 +171,8 @@ export async function recordResetLinkMailed(input: {
  *
  * The invite state is read under the credential-setup lock, the lock minting and the activation
  * tidy-up take, so it sees their committed result. (A mailed link needs no lock: it is spendable
- * in every state. A record written while this waited is checked again under the lock.) Better
- * Auth spends the token after this returns, outside the lock: an activation committing in that
- * gap orders the reset just before the activation, a reset the link was allowed to make anyway
- * (and the reset ends every session).
+ * in every state. A record written while this waited is checked again under the lock.) The final
+ * admission runs again inside the password transaction.
  */
 export async function isResetLinkRedeemable(token: string, now = new Date()): Promise<boolean> {
   const identifier = `${RESET_PASSWORD_IDENTIFIER_PREFIX}${token}`;
@@ -216,38 +214,58 @@ function parseMailed(value: string): { userId: string; email: string } | null {
 }
 
 /**
- * Runs after Better Auth spent the reset token `token` (a successful `POST /reset-password`). If
- * that token was mailed, in one transaction under the user's credential-setup lock: the "mailed"
- * row is consumed, the address is marked verified and proved (`provedEmail`, only while it is
- * still the address the link went to), and every other reset link of the user is deleted.
- * Returns the user whose address was verified (for share-invite acceptance), else null. A token
- * that was not mailed changes nothing here.
+ * Authoritative admission at Better Auth's consumeOne seam, on the SAME
+ * transaction/client as token consumption, session deletion and password write.
+ * The caller holds password-write; the owner fence is the setup lock.
+ * Mailbox verification and deletion of competing links commit with this
+ * password, or all roll back. No after-hook can establish this property.
  */
-export async function verifyEmailIfResetLinkWasMailed(
+export async function admitResetSpend(
+  tx: Prisma.TransactionClient,
   token: string,
-): Promise<{ id: string; email: string } | null> {
-  const identifier = mailedIdentifier(token);
-  return prisma.$transaction(async (tx) => {
-    const mailed = await tx.verification.findFirst({
-      where: { identifier },
-      select: { value: true },
-    });
-    if (!mailed) return null;
-    const target = parseMailed(mailed.value);
-    if (!target) {
-      await tx.verification.deleteMany({ where: { identifier } });
-      return null;
-    }
-    await lockCredentialSetup(tx, target.userId);
-    const consumed = await tx.verification.deleteMany({ where: { identifier } });
-    if (consumed.count === 0) return null;
-    const verified = await tx.user.updateMany({
-      where: { id: target.userId, email: target.email },
+  now = new Date(),
+  { activatePrivateInvite = false }: { activatePrivateInvite?: boolean } = {},
+): Promise<boolean> {
+  const identifier = `${RESET_PASSWORD_IDENTIFIER_PREFIX}${token}`;
+  const first = await tx.verification.findFirst({ where: { identifier }, select: { value: true } });
+  if (!first) return true; // Better Auth refuses the missing token.
+  const userId = first.value;
+  await lockCredentialSetup(tx, userId);
+  const link = await tx.verification.findFirst({
+    where: { identifier, value: userId, expiresAt: { gt: now } },
+    select: { id: true },
+  });
+  if (!link) return false;
+  const mailed = await tx.verification.findFirst({
+    where: { identifier: mailedIdentifier(token), expiresAt: { gt: now } },
+    select: { value: true },
+  });
+  const target = mailed ? parseMailed(mailed.value) : null;
+  const user = await tx.user.findUnique({
+    where: { id: userId },
+    select: { ...inviteStateSelect(now), email: true },
+  });
+  const proved = target?.userId === userId && target.email === user?.email;
+  const pending =
+    user && isInvitePending({ ...user, adminInvited: await isAdminInvited(tx, userId) });
+  if (!user || (!proved && !pending)) return false;
+  await tx.verification.deleteMany({
+    where: {
+      value: userId,
+      identifier: { startsWith: RESET_PASSWORD_IDENTIFIER_PREFIX, not: identifier },
+    },
+  });
+  if (proved) {
+    await tx.verification.deleteMany({ where: { identifier: mailedIdentifier(token) } });
+    await tx.user.updateMany({
+      where: { id: userId, email: target.email },
       data: { emailVerified: true, provedEmail: provedEmailKey(target.email) },
     });
-    await deleteResetLinks(tx, target.userId);
-    return verified.count > 0 ? { id: target.userId, email: target.email } : null;
-  });
+  }
+  if (!proved && pending && activatePrivateInvite) {
+    await tx.user.updateMany({ where: { id: userId }, data: { emailVerified: true } });
+  }
+  return true;
 }
 
 /**
@@ -264,20 +282,6 @@ export function resetTokenOf(ctx: {
     (isRecord(ctx.body) ? ctx.body.token : undefined) ||
     (isRecord(ctx.query) ? ctx.query.token : undefined);
   return typeof token === "string" && token.length > 0 ? token : null;
-}
-
-/**
- * The reset token a finished Better Auth request spent, or null. Only a successful
- * `POST /reset-password` (its result is `{ status: true }`, an error is an `APIError`) qualifies.
- */
-export function spentResetToken(ctx: {
-  path?: string;
-  body?: unknown;
-  query?: unknown;
-  returned?: unknown;
-}): string | null {
-  if (!isRecord(ctx.returned) || ctx.returned.status !== true) return null;
-  return resetTokenOf(ctx);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

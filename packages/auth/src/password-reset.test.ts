@@ -19,6 +19,8 @@ vi.mock("./password-reset-links", () => ({ recordResetLinkMailed }));
 const {
   deliverResetPasswordEmail,
   passwordResetOptions,
+  preparePasswordResetFinalization,
+  takeCommittedPasswordReset,
   RESET_PASSWORD_TOKEN_EXPIRES_IN_SECONDS,
   withResetPasswordCallback,
 } = await import("./password-reset");
@@ -239,26 +241,16 @@ describe("a finished password reset", () => {
     return calls;
   }
   const lock = 'lock SELECT wsmp_acquire_fences(?::text[], ?) AS acquired ["00:owner:u1"] true';
-  const mark = `mark? ${JSON.stringify({ where: { identifier: "admin-invited:u1" }, select: { id: true } })}`;
   const deleteLinks = `delete ${JSON.stringify({ where: { value: "u1", identifier: { startsWith: "reset-password:" } } })}`;
 
-  it("without SMTP activates an invited account and deletes every other reset link, under the owner fence", async () => {
-    // The same per-user lock the invite link writer takes (packages/api set-password-link.ts),
-    // first: a resend racing this reset either sees the account verified, or its link is deleted.
-    expect(await spend({ invited: true })).toEqual([
-      lock,
-      mark,
-      `verify ${JSON.stringify({ where: { id: "u1", email: "invitee@example.test" }, data: { emailVerified: true } })}`,
-      deleteLinks,
-    ]);
-  });
+  it.each([true, false])(
+    "without SMTP only cleans links (invited=%s); activation committed in the adapter",
+    async (invited) => {
+      expect(await spend({ invited })).toEqual([lock, deleteLinks]);
+    },
+  );
 
-  it("without SMTP leaves a public sign-up alone (it was created verified)", async () => {
-    expect(await spend({ invited: false })).toEqual([lock, mark, deleteLinks]);
-  });
-
-  it("with SMTP verifies nothing itself: only a mailed link does, in the after-hook", async () => {
-    // A link shown to the admin may have been spent: this callback cannot tell which.
+  it("with SMTP leaves verification and proof to the atomic adapter", async () => {
     expect(await spend({ invited: true, smtp: true })).toEqual([lock, deleteLinks]);
     expect(await spend({ invited: false, smtp: true })).toEqual([lock, deleteLinks]);
   });
@@ -282,4 +274,41 @@ describe("a finished password reset", () => {
     ).rejects.toBe(failure);
     expect(revokeUserCredentials).toHaveBeenCalledExactlyOnceWith("u2");
   });
+});
+
+describe("request-local committed reset evidence", () => {
+  it.each([true, false])(
+    "records callback identity on failure=%s and consumes once",
+    async (fails) => {
+      const error = new Error("callback failed");
+      const callback = vi.fn(async () => {
+        if (fails) throw error;
+      });
+      const context: { options: import("better-auth").BetterAuthOptions } = {
+        options: { emailAndPassword: { enabled: true, onPasswordReset: callback } },
+      };
+      const other = { options: context.options };
+      const original = context.options;
+      preparePasswordResetFinalization(context);
+      expect(context.options).not.toBe(original);
+      expect(other.options).toBe(original);
+      expect(takeCommittedPasswordReset(context)).toBeUndefined();
+      const user = {
+        id: "u1",
+        email: "before@example.test",
+        name: "Invitee",
+        emailVerified: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      await context.options.emailAndPassword!.onPasswordReset!({ user }, undefined);
+      user.email = "after@example.test";
+      expect(takeCommittedPasswordReset(other)).toBeUndefined();
+      expect(takeCommittedPasswordReset(context)).toEqual({
+        user: { id: "u1", email: "before@example.test" },
+        ...(fails ? { failure: { error } } : {}),
+      });
+      expect(takeCommittedPasswordReset(context)).toBeUndefined();
+    },
+  );
 });

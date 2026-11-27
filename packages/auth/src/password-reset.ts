@@ -3,11 +3,7 @@ import prisma from "@ws-model-proxy/db";
 import { renderResetPassword, sendEmail } from "@ws-model-proxy/mailer";
 import type { BetterAuthOptions } from "better-auth";
 import { revokeUserCredentials } from "./credential-revocation";
-import {
-  ADMIN_INVITED_PREFIX,
-  lockCredentialSetup,
-  RESET_PASSWORD_IDENTIFIER_PREFIX,
-} from "./credential-setup-lock";
+import { lockCredentialSetup, RESET_PASSWORD_IDENTIFIER_PREFIX } from "./credential-setup-lock";
 import { recordResetLinkMailed } from "./password-reset-links";
 
 /** A reset link is good for one hour (and one use). The mail copy says so. */
@@ -138,7 +134,10 @@ type SendResetPassword = (data: {
 }) => Promise<void>;
 
 /** Only onPasswordReset, called after the password/token commit, may record this evidence. */
-const committedResetFailures = new WeakMap<object, { error: unknown }>();
+const committedResets = new WeakMap<
+  object,
+  { user: { id: string; email: string }; failure?: { error: unknown } }
+>();
 
 /** Before-hook: defer callback errors to the matching after-hook, on this call's options only. */
 export function preparePasswordResetFinalization(context: { options: BetterAuthOptions }): void {
@@ -152,22 +151,28 @@ export function preparePasswordResetFinalization(context: { options: BetterAuthO
     emailAndPassword: {
       ...options,
       onPasswordReset: async (data, request) => {
+        // Capture trusted callback identity before application callbacks can change it.
+        const evidence: NonNullable<ReturnType<typeof committedResets.get>> = {
+          user: { id: data.user.id, email: data.user.email },
+        };
         try {
           await onPasswordReset(data, request);
         } catch (error) {
           // An ordinary error here would bypass the after-hook entirely.
-          committedResetFailures.set(context, { error });
+          evidence.failure = { error };
+        } finally {
+          committedResets.set(context, evidence);
         }
       },
     },
   };
 }
 
-/** The after-hook takes the failure once, finishes mailed-link verification, then reports it. */
-export function takeCommittedResetFailure(context: object) {
-  const failure = committedResetFailures.get(context);
-  committedResetFailures.delete(context);
-  return failure;
+/** Take committed callback identity once; process durable proof before surfacing its error. */
+export function takeCommittedPasswordReset(context: object) {
+  const evidence = committedResets.get(context);
+  committedResets.delete(context);
+  return evidence;
 }
 
 /**
@@ -188,42 +193,19 @@ export function passwordResetOptions(
 } {
   const base = {
     revokeSessionsOnPasswordReset: true as const,
-    // Under the per-user credential-setup lock, every other reset link of the
-    // user is deleted, so an invite resend racing this reset never leaves a
-    // working link behind.
-    //
-    // With SMTP, whether the reset also verifies the address is decided by the
-    // `/reset-password` after-hook (index.ts), which knows the spent token: only
-    // a link that was mailed verifies and proves it (password-reset-links.ts);
-    // this callback is told only the user. Without SMTP nothing is mailed,
-    // verified by mail or proved: every public sign-up is created verified
-    // (user-create-policy.ts), and spending an admin invite's link (the only way
-    // in, credential-setup-lock.ts ADMIN_INVITED_PREFIX) activates it the same
-    // way, so it is marked verified here. Reset links carry no address, so
-    // Better Auth's update routes refuse an email change (index.ts
-    // `databaseHooks.user.update`).
+    // Admission, activation and mailbox proof commit with token/password writes in
+    // the selective adapter. This callback retains the second revocation sweep and
+    // a final owner-fenced cleanup for links minted after that commit.
     onPasswordReset: async ({ user }: { user: { id: string; email: string } }) => {
       // Defense in depth: the before hook already revoked credentials and all sessions together.
       try {
         await revokeUserCredentials(user.id);
       } finally {
         // Better Auth already committed the password and consumed this link. Finish
-        // setup and kill other links even if the post-sweep failed; its error still
+        // cleanup even if the post-sweep failed; its error still
         // propagates after finalization (and the revoker reports it).
         await prisma.$transaction(async (tx) => {
           await lockCredentialSetup(tx, user.id);
-          const invited =
-            !emailConfigured &&
-            (await tx.verification.findFirst({
-              where: { identifier: `${ADMIN_INVITED_PREFIX}${user.id}` },
-              select: { id: true },
-            }));
-          if (invited) {
-            await tx.user.updateMany({
-              where: { id: user.id, email: user.email },
-              data: { emailVerified: true },
-            });
-          }
           await tx.verification.deleteMany({
             where: { value: user.id, identifier: { startsWith: RESET_PASSWORD_IDENTIFIER_PREFIX } },
           });
