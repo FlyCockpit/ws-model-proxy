@@ -58,6 +58,7 @@ vi.mock("react-i18next", () => ({
 }));
 
 vi.mock("@/hooks/use-auth-session", () => ({
+  useIdentityUnverified: () => false,
   useAuthSession: () => ({
     state: {
       session: state.signedIn ? { user: { id: "owner", role: "user" } } : null,

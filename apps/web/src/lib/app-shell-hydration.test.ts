@@ -104,7 +104,10 @@ describe("resolveRouteSession", () => {
     const probe = vi.fn(async () => ({ status: "resolved" as const, session: null }));
     const admit = vi.fn(async () => undefined);
     vi.doMock("@/server/auth-session", () => ({ getRouteSession: probe }));
-    vi.doMock("@/lib/document-identity", () => ({ admitRouteIdentity: admit }));
+    vi.doMock("@/lib/document-identity", () => ({
+      admitRouteIdentity: admit,
+      identityVerificationGeneration: () => 0,
+    }));
     const hydration = await import("./app-shell-hydration");
     const { resolveRouteSession } = await import("./route-session");
     stubDocument(true);
@@ -129,7 +132,10 @@ describe("resolveRouteSession", () => {
     });
     const admit = vi.fn(async () => undefined);
     vi.doMock("@/server/auth-session", () => ({ getRouteSession: probe }));
-    vi.doMock("@/lib/document-identity", () => ({ admitRouteIdentity: admit }));
+    vi.doMock("@/lib/document-identity", () => ({
+      admitRouteIdentity: admit,
+      identityVerificationGeneration: () => 0,
+    }));
     const hydration = await import("./app-shell-hydration");
     const { resolveRouteSession } = await import("./route-session");
     stubDocument(true);

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useState, useSyncExternalStore } from "react";
 
 import { authClient } from "@/lib/auth-client";
 import {
@@ -7,6 +7,10 @@ import {
   nextConfirmedAuthSession,
   rememberConfirmedAnonymous,
 } from "@/lib/auth-session-state";
+import {
+  isDocumentIdentityUnverified,
+  subscribeIdentityVerification,
+} from "@/lib/document-identity";
 import { useNetworkStatus } from "./use-network-status";
 
 /**
@@ -18,9 +22,30 @@ import { useNetworkStatus } from "./use-network-status";
  */
 let confirmedAnonymous = false;
 
-export function useAuthSession() {
+/**
+ * True while another tab's identity change (or a 401) is unchecked in this document
+ * (`isDocumentIdentityUnverified`): nothing may show an account or the previous account's page
+ * until a fresh check settles it. docs/ui.md § Query cache follows identity.
+ */
+export function useIdentityUnverified(): boolean {
+  return useSyncExternalStore(
+    subscribeIdentityVerification,
+    isDocumentIdentityUnverified,
+    () => false,
+  );
+}
+
+/**
+ * The sole application adapter for Better Auth's reactive session atom. While another tab's
+ * identity change (or a 401) is unchecked here (`isDocumentIdentityUnverified`), it reports
+ * `pending` whatever the atom holds, so no chrome shows an account this document has not
+ * confirmed. `unmasked` is for the identity watcher only: it must see the raw session even then,
+ * to notice the answer that settles it. docs/ui.md § Query cache follows identity.
+ */
+export function useAuthSession({ unmasked = false }: { unmasked?: boolean } = {}) {
   const session = authClient.useSession();
   const isOnline = useNetworkStatus();
+  const unverified = useIdentityUnverified();
   const data = session.data as AuthSessionData | null | undefined;
 
   // The last session the server confirmed, kept through a refetch or a transient error. It is
@@ -35,8 +60,16 @@ export function useAuthSession() {
   });
   if (nextConfirmed !== confirmedSession) setConfirmedSession(nextConfirmed);
 
-  const refetch = useCallback(() => session.refetch(), [session]);
+  // Better Auth's refetch is one function for the atom's life; the snapshot around it is new on
+  // every change. Keyed by the function, so the watcher's checks (keyed by `refetch`) are not
+  // restarted, and their answers dropped, by the very refetch they start.
+  const { refetch: refetchSession } = session;
+  const refetch = useCallback(() => refetchSession(), [refetchSession]);
   const actions = useMemo(() => ({ refetch, retry: refetch }), [refetch]);
+
+  if (!unmasked && unverified) {
+    return classifyAuthSession({ data: null, isPending: true, isOffline: !isOnline, actions });
+  }
 
   const result = classifyAuthSession({
     data,
@@ -53,6 +86,29 @@ export function useAuthSession() {
     confirmedAnonymous = rememberConfirmedAnonymous(confirmedAnonymous, result);
   }
   return result;
+}
+
+/**
+ * The atom's confirmed identity right now, outside React (the watcher reads it after its own
+ * refetch settles): the user id, `null` when confirmed signed out, `undefined` while unknown
+ * (pending, or a failed check).
+ */
+export function readSessionIdentity(): string | null | undefined {
+  const snapshot = authClient.$store.atoms.session?.get();
+  if (!snapshot || snapshot.isPending || snapshot.isRefetching) return undefined;
+  if (snapshot.error) {
+    // A 401 confirms the session is gone; any other failure confirms nothing, even with the
+    // previous answer still retained in `data`.
+    return (snapshot.error as { status?: unknown }).status === 401 ? null : undefined;
+  }
+  const data = snapshot.data as AuthSessionData | null;
+  return data ? data.user.id : null;
+}
+
+/** A session fetch is in flight right now (another one superseded ours). */
+export function isSessionFetchInFlight(): boolean {
+  const snapshot = authClient.$store.atoms.session?.get();
+  return snapshot ? snapshot.isPending || snapshot.isRefetching : false;
 }
 
 /** Forget the settled state, as a new document would. Tests only. */

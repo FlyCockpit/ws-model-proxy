@@ -1,10 +1,17 @@
 import { useLayoutEffect } from "react";
 
-import { useAuthSession } from "@/hooks/use-auth-session";
+import {
+  isSessionFetchInFlight,
+  readSessionIdentity,
+  useAuthSession,
+} from "@/hooks/use-auth-session";
 import type { AuthSessionState } from "@/lib/auth-session-state";
 import {
   announceDocumentIdentity,
+  confirmDocumentIdentityFresh,
   connectIdentityPeers,
+  identityVerificationGeneration,
+  isDocumentIdentityUnverified,
   observeDocumentIdentity,
   replaceDocument,
   type SessionIdentity,
@@ -18,6 +25,60 @@ export function sessionIdentity(state: AuthSessionState["state"]): SessionIdenti
   if (state.status === "authenticated") return state.session.user.id;
   if (state.status === "anonymous") return null;
   return undefined;
+}
+
+/**
+ * The watcher's session checks while it is mounted: for a peer tab's
+ * announcement, a 401, and an unverified identity (another tab announced a
+ * change, or a request got a 401, while no watcher was mounted: the chrome
+ * shows no account until a check settles it). Only a check started here can
+ * settle that state: Better Auth's refetch cancels any fetch already in
+ * flight, so the answer it settles with was asked for after `since`, never
+ * inherited from before a newer invalidation. A failed check is retried when
+ * the tab regains focus, visibility or the network; one superseded by another
+ * fetch still running is followed up (at most 3 times, 250 ms apart). `stop()`
+ * drops every pending completion, timer and listener.
+ */
+function startIdentityChecks(refetch: () => unknown): { stop: () => void } {
+  let connected = true;
+  let followUp: ReturnType<typeof setTimeout> | undefined;
+  const check = (superseded = 0): Promise<void> => {
+    // A disconnected watcher starts nothing: its refetch would cancel the next watcher's check.
+    if (!connected) return Promise.resolve();
+    const since = identityVerificationGeneration();
+    return Promise.resolve(refetch()).then(() => {
+      if (!connected || !isDocumentIdentityUnverified()) return;
+      const checked = readSessionIdentity();
+      if (checked === undefined) {
+        if (isSessionFetchInFlight() && superseded < 3) {
+          // One follow-up at a time: overlapping checks share it, so `stop()` clears them all.
+          clearTimeout(followUp);
+          followUp = setTimeout(() => void check(superseded + 1), 250);
+        }
+        return;
+      }
+      if (observeDocumentIdentity(checked)) replaceDocument();
+      else confirmDocumentIdentityFresh(since);
+    });
+  };
+  const retry = () => {
+    if (isDocumentIdentityUnverified() && document.visibilityState !== "hidden") void check();
+  };
+  const disconnectPeers = connectIdentityPeers(() => check());
+  if (isDocumentIdentityUnverified()) void check();
+  window.addEventListener("focus", retry);
+  window.addEventListener("online", retry);
+  document.addEventListener("visibilitychange", retry);
+  return {
+    stop: () => {
+      connected = false;
+      clearTimeout(followUp);
+      disconnectPeers();
+      window.removeEventListener("focus", retry);
+      window.removeEventListener("online", retry);
+      document.removeEventListener("visibilitychange", retry);
+    },
+  };
 }
 
 /**
@@ -36,13 +97,18 @@ export function sessionIdentity(state: AuthSessionState["state"]): SessionIdenti
  * (`reportSessionRejected`) checks it here.
  */
 export function useReloadOnIdentityChange(): void {
-  const authSession = useAuthSession();
+  // Raw, never masked: the identity effect below must see the session even
+  // while the chrome is held neutral (an unverified identity).
+  const authSession = useAuthSession({ unmasked: true });
   const identity = sessionIdentity(authSession.state);
   const { refetch } = authSession.actions;
 
   // Connected first (effects run in order), so the first identity below is
   // already announced to the other tabs.
-  useLayoutEffect(() => connectIdentityPeers(() => refetch()), [refetch]);
+  useLayoutEffect(() => {
+    const watcher = startIdentityChecks(refetch);
+    return () => watcher.stop();
+  }, [refetch]);
 
   // Layout effect: replace the document before the browser paints a frame
   // that pairs the new identity's chrome with the old identity's cached data.

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentType, ReactNode } from "react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -36,9 +36,21 @@ vi.mock("@/components/error-state", () => ({ default: () => null }));
 vi.mock("@/hooks/use-reload-on-identity-change", () => ({
   useReloadOnIdentityChange: shell.identityHook,
 }));
-vi.mock("@/hooks/use-auth-session", () => ({
-  useAuthSession: () => ({ state: { session: null } }),
-}));
+vi.mock("@/hooks/use-auth-session", async () => {
+  const { useSyncExternalStore } = await import("react");
+  const identity = await import("@/lib/document-identity");
+  return {
+    useAuthSession: () => ({ state: { session: null } }),
+    // The real verification state, read as the real hook reads it.
+    useIdentityUnverified: () =>
+      useSyncExternalStore(
+        identity.subscribeIdentityVerification,
+        identity.isDocumentIdentityUnverified,
+        () => false,
+      ),
+  };
+});
+vi.mock("@/components/page-skeleton", () => ({ PageSkeleton: () => <p>Page skeleton</p> }));
 vi.mock("@/hooks/use-app-update", () => ({ useAppUpdate: () => undefined }));
 vi.mock("@/hooks/use-stale-build-recovery", () => ({ useStaleBuildRecovery: () => undefined }));
 vi.mock("@/hooks/use-document-lang", () => ({ useDocumentLang: () => undefined }));
@@ -49,6 +61,12 @@ vi.mock("@/hooks/use-mobile-keyboard", () => ({ useMobileKeyboard: () => false }
 vi.mock("@/stores/app-chrome", () => ({ useAppChrome: () => shell.hidden }));
 vi.mock("@/utils/orpc", () => ({ orpc: {} }));
 
+import {
+  confirmDocumentIdentityFresh,
+  identityVerificationGeneration,
+  reportSessionRejected,
+  resetDocumentIdentityForTests,
+} from "@/lib/document-identity";
 import { Route } from "./__root";
 
 const Component = Route.options.component as ComponentType & { preload?: () => Promise<unknown> };
@@ -57,10 +75,23 @@ beforeAll(async () => {
 });
 afterEach(() => {
   cleanup();
+  resetDocumentIdentityForTests(() => undefined);
   shell.hidden = false;
   vi.clearAllMocks();
 });
 describe("root shell", () => {
+  it("holds the matched page as a skeleton while the identity is unverified, keeping the watcher", () => {
+    // A 401 while no watcher was connected (the root's error state, before an error reset
+    // re-renders the previous account's retained matches without their guards).
+    reportSessionRejected();
+    render(<Component />);
+    expect(screen.queryByText("Page content")).toBeNull();
+    expect(screen.getByText("Page skeleton")).toBeTruthy();
+    expect(shell.identityHook).toHaveBeenCalled();
+    // The watcher's check confirms the document's account: the page comes back.
+    act(() => confirmDocumentIdentityFresh(identityVerificationGeneration()));
+    expect(screen.getByText("Page content")).toBeTruthy();
+  });
   it("bounds its single grid column and owns contained vertical scrolling", () => {
     render(<Component />);
     const main = screen.getByRole("main");

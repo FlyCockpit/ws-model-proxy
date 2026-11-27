@@ -181,9 +181,10 @@ to one identity: the one the document was used by. `apps/web/src/lib/document-id
 that identity at module scope for the whole life of the document (never in a component, which an
 error reset would unmount and make forget). When a confirmed identity differs from it, the document
 is replaced with a full load. A page load is asynchronous, so every replacement first quarantines
-the document synchronously: the page is hidden and the QueryClient sealed (emptied, and anything a
-late callback adds is removed again), so nothing of the previous identity stays on screen while the
-new page loads.
+the document synchronously: the page is hidden (`display: none !important` on the root, which no
+descendant can undo) and the QueryClient sealed (emptied, and anything a late callback adds is
+removed again), so nothing of the previous identity stays on screen while the new page loads. A
+replaced document reloads once, however many changes follow.
 
 | Transition | What happens |
 |---|---|
@@ -208,6 +209,21 @@ Three observers feed it, and none can be skipped:
   auth client announces every session change made in the tab (`$sessionSignal`), and the watcher
   and the guards announce each newly confirmed identity on the document's `BroadcastChannel`; every
   other tab then re-checks its session.
+  While the watcher is not mounted (the root's pending or error state, a route loader's query
+  before the shell mounts), a peer's announcement or a 401 cannot be checked: it marks the
+  document's identity unverified instead (generation-counted). Until a fresh check confirms the
+  document's identity or replaces the document, `useAuthSession()` reports `pending` everywhere,
+  so no chrome shows an account Better Auth's atom may hold stale; the shell's nav ignores the
+  guards' route context (`useShellIdentity`), and the root holds the matched page as a skeleton
+  (an error reset re-renders retained matches without their guards; the watcher stays mounted
+  outside that gate). A fresh check is a guard's
+  server answer, or a refetch the watcher itself starts once it mounts (retried on focus,
+  visibility and reconnect; one superseded by another session fetch is followed up at most 3
+  times, 250 ms apart; all dropped on unmount). An answer asked for before a newer invalidation
+  never counts, and only a settled successful answer (or a 401) is read as one. The watcher alone
+  reads the session unmasked (`useAuthSession({ unmasked: true })`). The template's
+  `SessionUnconfirmed` for its `_app` pending shell is not needed here: the chrome lives in the
+  root component next to the watcher, so whenever it paints, the watcher is connected.
 - **The global error toasts** (`utils/query-error-toast.ts`, `utils/mutation-error-toast.ts`):
   before any toast opt-out, a query rejected with 401 asks Better Auth to check the session (one
   check in flight at a time) instead of toasting; a mutation still toasts. Nothing toasts once the
@@ -246,7 +262,8 @@ cache, or needs its own identity scoping.
   (`rememberConfirmedAnonymous` in `lib/auth-session-state.ts`), so once the document settled
   signed out, a refetch or a failed refetch stays anonymous: the sign-in and sign-up forms keep
   their typed values instead of flashing their skeleton or the unable-to-connect card. Only the
-  first load waits. A sign-in clears it; a sign-out replaces the document.
+  first load waits (and an unverified identity, § Query cache follows identity). A sign-in clears
+  it; a sign-out replaces the document.
 - **Guards wait for the shell to hydrate.** The root route is `ssr: false`: the server sends
   `ShellSkeleton`, shaped by the URL (sidebar, bottom nav). React hydrates it in a later
   Suspense pass, so a guard redirect that landed first (a signed-out cold load of

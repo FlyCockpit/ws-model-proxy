@@ -5,7 +5,10 @@ import {
   admitRouteIdentity,
   announceDocumentIdentity,
   announceSessionChange,
+  confirmDocumentIdentityFresh,
   connectIdentityPeers,
+  identityVerificationGeneration,
+  isDocumentIdentityUnverified,
   isDocumentReplaced,
   leaveDocument,
   markExplicitSignOut,
@@ -17,6 +20,7 @@ import {
   sealQueryClient,
   shouldReloadForIdentity,
   skipErrorToastForIdentity,
+  subscribeIdentityVerification,
   watchDocumentRestore,
 } from "./document-identity";
 
@@ -93,6 +97,15 @@ describe("observeDocumentIdentity", () => {
     expect(isDocumentReplaced()).toBe(true);
     // The account that signs in next still finds a document on its way out.
     expect(observeDocumentIdentity("b")).toBe(true);
+  });
+
+  it("a replaced document reloads once, however many changes follow", () => {
+    observeDocumentIdentity("a");
+    expect(observeDocumentIdentity(null)).toBe(true);
+    replaceDocument();
+    expect(observeDocumentIdentity("b")).toBe(true);
+    replaceDocument();
+    expect(reload).toHaveBeenCalledTimes(1);
   });
 
   it("A → B directly replaces the document", () => {
@@ -381,11 +394,62 @@ describe("other tabs", () => {
     expect(channel.postMessage).toHaveBeenCalledTimes(2);
     channel.onmessage?.({} as MessageEvent);
     expect(check).toHaveBeenCalledTimes(1);
-    // Without a watcher, a peer's announcement or a 401 checks nothing.
+    // Without a watcher, a peer's announcement or a 401 checks nothing here: it leaves the
+    // identity unverified, for the watcher to check once it mounts.
     disconnect();
     channel.onmessage?.({} as MessageEvent);
     reportSessionRejected();
     expect(check).toHaveBeenCalledTimes(1);
+    expect(isDocumentIdentityUnverified()).toBe(true);
+  });
+
+  it("a peer's announcement or a 401 with no watcher mounted leaves the identity unverified", async () => {
+    const channel = fakeChannel();
+    resetDocumentIdentityForTests(() => channel);
+    const changed = vi.fn();
+    subscribeIdentityVerification(changed);
+    observeDocumentIdentity("a");
+    announceDocumentIdentity("a");
+    channel.onmessage?.({} as MessageEvent);
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    expect(changed).toHaveBeenCalledTimes(1);
+    // A guard's server answer for the same account confirms it.
+    await admitRouteIdentity(resolved("a"));
+    expect(isDocumentIdentityUnverified()).toBe(false);
+    reportSessionRejected();
+    expect(isDocumentIdentityUnverified()).toBe(true);
+  });
+
+  it("with a watcher connected, a peer's announcement or a 401 is checked, not left unverified", () => {
+    const channel = fakeChannel();
+    resetDocumentIdentityForTests(() => channel);
+    connectIdentityPeers(vi.fn());
+    channel.onmessage?.({} as MessageEvent);
+    reportSessionRejected();
+    expect(isDocumentIdentityUnverified()).toBe(false);
+  });
+
+  it("an answer that predates a newer invalidation settles nothing", async () => {
+    const channel = fakeChannel();
+    resetDocumentIdentityForTests(() => channel);
+    observeDocumentIdentity("a");
+    announceDocumentIdentity("a");
+    channel.onmessage?.({} as MessageEvent);
+    // A guard's probe starts, then another tab announces again mid-probe.
+    const since = identityVerificationGeneration();
+    channel.onmessage?.({} as MessageEvent);
+    await admitRouteIdentity(resolved("a"), since);
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    confirmDocumentIdentityFresh(since);
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    confirmDocumentIdentityFresh(identityVerificationGeneration());
+    expect(isDocumentIdentityUnverified()).toBe(false);
+  });
+
+  it("is never marked unverified during SSR (module state is process-wide there)", () => {
+    vi.stubGlobal("window", undefined);
+    reportSessionRejected();
+    expect(isDocumentIdentityUnverified()).toBe(false);
   });
 
   it("an identity announced across a remount of the watcher is not announced twice", () => {

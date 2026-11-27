@@ -1,5 +1,5 @@
 import { appShellHydrated } from "@/lib/app-shell-hydration";
-import { admitRouteIdentity } from "@/lib/document-identity";
+import { admitRouteIdentity, identityVerificationGeneration } from "@/lib/document-identity";
 import type { RouteSessionResolution } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
 
@@ -20,9 +20,12 @@ export async function resolveRouteSession(): Promise<RouteSessionResolution> {
   // while the server-rendered shell is still hydrating
   // (lib/app-shell-hydration.ts). The wait runs alongside the probe, and a
   // failed probe (a transport error) also waits before it reaches the router.
+  // Taken before the probe: an identity change announced while it runs is
+  // newer than its answer.
+  const since = identityVerificationGeneration();
   const [probe] = await Promise.allSettled([getRouteSession(), appShellHydrated()]);
   if (probe.status === "rejected") throw probe.reason;
   const resolution = probe.value;
-  await admitRouteIdentity(resolution);
+  await admitRouteIdentity(resolution, since);
   return resolution;
 }

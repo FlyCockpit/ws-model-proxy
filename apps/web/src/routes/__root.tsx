@@ -24,12 +24,13 @@ import BottomNav from "@/components/bottom-nav";
 import ErrorState from "@/components/error-state";
 import { FileDropGuard } from "@/components/file-drop-guard";
 import Header from "@/components/header";
+import { PageSkeleton } from "@/components/page-skeleton";
 import { ShellSkeleton } from "@/components/shell-skeleton";
 import { ThemeColorSync } from "@/components/theme-color-sync";
 import { ThemeProvider } from "@/components/theme-provider";
 import { UiLabelsBridge } from "@/components/ui-labels-bridge";
 import { useAppUpdate } from "@/hooks/use-app-update";
-import { useAuthSession } from "@/hooks/use-auth-session";
+import { useAuthSession, useIdentityUnverified } from "@/hooks/use-auth-session";
 import { useDocumentLang } from "@/hooks/use-document-lang";
 import { useHashTargetScroll } from "@/hooks/use-hash-target-scroll";
 import { useMobileKeyboard } from "@/hooks/use-mobile-keyboard";
@@ -168,6 +169,11 @@ function RootComponent() {
   // A page that took the whole viewport (the maximized terminal) hides the chrome; safe areas and
   // the keyboard inset still apply.
   const chromeHidden = useAppChrome((state) => state.hidden);
+  // Another tab's identity change is unchecked here (the watcher was not connected: the root's
+  // pending or error state). The matched page may be the previous account's (an error reset
+  // re-renders retained matches without their guards), so it waits as a skeleton until the
+  // watcher's check (above, outside this gate) confirms the account or replaces the document.
+  const identityUnverified = useIdentityUnverified();
 
   return (
     <I18nextProvider i18n={i18n}>
@@ -226,7 +232,7 @@ function RootComponent() {
                 data-scroll-restoration-id={MAIN_SCROLLER_ID}
                 className="relative min-h-0 min-w-0 overflow-y-auto overflow-x-clip overscroll-contain outline-none [container-type:size]"
               >
-                <Outlet />
+                {identityUnverified ? <PageSkeleton /> : <Outlet />}
               </main>
               <BottomNav hidden={mobileKeyboardOpen || chromeHidden} />
             </div>

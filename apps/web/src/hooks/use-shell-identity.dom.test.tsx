@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
@@ -22,11 +22,31 @@ vi.mock("@tanstack/react-router", () => ({
       ...(state.pathname ? { location: { pathname: state.pathname } } : {}),
     }),
 }));
-vi.mock("@/hooks/use-auth-session", () => ({ useAuthSession: () => ({ state: state.client }) }));
+vi.mock("@/hooks/use-auth-session", async () => {
+  const { useSyncExternalStore } = await import("react");
+  const identity = await import("@/lib/document-identity");
+  return {
+    useAuthSession: () => ({ state: state.client }),
+    // The real verification state, read as the real hook reads it.
+    useIdentityUnverified: () =>
+      useSyncExternalStore(
+        identity.subscribeIdentityVerification,
+        identity.isDocumentIdentityUnverified,
+        () => false,
+      ),
+  };
+});
 
+import {
+  confirmDocumentIdentityFresh,
+  identityVerificationGeneration,
+  reportSessionRejected,
+  resetDocumentIdentityForTests,
+} from "@/lib/document-identity";
 import { useShellIdentity } from "./use-shell-identity";
 
 afterEach(() => {
+  resetDocumentIdentityForTests(() => undefined);
   state.client = { status: "pending", session: null };
   state.matches = [];
 });
@@ -38,6 +58,18 @@ describe("useShellIdentity", () => {
       signedIn: true,
       role: "admin",
     });
+  });
+
+  it("never draws a guard's (possibly previous) account while the identity is unverified", () => {
+    // A's guard context is still matched; another tab's change (here a 401 with no watcher
+    // connected) is unchecked, so the masked session is pending.
+    state.matches = [{ context: { session: { user: { role: "admin" } } } }];
+    reportSessionRejected();
+    const view = renderHook(() => useShellIdentity());
+    expect(view.result.current).toEqual({ signedIn: false, role: null });
+    // A fresh check confirms the document's account: the guard's session stands in again.
+    act(() => confirmDocumentIdentityFresh(identityVerificationGeneration()));
+    expect(view.result.current).toEqual({ signedIn: true, role: "admin" });
   });
 
   it("lets the browser session decide once it is known", () => {

@@ -7,14 +7,27 @@ import type { AuthSessionState } from "@/lib/auth-session-state";
 const boundary = vi.hoisted(() => ({
   state: { status: "pending", session: null } as AuthSessionState["state"],
   refetch: vi.fn(),
+  /** What the atom holds right after a refetch (`readSessionIdentity`). */
+  checked: undefined as string | null | undefined,
+  inFlight: false,
 }));
 vi.mock("@/hooks/use-auth-session", () => ({
-  useAuthSession: () => ({ state: boundary.state, actions: { refetch: boundary.refetch } }),
+  useAuthSession: (options?: { unmasked?: boolean }) => ({
+    // The watcher must read the raw session: a masked read here would see only `pending`, and
+    // every identity test below would fail.
+    state: options?.unmasked === true ? boundary.state : { status: "pending", session: null },
+    actions: { refetch: boundary.refetch },
+  }),
+  readSessionIdentity: () => boundary.checked,
+  isSessionFetchInFlight: () => boundary.inFlight,
 }));
 
 import {
+  admitRouteIdentity,
+  isDocumentIdentityUnverified,
   markExplicitSignOut,
   onDocumentReplaced,
+  reportSessionRejected,
   resetDocumentIdentityForTests,
 } from "@/lib/document-identity";
 import { sessionIdentity, useReloadOnIdentityChange } from "./use-reload-on-identity-change";
@@ -43,11 +56,32 @@ beforeEach(() => {
   resetDocumentIdentityForTests(() => new FakeChannel());
   boundary.state = { status: "pending", session: null };
   boundary.refetch.mockReset();
+  boundary.checked = undefined;
+  boundary.inFlight = false;
   document.documentElement.style.removeProperty("display");
   Object.defineProperty(window, "location", { configurable: true, value: { reload } });
   reload.mockReset();
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
+
+const settle = async () => {
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+};
+const fire = (target: EventTarget, type: string) => target.dispatchEvent(new Event(type));
+
+/** A signed-in page, then the root watcher goes away (an error reset) and a peer announces. */
+function announcedWhileUnmounted() {
+  const update = setup();
+  update(user("a"));
+  const [channel] = FakeChannel.open;
+  update.unmount();
+  channel?.onmessage?.({} as MessageEvent);
+  expect(isDocumentIdentityUnverified()).toBe(true);
+  return channel;
+}
 
 function setup() {
   const view = renderHook(() => useReloadOnIdentityChange());
@@ -101,8 +135,9 @@ describe("useReloadOnIdentityChange", () => {
     const update = setup();
     update(user("a"));
     update(anonymous);
+    // Still on its way out when B is confirmed: one reload is enough.
     update(user("b"));
-    expect(reload).toHaveBeenCalledTimes(2);
+    expect(reload).toHaveBeenCalledTimes(1);
   });
   it("remembers whose data is in memory across a remount (an error reset of the root)", () => {
     const update = setup();
@@ -150,6 +185,137 @@ describe("useReloadOnIdentityChange", () => {
     channel?.onmessage?.({} as MessageEvent);
     expect(boundary.refetch).toHaveBeenCalledTimes(1);
     expect(FakeChannel.open).toHaveLength(1);
+  });
+});
+
+describe("unverified identity", () => {
+  it("re-checks on mount after a peer's announcement with no watcher, and replaces for another account", async () => {
+    announcedWhileUnmounted();
+    boundary.checked = "b";
+    setup();
+    expect(boundary.refetch).toHaveBeenCalledTimes(1);
+    await settle();
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+  it("a 401 with no watcher mounted leaves it unverified, and the mount check settles it", async () => {
+    const update = setup();
+    update(user("a"));
+    update.unmount();
+    reportSessionRejected();
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    boundary.checked = "a";
+    setup()(user("a"));
+    await settle();
+    expect(isDocumentIdentityUnverified()).toBe(false);
+    expect(reload).not.toHaveBeenCalled();
+  });
+  it("a failed check keeps it unverified; a guard's confirmation lifts it", async () => {
+    announcedWhileUnmounted();
+    setup();
+    await settle();
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    await admitRouteIdentity({ status: "resolved", session: { user: { id: "a" } } });
+    expect(isDocumentIdentityUnverified()).toBe(false);
+  });
+  it("a failed mount check is retried on reconnect, focus or visibility, never left unverified", async () => {
+    announcedWhileUnmounted();
+    setup()(user("a"));
+    await settle();
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    fire(window, "online");
+    await settle();
+    expect(boundary.refetch).toHaveBeenCalledTimes(2);
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    boundary.checked = "a";
+    fire(window, "focus");
+    await settle();
+    expect(isDocumentIdentityUnverified()).toBe(false);
+    expect(reload).not.toHaveBeenCalled();
+    // Settled: further events check nothing more.
+    fire(document, "visibilitychange");
+    await settle();
+    expect(boundary.refetch).toHaveBeenCalledTimes(3);
+  });
+  it("a retried check that answers another account replaces the document", async () => {
+    announcedWhileUnmounted();
+    setup()(user("a"));
+    await settle();
+    boundary.checked = "b";
+    fire(document, "visibilitychange");
+    await settle();
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+  it("a fetch in flight across an unmount and a newer invalidation can't settle it, even after a remount", async () => {
+    const answers: (() => void)[] = [];
+    boundary.refetch.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          answers.push(resolve);
+        }),
+    );
+    const channel = announcedWhileUnmounted();
+    // Check 1 starts; the watcher unmounts before it answers; another tab announces again.
+    setup().unmount();
+    channel?.onmessage?.({} as MessageEvent);
+    // The watcher remounts while check 1 is still in flight: check 2 starts.
+    setup();
+    expect(answers).toHaveLength(2);
+    boundary.checked = "a";
+    answers[0]?.();
+    await settle();
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    answers[1]?.();
+    await settle();
+    expect(isDocumentIdentityUnverified()).toBe(false);
+  });
+  it("a check superseded by an automatic refresh checks again once that settles", async () => {
+    vi.useFakeTimers();
+    announcedWhileUnmounted();
+    boundary.inFlight = true;
+    setup()(user("a"));
+    await settle();
+    expect(isDocumentIdentityUnverified()).toBe(true);
+    boundary.inFlight = false;
+    boundary.checked = "a";
+    await vi.advanceTimersByTimeAsync(250);
+    await settle();
+    expect(boundary.refetch).toHaveBeenCalledTimes(2);
+    expect(isDocumentIdentityUnverified()).toBe(false);
+  });
+  it("a superseded check follows up at most three times", async () => {
+    vi.useFakeTimers();
+    announcedWhileUnmounted();
+    boundary.inFlight = true;
+    setup();
+    await settle();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(boundary.refetch).toHaveBeenCalledTimes(4);
+    expect(isDocumentIdentityUnverified()).toBe(true);
+  });
+  it("overlapping superseded checks share one follow-up, and unmounting drops it", async () => {
+    vi.useFakeTimers();
+    announcedWhileUnmounted();
+    boundary.inFlight = true;
+    const update = setup();
+    // The mount check and a focus retry are both superseded: each would schedule a follow-up.
+    fire(window, "focus");
+    await settle();
+    expect(boundary.refetch).toHaveBeenCalledTimes(2);
+    update.unmount();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(boundary.refetch).toHaveBeenCalledTimes(2);
+  });
+  it("unmounting drops a pending follow-up and the retry listeners", async () => {
+    vi.useFakeTimers();
+    announcedWhileUnmounted();
+    boundary.inFlight = true;
+    const update = setup();
+    await settle();
+    update.unmount();
+    await vi.advanceTimersByTimeAsync(1000);
+    fire(window, "focus");
+    await settle();
+    expect(boundary.refetch).toHaveBeenCalledTimes(1);
   });
 });
 

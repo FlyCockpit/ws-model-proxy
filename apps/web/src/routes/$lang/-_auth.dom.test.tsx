@@ -50,6 +50,7 @@ vi.mock("react-i18next", () => ({
 }));
 // The browser session is still loading, as on the first frame of a reload.
 vi.mock("@/hooks/use-auth-session", () => ({
+  useIdentityUnverified: () => false,
   useAuthSession: () => ({
     state: shell.clientSession
       ? { status: "authenticated", session: shell.clientSession }
