@@ -43,6 +43,8 @@ A successful password change with `revokeOtherSessions: true` keeps only the ses
 
 Email/password sign-in fingerprints the stored credential before Better Auth verifies it, checks before session creation and rechecks after insertion. A changed credential refuses the session and removes any new rows, with no session cookie. Two-factor password steps store the same fingerprint beside their challenge, and code steps require it to match before and after insertion. Every session derived from a signed-in request (including two-factor rotation and impersonation) needs its parent session row before and after insertion; a failed after-check deletes the new row. Session renewal updates the existing row and cannot resurrect a deleted one.
 
+Only exact `POST /api/auth/admin/stop-impersonating` checks the original actor rather than the current target. It requires a live impersonated target session and exactly one unquoted, signed saved-admin cookie naming an existing, unexpired, non-impersonated session owned by that target session's `impersonatedBy`. The saved actor is loaded fresh and must satisfy verified-admin, forced-2FA, ban and pending-deletion rules. The target's role and lifecycle cannot authorize or veto the return. Every other admin path and method keeps the strict active-admin gate and the existing oRPC-only access-change restrictions. Better Auth receives the original request and retains its origin/CSRF, expected-identity and restoration handling.
+
 The pinned Better Auth 1.7.18 session-creation inventory is:
 
 | Source / path | Required authority |

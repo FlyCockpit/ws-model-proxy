@@ -21,7 +21,13 @@ async function assertTwoFactorPolicy(session: Session): Promise<void> {
   }
 }
 
-function isVerifiedAdmin(session: Session): boolean {
+// Accept the fresh actor projection used by the cookie-only restore gate too.
+// These are the only fields this rule reads; Prisma's nullable 2FA flag is falsey.
+type AdminAuthoritySession = {
+  user: Pick<Session["user"], "emailVerified" | "role"> & { twoFactorEnabled?: boolean | null };
+};
+
+function isVerifiedAdmin(session: AdminAuthoritySession): boolean {
   return session.user.emailVerified && isAdminRole(session.user.role);
 }
 
@@ -34,7 +40,7 @@ export type AdminAuthorityFailure = "not-admin" | "two-factor";
  * re-deriving it.
  */
 export async function checkAdminAuthority(
-  session: Session,
+  session: AdminAuthoritySession,
 ): Promise<{ ok: true } | { ok: false; reason: AdminAuthorityFailure }> {
   if (!isVerifiedAdmin(session)) return { ok: false, reason: "not-admin" };
   if ((await isForceTwoFactorRequired()) && !session.user.twoFactorEnabled) {
